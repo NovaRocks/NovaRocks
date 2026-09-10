@@ -62,10 +62,18 @@ pub enum RunFailure {
 
 /// Run a transaction body that has no externally visible side effects.
 ///
+/// One absolute deadline covers reservation, body execution, commit, retry
+/// backoff, and saturation waits for this call. Calling the runner again
+/// creates a new budget, so any outer recovery loop must impose its own bound.
+///
 /// Each replay reserves a fresh attempt from the same open StateStore instance.
 /// A dispatched commit that times out returns the exact observation capability
 /// issued with that attempt; callers must resolve it or establish the effect by
-/// an authoritative read before starting new work.
+/// an authoritative read before starting new work. Dropping or cancelling this
+/// future must likewise be treated as possibly committed because cancellation
+/// can race a dispatched provider commit. `DeadlineExceeded` is returned only
+/// before commit dispatch; `CommitUnknown` means the runner lost certainty
+/// after dispatch.
 pub async fn run_side_effect_free<T, F>(
     store: &dyn StateStore,
     metrics: &dyn StateStoreRunMetrics,

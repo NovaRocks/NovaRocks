@@ -46,6 +46,16 @@ pub trait IcebergStaticCredentialResolver: Send + Sync {
         &self,
         reference: &StaticCredentialReference,
     ) -> Result<ObjectStoreSecretMaterial, ConnectorError>;
+
+    fn resolve_object_store_metadata_static(
+        &self,
+        _reference: &StaticCredentialReference,
+    ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "role-local resolver does not provide Iceberg metadata credentials",
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -71,6 +81,7 @@ enum IcebergStorageAccess {
 pub struct IcebergReadBinding {
     resources: FsAccessResources,
     credential_resolver: Option<Arc<dyn IcebergStaticCredentialResolver>>,
+    credential_purpose: CatalogCredentialPurpose,
     storage_access: Option<IcebergStorageAccess>,
     request_context: Option<ConnectorRequestContext>,
 }
@@ -113,6 +124,7 @@ impl IcebergReadBinding {
         Self {
             resources,
             credential_resolver: None,
+            credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: None,
             request_context: None,
         }
@@ -127,18 +139,48 @@ impl IcebergReadBinding {
         Self {
             resources,
             credential_resolver: Some(credential_resolver),
+            credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
+            storage_access: None,
+            request_context: None,
+        }
+    }
+
+    /// Build the FE generation template used only for metadata, manifest and
+    /// statistics observation. It cannot select an execution-data credential.
+    pub fn with_static_metadata_credential_resolver(
+        resources: FsAccessResources,
+        credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
+    ) -> Self {
+        Self {
+            resources,
+            credential_resolver: Some(credential_resolver),
+            credential_purpose: CatalogCredentialPurpose::ObjectStoreMetadata,
             storage_access: None,
             request_context: None,
         }
     }
 
     /// Bind a catalog definition to its exact, role-local static credential
-    /// resolver. The catalog carrier contains only non-secret facts. Vended
-    /// credentials are intentionally rejected until their query-attempt lease
-    /// protocol exists.
+    /// resolver. The catalog carrier contains only non-secret facts. A vended
+    /// data binding records the attempt-owned acquisition mode without placing
+    /// response credentials in this generation template.
     pub fn from_catalog_properties(
         resources: FsAccessResources,
         credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
+        properties: &CatalogProperties,
+    ) -> Result<Self, ConnectorError> {
+        Self::from_catalog_properties_for_purpose(
+            resources,
+            credential_resolver,
+            CatalogCredentialPurpose::ObjectStoreData,
+            properties,
+        )
+    }
+
+    fn from_catalog_properties_for_purpose(
+        resources: FsAccessResources,
+        credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
+        credential_purpose: CatalogCredentialPurpose,
         properties: &CatalogProperties,
     ) -> Result<Self, ConnectorError> {
         if properties.provider_id().as_str() != "iceberg" {
@@ -157,7 +199,7 @@ impl IcebergReadBinding {
         let object_store_binding = properties
             .credential_bindings()
             .iter()
-            .find(|binding| binding.purpose() == CatalogCredentialPurpose::ObjectStoreData);
+            .find(|binding| binding.purpose() == credential_purpose);
 
         let endpoint_config =
             crate::catalog_config::object_store_endpoint_config_from_catalog_properties(
@@ -213,6 +255,7 @@ impl IcebergReadBinding {
         Ok(Self {
             resources,
             credential_resolver: Some(credential_resolver),
+            credential_purpose,
             storage_access: Some(storage_access),
             request_context: None,
         })
@@ -225,7 +268,12 @@ impl IcebergReadBinding {
         let resolver = self.credential_resolver.clone().ok_or_else(|| {
             invalid("Iceberg catalog access binding has no role-local credential resolver")
         })?;
-        Self::from_catalog_properties(self.resources.clone(), resolver, properties)
+        Self::from_catalog_properties_for_purpose(
+            self.resources.clone(),
+            resolver,
+            self.credential_purpose,
+            properties,
+        )
     }
 
     /// Explicit convenience constructor for composition roots that do not
@@ -272,6 +320,7 @@ impl IcebergReadBinding {
         Self {
             resources,
             credential_resolver: Some(resolver),
+            credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: Some(storage_access),
             request_context: None,
         }
@@ -283,6 +332,7 @@ impl IcebergReadBinding {
         Self {
             resources: self.resources.clone(),
             credential_resolver: self.credential_resolver.clone(),
+            credential_purpose: self.credential_purpose,
             storage_access: self.storage_access.clone(),
             request_context: Some(request_context),
         }
@@ -556,7 +606,19 @@ impl IcebergReadBinding {
         let resolver = self.credential_resolver.as_ref().ok_or_else(|| {
             invalid("Iceberg object-store operation has no role-local credential resolver")
         })?;
-        let secret_material = resolver.resolve_object_store_static(credential_reference)?;
+        let secret_material = match self.credential_purpose {
+            CatalogCredentialPurpose::ObjectStoreMetadata => {
+                resolver.resolve_object_store_metadata_static(credential_reference)?
+            }
+            CatalogCredentialPurpose::ObjectStoreData => {
+                resolver.resolve_object_store_static(credential_reference)?
+            }
+            CatalogCredentialPurpose::CatalogControl => {
+                return Err(invalid(
+                    "Iceberg filesystem binding cannot use catalog-control credentials",
+                ));
+            }
+        };
         Ok((endpoint_config.clone(), secret_material))
     }
 
@@ -701,7 +763,7 @@ mod tests {
             vec![
                 CatalogCredentialBinding::try_new(
                     CatalogCredentialPurpose::ObjectStoreData,
-                    CredentialConsumerRole::FrontendAndBackend,
+                    CredentialConsumerRole::Backend,
                     CatalogCredentialMode::Vended,
                 )
                 .expect("vended binding"),

@@ -34,6 +34,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::catalog_credential_registry::CatalogCredentialRegistry;
+use novarocks_types::ClusterRole;
 
 /// Immutable role-local resources used to bind one admitted Paimon request.
 /// Construction performs no catalog or object-store I/O.
@@ -41,6 +42,7 @@ use crate::catalog_credential_registry::CatalogCredentialRegistry;
 pub(crate) struct ServerPaimonRoleFileIoFactory {
     resources: FsAccessResources,
     credentials: CatalogCredentialRegistry,
+    purpose: CatalogCredentialPurpose,
 }
 
 impl ServerPaimonRoleFileIoFactory {
@@ -48,9 +50,14 @@ impl ServerPaimonRoleFileIoFactory {
         resources: FsAccessResources,
         credentials: CatalogCredentialRegistry,
     ) -> Self {
+        let purpose = match credentials.role() {
+            ClusterRole::Fe => CatalogCredentialPurpose::ObjectStoreMetadata,
+            ClusterRole::Be => CatalogCredentialPurpose::ObjectStoreData,
+        };
         Self {
             resources,
             credentials,
+            purpose,
         }
     }
 }
@@ -94,10 +101,10 @@ impl PaimonRoleFileIoFactory for ServerPaimonRoleFileIoFactory {
         let object_store_binding = properties
             .credential_bindings()
             .iter()
-            .find(|binding| binding.purpose() == CatalogCredentialPurpose::ObjectStoreData)
+            .find(|binding| binding.purpose() == self.purpose)
             .ok_or_else(|| {
                 invalid(
-                    "Paimon object-store warehouse requires an exact object-store credential binding",
+                    "Paimon object-store warehouse requires the exact role-local credential binding",
                 )
             })?;
         let credential_reference = match object_store_binding.mode() {
@@ -141,10 +148,7 @@ impl PaimonRoleFileIoFactory for ServerPaimonRoleFileIoFactory {
 
         let material = self
             .credentials
-            .resolve(
-                CatalogCredentialPurpose::ObjectStoreData,
-                credential_reference,
-            )
+            .resolve(self.purpose, credential_reference)
             .and_then(|material| material.as_s3())
             .ok_or_else(|| {
                 invalid("role-local registry has no exact S3 object-store credential binding")
@@ -257,7 +261,11 @@ mod tests {
         .expect("request")
     }
 
-    fn properties(reference: &StaticCredentialReference) -> CatalogProperties {
+    fn properties(
+        reference: &StaticCredentialReference,
+        purpose: CatalogCredentialPurpose,
+        role: CredentialConsumerRole,
+    ) -> CatalogProperties {
         CatalogProperties::new(
             CatalogHandle::new(
                 ConnectorInstanceId::parse("paimon_fixture").expect("instance"),
@@ -274,8 +282,8 @@ mod tests {
             ],
             vec![
                 CatalogCredentialBinding::try_new(
-                    CatalogCredentialPurpose::ObjectStoreData,
-                    CredentialConsumerRole::FrontendAndBackend,
+                    purpose,
+                    role,
                     CatalogCredentialMode::Static(reference.clone()),
                 )
                 .expect("binding"),
@@ -287,20 +295,18 @@ mod tests {
     fn factory(
         runtime: &tokio::runtime::Runtime,
         reference: &StaticCredentialReference,
+        cluster_role: ClusterRole,
+        purpose: CatalogCredentialPurpose,
     ) -> ServerPaimonRoleFileIoFactory {
         let material = CatalogCredentialMaterial::S3(
             S3CredentialMaterial::new(SecretValue::new("access"), SecretValue::new("secret"), None)
                 .expect("material"),
         );
         let registry = CatalogCredentialRegistry::try_new(
-            ClusterRole::Be,
+            cluster_role,
             vec![
-                CatalogCredentialRegistryEntry::try_new(
-                    CatalogCredentialPurpose::ObjectStoreData,
-                    reference.clone(),
-                    material,
-                )
-                .expect("entry"),
+                CatalogCredentialRegistryEntry::try_new(purpose, reference.clone(), material)
+                    .expect("entry"),
             ],
         )
         .expect("registry");
@@ -320,11 +326,60 @@ mod tests {
     fn binds_exact_static_credential_without_remote_io() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let reference = StaticCredentialReference::try_new("minio", "v1").expect("reference");
-        let factory = factory(&runtime, &reference);
+        let factory = factory(
+            &runtime,
+            &reference,
+            ClusterRole::Be,
+            CatalogCredentialPurpose::ObjectStoreData,
+        );
 
         factory
-            .bind_file_io(&properties(&reference), "s3://warehouse/paimon", &request())
+            .bind_file_io(
+                &properties(
+                    &reference,
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::Backend,
+                ),
+                "s3://warehouse/paimon",
+                &request(),
+            )
             .expect("pure Paimon file binding");
+    }
+
+    #[test]
+    fn frontend_binds_only_the_metadata_credential() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let reference = StaticCredentialReference::try_new("minio", "v1").expect("reference");
+        let factory = factory(
+            &runtime,
+            &reference,
+            ClusterRole::Fe,
+            CatalogCredentialPurpose::ObjectStoreMetadata,
+        );
+
+        factory
+            .bind_file_io(
+                &properties(
+                    &reference,
+                    CatalogCredentialPurpose::ObjectStoreMetadata,
+                    CredentialConsumerRole::Frontend,
+                ),
+                "s3://warehouse/paimon",
+                &request(),
+            )
+            .expect("frontend Paimon metadata binding");
+        let error = factory
+            .bind_file_io(
+                &properties(
+                    &reference,
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::Backend,
+                ),
+                "s3://warehouse/paimon",
+                &request(),
+            )
+            .expect_err("frontend must not fall back to a data credential");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     #[test]
@@ -332,10 +387,23 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let configured = StaticCredentialReference::try_new("minio", "v1").expect("reference");
         let requested = StaticCredentialReference::try_new("minio", "v2").expect("reference");
-        let factory = factory(&runtime, &configured);
+        let factory = factory(
+            &runtime,
+            &configured,
+            ClusterRole::Be,
+            CatalogCredentialPurpose::ObjectStoreData,
+        );
 
         let error = factory
-            .bind_file_io(&properties(&requested), "s3://warehouse/paimon", &request())
+            .bind_file_io(
+                &properties(
+                    &requested,
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::Backend,
+                ),
+                "s3://warehouse/paimon",
+                &request(),
+            )
             .expect_err("unknown credential generation must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }

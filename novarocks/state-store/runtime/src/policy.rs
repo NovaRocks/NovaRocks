@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Application-owned retry and deadline policy for StateStore operations.
+//!
+//! These limits express how much work the application is willing to spend.
+//! They are not provider capabilities and must not be inferred from, widened
+//! by, or delegated to a StateStore implementation.
+
 use std::time::Duration;
 
 pub const DEFAULT_MAX_ATTEMPTS: usize = 5;

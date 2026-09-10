@@ -694,10 +694,36 @@ fn load_fixture(path: &Path, expected_stage: &str) -> Result<Fixture> {
         catalog.get("type").and_then(Value::as_str) == Some("filesystem"),
         "Paimon fixture is not a Filesystem Catalog"
     );
-    let binding = catalog
-        .get("credential_binding")
+    let bindings = catalog
+        .get("credential_bindings")
         .and_then(Value::as_object)
-        .context("Paimon fixture has no credential binding")?;
+        .context("Paimon fixture has no credential bindings")?;
+    let metadata_binding = bindings
+        .get("object_store_metadata")
+        .and_then(Value::as_object)
+        .context("Paimon fixture has no object-store metadata binding")?;
+    let data_binding = bindings
+        .get("object_store_data")
+        .and_then(Value::as_object)
+        .context("Paimon fixture has no object-store data binding")?;
+    ensure!(
+        metadata_binding
+            .get("consumer_role")
+            .and_then(Value::as_str)
+            == Some("frontend"),
+        "Paimon metadata credential binding is not frontend-owned"
+    );
+    ensure!(
+        data_binding.get("consumer_role").and_then(Value::as_str) == Some("backend"),
+        "Paimon data credential binding is not backend-owned"
+    );
+    let credential_name = required_map_string(metadata_binding, "name")?;
+    let credential_generation = required_map_string(metadata_binding, "generation")?;
+    ensure!(
+        required_map_string(data_binding, "name")? == credential_name
+            && required_map_string(data_binding, "generation")? == credential_generation,
+        "Paimon metadata and data bindings must use the same fixture credential generation"
+    );
     let root = path
         .parent()
         .context("Paimon fixture manifest has no parent directory")?
@@ -711,8 +737,8 @@ fn load_fixture(path: &Path, expected_stage: &str) -> Result<Fixture> {
         warehouse: required_string(&value, "warehouse_uri")?,
         endpoint: required_map_string(catalog, "endpoint")?,
         region: required_map_string(catalog, "region")?,
-        credential_name: required_map_string(binding, "name")?,
-        credential_generation: required_map_string(binding, "generation")?,
+        credential_name,
+        credential_generation,
     })
 }
 
@@ -747,13 +773,19 @@ fn create_paimon_catalog(control: &mut mysql::Conn, name: &str, fixture: &Fixtur
              \"aws.s3.endpoint\"=\"{}\",\
              \"aws.s3.region\"=\"{}\",\
              \"aws.s3.enable_path_style_access\"=\"true\",\
-             \"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\
+             \"credential.object-store-metadata.consumer-role\"=\"frontend\",\
+             \"credential.object-store-metadata.mode\"=\"static\",\
+             \"credential.object-store-metadata.name\"=\"{}\",\
+             \"credential.object-store-metadata.generation\"=\"{}\",\
+             \"credential.object-store-data.consumer-role\"=\"backend\",\
              \"credential.object-store-data.mode\"=\"static\",\
              \"credential.object-store-data.name\"=\"{}\",\
              \"credential.object-store-data.generation\"=\"{}\")",
             sql_string(&fixture.warehouse),
             sql_string(&fixture.endpoint),
             sql_string(&fixture.region),
+            sql_string(&fixture.credential_name),
+            sql_string(&fixture.credential_generation),
             sql_string(&fixture.credential_name),
             sql_string(&fixture.credential_generation),
         ))

@@ -36,12 +36,16 @@ pub const MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES: usize = 64;
 pub const MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES: usize = 2 * 1024;
 
 const CREDENTIAL_BINDING_DOMAIN: &[u8] = b"novarocks.catalog.credential.bindings.v1\0";
-const STORAGE_ACCESS_DOMAIN: &[u8] = b"novarocks.storage.access-domain.v1\0";
+const STORAGE_ACCESS_DOMAIN: &[u8] = b"novarocks.storage.access-domain.v2\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CatalogCredentialPurpose {
+    /// Frontend access to a provider's catalog control API.
     CatalogControl,
+    /// Backend access to table data for one execution attempt.
     ObjectStoreData,
+    /// Frontend access to metadata, manifests, and statistics files.
+    ObjectStoreMetadata,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -105,8 +109,12 @@ impl CatalogCredentialBinding {
                 CatalogCredentialMode::Static(_)
             ) | (
                 CatalogCredentialPurpose::ObjectStoreData,
-                CredentialConsumerRole::FrontendAndBackend,
+                CredentialConsumerRole::Backend,
                 CatalogCredentialMode::Static(_) | CatalogCredentialMode::Vended
+            ) | (
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Static(_)
             )
         );
         if !valid {
@@ -170,6 +178,7 @@ pub fn canonical_catalog_credential_binding_bytes(
         output.push(match binding.purpose {
             CatalogCredentialPurpose::CatalogControl => 0,
             CatalogCredentialPurpose::ObjectStoreData => 1,
+            CatalogCredentialPurpose::ObjectStoreMetadata => 2,
         });
         output.push(match binding.consumer_role {
             CredentialConsumerRole::Frontend => 0,
@@ -284,8 +293,16 @@ pub enum CatalogUncredentialedStorageKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StorageAccessScope {
-    Static(StaticCredentialReference),
-    Vended(Vec<StorageCredentialScopePrefix>),
+    Static {
+        purpose: CatalogCredentialPurpose,
+        consumer_role: CredentialConsumerRole,
+        reference: StaticCredentialReference,
+    },
+    Vended {
+        purpose: CatalogCredentialPurpose,
+        consumer_role: CredentialConsumerRole,
+        prefixes: Vec<StorageCredentialScopePrefix>,
+    },
     Uncredentialed {
         kind: CatalogUncredentialedStorageKind,
         authority: Option<Arc<str>>,
@@ -298,13 +315,20 @@ impl CatalogStorageAccessDomainInput {
         catalog_name: ConnectorInstanceId,
         config_format_version: u32,
         non_secret_properties: Vec<CatalogNonSecretProperty>,
-        object_store_binding: CatalogCredentialBinding,
+        storage_binding: CatalogCredentialBinding,
         mut vended_prefixes: Vec<StorageCredentialScopePrefix>,
     ) -> Result<Self, ConnectorError> {
-        if object_store_binding.purpose != CatalogCredentialPurpose::ObjectStoreData
-            || object_store_binding.consumer_role != CredentialConsumerRole::FrontendAndBackend
-        {
-            return Err(invalid("object-store credential binding"));
+        if !matches!(
+            (storage_binding.purpose, storage_binding.consumer_role),
+            (
+                CatalogCredentialPurpose::ObjectStoreData,
+                CredentialConsumerRole::Backend
+            ) | (
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::Frontend
+            )
+        ) {
+            return Err(invalid("storage credential binding"));
         }
         if vended_prefixes.len() > MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES {
             return Err(exhausted("storage credential scope prefix set"));
@@ -313,12 +337,22 @@ impl CatalogStorageAccessDomainInput {
         if vended_prefixes.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(invalid("duplicate storage credential scope prefix"));
         }
-        let storage_scope = match object_store_binding.mode {
+        let purpose = storage_binding.purpose;
+        let consumer_role = storage_binding.consumer_role;
+        let storage_scope = match storage_binding.mode {
             CatalogCredentialMode::Static(reference) if vended_prefixes.is_empty() => {
-                StorageAccessScope::Static(reference)
+                StorageAccessScope::Static {
+                    purpose,
+                    consumer_role,
+                    reference,
+                }
             }
             CatalogCredentialMode::Vended if !vended_prefixes.is_empty() => {
-                StorageAccessScope::Vended(vended_prefixes)
+                StorageAccessScope::Vended {
+                    purpose,
+                    consumer_role,
+                    prefixes: vended_prefixes,
+                }
             }
             CatalogCredentialMode::Static(_) => {
                 return Err(invalid("static storage binding with vended prefix scope"));
@@ -409,13 +443,25 @@ impl CatalogStorageAccessDomainInput {
             hash_bytes(&mut digest, property.value.as_bytes());
         }
         match &self.storage_scope {
-            StorageAccessScope::Static(reference) => {
+            StorageAccessScope::Static {
+                purpose,
+                consumer_role,
+                reference,
+            } => {
                 digest.update([0]);
+                digest.update([credential_purpose_discriminant(*purpose)]);
+                digest.update([consumer_role_discriminant(*consumer_role)]);
                 hash_bytes(&mut digest, reference.name.as_bytes());
                 hash_bytes(&mut digest, reference.generation.as_bytes());
             }
-            StorageAccessScope::Vended(prefixes) => {
+            StorageAccessScope::Vended {
+                purpose,
+                consumer_role,
+                prefixes,
+            } => {
                 digest.update([1]);
+                digest.update([credential_purpose_discriminant(*purpose)]);
+                digest.update([consumer_role_discriminant(*consumer_role)]);
                 hash_count(&mut digest, prefixes.len());
                 for prefix in prefixes {
                     hash_bytes(&mut digest, prefix.0.as_bytes());
@@ -436,6 +482,22 @@ impl CatalogStorageAccessDomainInput {
             }
         }
         StorageAccessDomainId(digest.finalize().into())
+    }
+}
+
+const fn credential_purpose_discriminant(purpose: CatalogCredentialPurpose) -> u8 {
+    match purpose {
+        CatalogCredentialPurpose::CatalogControl => 0,
+        CatalogCredentialPurpose::ObjectStoreData => 1,
+        CatalogCredentialPurpose::ObjectStoreMetadata => 2,
+    }
+}
+
+const fn consumer_role_discriminant(role: CredentialConsumerRole) -> u8 {
+    match role {
+        CredentialConsumerRole::Frontend => 0,
+        CredentialConsumerRole::Backend => 1,
+        CredentialConsumerRole::FrontendAndBackend => 2,
     }
 }
 
@@ -552,7 +614,7 @@ mod tests {
     fn static_data_binding(generation: &str) -> CatalogCredentialBinding {
         CatalogCredentialBinding::try_new(
             CatalogCredentialPurpose::ObjectStoreData,
-            CredentialConsumerRole::FrontendAndBackend,
+            CredentialConsumerRole::Backend,
             CatalogCredentialMode::Static(static_reference(generation)),
         )
         .unwrap()
@@ -564,6 +626,17 @@ mod tests {
             CredentialConsumerRole::Frontend,
             CatalogCredentialMode::Static(
                 StaticCredentialReference::try_new("rest-control", "blue").unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn metadata_binding() -> CatalogCredentialBinding {
+        CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreMetadata,
+            CredentialConsumerRole::Frontend,
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new("warehouse-metadata", "blue").unwrap(),
             ),
         )
         .unwrap()
@@ -620,7 +693,7 @@ mod tests {
         assert!(
             CatalogCredentialBinding::try_new(
                 CatalogCredentialPurpose::ObjectStoreData,
-                CredentialConsumerRole::Backend,
+                CredentialConsumerRole::FrontendAndBackend,
                 CatalogCredentialMode::Static(static_reference("one")),
             )
             .is_err()
@@ -628,10 +701,34 @@ mod tests {
         assert!(
             CatalogCredentialBinding::try_new(
                 CatalogCredentialPurpose::ObjectStoreData,
-                CredentialConsumerRole::FrontendAndBackend,
+                CredentialConsumerRole::Backend,
                 CatalogCredentialMode::Static(static_reference("one")),
             )
             .is_ok()
+        );
+        assert!(
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Static(static_reference("one")),
+            )
+            .is_ok()
+        );
+        assert!(
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::FrontendAndBackend,
+                CatalogCredentialMode::Static(static_reference("one")),
+            )
+            .is_err()
+        );
+        assert!(
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Vended,
+            )
+            .is_err()
         );
     }
 
@@ -652,6 +749,18 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn canonical_binding_discriminants_preserve_data_and_append_metadata() {
+        let purpose_offset = CREDENTIAL_BINDING_DOMAIN.len() + std::mem::size_of::<u32>();
+        let data = canonical_catalog_credential_binding_bytes(&[static_data_binding("blue")])
+            .expect("data binding bytes");
+        let metadata = canonical_catalog_credential_binding_bytes(&[metadata_binding()])
+            .expect("metadata binding bytes");
+
+        assert_eq!(data[purpose_offset], 1);
+        assert_eq!(metadata[purpose_offset], 2);
     }
 
     #[test]
@@ -688,10 +797,32 @@ mod tests {
         assert_eq!(
             first.as_bytes(),
             &[
-                195, 64, 121, 50, 40, 163, 103, 75, 132, 126, 198, 210, 167, 135, 20, 34, 126, 200,
-                13, 121, 21, 91, 42, 163, 216, 17, 227, 65, 190, 123, 141, 81,
+                2, 67, 53, 41, 126, 17, 195, 228, 118, 40, 75, 52, 156, 194, 211, 125, 242, 71,
+                160, 209, 154, 69, 176, 118, 34, 81, 160, 130, 132, 245, 154, 85,
             ]
         );
+    }
+
+    #[test]
+    fn access_domain_retains_the_exact_storage_purpose_and_consumer_role() {
+        let data = access_input("blue", vec![]).derive_access_domain();
+        let metadata = CatalogStorageAccessDomainInput::try_new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::try_from_canonical("analytics").unwrap(),
+            2,
+            vec![],
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Static(static_reference("blue")),
+            )
+            .unwrap(),
+            vec![],
+        )
+        .unwrap()
+        .derive_access_domain();
+
+        assert_ne!(data, metadata);
     }
 
     #[test]
@@ -700,7 +831,7 @@ mod tests {
         let second = StorageCredentialScopePrefix::try_from_normalized("s3://bucket/b/").unwrap();
         let vended = CatalogCredentialBinding::try_new(
             CatalogCredentialPurpose::ObjectStoreData,
-            CredentialConsumerRole::FrontendAndBackend,
+            CredentialConsumerRole::Backend,
             CatalogCredentialMode::Vended,
         )
         .unwrap();
@@ -720,7 +851,7 @@ mod tests {
             vec![],
             CatalogCredentialBinding::try_new(
                 CatalogCredentialPurpose::ObjectStoreData,
-                CredentialConsumerRole::FrontendAndBackend,
+                CredentialConsumerRole::Backend,
                 CatalogCredentialMode::Vended,
             )
             .unwrap(),

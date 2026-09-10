@@ -397,6 +397,35 @@ impl IcebergVendedS3RefreshScope {
                 .zip(&self.prefixes)
                 .all(|(credential, prefix)| credential.prefix == *prefix)
     }
+
+    /// Bind a newly acquired attempt to the declared credentials endpoint.
+    ///
+    /// A new attempt proves coverage of its frozen resources independently;
+    /// it does not inherit the preceding attempt's prefix set. The endpoint
+    /// remains the declared acquisition path, while the fresh response becomes
+    /// the scope that later renewals for this attempt must preserve.
+    pub(crate) fn reacquired_for_seed(
+        &self,
+        seed: &IcebergVendedCredentialLeaseSeed,
+    ) -> Result<Self, ConnectorError> {
+        if seed
+            .refresh_endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint != self.endpoint())
+        {
+            return Err(invalid(
+                "vended REST credential reacquisition changed the credentials endpoint",
+            ));
+        }
+        Ok(Self {
+            prefixes: seed
+                .credentials
+                .iter()
+                .map(|entry| entry.prefix.clone())
+                .collect(),
+            endpoint: Arc::clone(&self.endpoint),
+        })
+    }
 }
 
 impl IcebergVendedS3LoadTableScope {
@@ -907,16 +936,14 @@ impl IcebergAttemptTableAccess {
                 "vended REST load-table delegation returned a different table UUID",
             ));
         }
-        let Some(IcebergVendedS3RenewalCapability::LoadTableDelegation(expected_scope)) =
-            self.renewal()
-        else {
+        let Some(IcebergVendedS3RenewalCapability::LoadTableDelegation(_)) = self.renewal() else {
             return Err(invalid(
                 "frozen table requires credentials-endpoint attempt access",
             ));
         };
-        if !expected_scope.matches_seed(delegation) {
+        if delegation.refresh_endpoint().is_some() {
             return Err(invalid(
-                "vended REST load-table delegation changed prefix scope or acquisition path",
+                "vended REST load-table delegation changed its acquisition path",
             ));
         }
         self.validate_table_access(delegation)
@@ -1303,6 +1330,15 @@ mod tests {
             .expect_err("a same-name table with a different UUID must be rejected");
         assert!(error.to_string().contains("different table UUID"));
 
+        let mut broader_scope = input("s3://warehouse/", 600, "broader-scope");
+        broader_scope
+            .config
+            .remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
+        let broader_scope = seed(vec![broader_scope]);
+        access
+            .validate_attempt_reacquisition(&observed, &broader_scope)
+            .expect("a later attempt may receive a different scope that covers frozen resources");
+
         let mut outside_scope = input("s3://other/data", 600, "wrong-scope");
         outside_scope
             .config
@@ -1311,7 +1347,37 @@ mod tests {
         let error = access
             .validate_attempt_reacquisition(&observed, &outside_scope)
             .expect_err("delegation must cover the original bound resources");
-        assert!(error.to_string().contains("changed prefix scope"));
+        assert!(error.to_string().contains("no matching prefix"));
+    }
+
+    #[test]
+    fn credentials_endpoint_reacquisition_adopts_new_covering_prefixes() {
+        let initial = seed(vec![input("s3://warehouse/data/", 600, "initial")]);
+        let original_scope = initial.refresh_scope().expect("initial refresh scope");
+        let mut broader = input("s3://warehouse/", 900, "replacement");
+        broader.config.remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
+        let broader = seed(vec![broader]);
+
+        assert!(!original_scope.matches_seed(&broader));
+        let replacement_scope = original_scope
+            .reacquired_for_seed(&broader)
+            .expect("replacement attempt scope");
+        assert!(replacement_scope.matches_seed(&broader));
+        assert_eq!(
+            replacement_scope.endpoint(),
+            "https://catalog.example.test/v1/credentials"
+        );
+
+        let mut changed_endpoint = input("s3://warehouse/", 900, "changed-endpoint");
+        changed_endpoint.config.insert(
+            CLIENT_REFRESH_CREDENTIALS_ENDPOINT.to_string(),
+            "https://other.example.test/v1/credentials".to_string(),
+        );
+        assert!(
+            replacement_scope
+                .reacquired_for_seed(&seed(vec![changed_endpoint]))
+                .is_err()
+        );
     }
 
     #[test]

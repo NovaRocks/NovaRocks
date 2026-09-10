@@ -129,12 +129,10 @@ impl IcebergConnectorFactory {
             .map(|property| (property.key().to_string(), property.value().to_string()))
             .collect::<Vec<_>>();
         let rest_access_delegation = rest_access_delegation_mode(catalog_properties, &properties)?;
-        // Both modes bind the immutable catalog definition.  Vended binding
-        // carries only the owner and endpoint; it deliberately has no static
-        // secret and therefore requires a request storage resolver before any
-        // object-store I/O.  Leaving it as an unbound template loses that
-        // mode information and makes optional control-generation probes try
-        // to resolve an unauthorised warehouse instead of deferring them.
+        // Bind the FE metadata principal independently from the execution-data
+        // declaration inspected above. A vended data binding chooses the
+        // attempt acquisition strategy; all FE FileIO uses this static
+        // generation-owned metadata binding.
         let planning_binding = self
             .control_resources
             .planning_binding()
@@ -702,7 +700,7 @@ mod tests {
             vec![
                 CatalogCredentialBinding::try_new(
                     CatalogCredentialPurpose::ObjectStoreData,
-                    CredentialConsumerRole::FrontendAndBackend,
+                    CredentialConsumerRole::Backend,
                     CatalogCredentialMode::Static(
                         StaticCredentialReference::try_new("iceberg-test-object-store", "test")
                             .expect("test credential reference"),

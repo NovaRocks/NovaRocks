@@ -20,7 +20,8 @@
 use std::sync::Arc;
 
 use crate::query_execution::completion::{
-    PreparedDistributedQuery, PreparedRetriableDistributedRequest, QueryAttemptReservation,
+    LogicalQueryReservation, PreparedDistributedQuery, PreparedRetriableDistributedRequest,
+    QueryAttemptReservation,
 };
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
@@ -70,8 +71,17 @@ impl QueryExecutionService {
         self.coordinator.execute_prepared(operation)
     }
 
-    /// Reserve a candidate first-round identity before any provider metadata
-    /// materialization can return attempt-scoped credentials.
+    /// Reserve one logical query identity for preparation diagnostics. This
+    /// does not create an execution attempt or any attempt-scoped capability.
+    pub(crate) fn reserve_logical_query(
+        &self,
+    ) -> Result<LogicalQueryReservation, DistributedQueryError> {
+        self.coordinator.reserve_logical_query()
+    }
+
+    /// Reserve a candidate first-round identity for an effectful statement
+    /// whose staged protocol must own attempt-scoped capabilities during
+    /// request construction. Read-only query preparation never calls this.
     pub(crate) fn reserve_initial_attempt(
         &self,
     ) -> Result<QueryAttemptReservation, DistributedQueryError> {

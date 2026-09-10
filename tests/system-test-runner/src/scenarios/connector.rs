@@ -2,7 +2,9 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
+use novarocks_cluster_harness::isolated_iceberg_rest::{
+    IsolatedIcebergRestFixture, IsolatedS3Identity,
+};
 use novarocks_cluster_harness::loopback_s3::{
     LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Object, LoopbackS3Request,
 };
@@ -27,6 +29,10 @@ const CONNECTOR_READER_OPEN: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN";
 /// applied. It replaces `NOVAROCKS_QUERY_LIFECYCLE_ABORT`, which only the
 /// retired chain emits and which a production query no longer reaches.
 const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
+const VENDED_METADATA_CREDENTIAL_NAME: &str = "vended-rest-metadata";
+const VENDED_METADATA_CREDENTIAL_GENERATION: &str = "v1";
+const VENDED_METADATA_ACCESS_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_ACCESS_KEY_ID";
+const VENDED_METADATA_SECRET_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_SECRET_ACCESS_KEY";
 /// A Backend is about to build at least one catalog runtime for one attempt.
 ///
 /// The task protocol's successor of `NOVAROCKS_CATALOG_LOADING`, and the only
@@ -967,6 +973,7 @@ impl Scenario for VendedRestReadWritePem {
         rest.provision_empty_table("vended_rest_db", "vended_rest_data")
             .context("provision isolated vended REST source table")?;
         let endpoints = rest.endpoints().clone();
+        let metadata_identity = rest.static_s3_identity();
         let identities = rest
             .provision_vended_s3_identities()
             .context("provision isolated initial and rotated vended S3 identities")?;
@@ -1010,6 +1017,7 @@ impl Scenario for VendedRestReadWritePem {
         *fixture = Some(VendedRestSystemFixture { rest, proxy });
 
         let mut config = connector_launch_config();
+        configure_vended_metadata_access(&mut config, metadata_identity);
         // Vended lease envelopes are confidential lifecycle payloads. The
         // scenario must therefore exercise the native TLS branch, never the
         // default authenticated h2c fixture.
@@ -1047,7 +1055,7 @@ impl Scenario for VendedRestReadWritePem {
         context.action("create REST catalog with an explicit vended data binding");
         control
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")",
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")",
                 self.vended_minio_endpoint()?
             ))
             .context("create vended REST catalog")?;
@@ -1177,6 +1185,7 @@ impl Scenario for VendedRestWriteOutcomePem {
         rest.provision_empty_table("vended_write_outcome_db", "vended_write_outcome_data")
             .context("provision isolated vended write-outcome table")?;
         let endpoints = rest.endpoints().clone();
+        let metadata_identity = rest.static_s3_identity();
         let identities = rest
             .provision_vended_s3_identities()
             .context("provision isolated vended write-outcome identities")?;
@@ -1213,6 +1222,7 @@ impl Scenario for VendedRestWriteOutcomePem {
         *fixture = Some(VendedRestSystemFixture { rest, proxy });
 
         let mut config = connector_launch_config();
+        configure_vended_metadata_access(&mut config, metadata_identity);
         config.native_trust_fixture = NativeTrustFixture::pem_ip();
         Ok(config)
     }
@@ -1232,7 +1242,7 @@ impl Scenario for VendedRestWriteOutcomePem {
         const TABLE: &str = "vended_write_outcome_data";
         control
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")"
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")"
             ))
             .context("create response-loss REST vended catalog")?;
 
@@ -1350,6 +1360,7 @@ impl Scenario for VendedRestRefreshPem {
         rest.provision_empty_table("vended_refresh_db", "vended_refresh_data")
             .context("provision isolated vended refresh source table")?;
         let endpoints = rest.endpoints().clone();
+        let metadata_identity = rest.static_s3_identity();
         let identities = rest
             .provision_vended_s3_identities()
             .context("provision isolated vended refresh S3 identities")?;
@@ -1391,6 +1402,7 @@ impl Scenario for VendedRestRefreshPem {
         *fixture = Some(VendedRestSystemFixture { rest, proxy });
 
         let mut config = connector_launch_config();
+        configure_vended_metadata_access(&mut config, metadata_identity);
         config.native_trust_fixture = NativeTrustFixture::pem_ip();
         Ok(config)
     }
@@ -1425,7 +1437,7 @@ impl Scenario for VendedRestRefreshPem {
         context.action("create short-TTL REST catalog with a vended data binding");
         control
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")"
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")"
             ))
             .context("create short-TTL vended REST catalog")?;
         context.action("write three independent vended data files for the 1FE+3BE long read");
@@ -2439,23 +2451,52 @@ operator_buffer_chunks = 1
     }
 }
 
+fn configure_vended_metadata_access(
+    config: &mut ScenarioLaunchConfig,
+    identity: IsolatedS3Identity,
+) {
+    config.child_environment.fe.insert(
+        VENDED_METADATA_ACCESS_KEY_ENV.to_string(),
+        identity.access_key_id,
+    );
+    config.child_environment.fe.insert(
+        VENDED_METADATA_SECRET_KEY_ENV.to_string(),
+        identity.secret_access_key,
+    );
+    let existing = config.config_overlay.fe.take().unwrap_or_default();
+    config.config_overlay.fe = Some(format!(
+        r#"{existing}
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "{VENDED_METADATA_CREDENTIAL_NAME}"
+generation = "{VENDED_METADATA_CREDENTIAL_GENERATION}"
+kind = "s3"
+access_key_id = "${{ENV:{VENDED_METADATA_ACCESS_KEY_ENV}}}"
+access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
+"#
+    ));
+}
+
 fn static_credential_launch_overlay(snapshot: &Path) -> CrossProcessConfigOverlay {
-    let credentials = static_credential_registry_overlay();
     CrossProcessConfigOverlay {
         fe: Some(format!(
-            "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{credentials}\n{READER_CACHE_OVERLAY}",
-            snapshot.display()
+            "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{}\n{READER_CACHE_OVERLAY}",
+            snapshot.display(),
+            static_credential_registry_overlay("object-store-metadata"),
         )),
-        be: Some(format!("{credentials}\n{READER_CACHE_OVERLAY}")),
+        be: Some(format!(
+            "{}\n{READER_CACHE_OVERLAY}",
+            static_credential_registry_overlay("object-store-data"),
+        )),
         ..Default::default()
     }
 }
 
-fn static_credential_registry_overlay() -> String {
+fn static_credential_registry_overlay(purpose: &str) -> String {
     format!(
         r#"
 [[connector.credentials]]
-purpose = "object-store-data"
+purpose = "{purpose}"
 name = "{STATIC_BLUE_CREDENTIAL_NAME}"
 generation = "{STATIC_BLUE_CREDENTIAL_GENERATION}"
 kind = "s3"
@@ -2463,7 +2504,7 @@ access_key_id = "{STATIC_BLUE_KEY_ID}"
 access_key_secret = "{STATIC_BLUE_KEY_SECRET}"
 
 [[connector.credentials]]
-purpose = "object-store-data"
+purpose = "{purpose}"
 name = "{STATIC_GREEN_CREDENTIAL_NAME}"
 generation = "{STATIC_GREEN_CREDENTIAL_GENERATION}"
 kind = "s3"
@@ -2488,8 +2529,14 @@ fn write_static_credential_snapshot(
              display_name = \"{STATIC_BLUE_CATALOG}\"\n\
              config_format_version = 3\n\
              [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-metadata\"\n\
+             consumer_role = \"frontend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_BLUE_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_BLUE_CREDENTIAL_GENERATION}\"\n\
+             [[catalogs.credential_bindings]]\n\
              purpose = \"object-store-data\"\n\
-             consumer_role = \"frontend-and-backend\"\n\
+             consumer_role = \"backend\"\n\
              mode = \"static\"\n\
              name = \"{STATIC_BLUE_CREDENTIAL_NAME}\"\n\
              generation = \"{STATIC_BLUE_CREDENTIAL_GENERATION}\"\n\
@@ -2505,8 +2552,14 @@ fn write_static_credential_snapshot(
              display_name = \"{STATIC_GREEN_CATALOG}\"\n\
              config_format_version = 3\n\
              [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-metadata\"\n\
+             consumer_role = \"frontend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_GREEN_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_GREEN_CREDENTIAL_GENERATION}\"\n\
+             [[catalogs.credential_bindings]]\n\
              purpose = \"object-store-data\"\n\
-             consumer_role = \"frontend-and-backend\"\n\
+             consumer_role = \"backend\"\n\
              mode = \"static\"\n\
              name = \"{STATIC_GREEN_CREDENTIAL_NAME}\"\n\
              generation = \"{STATIC_GREEN_CREDENTIAL_GENERATION}\"\n\
@@ -2536,8 +2589,14 @@ fn write_access_domain_collision_snapshot(
              display_name = \"{COLLISION_BLUE_CATALOG}\"\n\
              config_format_version = 3\n\
              [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-metadata\"\n\
+             consumer_role = \"frontend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_BLUE_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_BLUE_CREDENTIAL_GENERATION}\"\n\
+             [[catalogs.credential_bindings]]\n\
              purpose = \"object-store-data\"\n\
-             consumer_role = \"frontend-and-backend\"\n\
+             consumer_role = \"backend\"\n\
              mode = \"static\"\n\
              name = \"{STATIC_BLUE_CREDENTIAL_NAME}\"\n\
              generation = \"{STATIC_BLUE_CREDENTIAL_GENERATION}\"\n\
@@ -2553,8 +2612,14 @@ fn write_access_domain_collision_snapshot(
              display_name = \"{COLLISION_GREEN_CATALOG}\"\n\
              config_format_version = 3\n\
              [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-metadata\"\n\
+             consumer_role = \"frontend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_GREEN_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_GREEN_CREDENTIAL_GENERATION}\"\n\
+             [[catalogs.credential_bindings]]\n\
              purpose = \"object-store-data\"\n\
-             consumer_role = \"frontend-and-backend\"\n\
+             consumer_role = \"backend\"\n\
              mode = \"static\"\n\
              name = \"{STATIC_GREEN_CREDENTIAL_NAME}\"\n\
              generation = \"{STATIC_GREEN_CREDENTIAL_GENERATION}\"\n\

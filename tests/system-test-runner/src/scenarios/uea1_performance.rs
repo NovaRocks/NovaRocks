@@ -108,7 +108,11 @@ impl Scenario for Uea1PerformanceScenario {
              \"iceberg.catalog.type\"=\"rest\",\
              \"uri\"=\"{}\",\
              \"warehouse\"=\"{}\",\
-             \"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\
+             \"credential.object-store-metadata.consumer-role\"=\"frontend\",\
+             \"credential.object-store-metadata.mode\"=\"static\",\
+             \"credential.object-store-metadata.name\"=\"{MIXED_CREDENTIAL_NAME}\",\
+             \"credential.object-store-metadata.generation\"=\"{MIXED_CREDENTIAL_GENERATION}\",\
+             \"credential.object-store-data.consumer-role\"=\"backend\",\
              \"credential.object-store-data.mode\"=\"static\",\
              \"credential.object-store-data.name\"=\"{MIXED_CREDENTIAL_NAME}\",\
              \"credential.object-store-data.generation\"=\"{MIXED_CREDENTIAL_GENERATION}\",\
@@ -142,10 +146,10 @@ impl Scenario for Uea1PerformanceScenario {
         child_environment
             .be
             .insert(SECRET_KEY_ENV.to_string(), identity.secret_access_key);
-        let credential_registry = format!(
+        let metadata_credential_registry = format!(
             r#"
 [[connector.credentials]]
-purpose = "object-store-data"
+purpose = "object-store-metadata"
 name = "{MIXED_CREDENTIAL_NAME}"
 generation = "{MIXED_CREDENTIAL_GENERATION}"
 kind = "s3"
@@ -153,11 +157,13 @@ access_key_id = "${{ENV:{ACCESS_KEY_ENV}}}"
 access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
 "#
         );
+        let data_credential_registry =
+            metadata_credential_registry.replace("object-store-metadata", "object-store-data");
         Ok(ScenarioLaunchConfig {
             child_environment,
             config_overlay: CrossProcessConfigOverlay {
-                fe: Some(credential_registry.clone()),
-                be: Some(credential_registry),
+                fe: Some(metadata_credential_registry),
+                be: Some(data_credential_registry),
                 ..Default::default()
             },
             ..Default::default()

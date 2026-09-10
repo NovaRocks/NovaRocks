@@ -784,6 +784,7 @@ struct ConnectorConfigWire {
 enum CatalogCredentialPurposeWire {
     CatalogControl,
     ObjectStoreData,
+    ObjectStoreMetadata,
 }
 
 impl From<CatalogCredentialPurposeWire> for CatalogCredentialPurpose {
@@ -791,6 +792,7 @@ impl From<CatalogCredentialPurposeWire> for CatalogCredentialPurpose {
         match value {
             CatalogCredentialPurposeWire::CatalogControl => Self::CatalogControl,
             CatalogCredentialPurposeWire::ObjectStoreData => Self::ObjectStoreData,
+            CatalogCredentialPurposeWire::ObjectStoreMetadata => Self::ObjectStoreMetadata,
         }
     }
 }
@@ -2396,6 +2398,55 @@ session_token = "token"
     }
 
     #[test]
+    fn frontend_metadata_credentials_are_explicit_and_generation_exact() {
+        let config: NovaRocksConfig = toml::from_str(
+            r#"
+[cluster]
+role = "fe"
+
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "warehouse-metadata"
+generation = "blue"
+kind = "s3"
+access_key_id = "access"
+access_key_secret = "secret"
+"#,
+        )
+        .expect("parse FE metadata credential registry");
+        let registry = config
+            .connector
+            .credential_registry(ClusterRole::Fe)
+            .expect("FE registry");
+        assert!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreMetadata,
+                    &StaticCredentialReference::try_new("warehouse-metadata", "blue").unwrap(),
+                )
+                .and_then(|material| material.as_s3())
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreMetadata,
+                    &StaticCredentialReference::try_new("warehouse-metadata", "green").unwrap(),
+                )
+                .is_none()
+        );
+        assert!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    &StaticCredentialReference::try_new("warehouse-metadata", "blue").unwrap(),
+                )
+                .is_none(),
+            "metadata credentials must not fall back to the data purpose"
+        );
+    }
+
+    #[test]
     fn connector_credentials_reject_legacy_and_invalid_role_local_startup_config() {
         let cases = [
             (
@@ -2423,6 +2474,23 @@ kind = "iceberg-rest-bearer"
 token = "token"
 "#,
                 "role Be cannot own CatalogControl credential",
+            ),
+            (
+                "backend-object-store-metadata",
+                r#"
+[cluster]
+role = "be"
+frontend_endpoint = "127.0.0.1:9070"
+
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "warehouse-metadata"
+generation = "blue"
+kind = "s3"
+access_key_id = "access"
+access_key_secret = "secret"
+"#,
+                "role Be cannot own ObjectStoreMetadata credential",
             ),
             (
                 "duplicate-static-reference",
@@ -2461,6 +2529,21 @@ access_key_id = "access"
 access_key_secret = "secret"
 "#,
                 "does not accept material kind S3",
+            ),
+            (
+                "metadata-wrong-kind",
+                r#"
+[cluster]
+role = "fe"
+
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "warehouse-metadata"
+generation = "blue"
+kind = "iceberg-rest-bearer"
+token = "token"
+"#,
+                "does not accept material kind IcebergRestBearer",
             ),
             (
                 "empty-secret",

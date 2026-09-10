@@ -709,7 +709,7 @@ mod tests {
             vec![
                 CatalogCredentialBinding::try_new(
                     CatalogCredentialPurpose::ObjectStoreData,
-                    CredentialConsumerRole::FrontendAndBackend,
+                    CredentialConsumerRole::Backend,
                     CatalogCredentialMode::Vended,
                 )
                 .expect("vended binding"),

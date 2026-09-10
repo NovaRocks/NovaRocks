@@ -783,12 +783,18 @@ impl FrontendDistributedQueryCoordinator {
         // runtime for the handle its own plan carries.
         let init_options = match write_stack_session.as_ref() {
             Some(session) => {
-                let catalog_set = novarocks_proto_codec::catalog::CatalogSet::new([session
+                let backend_catalog = session
                     .catalog_properties()
-                    .clone()])
-                .map_err(|error| {
-                    failed(format!("write session catalog set is invalid: {error}"))
-                })?;
+                    .backend_execution_projection()
+                    .map_err(|error| {
+                        failed(format!(
+                            "project write catalog for backend execution: {error}"
+                        ))
+                    })?;
+                let catalog_set =
+                    novarocks_proto_codec::catalog::CatalogSet::new([backend_catalog]).map_err(
+                        |error| failed(format!("write session catalog set is invalid: {error}")),
+                    )?;
                 init_options.with_catalog_set(catalog_set)
             }
             None => init_options,
@@ -1937,13 +1943,13 @@ impl FrontendDistributedQueryCoordinator {
 }
 
 impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
-    fn reserve_initial_attempt(
+    fn reserve_logical_query(
         &self,
-    ) -> Result<crate::query_execution::completion::QueryAttemptReservation, DistributedQueryError>
+    ) -> Result<crate::query_execution::completion::LogicalQueryReservation, DistributedQueryError>
     {
         let query_id = self.query_ids.next_query_id()?;
         crate::preparation_diagnostics::bind_logical_query(query_id);
-        crate::query_execution::completion::QueryAttemptReservation::first(query_id)
+        Ok(crate::query_execution::completion::LogicalQueryReservation::new(query_id))
     }
 
     fn execute(
@@ -1965,21 +1971,17 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
     ) -> Result<StatementResult, DistributedQueryError> {
-        let (first_request, first_completion, mut attempt_factory, reservation) =
+        let (first_request, first_completion, mut attempt_factory, logical_reservation) =
             operation.into_parts();
-        let reservation = match reservation {
-            Some(reservation) => reservation,
-            None => crate::query_execution::completion::QueryAttemptReservation::first(
-                self.query_ids.next_query_id()?,
-            )?,
-        };
-        let query_id = reservation.query_id();
-        let first_execution_id = reservation.execution_id();
+        let query_id = logical_reservation.into_query_id();
         let first_revision = first_request.topology().revision();
         let retry_deadline = statement_deadline_for_request(&first_request)?;
         let first_retry_boundary = attempt_factory
             .as_deref()
             .map(|factory| factory as &dyn PreReadyRetryBoundary);
+        let first_reservation =
+            crate::query_execution::completion::QueryAttemptReservation::first(query_id)?;
+        let first_execution_id = first_reservation.execution_id();
         match self.execute_round(
             query_id,
             first_execution_id,
@@ -1987,7 +1989,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
             first_request,
             first_retry_boundary,
             RoundCredentialLeaseSource::Reservation {
-                reservation,
+                reservation: first_reservation,
                 observed_collected: None,
             },
         ) {
@@ -2026,40 +2028,14 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                     })?;
                 observe_waiting_for_backend(waiting_started_at.elapsed());
                 let instantiation_started_at = Instant::now();
+                let replacement = factory.instantiate(fresh_topology);
+                observe_pre_ready_replan(instantiation_started_at.elapsed());
+                let replacement = replacement?;
+                let (replacement_request, replacement_completion) = replacement.into_parts();
                 let replacement_reservation =
                     crate::query_execution::completion::QueryAttemptReservation::retry(
                         query_id, 2,
                     )?;
-                let replacement = factory.instantiate(fresh_topology, replacement_reservation);
-                observe_pre_ready_replan(instantiation_started_at.elapsed());
-                let replacement = replacement?;
-                let (
-                    replacement_request,
-                    replacement_completion,
-                    replacement_factory,
-                    replacement_reservation,
-                ) = replacement.into_parts();
-                if replacement_factory.is_some() {
-                    return Err(DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "replacement distributed round must not retain another automatic retry factory",
-                    ));
-                }
-                let replacement_reservation = replacement_reservation.ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "replacement distributed round lost its reserved attempt identity",
-                    )
-                })?;
-                if replacement_reservation.query_id() != query_id
-                    || replacement_reservation.execution_id().attempt_id()
-                        != execution_id_for_round(query_id, 2)?.attempt_id()
-                {
-                    return Err(DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "replacement distributed round changed its reserved attempt identity",
-                    ));
-                }
                 let replacement_execution_id = replacement_reservation.execution_id();
                 self.execute_round(
                     query_id,
@@ -2534,7 +2510,8 @@ mod tests {
         FinalTaskInfoRead, FragmentDispatcher, RootResultOutcome,
     };
     use crate::query_execution::completion::{
-        PreReadyRetryBoundary, PreparedDistributedAttemptFactory, PreparedDistributedQuery,
+        LogicalQueryReservation, PreReadyRetryBoundary, PreparedDistributedAttempt,
+        PreparedDistributedAttemptFactory, PreparedDistributedQuery,
         PreparedDistributedRequestFactory, PreparedQueryCompletion,
         PreparedRetriableDistributedRequest,
     };
@@ -2885,17 +2862,15 @@ mod tests {
         fn instantiate(
             &mut self,
             topology: crate::common::backend_topology::BackendTopologySnapshot,
-            reservation: crate::query_execution::completion::QueryAttemptReservation,
-        ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
+        ) -> Result<PreparedDistributedAttempt, DistributedQueryError> {
             self.replanned_topologies
                 .lock()
                 .expect("replanned topologies")
                 .push(topology.clone());
-            Ok(PreparedDistributedQuery::new(
+            Ok(PreparedDistributedAttempt::new(
                 fresh_result_request(topology)?,
                 PreparedQueryCompletion::result(),
-            )
-            .with_attempt_reservation(reservation))
+            ))
         }
     }
 
@@ -3196,6 +3171,7 @@ mod tests {
         let operation = PreparedDistributedQuery::new(
             fresh_result_request(first_snapshot.clone()).expect("first request"),
             PreparedQueryCompletion::result(),
+            LogicalQueryReservation::for_test(QueryId::new(7, 11)),
         )
         .with_attempt_factory(Box::new(RecordingRetryFactory {
             permits: Arc::clone(&permits),
@@ -3362,6 +3338,7 @@ mod tests {
         let operation = PreparedDistributedQuery::new(
             fresh_result_request(snapshot).expect("first request"),
             PreparedQueryCompletion::result(),
+            LogicalQueryReservation::for_test(QueryId::new(7, 12)),
         )
         .with_attempt_factory(Box::new(RecordingRetryFactory {
             permits: Arc::new(AtomicUsize::new(0)),

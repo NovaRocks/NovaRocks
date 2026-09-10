@@ -742,8 +742,17 @@ fn freeze_query_catalog_lease(
 ) -> Result<QueryCatalogLease, DistributedQueryError> {
     let typed_reads = attempt_access
         .iter()
-        .map(|(_, _, access)| access.catalog_properties().clone())
-        .collect::<Vec<_>>();
+        .map(|(_, _, access)| {
+            access
+                .catalog_properties()
+                .backend_execution_projection()
+                .map_err(|error| {
+                    contract_error(format!(
+                        "project catalog generation for backend execution: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let catalog_set = merge_catalog_properties(existing, typed_reads)?;
     Ok(QueryCatalogLease::new(catalog_set, Vec::new()))
 }

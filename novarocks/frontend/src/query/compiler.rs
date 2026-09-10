@@ -30,7 +30,7 @@ use crate::common::admitted_query_context::{
     QueryExecutionContext, RequestContext, StatementAdmissionContext,
 };
 use crate::common::statement_effect::StatementEffectTracker;
-use crate::connector::connector_request_context_for_query;
+use crate::connector::connector_planning_context_for_query;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use crate::query_execution::compiler::{
@@ -38,7 +38,7 @@ use crate::query_execution::compiler::{
     query_statistics_snapshot,
 };
 use crate::query_execution::completion::{
-    PreReadyRetryBoundary, PreparedDistributedAttemptFactory,
+    PreReadyRetryBoundary, PreparedDistributedAttempt, PreparedDistributedAttemptFactory,
 };
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::kernels::{
@@ -172,8 +172,8 @@ impl RetryCompletionTemplate {
 ///
 /// It owns the exact logical request and immutable attempt template, not the
 /// means to create either. A pre-ready topology retry derives only what an
-/// attempt actually owns -- connector access, the attempt reservation, and
-/// the admitted topology.
+/// attempt actually owns from the admitted topology. The coordinator remains
+/// the sole owner that can mint the fresh attempt identity and credentials.
 ///
 /// The previous shape returned to the compiler and re-ran analysis, the
 /// optimizer, MV candidate discovery and a fresh statistics snapshot. That was
@@ -194,13 +194,12 @@ impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
     fn instantiate(
         &mut self,
         topology: crate::common::backend_topology::BackendTopologySnapshot,
-        reservation: crate::query_execution::completion::QueryAttemptReservation,
-    ) -> Result<PreparedQueryDistributedOperation, DistributedQueryError> {
+    ) -> Result<PreparedDistributedAttempt, DistributedQueryError> {
         let execution = self.statement.for_topology(topology);
         let request = self
             .logical_execution
             .instantiate_attempt(execution.execution());
-        Ok(PreparedQueryDistributedOperation::new(
+        Ok(PreparedDistributedAttempt::new(
             request,
             match self.completion.next_round_intent() {
                 PostCompileIntent::Result => {
@@ -215,8 +214,7 @@ impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
                     execution_started_at,
                 ),
             },
-        )
-        .with_attempt_reservation(reservation))
+        ))
     }
 }
 
@@ -267,10 +265,11 @@ impl FrontendQueryCompiler {
         context: &RequestContext,
         query_options: Option<QueryOptions>,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
-        let connector_context = connector_request_context_for_query(
+        let connector_planning_context = connector_planning_context_for_query(
             query_options.as_ref(),
             context.execution().cancellation().clone(),
         )?;
+        let connector_context = connector_planning_context.request();
         let current_catalog = context.session().current_catalog();
         let current_database = context.session().current_database();
 
@@ -281,7 +280,7 @@ impl FrontendQueryCompiler {
                     explain.query.as_ref(),
                     current_catalog,
                     current_database,
-                    &connector_context,
+                    connector_context,
                 )?;
                 let catalog_service = query_catalog_service_snapshot(&self.query);
                 let materializer = build_catalog_service_provider(
@@ -331,7 +330,7 @@ impl FrontendQueryCompiler {
                         .into_pending()
                         .map_err(FrontendQueryCompilerError::from_compile)?;
                     let statistics =
-                        query_statistics_snapshot(&self.query, &materializer, &connector_context)?;
+                        query_statistics_snapshot(&self.query, &materializer, connector_context)?;
                     SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
                         .map_err(FrontendQueryCompilerError::from_compile)?
                 };
@@ -346,7 +345,7 @@ impl FrontendQueryCompiler {
                 current_catalog,
                 current_database,
                 query_options,
-                &connector_context,
+                &connector_planning_context,
                 context.execution(),
             ),
             Statement::Query(query) => {
@@ -360,14 +359,14 @@ impl FrontendQueryCompiler {
                     query,
                     current_catalog,
                     current_database,
-                    &connector_context,
+                    connector_context,
                 )?;
                 self.prepare_distributed_query(
                     &query,
                     current_catalog,
                     current_database,
                     query_options,
-                    connector_context,
+                    connector_planning_context,
                     context.execution(),
                     SqlCompileIntent::Query,
                     true,
@@ -387,23 +386,19 @@ impl FrontendQueryCompiler {
         current_catalog: Option<&str>,
         current_database: &str,
         query_options: Option<QueryOptions>,
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+        connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
         intent: SqlCompileIntent,
         allow_mv_rewrite_candidates: bool,
         completion_intent: PostCompileIntent,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
-        // This must happen before the catalog materializer is constructed:
-        // an Iceberg REST observation may return credentials that are valid
-        // only for this candidate attempt.
-        let reservation = self
+        let connector_context = connector_planning_context.request();
+        let logical_reservation = self
             .query
             .query_execution()
-            .reserve_initial_attempt()
+            .reserve_logical_query()
             .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
         let catalog_service = query_catalog_service_snapshot(&self.query);
-        let attempt_connector_context =
-            reservation.connector_request_context(connector_context.clone());
         let bindings = Arc::new(
             QueryTableBindingStore::try_new()
                 .expect("query table binding scope allocation must not fail"),
@@ -412,7 +407,7 @@ impl FrontendQueryCompiler {
             current_catalog,
             &catalog_service,
             self.query.connector_control().as_ref(),
-            attempt_connector_context.clone(),
+            connector_context.clone(),
             Arc::clone(&bindings),
             Vec::new(),
             self.query.catalog_application().map(Arc::as_ref),
@@ -446,8 +441,7 @@ impl FrontendQueryCompiler {
         .into_pending()
         .map_err(FrontendQueryCompilerError::from_compile)?;
         reject_quarantined_mv_targets(bindings.as_ref(), self.mv_readiness.as_ref())?;
-        let statistics =
-            query_statistics_snapshot(&self.query, &materializer, &attempt_connector_context)?;
+        let statistics = query_statistics_snapshot(&self.query, &materializer, connector_context)?;
         // Analysis (including optional candidate target materialization) and
         // statistics have now admitted every table this statement may use.
         // Freeze the exact receipt set before optimizer selection so the
@@ -486,7 +480,7 @@ impl FrontendQueryCompiler {
                     sql_cost,
                     &self.query,
                     Some(bindings.as_ref()),
-                    &attempt_connector_context,
+                    connector_context,
                     query_options.clone(),
                     execution,
                     completion_intent,
@@ -500,8 +494,8 @@ impl FrontendQueryCompiler {
         let request = assembly.finish(native_bundle)?;
         let logical_execution = request.restartable_read();
         drop(materializer);
-        let mut operation = PreparedQueryDistributedOperation::new(request, completion)
-            .with_attempt_reservation(reservation);
+        let mut operation =
+            PreparedQueryDistributedOperation::new(request, completion, logical_reservation);
         if let Some(logical_execution) = logical_execution {
             operation =
                 operation.with_attempt_factory(Box::new(FrontendDistributedAttemptFactory {
@@ -609,9 +603,10 @@ impl FrontendQueryCompiler {
         current_catalog: Option<&str>,
         current_database: &str,
         query_options: Option<QueryOptions>,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        connector_planning_context: &novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
+        let connector_context = connector_planning_context.request();
         let query = self.prepare_explain_query(
             query,
             current_catalog,
@@ -624,7 +619,7 @@ impl FrontendQueryCompiler {
             current_catalog,
             current_database,
             Some(query_options_for_explain_analyze(query_options)),
-            connector_context.clone(),
+            connector_planning_context.clone(),
             execution,
             SqlCompileIntent::Explain {
                 level: ExplainLevel::Analyze,

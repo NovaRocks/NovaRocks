@@ -27,8 +27,8 @@ use std::{fmt::Write, sync::Arc};
 use uuid::Uuid;
 
 use super::{
-    CatalogCredentialBinding, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorProviderId, canonicalize_catalog_credential_bindings,
+    CatalogCredentialBinding, CatalogCredentialPurpose, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceId, ConnectorProviderId, canonicalize_catalog_credential_bindings,
 };
 
 pub const CATALOG_VERSION_BYTES: usize = 32;
@@ -183,6 +183,28 @@ impl CatalogProperties {
     pub fn credential_bindings(&self) -> &[CatalogCredentialBinding] {
         &self.credential_bindings
     }
+
+    /// Project one catalog generation onto the BE execution boundary.
+    ///
+    /// The handle and non-secret provider properties stay exact. FE-only
+    /// catalog-control and metadata principals never cross the process
+    /// boundary; a backend receives only the data-access declaration it may
+    /// consume for this generation.
+    pub fn backend_execution_projection(&self) -> Result<Self, ConnectorError> {
+        let credential_bindings = self
+            .credential_bindings
+            .iter()
+            .filter(|binding| binding.purpose() == CatalogCredentialPurpose::ObjectStoreData)
+            .cloned()
+            .collect();
+        Self::new(
+            self.handle.clone(),
+            self.provider_id.clone(),
+            self.config_format_version,
+            self.execution_properties.clone(),
+            credential_bindings,
+        )
+    }
 }
 
 /// The process-local identity of an FE control runtime.
@@ -234,6 +256,9 @@ fn invalid(subject: &str) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::{
+        CatalogCredentialMode, CredentialConsumerRole, StaticCredentialReference,
+    };
 
     fn handle(version: u8) -> CatalogHandle {
         CatalogHandle::new(
@@ -276,6 +301,65 @@ mod tests {
                 vec![],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn backend_projection_keeps_only_exact_data_access_binding() {
+        let static_binding = |purpose, role, name| {
+            CatalogCredentialBinding::try_new(
+                purpose,
+                role,
+                CatalogCredentialMode::Static(
+                    StaticCredentialReference::try_new(name, "blue").unwrap(),
+                ),
+            )
+            .unwrap()
+        };
+        let properties = CatalogProperties::new(
+            handle(9),
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            3,
+            vec![CatalogProperty::new("warehouse", "s3://warehouse").unwrap()],
+            vec![
+                static_binding(
+                    CatalogCredentialPurpose::CatalogControl,
+                    CredentialConsumerRole::Frontend,
+                    "rest-control",
+                ),
+                static_binding(
+                    CatalogCredentialPurpose::ObjectStoreMetadata,
+                    CredentialConsumerRole::Frontend,
+                    "warehouse-metadata",
+                ),
+                static_binding(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::Backend,
+                    "warehouse-data",
+                ),
+            ],
+        )
+        .unwrap();
+
+        let projection = properties.backend_execution_projection().unwrap();
+        assert_eq!(projection.handle(), properties.handle());
+        assert_eq!(projection.provider_id(), properties.provider_id());
+        assert_eq!(
+            projection.config_format_version(),
+            properties.config_format_version()
+        );
+        assert_eq!(
+            projection.execution_properties(),
+            properties.execution_properties()
+        );
+        assert_eq!(projection.credential_bindings().len(), 1);
+        assert_eq!(
+            projection.credential_bindings()[0].purpose(),
+            CatalogCredentialPurpose::ObjectStoreData
+        );
+        assert_eq!(
+            projection.credential_bindings()[0].consumer_role(),
+            CredentialConsumerRole::Backend
         );
     }
 

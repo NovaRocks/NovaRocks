@@ -30,10 +30,38 @@ use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
 use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 use std::sync::Arc;
 
-/// FE-local identity reserved before connector metadata materialization for
-/// one distributed attempt. It intentionally belongs to the statement wrapper
-/// rather than the Core request, because metadata can acquire attempt-scoped
-/// capabilities before Core request construction.
+/// Move-only ownership of one logical query identity.
+///
+/// Preparation uses this identity only to correlate diagnostics. Attempt
+/// identity, credentials and request scope are minted later by the
+/// coordinator, after the immutable logical operation has crossed the
+/// execution boundary.
+pub struct LogicalQueryReservation {
+    query_id: QueryId,
+}
+
+impl LogicalQueryReservation {
+    pub(crate) const fn new(query_id: QueryId) -> Self {
+        Self { query_id }
+    }
+
+    pub(crate) const fn into_query_id(self) -> QueryId {
+        self.query_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(query_id: QueryId) -> Self {
+        Self::new(query_id)
+    }
+}
+
+/// FE-local identity for one distributed attempt.
+///
+/// Read-only query preparation cannot construct this value. The coordinator
+/// mints it only after receiving the frozen logical operation. Effectful
+/// statement wrappers may reserve it earlier when their staged business
+/// protocol must own attempt-scoped capabilities before Core request
+/// construction.
 pub struct QueryAttemptReservation {
     query_id: QueryId,
     execution_id: QueryExecutionId,
@@ -159,8 +187,39 @@ pub(crate) trait PreparedDistributedAttemptFactory: Send + PreReadyRetryBoundary
     fn instantiate(
         &mut self,
         topology: crate::common::backend_topology::BackendTopologySnapshot,
-        reservation: QueryAttemptReservation,
-    ) -> Result<PreparedDistributedQuery, crate::query_execution::contract::DistributedQueryError>;
+    ) -> Result<PreparedDistributedAttempt, crate::query_execution::contract::DistributedQueryError>;
+}
+
+/// Request and completion artifacts for a replacement attempt of an already
+/// owned logical query.
+///
+/// This deliberately carries no logical or attempt reservation. The
+/// coordinator keeps the sole logical identity and mints a fresh attempt only
+/// after these immutable replacement artifacts have been produced.
+pub(crate) struct PreparedDistributedAttempt {
+    request: crate::query_execution::contract::DistributedQueryRequest,
+    completion: PreparedQueryCompletion,
+}
+
+impl PreparedDistributedAttempt {
+    pub(crate) fn new(
+        request: crate::query_execution::contract::DistributedQueryRequest,
+        completion: PreparedQueryCompletion,
+    ) -> Self {
+        Self {
+            request,
+            completion,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::query_execution::contract::DistributedQueryRequest,
+        PreparedQueryCompletion,
+    ) {
+        (self.request, self.completion)
+    }
 }
 
 /// Frontend-owned factory for a replacement whole distributed round whose
@@ -261,7 +320,7 @@ pub struct PreparedDistributedQuery {
     request: crate::query_execution::contract::DistributedQueryRequest,
     completion: PreparedQueryCompletion,
     attempt_factory: Option<Box<dyn PreparedDistributedAttemptFactory>>,
-    reservation: Option<QueryAttemptReservation>,
+    logical_reservation: LogicalQueryReservation,
 }
 
 impl PreparedDistributedQuery {
@@ -271,12 +330,13 @@ impl PreparedDistributedQuery {
     pub fn new(
         request: crate::query_execution::contract::DistributedQueryRequest,
         completion: PreparedQueryCompletion,
+        logical_reservation: LogicalQueryReservation,
     ) -> Self {
         Self {
             request,
             completion,
             attempt_factory: None,
-            reservation: None,
+            logical_reservation,
         }
     }
 
@@ -288,24 +348,19 @@ impl PreparedDistributedQuery {
         self
     }
 
-    pub(crate) fn with_attempt_reservation(mut self, reservation: QueryAttemptReservation) -> Self {
-        self.reservation = Some(reservation);
-        self
-    }
-
     pub(crate) fn into_parts(
         self,
     ) -> (
         crate::query_execution::contract::DistributedQueryRequest,
         PreparedQueryCompletion,
         Option<Box<dyn PreparedDistributedAttemptFactory>>,
-        Option<QueryAttemptReservation>,
+        LogicalQueryReservation,
     ) {
         (
             self.request,
             self.completion,
             self.attempt_factory,
-            self.reservation,
+            self.logical_reservation,
         )
     }
 }
@@ -578,6 +633,22 @@ fn format_explain_analyze_duration(duration: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn logical_query_identity_is_separate_from_attempt_identity() {
+        let query_id = novarocks_types::QueryId::new(7, 41);
+        let logical = super::LogicalQueryReservation::for_test(query_id);
+
+        assert_eq!(logical.into_query_id(), query_id);
+
+        let first = super::QueryAttemptReservation::first(query_id).expect("first attempt");
+        let replacement =
+            super::QueryAttemptReservation::retry(query_id, 2).expect("replacement attempt");
+        assert_eq!(first.query_id(), query_id);
+        assert_eq!(replacement.query_id(), query_id);
+        assert_eq!(first.execution_id().attempt_id().get(), 1);
+        assert_eq!(replacement.execution_id().attempt_id().get(), 2);
+    }
+
     #[test]
     fn connector_file_summary_includes_cache_and_page_index_effect_counters() {
         assert_eq!(

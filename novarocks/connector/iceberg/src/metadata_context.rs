@@ -353,16 +353,11 @@ impl IcebergMetadataContext {
                         ),
                     )
                 })?;
-            if !scope.matches_seed(&seed) {
-                return Err((
-                    ConnectorErrorKind::InvalidRequest,
-                    format!(
-                        "reacquire Iceberg table {namespace}.{table}: credentials endpoint changed prefix scope or endpoint"
-                    ),
-                ));
-            }
             frozen
                 .validate_table_access(&seed)
+                .map_err(|error| (error.kind(), error.to_string()))?;
+            let attempt_scope = scope
+                .reacquired_for_seed(&seed)
                 .map_err(|error| (error.kind(), error.to_string()))?;
             let contribution = seed
                 .into_vended_s3_credential_lease_contribution()
@@ -370,7 +365,7 @@ impl IcebergMetadataContext {
                     contribution.with_refresher(Arc::new(IcebergRestVendedS3LeaseRefresher::new(
                         rest_catalog,
                         self.resources.catalog_runtime().clone(),
-                        scope,
+                        attempt_scope,
                     )))
                 })
                 .map_err(|error| (error.kind(), error.to_string()))?;
@@ -408,12 +403,9 @@ impl IcebergMetadataContext {
                 ),
             )
         })?;
-        let request_binding = self
-            .resources
-            .planning_binding()
-            .for_request(request_context.clone());
+        let metadata_binding = self.resources.planning_binding().clone();
         let observed = materialization
-            .materialize_for_request(request_binding.clone())
+            .materialize_for_request(metadata_binding)
             .map_err(|error| (error.kind(), error.to_string()))?;
         frozen
             .validate_attempt_reacquisition(&observed, &seed)
@@ -430,6 +422,10 @@ impl IcebergMetadataContext {
                     ),
                 )
             })?;
+        let request_binding = self
+            .resources
+            .planning_binding()
+            .for_request(request_context.clone());
         frozen
             .reacquired_request_scoped(request_binding)
             .map_err(|error| (error.kind(), error.to_string()))
@@ -450,10 +446,13 @@ impl IcebergMetadataContext {
         self.load_table_classified_with_credential_lease_collection(namespace, table, None, None)
     }
 
-    /// Load a table and immediately hand a REST-vended credential response to
-    /// the request-local query-attempt collector. A missing collector remains
-    /// fail-closed, and no vended response is ever inserted into the physical
-    /// table cache.
+    /// Load a table through either an observation or attempt context.
+    ///
+    /// Observation uses the generation's FE metadata principal and retains
+    /// only the non-secret renewal capability. Attempt instantiation transfers
+    /// a REST-vended response into its request-local collector. A context that
+    /// advertises an attempt sink without a matching collection port fails
+    /// closed, and no vended response enters the physical table cache.
     pub(crate) fn load_table_classified_with_credential_lease_collection(
         &self,
         namespace: &str,
@@ -568,27 +567,14 @@ impl IcebergMetadataContext {
             })?;
         let (materialization, access_delegation) = loaded.into_parts();
         if let Some(seed) = access_delegation.into_vended_lease_seed() {
-            let request_context = request_context.ok_or_else(|| {
-                (
-                    ConnectorErrorKind::InvalidRequest,
-                    format!(
-                        "load Iceberg table {namespace}.{table}: vended REST credentials require a request-scoped storage resolver"
-                    ),
-                )
-            })?;
-            if credential_lease_collection.is_none() && request_context.storage_resolver().is_none()
-            {
-                return Err((
-                    ConnectorErrorKind::InvalidRequest,
-                    format!(
-                        "load Iceberg table {namespace}.{table}: vended REST terminal reload requires an admitted storage resolver"
-                    ),
-                ));
-            }
-            let request_binding = self
-                .resources
-                .planning_binding()
-                .for_request(request_context.clone());
+            let request_binding = request_context.map_or_else(
+                || self.resources.planning_binding().clone(),
+                |context| {
+                    self.resources
+                        .planning_binding()
+                        .for_request(context.clone())
+                },
+            );
             let observed_table = materialization
                 .materialize_for_request(request_binding.clone())
                 .map_err(|error| (error.kind(), error.to_string()))?;
@@ -611,7 +597,9 @@ impl IcebergMetadataContext {
                             ),
                         )
                     })?;
-            } else if request_context.vended_credential_lease_sink().is_some() {
+            } else if request_context
+                .is_some_and(|context| context.vended_credential_lease_sink().is_some())
+            {
                 return Err((
                     ConnectorErrorKind::Unsupported,
                     format!(

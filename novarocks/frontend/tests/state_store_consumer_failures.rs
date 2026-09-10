@@ -380,7 +380,7 @@ fn attachment() -> CatalogAttachment {
         credential_bindings: vec![
             CatalogCredentialBinding::try_new(
                 CatalogCredentialPurpose::ObjectStoreData,
-                CredentialConsumerRole::FrontendAndBackend,
+                CredentialConsumerRole::Backend,
                 CatalogCredentialMode::Static(
                     StaticCredentialReference::try_new("warehouse-data", "blue")
                         .expect("credential reference"),

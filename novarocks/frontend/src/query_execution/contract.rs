@@ -653,6 +653,20 @@ impl std::error::Error for DistributedQueryError {}
 
 /// Frontend-owned distributed query execution port.
 pub trait DistributedQueryCoordinator: Send + Sync + 'static {
+    /// Reserve the identity of one logical query without creating an
+    /// execution attempt. SELECT preparation uses it only for diagnostics;
+    /// the coordinator mints attempt identity after the frozen operation is
+    /// submitted.
+    fn reserve_logical_query(
+        &self,
+    ) -> Result<crate::query_execution::completion::LogicalQueryReservation, DistributedQueryError>
+    {
+        Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::Rejected,
+            "distributed query coordinator does not reserve logical query identities",
+        ))
+    }
+
     /// Reserve the first attempt identity before connector metadata
     /// materialization. Production owns the query-id source; injected test
     /// coordinators fail closed unless they explicitly implement this port.
@@ -660,10 +674,8 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         &self,
     ) -> Result<crate::query_execution::completion::QueryAttemptReservation, DistributedQueryError>
     {
-        Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::Rejected,
-            "distributed query coordinator does not reserve attempt identities",
-        ))
+        let logical = self.reserve_logical_query()?;
+        crate::query_execution::completion::QueryAttemptReservation::first(logical.into_query_id())
     }
 
     fn execute(
@@ -694,17 +706,11 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
     ) -> Result<crate::runtime::statement_result::StatementResult, DistributedQueryError> {
-        let (request, completion, attempt_factory, reservation) = operation.into_parts();
+        let (request, completion, attempt_factory, _logical_reservation) = operation.into_parts();
         if attempt_factory.is_some() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "injected coordinator does not implement statement-level pre-ready replan",
-            ));
-        }
-        if reservation.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "injected coordinator does not implement reserved distributed attempts",
             ));
         }
         let outcome = self.execute(request)?;

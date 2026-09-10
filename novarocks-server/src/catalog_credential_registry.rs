@@ -225,6 +225,9 @@ impl CatalogCredentialRegistryEntry {
             ) | (
                 CatalogCredentialPurpose::ObjectStoreData,
                 CatalogCredentialMaterialKind::S3
+            ) | (
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CatalogCredentialMaterialKind::S3
             )
         );
         if !kind_matches {
@@ -272,9 +275,10 @@ impl CatalogCredentialRegistry {
                 (role, entry.key.purpose),
                 (ClusterRole::Fe, CatalogCredentialPurpose::CatalogControl)
                     | (
-                        ClusterRole::Fe | ClusterRole::Be,
-                        CatalogCredentialPurpose::ObjectStoreData
+                        ClusterRole::Fe,
+                        CatalogCredentialPurpose::ObjectStoreMetadata
                     )
+                    | (ClusterRole::Be, CatalogCredentialPurpose::ObjectStoreData)
             );
             if !role_allows_purpose {
                 return Err(format!(
@@ -342,6 +346,27 @@ impl novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolve
                 novarocks_spi::connector::ConnectorError::new(
                     novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
                     "role-local registry has no exact S3 object-store credential binding",
+                )
+            })?;
+        Ok(novarocks_fs::ObjectStoreSecretMaterial {
+            access_key_id: material.access_key_id().clone(),
+            access_key_secret: material.access_key_secret().clone(),
+            session_token: material.session_token().cloned(),
+        })
+    }
+
+    fn resolve_object_store_metadata_static(
+        &self,
+        reference: &StaticCredentialReference,
+    ) -> Result<novarocks_fs::ObjectStoreSecretMaterial, novarocks_spi::connector::ConnectorError>
+    {
+        let material = self
+            .resolve(CatalogCredentialPurpose::ObjectStoreMetadata, reference)
+            .and_then(CatalogCredentialMaterial::as_s3)
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "role-local registry has no exact S3 metadata credential binding",
                 )
             })?;
         Ok(novarocks_fs::ObjectStoreSecretMaterial {
@@ -439,7 +464,18 @@ mod tests {
             s3("blue"),
         )
         .unwrap();
-        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Fe, vec![data.clone()]).is_ok());
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Fe, vec![data.clone()]).is_err());
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![data.clone()]).is_ok());
+        let metadata = CatalogCredentialRegistryEntry::try_new(
+            CatalogCredentialPurpose::ObjectStoreMetadata,
+            reference("warehouse-metadata", "blue"),
+            s3("metadata"),
+        )
+        .unwrap();
+        assert!(
+            CatalogCredentialRegistry::try_new(ClusterRole::Fe, vec![metadata.clone()]).is_ok()
+        );
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![metadata]).is_err());
         let control = CatalogCredentialRegistryEntry::try_new(
             CatalogCredentialPurpose::CatalogControl,
             reference("rest", "blue"),
@@ -463,6 +499,38 @@ mod tests {
                 CatalogCredentialPurpose::CatalogControl,
                 reference("rest", "blue"),
                 s3("wrong-kind")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn iceberg_metadata_resolution_never_falls_back_to_data_credentials() {
+        let reference = reference("warehouse", "blue");
+        let registry = CatalogCredentialRegistry::try_new(
+            ClusterRole::Fe,
+            vec![
+                CatalogCredentialRegistryEntry::try_new(
+                    CatalogCredentialPurpose::ObjectStoreMetadata,
+                    reference.clone(),
+                    s3("metadata"),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver::resolve_object_store_metadata_static(
+                &registry,
+                &reference,
+            )
+            .is_ok()
+        );
+        assert!(
+            novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver::resolve_object_store_static(
+                &registry,
+                &reference,
             )
             .is_err()
         );

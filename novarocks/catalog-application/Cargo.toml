@@ -28,4 +28,4 @@ workspace = true
 doctest = false
 
 [dependencies]
-novarocks-spi = { path = "../spi" }
+novarocks-spi.workspace = true

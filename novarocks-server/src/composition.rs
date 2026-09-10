@@ -797,6 +797,25 @@ pub(crate) fn compose_iceberg_access_template(
     ))
 }
 
+/// Build the FE-only Iceberg metadata access template. Its resolver selects
+/// only `ObjectStoreMetadata`; execution-data bindings remain unavailable to
+/// planning FileIO.
+pub(crate) fn compose_iceberg_metadata_access_template(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<IcebergReadBinding> {
+    let resolver: std::sync::Arc<
+        dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
+    > = std::sync::Arc::new(
+        config
+            .connector
+            .credential_registry(ClusterRole::Fe)
+            .map_err(|error| anyhow::anyhow!("resolve FE metadata credentials: {error}"))?,
+    );
+    let resources = compose_connector_file_planning_resources(config, runtime)?;
+    Ok(IcebergReadBinding::with_static_metadata_credential_resolver(resources, resolver))
+}
+
 pub(crate) fn compose_paimon_access_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,

@@ -38,6 +38,7 @@ use std::time::Duration;
 
 const REQUIRED_BACKENDS: usize = 3;
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
+const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -138,6 +139,48 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let connector = context.handle().native_probe_connector(endpoint, mode)?;
         let trust = context.handle().native_probe_trust()?;
         let authorization = authorization_header(&trust)?;
+        let heartbeat: proto::HeartbeatResponse = raw_unary(
+            connector.clone(),
+            HEARTBEAT_PATH,
+            &authorization,
+            proto::HeartbeatRequest {
+                expected_process_id: Some(proto::BackendProcessId {
+                    value: backend.to_bytes().to_vec(),
+                }),
+            },
+        )?;
+        let admission_epoch_capability = heartbeat
+            .admission_epoch_capability
+            .context("raw Establish target heartbeat omitted its admission epoch capability")?;
+        let acquisition = raw_apply_task_operations(
+            &connector,
+            &authorization,
+            vec![raw_acquire_admission_ticket(
+                query_context.clone(),
+                native_compatibility_id,
+                admission_epoch_capability,
+            )],
+        )?;
+        let acquisition_receipt =
+            only_successful_receipt(acquisition, "admission ticket acquisition")?;
+        ensure!(
+            proto::TaskOperationOutcome::try_from(acquisition_receipt.outcome)
+                == Ok(proto::TaskOperationOutcome::Accepted),
+            "admission ticket acquisition must be accepted, got {acquisition_receipt:?}"
+        );
+        let Some(proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(ticket)) =
+            acquisition_receipt.ack
+        else {
+            anyhow::bail!("accepted admission acquisition omitted its ticket acknowledgement");
+        };
+        ensure!(
+            ticket.query_context.as_ref() == Some(&query_context)
+                && ticket.valid_for_millis == 30_000,
+            "admission ticket acknowledgement does not bind the exact raw request: {ticket:?}"
+        );
+        let admission_ticket_id = ticket
+            .ticket_id
+            .context("admission ticket acknowledgement omitted its ticket id")?;
         let establish_applied_before = context
             .handle()
             .be_log_count(0, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)?;
@@ -150,7 +193,11 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             let response = raw_apply_task_operations(
                 &connector,
                 &authorization,
-                vec![raw_establish(query_context.clone(), compatibility_id)],
+                vec![raw_establish(
+                    query_context.clone(),
+                    admission_ticket_id.clone(),
+                    compatibility_id,
+                )],
             )?;
             ensure!(
                 response.grpc_status == tonic::Code::InvalidArgument as u16,
@@ -172,7 +219,11 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let foreign_response = raw_apply_task_operations(
             &connector,
             &authorization,
-            vec![raw_establish(query_context.clone(), Some(foreign.to_vec()))],
+            vec![raw_establish(
+                query_context.clone(),
+                admission_ticket_id.clone(),
+                Some(foreign.to_vec()),
+            )],
         )?;
         let foreign_receipt = only_successful_receipt(foreign_response, "foreign Establish")?;
         ensure!(
@@ -224,6 +275,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             &authorization,
             vec![raw_establish(
                 query_context,
+                admission_ticket_id,
                 Some(native_compatibility_id.to_vec()),
             )],
         )?;
@@ -552,6 +604,7 @@ fn raw_query_options() -> proto::QueryOptions {
 
 fn raw_establish(
     query_context: proto::QueryContextRef,
+    admission_ticket_id: proto::AdmissionTicketId,
     native_compatibility_id: Option<Vec<u8>>,
 ) -> proto::TaskOperation {
     proto::TaskOperation {
@@ -576,10 +629,33 @@ fn raw_establish(
                         query_options: Some(raw_query_options()),
                         native_compatibility_id: native_compatibility_id
                             .map(|value| proto::NativeCompatibilityId { value }),
+                        admission_ticket_id: Some(admission_ticket_id),
                     },
                 )),
             },
         )),
+    }
+}
+
+fn raw_acquire_admission_ticket(
+    query_context: proto::QueryContextRef,
+    native_compatibility_id: [u8; 32],
+    admission_epoch_capability: proto::AdmissionEpochCapability,
+) -> proto::TaskOperation {
+    proto::TaskOperation {
+        envelope: Some(raw_operation_envelope(15_000)),
+        operation: Some(
+            proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(
+                proto::AcquireQueryContextAdmissionTicketRequest {
+                    query_context: Some(query_context),
+                    valid_for_millis: 30_000,
+                    native_compatibility_id: Some(proto::NativeCompatibilityId {
+                        value: native_compatibility_id.to_vec(),
+                    }),
+                    admission_epoch_capability: Some(admission_epoch_capability),
+                },
+            ),
+        ),
     }
 }
 

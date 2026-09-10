@@ -357,10 +357,15 @@ impl PreparedDistributedQueryAssembly {
         self,
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
         completion: PreparedQueryCompletion,
+        logical_reservation: crate::query_execution::completion::LogicalQueryReservation,
     ) -> Result<PreparedQueryOperation, String> {
         let request = self.finish(native_attachment)?;
         Ok(PreparedQueryOperation::Distributed(
-            crate::query_execution::PreparedQueryDistributedOperation::new(request, completion),
+            crate::query_execution::PreparedQueryDistributedOperation::new(
+                request,
+                completion,
+                logical_reservation,
+            ),
         ))
     }
 }

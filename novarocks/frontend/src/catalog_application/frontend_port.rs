@@ -1189,6 +1189,10 @@ fn extract_catalog_credential_bindings(
                 | "credential.object-store-data.mode"
                 | "credential.object-store-data.name"
                 | "credential.object-store-data.generation"
+                | "credential.object-store-metadata.consumer-role"
+                | "credential.object-store-metadata.mode"
+                | "credential.object-store-metadata.name"
+                | "credential.object-store-metadata.generation"
         );
         if recognized {
             if credential_fields.insert(normalized, value).is_some() {
@@ -1220,6 +1224,13 @@ fn extract_catalog_credential_bindings(
     )? {
         bindings.push(binding);
     }
+    if let Some(binding) = take_credential_binding(
+        &mut credential_fields,
+        "credential.object-store-metadata",
+        CatalogCredentialPurpose::ObjectStoreMetadata,
+    )? {
+        bindings.push(binding);
+    }
     debug_assert!(credential_fields.is_empty());
     let bindings = canonicalize_catalog_credential_bindings(bindings)
         .map_err(|error| invalid_credential_property(error.to_string()))?;
@@ -1240,6 +1251,7 @@ fn take_credential_binding(
     }
     let role = match role.as_deref() {
         Some("frontend") => CredentialConsumerRole::Frontend,
+        Some("backend") => CredentialConsumerRole::Backend,
         Some("frontend-and-backend") => CredentialConsumerRole::FrontendAndBackend,
         Some(_) => {
             return Err(invalid_credential_property(
@@ -1714,7 +1726,7 @@ mod tests {
             ),
             (
                 "credential.object-store-data.consumer-role".to_string(),
-                "frontend-and-backend".to_string(),
+                "backend".to_string(),
             ),
             (
                 "credential.catalog-control.mode".to_string(),
@@ -1736,13 +1748,29 @@ mod tests {
                 "credential.catalog-control.generation".to_string(),
                 "blue".to_string(),
             ),
+            (
+                "credential.object-store-metadata.consumer-role".to_string(),
+                "frontend".to_string(),
+            ),
+            (
+                "credential.object-store-metadata.mode".to_string(),
+                "static".to_string(),
+            ),
+            (
+                "credential.object-store-metadata.name".to_string(),
+                "warehouse-metadata".to_string(),
+            ),
+            (
+                "credential.object-store-metadata.generation".to_string(),
+                "blue".to_string(),
+            ),
         ])
         .expect("typed credential bindings");
         assert_eq!(
             properties,
             vec![("type".to_string(), "iceberg".to_string())]
         );
-        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings.len(), 3);
         assert_eq!(
             bindings[0].purpose(),
             CatalogCredentialPurpose::CatalogControl
@@ -1751,9 +1779,14 @@ mod tests {
             bindings[1].purpose(),
             CatalogCredentialPurpose::ObjectStoreData
         );
+        assert_eq!(bindings[1].consumer_role(), CredentialConsumerRole::Backend);
         assert_eq!(
-            bindings[1].consumer_role(),
-            CredentialConsumerRole::FrontendAndBackend
+            bindings[2].purpose(),
+            CatalogCredentialPurpose::ObjectStoreMetadata
+        );
+        assert_eq!(
+            bindings[2].consumer_role(),
+            CredentialConsumerRole::Frontend
         );
     }
 
@@ -1771,7 +1804,7 @@ mod tests {
             vec![
                 (
                     "credential.object-store-data.consumer-role".to_string(),
-                    "backend".to_string(),
+                    "frontend-and-backend".to_string(),
                 ),
                 (
                     "credential.object-store-data.mode".to_string(),
@@ -1811,6 +1844,16 @@ mod tests {
                 ),
                 (
                     "credential.object-store-data.mode".to_string(),
+                    "vended".to_string(),
+                ),
+            ],
+            vec![
+                (
+                    "credential.object-store-metadata.consumer-role".to_string(),
+                    "frontend".to_string(),
+                ),
+                (
+                    "credential.object-store-metadata.mode".to_string(),
                     "vended".to_string(),
                 ),
             ],

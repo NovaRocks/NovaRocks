@@ -667,14 +667,13 @@ fn stored_binding_from(binding: &CatalogCredentialBinding) -> StoredCredentialBi
         purpose: match binding.purpose() {
             CatalogCredentialPurpose::CatalogControl => "catalog-control",
             CatalogCredentialPurpose::ObjectStoreData => "object-store-data",
+            CatalogCredentialPurpose::ObjectStoreMetadata => "object-store-metadata",
         }
         .to_string(),
         consumer_role: match binding.consumer_role() {
             CredentialConsumerRole::Frontend => "frontend",
+            CredentialConsumerRole::Backend => "backend",
             CredentialConsumerRole::FrontendAndBackend => "frontend-and-backend",
-            CredentialConsumerRole::Backend => {
-                unreachable!("validated catalog credential binding cannot target backend alone")
-            }
         }
         .to_string(),
         mode: mode.to_string(),
@@ -689,10 +688,12 @@ fn binding_from_stored(
     let purpose = match stored.purpose.as_str() {
         "catalog-control" => CatalogCredentialPurpose::CatalogControl,
         "object-store-data" => CatalogCredentialPurpose::ObjectStoreData,
+        "object-store-metadata" => CatalogCredentialPurpose::ObjectStoreMetadata,
         _ => return Err(corruption("unknown catalog credential purpose")),
     };
     let consumer_role = match stored.consumer_role.as_str() {
         "frontend" => CredentialConsumerRole::Frontend,
+        "backend" => CredentialConsumerRole::Backend,
         "frontend-and-backend" => CredentialConsumerRole::FrontendAndBackend,
         _ => return Err(corruption("unknown catalog credential consumer role")),
     };
@@ -800,9 +801,21 @@ mod tests {
     fn object_store_binding(generation: &str) -> CatalogCredentialBinding {
         CatalogCredentialBinding::try_new(
             CatalogCredentialPurpose::ObjectStoreData,
-            CredentialConsumerRole::FrontendAndBackend,
+            CredentialConsumerRole::Backend,
             CatalogCredentialMode::Static(
                 StaticCredentialReference::try_new("warehouse-data", generation)
+                    .expect("credential reference"),
+            ),
+        )
+        .expect("credential binding")
+    }
+
+    fn metadata_store_binding(generation: &str) -> CatalogCredentialBinding {
+        CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreMetadata,
+            CredentialConsumerRole::Frontend,
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new("warehouse-metadata", generation)
                     .expect("credential reference"),
             ),
         )
@@ -819,6 +832,36 @@ mod tests {
             credential_bindings: vec![object_store_binding("blue")],
             created_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn metadata_binding_uses_a_stable_persistent_name() {
+        let binding = metadata_store_binding("blue");
+        let stored = stored_binding_from(&binding);
+        assert_eq!(stored.purpose, "object-store-metadata");
+        assert_eq!(
+            binding_from_stored(stored).expect("stored binding"),
+            binding
+        );
+    }
+
+    #[test]
+    fn legacy_shared_data_binding_fails_closed_after_raw_record_decode() {
+        let error = binding_from_stored(StoredCredentialBinding {
+            purpose: "object-store-data".to_string(),
+            consumer_role: "frontend-and-backend".to_string(),
+            mode: "static".to_string(),
+            name: Some("warehouse-data".to_string()),
+            generation: Some("blue".to_string()),
+        })
+        .expect_err("legacy shared data authority must not become a catalog binding");
+
+        assert_eq!(error.kind(), CatalogAttachmentErrorKind::Corruption);
+        assert!(
+            error
+                .to_string()
+                .contains("catalog credential purpose, role, and mode combination")
+        );
     }
 
     #[test]

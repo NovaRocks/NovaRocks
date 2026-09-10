@@ -200,7 +200,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             .iter()
             .find(|binding| {
                 binding.purpose() == CatalogCredentialPurpose::ObjectStoreData
-                    && binding.consumer_role() == CredentialConsumerRole::FrontendAndBackend
+                    && binding.consumer_role() == CredentialConsumerRole::Backend
                     && matches!(binding.mode(), CatalogCredentialMode::Vended)
             })
             .cloned()
@@ -1036,7 +1036,7 @@ mod tests {
             vec![
                 CatalogCredentialBinding::try_new(
                     CatalogCredentialPurpose::ObjectStoreData,
-                    CredentialConsumerRole::FrontendAndBackend,
+                    CredentialConsumerRole::Backend,
                     CatalogCredentialMode::Vended,
                 )
                 .expect("vended binding"),

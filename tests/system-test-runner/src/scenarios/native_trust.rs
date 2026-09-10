@@ -35,7 +35,8 @@ use novarocks_cluster_harness::vended_rest_catalog::{
     VendedRefreshBehavior, VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
 };
 use novarocks_cluster_harness::{
-    NativeTrustFixture, NativeTrustFixtureMode, QueryLifecycleStructuredSnapshot, ServerHandle,
+    CrossProcessChildEnvironment, CrossProcessConfigOverlay, NativeTrustFixture,
+    NativeTrustFixtureMode, QueryLifecycleStructuredSnapshot, ServerHandle,
 };
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
 use novarocks_proto_models::novarocks as proto;
@@ -53,6 +54,10 @@ const UNKNOWN_NATIVE_PATH: &str = "/novarocks.NovaRocksGrpc/Nwt3Unknown";
 const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
 const APPLY_TASK_OPERATIONS_PATH: &str = "/novarocks.NovaRocksGrpc/ApplyTaskOperations";
 const DIRECT_INGRESS_SECRET_SENTINEL: &str = "NOVAROCKS_DIRECT_INGRESS_SECRET_SENTINEL";
+const VENDED_METADATA_CREDENTIAL_NAME: &str = "native-trust-vended-metadata";
+const VENDED_METADATA_CREDENTIAL_GENERATION: &str = "v1";
+const VENDED_METADATA_ACCESS_KEY_ENV: &str = "NOVAROCKS_NATIVE_TRUST_METADATA_ACCESS_KEY_ID";
+const VENDED_METADATA_SECRET_KEY_ENV: &str = "NOVAROCKS_NATIVE_TRUST_METADATA_SECRET_ACCESS_KEY";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -337,6 +342,7 @@ impl Scenario for VendedCredentialTlsGate {
         rest.provision_empty_table("vended_tls_db", "vended_tls_data")
             .context("provision isolated vended TLS gate source table")?;
         let endpoints = rest.endpoints().clone();
+        let metadata_identity = rest.static_s3_identity();
         let identities = rest
             .provision_vended_s3_identities()
             .context("provision isolated vended TLS gate S3 identities")?;
@@ -377,8 +383,33 @@ impl Scenario for VendedCredentialTlsGate {
             "vended TLS gate fixture was initialized more than once"
         );
         *fixture = Some(VendedCredentialTlsFixture { rest, proxy });
+        let mut child_environment = CrossProcessChildEnvironment::default();
+        child_environment.fe.insert(
+            VENDED_METADATA_ACCESS_KEY_ENV.to_string(),
+            metadata_identity.access_key_id,
+        );
+        child_environment.fe.insert(
+            VENDED_METADATA_SECRET_KEY_ENV.to_string(),
+            metadata_identity.secret_access_key,
+        );
+        let metadata_registry = format!(
+            r#"
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "{VENDED_METADATA_CREDENTIAL_NAME}"
+generation = "{VENDED_METADATA_CREDENTIAL_GENERATION}"
+kind = "s3"
+access_key_id = "${{ENV:{VENDED_METADATA_ACCESS_KEY_ENV}}}"
+access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
+"#
+        );
         Ok(ScenarioLaunchConfig {
             native_trust_fixture: self.fixture.clone(),
+            child_environment,
+            config_overlay: CrossProcessConfigOverlay {
+                fe: Some(metadata_registry),
+                ..Default::default()
+            },
             ..Default::default()
         })
     }
@@ -400,7 +431,7 @@ impl Scenario for VendedCredentialTlsGate {
         const CATALOG: &str = "vended_tls_gate";
         connection
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")"
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")"
             ))
             .context("create real REST-vended catalog for Native TLS gate")?;
 

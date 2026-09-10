@@ -251,12 +251,13 @@ pub struct ConnectorPlanningContext {
 
 impl ConnectorPlanningContext {
     pub fn try_from_request(request: ConnectorRequestContext) -> Result<Self, ConnectorError> {
-        if request.vended_credential_lease_sink.is_some()
+        if request.storage_resolver.is_some()
+            || request.vended_credential_lease_sink.is_some()
             || request.vended_credential_lease_collection.is_some()
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "Connector planning context cannot own attempt credential collection",
+                "Connector planning context cannot own attempt storage or credential capabilities",
             ));
         }
         Ok(Self { request })
@@ -455,7 +456,7 @@ mod tests {
 
     use super::{
         ConnectorCancellation, ConnectorPlanningContext, ConnectorRequestContext,
-        ResolvedVendedS3Access, StorageAccessRequest,
+        ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
     };
     use crate::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorInstanceId,
@@ -477,6 +478,17 @@ mod tests {
     struct EmptyLedger;
 
     struct RejectingSink;
+
+    struct RejectingResolver;
+
+    impl ConnectorStorageResolver for RejectingResolver {
+        fn resolve_vended_s3(
+            &self,
+            _request: &StorageAccessRequest,
+        ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+            unreachable!("planning context construction must reject the resolver")
+        }
+    }
 
     impl ConnectorVendedCredentialLeaseSink for RejectingSink {
         fn offer_vended_s3_credential_lease(
@@ -574,6 +586,10 @@ mod tests {
         )
         .unwrap();
         assert!(ConnectorPlanningContext::try_from_request(base.clone()).is_ok());
+        let resolver_decorated = base
+            .clone()
+            .with_storage_resolver(Arc::new(RejectingResolver));
+        assert!(ConnectorPlanningContext::try_from_request(resolver_decorated).is_err());
         let attempt_decorated = base.with_vended_credential_lease_sink(Arc::new(RejectingSink));
         assert!(ConnectorPlanningContext::try_from_request(attempt_decorated).is_err());
     }
