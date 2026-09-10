@@ -34,6 +34,7 @@
 //! coordinator keeps owning distributed query execution untouched.
 // Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
 
+pub(crate) mod abort_effect;
 pub(crate) mod blocking_io;
 pub mod clock;
 pub mod completion;

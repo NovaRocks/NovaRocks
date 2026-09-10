@@ -823,6 +823,9 @@ impl AbortQueryContextEffectPort for PermanentlyBackpressuredAbortEffectPort {
 pub enum AbortQueryContextEffectAdmission {
     Admitted(Box<dyn AbortQueryContextEffectReservation>),
     Backpressured,
+    /// The role-composed effect owner is gone, so no later capacity change
+    /// can make this Abort issuable.
+    Closed,
 }
 
 impl fmt::Debug for AbortQueryContextEffectAdmission {
@@ -830,6 +833,7 @@ impl fmt::Debug for AbortQueryContextEffectAdmission {
         match self {
             Self::Admitted(_) => formatter.write_str("Admitted(..)"),
             Self::Backpressured => formatter.write_str("Backpressured"),
+            Self::Closed => formatter.write_str("Closed"),
         }
     }
 }
@@ -861,6 +865,9 @@ impl AbortQueryContextIssuePermit {
             AbortQueryContextEffectAdmission::Admitted(reservation) => reservation,
             AbortQueryContextEffectAdmission::Backpressured => {
                 return Ok(AbortQueryContextIssueSubmit::Backpressured(self));
+            }
+            AbortQueryContextEffectAdmission::Closed => {
+                return Err(ContextStandDownError::EffectCapacityClosed);
             }
         };
         self.publish(AbortIssueEventKind::TransportOwned)?;
@@ -1080,6 +1087,31 @@ mod tests {
                     submissions: Arc::clone(&self.submissions),
                 }))
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ClosedPort {
+        capacity: watch::Sender<u64>,
+    }
+
+    impl Default for ClosedPort {
+        fn default() -> Self {
+            let (capacity, _) = watch::channel(0);
+            Self { capacity }
+        }
+    }
+
+    impl AbortQueryContextEffectPort for ClosedPort {
+        fn subscribe_capacity(&self) -> watch::Receiver<u64> {
+            self.capacity.subscribe()
+        }
+
+        fn try_reserve(
+            &self,
+            _identity: AbortQueryContextIssueIdentity,
+        ) -> AbortQueryContextEffectAdmission {
+            AbortQueryContextEffectAdmission::Closed
         }
     }
 
@@ -1413,6 +1445,24 @@ mod tests {
         let submission = port.submissions.lock().unwrap().pop().unwrap();
         assert_eq!(submission.identity(), identity);
         assert_eq!(submission.request().identity(), identity);
+    }
+
+    #[test]
+    fn a_closed_effect_port_fails_instead_of_waiting_for_capacity() {
+        let context = context(BackendProcessId::new_v7());
+        let mut ledger = ledger([context]);
+        ledger
+            .begin(
+                activation(),
+                ContextStandDownCause::LogicalExecutionCancelled,
+                [(context, EstablishStandDownFact::AbortRequired)],
+            )
+            .unwrap();
+        let permit = ledger.authorize_next().unwrap().unwrap();
+        assert_eq!(
+            permit.try_submit(&ClosedPort::default()).unwrap_err(),
+            ContextStandDownError::EffectCapacityClosed
+        );
     }
 
     #[test]

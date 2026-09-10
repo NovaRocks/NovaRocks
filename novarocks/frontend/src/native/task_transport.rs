@@ -229,12 +229,6 @@ fn encode_query_context_operation(
     }
 }
 
-/// Whether an applied acknowledgement of this kind carries a body its owner
-/// consumes.
-///
-/// A cancel and an abort are answered by a receipt header alone: the terminal
-/// fact still arrives as a published status, so their owners read the outcome
-/// and nothing else.
 /// Whether an owner consumes this kind's acknowledgement body.
 ///
 /// `CancelTask` is deliberately absent even though its receipt carries a task
@@ -249,6 +243,7 @@ const fn consumes_ack_body(kind: OperationKind) -> bool {
             | OperationKind::CreateTask
             | OperationKind::UpdateTask
             | OperationKind::UpdateQueryContext
+            | OperationKind::AbortQueryContext
             | OperationKind::ReleaseQueryContext
     )
 }
@@ -258,6 +253,26 @@ const fn is_applied(outcome: OperationOutcome) -> bool {
         outcome,
         OperationOutcome::Accepted | OperationOutcome::Idempotent
     )
+}
+
+/// Whether this exact operation result must carry its typed acknowledgement.
+///
+/// Abort differs from the other mutations: losing to an already-closing
+/// context is a successful stand-down observation even when the operation was
+/// not newly applied. Its context state is therefore part of the mandatory
+/// receipt for every legal closing outcome.
+const fn consumes_ack_body_for_outcome(kind: OperationKind, outcome: OperationOutcome) -> bool {
+    if matches!(kind, OperationKind::AbortQueryContext) {
+        return matches!(
+            outcome,
+            OperationOutcome::Accepted
+                | OperationOutcome::Idempotent
+                | OperationOutcome::ContextTerminalReceipt
+                | OperationOutcome::LeaseExpired
+                | OperationOutcome::Gone
+        );
+    }
+    is_applied(outcome) && consumes_ack_body(kind)
 }
 
 /// Whether this intent is a lease renewal, decided from the neutral command
@@ -328,7 +343,7 @@ fn decode_ack(
     let body = receipt
         .ack
         .as_ref()
-        .ok_or_else(|| format!("an applied {kind} carries no acknowledgement body"))?;
+        .ok_or_else(|| format!("{kind} requires an acknowledgement body for this outcome"))?;
     match (kind, body, address) {
         (
             OperationKind::AcquireQueryContextAdmissionTicket,
@@ -352,7 +367,7 @@ fn decode_ack(
             .map(AckPayload::Update)
             .map_err(|error| error.to_string()),
         (
-            OperationKind::UpdateQueryContext,
+            OperationKind::UpdateQueryContext | OperationKind::AbortQueryContext,
             proto::task_operation_receipt::Ack::QueryContext(ack),
             AckAddress::Context(context),
         ) => codec::decode_query_context_ack(ack, context, path())
@@ -998,7 +1013,7 @@ fn acknowledgement(
     receipt: &proto::TaskOperationReceipt,
 ) -> OperationAcknowledgement {
     let outcome = header.outcome();
-    if !is_applied(outcome) || !consumes_ack_body(item.kind) {
+    if !consumes_ack_body_for_outcome(item.kind, outcome) {
         observe_settled(item.kind, item.lease_renewal, outcome);
         return OperationAcknowledgement::worker_receipt(
             item.operation_id,
@@ -1015,12 +1030,13 @@ fn acknowledgement(
                 .with_detail(header.detail().cloned())
         }
         Err(detail) => {
-            // An applied operation whose acknowledgement body cannot be read
-            // is a protocol violation, not an operation that carried nothing.
+            // An operation result that requires a typed acknowledgement but
+            // whose body cannot be read is a protocol violation, not an
+            // operation that carried nothing.
             tracing::warn!(
                 kind = item.kind.as_str(),
                 detail,
-                "applied task operation receipt has an unreadable acknowledgement"
+                "task operation receipt has a required but unreadable acknowledgement"
             );
             observe_refusal(REFUSAL_UNUSABLE_ACK, 1);
             observe_settled(
@@ -1680,10 +1696,11 @@ mod tests {
     use std::pin::Pin;
 
     use novarocks_execution::task_execution::{
-        AdmissionTicketId, CancelReason, CancelTask, CreateTaskReceipt, CredentialEpoch,
-        CredentialLeaseId, CredentialUpdate, DomainVersion, EstablishQueryContext,
-        FetchTaskDynamicFilters, LeaseSequence, LeaseValidFor, RenewQueryExecutionLease,
-        TaskDomainUpdate, TaskStatus, TaskStatusVersion, UpdateTask,
+        AbortCause, AbortQueryContext, AdmissionTicketId, CancelReason, CancelTask,
+        CreateTaskReceipt, CredentialEpoch, CredentialLeaseId, CredentialUpdate, DomainVersion,
+        EstablishQueryContext, FetchTaskDynamicFilters, LeaseSequence, LeaseValidFor,
+        QueryContextReceipt, QueryContextState, RenewQueryExecutionLease, TaskDomainUpdate,
+        TaskStatus, TaskStatusVersion, UpdateTask,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter};
@@ -1693,7 +1710,8 @@ mod tests {
         ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
     };
     use novarocks_task_codec::operation::{
-        decode_subscribe_task_status, encode_operation_outcome, encode_status_event,
+        decode_subscribe_task_status, encode_operation_outcome, encode_query_context_ack,
+        encode_status_event,
     };
     use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, StageId, TaskId};
     use novarocks_types::{AttemptId, QueryId};
@@ -1738,6 +1756,14 @@ mod tests {
             TaskOperationId::new_v7(),
             identity(task, backend),
             CancelReason::UpstreamNoLongerNeeded,
+        ))
+    }
+
+    fn abort_intent(context: QueryContextRef) -> OperationIntent {
+        OperationIntent::AbortQueryContext(AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            AbortCause::QueryFailed,
         ))
     }
 
@@ -3002,6 +3028,74 @@ mod tests {
             )]));
 
         submit_batch(&fixture.sink, batch);
+        let acks = settled(&fixture.acks, 1).await;
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::InvalidStateOrRequest)
+        );
+        assert_eq!(*acks[0].payload(), AckPayload::None);
+    }
+
+    #[tokio::test]
+    async fn every_legal_abort_closing_outcome_keeps_its_context_receipt() {
+        for (outcome, state) in [
+            (OperationOutcome::Accepted, QueryContextState::Aborting),
+            (OperationOutcome::Idempotent, QueryContextState::Aborting),
+            (
+                OperationOutcome::ContextTerminalReceipt,
+                QueryContextState::Releasing,
+            ),
+            (
+                OperationOutcome::LeaseExpired,
+                QueryContextState::TerminalRetained,
+            ),
+            (OperationOutcome::Gone, QueryContextState::Gone),
+        ] {
+            let backend = BackendProcessId::new_v7();
+            let context = context(backend);
+            let fixture = sink_fixture(Loopback::start().await, backend);
+            fixture
+                .loopback
+                .peer
+                .expect_apply(ApplyAnswer::WithAck(vec![(
+                    outcome,
+                    Some(proto::task_operation_receipt::Ack::QueryContext(
+                        encode_query_context_ack(
+                            &QueryContextReceipt::new(context, state),
+                            Some(AbortCause::QueryFailed),
+                        )
+                        .expect("a closing context receipt encodes"),
+                    )),
+                )]));
+            submit_batch(
+                &fixture.sink,
+                released_batch(backend, vec![abort_intent(context)]),
+            );
+            let acks = settled(&fixture.acks, 1).await;
+            assert_eq!(acks[0].worker_outcome(), Some(outcome));
+            assert!(matches!(
+                acks[0].payload(),
+                AckPayload::Context(receipt)
+                    if receipt.context() == context && receipt.state() == state
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legal_abort_closing_outcome_without_its_body_fails_closed() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        fixture
+            .loopback
+            .peer
+            .expect_apply(ApplyAnswer::WithAck(vec![(
+                OperationOutcome::ContextTerminalReceipt,
+                None,
+            )]));
+        submit_batch(
+            &fixture.sink,
+            released_batch(backend, vec![abort_intent(context(backend))]),
+        );
         let acks = settled(&fixture.acks, 1).await;
         assert_eq!(
             acks[0].worker_outcome(),
