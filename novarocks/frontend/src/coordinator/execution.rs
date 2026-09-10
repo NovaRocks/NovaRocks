@@ -4254,9 +4254,14 @@ fn prepare_round_split_assignment(
                     "typed connector scan fragment_id={fragment_id} node_id={plan_node_id} has no attempt access"
                 ))
             })?;
+        let connector_context = crate::connector::context_for_planning_lease_typed(
+            access.planning_lease(),
+            connector_context.clone(),
+        )
+        .map_err(|error| failed(error.to_string()))?;
         let attempt_context =
             novarocks_spi::connector::ConnectorAttemptContext::from_admitted_request(
-                connector_context.clone(),
+                connector_context,
             );
         let capabilities = access
             .access()
