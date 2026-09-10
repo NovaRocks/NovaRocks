@@ -768,6 +768,13 @@ numbering, supersede, and collision-renumbering rules. `docs/adr/README.md` rema
 authoritative for this repository: where it and the skill contract disagree, the
 README wins.
 
+Before writing one, apply the scope test: an ADR records a **long-lived design in
+the code**, not one fix's ruling. If the entry would lose its value once the
+incident that prompted it is forgotten, it belongs in the knowledge base as a
+case, not here. Case narrative — field quotes, logs, the investigation path,
+wrong turns, which fix was chosen — stays out of the ADR body; the ADR reaches it
+through `provenance` and `related` only.
+
 ---
 
 ## 12. Project Development Workflow and Knowledge Base
@@ -798,7 +805,9 @@ Use the generic skills-only plugin under `.agents/skills/workbench/`:
 - `dev-workflow-finish`: publish and archive only when authorized;
 - `ops-capture`: record a reproducible scenario, a first-hand debugging case, or
   an ADR, with its symptoms written both the way the field describes them and the
-  way they appear in logs;
+  way they appear in logs; for an ADR it first applies a scope test that keeps
+  case narrative out of the record and makes the ruling produce named, reusable
+  rules;
 - `ops-lookup`: check our own records for whether a symptom has been hit before,
   and hand off to external-source search when it has not.
 
