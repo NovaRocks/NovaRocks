@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,7 +88,7 @@ pub struct FragmentPrepareContext {
 mod owner_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroUsize;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
@@ -333,6 +334,95 @@ mod owner_tests {
             session.aborted.load(Ordering::Acquire),
             "result registration must be cancelled after actual driver stop"
         );
+    }
+
+    #[test]
+    fn stopped_observer_panic_before_terminal_freeze_is_isolated() {
+        let session = BlockingResultSession::new();
+        let mut context = FragmentPrepareContext::default();
+        context.result_writer = Arc::new(BlockingResultWriter {
+            session: Arc::clone(&session),
+        });
+        let running = prepare_fragment(
+            submission(
+                UniqueId::new(95, 96),
+                one_row_chunk(),
+                FragmentSinkProgram::Result,
+            ),
+            context,
+        )
+        .expect("result fragment prepares")
+        .start();
+
+        let entered_deadline = Instant::now() + Duration::from_secs(1);
+        while !session.entered.load(Ordering::Acquire) && Instant::now() < entered_deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            session.entered.load(Ordering::Acquire),
+            "test sink must hold the driver before terminal freeze"
+        );
+
+        let first = Arc::new(AtomicUsize::new(0));
+        let first_callback = Arc::clone(&first);
+        running.subscribe_stopped(move |_| {
+            first_callback.fetch_add(1, Ordering::SeqCst);
+        });
+        running.subscribe_stopped(|_| {
+            panic!("injected fragment terminal observer panic");
+        });
+        let last = Arc::new(AtomicUsize::new(0));
+        let last_callback = Arc::clone(&last);
+        let (last_tx, last_rx) = mpsc::sync_channel(1);
+        running.subscribe_stopped(move |_| {
+            last_callback.fetch_add(1, Ordering::SeqCst);
+            last_tx
+                .send(())
+                .expect("last observer receiver remains available");
+        });
+
+        session.release();
+        let terminal = running.join();
+        last_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("observer delivery completes after terminal freeze");
+        assert!(matches!(terminal.outcome(), FragmentOutcome::Succeeded));
+        assert_eq!(running.stopped_fact(), Some(terminal));
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(last.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stopped_observer_panic_after_terminal_freeze_is_isolated() {
+        let running = prepare_fragment(
+            noop_submission(UniqueId::new(97, 98)),
+            FragmentPrepareContext::default(),
+        )
+        .expect("fragment prepares")
+        .start();
+        let terminal = running.join();
+
+        let first = Arc::new(AtomicUsize::new(0));
+        let first_callback = Arc::clone(&first);
+        let expected = terminal.clone();
+        running.subscribe_stopped(move |fact| {
+            assert_eq!(fact, expected);
+            first_callback.fetch_add(1, Ordering::SeqCst);
+        });
+        running.subscribe_stopped(|_| {
+            panic!("injected immediate fragment terminal observer panic");
+        });
+        let last = Arc::new(AtomicUsize::new(0));
+        let last_callback = Arc::clone(&last);
+        let expected = terminal.clone();
+        running.subscribe_stopped(move |fact| {
+            assert_eq!(fact, expected);
+            last_callback.fetch_add(1, Ordering::SeqCst);
+        });
+
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(last.load(Ordering::SeqCst), 1);
+        assert_eq!(running.stopped_fact(), Some(terminal));
     }
 }
 
@@ -757,7 +847,17 @@ struct RunningFragmentState {
     resources: FragmentResources,
     cancel_reason: Option<FragmentCancelReason>,
     terminal: Option<FragmentTerminalFact>,
-    stopped_observers: Vec<Box<dyn FnOnce(FragmentTerminalFact) + Send + 'static>>,
+    stopped_observers: Vec<FragmentTerminalObserver>,
+}
+
+type FragmentTerminalObserver = Box<dyn FnOnce(FragmentTerminalFact) + Send + 'static>;
+
+fn invoke_terminal_observer(observer: FragmentTerminalObserver, terminal: FragmentTerminalFact) {
+    // The terminal fact is immutable and retained before notification. Isolate
+    // every callback so one faulty observer cannot block the remaining owners.
+    if catch_unwind(AssertUnwindSafe(|| observer(terminal))).is_err() {
+        tracing::error!("fragment terminal observer panicked after the fact was frozen");
+    }
 }
 
 impl RunningFragmentHandle {
@@ -860,12 +960,12 @@ impl RunningFragmentLifecycle {
             (fact, observers)
         };
         for observer in observers {
-            observer(fact.clone());
+            invoke_terminal_observer(observer, fact.clone());
         }
         fact
     }
 
-    fn subscribe_stopped(&self, observer: Box<dyn FnOnce(FragmentTerminalFact) + Send + 'static>) {
+    fn subscribe_stopped(&self, observer: FragmentTerminalObserver) {
         let mut observer = Some(observer);
         let terminal = {
             let mut state = self.state.lock().expect("running fragment state lock");
@@ -880,9 +980,12 @@ impl RunningFragmentLifecycle {
             }
         };
         if let Some(terminal) = terminal {
-            observer
-                .take()
-                .expect("stopped observer was not registered")(terminal);
+            invoke_terminal_observer(
+                observer
+                    .take()
+                    .expect("stopped observer was not registered"),
+                terminal,
+            );
         }
     }
 }

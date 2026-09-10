@@ -29,6 +29,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +69,14 @@ impl FragmentStoppedFact {
 }
 
 type FragmentStoppedObserver = Box<dyn FnOnce(FragmentStoppedFact) + Send + 'static>;
+
+fn invoke_stopped_observer(observer: FragmentStoppedObserver, stopped: FragmentStoppedFact) {
+    // The stopped fact is frozen before notification. A faulty observer cannot
+    // revoke that fact or prevent the remaining one-shot observers from seeing it.
+    if catch_unwind(AssertUnwindSafe(|| observer(stopped))).is_err() {
+        tracing::error!("fragment stopped observer panicked after the fact was frozen");
+    }
+}
 
 struct FragmentCompletionState {
     remaining: usize,
@@ -131,7 +140,7 @@ impl FragmentCompletion {
             (stopped, observers)
         };
         for observer in observers {
-            observer(stopped.clone());
+            invoke_stopped_observer(observer, stopped.clone());
         }
         true
     }
@@ -175,9 +184,12 @@ impl FragmentCompletion {
             }
         };
         if let Some(stopped) = stopped {
-            observer
-                .take()
-                .expect("stopped observer was not registered")(stopped);
+            invoke_stopped_observer(
+                observer
+                    .take()
+                    .expect("stopped observer was not registered"),
+                stopped,
+            );
         }
     }
 
@@ -982,6 +994,68 @@ mod tests {
         assert!(!completion.driver_finished());
         assert_eq!(before.load(Ordering::SeqCst), 1);
         assert_eq!(after.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stopped_observer_panic_before_transition_is_isolated() {
+        let completion = FragmentCompletion::new(1);
+        let first = Arc::new(AtomicUsize::new(0));
+        let first_callback = Arc::clone(&first);
+        completion.subscribe_stopped(Box::new(move |fact| {
+            assert_eq!(fact.conclusion(), Ok(()));
+            first_callback.fetch_add(1, Ordering::SeqCst);
+        }));
+        completion.subscribe_stopped(Box::new(|_| {
+            panic!("injected stopped observer panic");
+        }));
+        let last = Arc::new(AtomicUsize::new(0));
+        let last_callback = Arc::clone(&last);
+        completion.subscribe_stopped(Box::new(move |fact| {
+            assert_eq!(fact.conclusion(), Ok(()));
+            last_callback.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        assert!(completion.driver_finished());
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(last.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            completion
+                .stopped_fact()
+                .expect("the terminal transition freezes a stopped fact")
+                .conclusion(),
+            Ok(())
+        );
+        assert!(!completion.driver_finished());
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(last.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stopped_observer_panic_after_transition_is_isolated() {
+        let completion = FragmentCompletion::new(0);
+        let frozen = completion
+            .stopped_fact()
+            .expect("zero-driver completion starts stopped");
+        let first = Arc::new(AtomicUsize::new(0));
+        let first_callback = Arc::clone(&first);
+        let expected = frozen.clone();
+        completion.subscribe_stopped(Box::new(move |fact| {
+            assert_eq!(fact, expected);
+            first_callback.fetch_add(1, Ordering::SeqCst);
+        }));
+        completion.subscribe_stopped(Box::new(|_| {
+            panic!("injected immediate stopped observer panic");
+        }));
+        let last = Arc::new(AtomicUsize::new(0));
+        let last_callback = Arc::clone(&last);
+        completion.subscribe_stopped(Box::new(move |fact| {
+            assert_eq!(fact.conclusion(), Ok(()));
+            last_callback.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(last.load(Ordering::SeqCst), 1);
+        assert_eq!(completion.stopped_fact(), Some(frozen));
     }
 
     #[test]
