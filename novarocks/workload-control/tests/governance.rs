@@ -732,13 +732,44 @@ fn result_credit_limits_foreign_authorities_and_invalid_transitions_fail_closed(
     let credit = authority
         .reserve_result_credit(&work.owner.scope(), 16)
         .unwrap();
+    let rejection = match credit.begin_protocol_write(1) {
+        Ok(_) => panic!("invalid protocol transition must be rejected"),
+        Err(rejection) => rejection,
+    };
     assert!(matches!(
-        credit.begin_protocol_write(1),
-        Err(WorkError::InvalidResultCreditTransition {
+        rejection.error(),
+        WorkError::InvalidResultCreditTransition {
             from: ResultCreditStage::ReservedBeforeFetch,
             requested: ResultCreditStage::ProtocolWriting,
-        })
+        }
     ));
+    let (_, credit) = rejection.into_parts();
+    assert_eq!(authority.snapshot().held_bytes(), 16);
+    drop(credit);
+    assert_eq!(authority.snapshot().held_bytes(), 0);
+
+    let credit = authority
+        .reserve_result_credit(&work.owner.scope(), 16)
+        .unwrap()
+        .begin_fetch()
+        .unwrap()
+        .retain_raw(8)
+        .unwrap()
+        .reserve_decode(&authority, 8)
+        .unwrap()
+        .queue_decoded(8)
+        .unwrap()
+        .reserve_protocol(&authority, 4)
+        .unwrap();
+    let rejection = match credit.begin_protocol_write(5) {
+        Ok(_) => panic!("protocol bytes beyond the reservation must be rejected"),
+        Err(rejection) => rejection,
+    };
+    assert!(matches!(rejection.error(), WorkError::Capacity(_)));
+    let (_, credit) = rejection.into_parts();
+    assert_eq!(credit.stage(), ResultCreditStage::ProtocolReserved);
+    assert_eq!(authority.snapshot().held_bytes(), 12);
+    drop(credit);
     assert_eq!(authority.snapshot().held_bytes(), 0);
 
     let credit = authority

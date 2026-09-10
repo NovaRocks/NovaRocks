@@ -18,7 +18,9 @@
 mod candidate;
 mod command;
 mod execution;
+mod result;
 
 pub use candidate::*;
 pub use command::*;
 pub use execution::*;
+pub use result::*;

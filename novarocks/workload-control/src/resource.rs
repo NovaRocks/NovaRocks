@@ -778,21 +778,31 @@ impl ResultCredit {
 
     /// Convert the protocol reservation to its retained bytes without
     /// releasing the decoded batch that the writer may still reference.
-    pub fn begin_protocol_write(mut self, actual_bytes: u64) -> Result<Self, WorkError> {
-        self.require(
+    pub fn begin_protocol_write(
+        mut self,
+        actual_bytes: u64,
+    ) -> Result<Self, ResultCreditReservationError> {
+        if let Err(error) = self.require(
             ResultCreditStage::ProtocolReserved,
             ResultCreditStage::ProtocolWriting,
-        )?;
-        self.scope.check()?;
+        ) {
+            return Err(Self::reservation_error(error, self));
+        }
+        if let Err(error) = self.scope.check() {
+            return Err(Self::reservation_error(error, self));
+        }
         if actual_bytes == 0 || actual_bytes > self.secondary_bytes {
-            return Err(WorkError::Capacity("invalid protocol result bytes"));
+            return Err(Self::reservation_error(
+                WorkError::Capacity("invalid protocol result bytes"),
+                self,
+            ));
         }
         let decoded = self.primary_bytes;
         let reserved = self.secondary_bytes;
-        let retained = decoded
-            .checked_add(actual_bytes)
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        self.scope.inner.update_facts_silent(|state| {
+        let Some(retained) = decoded.checked_add(actual_bytes) else {
+            return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
+        };
+        let result = self.scope.inner.update_facts_silent(|state| {
             checked_result_stage_add(
                 state,
                 self.scope.id,
@@ -826,7 +836,10 @@ impl ResultCredit {
                 retained,
             );
             Ok(())
-        })?;
+        });
+        if let Err(error) = result {
+            return Err(Self::reservation_error(error, self));
+        }
         if actual_bytes < reserved {
             self.scope.inner.notify_capacity_available();
         }
