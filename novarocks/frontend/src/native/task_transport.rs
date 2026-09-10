@@ -54,8 +54,9 @@ use prometheus::{
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
-    AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome, QueryContextRef,
-    TaskIdentity, TaskOperationId, TaskStatusCursor, UpdateQueryContext,
+    AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome,
+    QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QueryContextRef, TaskIdentity,
+    TaskOperationId, TaskStatusCursor, UpdateQueryContext,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::catalog::CatalogSet;
@@ -69,11 +70,12 @@ use novarocks_task_codec::domain as codec_domain;
 use novarocks_task_codec::domain::{stored_credential, stored_message};
 use novarocks_task_codec::operation as codec;
 use novarocks_task_codec::operation::{
-    ReceiptHeader, StatusStreamEvent, decode_receipt_batch, decode_status_event,
-    encode_abort_query_context, encode_acquire_query_context_admission_ticket,
-    encode_advance_query_context_domain, encode_cancel_task, encode_create_task,
+    ContextAwareStatusStreamEvent, ReceiptHeader, decode_context_aware_status_event,
+    decode_receipt_batch, encode_abort_query_context,
+    encode_acquire_query_context_admission_ticket, encode_advance_query_context_domain,
+    encode_cancel_task, encode_context_aware_subscribe_task_status, encode_create_task,
     encode_establish_query_context, encode_operation_batch, encode_release_query_context,
-    encode_renew_lease, encode_subscribe_task_status, encode_update_task,
+    encode_renew_lease, encode_update_task,
 };
 use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::BackendProcessId;
@@ -87,6 +89,7 @@ use crate::task_execution::intent::{
 use crate::task_execution::status_intake::{
     StatusEvent, StatusIntakeAdmission, StatusIntakeHandle, StatusIntakeWake,
 };
+use crate::task_execution::{ContextConvergenceIntakeHandle, ContextConvergencePublishError};
 
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::{ChannelAcquisitionError, Client};
@@ -1148,6 +1151,7 @@ impl SubscriptionState {
 /// One running subscription. Dropping it stops the stream.
 struct Subscription {
     state: Arc<Mutex<SubscriptionState>>,
+    reconciliation: tokio::sync::watch::Sender<TaskCursorReconciliation>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -1165,6 +1169,7 @@ impl Drop for Subscription {
 pub(crate) struct TaskStatusSubscriber {
     targets: BTreeMap<BackendProcessId, TaskBackendTarget>,
     intake: StatusIntakeHandle,
+    context_convergence: Option<ContextConvergenceIntakeHandle>,
     error_budget: u32,
     data_runtime: FrontendDataRuntime,
     active: Mutex<BTreeMap<QueryContextRef, Subscription>>,
@@ -1181,6 +1186,11 @@ impl fmt::Debug for TaskStatusSubscriber {
 }
 
 impl TaskStatusSubscriber {
+    /// Builds the task-only transport retained until the production owner cut
+    /// installs the convergence intake in the same atomic change.
+    ///
+    /// This is a migration-only constructor. New ownership must use
+    /// [`Self::new_context_aware`].
     pub(crate) fn new(
         backends: &[(BackendProcessId, RuntimeEndpoint)],
         intake: StatusIntakeHandle,
@@ -1193,6 +1203,28 @@ impl TaskStatusSubscriber {
         Ok(Self {
             targets: freeze_targets(backends, &data_runtime)?,
             intake,
+            context_convergence: None,
+            error_budget,
+            data_runtime,
+            active: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Builds the single-stream task and query-context observation transport.
+    pub(crate) fn new_context_aware(
+        backends: &[(BackendProcessId, RuntimeEndpoint)],
+        intake: StatusIntakeHandle,
+        context_convergence: ContextConvergenceIntakeHandle,
+        error_budget: u32,
+        data_runtime: FrontendDataRuntime,
+    ) -> Result<Self, String> {
+        if error_budget == 0 {
+            return Err("the status subscription error budget must be nonzero".to_owned());
+        }
+        Ok(Self {
+            targets: freeze_targets(backends, &data_runtime)?,
+            intake,
+            context_convergence: Some(context_convergence),
             error_budget,
             data_runtime,
             active: Mutex::new(BTreeMap::new()),
@@ -1217,22 +1249,34 @@ impl TaskStatusSubscriber {
         Ok(())
     }
 
-    /// Replaces this context's subscription, replaying the given cursors.
+    /// Reconciles this context's one subscription to the runner's cursors.
     ///
     /// This is the answer to observation loss the runner saw on its own side,
     /// such as a full intake queue. Loss the stream itself sees is recovered
-    /// by the subscription without anyone asking.
+    /// by the subscription without anyone asking. The bounded watch channel
+    /// coalesces repeated reconciliation requests and gives the same loop the
+    /// later one-way lifecycle control seam; it never creates a second stream.
     pub(crate) fn resubscribe(
         &self,
         context: QueryContextRef,
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String> {
-        let subscription = self.start(context, cursors)?;
+        let cursors = task_cursor_map(context, cursors)?;
         let mut active = self
             .active
             .lock()
             .map_err(|_| "task status subscription lock poisoned".to_owned())?;
-        active.insert(context, subscription);
+        if let Some(subscription) = active.get(&context) {
+            subscription.reconciliation.send_modify(|current| {
+                current.generation = current
+                    .generation
+                    .checked_add(1)
+                    .expect("task cursor reconciliation generation exhausted");
+                current.cursors.clone_from(&cursors);
+            });
+        } else {
+            active.insert(context, self.start_with_cursors(context, cursors)?);
+        }
         observe_resubscribe();
         Ok(())
     }
@@ -1256,6 +1300,14 @@ impl TaskStatusSubscriber {
         context: QueryContextRef,
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<Subscription, String> {
+        self.start_with_cursors(context, task_cursor_map(context, cursors)?)
+    }
+
+    fn start_with_cursors(
+        &self,
+        context: QueryContextRef,
+        cursors: BTreeMap<TaskIdentity, TaskStatusCursor>,
+    ) -> Result<Subscription, String> {
         let target = self
             .targets
             .get(&context.backend_process_id())
@@ -1266,16 +1318,56 @@ impl TaskStatusSubscriber {
                 )
             })?;
         let state = Arc::new(Mutex::new(SubscriptionState::Opening));
+        let (reconciliation, receiver) = tokio::sync::watch::channel(TaskCursorReconciliation {
+            generation: 0,
+            cursors,
+        });
         let task = self.data_runtime.spawn(run_subscription(
             target.client.clone(),
             context,
-            cursors,
+            receiver,
             self.intake.clone(),
+            self.context_convergence.clone(),
             self.error_budget,
             Arc::clone(&state),
         ));
-        Ok(Subscription { state, task })
+        Ok(Subscription {
+            state,
+            reconciliation,
+            task,
+        })
     }
+}
+
+#[derive(Clone, Debug)]
+struct TaskCursorReconciliation {
+    generation: u64,
+    cursors: BTreeMap<TaskIdentity, TaskStatusCursor>,
+}
+
+fn task_cursor_map(
+    context: QueryContextRef,
+    cursors: Vec<TaskStatusCursor>,
+) -> Result<BTreeMap<TaskIdentity, TaskStatusCursor>, String> {
+    let count = cursors.len();
+    let cursors = cursors
+        .into_iter()
+        .map(|cursor| {
+            let identity = cursor.identity();
+            if identity.query_execution_id() != context.query_execution_id()
+                || identity.backend_process_id() != context.backend_process_id()
+            {
+                return Err(format!(
+                    "task status cursor {identity} is outside query context {context}"
+                ));
+            }
+            Ok((identity, cursor))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if cursors.len() != count {
+        return Err("task status reconciliation contains duplicate task cursors".to_owned());
+    }
+    Ok(cursors)
 }
 
 fn set_state(state: &Mutex<SubscriptionState>, next: SubscriptionState) {
@@ -1294,26 +1386,80 @@ fn set_state(state: &Mutex<SubscriptionState>, next: SubscriptionState) {
 async fn run_subscription(
     client: Client,
     context: QueryContextRef,
-    initial: Vec<TaskStatusCursor>,
+    mut reconciliation: tokio::sync::watch::Receiver<TaskCursorReconciliation>,
     intake: StatusIntakeHandle,
+    context_convergence: Option<ContextConvergenceIntakeHandle>,
     error_budget: u32,
     state: Arc<Mutex<SubscriptionState>>,
 ) {
-    let mut cursors = initial
-        .into_iter()
-        .map(|cursor| (cursor.identity(), cursor))
-        .collect::<BTreeMap<TaskIdentity, TaskStatusCursor>>();
+    let initial = reconciliation.borrow_and_update().clone();
+    let mut reconciliation_generation = initial.generation;
+    let mut cursors = initial.cursors;
+    let mut context_cursor = context_convergence
+        .as_ref()
+        .map(|_| QueryContextConvergenceCursor::unobserved(context));
     let mut failures = 0_u32;
-    loop {
-        match open_subscription(&client, context, &cursors).await {
+    'subscription: loop {
+        let opened = tokio::select! {
+            changed = reconciliation.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                apply_task_cursor_reconciliation(
+                    &mut reconciliation,
+                    &mut reconciliation_generation,
+                    &mut cursors,
+                );
+                set_state(&state, SubscriptionState::Resubscribing);
+                continue 'subscription;
+            }
+            opened = open_subscription(&client, context, &cursors, context_cursor) => opened,
+        };
+        match opened {
             Ok(mut stream) => {
                 set_state(&state, SubscriptionState::Live);
                 let mut delivered = false;
                 loop {
-                    match stream.message().await {
+                    let message = tokio::select! {
+                        changed = reconciliation.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            apply_task_cursor_reconciliation(
+                                &mut reconciliation,
+                                &mut reconciliation_generation,
+                                &mut cursors,
+                            );
+                            set_state(&state, SubscriptionState::Resubscribing);
+                            continue 'subscription;
+                        }
+                        message = stream.message() => message,
+                    };
+                    match message {
                         Ok(Some(event)) => {
-                            match observe_event(context, &event, &mut cursors, &intake) {
-                                Ok(()) => delivered = true,
+                            match observe_stream_event(
+                                context,
+                                &event,
+                                &mut cursors,
+                                &intake,
+                                context_convergence.as_ref(),
+                                &mut context_cursor,
+                            )
+                            .await
+                            {
+                                Ok(StreamObservation::Delivered) => delivered = true,
+                                Ok(StreamObservation::AwaitTaskReconciliation) => {
+                                    set_state(&state, SubscriptionState::Resubscribing);
+                                    if reconciliation.changed().await.is_err() {
+                                        return;
+                                    }
+                                    apply_task_cursor_reconciliation(
+                                        &mut reconciliation,
+                                        &mut reconciliation_generation,
+                                        &mut cursors,
+                                    );
+                                    continue 'subscription;
+                                }
                                 Err(next) => {
                                     set_state(&state, next);
                                     return;
@@ -1369,36 +1515,98 @@ async fn run_subscription(
     }
 }
 
+fn apply_task_cursor_reconciliation(
+    reconciliation: &mut tokio::sync::watch::Receiver<TaskCursorReconciliation>,
+    generation: &mut u64,
+    cursors: &mut BTreeMap<TaskIdentity, TaskStatusCursor>,
+) {
+    let latest = reconciliation.borrow_and_update();
+    assert!(
+        latest.generation > *generation,
+        "task cursor reconciliation generations are strictly increasing"
+    );
+    *generation = latest.generation;
+    cursors.clone_from(&latest.cursors);
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum StreamObservation {
+    Delivered,
+    AwaitTaskReconciliation,
+}
+
+async fn observe_stream_event(
+    context: QueryContextRef,
+    event: &proto::TaskStatusStreamEvent,
+    cursors: &mut BTreeMap<TaskIdentity, TaskStatusCursor>,
+    intake: &StatusIntakeHandle,
+    context_convergence: Option<&ContextConvergenceIntakeHandle>,
+    context_cursor: &mut Option<QueryContextConvergenceCursor>,
+) -> Result<StreamObservation, SubscriptionState> {
+    let decoded =
+        decode_context_aware_status_event(event, FieldPath::root("task_status_stream_event"))
+            .map_err(|error| {
+                tracing::warn!(detail = %error, "SubscribeTaskStatus event is malformed");
+                SubscriptionState::Rejected
+            })?;
+    match decoded {
+        ContextAwareStatusStreamEvent::Status(status) => {
+            let identity = status.identity();
+            let version = status.version();
+            let cursor = cursors
+                .get(&identity)
+                .copied()
+                .unwrap_or_else(|| TaskStatusCursor::unobserved(identity));
+            if let Some(current) = cursor.current_version() {
+                if version < current {
+                    tracing::warn!(
+                        task = %identity,
+                        current_version = current.get(),
+                        event_version = version.get(),
+                        "SubscribeTaskStatus event would move its task cursor backwards"
+                    );
+                    return Err(SubscriptionState::Rejected);
+                }
+                if version == current {
+                    return Ok(StreamObservation::Delivered);
+                }
+            }
+            observe_task_event(
+                context,
+                identity,
+                StatusEvent::Published(status),
+                Some(cursor.advanced_to(version)),
+                cursors,
+                intake,
+            )
+        }
+        ContextAwareStatusStreamEvent::Gone(identity) => observe_task_event(
+            context,
+            identity,
+            StatusEvent::Gone(identity),
+            None,
+            cursors,
+            intake,
+        ),
+        ContextAwareStatusStreamEvent::ContextConvergence(receipt) => {
+            observe_context_convergence(context, receipt, context_convergence, context_cursor).await
+        }
+    }
+}
+
 /// Enqueues one observed event and advances its task's cursor only after the
 /// bounded intake retained it.
 ///
 /// This is everything the receive path may do. It classifies nothing, opens no
 /// edge, completes no stage, and settles no operation.
-fn observe_event(
+fn observe_task_event(
     context: QueryContextRef,
-    event: &proto::TaskStatusStreamEvent,
+    identity: TaskIdentity,
+    event: StatusEvent,
+    next_cursor: Option<TaskStatusCursor>,
     cursors: &mut BTreeMap<TaskIdentity, TaskStatusCursor>,
     intake: &StatusIntakeHandle,
-) -> Result<(), SubscriptionState> {
-    let decoded = match decode_status_event(event, FieldPath::root("task_status_stream_event")) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            tracing::warn!(detail = %error, "SubscribeTaskStatus event is malformed");
-            return Err(SubscriptionState::Rejected);
-        }
-    };
-    let (identity, event, next_cursor) = match decoded {
-        StatusStreamEvent::Status(status) => {
-            let identity = status.identity();
-            let cursor = cursors
-                .get(&identity)
-                .copied()
-                .unwrap_or_else(|| TaskStatusCursor::unobserved(identity));
-            let next_cursor = cursor.advanced_to(status.version());
-            (identity, StatusEvent::Published(status), Some(next_cursor))
-        }
-        StatusStreamEvent::Gone(identity) => (identity, StatusEvent::Gone(identity), None),
-    };
+) -> Result<StreamObservation, SubscriptionState> {
     if identity.query_execution_id() != context.query_execution_id() {
         tracing::warn!(
             context_execution = ?context.query_execution_id(),
@@ -1420,7 +1628,7 @@ fn observe_event(
             if let Some(next_cursor) = next_cursor {
                 cursors.insert(identity, next_cursor);
             }
-            Ok(())
+            Ok(StreamObservation::Delivered)
         }
         // The intake has already recorded observation loss and woken the
         // TaskRound. Stop this stream immediately so no later version can
@@ -1428,7 +1636,121 @@ fn observe_event(
         // backpressure, not a network failure, so the subscription loop must
         // not spend its transport error budget or resubscribe from its private
         // cursor. TaskRound will replace it from the state machine's cursor.
-        StatusIntakeAdmission::Overflowed => Err(SubscriptionState::Resubscribing),
+        StatusIntakeAdmission::Overflowed => Ok(StreamObservation::AwaitTaskReconciliation),
+    }
+}
+
+#[cfg(test)]
+fn observe_event(
+    context: QueryContextRef,
+    event: &proto::TaskStatusStreamEvent,
+    cursors: &mut BTreeMap<TaskIdentity, TaskStatusCursor>,
+    intake: &StatusIntakeHandle,
+) -> Result<(), SubscriptionState> {
+    let decoded =
+        decode_context_aware_status_event(event, FieldPath::root("task_status_stream_event"))
+            .map_err(|_| SubscriptionState::Rejected)?;
+    let observed = match decoded {
+        ContextAwareStatusStreamEvent::Status(status) => {
+            let identity = status.identity();
+            let cursor = cursors
+                .get(&identity)
+                .copied()
+                .unwrap_or_else(|| TaskStatusCursor::unobserved(identity));
+            observe_task_event(
+                context,
+                identity,
+                StatusEvent::Published(status.clone()),
+                Some(cursor.advanced_to(status.version())),
+                cursors,
+                intake,
+            )?
+        }
+        ContextAwareStatusStreamEvent::Gone(identity) => observe_task_event(
+            context,
+            identity,
+            StatusEvent::Gone(identity),
+            None,
+            cursors,
+            intake,
+        )?,
+        ContextAwareStatusStreamEvent::ContextConvergence(_) => {
+            return Err(SubscriptionState::Rejected);
+        }
+    };
+    match observed {
+        StreamObservation::Delivered => Ok(()),
+        StreamObservation::AwaitTaskReconciliation => Err(SubscriptionState::Resubscribing),
+    }
+}
+
+async fn observe_context_convergence(
+    context: QueryContextRef,
+    receipt: QueryContextConvergenceReceipt,
+    intake: Option<&ContextConvergenceIntakeHandle>,
+    cursor: &mut Option<QueryContextConvergenceCursor>,
+) -> Result<StreamObservation, SubscriptionState> {
+    let (Some(intake), Some(current)) = (intake, cursor.as_mut()) else {
+        tracing::warn!(
+            %context,
+            "a task-only SubscribeTaskStatus stream received a context convergence event"
+        );
+        return Err(SubscriptionState::Rejected);
+    };
+    if receipt.context() != context {
+        tracing::warn!(
+            %context,
+            receipt_context = %receipt.context(),
+            "SubscribeTaskStatus convergence event addresses a different query context"
+        );
+        return Err(SubscriptionState::Rejected);
+    }
+    if let Some(version) = current.current_version() {
+        if receipt.version() < version {
+            tracing::warn!(
+                %context,
+                cursor_version = %version,
+                receipt_version = %receipt.version(),
+                "SubscribeTaskStatus convergence cursor would move backwards"
+            );
+            return Err(SubscriptionState::Rejected);
+        }
+        if receipt.version() == version {
+            return Ok(StreamObservation::Delivered);
+        }
+    }
+
+    loop {
+        // Read the epoch before publishing. A release that races with the
+        // overflow is then visible to `wait_for_capacity_change`; reading it
+        // afterwards could wait on an epoch that already incorporated the only
+        // capacity transition owed to this receipt.
+        let capacity = intake.capacity_state();
+        match intake.publish(context, receipt) {
+            Ok(admission) => {
+                assert!(admission.authorizes_cursor_advance());
+                *current = current.advanced_to(receipt.version());
+                return Ok(StreamObservation::Delivered);
+            }
+            Err(ContextConvergencePublishError::Overflow) => {
+                let changed = intake.wait_for_capacity_change(capacity.epoch()).await;
+                if changed.is_closed() {
+                    tracing::warn!(
+                        %context,
+                        "context convergence intake closed while waiting for capacity"
+                    );
+                    return Err(SubscriptionState::Rejected);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %context,
+                    detail = %error,
+                    "SubscribeTaskStatus convergence event was rejected"
+                );
+                return Err(SubscriptionState::Rejected);
+            }
+        }
     }
 }
 
@@ -1436,9 +1758,10 @@ async fn open_subscription(
     client: &Client,
     context: QueryContextRef,
     cursors: &BTreeMap<TaskIdentity, TaskStatusCursor>,
+    context_cursor: Option<QueryContextConvergenceCursor>,
 ) -> Result<tonic::Streaming<proto::TaskStatusStreamEvent>, tonic::Status> {
     let cursors = cursors.values().copied().collect::<Vec<_>>();
-    let request = encode_subscribe_task_status(context, &cursors)
+    let request = encode_context_aware_subscribe_task_status(context, &cursors, context_cursor)
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
     let mut grpc = client
         .grpc_with_channel_error()
@@ -1721,14 +2044,17 @@ mod tests {
     //! exercised rather than mocked.
 
     use std::collections::VecDeque;
+    use std::num::NonZeroUsize;
     use std::pin::Pin;
 
     use novarocks_execution::task_execution::{
         AbortCause, AbortQueryContext, AdmissionTicketId, CancelReason, CancelTask,
         CreateTaskReceipt, CredentialEpoch, CredentialLeaseId, CredentialUpdate, DomainVersion,
         EstablishQueryContext, FetchTaskDynamicFilters, LeaseSequence, LeaseValidFor,
-        QueryContextReceipt, QueryContextState, RenewQueryExecutionLease, TaskDomainUpdate,
-        TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, UpdateTask,
+        QueryContextConvergenceReceipt, QueryContextConvergenceState,
+        QueryContextConvergenceVersion, QueryContextReceipt, QueryContextState,
+        RenewQueryExecutionLease, TaskDomainUpdate, TaskOutputFacts, TaskState, TaskStatus,
+        TaskStatusVersion, UpdateTask,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter};
@@ -1738,7 +2064,8 @@ mod tests {
         ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
     };
     use novarocks_task_codec::operation::{
-        decode_subscribe_task_status, encode_operation_outcome, encode_query_context_ack,
+        decode_context_aware_subscribe_task_status, decode_subscribe_task_status,
+        encode_context_convergence_event, encode_operation_outcome, encode_query_context_ack,
         encode_status_event,
     };
     use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, StageId, TaskId};
@@ -1748,6 +2075,7 @@ mod tests {
 
     use crate::native::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
     use crate::native::transport_supervisor::NativeTransportSupervisor;
+    use crate::task_execution::ContextConvergenceIntake;
     use crate::task_execution::dispatch::OperationDispatcher;
     use crate::task_execution::status_intake::{CountingWake, StatusIntake};
     use novarocks_query_application::coordination::{DispatchBudget, MonotonicInstant};
@@ -1977,6 +2305,16 @@ mod tests {
 
         fn subscribed(&self) -> Vec<proto::SubscribeTaskStatusRequest> {
             self.state.lock().expect("peer state").subscribed.clone()
+        }
+
+        fn open_held_subscriptions(&self) -> usize {
+            self.state
+                .lock()
+                .expect("peer state")
+                .held
+                .iter()
+                .filter(|sender| !sender.is_closed())
+                .count()
         }
     }
 
@@ -2671,6 +3009,13 @@ mod tests {
         acks: TaskAckIntake,
     }
 
+    struct ContextAwareSubscriberFixture {
+        loopback: Loopback,
+        subscriber: TaskStatusSubscriber,
+        status_intake: StatusIntake,
+        convergence_intake: ContextConvergenceIntake,
+    }
+
     fn subscriber_fixture(
         loopback: Loopback,
         backend: BackendProcessId,
@@ -2693,6 +3038,361 @@ mod tests {
             wake,
             acks: TaskAckIntake::new(Arc::new(CountingWake::default())),
         }
+    }
+
+    fn context_aware_subscriber_fixture(
+        loopback: Loopback,
+        backend: BackendProcessId,
+        error_budget: u32,
+        convergence_capacity: NonZeroUsize,
+    ) -> ContextAwareSubscriberFixture {
+        let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let wake = Arc::new(CountingWake::default());
+        let status_intake = StatusIntake::new(16, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+        let convergence_intake = ContextConvergenceIntake::bounded(convergence_capacity);
+        let subscriber = TaskStatusSubscriber::new_context_aware(
+            &[(backend, loopback.endpoint.clone())],
+            status_intake.handle(),
+            convergence_intake.handle(),
+            error_budget,
+            data_runtime,
+        )
+        .expect("one frozen context-aware backend target");
+        ContextAwareSubscriberFixture {
+            loopback,
+            subscriber,
+            status_intake,
+            convergence_intake,
+        }
+    }
+
+    fn convergence_receipt(context: QueryContextRef) -> QueryContextConvergenceReceipt {
+        QueryContextConvergenceReceipt::new(
+            context,
+            QueryContextConvergenceVersion::FIRST,
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_context_aware_stream_retains_convergence_and_reconnects_from_its_cursor() {
+        let backend = BackendProcessId::new_v7();
+        let mut fixture = context_aware_subscriber_fixture(
+            Loopback::start().await,
+            backend,
+            2,
+            NonZeroUsize::MIN,
+        );
+        let query_context = context(backend);
+        let receipt = convergence_receipt(query_context);
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenClose(vec![
+                encode_context_convergence_event(receipt),
+            ]));
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
+
+        fixture
+            .subscriber
+            .ensure(query_context, Vec::new())
+            .expect("the convergence-aware subscription starts");
+        let requests = subscribe_requests(&fixture.loopback.peer, 2).await;
+
+        let (first_context, first_tasks, first_context_cursor) =
+            decode_context_aware_subscribe_task_status(
+                &requests[0],
+                FieldPath::root("first_context_aware_subscription"),
+            )
+            .expect("a legal context-aware subscription");
+        assert_eq!(first_context, query_context);
+        assert!(first_tasks.is_empty());
+        let first_context_cursor = first_context_cursor.expect("convergence is always requested");
+        assert_eq!(first_context_cursor.context(), query_context);
+        assert_eq!(first_context_cursor.current_version(), None);
+
+        let (_, _, replayed_context_cursor) = decode_context_aware_subscribe_task_status(
+            &requests[1],
+            FieldPath::root("replayed_context_aware_subscription"),
+        )
+        .expect("a legal replay");
+        assert_eq!(
+            replayed_context_cursor.and_then(|cursor| cursor.current_version()),
+            Some(QueryContextConvergenceVersion::FIRST),
+            "the stream advances its context cursor only after the inbox retained the receipt"
+        );
+        assert_eq!(fixture.convergence_intake.pending(), 1);
+        assert_eq!(
+            fixture
+                .convergence_intake
+                .peek_retained()
+                .expect("the complete convergence receipt is retained")
+                .receipt(),
+            receipt
+        );
+        assert_eq!(
+            fixture.status_intake.queued(),
+            0,
+            "context convergence never enters the task status route"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_reconciliation_reopens_one_stream_and_preserves_the_context_cursor() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = context_aware_subscriber_fixture(
+            Loopback::start().await,
+            backend,
+            2,
+            NonZeroUsize::MIN,
+        );
+        let query_context = context(backend);
+        let task = identity(1, backend);
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
+                encode_context_convergence_event(convergence_receipt(query_context)),
+            ]));
+        fixture
+            .subscriber
+            .ensure(query_context, vec![TaskStatusCursor::unobserved(task)])
+            .expect("the first subscription starts");
+        for _ in 0..600 {
+            if fixture.convergence_intake.pending() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fixture.convergence_intake.pending(), 1);
+
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
+        fixture
+            .subscriber
+            .resubscribe(
+                query_context,
+                vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)],
+            )
+            .expect("TaskRound reconciles its authoritative task cursor");
+        let requests = subscribe_requests(&fixture.loopback.peer, 2).await;
+        for _ in 0..600 {
+            if fixture.loopback.peer.open_held_subscriptions() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fixture.loopback.peer.open_held_subscriptions(),
+            1,
+            "reconciliation closes the old stream before the same loop opens its replacement"
+        );
+        let (_, task_cursors, context_cursor) = decode_context_aware_subscribe_task_status(
+            &requests[1],
+            FieldPath::root("reconciled_context_aware_subscription"),
+        )
+        .expect("a legal reconciled subscription");
+        assert_eq!(
+            task_cursors[0].current_version(),
+            Some(TaskStatusVersion::FIRST)
+        );
+        assert_eq!(
+            context_cursor.and_then(|cursor| cursor.current_version()),
+            Some(QueryContextConvergenceVersion::FIRST),
+            "task reconciliation cannot reset the independently retained convergence cursor"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn convergence_overflow_waits_for_capacity_without_spending_the_network_budget() {
+        let backend = BackendProcessId::new_v7();
+        let mut fixture = context_aware_subscriber_fixture(
+            Loopback::start().await,
+            backend,
+            1,
+            NonZeroUsize::MIN,
+        );
+        let first = context(backend);
+        let second = context(backend);
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
+                encode_context_convergence_event(convergence_receipt(first)),
+            ]));
+        fixture
+            .subscriber
+            .ensure(first, Vec::new())
+            .expect("the first subscription starts");
+        for _ in 0..600 {
+            if fixture.convergence_intake.pending() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fixture.convergence_intake.pending(), 1);
+
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
+                encode_context_convergence_event(convergence_receipt(second)),
+            ]));
+        fixture
+            .subscriber
+            .ensure(second, Vec::new())
+            .expect("the second subscription starts");
+        let _ = subscribe_requests(&fixture.loopback.peer, 2).await;
+        tokio::time::sleep(RESUBSCRIBE_BACKOFF_STEP * 2).await;
+        assert_eq!(
+            fixture.loopback.peer.subscribed().len(),
+            2,
+            "local convergence backpressure does not reconnect or consume network budget"
+        );
+        assert_ne!(
+            fixture.subscriber.state(second),
+            Some(SubscriptionState::BudgetExhausted)
+        );
+
+        let first_lease = fixture
+            .convergence_intake
+            .peek_retained()
+            .expect("the first context occupies the only slot");
+        assert_eq!(first_lease.receipt(), convergence_receipt(first));
+        assert_eq!(
+            first_lease.ack(),
+            crate::task_execution::context_convergence::ContextConvergenceRetainedAck::Released
+        );
+        for _ in 0..600 {
+            let Some(lease) = fixture.convergence_intake.peek_retained() else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            assert_eq!(
+                lease.receipt(),
+                convergence_receipt(second),
+                "the blocked transport retries the same complete receipt after the epoch changes"
+            );
+            return;
+        }
+        panic!("the second convergence receipt was not retried after capacity became available");
+    }
+
+    #[tokio::test]
+    async fn convergence_protocol_errors_leave_the_cursor_unchanged() {
+        let backend = BackendProcessId::new_v7();
+        let exact = context(backend);
+        let stranger = context(backend);
+        let owner = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
+        let handle = owner.handle();
+        let second_version = QueryContextConvergenceVersion::FIRST
+            .next()
+            .expect("version two");
+        let mut cursor = Some(QueryContextConvergenceCursor::at(exact, second_version));
+        assert_eq!(
+            observe_context_convergence(
+                exact,
+                convergence_receipt(exact),
+                Some(&handle),
+                &mut cursor,
+            )
+            .await,
+            Err(SubscriptionState::Rejected)
+        );
+        assert_eq!(
+            cursor.and_then(|cursor| cursor.current_version()),
+            Some(second_version),
+            "an older receipt cannot move the subscriber cursor backwards"
+        );
+        assert_eq!(owner.pending(), 0);
+
+        let mut cursor = Some(QueryContextConvergenceCursor::unobserved(exact));
+        assert_eq!(
+            observe_context_convergence(
+                exact,
+                convergence_receipt(stranger),
+                Some(&handle),
+                &mut cursor,
+            )
+            .await,
+            Err(SubscriptionState::Rejected)
+        );
+        assert_eq!(cursor.and_then(|cursor| cursor.current_version()), None);
+        assert_eq!(owner.pending(), 0);
+
+        let closed_owner = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
+        let closed = closed_owner.handle();
+        drop(closed_owner);
+        assert_eq!(
+            observe_context_convergence(
+                exact,
+                convergence_receipt(exact),
+                Some(&closed),
+                &mut cursor,
+            )
+            .await,
+            Err(SubscriptionState::Rejected)
+        );
+        assert_eq!(cursor.and_then(|cursor| cursor.current_version()), None);
+    }
+
+    #[tokio::test]
+    async fn task_status_replay_cannot_move_the_transport_cursor_backwards() {
+        let backend = BackendProcessId::new_v7();
+        let query_context = context(backend);
+        let task = identity(1, backend);
+        let second_version = TaskStatusVersion::FIRST.next().expect("version two");
+        let intake = StatusIntake::new(2, Arc::new(CountingWake::default()));
+        let mut cursors = BTreeMap::from([(task, TaskStatusCursor::at(task, second_version))]);
+
+        assert_eq!(
+            observe_stream_event(
+                query_context,
+                &encode_status_event(&status_at(task, TaskStatusVersion::FIRST)),
+                &mut cursors,
+                &intake.handle(),
+                None,
+                &mut None,
+            )
+            .await,
+            Err(SubscriptionState::Rejected)
+        );
+        assert_eq!(
+            cursors
+                .get(&task)
+                .and_then(|cursor| cursor.current_version()),
+            Some(second_version)
+        );
+        assert_eq!(intake.queued(), 0);
+
+        assert_eq!(
+            observe_stream_event(
+                query_context,
+                &encode_status_event(&status_at(task, second_version)),
+                &mut cursors,
+                &intake.handle(),
+                None,
+                &mut None,
+            )
+            .await,
+            Ok(StreamObservation::Delivered)
+        );
+        assert_eq!(
+            cursors
+                .get(&task)
+                .and_then(|cursor| cursor.current_version()),
+            Some(second_version)
+        );
+        assert_eq!(
+            intake.queued(),
+            0,
+            "an exact replay is idempotent and does not consume bounded intake capacity"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

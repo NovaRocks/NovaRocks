@@ -70,6 +70,7 @@ use super::host::{
 };
 use super::observation::{
     ContextConvergenceCursorError, CursorObservation, TaskStatusEvent, TaskStatusSource,
+    TaskStatusSubscriptionPosition,
 };
 use super::receipt::OperationReceipt;
 use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
@@ -1885,8 +1886,14 @@ fn retention_expiry_yields_gone() {
             .outcome(),
         OperationOutcome::Gone
     );
+    let CursorObservation::Current(terminal) =
+        source.observe(TaskStatusCursor::unobserved(identity))
+    else {
+        panic!("a reconnect must observe the terminal before Gone");
+    };
+    assert_eq!(terminal.state(), TaskState::Finished);
     assert_eq!(
-        source.observe(TaskStatusCursor::unobserved(identity)),
+        source.observe(TaskStatusCursor::at(identity, terminal.version())),
         CursorObservation::Gone
     );
     assert_eq!(source.next_event(), Some(TaskStatusEvent::Gone(identity)));
@@ -2119,6 +2126,165 @@ fn a_behind_cursor_gets_the_latest_rather_than_a_replay() {
 }
 
 #[test]
+fn overlapping_subscription_positions_cannot_consume_each_others_task_status() {
+    let fixture = Fixture::new();
+    let source = TaskStatusSource::new();
+    let context = fixture.context(1);
+    let identity = fixture.identity(1, 1, 1);
+    let cursor = TaskStatusCursor::unobserved(identity);
+    let old_stream = Mutex::new(TaskStatusSubscriptionPosition::new(&[cursor], None));
+    let replacement_stream = Mutex::new(TaskStatusSubscriptionPosition::new(&[cursor], None));
+
+    // Both subscriptions have completed their initial catch-up before this
+    // live terminal candidate arrives. An HTTP/2 cancellation can leave the
+    // old server stream alive in exactly this overlap window.
+    let status = running_status(identity, 1);
+    source.publish(status.clone());
+
+    let old_event = source
+        .next_subscription_event_at(context, &old_stream)
+        .expect("the old stream cursor is valid")
+        .expect("the old stream observes the live status");
+    old_stream
+        .lock()
+        .expect("old subscription position")
+        .note_delivered(&old_event);
+    assert_eq!(old_event, TaskStatusEvent::Status(status.clone()));
+
+    assert_eq!(
+        source
+            .next_subscription_event_at(context, &replacement_stream)
+            .expect("the replacement cursor is valid"),
+        Some(TaskStatusEvent::Status(status)),
+        "the old stream's observation cannot take a retained status away from its replacement"
+    );
+}
+
+#[test]
+fn reclaimed_terminal_precedes_gone_for_every_subscription_position() {
+    let fixture = Fixture::new();
+    let source = TaskStatusSource::new();
+    let context = fixture.context(1);
+    let identity = fixture.identity(1, 1, 1);
+    let cursor = TaskStatusCursor::unobserved(identity);
+    let first = Mutex::new(TaskStatusSubscriptionPosition::new(&[cursor], None));
+    let replacement = Mutex::new(TaskStatusSubscriptionPosition::new(&[cursor], None));
+    let terminal = finished_status(identity, 1);
+
+    source.publish(terminal.clone());
+    source.mark_gone(identity);
+
+    for position in [&first, &replacement] {
+        let status = source
+            .next_subscription_event_at(context, position)
+            .expect("the subscription cursor is valid")
+            .expect("the reclaimed terminal remains observable");
+        assert_eq!(status, TaskStatusEvent::Status(terminal.clone()));
+        position
+            .lock()
+            .expect("subscription position")
+            .note_delivered(&status);
+
+        let gone = source
+            .next_subscription_event_at(context, position)
+            .expect("the subscription cursor is valid")
+            .expect("gone follows the complete terminal");
+        assert_eq!(gone, TaskStatusEvent::Gone(identity));
+        position
+            .lock()
+            .expect("subscription position")
+            .note_delivered(&gone);
+        assert_eq!(
+            source
+                .next_subscription_event_at(context, position)
+                .expect("the subscription cursor remains valid"),
+            None
+        );
+    }
+
+    assert_eq!(
+        source.observe(cursor),
+        CursorObservation::Current(Box::new(terminal.clone()))
+    );
+    assert_eq!(
+        source.observe(TaskStatusCursor::at(identity, terminal.version())),
+        CursorObservation::Gone
+    );
+    source.forget_gone(identity);
+    assert_eq!(source.observe(cursor), CursorObservation::Gone);
+}
+
+#[test]
+fn an_expired_terminal_wakes_a_lagging_subscription_with_gone() {
+    let fixture = Fixture::new();
+    let source = TaskStatusSource::new();
+    let context = fixture.context(1);
+    let identity = fixture.identity(1, 1, 1);
+    let cursor = TaskStatusCursor::unobserved(identity);
+    let lagging = Mutex::new(TaskStatusSubscriptionPosition::new(&[cursor], None));
+
+    source.publish(finished_status(identity, 1));
+    source.mark_gone(identity);
+    source.forget_gone(identity);
+
+    assert_eq!(
+        source
+            .next_subscription_event_at(context, &lagging)
+            .expect("the subscription cursor is valid"),
+        Some(TaskStatusEvent::Gone(identity)),
+        "expiry must be an explicit observation gap rather than a silent wait"
+    );
+}
+
+#[test]
+fn subscription_position_rotates_past_a_noisy_task() {
+    let fixture = Fixture::new();
+    let source = TaskStatusSource::new();
+    let context = fixture.context(1);
+    let noisy = fixture.identity(1, 1, 1);
+    let quiet = fixture.identity(1, 1, 2);
+    let position = Mutex::new(TaskStatusSubscriptionPosition::new(
+        &[
+            TaskStatusCursor::unobserved(noisy),
+            TaskStatusCursor::unobserved(quiet),
+        ],
+        None,
+    ));
+    source.publish(running_status(noisy, 1));
+    source.publish(running_status(quiet, 1));
+
+    let first = source
+        .next_subscription_event_at(context, &position)
+        .expect("the subscription cursor is valid")
+        .expect("the first task has a status");
+    assert!(matches!(first, TaskStatusEvent::Status(ref status) if status.identity() == noisy));
+    position
+        .lock()
+        .expect("subscription position")
+        .note_delivered(&first);
+
+    source.publish(running_status(noisy, 2));
+    let second = source
+        .next_subscription_event_at(context, &position)
+        .expect("the subscription cursor remains valid")
+        .expect("the quiet task is still owed");
+    assert!(
+        matches!(second, TaskStatusEvent::Status(ref status) if status.identity() == quiet),
+        "a newer noisy-task version cannot displace the next task after the rotation point"
+    );
+    position
+        .lock()
+        .expect("subscription position")
+        .note_delivered(&second);
+
+    let third = source
+        .next_subscription_event_at(context, &position)
+        .expect("the subscription cursor remains valid")
+        .expect("the noisy task's newer version remains owed");
+    assert!(matches!(third, TaskStatusEvent::Status(ref status) if status.identity() == noisy));
+}
+
+#[test]
 fn context_convergence_is_single_version_context_first_and_future_closed() {
     let fixture = Fixture::new();
     let source = TaskStatusSource::new();
@@ -2215,6 +2381,17 @@ fn running_status(identity: TaskIdentity, version: u64) -> TaskStatus {
         TaskOutputFacts::default(),
     )
     .expect("a legal snapshot")
+}
+
+fn finished_status(identity: TaskIdentity, version: u64) -> TaskStatus {
+    TaskStatus::try_new(
+        identity,
+        TaskStatusVersion::new(version).expect("nonzero version"),
+        TaskState::Finished,
+        None,
+        TaskOutputFacts::new(true),
+    )
+    .expect("a legal terminal snapshot")
 }
 
 // --------------------------------------------------------------- operations

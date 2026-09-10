@@ -47,7 +47,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor;
@@ -76,7 +76,10 @@ use tokio_stream::Stream;
 
 use super::fault;
 use super::host::HostRejection;
-use super::observation::{ContextConvergenceCursorError, TaskStatusEvent, TaskStatusSource};
+use super::observation::{
+    ContextConvergenceCursorError, TaskStatusEvent, TaskStatusSource,
+    TaskStatusSubscriptionPosition,
+};
 use super::receipt::OperationReceipt;
 use super::registry::TaskExecutionRegistry;
 use super::shared_facts::encode_dynamic_filter_read;
@@ -373,6 +376,7 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
             source,
             catch_up,
             context,
+            cursors,
             context_convergence_cursor,
         )))
     }
@@ -463,7 +467,7 @@ struct TaskStatusSubscription {
     source: Arc<TaskStatusSource>,
     catch_up: VecDeque<TaskStatusEvent>,
     context: QueryContextRef,
-    context_convergence_cursor: Option<QueryContextConvergenceCursor>,
+    position: Arc<Mutex<TaskStatusSubscriptionPosition>>,
     /// The parked wait for the next frame. It owns its own handle to the
     /// source, so polling never borrows across the await.
     pending: Option<
@@ -481,24 +485,26 @@ impl TaskStatusSubscription {
         source: Arc<TaskStatusSource>,
         catch_up: Vec<TaskStatusEvent>,
         context: QueryContextRef,
+        task_cursors: Vec<novarocks_execution_contract::task_execution::status::TaskStatusCursor>,
         context_convergence_cursor: Option<QueryContextConvergenceCursor>,
     ) -> Self {
         Self {
             source,
             catch_up: catch_up.into(),
             context,
-            context_convergence_cursor,
+            position: Arc::new(Mutex::new(TaskStatusSubscriptionPosition::new(
+                &task_cursors,
+                context_convergence_cursor,
+            ))),
             pending: None,
         }
     }
 
     fn note_delivered(&mut self, event: &TaskStatusEvent) {
-        if let TaskStatusEvent::ContextConvergence(receipt) = event {
-            self.context_convergence_cursor = Some(QueryContextConvergenceCursor::at(
-                receipt.context(),
-                receipt.version(),
-            ));
-        }
+        self.position
+            .lock()
+            .expect("task status subscription position")
+            .note_delivered(event);
     }
 }
 
@@ -514,10 +520,10 @@ impl Stream for TaskStatusSubscription {
         if this.pending.is_none() {
             let source = Arc::clone(&this.source);
             let context = this.context;
-            let context_convergence_cursor = this.context_convergence_cursor;
+            let position = Arc::clone(&this.position);
             this.pending = Some(Box::pin(async move {
                 source
-                    .next_subscription_event_owned(context, context_convergence_cursor)
+                    .next_subscription_event_owned(context, &position)
                     .await
             }));
         }
@@ -1416,6 +1422,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlapping_server_streams_observe_the_same_terminal_status() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let identity = fixture.identity(1, 1);
+        fixture.apply(vec![
+            fixture.establish(context, TaskOperationId::new_v7()),
+            create_task(context, identity, TaskOperationId::new_v7()),
+        ]);
+
+        let request = || proto::SubscribeTaskStatusRequest {
+            query_context: Some(encode_query_context_ref(context)),
+            cursors: vec![novarocks_task_codec::status::encode_task_status_cursor(
+                TaskStatusCursor::unobserved(identity),
+            )],
+            context_convergence_cursor: None,
+        };
+        let mut old_stream = fixture
+            .ingress
+            .subscribe_task_status(request())
+            .expect("the old stream opens");
+        let mut replacement_stream = fixture
+            .ingress
+            .subscribe_task_status(request())
+            .expect("the replacement stream opens");
+
+        // Drain both retained catch-up frames before publishing the live
+        // terminal. This is the overlap window created while HTTP/2
+        // cancellation of the old handler is still in flight.
+        assert_eq!(next_status_version(&mut old_stream).await, 1);
+        assert_eq!(next_status_version(&mut replacement_stream).await, 1);
+
+        let terminal = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::FIRST.next().expect("version two"),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("finished status carries complete output responsibility");
+        let source = fixture
+            .registry
+            .status_source(context)
+            .expect("the context retains its observation source");
+        source.publish(terminal);
+        source.mark_gone(identity);
+
+        assert_eq!(next_status_version(&mut old_stream).await, 2);
+        assert_eq!(
+            next_status_version(&mut replacement_stream).await,
+            2,
+            "the old handler cannot consume the terminal retained for its replacement"
+        );
+        next_gone_identity(&mut old_stream, identity).await;
+        next_gone_identity(&mut replacement_stream, identity).await;
+    }
+
+    #[tokio::test]
     async fn a_context_aware_subscription_catches_up_and_rejects_a_future_cursor() {
         let fixture = Fixture::new();
         let context = fixture.context();
@@ -1625,6 +1688,32 @@ mod tests {
             }
             proto::task_status_stream_event::Event::ContextConvergence(_) => {
                 panic!("expected a task status frame, not context convergence")
+            }
+        }
+    }
+
+    async fn next_gone_identity(stream: &mut TaskStatusEventStream, expected: TaskIdentity) {
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a retained gone frame must wake the subscription")
+            .expect("the stream is still open")
+            .expect("an observation frame is never a status error");
+        match novarocks_task_codec::operation::decode_context_aware_status_event(
+            &event,
+            FieldPath::root("task_status_stream_event"),
+        )
+        .expect("the backend encoded a valid observation")
+        {
+            novarocks_task_codec::operation::ContextAwareStatusStreamEvent::Gone(identity) => {
+                assert_eq!(identity, expected);
+            }
+            novarocks_task_codec::operation::ContextAwareStatusStreamEvent::Status(_) => {
+                panic!("expected a reclamation frame, not a status")
+            }
+            novarocks_task_codec::operation::ContextAwareStatusStreamEvent::ContextConvergence(
+                _,
+            ) => {
+                panic!("expected a task reclamation frame, not context convergence")
             }
         }
     }

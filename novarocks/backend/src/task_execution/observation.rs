@@ -17,26 +17,30 @@
 
 //! The status subscription source of one query context.
 //!
-//! It holds three things and nothing else: the current snapshot of every task
-//! it knows, the at-most-one snapshot queued for delivery per task, and the
-//! terminal snapshot. There is no history buffer, so a cursor that has fallen
-//! behind is answered with the current latest rather than a replay — a
-//! frontend that missed versions has missed nothing it can act on, because
-//! every snapshot is complete rather than a delta.
+//! It holds the current snapshot of every task it knows, the retained gone
+//! tombstones, and one coalesced diagnostic queue. There is no history buffer,
+//! so a cursor that has fallen behind is answered with the current latest
+//! rather than a replay — a frontend that missed versions has missed nothing
+//! it can act on, because every snapshot is complete rather than a delta.
 //!
-//! Delivery is per-task fair by construction: each task owns exactly one
-//! queue position while it has anything pending, so a task publishing
-//! thousands of metric versions coalesces into its own slot instead of
-//! pushing another task's snapshot back.
+//! Every RPC subscription owns its own cursor position and reads these retained
+//! facts without consuming them. That property is load-bearing during
+//! reconnect: an old HTTP/2 stream may outlive the frontend's local handle for
+//! a short time, and it must not be able to take a terminal frame away from the
+//! replacement stream. Selection rotates after the last delivered task, so a
+//! noisy task cannot starve another task in the same subscription.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Mutex;
 
 use novarocks_execution_contract::task_execution::context_convergence::{
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
 };
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
-use novarocks_execution_contract::task_execution::status::{TaskStatus, TaskStatusCursor};
+use novarocks_execution_contract::task_execution::status::{
+    TaskStatus, TaskStatusCursor, TaskStatusVersion,
+};
 
 /// One immutable observation frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,6 +51,57 @@ pub enum TaskStatusEvent {
     Status(TaskStatus),
     /// Retained state for this task was reclaimed.
     Gone(TaskIdentity),
+}
+
+/// One server stream's private observation position.
+///
+/// It is never stored in [`TaskStatusSource`], so overlapping reconnect streams
+/// cannot advance or consume each other's task or context observations.
+#[derive(Debug)]
+pub(crate) struct TaskStatusSubscriptionPosition {
+    context_cursor: Option<QueryContextConvergenceCursor>,
+    task_versions: BTreeMap<TaskIdentity, Option<TaskStatusVersion>>,
+    gone: BTreeSet<TaskIdentity>,
+    task_change_revision: u64,
+    gone_after_terminal: Option<TaskIdentity>,
+}
+
+impl TaskStatusSubscriptionPosition {
+    pub(crate) fn new(
+        task_cursors: &[TaskStatusCursor],
+        context_cursor: Option<QueryContextConvergenceCursor>,
+    ) -> Self {
+        Self {
+            context_cursor,
+            task_versions: task_cursors
+                .iter()
+                .map(|cursor| (cursor.identity(), cursor.current_version()))
+                .collect(),
+            gone: BTreeSet::new(),
+            task_change_revision: 0,
+            gone_after_terminal: None,
+        }
+    }
+
+    /// Advances only the stream that actually handed this frame to its caller.
+    pub(crate) fn note_delivered(&mut self, event: &TaskStatusEvent) {
+        match event {
+            TaskStatusEvent::ContextConvergence(receipt) => {
+                self.context_cursor = Some(QueryContextConvergenceCursor::at(
+                    receipt.context(),
+                    receipt.version(),
+                ));
+            }
+            TaskStatusEvent::Status(status) => {
+                let identity = status.identity();
+                self.task_versions.insert(identity, Some(status.version()));
+                self.gone.remove(&identity);
+            }
+            TaskStatusEvent::Gone(identity) => {
+                self.gone.insert(*identity);
+            }
+        }
+    }
 }
 
 /// Why a context convergence cursor cannot open a subscription.
@@ -113,7 +168,21 @@ impl PendingSlot {
 struct SourceState {
     latest_context_convergence: Option<QueryContextConvergenceReceipt>,
     latest: BTreeMap<TaskIdentity, TaskStatus>,
-    reclaimed: BTreeSet<TaskIdentity>,
+    /// The last complete terminal remains observable for the same bounded
+    /// lifetime as the task's gone fence. A reconnect that was behind must see
+    /// this fact before it sees `Gone`.
+    reclaimed: BTreeMap<TaskIdentity, TaskStatus>,
+    /// Identities whose detailed gone fence expired while this context source
+    /// is still reachable. The owning context's cumulative task bound makes
+    /// this set finite. It preserves an explicit observation gap (`Gone`) for
+    /// a lagging stream after the heavier terminal snapshot is released.
+    forgotten: BTreeSet<TaskIdentity>,
+    /// One coalesced change-index entry per retained task. Subscriptions walk
+    /// this index with private revision cursors instead of rescanning all tasks
+    /// for every delivered frame.
+    task_change_order: BTreeMap<u64, TaskIdentity>,
+    task_change_revision: BTreeMap<TaskIdentity, u64>,
+    next_task_change_revision: u64,
     pending: BTreeMap<TaskIdentity, PendingSlot>,
     order: VecDeque<TaskIdentity>,
     stats: TaskStatusSourceStats,
@@ -150,6 +219,7 @@ impl TaskStatusSource {
         let status_state = status.state();
         let mut state = self.state.lock().expect("task status source lock");
         state.latest.insert(identity, status.clone());
+        Self::note_task_change_locked(&mut state, identity);
         let slot = state.pending.entry(identity).or_default();
         let was_empty = slot.is_empty();
         let queued_terminal = slot.status.as_ref().is_some_and(TaskStatus::is_terminal);
@@ -196,8 +266,19 @@ impl TaskStatusSource {
     /// Records that a task's retained state was reclaimed.
     pub fn mark_gone(&self, identity: TaskIdentity) {
         let mut state = self.state.lock().expect("task status source lock");
-        state.latest.remove(&identity);
-        state.reclaimed.insert(identity);
+        let Some(terminal) = state.latest.remove(&identity) else {
+            assert!(
+                state.reclaimed.contains_key(&identity) || state.forgotten.contains(&identity),
+                "a reclaimed task must retain its final observation"
+            );
+            return;
+        };
+        assert!(
+            terminal.is_terminal(),
+            "only a terminal task observation can become a gone fence"
+        );
+        state.reclaimed.insert(identity, terminal);
+        Self::note_task_change_locked(&mut state, identity);
         let slot = state.pending.entry(identity).or_default();
         let was_empty = slot.is_empty();
         slot.gone = true;
@@ -209,6 +290,47 @@ impl TaskStatusSource {
         self.wake.notify_waiters();
     }
 
+    /// Releases detailed observation data when the Registry evicts the gone
+    /// fence. A minimal `Gone` remains until the context source itself is
+    /// dropped, so an already-open or reconnecting stream observes an explicit
+    /// retention gap instead of parking forever.
+    pub fn forget_gone(&self, identity: TaskIdentity) {
+        let mut state = self.state.lock().expect("task status source lock");
+        if state.reclaimed.remove(&identity).is_none() {
+            assert!(
+                state.forgotten.contains(&identity),
+                "only a reclaimed observation can expire"
+            );
+            return;
+        }
+        state.forgotten.insert(identity);
+        Self::note_task_change_locked(&mut state, identity);
+        let slot = state.pending.entry(identity).or_default();
+        let was_empty = slot.is_empty();
+        slot.status = None;
+        slot.gone = true;
+        if was_empty {
+            state.order.push_back(identity);
+        }
+        drop(state);
+        self.wake.notify_waiters();
+    }
+
+    fn note_task_change_locked(state: &mut SourceState, identity: TaskIdentity) {
+        let revision = state
+            .next_task_change_revision
+            .checked_add(1)
+            .expect("task observation change revision exhausted");
+        state.next_task_change_revision = revision;
+        if let Some(previous) = state.task_change_revision.insert(identity, revision) {
+            state.task_change_order.remove(&previous);
+        }
+        assert!(
+            state.task_change_order.insert(revision, identity).is_none(),
+            "task observation change revisions are unique"
+        );
+    }
+
     /// Waits for the next per-task frame without consuming a context frame.
     ///
     /// This preserves the legacy task-only subscription while a
@@ -216,6 +338,8 @@ impl TaskStatusSource {
     pub async fn next_task_event_owned(&self) -> Option<TaskStatusEvent> {
         loop {
             let woken = self.wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
             if let Some(event) = self.next_task_event() {
                 return Some(event);
             }
@@ -227,20 +351,86 @@ impl TaskStatusSource {
     }
 
     /// Waits for the next frame owed to one subscription's own cursor.
-    pub async fn next_subscription_event_owned(
+    pub(crate) async fn next_subscription_event_owned(
         &self,
         context: QueryContextRef,
-        context_cursor: Option<QueryContextConvergenceCursor>,
+        position: &Mutex<TaskStatusSubscriptionPosition>,
     ) -> Result<Option<TaskStatusEvent>, ContextConvergenceCursorError> {
         loop {
             let woken = self.wake.notified();
-            if let Some(event) = self.next_subscription_event(context, context_cursor)? {
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if let Some(event) = self.next_subscription_event_at(context, position)? {
                 return Ok(Some(event));
             }
             woken.await;
-            if let Some(event) = self.next_subscription_event(context, context_cursor)? {
+            if let Some(event) = self.next_subscription_event_at(context, position)? {
                 return Ok(Some(event));
             }
+        }
+    }
+
+    /// Reads the next fact owed to one stream without consuming shared state.
+    pub(crate) fn next_subscription_event_at(
+        &self,
+        context: QueryContextRef,
+        position: &Mutex<TaskStatusSubscriptionPosition>,
+    ) -> Result<Option<TaskStatusEvent>, ContextConvergenceCursorError> {
+        let mut state = self.state.lock().expect("task status source lock");
+        let mut position = position.lock().expect("task status subscription position");
+        if let Some(cursor) = position.context_cursor
+            && let Some(receipt) = Self::context_event_locked(&state, context, cursor)?
+        {
+            state.stats.delivered = state.stats.delivered.saturating_add(1);
+            return Ok(Some(TaskStatusEvent::ContextConvergence(receipt)));
+        }
+        let event = Self::task_event_at_locked(&state, &mut position);
+        if event.is_some() {
+            state.stats.delivered = state.stats.delivered.saturating_add(1);
+        }
+        Ok(event)
+    }
+
+    fn task_event_at_locked(
+        state: &SourceState,
+        position: &mut TaskStatusSubscriptionPosition,
+    ) -> Option<TaskStatusEvent> {
+        if let Some(identity) = position.gone_after_terminal.take()
+            && !position.gone.contains(&identity)
+        {
+            return Some(TaskStatusEvent::Gone(identity));
+        }
+
+        loop {
+            let (&revision, &identity) = state
+                .task_change_order
+                .range((Excluded(position.task_change_revision), Unbounded))
+                .next()?;
+            position.task_change_revision = revision;
+
+            if let Some(status) = state.latest.get(&identity) {
+                let observed = position.task_versions.get(&identity).copied().flatten();
+                if observed.is_none_or(|version| version < status.version()) {
+                    return Some(TaskStatusEvent::Status(status.clone()));
+                }
+                continue;
+            }
+
+            let Some(terminal) = state.reclaimed.get(&identity) else {
+                if state.forgotten.contains(&identity) && !position.gone.contains(&identity) {
+                    return Some(TaskStatusEvent::Gone(identity));
+                }
+                continue;
+            };
+            if position.gone.contains(&identity) {
+                continue;
+            }
+            let observed = position.task_versions.get(&identity).copied().flatten();
+            if observed.is_none_or(|version| version < terminal.version()) {
+                position.gone_after_terminal = Some(identity);
+                return Some(TaskStatusEvent::Status(terminal.clone()));
+            }
+            return Some(TaskStatusEvent::Gone(identity));
         }
     }
 
@@ -326,7 +516,13 @@ impl TaskStatusSource {
                 _ => CursorObservation::Current(Box::new(status.clone())),
             };
         }
-        if state.reclaimed.contains(&identity) {
+        if let Some(terminal) = state.reclaimed.get(&identity) {
+            return match cursor.current_version() {
+                Some(version) if version >= terminal.version() => CursorObservation::Gone,
+                _ => CursorObservation::Current(Box::new(terminal.clone())),
+            };
+        }
+        if state.forgotten.contains(&identity) {
             return CursorObservation::Gone;
         }
         CursorObservation::Unknown

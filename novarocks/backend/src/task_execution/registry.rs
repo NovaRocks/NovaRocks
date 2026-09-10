@@ -2530,6 +2530,7 @@ impl TaskExecutionRegistry {
             };
             if let Some(entry) = state.contexts.get_mut(&context) {
                 entry.tasks.remove(&identity);
+                entry.source.forget_gone(identity);
             }
             let spent = state
                 .contexts
