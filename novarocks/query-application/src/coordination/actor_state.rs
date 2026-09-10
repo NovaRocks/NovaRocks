@@ -479,7 +479,7 @@ impl LogicalExecutionState {
             output_mode,
             max_attempts,
             attempts_started: 1,
-            phase: ExecutionPhase::Running {
+            phase: ExecutionPhase::Instantiating {
                 execution: initial,
                 eligibility_generation: delivery.eligibility_generation(),
             },
@@ -1099,7 +1099,11 @@ impl LogicalExecutionState {
         current: &AttemptCapability,
         conclusion: LogicalConclusion,
     ) -> Result<(), ActorStateError> {
-        self.require_current_capability(current)?;
+        if matches!(conclusion, LogicalConclusion::Succeeded) {
+            self.require_running_capability(current)?;
+        } else {
+            self.require_current_capability(current)?;
+        }
         self.conclude_current_execution(current.execution, conclusion)
     }
 
@@ -1250,6 +1254,15 @@ mod tests {
         state.attempt_capability(execution).unwrap()
     }
 
+    fn running_capability(
+        state: &mut LogicalExecutionState,
+        execution: QueryExecutionId,
+    ) -> AttemptCapability {
+        let capability = capability(state, execution);
+        state.mark_running(&capability).unwrap();
+        capability
+    }
+
     fn success_receipt(
         state: &mut LogicalExecutionState,
         capability: &AttemptCapability,
@@ -1269,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_delivery_then_replacement_is_refused() {
+    fn initial_attempt_requires_exact_running_capability_once() {
         let mut state = LogicalExecutionState::new(
             execution(1),
             RecoveryMode::RestartAttemptBeforeVisibility,
@@ -1279,6 +1292,74 @@ mod tests {
         )
         .unwrap();
         let initial = capability(&state, execution(1));
+
+        assert!(matches!(
+            state.phase(),
+            ExecutionPhase::Instantiating { execution: current, .. }
+                if current == execution(1)
+        ));
+        assert!(matches!(
+            state.begin_schema_delivery(&initial),
+            Err(ActorStateError::WrongPhase)
+        ));
+        assert_eq!(
+            state
+                .begin_result_delivery(&initial, 0, ResultPacket::Data(Payload))
+                .unwrap_err()
+                .error(),
+            DeliveryGateError::WrongExecutionPhase
+        );
+        assert_eq!(
+            state.begin_replacement(
+                &initial,
+                execution(2),
+                AttemptFailureClass::RecoverableInfrastructure,
+                false,
+            ),
+            Err(ActorStateError::WrongPhase)
+        );
+        assert!(matches!(
+            state.issue_attempt_success_effect(&initial),
+            Err(ActorStateError::WrongPhase)
+        ));
+        assert_eq!(
+            state.conclude(&initial, LogicalConclusion::Succeeded),
+            Err(ActorStateError::WrongPhase)
+        );
+
+        let wrong = AttemptCapability {
+            generation: initial.generation + 1,
+            ..initial
+        };
+        assert_eq!(
+            state.mark_running(&wrong),
+            Err(ActorStateError::StaleAttemptCapability)
+        );
+
+        let initial = capability(&state, execution(1));
+        state.mark_running(&initial).unwrap();
+        assert!(matches!(
+            state.phase(),
+            ExecutionPhase::Running { execution: current, .. }
+                if current == execution(1)
+        ));
+        assert_eq!(
+            state.mark_running(&initial),
+            Err(ActorStateError::WrongPhase)
+        );
+    }
+
+    #[test]
+    fn begin_delivery_then_replacement_is_refused() {
+        let mut state = LogicalExecutionState::new(
+            execution(1),
+            RecoveryMode::RestartAttemptBeforeVisibility,
+            ExecutionEffect::None,
+            LogicalOutputMode::ResultStream,
+            2,
+        )
+        .unwrap();
+        let initial = running_capability(&mut state, execution(1));
         emit_schema(&mut state, &initial);
         let _permit = state
             .begin_result_delivery(&initial, 0, ResultPacket::Data(Payload))
@@ -1306,7 +1387,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         emit_schema(&mut state, &initial);
         let token = state
             .begin_replacement(
@@ -1348,7 +1429,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         state
             .conclude(&initial, LogicalConclusion::Succeeded)
             .unwrap();
@@ -1389,7 +1470,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         assert_eq!(
             state
                 .begin_result_delivery(&initial, 0, ResultPacket::Data(Payload))
@@ -1418,7 +1499,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         emit_schema(&mut state, &initial);
         assert_eq!(
             state.conclude(&initial, LogicalConclusion::Succeeded),
@@ -1446,7 +1527,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         assert_eq!(
             state
                 .begin_result_delivery(&initial, 0, ResultPacket::Data(Payload))
@@ -1487,7 +1568,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         let success = success_receipt(&mut state, &initial);
         state.conclude(&initial, LogicalConclusion::Failed).unwrap();
         assert_eq!(
@@ -1510,7 +1591,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         emit_schema(&mut state, &initial);
         let success = success_receipt(&mut state, &initial);
         let permit = state
@@ -1534,7 +1615,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         emit_schema(&mut state, &initial);
         let success = success_receipt(&mut state, &initial);
         let permit = state
@@ -1554,7 +1635,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         let token = state
             .begin_replacement(
                 &initial,
@@ -1595,7 +1676,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         let token = state
             .begin_replacement(
                 &initial,
@@ -1629,7 +1710,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         let token = state
             .begin_replacement(
                 &initial,
@@ -1660,7 +1741,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         let token = state
             .begin_replacement(
                 &initial,
@@ -1709,8 +1790,8 @@ mod tests {
             1,
         )
         .unwrap();
-        let first_capability = capability(&first, execution(1));
-        let second_capability = capability(&second, execution(1));
+        let first_capability = running_capability(&mut first, execution(1));
+        let second_capability = running_capability(&mut second, execution(1));
         let pending = first
             .issue_attempt_success_effect(&first_capability)
             .unwrap();
@@ -1749,8 +1830,8 @@ mod tests {
             1,
         )
         .unwrap();
-        let first_capability = capability(&first, execution(1));
-        let second_capability = capability(&second, execution(1));
+        let first_capability = running_capability(&mut first, execution(1));
+        let second_capability = running_capability(&mut second, execution(1));
         let first_success = success_receipt(&mut first, &first_capability);
         emit_schema(&mut second, &second_capability);
 
@@ -1782,7 +1863,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let initial = capability(&state, execution(1));
+        let initial = running_capability(&mut state, execution(1));
         let BeginSchemaDelivery::Permit(permit) = state.begin_schema_delivery(&initial).unwrap()
         else {
             panic!("first schema write must receive a permit");
