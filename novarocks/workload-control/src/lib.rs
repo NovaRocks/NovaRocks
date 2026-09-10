@@ -71,6 +71,7 @@ pub enum WorkError {
     AlreadyAdmitted,
     AlreadyWaitingForResource(ResourceClass),
     AlreadyWaitingForResultFetch,
+    AlreadyWaitingForResultDecode,
     Conflict,
     OwnerStillPresent,
     ArithmeticOverflow,
@@ -97,6 +98,9 @@ impl std::fmt::Display for WorkError {
             }
             Self::AlreadyWaitingForResultFetch => {
                 f.write_str("Work already has a result fetch capacity wait")
+            }
+            Self::AlreadyWaitingForResultDecode => {
+                f.write_str("Work already has a result decode capacity wait")
             }
             Self::Conflict => f.write_str("Work identity has conflicting facts"),
             Self::OwnerStillPresent => f.write_str("Work still has an active owner"),

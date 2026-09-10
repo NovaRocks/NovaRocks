@@ -245,6 +245,7 @@ pub(crate) struct State {
     pub requests: BTreeMap<u64, PendingAdmission>,
     pub resource_waiters: ResourceWaiters,
     pub next_result_fetch_waiter_id: u64,
+    pub next_decode_waiter_id: u64,
     pub next_protocol_waiter_id: u64,
     pub preparation_queue: FairQueue,
     pub execution_queue: FairQueue,
@@ -290,6 +291,14 @@ impl State {
             .checked_add(1)
             .ok_or(WorkError::ArithmeticOverflow)?;
         Ok(self.next_protocol_waiter_id)
+    }
+
+    pub(crate) fn next_decode_waiter_id(&mut self) -> Result<u64, WorkError> {
+        self.next_decode_waiter_id = self
+            .next_decode_waiter_id
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        Ok(self.next_decode_waiter_id)
     }
 
     pub(crate) fn next_result_fetch_waiter_id(&mut self) -> Result<u64, WorkError> {
@@ -342,12 +351,14 @@ pub(crate) struct ResourceWaiters {
     pub generic: BTreeSet<(WorkId, ResourceClass)>,
     pub result_fetch: BTreeMap<u64, ResultWaiter>,
     pub result_fetch_by_scope: BTreeMap<WorkId, u64>,
+    pub decode: BTreeMap<u64, ResultWaiter>,
+    pub decode_by_scope: BTreeMap<WorkId, u64>,
     pub protocol: BTreeMap<u64, ResultWaiter>,
 }
 
 impl ResourceWaiters {
     pub(crate) fn len(&self) -> usize {
-        self.generic.len() + self.result_fetch.len() + self.protocol.len()
+        self.generic.len() + self.result_fetch.len() + self.decode.len() + self.protocol.len()
     }
 }
 

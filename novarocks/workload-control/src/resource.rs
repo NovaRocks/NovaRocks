@@ -246,6 +246,55 @@ impl Drop for ResultFetchWaitRegistration {
     }
 }
 
+/// One ordered decoded-output reservation. A scope admits at most one decode
+/// wait because decoding is the single owner transition for its retained raw
+/// result.
+struct DecodeWaitRegistration {
+    scope: WorkScope,
+    ticket: Option<u64>,
+}
+
+impl DecodeWaitRegistration {
+    fn remove_locked(&mut self, state: &mut State) -> bool {
+        let Some(ticket) = self.ticket.take() else {
+            return false;
+        };
+        let removed = state.resource_waiters.decode.remove(&ticket);
+        let scope_ticket = state
+            .resource_waiters
+            .decode_by_scope
+            .remove(&self.scope.id);
+        debug_assert!(
+            removed.is_some(),
+            "Decode waiter registration was already removed"
+        );
+        debug_assert_eq!(scope_ticket, Some(ticket));
+        if removed.is_some() {
+            state
+                .nodes
+                .get_mut(&self.scope.id)
+                .unwrap()
+                .resource_waiters -= 1;
+            state.collect(self.scope.id);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for DecodeWaitRegistration {
+    fn drop(&mut self) {
+        if self.ticket.is_none() {
+            return;
+        }
+        let inner = Arc::clone(&self.scope.inner);
+        inner.update_facts(|state| {
+            self.remove_locked(state);
+        });
+    }
+}
+
 /// One independently ordered protocol-output wait. Unlike generic resource
 /// waits, a scope may own several of these because every retained result batch
 /// carries its own credit and must be able to make progress independently.
@@ -373,6 +422,24 @@ fn reserve_protocol_bytes(
     Ok(())
 }
 
+fn reserve_decode_bytes(
+    state: &mut State,
+    config: &ResourceConfig,
+    scope: WorkId,
+    raw_bytes: u64,
+    decoded_bytes: u64,
+) -> Result<(), WorkError> {
+    let combined = raw_bytes
+        .checked_add(decoded_bytes)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    check_capacity(state, config, scope, decoded_bytes, ResourceClass::Data)?;
+    checked_result_stage_add(state, scope, ResultCreditStage::DecodeReserved, combined)?;
+    remove_result_stage(state, scope, ResultCreditStage::RawRetained, raw_bytes);
+    reserve_bytes(state, scope, decoded_bytes, ResourceClass::Data);
+    add_result_stage(state, scope, ResultCreditStage::DecodeReserved, combined);
+    Ok(())
+}
+
 fn reserve_result_fetch_bytes(
     state: &mut State,
     config: &ResourceConfig,
@@ -472,6 +539,46 @@ fn register_protocol_waiter(
     state.nodes.get_mut(&scope.id).unwrap().resource_waiters += 1;
     state.record_waiting_peak();
     Ok(ProtocolWaitRegistration {
+        scope: scope.clone(),
+        ticket: Some(ticket),
+    })
+}
+
+fn register_decode_waiter(
+    scope: &WorkScope,
+    state: &mut State,
+    bytes: u64,
+) -> Result<DecodeWaitRegistration, WorkError> {
+    state
+        .nodes
+        .get(&scope.id)
+        .ok_or(WorkError::Released)?
+        .check()?;
+    if state
+        .resource_waiters
+        .decode_by_scope
+        .contains_key(&scope.id)
+    {
+        return Err(WorkError::AlreadyWaitingForResultDecode);
+    }
+    if state.waiting_records() >= scope.inner.config.waiting_limit {
+        return Err(WorkError::Capacity("waiting entries"));
+    }
+    let ticket = state.next_decode_waiter_id()?;
+    state.resource_waiters.decode.insert(
+        ticket,
+        ResultWaiter {
+            scope: scope.id,
+            bytes,
+        },
+    );
+    state
+        .resource_waiters
+        .decode_by_scope
+        .insert(scope.id, ticket);
+    state.nodes.get_mut(&scope.id).unwrap().resource_waiters += 1;
+    state.record_waiting_peak();
+    Ok(DecodeWaitRegistration {
         scope: scope.clone(),
         ticket: Some(ticket),
     })
@@ -765,8 +872,7 @@ fn remove_result_stage(state: &mut State, id: WorkId, stage: ResultCreditStage, 
     scope.set_bytes(stage, scope.bytes(stage) - bytes);
 }
 
-/// Move-only ownership of one result batch's local memory budget. A failed
-/// transition consumes the token and its Drop returns all remaining capacity.
+/// Move-only ownership of one result batch's local memory budget.
 pub struct ResultCredit {
     scope: WorkScope,
     stage: ResultCreditStage,
@@ -776,8 +882,9 @@ pub struct ResultCredit {
     secondary_bytes: u64,
 }
 
-/// A capacity or authority refusal that preserves the existing credit. The
-/// caller may wait and retry without dropping the still-accounted payload.
+/// A result-credit transition refusal that preserves the existing credit. The
+/// caller destroys or transfers the still-accounted payload before releasing
+/// the token, or may retry a capacity-dependent transition.
 pub struct ResultCreditReservationError {
     error: WorkError,
     credit: ResultCredit,
@@ -838,16 +945,21 @@ impl ResultCredit {
 
     /// Record the exact bytes returned by the Worker. Unused fetch capacity is
     /// released only after the fetch completes.
-    pub fn retain_raw(mut self, actual_bytes: u64) -> Result<Self, WorkError> {
-        self.require(
+    pub fn retain_raw(mut self, actual_bytes: u64) -> Result<Self, ResultCreditReservationError> {
+        if let Err(error) = self.require(
             ResultCreditStage::InFlightRaw,
             ResultCreditStage::RawRetained,
-        )?;
+        ) {
+            return Err(Self::reservation_error(error, self));
+        }
         if actual_bytes == 0 || actual_bytes > self.primary_bytes {
-            return Err(WorkError::Capacity("invalid raw result bytes"));
+            return Err(Self::reservation_error(
+                WorkError::Capacity("invalid raw result bytes"),
+                self,
+            ));
         }
         let reserved = self.primary_bytes;
-        self.scope.inner.update_facts_silent(|state| {
+        let result = self.scope.inner.update_facts_silent(|state| {
             checked_result_stage_add(
                 state,
                 self.scope.id,
@@ -882,7 +994,10 @@ impl ResultCredit {
                 actual_bytes,
             );
             Ok(())
-        })?;
+        });
+        if let Err(error) = result {
+            return Err(Self::reservation_error(error, self));
+        }
         if actual_bytes < reserved {
             self.scope.inner.notify_capacity_available();
         }
@@ -916,38 +1031,17 @@ impl ResultCredit {
                 self,
             ));
         }
-        let Some(combined) = self.primary_bytes.checked_add(bytes) else {
-            return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
-        };
         let result = self.scope.inner.update_facts_silent(|state| {
-            check_capacity(
+            if !state.resource_waiters.decode.is_empty() {
+                return Err(WorkError::Capacity("decode reservation queue"));
+            }
+            reserve_decode_bytes(
                 state,
                 &self.scope.inner.resource_config,
                 self.scope.id,
-                bytes,
-                ResourceClass::Data,
-            )?;
-            checked_result_stage_add(
-                state,
-                self.scope.id,
-                ResultCreditStage::DecodeReserved,
-                combined,
-            )?;
-
-            remove_result_stage(
-                state,
-                self.scope.id,
-                ResultCreditStage::RawRetained,
                 self.primary_bytes,
-            );
-            reserve_bytes(state, self.scope.id, bytes, ResourceClass::Data);
-            add_result_stage(
-                state,
-                self.scope.id,
-                ResultCreditStage::DecodeReserved,
-                combined,
-            );
-            Ok(())
+                bytes,
+            )
         });
         if let Err(error) = result {
             return Err(Self::reservation_error(error, self));
@@ -957,20 +1051,197 @@ impl ResultCredit {
         Ok(self)
     }
 
+    /// Reserve decoded-output bytes in FIFO order while retaining the raw
+    /// credit. At most one decode wait may be registered for a scope. The queue
+    /// head checks and charges capacity under the authority lock, so a direct
+    /// reservation or a later waiter cannot bypass it. Cancellation, timeout,
+    /// Drop, and every error remove the registration without consuming the
+    /// original token.
+    pub async fn reserve_decode_when_available(
+        mut self,
+        authority: &LocalResourceAuthority,
+        bytes: u64,
+    ) -> Result<Self, ResultCreditReservationError> {
+        if let Err(error) = self.require(
+            ResultCreditStage::RawRetained,
+            ResultCreditStage::DecodeReserved,
+        ) {
+            return Err(Self::reservation_error(error, self));
+        }
+        if let Err(error) = self.scope.check() {
+            return Err(Self::reservation_error(error, self));
+        }
+        if !Arc::ptr_eq(&authority.inner, &self.scope.inner) {
+            return Err(Self::reservation_error(WorkError::ForeignAuthority, self));
+        }
+        if bytes == 0 {
+            return Err(Self::reservation_error(
+                WorkError::Capacity("zero-byte decode reservation"),
+                self,
+            ));
+        }
+        let Some(combined) = self.primary_bytes.checked_add(bytes) else {
+            return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
+        };
+        let config = &self.scope.inner.resource_config;
+        let data_limit = config.total_bytes - config.control_bytes;
+        if combined > config.per_scope_bytes || combined > data_limit {
+            return Err(Self::reservation_error(
+                WorkError::Capacity("unrepresentable decode allocation"),
+                self,
+            ));
+        }
+        let cancellation = match self.scope.cancellation() {
+            Ok(cancellation) => cancellation,
+            Err(error) => return Err(Self::reservation_error(error, self)),
+        };
+        let capacity_deadline = match tokio::time::Instant::now()
+            .checked_add(self.scope.inner.config.capacity_wait_timeout)
+        {
+            Some(deadline) => deadline,
+            None => {
+                return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
+            }
+        };
+        let wait_deadline = cancellation
+            .deadline()
+            .map_or(capacity_deadline, |deadline| {
+                deadline.min(capacity_deadline)
+            });
+
+        let start = self.scope.inner.update_facts(|state| {
+            state
+                .nodes
+                .get(&self.scope.id)
+                .ok_or(WorkError::Released)?
+                .check()?;
+            if tokio::time::Instant::now() >= wait_deadline {
+                return Err(WorkError::CapacityWaitTimeout);
+            }
+            if state.resource_waiters.decode.is_empty() {
+                match reserve_decode_bytes(
+                    state,
+                    &self.scope.inner.resource_config,
+                    self.scope.id,
+                    self.primary_bytes,
+                    bytes,
+                ) {
+                    Ok(()) => return Ok(None),
+                    Err(WorkError::Capacity(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            register_decode_waiter(&self.scope, state, bytes).map(Some)
+        });
+        let mut registration = match start {
+            Ok(None) => {
+                self.stage = ResultCreditStage::DecodeReserved;
+                self.secondary_bytes = bytes;
+                return Ok(self);
+            }
+            Ok(Some(registration)) => registration,
+            Err(error) => return Err(Self::reservation_error(error, self)),
+        };
+
+        let inner = Arc::clone(&self.scope.inner);
+        let timeout = tokio::time::sleep_until(wait_deadline);
+        let cancelled = cancellation.cancelled();
+        tokio::pin!(timeout, cancelled);
+        loop {
+            let changed = inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Err(error) = self.scope.check() {
+                return Err(Self::reservation_error(error, self));
+            }
+            if tokio::time::Instant::now() >= wait_deadline {
+                return Err(Self::reservation_error(
+                    WorkError::CapacityWaitTimeout,
+                    self,
+                ));
+            }
+
+            let grant = inner.update_facts_silent(|state| {
+                let ticket = registration
+                    .ticket
+                    .expect("live decode wait owns its queue ticket");
+                let waiter = state
+                    .resource_waiters
+                    .decode
+                    .get(&ticket)
+                    .ok_or(WorkError::Released)?;
+                debug_assert_eq!((waiter.scope, waiter.bytes), (self.scope.id, bytes));
+                if state.resource_waiters.decode.keys().next().copied() != Some(ticket) {
+                    return Ok(false);
+                }
+                state
+                    .nodes
+                    .get(&self.scope.id)
+                    .ok_or(WorkError::Released)?
+                    .check()?;
+                if tokio::time::Instant::now() >= wait_deadline {
+                    return Err(WorkError::CapacityWaitTimeout);
+                }
+                match reserve_decode_bytes(
+                    state,
+                    &self.scope.inner.resource_config,
+                    self.scope.id,
+                    self.primary_bytes,
+                    bytes,
+                ) {
+                    Ok(()) => {
+                        registration.remove_locked(state);
+                        Ok(true)
+                    }
+                    Err(WorkError::Capacity(_)) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            });
+            match grant {
+                Ok(true) => {
+                    inner.notify_capacity_available();
+                    self.stage = ResultCreditStage::DecodeReserved;
+                    self.secondary_bytes = bytes;
+                    return Ok(self);
+                }
+                Ok(false) => {}
+                Err(error) => return Err(Self::reservation_error(error, self)),
+            }
+
+            tokio::select! {
+                _ = changed => {},
+                _ = &mut timeout => {},
+                reason = &mut cancelled => {
+                    return Err(Self::reservation_error(WorkError::Cancelled(reason), self));
+                }
+            }
+        }
+    }
+
     /// Publish decoded output and release its raw predecessor in one ledger
     /// update.
-    pub fn queue_decoded(mut self, actual_bytes: u64) -> Result<Self, WorkError> {
-        self.require(
+    pub fn queue_decoded(
+        mut self,
+        actual_bytes: u64,
+    ) -> Result<Self, ResultCreditReservationError> {
+        if let Err(error) = self.require(
             ResultCreditStage::DecodeReserved,
             ResultCreditStage::DecodedQueued,
-        )?;
+        ) {
+            return Err(Self::reservation_error(error, self));
+        }
         if actual_bytes == 0 || actual_bytes > self.secondary_bytes {
-            return Err(WorkError::Capacity("invalid decoded result bytes"));
+            return Err(Self::reservation_error(
+                WorkError::Capacity("invalid decoded result bytes"),
+                self,
+            ));
         }
         let raw = self.primary_bytes;
         let reserved = self.secondary_bytes;
-        let combined = raw + reserved;
-        self.scope.inner.update_facts_silent(|state| {
+        let Some(combined) = raw.checked_add(reserved) else {
+            return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
+        };
+        let result = self.scope.inner.update_facts_silent(|state| {
             checked_result_stage_add(
                 state,
                 self.scope.id,
@@ -1005,7 +1276,10 @@ impl ResultCredit {
                 actual_bytes,
             );
             Ok(())
-        })?;
+        });
+        if let Err(error) = result {
+            return Err(Self::reservation_error(error, self));
+        }
         self.scope.inner.notify_capacity_available();
         self.stage = ResultCreditStage::DecodedQueued;
         self.primary_bytes = actual_bytes;
