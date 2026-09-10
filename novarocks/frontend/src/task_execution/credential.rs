@@ -187,8 +187,13 @@ pub struct CredentialRefreshOwner {
     participants: BTreeSet<QueryContextRef>,
     /// The highest epoch each context has acknowledged.
     accepted: BTreeMap<QueryContextRef, CredentialEpoch>,
-    /// Contexts holding a released, not-yet-settled request for `minted`.
-    in_flight: BTreeSet<QueryContextRef>,
+    /// The exact released request each context has not yet settled.
+    ///
+    /// Retaining the whole immutable request is load-bearing: after an unknown
+    /// outcome, a replay must keep the original operation id as well as the
+    /// epoch and confidential material. Remembering only the context would
+    /// make it possible to mint a different operation for the same epoch.
+    in_flight: BTreeMap<QueryContextRef, UpdateQueryContext>,
     /// When the minted epoch stops being usable.
     hard_deadline: Option<MonotonicInstant>,
 }
@@ -227,7 +232,7 @@ impl CredentialRefreshOwner {
             material: Arc::clone(initial.material()),
             participants,
             accepted,
-            in_flight: BTreeSet::new(),
+            in_flight: BTreeMap::new(),
             hard_deadline: None,
         }
     }
@@ -303,7 +308,7 @@ impl CredentialRefreshOwner {
         if !self.participants.contains(&context) {
             return Ok(None);
         }
-        if self.in_flight.contains(&context) {
+        if self.in_flight.contains_key(&context) {
             return Ok(None);
         }
         if self
@@ -313,20 +318,20 @@ impl CredentialRefreshOwner {
         {
             return Ok(None);
         }
-        self.in_flight.insert(context);
-        Ok(Some(self.request_for(context)))
+        let request = self.request_for(context);
+        self.in_flight.insert(context, request.clone());
+        Ok(Some(request))
     }
 
     /// The identical request again, after a genuinely unknown outcome.
     ///
     /// It is byte-for-byte the request that was already sent, including the
     /// same material, because a backend recognises a replay only by finding
-    /// the same epoch carrying the same content. A newly refreshed secret at
-    /// the same epoch would be a conflict, not a retry.
+    /// the same operation id and epoch carrying the same content. A newly
+    /// identified operation or refreshed secret at the same epoch would be a
+    /// different request, not a retry.
     pub fn retry(&self, context: QueryContextRef) -> Option<UpdateQueryContext> {
-        self.in_flight
-            .contains(&context)
-            .then(|| self.request_for(context))
+        self.in_flight.get(&context).cloned()
     }
 
     fn request_for(&self, context: QueryContextRef) -> UpdateQueryContext {
@@ -403,7 +408,7 @@ mod tests {
 
     use novarocks_execution::task_execution::{
         ConfidentialContent, CredentialEpoch, CredentialLeaseId, CredentialUpdate,
-        QueryContextDomainUpdate, QueryContextRef, UpdateQueryContext,
+        QueryContextDomainUpdate, QueryContextRef, TaskOperationId, UpdateQueryContext,
     };
     use novarocks_query_application::coordination::MonotonicInstant;
     use novarocks_types::identity::{
@@ -454,6 +459,20 @@ mod tests {
             },
             other => panic!("expected an advance, got {other:?}"),
         }
+    }
+
+    fn operation_id_of(request: &UpdateQueryContext) -> TaskOperationId {
+        request.envelope().operation_id()
+    }
+
+    fn material_of(request: &UpdateQueryContext) -> &Arc<dyn ConfidentialContent> {
+        let UpdateQueryContext::AdvanceDomain(advance) = request else {
+            panic!("expected an advance")
+        };
+        let QueryContextDomainUpdate::Credential(update) = advance.domain() else {
+            panic!("expected a credential domain")
+        };
+        update.material()
     }
 
     #[test]
@@ -558,8 +577,17 @@ mod tests {
         let again = owner
             .retry(only)
             .expect("an unknown outcome may be retried");
+        assert_eq!(
+            operation_id_of(&again),
+            operation_id_of(&first),
+            "an unknown outcome replays the original operation identity"
+        );
         assert_eq!(epoch_of(&first), epoch);
         assert_eq!(epoch_of(&again), epoch);
+        assert!(
+            Arc::ptr_eq(material_of(&first), material_of(&again)),
+            "the replay retains the exact confidential material"
+        );
 
         owner.accept(only, epoch);
         assert!(

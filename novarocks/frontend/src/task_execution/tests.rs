@@ -4018,6 +4018,41 @@ fn credential_ack(
         .expect("the state machine releases the permit");
 }
 
+/// Reports that transport lost the outcome of one credential advance.
+fn credential_unknown_ack(
+    execution: &mut QueryTaskExecution,
+    observer: &dyn crate::task_execution::round::AcknowledgementObserver,
+    intent: &OperationIntent,
+) {
+    let ack = OperationAcknowledgement::transport_unknown(
+        intent.operation_id(),
+        OperationKind::UpdateQueryContext,
+    );
+    observer
+        .observe_acknowledgement(&ack)
+        .expect("the rotation owner retains an unknown advance");
+    execution
+        .acknowledge(&ack)
+        .expect("the state machine releases the unknown transport slot");
+}
+
+fn credential_material(intent: &OperationIntent) -> &Arc<dyn ConfidentialContent> {
+    use novarocks_execution::task_execution::operation::{
+        QueryContextDomainUpdate, UpdateQueryContext,
+    };
+
+    let OperationIntent::UpdateQueryContext(request) = intent else {
+        panic!("a credential advance is a context update")
+    };
+    let UpdateQueryContext::AdvanceDomain(advance) = request.as_ref() else {
+        panic!("a rotation is an advance")
+    };
+    let QueryContextDomainUpdate::Credential(update) = advance.domain() else {
+        panic!("a rotation carries the credential domain")
+    };
+    update.material()
+}
+
 fn is_credential_advance(intent: &OperationIntent) -> bool {
     use novarocks_execution::task_execution::operation::{
         QueryContextDomainUpdate, UpdateQueryContext,
@@ -4118,7 +4153,43 @@ fn a_credential_rotation_reaches_every_context_and_is_reported_once() {
     );
     assert_eq!(pump.rotations_applied(), 0, "nothing has accepted it yet");
 
-    for intent in &advances {
+    // Lose one acknowledgement and prove the complete immutable request is
+    // replayed. A fresh operation id at the same epoch is not a retry: it is a
+    // second claim on one domain transition.
+    credential_unknown_ack(
+        &mut harness.execution,
+        pump.as_ref() as &dyn AcknowledgementObserver,
+        &advances[0],
+    );
+    driver
+        .drive(&mut harness.execution)
+        .expect("an unknown advance is retried");
+    let retry = harness
+        .released()
+        .into_iter()
+        .filter(is_credential_advance)
+        .collect::<Vec<_>>();
+    assert_eq!(retry.len(), 1, "only the unknown advance is replayed");
+    assert_eq!(
+        retry[0].operation_id(),
+        advances[0].operation_id(),
+        "the retry keeps the original operation identity"
+    );
+    assert!(
+        Arc::ptr_eq(
+            credential_material(&retry[0]),
+            credential_material(&advances[0])
+        ),
+        "the retry keeps the exact credential material"
+    );
+
+    credential_ack(
+        &mut harness.execution,
+        pump.as_ref() as &dyn AcknowledgementObserver,
+        &retry[0],
+        OperationOutcome::Accepted,
+    );
+    for intent in &advances[1..] {
         credential_ack(
             &mut harness.execution,
             pump.as_ref() as &dyn AcknowledgementObserver,
@@ -4191,6 +4262,84 @@ fn a_rotation_that_cannot_be_accepted_before_its_hard_deadline_fails_the_attempt
     assert!(
         error.to_string().contains("stopped being usable"),
         "{error}"
+    );
+}
+
+#[test]
+fn a_provider_success_settled_at_the_hard_deadline_is_not_installed() {
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::round::TurnPump;
+
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let (storage, credential, refresher) = refreshable_credential_storage_with_refresher(60_000);
+    let storage_lease_id = storage.refreshable()[0].0;
+    let before = storage
+        .refresh_source(storage_lease_id)
+        .expect("the lease is refreshable")
+        .0;
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts),
+        Arc::clone(&storage),
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
+    )
+    .expect("a refreshable lease");
+    let mut driver = Arc::clone(&pump);
+
+    driver
+        .drive(&mut harness.execution)
+        .expect("the first turn schedules the soft deadline");
+    clock.advance(Duration::from_secs(120));
+    driver
+        .drive(&mut harness.execution)
+        .expect("the due turn starts the provider call");
+    for _ in 0..600 {
+        if pump.stage_provider_outcome_for_test() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        pump.stage_provider_outcome_for_test(),
+        "the successful provider outcome must be present before time advances"
+    );
+    assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Settlement, not the instant the blocking provider returned, owns the
+    // mutation. Once that turn reaches the hard deadline the successful value
+    // is stale and must be discarded before it can alter either authority.
+    let hard_deadline = pump
+        .provider_hard_deadline_for_test()
+        .expect("the finished provider call retains its hard deadline");
+    clock.set(hard_deadline.since_origin());
+    let error = driver
+        .drive(&mut harness.execution)
+        .expect_err("a late provider success fails closed");
+    assert!(error.to_string().contains("answered after"), "{error}");
+
+    let after = storage
+        .refresh_source(storage_lease_id)
+        .expect("the original lease remains installed")
+        .0;
+    assert_eq!(after.epoch(), before.epoch(), "storage epoch must not move");
+    assert_eq!(
+        after.not_after_unix_ms(),
+        before.not_after_unix_ms(),
+        "storage material must not be replaced"
+    );
+    assert_eq!(
+        pump.minted_epoch(),
+        CredentialEpoch::FIRST,
+        "the credential domain epoch must not be minted"
     );
 }
 

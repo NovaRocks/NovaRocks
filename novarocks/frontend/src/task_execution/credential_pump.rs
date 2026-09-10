@@ -95,6 +95,9 @@ struct VendingRound {
     /// When the epoch being replaced stops being usable.
     hard_deadline: MonotonicInstant,
     outcome: ConnectorBlockingIoJob<VendOutcome>,
+    /// A completed outcome staged by deterministic unit tests.
+    #[cfg(test)]
+    staged_outcome: Option<Result<VendOutcome, super::blocking_io::ConnectorBlockingIoError>>,
 }
 
 struct RotationState {
@@ -184,6 +187,42 @@ impl CredentialRotationPump {
             .rotations_applied
     }
 
+    #[cfg(test)]
+    pub(crate) fn minted_epoch(&self) -> CredentialEpoch {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .owner
+            .minted_epoch()
+    }
+
+    /// Moves a completed provider outcome into the serial owner's state.
+    ///
+    /// This exposes no production state transition. It lets a manual-clock
+    /// test prove that the provider has already returned before advancing the
+    /// clock past the hard deadline, without racing the blocking worker.
+    #[cfg(test)]
+    pub(crate) fn stage_provider_outcome_for_test(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(round) = state.vending.as_mut() else {
+            return false;
+        };
+        if round.staged_outcome.is_none() {
+            round.staged_outcome = round.outcome.try_take();
+        }
+        round.staged_outcome.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_hard_deadline_for_test(&self) -> Option<MonotonicInstant> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .vending
+            .as_ref()
+            .map(|round| round.hard_deadline)
+    }
+
     /// Stops rotating and drops the material.
     ///
     /// Called when the attempt is done with its credential. After it the driver
@@ -242,6 +281,12 @@ impl CredentialRotationPump {
             return Ok(0);
         };
         let hard_deadline = round.hard_deadline;
+        #[cfg(test)]
+        let outcome = round
+            .staged_outcome
+            .take()
+            .or_else(|| round.outcome.try_take());
+        #[cfg(not(test))]
         let outcome = round.outcome.try_take();
         let Some(outcome) = outcome else {
             if now >= hard_deadline {
@@ -253,15 +298,13 @@ impl CredentialRotationPump {
             return Ok(0);
         };
         state.vending = None;
+        if now >= hard_deadline {
+            return Err(self.rotation_failed(
+                "the credential provider answered after the credential stopped being usable",
+            ));
+        }
         match outcome {
             Err(error) => {
-                if now >= hard_deadline {
-                    return Err(self.rotation_failed(&format!(
-                        "the credential provider worker failed and the credential stopped being \
-                         usable: {}",
-                        error.detail()
-                    )));
-                }
                 tracing::warn!(
                     execution_id = ?self.execution_id,
                     detail = %error,
@@ -378,6 +421,8 @@ impl CredentialRotationPump {
         state.vending = Some(VendingRound {
             hard_deadline,
             outcome,
+            #[cfg(test)]
+            staged_outcome: None,
         });
         state.next_attempt_at = None;
         Ok(1)
