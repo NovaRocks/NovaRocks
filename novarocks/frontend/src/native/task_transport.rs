@@ -1448,6 +1448,7 @@ const fn outcome_name(outcome: OperationOutcome) -> &'static str {
         OperationOutcome::TerminalRejected => "terminal_rejected",
         OperationOutcome::Gone => "gone",
         OperationOutcome::ResourceExhausted => "resource_exhausted",
+        OperationOutcome::AdmissionTicketStillActive => "admission_ticket_still_active",
     }
 }
 

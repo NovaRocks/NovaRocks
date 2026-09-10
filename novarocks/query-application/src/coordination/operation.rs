@@ -64,7 +64,9 @@ pub fn frontend_action(result: OperationDispatchResult) -> FrontendAction {
     match receipt.outcome() {
         OperationOutcome::Accepted | OperationOutcome::Idempotent => FrontendAction::Settled,
         OperationOutcome::OperationTimedOut => FrontendAction::FailOperationClosed,
-        OperationOutcome::ReleaseNotReady => FrontendAction::RetryAfterProgress,
+        OperationOutcome::ReleaseNotReady | OperationOutcome::AdmissionTicketStillActive => {
+            FrontendAction::RetryAfterProgress
+        }
         OperationOutcome::ContextTerminalReceipt
         | OperationOutcome::Gone
         | OperationOutcome::TerminalRejected => FrontendAction::StopSendingAndReconcile,
@@ -108,6 +110,10 @@ mod tests {
         assert_eq!(
             frontend_action(receipt(OperationOutcome::ResourceExhausted)),
             FrontendAction::FailAttempt
+        );
+        assert_eq!(
+            frontend_action(receipt(OperationOutcome::AdmissionTicketStillActive)),
+            FrontendAction::RetryAfterProgress
         );
     }
 }

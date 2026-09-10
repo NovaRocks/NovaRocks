@@ -505,10 +505,12 @@ impl TaskExecutionRegistry {
                         OperationOutcome::ContextTerminalReceipt
                     }
                     AdmissionTicketAcquisitionRejection::ValidityExceedsWorkerLimit
-                    | AdmissionTicketAcquisitionRejection::ContextAlreadyGranted
                     | AdmissionTicketAcquisitionRejection::OperationReplayConflict
                     | AdmissionTicketAcquisitionRejection::SealedEpoch => {
                         OperationOutcome::InvalidStateOrRequest
+                    }
+                    AdmissionTicketAcquisitionRejection::ContextAlreadyGranted => {
+                        OperationOutcome::AdmissionTicketStillActive
                     }
                 };
                 OperationReceipt::rejected(operation, outcome, rejection.to_string())

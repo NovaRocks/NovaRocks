@@ -1387,6 +1387,34 @@ fn abort_before_establish_fences_a_later_establish_and_create() {
 }
 
 #[test]
+fn a_second_admission_operation_reports_the_still_active_ticket_exactly() {
+    let fixture = Fixture::new();
+    let context = fixture.context(1);
+    let acquire = || {
+        AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context,
+            LeaseValidFor::new(Duration::from_secs(10)).expect("legal ticket validity"),
+            NativeCompatibilityId::new([0x71; 32]),
+            fixture.registry.admission_epoch_capability(),
+        )
+    };
+    let first = fixture
+        .registry
+        .acquire_query_context_admission_ticket(acquire());
+    assert_eq!(first.outcome(), OperationOutcome::Accepted);
+
+    let second = fixture
+        .registry
+        .acquire_query_context_admission_ticket(acquire());
+    assert_eq!(
+        second.outcome(),
+        OperationOutcome::AdmissionTicketStillActive
+    );
+    assert!(second.acknowledgement().is_none());
+}
+
+#[test]
 fn an_establish_conflict_is_reported_rather_than_applied() {
     let fixture = Fixture::new();
     let original = fixture.establish_request(1, LeaseBounds::INITIAL_REQUEST);

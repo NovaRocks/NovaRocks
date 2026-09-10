@@ -949,6 +949,9 @@ enum TaskOperationOutcome {
   // The backend proves it did not apply the operation and the frontend fails
   // the current attempt without retrying it on another process.
   TASK_OPERATION_OUTCOME_COMPATIBILITY_MISMATCH = 17;
+  // Admission found an older unredeemed ticket for the same context. The new
+  // operation created no grant and may retry after bounded backoff.
+  TASK_OPERATION_OUTCOME_ADMISSION_TICKET_STILL_ACTIVE = 18;
 }
 
 // Per plan node, the highest sequence this task has accepted and whether that

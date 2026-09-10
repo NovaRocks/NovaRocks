@@ -74,7 +74,7 @@ fn fetch_result_response_uses_pre_release_reset_tags() {
     let response = novarocks::FetchResultResponse {
         status: Status::Ready as i32,
         message: "ready".to_string(),
-        result_arrow_ipc: b"NRX1".to_vec(),
+        result_arrow_ipc: b"NRX1".to_vec().into(),
         packet_seq: 9,
         eos: true,
     };

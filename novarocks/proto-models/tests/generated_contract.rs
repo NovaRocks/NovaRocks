@@ -1387,6 +1387,7 @@ fn the_operation_outcome_enum_reserves_the_client_only_category() {
         "TASK_OPERATION_OUTCOME_RELEASE_NOT_READY",
         "TASK_OPERATION_OUTCOME_GONE",
         "TASK_OPERATION_OUTCOME_RESOURCE_EXHAUSTED",
+        "TASK_OPERATION_OUTCOME_ADMISSION_TICKET_STILL_ACTIVE",
     ] {
         assert!(
             outcome.values().any(|value| value.name() == expected),
@@ -1514,7 +1515,7 @@ fn admission_ticket_contract_is_exact_and_append_only() {
     let request = pool
         .get_message_by_name("novarocks.AcquireQueryContextAdmissionTicketRequest")
         .expect("admission ticket request descriptor");
-    assert_eq!(request.fields().count(), 3);
+    assert_eq!(request.fields().count(), 4);
     assert_eq!(
         request
             .get_field_by_name("query_context")
@@ -1535,6 +1536,14 @@ fn admission_ticket_contract_is_exact_and_append_only() {
     assert_eq!(compatibility.number(), 3);
     assert!(matches!(
         compatibility.kind(),
+        prost_reflect::Kind::Message(_)
+    ));
+    let admission_epoch = request
+        .get_field_by_name("admission_epoch_capability")
+        .expect("admission epoch capability");
+    assert_eq!(admission_epoch.number(), 4);
+    assert!(matches!(
+        admission_epoch.kind(),
         prost_reflect::Kind::Message(_)
     ));
 

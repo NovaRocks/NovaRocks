@@ -15,18 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
+use novarocks_execution_contract::{
+    AcquireQueryContextAdmissionTicket, EstablishQueryContext, QueryContextRef,
+};
+use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::QueryExecutionId;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::actor_state::{ActorStateError, AttemptCapability, LogicalExecutionState};
-use super::{ExecutionEffect, ExecutionPhase, LogicalConclusion, LogicalOutputMode, RecoveryMode};
+use super::{
+    AdmissionIssueDisposition, AdmissionIssueReceipt, AdmissionIssueSettlement,
+    EstablishIssueError, EstablishIssueLedger, EstablishIssuePermit, EstablishIssueSnapshot,
+    ExecutionEffect, ExecutionPhase, LogicalConclusion, LogicalOutputMode, MonotonicInstant,
+    RecoveryMode,
+};
 
 /// Immutable identity of one actor-owned attempt activation generation.
 ///
@@ -42,6 +53,37 @@ pub struct AttemptActivationIdentity {
 /// Opaque process-local identity of one logical execution actor instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalExecutionActorId(u64);
+
+/// Actor-owned monotonic time authority. Callers never provide a current time
+/// or derive an admission-ticket expiry themselves.
+pub trait LogicalExecutionClock: fmt::Debug + Send + Sync {
+    fn now(&self) -> MonotonicInstant;
+}
+
+#[derive(Debug)]
+pub struct ProcessLogicalExecutionClock {
+    origin: Instant,
+}
+
+impl ProcessLogicalExecutionClock {
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for ProcessLogicalExecutionClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogicalExecutionClock for ProcessLogicalExecutionClock {
+    fn now(&self) -> MonotonicInstant {
+        MonotonicInstant::from_origin(self.origin.elapsed())
+    }
+}
 
 impl AttemptActivationIdentity {
     pub const fn actor(self) -> LogicalExecutionActorId {
@@ -218,6 +260,72 @@ impl RunningAttemptPermit {
         }
     }
 
+    /// Freezes the actor's own local time immediately before the admission
+    /// transport is issued. Exact transport replay keeps this receipt.
+    pub async fn begin_admission_issue(
+        &self,
+        request_to_issue: AcquireQueryContextAdmissionTicket,
+    ) -> Result<AdmissionIssueReceipt, LogicalExecutionActorError> {
+        request(self.mailbox(), |reply| ActorCommand::BeginAdmissionIssue {
+            activation: self.identity(),
+            request: request_to_issue,
+            reply,
+        })
+        .await
+    }
+
+    /// Records one exact Worker admission grant in the actor-owned Establish
+    /// ledger before any request can be authorized from it.
+    pub async fn settle_admission_issue(
+        &self,
+        admission_issue: AdmissionIssueReceipt,
+        settlement: AdmissionIssueSettlement,
+    ) -> Result<AdmissionIssueDisposition, LogicalExecutionActorError> {
+        request(self.mailbox(), |reply| ActorCommand::SettleAdmissionIssue {
+            activation: self.identity(),
+            admission_issue,
+            settlement,
+            reply,
+        })
+        .await
+    }
+
+    /// Authorizes one exact Establish and returns its move-only pre-transport
+    /// permit. Replays must retain the same request allocation.
+    pub async fn authorize_establish(
+        &self,
+        request_to_issue: Arc<EstablishQueryContext>,
+        native_compatibility_id: NativeCompatibilityId,
+    ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
+        request(self.mailbox(), |reply| ActorCommand::AuthorizeEstablish {
+            activation: self.identity(),
+            request: request_to_issue,
+            native_compatibility_id,
+            reply,
+        })
+        .await
+    }
+
+    /// Re-authorizes the actor-retained exact request after a definitely-unsent
+    /// or transport-unknown outcome. The caller cannot replace its payload.
+    pub async fn reauthorize_establish(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
+        request(self.mailbox(), |reply| ActorCommand::ReauthorizeEstablish {
+            activation: self.identity(),
+            context,
+            reply,
+        })
+        .await
+    }
+
+    fn mailbox(&self) -> &mpsc::Sender<ActorCommand> {
+        self.mailbox_liveness
+            .as_ref()
+            .expect("live running permit retains actor liveness")
+    }
+
     fn into_parts(
         mut self,
     ) -> (
@@ -260,24 +368,41 @@ fn identity_of(capability: &AttemptCapability) -> AttemptActivationIdentity {
 /// T08 first connects a single, completion-only attempt. Recovery and result
 /// delivery remain reducer capabilities until their actor-owned effect gates
 /// are connected; callers cannot select those modes prematurely.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct LogicalExecutionActorConfig {
     initial_execution: QueryExecutionId,
     effect: ExecutionEffect,
     mailbox_capacity: NonZeroUsize,
+    required_establish_contexts: Vec<QueryContextRef>,
+    max_admission_issues_per_context: NonZeroUsize,
+    max_establish_authorizations_per_context: NonZeroUsize,
+    clock: Arc<dyn LogicalExecutionClock>,
 }
 
 impl LogicalExecutionActorConfig {
-    pub const fn single_attempt_completion(
+    pub fn single_attempt_completion(
         initial_execution: QueryExecutionId,
         effect: ExecutionEffect,
         mailbox_capacity: NonZeroUsize,
+        required_establish_contexts: Vec<QueryContextRef>,
+        max_admission_issues_per_context: NonZeroUsize,
+        max_establish_authorizations_per_context: NonZeroUsize,
     ) -> Self {
         Self {
             initial_execution,
             effect,
             mailbox_capacity,
+            required_establish_contexts,
+            max_admission_issues_per_context,
+            max_establish_authorizations_per_context,
+            clock: Arc::new(ProcessLogicalExecutionClock::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn LogicalExecutionClock>) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
@@ -291,10 +416,14 @@ pub enum LogicalExecutionActorError {
     WrongPhase,
     AlreadyConcluded,
     InvariantViolation,
+    Establish(EstablishIssueError),
 }
 
 impl fmt::Display for LogicalExecutionActorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::Establish(error) = self {
+            return write!(formatter, "Establish issue protocol failed: {error}");
+        }
         formatter.write_str(match self {
             Self::MailboxClosed => "logical execution actor mailbox is closed",
             Self::StaleAuthority => "attempt authority belongs to another actor or generation",
@@ -302,6 +431,7 @@ impl fmt::Display for LogicalExecutionActorError {
             Self::WrongPhase => "logical execution is in the wrong phase",
             Self::AlreadyConcluded => "logical execution has already concluded",
             Self::InvariantViolation => "logical execution actor invariant was violated",
+            Self::Establish(_) => unreachable!("handled above"),
         })
     }
 }
@@ -333,12 +463,19 @@ impl From<ActorStateError> for LogicalExecutionActorError {
     }
 }
 
+impl From<EstablishIssueError> for LogicalExecutionActorError {
+    fn from(value: EstablishIssueError) -> Self {
+        Self::Establish(value)
+    }
+}
+
 /// Immutable observation of the actor-owned state. It carries no mutation
 /// authority and is suitable for diagnostics and deterministic supervision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalExecutionActorSnapshot {
     pub phase: ExecutionPhase,
     pub conclusion: Option<LogicalConclusion>,
+    pub establish_error: Option<EstablishIssueError>,
 }
 
 type ActorReply<T> = oneshot::Sender<Result<T, LogicalExecutionActorError>>;
@@ -363,6 +500,32 @@ enum ActorCommand {
     Failed {
         permit: RunningAttemptPermit,
         reply: ActorReply<LogicalConclusion>,
+    },
+    BeginAdmissionIssue {
+        activation: AttemptActivationIdentity,
+        request: AcquireQueryContextAdmissionTicket,
+        reply: ActorReply<AdmissionIssueReceipt>,
+    },
+    SettleAdmissionIssue {
+        activation: AttemptActivationIdentity,
+        admission_issue: AdmissionIssueReceipt,
+        settlement: AdmissionIssueSettlement,
+        reply: ActorReply<AdmissionIssueDisposition>,
+    },
+    AuthorizeEstablish {
+        activation: AttemptActivationIdentity,
+        request: Arc<EstablishQueryContext>,
+        native_compatibility_id: NativeCompatibilityId,
+        reply: ActorReply<EstablishIssuePermit>,
+    },
+    ReauthorizeEstablish {
+        activation: AttemptActivationIdentity,
+        context: QueryContextRef,
+        reply: ActorReply<EstablishIssuePermit>,
+    },
+    EstablishSnapshot {
+        context: QueryContextRef,
+        reply: ActorReply<Option<EstablishIssueSnapshot>>,
     },
     Snapshot {
         reply: ActorReply<LogicalExecutionActorSnapshot>,
@@ -438,6 +601,17 @@ impl LogicalExecutionActor {
     ) -> Result<LogicalExecutionActorSnapshot, LogicalExecutionActorError> {
         request(&self.sender, |reply| ActorCommand::Snapshot { reply }).await
     }
+
+    pub async fn establish_snapshot(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<Option<EstablishIssueSnapshot>, LogicalExecutionActorError> {
+        request(&self.sender, |reply| ActorCommand::EstablishSnapshot {
+            context,
+            reply,
+        })
+        .await
+    }
 }
 
 async fn request<T>(
@@ -501,9 +675,34 @@ pub fn spawn_logical_execution_actor(
         settled: AtomicBool::new(false),
     });
     let (sender, receiver) = mpsc::channel(config.mailbox_capacity.get());
+    let required_contexts: BTreeSet<_> =
+        config.required_establish_contexts.iter().copied().collect();
+    if required_contexts.len() != config.required_establish_contexts.len() {
+        return Err(LogicalExecutionActorError::InvariantViolation);
+    }
+    if required_contexts
+        .iter()
+        .any(|context| context.query_execution_id() != config.initial_execution)
+    {
+        return Err(LogicalExecutionActorError::WrongExecution);
+    }
+    let establish = EstablishIssueLedger::new(
+        required_contexts,
+        config.max_admission_issues_per_context,
+        config.max_establish_authorizations_per_context,
+    );
+    let clock = Arc::clone(&config.clock);
     let actor_lifetime = Arc::clone(&lifetime);
     let join = runtime.spawn(async move {
-        run_actor(&mut state, receiver, abandoned_rx, actor_lifetime).await;
+        run_actor(
+            &mut state,
+            receiver,
+            abandoned_rx,
+            actor_lifetime,
+            establish,
+            clock,
+        )
+        .await;
     });
     Ok((
         LogicalExecutionActorOwner {
@@ -526,9 +725,13 @@ async fn run_actor(
     mut receiver: mpsc::Receiver<ActorCommand>,
     mut abandoned: watch::Receiver<bool>,
     lifetime: Arc<PermitLifetime>,
+    mut establish: EstablishIssueLedger,
+    clock: Arc<dyn LogicalExecutionClock>,
 ) {
+    let mut establish_error = None;
     loop {
         if *abandoned.borrow() {
+            establish.revoke_issue_authority();
             conclude_abandoned(state);
             lifetime.settle();
         }
@@ -536,17 +739,53 @@ async fn run_actor(
             biased;
             changed = abandoned.changed(), if !*abandoned.borrow() => {
                 if changed.is_ok() && *abandoned.borrow() {
+                    establish.revoke_issue_authority();
                     conclude_abandoned(state);
                     lifetime.settle();
+                }
+            }
+            result = establish.apply_next_event() => {
+                match result {
+                    Ok(()) if establish.has_worker_rejection() => {
+                        establish_error.get_or_insert(EstablishIssueError::EstablishRejected);
+                        establish.revoke_issue_authority();
+                        conclude_failed(state);
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        establish_error.get_or_insert(error);
+                        establish.revoke_issue_authority();
+                        conclude_failed(state);
+                    }
                 }
             }
             command = receiver.recv() => {
                 let Some(command) = command else {
                     return;
                 };
-                handle_command(state, command);
+                handle_command(
+                    state,
+                    &mut establish,
+                    &mut establish_error,
+                    clock.as_ref(),
+                    command,
+                );
             }
         }
+    }
+}
+
+fn conclude_failed(state: &mut LogicalExecutionState) {
+    if state.conclusion().is_some() {
+        return;
+    }
+    let execution = match state.phase() {
+        ExecutionPhase::Instantiating { execution, .. }
+        | ExecutionPhase::Running { execution, .. } => execution,
+        _ => return,
+    };
+    if let Ok(capability) = state.attempt_capability(execution) {
+        let _ = state.conclude(&capability, LogicalConclusion::Failed);
     }
 }
 
@@ -564,7 +803,13 @@ fn conclude_abandoned(state: &mut LogicalExecutionState) {
     }
 }
 
-fn handle_command(state: &mut LogicalExecutionState, command: ActorCommand) {
+fn handle_command(
+    state: &mut LogicalExecutionState,
+    establish: &mut EstablishIssueLedger,
+    establish_error: &mut Option<EstablishIssueError>,
+    clock: &dyn LogicalExecutionClock,
+    command: ActorCommand,
+) {
     match command {
         ActorCommand::Activate { readiness, reply } => {
             let (capability, lifetime, mailbox_liveness) = readiness.into_parts();
@@ -592,24 +837,122 @@ fn handle_command(state: &mut LogicalExecutionState, command: ActorCommand) {
                 reply,
             );
         }
-        ActorCommand::Completed { permit, reply } => {
-            settle_terminal(
-                state,
-                permit.into_parts(),
-                LogicalConclusion::Succeeded,
-                reply,
-            );
-        }
+        ActorCommand::Completed { permit, reply } => match establish.ensure_success_ready() {
+            Ok(()) => {
+                establish.revoke_issue_authority();
+                settle_terminal(
+                    state,
+                    permit.into_parts(),
+                    LogicalConclusion::Succeeded,
+                    reply,
+                );
+            }
+            Err(error) => {
+                establish_error.get_or_insert(error);
+                establish.revoke_issue_authority();
+                settle_terminal_with_error(state, permit.into_parts(), error.into(), reply);
+            }
+        },
         ActorCommand::Failed { permit, reply } => {
+            establish.revoke_issue_authority();
             settle_terminal(state, permit.into_parts(), LogicalConclusion::Failed, reply);
+        }
+        ActorCommand::BeginAdmissionIssue {
+            activation,
+            request,
+            reply,
+        } => {
+            let result = verify_running_activation(state, activation)
+                .and_then(|()| (*establish_error).map_or(Ok(()), |error| Err(error.into())))
+                .and_then(|()| {
+                    establish
+                        .begin_admission_issue(activation, request, clock.now())
+                        .map_err(Into::into)
+                });
+            let _ = reply.send(result);
+        }
+        ActorCommand::SettleAdmissionIssue {
+            activation,
+            admission_issue,
+            settlement,
+            reply,
+        } => {
+            let result = verify_running_activation(state, activation)
+                .and_then(|()| (*establish_error).map_or(Ok(()), |error| Err(error.into())))
+                .and_then(|()| {
+                    establish
+                        .settle_admission_issue(
+                            activation,
+                            admission_issue,
+                            settlement,
+                            clock.now(),
+                        )
+                        .map_err(Into::into)
+                });
+            if let Err(LogicalExecutionActorError::Establish(error)) = result {
+                establish_error.get_or_insert(error);
+                establish.revoke_issue_authority();
+                conclude_failed(state);
+            }
+            let _ = reply.send(result);
+        }
+        ActorCommand::AuthorizeEstablish {
+            activation,
+            request,
+            native_compatibility_id,
+            reply,
+        } => {
+            let result = verify_running_activation(state, activation)
+                .and_then(|()| (*establish_error).map_or(Ok(()), |error| Err(error.into())))
+                .and_then(|()| {
+                    establish
+                        .authorize_issue(activation, request, native_compatibility_id, clock.now())
+                        .map_err(Into::into)
+                });
+            let _ = reply.send(result);
+        }
+        ActorCommand::ReauthorizeEstablish {
+            activation,
+            context,
+            reply,
+        } => {
+            let result = verify_running_activation(state, activation)
+                .and_then(|()| (*establish_error).map_or(Ok(()), |error| Err(error.into())))
+                .and_then(|()| {
+                    establish
+                        .reauthorize_issue(activation, context, clock.now())
+                        .map_err(Into::into)
+                });
+            let _ = reply.send(result);
+        }
+        ActorCommand::EstablishSnapshot { context, reply } => {
+            let _ = reply.send(Ok(establish.snapshot(context)));
         }
         ActorCommand::Snapshot { reply } => {
             let _ = reply.send(Ok(LogicalExecutionActorSnapshot {
                 phase: state.phase(),
                 conclusion: state.conclusion(),
+                establish_error: *establish_error,
             }));
         }
     }
+}
+
+fn verify_running_activation(
+    state: &LogicalExecutionState,
+    activation: AttemptActivationIdentity,
+) -> Result<(), LogicalExecutionActorError> {
+    if !matches!(
+        state.phase(),
+        ExecutionPhase::Running { execution, .. } if execution == activation.execution()
+    ) {
+        return Err(LogicalExecutionActorError::WrongPhase);
+    }
+    let current = state.attempt_capability(activation.execution())?;
+    if identity_of(&current) != activation {
+        return Err(LogicalExecutionActorError::StaleAuthority);
+    }
+    Ok(())
 }
 
 fn settle_terminal(
@@ -634,6 +977,28 @@ fn settle_terminal(
     let _ = reply.send(result);
 }
 
+fn settle_terminal_with_error(
+    state: &mut LogicalExecutionState,
+    (capability, lifetime, _mailbox_liveness): (
+        AttemptCapability,
+        Arc<PermitLifetime>,
+        mpsc::Sender<ActorCommand>,
+    ),
+    error: LogicalExecutionActorError,
+    reply: ActorReply<LogicalConclusion>,
+) {
+    match state.conclude(&capability, LogicalConclusion::Failed) {
+        Ok(()) => {
+            lifetime.settle();
+            let _ = reply.send(Err(error));
+        }
+        Err(state_error) => {
+            lifetime.abandon();
+            let _ = reply.send(Err(state_error.into()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -651,6 +1016,9 @@ mod tests {
             initial_execution,
             ExecutionEffect::None,
             NonZeroUsize::new(1).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
         )
     }
 

@@ -354,7 +354,7 @@ fn release_fetch_result_response() -> novarocks::FetchResultResponse {
     novarocks::FetchResultResponse {
         status: novarocks::fetch_result_response::Status::Ready as i32,
         message: "ready".to_string(),
-        result_arrow_ipc: b"NRX1-fixture".to_vec(),
+        result_arrow_ipc: b"NRX1-fixture".to_vec().into(),
         packet_seq: 9,
         eos: true,
     }
@@ -540,7 +540,7 @@ fn release_fetch_result_response_fixture_decodes() {
         "FetchResultResponse fixture status"
     );
     assert_eq!(response.message, "ready");
-    assert_eq!(response.result_arrow_ipc, b"NRX1-fixture");
+    assert_eq!(response.result_arrow_ipc.as_ref(), b"NRX1-fixture");
     assert_eq!(response.packet_seq, 9);
     assert!(response.eos, "FetchResultResponse fixture eos");
 }

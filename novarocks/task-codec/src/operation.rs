@@ -856,6 +856,9 @@ fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, Proto
         Ok(novarocks::TaskOperationOutcome::ResourceExhausted) => {
             Ok(OperationOutcome::ResourceExhausted)
         }
+        Ok(novarocks::TaskOperationOutcome::AdmissionTicketStillActive) => {
+            Ok(OperationOutcome::AdmissionTicketStillActive)
+        }
         Ok(novarocks::TaskOperationOutcome::Unspecified) | Err(_) => Err(invalid_enum(
             path,
             "operation outcome must be a known non-default value",
@@ -893,6 +896,9 @@ fn encode_outcome(value: OperationOutcome) -> i32 {
         OperationOutcome::TerminalRejected => novarocks::TaskOperationOutcome::TerminalRejected,
         OperationOutcome::Gone => novarocks::TaskOperationOutcome::Gone,
         OperationOutcome::ResourceExhausted => novarocks::TaskOperationOutcome::ResourceExhausted,
+        OperationOutcome::AdmissionTicketStillActive => {
+            novarocks::TaskOperationOutcome::AdmissionTicketStillActive
+        }
     };
     encoded as i32
 }

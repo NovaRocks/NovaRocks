@@ -860,6 +860,7 @@ mod tests {
             OperationOutcome::TerminalRejected,
             OperationOutcome::Gone,
             OperationOutcome::ResourceExhausted,
+            OperationOutcome::AdmissionTicketStillActive,
         ] {
             assert_eq!(
                 decode_operation_outcome(

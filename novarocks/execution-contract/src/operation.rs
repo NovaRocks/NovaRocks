@@ -291,6 +291,9 @@ pub enum OperationOutcome {
     /// A per-context or per-backend capacity bound was reached. This fails
     /// closed rather than degrading: there is no older path to fall back to.
     ResourceExhausted,
+    /// Admission found an older unredeemed ticket for the same context. The
+    /// new operation created no grant and may retry after bounded backoff.
+    AdmissionTicketStillActive,
 }
 
 /// The split receipt of one plan node.
