@@ -37,9 +37,9 @@ use novarocks_types::NativeCompatibilityId;
 
 use crate::task_execution::descriptor::TaskDescriptor;
 use crate::task_execution::domain::{
-    CodecOwnedContent, ConfidentialContent, CredentialEpoch, CredentialLeaseId, DomainProgression,
-    DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer, SplitWatermark,
-    TaskDomainKind,
+    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
+    DomainProgression, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer,
+    SplitWatermark, TaskDomainKind,
 };
 use crate::task_execution::identity::{
     AdmissionEpochCapability, AdmissionTicketId, IdentityMismatch, QueryContextRef, TaskIdentity,
@@ -867,6 +867,47 @@ impl AcquireQueryContextAdmissionTicket {
     }
 }
 
+/// Secret-free, typed equality projection for the semantic content of one
+/// establish request.
+///
+/// Operation, context, admission ticket, and transport compatibility remain
+/// separate identities. Credential material is deliberately absent.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct EstablishSemanticIdentity {
+    catalog_binding: ContentFingerprint,
+    initial_runtime_filter: ContentFingerprint,
+    query_options: ContentFingerprint,
+    credential_lease_id: CredentialLeaseId,
+    credential_epoch: CredentialEpoch,
+    initial_lease_valid_for: LeaseValidFor,
+}
+
+impl EstablishSemanticIdentity {
+    pub const fn catalog_binding(self) -> ContentFingerprint {
+        self.catalog_binding
+    }
+
+    pub const fn initial_runtime_filter(self) -> ContentFingerprint {
+        self.initial_runtime_filter
+    }
+
+    pub const fn query_options(self) -> ContentFingerprint {
+        self.query_options
+    }
+
+    pub const fn credential_lease_id(self) -> CredentialLeaseId {
+        self.credential_lease_id
+    }
+
+    pub const fn credential_epoch(self) -> CredentialEpoch {
+        self.credential_epoch
+    }
+
+    pub const fn initial_lease_valid_for(self) -> LeaseValidFor {
+        self.initial_lease_valid_for
+    }
+}
+
 /// Create one query context and install its shared facts atomically.
 ///
 /// The initial lease is not a parameter of this type beyond its duration: its
@@ -949,6 +990,23 @@ impl EstablishQueryContext {
 
     pub const fn initial_lease_valid_for(&self) -> LeaseValidFor {
         self.initial_lease_valid_for
+    }
+
+    /// The typed, secret-free facts that decide whether two Establish
+    /// requests have the same execution semantics.
+    ///
+    /// Routing and replay coordinates remain separate: operation, context,
+    /// admission ticket, and transport compatibility are deliberately absent.
+    /// Credential material is confidential and therefore cannot participate.
+    pub fn semantic_identity(&self) -> EstablishSemanticIdentity {
+        EstablishSemanticIdentity {
+            catalog_binding: self.catalog_binding.fingerprint(),
+            initial_runtime_filter: self.initial_runtime_filter.fingerprint(),
+            query_options: self.query_options.fingerprint(),
+            credential_lease_id: self.initial_credential.lease_id(),
+            credential_epoch: self.initial_credential.epoch(),
+            initial_lease_valid_for: self.initial_lease_valid_for,
+        }
     }
 }
 
@@ -1307,11 +1365,11 @@ mod request_tests {
     use std::time::Duration;
 
     #[derive(Debug)]
-    struct FakeContent;
+    struct FakeContent(u8);
 
     impl CodecOwnedContent for FakeContent {
         fn fingerprint(&self) -> ContentFingerprint {
-            ContentFingerprint::from_bytes([5; 16])
+            ContentFingerprint::from_bytes([self.0; 16])
         }
 
         fn encoded_len(&self) -> usize {
@@ -1345,11 +1403,15 @@ mod request_tests {
     }
 
     fn content() -> Arc<dyn CodecOwnedContent> {
-        Arc::new(FakeContent)
+        content_with(5)
+    }
+
+    fn content_with(fingerprint: u8) -> Arc<dyn CodecOwnedContent> {
+        Arc::new(FakeContent(fingerprint))
     }
 
     fn plan() -> Arc<dyn PhysicalFragmentPlan> {
-        Arc::new(FakeContent)
+        Arc::new(FakeContent(5))
     }
 
     fn execution() -> QueryExecutionId {
@@ -1562,6 +1624,183 @@ mod request_tests {
         assert_eq!(
             establish.initial_credential().epoch(),
             CredentialEpoch::FIRST
+        );
+    }
+
+    #[test]
+    fn establish_semantic_identity_tracks_each_public_semantic_fact() {
+        let context = QueryContextRef::new(
+            execution(),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let operation = TaskOperationId::new_v7();
+        let ticket = AdmissionTicketId::try_from_bytes([0x61; 16]).expect("nonzero ticket");
+        let establish = |catalog,
+                         runtime_filter,
+                         query_options,
+                         credential_lease,
+                         credential_epoch,
+                         secret,
+                         lease_seconds| {
+            EstablishQueryContext::new(
+                operation,
+                context,
+                ticket,
+                content_with(catalog),
+                content_with(runtime_filter),
+                content_with(query_options),
+                CredentialUpdate::new(
+                    credential_lease,
+                    credential_epoch,
+                    Arc::new(FakeSecret(secret)),
+                ),
+                LeaseValidFor::new(Duration::from_secs(lease_seconds))
+                    .expect("a legal lease duration"),
+            )
+        };
+        let baseline = establish(
+            1,
+            2,
+            3,
+            CredentialLeaseId::new(4),
+            CredentialEpoch::FIRST,
+            "a",
+            30,
+        )
+        .semantic_identity();
+
+        assert_ne!(
+            baseline,
+            establish(
+                9,
+                2,
+                3,
+                CredentialLeaseId::new(4),
+                CredentialEpoch::FIRST,
+                "a",
+                30,
+            )
+            .semantic_identity()
+        );
+        assert_ne!(
+            baseline,
+            establish(
+                1,
+                9,
+                3,
+                CredentialLeaseId::new(4),
+                CredentialEpoch::FIRST,
+                "a",
+                30,
+            )
+            .semantic_identity()
+        );
+        assert_ne!(
+            baseline,
+            establish(
+                1,
+                2,
+                9,
+                CredentialLeaseId::new(4),
+                CredentialEpoch::FIRST,
+                "a",
+                30,
+            )
+            .semantic_identity()
+        );
+        assert_ne!(
+            baseline,
+            establish(
+                1,
+                2,
+                3,
+                CredentialLeaseId::new(9),
+                CredentialEpoch::FIRST,
+                "a",
+                30,
+            )
+            .semantic_identity()
+        );
+        assert_ne!(
+            baseline,
+            establish(
+                1,
+                2,
+                3,
+                CredentialLeaseId::new(4),
+                CredentialEpoch::new(2).expect("nonzero"),
+                "a",
+                30,
+            )
+            .semantic_identity()
+        );
+        assert_ne!(
+            baseline,
+            establish(
+                1,
+                2,
+                3,
+                CredentialLeaseId::new(4),
+                CredentialEpoch::FIRST,
+                "a",
+                31,
+            )
+            .semantic_identity()
+        );
+
+        let same_facts_different_secret = establish(
+            1,
+            2,
+            3,
+            CredentialLeaseId::new(4),
+            CredentialEpoch::FIRST,
+            SECRET_SENTINEL,
+            30,
+        );
+        assert_eq!(baseline, same_facts_different_secret.semantic_identity());
+
+        let different_routing_identity = EstablishQueryContext::new(
+            TaskOperationId::new_v7(),
+            QueryContextRef::new(
+                QueryExecutionId::new(
+                    QueryId::new(8, 10),
+                    AttemptId::new(2).expect("nonzero attempt"),
+                )
+                .expect("nonzero query"),
+                FrontendProcessId::new_v7(),
+                BackendProcessId::new_v7(),
+            ),
+            AdmissionTicketId::try_from_bytes([0x62; 16]).expect("nonzero ticket"),
+            content_with(1),
+            content_with(2),
+            content_with(3),
+            CredentialUpdate::new(
+                CredentialLeaseId::new(4),
+                CredentialEpoch::FIRST,
+                Arc::new(FakeSecret("different secret")),
+            ),
+            LeaseValidFor::new(Duration::from_secs(30)).expect("a legal lease duration"),
+        );
+        assert_eq!(baseline, different_routing_identity.semantic_identity());
+
+        assert_eq!(
+            baseline.catalog_binding(),
+            ContentFingerprint::from_bytes([1; 16])
+        );
+        assert_eq!(
+            baseline.initial_runtime_filter(),
+            ContentFingerprint::from_bytes([2; 16])
+        );
+        assert_eq!(
+            baseline.query_options(),
+            ContentFingerprint::from_bytes([3; 16])
+        );
+        assert_eq!(baseline.credential_lease_id(), CredentialLeaseId::new(4));
+        assert_eq!(baseline.credential_epoch(), CredentialEpoch::FIRST);
+        assert_eq!(
+            baseline.initial_lease_valid_for().get(),
+            Duration::from_secs(30)
         );
     }
 

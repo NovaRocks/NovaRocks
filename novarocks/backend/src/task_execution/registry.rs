@@ -1229,10 +1229,10 @@ impl TaskExecutionRegistry {
                 entry.state = QueryContextState::Active;
                 entry.facts_visible = true;
                 entry.domains = QueryContextDomains::install_initial(
-                    record.catalog,
-                    record.runtime_filter,
-                    record.credential_lease,
-                    record.credential_epoch,
+                    record.semantic_identity.catalog_binding(),
+                    record.semantic_identity.initial_runtime_filter(),
+                    record.semantic_identity.credential_lease_id(),
+                    record.semantic_identity.credential_epoch(),
                     Arc::clone(request.initial_credential().material()),
                 );
                 // Deliberately untouched: reaching `Active` must not reset or

@@ -31,9 +31,9 @@ use novarocks_execution_contract::task_execution::domain::ContentFingerprint;
 use novarocks_execution_contract::task_execution::identity::{
     AdmissionTicketId, TaskIdentity, TaskOperationId,
 };
-use novarocks_execution_contract::task_execution::lease::LeaseValidFor;
 use novarocks_execution_contract::task_execution::operation::{
-    CreateTaskReceipt, EstablishQueryContext, OperationOutcome, QueryContextReceipt,
+    CreateTaskReceipt, EstablishQueryContext, EstablishSemanticIdentity, OperationOutcome,
+    QueryContextReceipt,
 };
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, FinalTaskInfo, TaskStatus, TerminationDetail,
@@ -56,14 +56,7 @@ use super::status::TaskStatusOwner;
 pub(super) struct EstablishRecord {
     pub(super) operation: TaskOperationId,
     pub(super) admission_ticket_id: AdmissionTicketId,
-    pub(super) catalog: ContentFingerprint,
-    pub(super) runtime_filter: ContentFingerprint,
-    pub(super) query_options: ContentFingerprint,
-    pub(super) credential_lease:
-        novarocks_execution_contract::task_execution::domain::CredentialLeaseId,
-    pub(super) credential_epoch:
-        novarocks_execution_contract::task_execution::domain::CredentialEpoch,
-    pub(super) lease_valid_for: LeaseValidFor,
+    pub(super) semantic_identity: EstablishSemanticIdentity,
     pub(super) original_receipt: Option<QueryContextReceipt>,
 }
 
@@ -72,12 +65,7 @@ impl EstablishRecord {
         Self {
             operation: request.envelope().operation_id(),
             admission_ticket_id: request.admission_ticket_id(),
-            catalog: request.catalog_binding().fingerprint(),
-            runtime_filter: request.initial_runtime_filter().fingerprint(),
-            query_options: request.query_options().fingerprint(),
-            credential_lease: request.initial_credential().lease_id(),
-            credential_epoch: request.initial_credential().epoch(),
-            lease_valid_for: request.initial_lease_valid_for(),
+            semantic_identity: request.semantic_identity(),
             original_receipt: None,
         }
     }
@@ -88,12 +76,7 @@ impl EstablishRecord {
     pub(super) fn same_request(&self, other: &Self) -> bool {
         self.operation == other.operation
             && self.admission_ticket_id == other.admission_ticket_id
-            && self.catalog == other.catalog
-            && self.runtime_filter == other.runtime_filter
-            && self.query_options == other.query_options
-            && self.credential_lease == other.credential_lease
-            && self.credential_epoch == other.credential_epoch
-            && self.lease_valid_for == other.lease_valid_for
+            && self.semantic_identity == other.semantic_identity
     }
 }
 
