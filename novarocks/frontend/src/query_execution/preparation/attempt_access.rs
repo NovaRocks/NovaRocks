@@ -34,6 +34,17 @@ pub(crate) struct LogicalExecutionAccessScope {
     entries: BTreeMap<(FragmentId, i32), Arc<ConnectorAttemptAccessEntry>>,
 }
 
+#[cfg(test)]
+impl LogicalExecutionAccessScope {
+    pub(super) fn get(
+        &self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<&ConnectorAttemptAccessEntry> {
+        self.entries.get(&(fragment_id, node_id)).map(Arc::as_ref)
+    }
+}
+
 pub(crate) type ConnectorAttemptAccessPlan = LogicalExecutionAccessScope;
 
 /// Move-only lineage proofs reserved for final execution-description sealing.
