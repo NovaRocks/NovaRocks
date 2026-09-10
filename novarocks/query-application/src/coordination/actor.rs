@@ -22,18 +22,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use arrow::record_batch::RecordBatch;
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, EstablishQueryContext, OperationOutcome, QueryContextRef,
+    ResultPacketSequence,
 };
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::QueryExecutionId;
 use novarocks_workload_control::{
-    CancellationReason, CancellationView, Obligation, ObligationKey, ObligationKind, Stage,
-    StagePermit, WorkOwner, WorkScope,
+    CancellationReason, CancellationView, Obligation, ObligationKey, ObligationKind, ResultCredit,
+    Stage, StagePermit, WorkOwner, WorkScope,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+
+use crate::api::{
+    BatchDelivery, EndDelivery, ExecutionOutput, QueryExecutionError, QueryResultStream,
+    QueryResultTransport, ResultDelivery, ResultDeliveryDisposition, ResultDeliveryReceipt,
+    ResultQueuePermit, ResultSchema,
+};
 
 use super::actor_state::{
     ActorStateError, AttemptCapability, LogicalExecutionState, ReplacementFact, ReplacementToken,
@@ -41,15 +49,17 @@ use super::actor_state::{
 use super::{
     AbortQueryContextEffectPort, AbortQueryContextIssuePermit, AbortQueryContextIssueSubmit,
     ActiveReplacementResources, AdmissionIssueDisposition, AdmissionIssueReceipt,
-    AdmissionIssueSettlement, AttemptFailureClass, ContextStandDownCause, ContextStandDownError,
-    ContextStandDownLedger, ContextStandDownSnapshot, EstablishIssueError, EstablishIssueLedger,
-    EstablishIssuePermit, EstablishIssueSnapshot, ExecutionEffect, ExecutionPhase,
-    LogicalConclusion, LogicalOutputMode, MonotonicInstant, RecoveryMode, RecoveryRefusal,
-    RegistryContextConvergence, ReplacementQualificationEffectAdmission,
-    ReplacementQualificationEffectPort, ReplacementQualificationEffectReceipt,
-    ReplacementQualificationEffectSubmission, ReplacementQualificationFailure,
-    ReplacementQualificationIdentity, ReplacementQualificationRequest,
-    ReplacementQualificationSettlement, ReplacementWorkerAdmissionEvidence, receipt_channel,
+    AdmissionIssueSettlement, AttemptFailureClass, BeginSchemaDelivery, ContextStandDownCause,
+    ContextStandDownError, ContextStandDownLedger, ContextStandDownSnapshot, DeliveryPermit,
+    EstablishIssueError, EstablishIssueLedger, EstablishIssuePermit, EstablishIssueSnapshot,
+    ExecutionEffect, ExecutionPhase, LogicalConclusion, LogicalOutputMode, MonotonicInstant,
+    RecoveryMode, RecoveryRefusal, RegistryContextConvergence,
+    ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
+    ReplacementQualificationEffectReceipt, ReplacementQualificationEffectSubmission,
+    ReplacementQualificationFailure, ReplacementQualificationIdentity,
+    ReplacementQualificationRequest, ReplacementQualificationSettlement,
+    ReplacementWorkerAdmissionEvidence, ResultPacket, SchemaDeliveryPermit,
+    SuccessEndOfStreamPermit, receipt_channel,
 };
 
 /// Immutable identity of one actor-owned attempt activation generation.
@@ -127,6 +137,25 @@ impl AttemptActivationIdentity {
 
     pub const fn generation(self) -> u64 {
         self.generation
+    }
+}
+
+/// Move-only proof that the exact attempt's Task graph and root result source
+/// reached stable success. The query application mints this only from its
+/// supervised Task-completion owner; an EOS marker cannot construct it.
+#[derive(Debug)]
+pub struct StableAttemptSuccessReceipt {
+    activation: AttemptActivationIdentity,
+}
+
+impl StableAttemptSuccessReceipt {
+    pub const fn activation(&self) -> AttemptActivationIdentity {
+        self.activation
+    }
+
+    #[cfg(test)]
+    const fn for_test(activation: AttemptActivationIdentity) -> Self {
+        Self { activation }
     }
 }
 
@@ -369,6 +398,49 @@ impl RunningAttemptPermit {
         .await
     }
 
+    /// Transfers one decoded batch to the actor-owned delivery boundary. The
+    /// future resolves only after the protocol consumer completes or rejects
+    /// the batch, so a Native adapter can delay its Worker ACK until success.
+    /// If the waiter is cancelled after submission, `snapshot` retains the
+    /// delivered watermark and is the retryable ACK authority.
+    pub async fn deliver_result_batch(
+        &self,
+        sequence: ResultPacketSequence,
+        batch: RecordBatch,
+        credit: ResultCredit,
+    ) -> Result<(), LogicalExecutionActorError> {
+        request(self.mailbox(), |reply| ActorCommand::DeliverResultBatch {
+            activation: self.identity(),
+            sequence,
+            batch,
+            credit,
+            reply,
+        })
+        .await
+    }
+
+    /// Reports stable attempt success and consumes the running authority. The
+    /// logical execution succeeds only after the protocol consumer completes
+    /// the resulting EOF delivery.
+    pub async fn finish_result_stream(
+        self,
+        success: StableAttemptSuccessReceipt,
+        sequence: ResultPacketSequence,
+    ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
+        let sender = self
+            .mailbox_liveness
+            .as_ref()
+            .cloned()
+            .ok_or(LogicalExecutionActorError::StaleAuthority)?;
+        request(&sender, |reply| ActorCommand::FinishResultStream {
+            permit: self,
+            success,
+            sequence,
+            reply,
+        })
+        .await
+    }
+
     fn mailbox(&self) -> &mpsc::Sender<ActorCommand> {
         self.mailbox_liveness
             .as_ref()
@@ -485,6 +557,8 @@ pub struct LogicalExecutionActorConfig {
     clock: Arc<dyn LogicalExecutionClock>,
     work_owner: Option<WorkOwner>,
     execution_stage: Option<StagePermit>,
+    result_schema: Option<ResultSchema>,
+    result_delivery_capacity: Option<NonZeroUsize>,
 }
 
 impl fmt::Debug for LogicalExecutionActorConfig {
@@ -556,6 +630,8 @@ impl LogicalExecutionActorConfig {
             clock: Arc::new(ProcessLogicalExecutionClock::new()),
             work_owner: Some(work_owner),
             execution_stage: Some(initial_execution_stage),
+            result_schema: None,
+            result_delivery_capacity: None,
         })
     }
 
@@ -630,7 +706,21 @@ impl LogicalExecutionActorConfig {
             clock: Arc::new(ProcessLogicalExecutionClock::new()),
             work_owner: Some(work_owner),
             execution_stage: Some(initial_execution_stage),
+            result_schema: None,
+            result_delivery_capacity: None,
         })
+    }
+
+    /// Attaches the fixed logical schema and bounded protocol queue used by
+    /// the actor-owned result stream.
+    pub(crate) fn with_result_stream(
+        mut self,
+        schema: ResultSchema,
+        delivery_capacity: NonZeroUsize,
+    ) -> Self {
+        self.result_schema = Some(schema);
+        self.result_delivery_capacity = Some(delivery_capacity);
+        self
     }
 
     /// Connects the role-composed Abort effect port. The query application
@@ -667,6 +757,7 @@ pub enum LogicalExecutionActorError {
     InvariantViolation,
     Establish(EstablishIssueError),
     StandDown(ContextStandDownError),
+    ResultDeliveryFailed,
 }
 
 impl fmt::Display for LogicalExecutionActorError {
@@ -697,6 +788,7 @@ impl fmt::Display for LogicalExecutionActorError {
             Self::AlreadyConcluded => "logical execution has already concluded",
             Self::ReplacementNotReady => "attempt replacement qualification is incomplete",
             Self::InvariantViolation => "logical execution actor invariant was violated",
+            Self::ResultDeliveryFailed => "logical result delivery failed",
             Self::Establish(_)
             | Self::StandDown(_)
             | Self::RecoveryRefused(_)
@@ -750,6 +842,10 @@ impl From<ContextStandDownError> for LogicalExecutionActorError {
 pub struct LogicalExecutionActorSnapshot {
     pub phase: ExecutionPhase,
     pub conclusion: Option<LogicalConclusion>,
+    pub schema_emitted: bool,
+    pub output_visible: bool,
+    pub accepted_result_packets: u64,
+    pub delivered_result_through: Option<ResultPacketSequence>,
     pub establish_error: Option<EstablishIssueError>,
     pub stand_down_error: Option<ContextStandDownError>,
     pub replacement_error: Option<ReplacementQualificationFailure>,
@@ -840,6 +936,65 @@ impl Drop for PendingAuthorityRequest {
 
 type ActorReply<T> = oneshot::Sender<Result<T, LogicalExecutionActorError>>;
 
+struct PendingResultBatch {
+    activation: AttemptActivationIdentity,
+    sequence: ResultPacketSequence,
+    delivery: BatchDelivery,
+    receipt: ResultDeliveryReceipt,
+    reply: ActorReply<()>,
+}
+
+struct PendingResultEnd {
+    permit: RunningAttemptPermit,
+    success: StableAttemptSuccessReceipt,
+    sequence: ResultPacketSequence,
+    reply: ActorReply<LogicalConclusion>,
+}
+
+enum PendingResult {
+    Batch(PendingResultBatch),
+    End(PendingResultEnd),
+}
+
+enum InFlightResult {
+    Schema {
+        permit: SchemaDeliveryPermit,
+        receipt: ResultDeliveryReceipt,
+    },
+    Batch {
+        permit: DeliveryPermit<()>,
+        receipt: ResultDeliveryReceipt,
+        reply: ActorReply<()>,
+    },
+    End {
+        permit: SuccessEndOfStreamPermit,
+        receipt: ResultDeliveryReceipt,
+        lifetime: Arc<PermitLifetime>,
+        reply: ActorReply<LogicalConclusion>,
+    },
+}
+
+struct ResultRuntime {
+    schema: ResultSchema,
+    schema_receipt: Option<ResultDeliveryReceipt>,
+    schema_writer_completed: bool,
+    failure_sender: Option<watch::Sender<Option<QueryExecutionError>>>,
+    transport: QueryResultTransport,
+    pending: Option<PendingResult>,
+    in_flight: Option<InFlightResult>,
+}
+
+enum ResultReceiptOutcome {
+    Schema(Result<ResultDeliveryDisposition, ()>),
+    Delivery(Result<ResultDeliveryDisposition, ()>),
+}
+
+impl ResultRuntime {
+    fn idle(&self) -> bool {
+        self.pending.is_none() && self.in_flight.is_none()
+    }
+}
+
 enum ActorCommand {
     TakeReplacementAdmissionEvidence {
         activation: AttemptActivationIdentity,
@@ -863,6 +1018,19 @@ enum ActorCommand {
     },
     Failed {
         permit: RunningAttemptPermit,
+        reply: ActorReply<LogicalConclusion>,
+    },
+    DeliverResultBatch {
+        activation: AttemptActivationIdentity,
+        sequence: ResultPacketSequence,
+        batch: RecordBatch,
+        credit: ResultCredit,
+        reply: ActorReply<()>,
+    },
+    FinishResultStream {
+        permit: RunningAttemptPermit,
+        success: StableAttemptSuccessReceipt,
+        sequence: ResultPacketSequence,
         reply: ActorReply<LogicalConclusion>,
     },
     BeginReplacement {
@@ -1097,11 +1265,22 @@ async fn request<T>(
 /// alive long enough to observe permit abandonment and conclude the logical
 /// execution. The production registry must retain this owner until exact
 /// attempt retirement is connected.
-#[derive(Debug)]
 #[must_use = "the logical execution actor owner must remain supervised"]
 pub struct LogicalExecutionActorOwner {
     actor: LogicalExecutionActor,
     join: JoinHandle<()>,
+    output: Option<ExecutionOutput>,
+}
+
+impl fmt::Debug for LogicalExecutionActorOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LogicalExecutionActorOwner")
+            .field("actor", &self.actor)
+            .field("join_finished", &self.join.is_finished())
+            .field("output_attached", &self.output.is_some())
+            .finish()
+    }
 }
 
 impl LogicalExecutionActorOwner {
@@ -1113,10 +1292,19 @@ impl LogicalExecutionActorOwner {
         self.join.is_finished()
     }
 
+    pub fn take_output(&mut self) -> Option<ExecutionOutput> {
+        self.output.take()
+    }
+
     /// Transfers ownership of an unfinished cancellation tail to an explicit
     /// residual supervisor without detaching its join handle.
     pub fn into_residual_stand_down_supervisor(self) -> ResidualStandDownSupervisor {
-        let Self { actor, join } = self;
+        let Self {
+            actor,
+            join,
+            output,
+        } = self;
+        drop(output);
         ResidualStandDownSupervisor { actor, join }
     }
 }
@@ -1266,6 +1454,37 @@ pub fn spawn_logical_execution_actor(
     let actor_lifetime = Arc::clone(&lifetime);
     let abort_effect_port = config.abort_effect_port.take();
     let replacement_effect_port = config.replacement_effect_port.take();
+    let (result_runtime, output) = match config.output_mode {
+        LogicalOutputMode::CompletionOnly => (None, Some(ExecutionOutput::Completion)),
+        LogicalOutputMode::ResultStream => {
+            let schema = config
+                .result_schema
+                .take()
+                .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+            let capacity = config
+                .result_delivery_capacity
+                .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+            let (transport, schema_receipt, failure_sender, stream) =
+                QueryResultStream::try_channel(
+                    config.initial_execution.query_id(),
+                    schema.clone(),
+                    capacity.get(),
+                )
+                .map_err(|_| LogicalExecutionActorError::InvariantViolation)?;
+            (
+                Some(ResultRuntime {
+                    schema,
+                    schema_receipt: Some(schema_receipt),
+                    schema_writer_completed: false,
+                    failure_sender: Some(failure_sender),
+                    transport,
+                    pending: None,
+                    in_flight: None,
+                }),
+                Some(ExecutionOutput::Rows(stream)),
+            )
+        }
+    };
     let join = runtime.spawn(async move {
         run_actor(
             &mut state,
@@ -1286,6 +1505,7 @@ pub fn spawn_logical_execution_actor(
             config.max_admission_issues_per_context,
             config.max_establish_authorizations_per_context,
             config.max_abort_authorizations_per_context,
+            result_runtime,
             clock,
         )
         .await;
@@ -1297,6 +1517,7 @@ pub fn spawn_logical_execution_actor(
                 sender: sender.clone(),
             },
             join,
+            output,
         },
         AttemptInstantiationPermit {
             capability: Some(capability),
@@ -1325,6 +1546,7 @@ async fn run_actor(
     max_admission_issues_per_context: NonZeroUsize,
     max_establish_authorizations_per_context: NonZeroUsize,
     max_abort_authorizations_per_context: NonZeroUsize,
+    mut result_runtime: Option<ResultRuntime>,
     clock: Arc<dyn LogicalExecutionClock>,
 ) {
     let mut establish_error = None;
@@ -1380,7 +1602,13 @@ async fn run_actor(
             clock.as_ref(),
         );
         release_concluded_actor_resources(state, &mut execution_stage, replacement.as_mut());
-        if !receiver_open && actor_cleanup_complete(state, &attempts, replacement.as_ref()) {
+        if state.conclusion().is_some() {
+            fail_result_runtime(state, result_runtime.as_mut());
+        }
+        if !receiver_open
+            && actor_cleanup_complete(state, &attempts, replacement.as_ref())
+            && result_runtime.as_ref().is_none_or(ResultRuntime::idle)
+        {
             work_owner.complete();
             return;
         }
@@ -1398,6 +1626,19 @@ async fn run_actor(
                 .is_none()
                 .then_some(replacement.conservative_expiry)
                 .flatten()
+        });
+        let result_capacity_transport = result_runtime.as_ref().and_then(|runtime| {
+            (runtime.pending.is_some() && runtime.in_flight.is_none())
+                .then(|| runtime.transport.clone())
+        });
+        let result_receipt_pending = result_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.in_flight.is_some() || runtime.schema_receipt.is_some());
+        let result_consumer_transport = result_runtime.as_ref().and_then(|runtime| {
+            state
+                .conclusion()
+                .is_none()
+                .then(|| runtime.transport.clone())
         });
         tokio::select! {
             biased;
@@ -1426,6 +1667,15 @@ async fn run_actor(
             }
             _ = wait_for_replacement_expiry(clock.as_ref(), replacement_expires_at), if replacement_expires_at.is_some() => {}
             _ = wait_for_abort_retry(clock.as_ref(), abort_retry_at), if abort_retry_at.is_some() => {}
+            permit = wait_for_result_capacity(result_capacity_transport), if result_capacity_transport.is_some() => {
+                apply_result_capacity(state, result_runtime.as_mut(), permit);
+            }
+            disposition = wait_for_result_receipt(result_runtime.as_mut()), if result_receipt_pending => {
+                apply_result_receipt(state, replacement.as_ref(), result_runtime.as_mut(), disposition);
+            }
+            _ = wait_for_result_consumer_closed(result_consumer_transport), if result_consumer_transport.is_some() => {
+                conclude_with(state, replacement.as_ref(), LogicalConclusion::Failed);
+            }
             result = wait_for_abort_capacity(&mut abort_capacity), if abort_backpressured => {
                 match result {
                     Ok(()) => {
@@ -1476,6 +1726,7 @@ async fn run_actor(
                     &work_owner.scope(),
                     &work_cancellation,
                     replacement_reservation_valid_for,
+                    result_runtime.as_mut(),
                     command,
                 );
             }
@@ -2063,6 +2314,338 @@ fn conclude_failed(state: &mut LogicalExecutionState) {
     }
 }
 
+fn start_schema_delivery(
+    state: &mut LogicalExecutionState,
+    runtime: &mut ResultRuntime,
+    activation: AttemptActivationIdentity,
+) -> Result<(), LogicalExecutionActorError> {
+    if state.schema_emitted() || matches!(runtime.in_flight, Some(InFlightResult::Schema { .. })) {
+        return Ok(());
+    }
+    if runtime.in_flight.is_some() {
+        return Err(LogicalExecutionActorError::ResultDeliveryFailed);
+    }
+    let capability = state.attempt_capability(activation.execution())?;
+    if identity_of(&capability) != activation {
+        return Err(LogicalExecutionActorError::StaleAuthority);
+    }
+    let BeginSchemaDelivery::Permit(permit) = state.begin_schema_delivery(&capability)? else {
+        return Ok(());
+    };
+    if runtime.schema_writer_completed {
+        state.complete_schema_delivery(permit)?;
+        return Ok(());
+    }
+    let receipt = runtime
+        .schema_receipt
+        .take()
+        .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+    runtime.in_flight = Some(InFlightResult::Schema { permit, receipt });
+    Ok(())
+}
+
+async fn wait_for_result_capacity(
+    transport: Option<QueryResultTransport>,
+) -> Result<ResultQueuePermit, QueryExecutionError> {
+    transport
+        .expect("result capacity wait is gated by one pending delivery")
+        .reserve_owned()
+        .await
+}
+
+async fn wait_for_result_receipt(runtime: Option<&mut ResultRuntime>) -> ResultReceiptOutcome {
+    let runtime = runtime.expect("result receipt wait is gated by a result runtime");
+    if let Some(in_flight) = runtime.in_flight.as_mut() {
+        return ResultReceiptOutcome::Delivery(match in_flight {
+            InFlightResult::Schema { receipt, .. }
+            | InFlightResult::Batch { receipt, .. }
+            | InFlightResult::End { receipt, .. } => receipt.await.map_err(|_| ()),
+        });
+    }
+    let receipt = runtime
+        .schema_receipt
+        .as_mut()
+        .expect("result receipt wait requires a schema or delivery receipt");
+    ResultReceiptOutcome::Schema(receipt.await.map_err(|_| ()))
+}
+
+async fn wait_for_result_consumer_closed(transport: Option<QueryResultTransport>) {
+    transport
+        .expect("result consumer wait is gated by a result runtime")
+        .closed()
+        .await;
+}
+
+fn apply_result_capacity(
+    state: &mut LogicalExecutionState,
+    runtime: Option<&mut ResultRuntime>,
+    reserved: Result<ResultQueuePermit, QueryExecutionError>,
+) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    let Some(pending) = runtime.pending.take() else {
+        return;
+    };
+    let slot = match reserved {
+        Ok(slot) => slot,
+        Err(_) => {
+            reject_pending_result(pending);
+            conclude_failed(state);
+            return;
+        }
+    };
+    match pending {
+        PendingResult::Batch(pending) => {
+            let capability = match state.attempt_capability(pending.activation.execution()) {
+                Ok(capability) if identity_of(&capability) == pending.activation => capability,
+                _ => {
+                    drop(slot);
+                    drop(pending.delivery);
+                    let _ = pending
+                        .reply
+                        .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                    return;
+                }
+            };
+            let permit = match state.begin_result_delivery(
+                &capability,
+                pending.sequence.get(),
+                ResultPacket::Data(()),
+            ) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    drop(slot);
+                    drop(pending.delivery);
+                    let _ = pending
+                        .reply
+                        .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                    conclude_failed(state);
+                    return;
+                }
+            };
+            runtime
+                .transport
+                .enqueue(slot, ResultDelivery::Batch(pending.delivery));
+            runtime.in_flight = Some(InFlightResult::Batch {
+                permit,
+                receipt: pending.receipt,
+                reply: pending.reply,
+            });
+        }
+        PendingResult::End(pending) => {
+            let activation = pending.permit.identity();
+            if pending.success.activation() != activation {
+                drop(slot);
+                drop(pending.permit);
+                let _ = pending
+                    .reply
+                    .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                conclude_failed(state);
+                return;
+            }
+            let capability = match state.attempt_capability(activation.execution()) {
+                Ok(capability) if identity_of(&capability) == activation => capability,
+                _ => {
+                    drop(slot);
+                    drop(pending.permit);
+                    let _ = pending
+                        .reply
+                        .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                    return;
+                }
+            };
+            let success = state
+                .issue_attempt_success_effect(&capability)
+                .and_then(|effect| state.complete_attempt_success_effect(&capability, effect));
+            let Ok(success) = success else {
+                drop(slot);
+                drop(pending.permit);
+                let _ = pending
+                    .reply
+                    .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                conclude_failed(state);
+                return;
+            };
+            let permit = match state.begin_success_end_of_stream(
+                &capability,
+                &success,
+                pending.sequence.get(),
+            ) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    drop(slot);
+                    drop(pending.permit);
+                    let _ = pending
+                        .reply
+                        .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                    conclude_failed(state);
+                    return;
+                }
+            };
+            let (delivery, receipt) =
+                EndDelivery::success_eof(activation.execution(), pending.sequence);
+            runtime
+                .transport
+                .enqueue(slot, ResultDelivery::End(delivery));
+            let (_capability, lifetime, mailbox_liveness) = pending.permit.into_parts();
+            drop(mailbox_liveness);
+            runtime.in_flight = Some(InFlightResult::End {
+                permit,
+                receipt,
+                lifetime,
+                reply: pending.reply,
+            });
+        }
+    }
+}
+
+fn apply_result_receipt(
+    state: &mut LogicalExecutionState,
+    replacement: Option<&ReplacementRuntime>,
+    runtime: Option<&mut ResultRuntime>,
+    outcome: ResultReceiptOutcome,
+) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    let disposition = match outcome {
+        ResultReceiptOutcome::Schema(disposition) => {
+            runtime.schema_receipt.take();
+            if matches!(disposition, Ok(ResultDeliveryDisposition::Completed)) {
+                runtime.schema_writer_completed = true;
+            } else {
+                conclude_with(state, replacement, LogicalConclusion::Failed);
+            }
+            return;
+        }
+        ResultReceiptOutcome::Delivery(disposition) => disposition,
+    };
+    let Some(in_flight) = runtime.in_flight.take() else {
+        return;
+    };
+    let completed = matches!(disposition, Ok(ResultDeliveryDisposition::Completed));
+    match in_flight {
+        InFlightResult::Schema { permit, .. } => {
+            if completed {
+                if state.complete_schema_delivery(permit).is_err() {
+                    conclude_failed(state);
+                }
+            } else {
+                let _ = state.fail_schema_delivery(permit);
+                conclude_failed(state);
+            }
+        }
+        InFlightResult::Batch { permit, reply, .. } => {
+            if completed {
+                match state.complete_result_delivery(permit) {
+                    Ok(_) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                        conclude_failed(state);
+                    }
+                }
+            } else {
+                let _ = state.fail_result_delivery(permit);
+                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                conclude_failed(state);
+            }
+        }
+        InFlightResult::End {
+            permit,
+            lifetime,
+            reply,
+            ..
+        } => {
+            if completed {
+                match state.complete_success_end_of_stream(permit) {
+                    Ok(_) => {
+                        lifetime.settle();
+                        let _ = reply.send(Ok(LogicalConclusion::Succeeded));
+                    }
+                    Err(_) => {
+                        lifetime.abandon();
+                        let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                        conclude_failed(state);
+                    }
+                }
+            } else {
+                let _ = state.fail_success_end_of_stream(permit);
+                lifetime.settle();
+                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                conclude_failed(state);
+            }
+        }
+    }
+}
+
+fn reject_pending_result(pending: PendingResult) {
+    match pending {
+        PendingResult::Batch(pending) => {
+            drop(pending.delivery);
+            let _ = pending
+                .reply
+                .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+        }
+        PendingResult::End(pending) => {
+            drop(pending.permit);
+            let _ = pending
+                .reply
+                .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+        }
+    }
+}
+
+fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut ResultRuntime>) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    if let Some(sender) = runtime.failure_sender.take() {
+        match state.conclusion() {
+            Some(LogicalConclusion::Succeeded) => drop(sender),
+            Some(LogicalConclusion::Cancelled) => {
+                sender.send_replace(Some(QueryExecutionError::new(
+                    crate::api::QueryExecutionErrorKind::Cancelled,
+                    "logical execution was cancelled before success EOF",
+                )));
+            }
+            Some(LogicalConclusion::Failed) => {
+                sender.send_replace(Some(QueryExecutionError::new(
+                    crate::api::QueryExecutionErrorKind::Failed,
+                    "logical execution failed before success EOF",
+                )));
+            }
+            Some(LogicalConclusion::BusinessDecisionRequired) => {
+                sender.send_replace(Some(QueryExecutionError::new(
+                    crate::api::QueryExecutionErrorKind::Failed,
+                    "logical execution requires a business decision before success EOF",
+                )));
+            }
+            None => {}
+        }
+    }
+    if let Some(pending) = runtime.pending.take() {
+        reject_pending_result(pending);
+    }
+    let Some(in_flight) = runtime.in_flight.take() else {
+        return;
+    };
+    match in_flight {
+        InFlightResult::Schema { .. } => {}
+        InFlightResult::Batch { reply, .. } => {
+            let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+        }
+        InFlightResult::End {
+            lifetime, reply, ..
+        } => {
+            lifetime.settle();
+            let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+        }
+    }
+}
+
 fn conclude_abandoned(state: &mut LogicalExecutionState, replacement: Option<&ReplacementRuntime>) {
     conclude_with(state, replacement, LogicalConclusion::Cancelled);
 }
@@ -2120,6 +2703,7 @@ fn handle_command(
     work: &WorkScope,
     work_cancellation: &CancellationView,
     replacement_reservation_valid_for: Option<Duration>,
+    result_runtime: Option<&mut ResultRuntime>,
     command: ActorCommand,
 ) {
     match command {
@@ -2210,6 +2794,99 @@ fn handle_command(
             }
             settle_terminal(state, permit.into_parts(), LogicalConclusion::Failed, reply);
         }
+        ActorCommand::DeliverResultBatch {
+            activation,
+            sequence,
+            batch,
+            credit,
+            reply,
+        } => {
+            let Some(runtime) = result_runtime else {
+                drop(batch);
+                drop(credit);
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            if verify_running_activation(state, activation).is_err()
+                || runtime.pending.is_some()
+                || matches!(
+                    runtime.in_flight,
+                    Some(InFlightResult::Batch { .. } | InFlightResult::End { .. })
+                )
+            {
+                drop(batch);
+                drop(credit);
+                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                return;
+            }
+            if sequence.next().is_none() || !runtime.schema.accepts(&batch) {
+                drop(batch);
+                drop(credit);
+                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                conclude_failed(state);
+                return;
+            }
+            let delivery = BatchDelivery::try_new(activation.execution(), sequence, batch, credit);
+            let Ok((delivery, receipt)) = delivery else {
+                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                conclude_failed(state);
+                return;
+            };
+            if start_schema_delivery(state, runtime, activation).is_err() {
+                drop(delivery);
+                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                conclude_failed(state);
+                return;
+            }
+            runtime.pending = Some(PendingResult::Batch(PendingResultBatch {
+                activation,
+                sequence,
+                delivery,
+                receipt,
+                reply,
+            }));
+        }
+        ActorCommand::FinishResultStream {
+            permit,
+            success,
+            sequence,
+            reply,
+        } => {
+            let activation = permit.identity();
+            let Some(runtime) = result_runtime else {
+                drop(permit);
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            let success_ready = attempts
+                .get_mut(&activation.execution())
+                .ok_or(LogicalExecutionActorError::WrongExecution)
+                .and_then(|attempt| attempt.establish.ensure_success_ready().map_err(Into::into));
+            if verify_running_activation(state, activation).is_err()
+                || success_ready.is_err()
+                || runtime.pending.is_some()
+                || matches!(
+                    runtime.in_flight,
+                    Some(InFlightResult::Batch { .. } | InFlightResult::End { .. })
+                )
+            {
+                drop(permit);
+                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                return;
+            }
+            if start_schema_delivery(state, runtime, activation).is_err() {
+                drop(permit);
+                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                conclude_failed(state);
+                return;
+            }
+            runtime.pending = Some(PendingResult::End(PendingResultEnd {
+                permit,
+                success,
+                sequence,
+                reply,
+            }));
+        }
         ActorCommand::BeginReplacement {
             permit,
             failure,
@@ -2219,6 +2896,15 @@ fn handle_command(
         } => {
             let activation = permit.identity();
             let (capability, lifetime, mailbox_liveness) = permit.into_parts();
+            if let Some(runtime) = result_runtime
+                && matches!(
+                    runtime.pending.as_ref(),
+                    Some(PendingResult::Batch(batch)) if batch.activation.execution() == activation.execution()
+                )
+                && let Some(pending) = runtime.pending.take()
+            {
+                reject_pending_result(pending);
+            }
             if let Some(reason) = work_cancellation.reason() {
                 revoke_all_establish_authority(attempts);
                 conclude_for_work_cancellation(state, replacement.as_ref(), &reason);
@@ -2498,6 +3184,12 @@ fn handle_command(
             let _ = reply.send(Ok(LogicalExecutionActorSnapshot {
                 phase: state.phase(),
                 conclusion: state.conclusion(),
+                schema_emitted: state.schema_emitted(),
+                output_visible: state.output_visible(),
+                accepted_result_packets: state.accepted_result_packets(),
+                delivered_result_through: state
+                    .delivered_result_through()
+                    .map(ResultPacketSequence::new),
                 establish_error: *establish_error,
                 stand_down_error: *stand_down_error,
                 replacement_error: *replacement_error,
@@ -2773,6 +3465,8 @@ mod tests {
         ReplacementQualificationEffectReservation,
     };
     use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_execution_contract::{
         AdmissionEpochCapability, AdmissionTicketId, CodecOwnedContent, ConfidentialContent,
         ContentFingerprint, CredentialEpoch, CredentialLeaseId, CredentialUpdate, LeaseValidFor,
@@ -2782,8 +3476,11 @@ mod tests {
     use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{AttemptId, BackendProcessId, FrontendProcessId, QueryId};
     use novarocks_workload_control::{
-        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        LocalResourceAuthority, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig,
+        WorkloadControl,
     };
+
+    use crate::api::{QueryExecutionErrorKind, ResultField};
 
     #[derive(Debug)]
     struct SelectiveAbortPort {
@@ -3510,6 +4207,10 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
+        .with_result_stream(
+            ResultSchema::new(Vec::<crate::api::ResultField>::new()),
+            NonZeroUsize::new(1).unwrap(),
+        )
     }
 
     fn recovery_config_with_contexts(
@@ -3532,6 +4233,10 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
+        .with_result_stream(
+            ResultSchema::new(Vec::<crate::api::ResultField>::new()),
+            NonZeroUsize::new(1).unwrap(),
+        )
     }
 
     fn config(initial_execution: QueryExecutionId) -> LogicalExecutionActorConfig {
@@ -3547,6 +4252,64 @@ mod tests {
             stage,
         )
         .unwrap()
+    }
+
+    fn result_schema() -> ResultSchema {
+        ResultSchema::new(vec![ResultField::new(
+            "value",
+            DataType::Int64,
+            false,
+            None,
+        )])
+    }
+
+    fn result_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![7_i64, 11]))],
+        )
+        .unwrap()
+    }
+
+    fn result_credit(
+        batch: &RecordBatch,
+    ) -> (
+        WorkloadControl,
+        WorkOwner,
+        LocalResourceAuthority,
+        ResultCredit,
+    ) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let authority = control.resources();
+        let credit = authority
+            .reserve_result_credit(&root.owner.scope(), bytes)
+            .unwrap()
+            .begin_fetch()
+            .unwrap()
+            .retain_raw(bytes)
+            .unwrap()
+            .reserve_decode(&authority, bytes)
+            .unwrap()
+            .queue_decoded(bytes)
+            .unwrap();
+        (control, root.owner, authority, credit)
     }
 
     async fn wait_for_conclusion(
@@ -4405,7 +5168,11 @@ mod tests {
             stage,
             Duration::from_secs(60),
         )
-        .unwrap();
+        .unwrap()
+        .with_result_stream(
+            ResultSchema::new(Vec::<crate::api::ResultField>::new()),
+            NonZeroUsize::new(1).unwrap(),
+        );
         let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
@@ -4458,6 +5225,10 @@ mod tests {
             Duration::from_secs(60),
         )
         .unwrap()
+        .with_result_stream(
+            ResultSchema::new(Vec::<crate::api::ResultField>::new()),
+            NonZeroUsize::new(1).unwrap(),
+        )
         .with_abort_query_context_effect_port(
             super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
@@ -4566,7 +5337,7 @@ mod tests {
         let submissions = Arc::clone(&port.submissions);
         let (owner, initial) =
             spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
-        let LogicalExecutionActorOwner { actor, join } = owner;
+        let LogicalExecutionActorOwner { actor, join, .. } = owner;
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
             .begin_replacement(
@@ -4775,6 +5546,10 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
+        .with_result_stream(
+            ResultSchema::new(Vec::<crate::api::ResultField>::new()),
+            NonZeroUsize::new(1).unwrap(),
+        )
         .with_clock(clock.clone());
         let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
         let actor = owner.actor();
@@ -4828,6 +5603,10 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
+        .with_result_stream(
+            ResultSchema::new(Vec::<crate::api::ResultField>::new()),
+            NonZeroUsize::new(1).unwrap(),
+        )
         .with_clock(clock.clone());
         let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
         let actor = owner.actor();
@@ -5322,7 +6101,7 @@ mod tests {
         let runtime = Handle::current();
         let (owner, permit) =
             spawn_logical_execution_actor(&runtime, config(execution(9))).unwrap();
-        let LogicalExecutionActorOwner { actor, join } = owner;
+        let LogicalExecutionActorOwner { actor, join, .. } = owner;
         drop(actor);
         tokio::task::yield_now().await;
         assert!(!join.is_finished());
@@ -5335,6 +6114,554 @@ mod tests {
         }
         assert!(join.is_finished());
         join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_holds_batch_ack_and_logical_success_until_writer_receipts() {
+        let runtime = Handle::current();
+        let first = execution(103);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+
+        let actor = owner.actor().clone();
+        let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
+        let batch = result_batch();
+        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let delivery_running = Arc::clone(&running);
+        let delivery_task = tokio::spawn(async move {
+            delivery_running
+                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .await
+        });
+
+        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+            panic!("actor must enqueue one batch");
+        };
+        assert!(!delivery_task.is_finished());
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), bytes);
+        delivery
+            .reserve_protocol(&authority, bytes)
+            .unwrap()
+            .begin_protocol_write(bytes)
+            .unwrap()
+            .complete()
+            .unwrap();
+        delivery_task.await.unwrap().unwrap();
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+
+        let running = Arc::try_unwrap(running).expect("batch sender released its permit");
+        let success = StableAttemptSuccessReceipt::for_test(running.identity());
+        let finish_task = tokio::spawn(async move {
+            running
+                .finish_result_stream(success, ResultPacketSequence::new(1))
+                .await
+        });
+        let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
+            panic!("actor must enqueue success EOF");
+        };
+        assert!(!finish_task.is_finished());
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+        end.complete();
+        assert_eq!(
+            finish_task.await.unwrap().unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        wait_for_conclusion(&actor, LogicalConclusion::Succeeded).await;
+        credit_owner.complete();
+        drop(control);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn cancelled_delivery_waiter_can_recover_the_durable_ack_watermark() {
+        let runtime = Handle::current();
+        let first = execution(109);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
+        let batch = result_batch();
+        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let delivery_running = Arc::clone(&running);
+        let delivery_task = tokio::spawn(async move {
+            delivery_running
+                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .await
+        });
+        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+            panic!("actor must enqueue one batch");
+        };
+
+        delivery_task.abort();
+        assert!(delivery_task.await.unwrap_err().is_cancelled());
+        let bytes = delivery.decoded_bytes();
+        delivery
+            .reserve_protocol(&authority, bytes)
+            .unwrap()
+            .begin_protocol_write(bytes)
+            .unwrap()
+            .complete()
+            .unwrap();
+        for _ in 0..16 {
+            let snapshot = actor.snapshot().await.unwrap();
+            if snapshot.delivered_result_through == Some(ResultPacketSequence::new(0)) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            actor.snapshot().await.unwrap().delivered_result_through,
+            Some(ResultPacketSequence::new(0))
+        );
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+
+        let running = Arc::try_unwrap(running).expect("cancelled waiter released its permit");
+        assert_eq!(
+            actor.fail_attempt(running).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        credit_owner.complete();
+        drop(control);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn logical_failure_wakes_an_idle_result_stream_without_queue_capacity() {
+        let runtime = Handle::current();
+        let first = execution(110);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        assert_eq!(
+            actor.fail_attempt(running).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("logical failure must wake the result stream");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("logical failure must terminate the result stream"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn cancellation_beats_a_queued_batch_before_protocol_delivery() {
+        let runtime = Handle::current();
+        let first = execution(113);
+        let (parent, work_owner, stage) = test_governed_child_work(None);
+        let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            first,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            Arc::new(DelayedQualificationPort::default()),
+            work_owner,
+            stage,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
+        let batch = result_batch();
+        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let delivery_running = Arc::clone(&running);
+        let delivery_task = tokio::spawn(async move {
+            delivery_running
+                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .await
+        });
+        for _ in 0..16 {
+            if actor.snapshot().await.unwrap().accepted_result_packets == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(actor.snapshot().await.unwrap().accepted_result_packets, 1);
+        assert_eq!(
+            actor.snapshot().await.unwrap().delivered_result_through,
+            None
+        );
+
+        parent.cancel(CancellationReason::Requested);
+        wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("cancellation must preempt the queued batch");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a queued batch must not pass a prior cancellation"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+        assert_eq!(
+            delivery_task.await.unwrap().unwrap_err(),
+            LogicalExecutionActorError::ResultDeliveryFailed
+        );
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        drop(stream);
+
+        drop(running);
+        credit_owner.complete();
+        drop(control);
+        drop(actor);
+        drop(owner);
+        parent.complete();
+    }
+
+    #[tokio::test]
+    async fn cancellation_view_interrupts_an_in_flight_protocol_delivery() {
+        let runtime = Handle::current();
+        let first = execution(114);
+        let (parent, work_owner, stage) = test_governed_child_work(None);
+        let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            first,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            Arc::new(DelayedQualificationPort::default()),
+            work_owner,
+            stage,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        let mut failure = stream.failure_view().unwrap();
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
+        let batch = result_batch();
+        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let delivery_running = Arc::clone(&running);
+        let delivery_task = tokio::spawn(async move {
+            delivery_running
+                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .await
+        });
+        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+            panic!("actor must enqueue one batch");
+        };
+
+        parent.cancel(CancellationReason::Requested);
+        let error = tokio::time::timeout(Duration::from_secs(1), failure.wait())
+            .await
+            .expect("the in-flight protocol writer must observe cancellation");
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+        delivery.fail(error);
+        assert_eq!(
+            delivery_task.await.unwrap().unwrap_err(),
+            LogicalExecutionActorError::ResultDeliveryFailed
+        );
+        wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+
+        drop(running);
+        credit_owner.complete();
+        drop(control);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+        parent.complete();
+    }
+
+    #[tokio::test]
+    async fn writer_failure_fails_delivery_and_releases_result_credit() {
+        let runtime = Handle::current();
+        let first = execution(104);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = Arc::new(actor.activate(initial.ready()).await.unwrap());
+        let batch = result_batch();
+        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        let delivery_running = Arc::clone(&running);
+        let delivery_task = tokio::spawn(async move {
+            delivery_running
+                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .await
+        });
+        let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
+            panic!("actor must enqueue one batch");
+        };
+        delivery.fail(QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            "protocol writer failed",
+        ));
+        assert_eq!(
+            delivery_task.await.unwrap().unwrap_err(),
+            LogicalExecutionActorError::ResultDeliveryFailed
+        );
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        drop(running);
+        credit_owner.complete();
+        drop(control);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn dropped_consumer_fails_closed_without_waiting_for_a_batch() {
+        let runtime = Handle::current();
+        let first = execution(105);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        drop(stream);
+        let actor = owner.actor().clone();
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        assert!(actor.activate(initial.ready()).await.is_err());
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn dropped_consumer_after_schema_completion_still_fails_closed() {
+        let runtime = Handle::current();
+        let first = execution(108);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        actor.snapshot().await.unwrap();
+        let _running = actor.activate(initial.ready()).await.unwrap();
+
+        drop(stream);
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn actor_rejects_foreign_and_gapped_result_packets_fail_closed() {
+        let runtime = Handle::current();
+        let first = execution(106);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let identity = running.identity();
+
+        let foreign_batch = result_batch();
+        let (foreign_control, foreign_owner, foreign_authority, foreign_credit) =
+            result_credit(&foreign_batch);
+        let foreign = AttemptActivationIdentity::from_parts(
+            identity.actor().get(),
+            replacement(first, 2),
+            identity.generation(),
+        );
+        assert_eq!(
+            request(&actor.sender, |reply| ActorCommand::DeliverResultBatch {
+                activation: foreign,
+                sequence: ResultPacketSequence::new(0),
+                batch: foreign_batch,
+                credit: foreign_credit,
+                reply,
+            })
+            .await
+            .unwrap_err(),
+            LogicalExecutionActorError::ResultDeliveryFailed
+        );
+        assert_eq!(foreign_authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+        foreign_owner.complete();
+        drop(foreign_control);
+
+        let gap_batch = result_batch();
+        let (gap_control, gap_owner, gap_authority, gap_credit) = result_credit(&gap_batch);
+        assert_eq!(
+            running
+                .deliver_result_batch(ResultPacketSequence::new(1), gap_batch, gap_credit)
+                .await
+                .unwrap_err(),
+            LogicalExecutionActorError::ResultDeliveryFailed
+        );
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        assert_eq!(gap_authority.snapshot().result_credit.held_bytes(), 0);
+        gap_owner.complete();
+        drop(gap_control);
+        drop(running);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn exhausted_data_sequence_and_foreign_success_receipt_fail_closed() {
+        let runtime = Handle::current();
+        let first = execution(111);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let batch = result_batch();
+        let (control, credit_owner, authority, credit) = result_credit(&batch);
+        assert_eq!(
+            running
+                .deliver_result_batch(ResultPacketSequence::new(u64::MAX), batch, credit)
+                .await
+                .unwrap_err(),
+            LogicalExecutionActorError::ResultDeliveryFailed
+        );
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        drop(running);
+        credit_owner.complete();
+        drop(control);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+
+        let second = execution(112);
+        let config = recovery_config(second, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let foreign = StableAttemptSuccessReceipt::for_test(AttemptActivationIdentity::from_parts(
+            running.identity().actor().get(),
+            replacement(second, 2),
+            running.identity().generation(),
+        ));
+        assert_eq!(
+            running
+                .finish_result_stream(foreign, ResultPacketSequence::new(0))
+                .await
+                .unwrap_err(),
+            LogicalExecutionActorError::ResultDeliveryFailed
+        );
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn schema_survives_replacement_and_empty_result_succeeds_after_eof_receipt() {
+        let runtime = Handle::current();
+        let first = execution(107);
+        let second = replacement(first, 2);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let config = recovery_config(first, port, 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        actor.snapshot().await.unwrap();
+
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let mut activation = Box::pin(actor.activate_replacement(qualification));
+        assert!(matches!(
+            std::future::poll_fn(|context| Poll::Ready(activation.as_mut().poll(context))).await,
+            Poll::Pending
+        ));
+        qualify(submissions.lock().unwrap().pop().unwrap());
+        let successor = actor
+            .activate(activation.await.unwrap().ready())
+            .await
+            .unwrap();
+
+        let success = StableAttemptSuccessReceipt::for_test(successor.identity());
+        let finish_task = tokio::spawn(async move {
+            successor
+                .finish_result_stream(success, ResultPacketSequence::new(0))
+                .await
+        });
+        let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
+            panic!("empty result must still deliver EOF");
+        };
+        assert_eq!(end.execution_id(), second);
+        assert_eq!(end.sequence(), ResultPacketSequence::new(0));
+        assert!(!finish_task.is_finished());
+        end.complete();
+        assert_eq!(
+            finish_task.await.unwrap().unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        assert!(stream.begin_schema().is_none());
+        wait_for_conclusion(&actor, LogicalConclusion::Succeeded).await;
+        drop(stream);
+        drop(actor);
+        drop(owner);
     }
 
     #[test]

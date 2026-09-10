@@ -36,7 +36,7 @@ use novarocks_workload_control::{
     LocalResourceAuthority, ResultCredit, ResultCreditReservationError, ResultCreditStage,
     WorkError,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 
@@ -109,7 +109,7 @@ impl ResultSchema {
         ))
     }
 
-    fn accepts(&self, batch: &RecordBatch) -> bool {
+    pub(crate) fn accepts(&self, batch: &RecordBatch) -> bool {
         let actual = batch.schema();
         actual.fields().len() == self.fields.len()
             && actual
@@ -460,170 +460,81 @@ impl ResultDelivery {
     }
 }
 
-type StreamMessage = Result<ResultDelivery, QueryExecutionError>;
+type StreamMessage = ResultDelivery;
 
-/// Move-only owner endpoint for one result stream. The channel bounds queued
-/// records; the `ResultCredit` inside every batch bounds bytes.
-pub(crate) struct QueryResultSink {
-    query_id: QueryId,
-    schema: ResultSchema,
-    schema_receipt: Option<ResultDeliveryReceipt>,
-    schema_completed: bool,
-    current_execution: Option<QueryExecutionId>,
-    next_sequence: ResultPacketSequence,
+enum StreamEvent {
+    Failure(QueryExecutionError),
+    Message(Option<StreamMessage>),
+}
+
+/// Cloneable observation of a logical failure that must interrupt any current
+/// schema or batch protocol write. The protocol adapter retains one view while
+/// it owns a delivery, instead of waiting for the next stream item.
+#[derive(Clone, Debug)]
+pub struct ResultFailureView {
+    receiver: watch::Receiver<Option<QueryExecutionError>>,
+}
+
+impl ResultFailureView {
+    pub fn current(&self) -> Option<QueryExecutionError> {
+        self.receiver.borrow().clone()
+    }
+
+    pub async fn wait(&mut self) -> QueryExecutionError {
+        loop {
+            if let Some(error) = self.current() {
+                return error;
+            }
+            if self.receiver.changed().await.is_err() {
+                return failed_result_delivery_message(
+                    "logical result owner disappeared before success EOF",
+                );
+            }
+        }
+    }
+}
+
+/// Pure bounded transport for one actor-owned result stream.
+///
+/// Query identity, attempt eligibility, packet sequencing, schema state, and
+/// visibility remain exclusively in the logical execution actor. This value
+/// only reserves queue capacity and synchronously transfers an already
+/// authorized delivery into that slot.
+#[derive(Clone)]
+pub(crate) struct QueryResultTransport {
     sender: mpsc::Sender<StreamMessage>,
 }
 
-impl QueryResultSink {
-    pub(crate) async fn wait_schema_completed(&mut self) -> Result<(), QueryExecutionError> {
-        if self.schema_completed {
-            return Ok(());
-        }
-        let receipt = self.schema_receipt.take().ok_or_else(|| {
-            invalid_result_delivery("result schema completion was already observed")
-        })?;
-        match receipt.await {
-            Ok(ResultDeliveryDisposition::Completed) => {
-                self.schema_completed = true;
-                Ok(())
-            }
-            Ok(ResultDeliveryDisposition::Failed(error)) => Err(error),
-            Ok(ResultDeliveryDisposition::Dropped) => Err(failed_result_delivery_message(
-                "result schema was dropped before completion",
-            )),
-            Err(_) => Err(failed_result_delivery_message(
-                "result schema disposition sender disappeared",
-            )),
-        }
+impl std::fmt::Debug for QueryResultTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueryResultTransport")
+            .field("capacity", &self.sender.capacity())
+            .field("closed", &self.sender.is_closed())
+            .finish()
     }
+}
 
-    pub(crate) async fn send_batch(
-        &mut self,
-        execution_id: QueryExecutionId,
-        sequence: ResultPacketSequence,
-        batch: RecordBatch,
-        credit: ResultCredit,
-    ) -> Result<ResultDeliveryReceipt, QueryExecutionError> {
-        if !self.schema_completed {
-            return Err(reject_batch(
-                batch,
-                credit,
-                invalid_result_delivery("result batch cannot be sent before schema completion"),
-            ));
-        }
-        if let Err(error) = self.validate_execution(execution_id, sequence) {
-            return Err(reject_batch(batch, credit, error));
-        }
-        if sequence != self.next_sequence {
-            return Err(reject_batch(
-                batch,
-                credit,
-                invalid_result_delivery(format!(
-                    "result batch sequence {} does not match expected {}",
-                    sequence.get(),
-                    self.next_sequence.get()
-                )),
-            ));
-        }
-        if !self.schema.accepts(&batch) {
-            return Err(reject_batch(
-                batch,
-                credit,
-                invalid_result_delivery("result batch does not match the fixed result schema"),
-            ));
-        }
-        let next_sequence = match self.next_sequence.next() {
-            Some(next) => next,
-            None => {
-                return Err(reject_batch(
-                    batch,
-                    credit,
-                    failed_result_delivery_message("result packet sequence is exhausted"),
-                ));
-            }
-        };
-        let (delivery, receipt) = BatchDelivery::try_new(execution_id, sequence, batch, credit)?;
-        if self.current_execution.is_none() {
-            self.current_execution = Some(execution_id);
-        }
-        self.sender
-            .send(Ok(ResultDelivery::Batch(delivery)))
-            .await
-            .map_err(|_| failed_result_delivery_message("result stream consumer disappeared"))?;
-        self.next_sequence = next_sequence;
-        Ok(receipt)
-    }
+pub(crate) struct ResultQueuePermit {
+    permit: mpsc::OwnedPermit<StreamMessage>,
+}
 
-    pub(crate) async fn send_success_eof(
-        self,
-        execution_id: QueryExecutionId,
-        sequence: ResultPacketSequence,
-    ) -> Result<ResultDeliveryReceipt, QueryExecutionError> {
-        if !self.schema_completed {
-            return Err(invalid_result_delivery(
-                "success EOF cannot be sent before schema completion",
-            ));
-        }
-        if execution_id.query_id() != self.query_id {
-            return Err(invalid_result_delivery(
-                "success EOF belongs to a different logical query",
-            ));
-        }
-        if self
-            .current_execution
-            .is_some_and(|current| current != execution_id)
-        {
-            return Err(invalid_result_delivery(
-                "success EOF belongs to a different visible execution attempt",
-            ));
-        }
-        if sequence != self.next_sequence {
-            return Err(invalid_result_delivery(format!(
-                "success EOF sequence {} does not match expected {}",
-                sequence.get(),
-                self.next_sequence.get()
-            )));
-        }
-        let (delivery, receipt) = EndDelivery::success_eof(execution_id, sequence);
+impl QueryResultTransport {
+    pub(crate) async fn reserve_owned(&self) -> Result<ResultQueuePermit, QueryExecutionError> {
         self.sender
-            .send(Ok(ResultDelivery::End(delivery)))
+            .clone()
+            .reserve_owned()
             .await
-            .map_err(|_| failed_result_delivery_message("result stream consumer disappeared"))?;
-        Ok(receipt)
-    }
-
-    pub(crate) async fn fail(self, error: QueryExecutionError) -> Result<(), QueryExecutionError> {
-        if !self.schema_completed {
-            return Err(invalid_result_delivery(
-                "schema delivery must report a pre-schema result failure",
-            ));
-        }
-        self.sender
-            .send(Err(error))
-            .await
+            .map(|permit| ResultQueuePermit { permit })
             .map_err(|_| failed_result_delivery_message("result stream consumer disappeared"))
     }
 
-    fn validate_execution(
-        &self,
-        execution_id: QueryExecutionId,
-        sequence: ResultPacketSequence,
-    ) -> Result<(), QueryExecutionError> {
-        if execution_id.query_id() != self.query_id {
-            return Err(invalid_result_delivery(
-                "result batch belongs to a different logical query",
-            ));
-        }
-        match self.current_execution {
-            Some(current) if current != execution_id => Err(invalid_result_delivery(
-                "result batch belongs to a different visible execution attempt",
-            )),
-            Some(_) => Ok(()),
-            None if sequence == ResultPacketSequence::new(0) => Ok(()),
-            None => Err(invalid_result_delivery(
-                "the first result batch of an execution must have sequence zero",
-            )),
-        }
+    pub(crate) fn enqueue(&self, permit: ResultQueuePermit, delivery: ResultDelivery) {
+        permit.permit.send(delivery);
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await;
     }
 }
 
@@ -631,6 +542,7 @@ pub struct QueryResultStream {
     query_id: QueryId,
     schema: Option<SchemaDelivery>,
     receiver: mpsc::Receiver<StreamMessage>,
+    failure: Option<ResultFailureView>,
     terminal_seen: bool,
 }
 
@@ -639,7 +551,15 @@ impl QueryResultStream {
         query_id: QueryId,
         schema: ResultSchema,
         delivery_capacity: usize,
-    ) -> Result<(QueryResultSink, Self), QueryExecutionError> {
+    ) -> Result<
+        (
+            QueryResultTransport,
+            ResultDeliveryReceipt,
+            watch::Sender<Option<QueryExecutionError>>,
+            Self,
+        ),
+        QueryExecutionError,
+    > {
         if delivery_capacity == 0 {
             return Err(invalid_result_delivery(
                 "result delivery capacity must be nonzero",
@@ -647,20 +567,16 @@ impl QueryResultStream {
         }
         let (schema_delivery, schema_receipt) = SchemaDelivery::new(query_id, schema.clone());
         let (sender, receiver) = mpsc::channel(delivery_capacity);
+        let (failure_sender, failure) = watch::channel(None);
         Ok((
-            QueryResultSink {
-                query_id,
-                schema,
-                schema_receipt: Some(schema_receipt),
-                schema_completed: false,
-                current_execution: None,
-                next_sequence: ResultPacketSequence::new(0),
-                sender,
-            },
+            QueryResultTransport { sender },
+            schema_receipt,
+            failure_sender,
             Self {
                 query_id,
                 schema: Some(schema_delivery),
                 receiver,
+                failure: Some(ResultFailureView { receiver: failure }),
                 terminal_seen: false,
             },
         ))
@@ -674,6 +590,10 @@ impl QueryResultStream {
         self.schema.take()
     }
 
+    pub fn failure_view(&self) -> Option<ResultFailureView> {
+        self.failure.clone()
+    }
+
     pub async fn next(&mut self) -> Result<Option<ResultDelivery>, QueryExecutionError> {
         if self.schema.is_some() {
             return Err(invalid_result_delivery(
@@ -683,15 +603,34 @@ impl QueryResultStream {
         if self.terminal_seen {
             return Ok(None);
         }
-        match self.receiver.recv().await {
-            Some(Ok(delivery @ ResultDelivery::Batch(_))) => Ok(Some(delivery)),
-            Some(Ok(delivery @ ResultDelivery::End(_))) => {
+        let message = loop {
+            let event = if let Some(failure) = self.failure.as_mut() {
+                tokio::select! {
+                    biased;
+                    failure = failure.wait() => StreamEvent::Failure(failure),
+                    message = self.receiver.recv() => StreamEvent::Message(message),
+                }
+            } else {
+                StreamEvent::Message(self.receiver.recv().await)
+            };
+            match event {
+                StreamEvent::Failure(error) => {
+                    self.failure.take();
+                    self.receiver.close();
+                    while let Ok(delivery) = self.receiver.try_recv() {
+                        drop(delivery);
+                    }
+                    self.terminal_seen = true;
+                    return Err(error);
+                }
+                StreamEvent::Message(message) => break message,
+            }
+        };
+        match message {
+            Some(delivery @ ResultDelivery::Batch(_)) => Ok(Some(delivery)),
+            Some(delivery @ ResultDelivery::End(_)) => {
                 self.terminal_seen = true;
                 Ok(Some(delivery))
-            }
-            Some(Err(error)) => {
-                self.terminal_seen = true;
-                Err(error)
             }
             None => {
                 self.terminal_seen = true;
@@ -876,13 +815,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_requires_schema_exact_sequence_and_success_eof() {
+    async fn stream_transport_only_moves_actor_authorized_deliveries() {
         let control = workload();
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let id = execution_id(2);
-        let (mut sink, mut stream) =
+        let (transport, schema_receipt, _failure_sender, mut stream) =
             QueryResultStream::try_channel(id.query_id(), result_schema(), 1).unwrap();
 
         let error = match stream.next().await {
@@ -893,15 +832,18 @@ mod tests {
         let delivered_schema = stream.begin_schema().unwrap();
         assert_eq!(delivered_schema.query_id(), id.query_id());
         delivered_schema.complete();
-        sink.wait_schema_completed().await.unwrap();
+        assert_eq!(
+            schema_receipt.await.unwrap(),
+            ResultDeliveryDisposition::Completed
+        );
 
         let batch = batch();
         let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
         let credit = decoded_credit(&control, &root.owner.scope(), bytes);
-        let receipt = sink
-            .send_batch(id, ResultPacketSequence::new(0), batch, credit)
-            .await
-            .unwrap();
+        let (delivery, receipt) =
+            BatchDelivery::try_new(id, ResultPacketSequence::new(0), batch, credit).unwrap();
+        let slot = transport.reserve_owned().await.unwrap();
+        transport.enqueue(slot, ResultDelivery::Batch(delivery));
         let ResultDelivery::Batch(delivery) = stream.next().await.unwrap().unwrap() else {
             panic!("expected batch delivery");
         };
@@ -916,10 +858,9 @@ mod tests {
             ResultDeliveryDisposition::Failed(_)
         ));
 
-        let eof_receipt = sink
-            .send_success_eof(id, ResultPacketSequence::new(1))
-            .await
-            .unwrap();
+        let (eof, eof_receipt) = EndDelivery::success_eof(id, ResultPacketSequence::new(1));
+        let slot = transport.reserve_owned().await.unwrap();
+        transport.enqueue(slot, ResultDelivery::End(eof));
         let ResultDelivery::End(eof) = stream.next().await.unwrap().unwrap() else {
             panic!("expected EOF delivery");
         };
@@ -930,6 +871,7 @@ mod tests {
             eof_receipt.await.unwrap(),
             ResultDeliveryDisposition::Completed
         );
+        drop(transport);
         assert!(stream.next().await.unwrap().is_none());
         drop(root);
     }
@@ -937,18 +879,50 @@ mod tests {
     #[tokio::test]
     async fn stream_failure_is_terminal_without_success_eof() {
         let id = execution_id(3);
-        let (mut sink, mut stream) =
+        let (_transport, schema_receipt, failure_sender, mut stream) =
             QueryResultStream::try_channel(id.query_id(), result_schema(), 1).unwrap();
         stream.begin_schema().unwrap().complete();
-        sink.wait_schema_completed().await.unwrap();
+        assert_eq!(
+            schema_receipt.await.unwrap(),
+            ResultDeliveryDisposition::Completed
+        );
 
         let expected = QueryExecutionError::new(QueryExecutionErrorKind::Failed, "attempt failed");
-        sink.fail(expected.clone()).await.unwrap();
+        failure_sender.send_replace(Some(expected.clone()));
         let actual = match stream.next().await {
             Err(error) => error,
             Ok(_) => panic!("failed stream must return its terminal error"),
         };
         assert_eq!(actual, expected);
+        assert!(stream.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn owner_loss_drops_queued_success_eof() {
+        let id = execution_id(4);
+        let (transport, schema_receipt, failure_sender, mut stream) =
+            QueryResultStream::try_channel(id.query_id(), result_schema(), 1).unwrap();
+        stream.begin_schema().unwrap().complete();
+        assert_eq!(
+            schema_receipt.await.unwrap(),
+            ResultDeliveryDisposition::Completed
+        );
+
+        let (eof, eof_receipt) = EndDelivery::success_eof(id, ResultPacketSequence::new(0));
+        let slot = transport.reserve_owned().await.unwrap();
+        transport.enqueue(slot, ResultDelivery::End(eof));
+        drop(failure_sender);
+        drop(transport);
+
+        let error = match stream.next().await {
+            Err(error) => error,
+            Ok(_) => panic!("owner loss must preempt a queued success EOF"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(
+            eof_receipt.await.unwrap(),
+            ResultDeliveryDisposition::Dropped
+        );
         assert!(stream.next().await.unwrap().is_none());
     }
 }
