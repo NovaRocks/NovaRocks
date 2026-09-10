@@ -36,12 +36,35 @@ use std::sync::{Arc, Mutex};
 use novarocks_execution::task_execution::{
     QueryContextConvergenceReceipt, QueryContextConvergenceState, QueryContextRef,
 };
+use tokio::sync::watch;
+
+/// The observable state of the intake's distinct-context capacity.
+///
+/// `epoch` advances only when acknowledgement removes a retained context and
+/// therefore makes one fixed slot reusable. Closing the intake changes only
+/// `closed`, while still waking every capacity waiter.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ContextConvergenceCapacityState {
+    epoch: u64,
+    closed: bool,
+}
+
+impl ContextConvergenceCapacityState {
+    pub const fn epoch(self) -> u64 {
+        self.epoch
+    }
+
+    pub const fn is_closed(self) -> bool {
+        self.closed
+    }
+}
 
 #[derive(Debug)]
 struct ContextConvergenceIntakeState {
     open: bool,
     pending: BTreeMap<QueryContextRef, QueryContextConvergenceReceipt>,
     order: VecDeque<QueryContextRef>,
+    leased: Option<(QueryContextRef, QueryContextConvergenceReceipt)>,
 }
 
 #[derive(Debug)]
@@ -49,6 +72,22 @@ struct ContextConvergenceIntakeInner {
     capacity: NonZeroUsize,
     state: Mutex<ContextConvergenceIntakeState>,
     wake: tokio::sync::Notify,
+    capacity_state: watch::Sender<ContextConvergenceCapacityState>,
+}
+
+impl ContextConvergenceIntakeInner {
+    fn release_capacity(&self) {
+        self.capacity_state.send_modify(|state| {
+            state.epoch = state
+                .epoch
+                .checked_add(1)
+                .expect("context convergence capacity epoch exhausted");
+        });
+    }
+
+    fn close_capacity(&self) {
+        self.capacity_state.send_modify(|state| state.closed = true);
+    }
 }
 
 /// A successful publication decision.
@@ -118,6 +157,32 @@ pub struct ContextConvergenceIntakeHandle {
 }
 
 impl ContextConvergenceIntakeHandle {
+    /// Returns the current capacity epoch and closure state.
+    pub fn capacity_state(&self) -> ContextConvergenceCapacityState {
+        *self.inner.capacity_state.borrow()
+    }
+
+    /// Waits until a distinct-context slot is released or the intake closes.
+    ///
+    /// The caller supplies the last epoch it observed before an overflow. The
+    /// watch value preserves a release that races with waiter registration, so
+    /// the wait cannot lose the transition.
+    pub async fn wait_for_capacity_change(
+        &self,
+        observed_epoch: u64,
+    ) -> ContextConvergenceCapacityState {
+        let mut receiver = self.inner.capacity_state.subscribe();
+        loop {
+            let current = *receiver.borrow_and_update();
+            if current.epoch != observed_epoch || current.closed {
+                return current;
+            }
+            if receiver.changed().await.is_err() {
+                return *receiver.borrow();
+            }
+        }
+    }
+
     /// Retains one complete receipt for the stream's exact context.
     ///
     /// A transport may advance its cursor only after this returns
@@ -183,6 +248,10 @@ pub struct ContextConvergenceIntake {
 
 impl ContextConvergenceIntake {
     pub fn bounded(capacity: NonZeroUsize) -> Self {
+        let (capacity_state, _) = watch::channel(ContextConvergenceCapacityState {
+            epoch: 0,
+            closed: false,
+        });
         Self {
             inner: Arc::new(ContextConvergenceIntakeInner {
                 capacity,
@@ -190,8 +259,10 @@ impl ContextConvergenceIntake {
                     open: true,
                     pending: BTreeMap::new(),
                     order: VecDeque::new(),
+                    leased: None,
                 }),
                 wake: tokio::sync::Notify::new(),
+                capacity_state,
             }),
         }
     }
@@ -233,6 +304,35 @@ impl ContextConvergenceIntake {
         }
     }
 
+    /// Leases the oldest retained receipt without removing it or releasing its
+    /// capacity slot.
+    ///
+    /// At most one lease exists because this move-only intake is the single
+    /// serial drain owner. Dropping the returned lease, including through task
+    /// cancellation, keeps the receipt retained for a later turn.
+    pub fn peek_retained(&mut self) -> Option<ContextConvergenceRetainedLease> {
+        let (context, receipt) = {
+            let mut state = self.inner.state.lock().expect("context convergence intake");
+            if state.leased.is_some() {
+                return None;
+            }
+            let context = state.order.front().copied()?;
+            let receipt = state
+                .pending
+                .get(&context)
+                .copied()
+                .expect("an ordered convergence context has a retained receipt");
+            state.leased = Some((context, receipt));
+            (context, receipt)
+        };
+        Some(ContextConvergenceRetainedLease {
+            inner: Arc::clone(&self.inner),
+            context,
+            receipt,
+            settled: false,
+        })
+    }
+
     /// Applies at most `max` complete receipts in first-context order.
     ///
     /// A receipt remains retained until `apply` returns success. This closes
@@ -248,52 +348,111 @@ impl ContextConvergenceIntake {
     ) -> Result<usize, E> {
         let mut applied = 0;
         while applied < max {
-            let next = {
-                let state = self.inner.state.lock().expect("context convergence intake");
-                let Some(context) = state.order.front().copied() else {
-                    break;
-                };
-                let receipt = state
-                    .pending
-                    .get(&context)
-                    .copied()
-                    .expect("an ordered convergence context has a retained receipt");
-                (context, receipt)
+            let Some(lease) = self.peek_retained() else {
+                break;
             };
-
-            apply(next.1)?;
-
-            let mut state = self.inner.state.lock().expect("context convergence intake");
-            assert_eq!(
-                state.order.front().copied(),
-                Some(next.0),
-                "only the serial intake owner may advance convergence order"
-            );
-            let retained =
-                state.pending.get(&next.0).copied().expect(
-                    "an applied convergence context remains retained until acknowledgement",
-                );
-            if retained == next.1 {
-                state.pending.remove(&next.0);
-                state.order.pop_front();
-            } else {
-                assert!(
-                    retained.version() > next.1.version(),
-                    "publish only replaces a retained convergence receipt with a newer version"
-                );
-            }
+            apply(lease.receipt())?;
+            let _ = lease.ack();
             applied += 1;
         }
         Ok(applied)
     }
 }
 
+/// The result of acknowledging a successfully applied retained receipt.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ContextConvergenceRetainedAck {
+    /// The leased receipt was still current and its context slot was released.
+    Released,
+    /// A newer receipt replaced the leased version and remains retained.
+    NewerRetained,
+    /// The serial intake owner closed before acknowledgement.
+    Closed,
+}
+
+/// A move-only lease over one complete retained convergence receipt.
+///
+/// The lease owns no lock and is safe to hold across an asynchronous registry
+/// application. Only [`Self::ack`] may remove its receipt. Dropping it leaves
+/// the receipt and its capacity slot intact.
+#[derive(Debug)]
+#[must_use = "dropping a convergence lease keeps its receipt retained"]
+pub struct ContextConvergenceRetainedLease {
+    inner: Arc<ContextConvergenceIntakeInner>,
+    context: QueryContextRef,
+    receipt: QueryContextConvergenceReceipt,
+    settled: bool,
+}
+
+impl ContextConvergenceRetainedLease {
+    pub const fn receipt(&self) -> QueryContextConvergenceReceipt {
+        self.receipt
+    }
+
+    pub fn ack(mut self) -> ContextConvergenceRetainedAck {
+        let (outcome, released) = {
+            let mut state = self.inner.state.lock().expect("context convergence intake");
+            if !state.open {
+                state.leased = None;
+                self.settled = true;
+                return ContextConvergenceRetainedAck::Closed;
+            }
+            assert_eq!(
+                state.leased,
+                Some((self.context, self.receipt)),
+                "only the exact outstanding convergence lease may acknowledge"
+            );
+            assert_eq!(
+                state.order.front().copied(),
+                Some(self.context),
+                "only the serial intake owner may advance convergence order"
+            );
+            let retained = state.pending.get(&self.context).copied().expect(
+                "an acknowledged convergence context remains retained until acknowledgement",
+            );
+            state.leased = None;
+            if retained == self.receipt {
+                state.pending.remove(&self.context);
+                state.order.pop_front();
+                (ContextConvergenceRetainedAck::Released, true)
+            } else {
+                assert!(
+                    retained.version() > self.receipt.version(),
+                    "publish only replaces a retained convergence receipt with a newer version"
+                );
+                (ContextConvergenceRetainedAck::NewerRetained, false)
+            }
+        };
+        self.settled = true;
+        if released {
+            self.inner.release_capacity();
+        }
+        outcome
+    }
+}
+
+impl Drop for ContextConvergenceRetainedLease {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let mut state = self.inner.state.lock().expect("context convergence intake");
+        if state.leased == Some((self.context, self.receipt)) {
+            state.leased = None;
+        }
+    }
+}
+
 impl Drop for ContextConvergenceIntake {
     fn drop(&mut self) {
-        let mut state = self.inner.state.lock().expect("context convergence intake");
-        state.open = false;
-        state.pending.clear();
-        state.order.clear();
+        {
+            let mut state = self.inner.state.lock().expect("context convergence intake");
+            state.open = false;
+            state.pending.clear();
+            state.order.clear();
+            state.leased = None;
+        }
+        self.inner.close_capacity();
     }
 }
 
@@ -492,9 +651,128 @@ mod tests {
         assert_eq!(applied, vec![receipt(second, 1)]);
     }
 
+    #[tokio::test]
+    async fn overflow_waiter_observes_the_next_released_slot_without_a_lost_wake() {
+        let first = context(12);
+        let second = context(13);
+        let mut intake = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
+        let transport = intake.handle();
+        let _ = transport
+            .publish(first, receipt(first, 1))
+            .expect("retain the first context");
+        let observed = transport.capacity_state();
+        assert_eq!(observed.epoch(), 0);
+        assert!(!observed.is_closed());
+        assert_eq!(
+            transport.publish(second, receipt(second, 1)),
+            Err(ContextConvergencePublishError::Overflow)
+        );
+
+        let lease = intake.peek_retained().expect("lease the retained context");
+        assert_eq!(lease.ack(), ContextConvergenceRetainedAck::Released);
+
+        let changed = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            transport.wait_for_capacity_change(observed.epoch()),
+        )
+        .await
+        .expect("a release racing waiter registration remains observable");
+        assert_eq!(changed.epoch(), 1);
+        assert!(!changed.is_closed());
+        assert_eq!(
+            transport.publish(second, receipt(second, 1)),
+            Ok(ContextConvergencePublishAdmission::Retained)
+        );
+    }
+
+    #[test]
+    fn acknowledgement_removes_the_same_version_and_releases_capacity() {
+        let exact = context(14);
+        let mut intake = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
+        let transport = intake.handle();
+        let retained = receipt(exact, 1);
+        let _ = transport
+            .publish(exact, retained)
+            .expect("retain convergence receipt");
+
+        let lease = intake.peek_retained().expect("lease retained receipt");
+        assert_eq!(lease.receipt(), retained);
+        assert_eq!(intake.pending(), 1);
+        assert_eq!(lease.ack(), ContextConvergenceRetainedAck::Released);
+        assert_eq!(intake.pending(), 0);
+        assert_eq!(transport.capacity_state().epoch(), 1);
+    }
+
+    #[test]
+    fn dropping_a_lease_keeps_the_receipt_and_capacity_slot() {
+        let exact = context(15);
+        let mut intake = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
+        let transport = intake.handle();
+        let retained = receipt(exact, 1);
+        let _ = transport
+            .publish(exact, retained)
+            .expect("retain convergence receipt");
+
+        let lease = intake.peek_retained().expect("lease retained receipt");
+        drop(lease);
+        assert_eq!(intake.pending(), 1);
+        assert_eq!(transport.capacity_state().epoch(), 0);
+
+        let retry = intake
+            .peek_retained()
+            .expect("a dropped lease can be acquired again");
+        assert_eq!(retry.receipt(), retained);
+        assert_eq!(retry.ack(), ContextConvergenceRetainedAck::Released);
+    }
+
+    #[test]
+    fn acknowledgement_keeps_a_newer_version_published_while_lease_is_held() {
+        let exact = context(16);
+        let mut intake = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
+        let transport = intake.handle();
+        let _ = transport
+            .publish(exact, receipt(exact, 1))
+            .expect("retain first version");
+
+        let lease = intake.peek_retained().expect("lease first version");
+        assert_eq!(
+            transport.publish(exact, receipt(exact, 2)),
+            Ok(ContextConvergencePublishAdmission::Retained)
+        );
+        assert_eq!(lease.ack(), ContextConvergenceRetainedAck::NewerRetained);
+        assert_eq!(intake.pending(), 1);
+        assert_eq!(transport.capacity_state().epoch(), 0);
+
+        let newer = intake.peek_retained().expect("lease the newer version");
+        assert_eq!(newer.receipt(), receipt(exact, 2));
+        assert_eq!(newer.ack(), ContextConvergenceRetainedAck::Released);
+        assert_eq!(intake.pending(), 0);
+        assert_eq!(transport.capacity_state().epoch(), 1);
+    }
+
+    #[tokio::test]
+    async fn closing_the_intake_wakes_capacity_waiters_without_advancing_epoch() {
+        let intake = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
+        let transport = intake.handle();
+        let observed = transport.capacity_state();
+        let waiter = {
+            let transport = transport.clone();
+            tokio::spawn(async move { transport.wait_for_capacity_change(observed.epoch()).await })
+        };
+        tokio::task::yield_now().await;
+        drop(intake);
+
+        let closed = tokio::time::timeout(std::time::Duration::from_millis(50), waiter)
+            .await
+            .expect("closing the intake wakes capacity waiters")
+            .expect("capacity waiter task succeeds");
+        assert_eq!(closed.epoch(), observed.epoch());
+        assert!(closed.is_closed());
+    }
+
     #[test]
     fn failed_application_keeps_the_receipt_retained_for_retry() {
-        let exact = context(12);
+        let exact = context(17);
         let mut intake = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
         let transport = intake.handle();
         let retained = receipt(exact, 1);
@@ -541,6 +819,8 @@ mod tests {
     #[test]
     fn transport_handle_is_cloneable_send_and_sync() {
         fn assert_handle<T: Clone + Send + Sync>() {}
+        fn assert_lease<T: Send>() {}
         assert_handle::<ContextConvergenceIntakeHandle>();
+        assert_lease::<ContextConvergenceRetainedLease>();
     }
 }

@@ -84,7 +84,9 @@ use crate::task_execution::intent::{
     AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
     TaskOperationQueueAdmission, TaskOperationQueuePermit, TaskOperationSink, TaskOperationSubmit,
 };
-use crate::task_execution::status_intake::{StatusEvent, StatusIntakeHandle, StatusIntakeWake};
+use crate::task_execution::status_intake::{
+    StatusEvent, StatusIntakeAdmission, StatusIntakeHandle, StatusIntakeWake,
+};
 
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::{ChannelAcquisitionError, Client};
@@ -1116,6 +1118,9 @@ pub(crate) enum SubscriptionState {
     /// An event addressed a different backend process. An exact process
     /// replacement is fatal to the attempt and is never followed.
     ProcessMismatch,
+    /// An event addressed a different query execution on the expected
+    /// backend process. It cannot contribute to this context's cursor.
+    QueryMismatch,
 }
 
 impl SubscriptionState {
@@ -1127,6 +1132,7 @@ impl SubscriptionState {
             Self::BudgetExhausted => "budget_exhausted",
             Self::Rejected => "rejected",
             Self::ProcessMismatch => "process_mismatch",
+            Self::QueryMismatch => "query_mismatch",
         }
     }
 
@@ -1134,7 +1140,7 @@ impl SubscriptionState {
     pub(crate) const fn is_fatal(self) -> bool {
         matches!(
             self,
-            Self::BudgetExhausted | Self::Rejected | Self::ProcessMismatch
+            Self::BudgetExhausted | Self::Rejected | Self::ProcessMismatch | Self::QueryMismatch
         )
     }
 }
@@ -1363,7 +1369,8 @@ async fn run_subscription(
     }
 }
 
-/// Enqueues one observed event and advances its task's cursor.
+/// Enqueues one observed event and advances its task's cursor only after the
+/// bounded intake retained it.
 ///
 /// This is everything the receive path may do. It classifies nothing, opens no
 /// edge, completes no stage, and settles no operation.
@@ -1380,18 +1387,26 @@ fn observe_event(
             return Err(SubscriptionState::Rejected);
         }
     };
-    let (identity, event) = match decoded {
+    let (identity, event, next_cursor) = match decoded {
         StatusStreamEvent::Status(status) => {
             let identity = status.identity();
             let cursor = cursors
                 .get(&identity)
                 .copied()
                 .unwrap_or_else(|| TaskStatusCursor::unobserved(identity));
-            cursors.insert(identity, cursor.advanced_to(status.version()));
-            (identity, StatusEvent::Published(status))
+            let next_cursor = cursor.advanced_to(status.version());
+            (identity, StatusEvent::Published(status), Some(next_cursor))
         }
-        StatusStreamEvent::Gone(identity) => (identity, StatusEvent::Gone(identity)),
+        StatusStreamEvent::Gone(identity) => (identity, StatusEvent::Gone(identity), None),
     };
+    if identity.query_execution_id() != context.query_execution_id() {
+        tracing::warn!(
+            context_execution = ?context.query_execution_id(),
+            event_execution = ?identity.query_execution_id(),
+            "SubscribeTaskStatus event addresses a different query execution"
+        );
+        return Err(SubscriptionState::QueryMismatch);
+    }
     if identity.backend_process_id() != context.backend_process_id() {
         tracing::warn!(
             context_backend = %context.backend_process_id(),
@@ -1400,8 +1415,21 @@ fn observe_event(
         );
         return Err(SubscriptionState::ProcessMismatch);
     }
-    intake.publish(event);
-    Ok(())
+    match intake.publish(event) {
+        StatusIntakeAdmission::Enqueued => {
+            if let Some(next_cursor) = next_cursor {
+                cursors.insert(identity, next_cursor);
+            }
+            Ok(())
+        }
+        // The intake has already recorded observation loss and woken the
+        // TaskRound. Stop this stream immediately so no later version can
+        // leap over the snapshot it could not retain. This is local
+        // backpressure, not a network failure, so the subscription loop must
+        // not spend its transport error budget or resubscribe from its private
+        // cursor. TaskRound will replace it from the state machine's cursor.
+        StatusIntakeAdmission::Overflowed => Err(SubscriptionState::Resubscribing),
+    }
 }
 
 async fn open_subscription(
@@ -1700,7 +1728,7 @@ mod tests {
         CreateTaskReceipt, CredentialEpoch, CredentialLeaseId, CredentialUpdate, DomainVersion,
         EstablishQueryContext, FetchTaskDynamicFilters, LeaseSequence, LeaseValidFor,
         QueryContextReceipt, QueryContextState, RenewQueryExecutionLease, TaskDomainUpdate,
-        TaskStatus, TaskStatusVersion, UpdateTask,
+        TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, UpdateTask,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter};
@@ -1745,6 +1773,17 @@ mod tests {
             TaskId::new(task).expect("a nonzero task id"),
             backend,
         )
+    }
+
+    fn status_at(identity: TaskIdentity, version: TaskStatusVersion) -> TaskStatus {
+        TaskStatus::try_new(
+            identity,
+            version,
+            TaskState::Running,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .expect("a running task status")
     }
 
     fn context(backend: BackendProcessId) -> QueryContextRef {
@@ -2801,6 +2840,174 @@ mod tests {
             fixture.intake.queued(),
             0,
             "an event from a replaced process is never published"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_status_event_from_another_query_execution_is_fatal() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = subscriber_fixture(Loopback::start().await, backend, 2);
+        let query_context = context(backend);
+        let foreign_execution = QueryExecutionId::new(
+            execution_id().query_id(),
+            AttemptId::new(2).expect("attempt two is nonzero"),
+        )
+        .expect("a nonzero query id");
+        let foreign_task = TaskIdentity::new(
+            foreign_execution,
+            StageId::new(1).expect("a nonzero stage id"),
+            TaskId::new(1).expect("a nonzero task id"),
+            backend,
+        );
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![encode_status_event(
+                &TaskStatus::created(foreign_task),
+            )]));
+
+        fixture
+            .subscriber
+            .ensure(query_context, Vec::new())
+            .expect("the subscription starts");
+        let mut observed = None;
+        for _ in 0..600 {
+            let state = fixture.subscriber.state(query_context);
+            if state == Some(SubscriptionState::QueryMismatch) {
+                observed = state;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(observed, Some(SubscriptionState::QueryMismatch));
+        assert!(observed.expect("a settled state").is_fatal());
+        assert_eq!(
+            fixture.intake.queued(),
+            0,
+            "an event from another query execution is never published"
+        );
+    }
+
+    #[test]
+    fn intake_overflow_preserves_the_last_enqueued_status_cursor() {
+        let backend = BackendProcessId::new_v7();
+        let query_context = context(backend);
+        let task = identity(1, backend);
+        let first = TaskStatus::created(task);
+        let second_version = TaskStatusVersion::FIRST.next().expect("version two");
+        let second = status_at(task, second_version);
+        let intake = StatusIntake::new(1, Arc::new(CountingWake::default()));
+        let handle = intake.handle();
+        let mut cursors = BTreeMap::from([(task, TaskStatusCursor::unobserved(task))]);
+
+        assert_eq!(
+            observe_event(
+                query_context,
+                &encode_status_event(&first),
+                &mut cursors,
+                &handle,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            cursors
+                .get(&task)
+                .and_then(|cursor| cursor.current_version()),
+            Some(TaskStatusVersion::FIRST)
+        );
+        assert_eq!(
+            observe_event(
+                query_context,
+                &encode_status_event(&second),
+                &mut cursors,
+                &handle,
+            ),
+            Err(SubscriptionState::Resubscribing)
+        );
+        assert_eq!(
+            cursors
+                .get(&task)
+                .and_then(|cursor| cursor.current_version()),
+            Some(TaskStatusVersion::FIRST),
+            "a status the bounded intake did not retain cannot advance the stream cursor"
+        );
+        let mut runner = intake.try_enter().expect("the runner slot is free");
+        assert!(runner.take_observation_loss());
+        assert_eq!(runner.drain(2), vec![StatusEvent::Published(first)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn intake_overflow_waits_for_task_round_resubscription_without_spending_error_budget() {
+        let backend = BackendProcessId::new_v7();
+        let loopback = Loopback::start().await;
+        let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let intake = StatusIntake::new(1, Arc::new(CountingWake::default()));
+        let subscriber = TaskStatusSubscriber::new(
+            &[(backend, loopback.endpoint.clone())],
+            intake.handle(),
+            1,
+            data_runtime,
+        )
+        .expect("one frozen backend target");
+        let query_context = context(backend);
+        let task = identity(1, backend);
+        let first = TaskStatus::created(task);
+        let second = status_at(task, TaskStatusVersion::FIRST.next().expect("version two"));
+        loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
+                encode_status_event(&first),
+                encode_status_event(&second),
+            ]));
+
+        subscriber
+            .ensure(query_context, vec![TaskStatusCursor::unobserved(task)])
+            .expect("the subscription starts");
+        for _ in 0..600 {
+            if subscriber.state(query_context) == Some(SubscriptionState::Resubscribing) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            subscriber.state(query_context),
+            Some(SubscriptionState::Resubscribing),
+            "local overflow waits for the serial runner instead of exhausting the network budget"
+        );
+        tokio::time::sleep(RESUBSCRIBE_BACKOFF_STEP * 2).await;
+        assert_eq!(
+            loopback.peer.subscribed().len(),
+            1,
+            "the receive task never privately resubscribes past a locally lost status"
+        );
+
+        let mut runner = intake.try_enter().expect("the runner slot is free");
+        assert!(runner.take_observation_loss());
+        assert_eq!(runner.drain(2), vec![StatusEvent::Published(first)]);
+        drop(runner);
+
+        loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
+        subscriber
+            .resubscribe(
+                query_context,
+                vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)],
+            )
+            .expect("TaskRound replaces the subscription from its cursor");
+        let requests = subscribe_requests(&loopback.peer, 2).await;
+        let (_, cursors) = decode_subscribe_task_status(
+            &requests[1],
+            FieldPath::root("post_overflow_subscription"),
+        )
+        .expect("a legal subscription");
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(cursors[0].identity(), task);
+        assert_eq!(
+            cursors[0].current_version(),
+            Some(TaskStatusVersion::FIRST),
+            "TaskRound's applied cursor is the only position allowed after overflow"
         );
     }
 
