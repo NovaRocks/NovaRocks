@@ -17,7 +17,7 @@
 
 use crate::{
     WorkError, WorkId, WorkScope,
-    scope::{Inner, State},
+    scope::{Inner, ProtocolWaiter, State},
 };
 use std::sync::{Arc, Mutex};
 
@@ -162,13 +162,13 @@ impl ResourceWaitRegistration {
                 node.check()?;
             }
             let key = (scope.id, class);
-            if state.resource_waiters.contains(&key) {
+            if state.resource_waiters.generic.contains(&key) {
                 return Err(WorkError::AlreadyWaitingForResource(class));
             }
             if state.waiting_records() >= scope.inner.config.waiting_limit {
                 return Err(WorkError::Capacity("waiting entries"));
             }
-            state.resource_waiters.insert(key);
+            state.resource_waiters.generic.insert(key);
             state.nodes.get_mut(&scope.id).unwrap().resource_waiters += 1;
             state.record_waiting_peak();
             Ok(Self {
@@ -182,7 +182,10 @@ impl ResourceWaitRegistration {
 impl Drop for ResourceWaitRegistration {
     fn drop(&mut self) {
         self.scope.inner.update_facts(|state| {
-            let removed = state.resource_waiters.remove(&(self.scope.id, self.class));
+            let removed = state
+                .resource_waiters
+                .generic
+                .remove(&(self.scope.id, self.class));
             debug_assert!(removed, "Resource waiter registration was already removed");
             state
                 .nodes
@@ -190,6 +193,51 @@ impl Drop for ResourceWaitRegistration {
                 .unwrap()
                 .resource_waiters -= 1;
             state.collect(self.scope.id);
+        });
+    }
+}
+
+/// One independently ordered protocol-output wait. Unlike generic resource
+/// waits, a scope may own several of these because every retained result batch
+/// carries its own credit and must be able to make progress independently.
+struct ProtocolWaitRegistration {
+    scope: WorkScope,
+    ticket: Option<u64>,
+}
+
+impl ProtocolWaitRegistration {
+    fn remove_locked(&mut self, state: &mut State) -> bool {
+        let Some(ticket) = self.ticket.take() else {
+            return false;
+        };
+        let removed = state.resource_waiters.protocol.remove(&ticket);
+        debug_assert!(
+            removed.is_some(),
+            "Protocol waiter registration was already removed"
+        );
+        state.protocol_wait_queue.retain(|queued| *queued != ticket);
+        if removed.is_some() {
+            state
+                .nodes
+                .get_mut(&self.scope.id)
+                .unwrap()
+                .resource_waiters -= 1;
+            state.collect(self.scope.id);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for ProtocolWaitRegistration {
+    fn drop(&mut self) {
+        if self.ticket.is_none() {
+            return;
+        }
+        let inner = Arc::clone(&self.scope.inner);
+        inner.update_facts(|state| {
+            self.remove_locked(state);
         });
     }
 }
@@ -252,6 +300,59 @@ fn release_reserved(state: &mut State, id: WorkId, bytes: u64, class: ResourceCl
         ResourceClass::Data => state.data_reserved -= bytes,
         ResourceClass::Control => state.control_reserved -= bytes,
     }
+}
+
+fn reserve_protocol_bytes(
+    state: &mut State,
+    config: &ResourceConfig,
+    scope: WorkId,
+    decoded_bytes: u64,
+    protocol_bytes: u64,
+) -> Result<(), WorkError> {
+    let combined = decoded_bytes
+        .checked_add(protocol_bytes)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    check_capacity(state, config, scope, protocol_bytes, ResourceClass::Data)?;
+    checked_result_stage_add(state, scope, ResultCreditStage::ProtocolReserved, combined)?;
+    remove_result_stage(
+        state,
+        scope,
+        ResultCreditStage::DecodedQueued,
+        decoded_bytes,
+    );
+    reserve_bytes(state, scope, protocol_bytes, ResourceClass::Data);
+    add_result_stage(state, scope, ResultCreditStage::ProtocolReserved, combined);
+    Ok(())
+}
+
+fn register_protocol_waiter(
+    scope: &WorkScope,
+    state: &mut State,
+    bytes: u64,
+) -> Result<ProtocolWaitRegistration, WorkError> {
+    state
+        .nodes
+        .get(&scope.id)
+        .ok_or(WorkError::Released)?
+        .check()?;
+    if state.waiting_records() >= scope.inner.config.waiting_limit {
+        return Err(WorkError::Capacity("waiting entries"));
+    }
+    let ticket = state.next_protocol_waiter_id()?;
+    state.resource_waiters.protocol.insert(
+        ticket,
+        ProtocolWaiter {
+            scope: scope.id,
+            bytes,
+        },
+    );
+    state.protocol_wait_queue.push_back(ticket);
+    state.nodes.get_mut(&scope.id).unwrap().resource_waiters += 1;
+    state.record_waiting_peak();
+    Ok(ProtocolWaitRegistration {
+        scope: scope.clone(),
+        ticket: Some(ticket),
+    })
 }
 
 impl LocalResourceAuthority {
@@ -605,6 +706,9 @@ impl ResultCredit {
         ) {
             return Err(Self::reservation_error(error, self));
         }
+        if let Err(error) = self.scope.check() {
+            return Err(Self::reservation_error(error, self));
+        }
         if !Arc::ptr_eq(&authority.inner, &self.scope.inner) {
             return Err(Self::reservation_error(WorkError::ForeignAuthority, self));
         }
@@ -736,37 +840,17 @@ impl ResultCredit {
                 self,
             ));
         }
-        let Some(combined) = self.primary_bytes.checked_add(bytes) else {
-            return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
-        };
         let result = self.scope.inner.update_facts_silent(|state| {
-            check_capacity(
+            if !state.protocol_wait_queue.is_empty() {
+                return Err(WorkError::Capacity("protocol reservation queue"));
+            }
+            reserve_protocol_bytes(
                 state,
                 &self.scope.inner.resource_config,
                 self.scope.id,
-                bytes,
-                ResourceClass::Data,
-            )?;
-            checked_result_stage_add(
-                state,
-                self.scope.id,
-                ResultCreditStage::ProtocolReserved,
-                combined,
-            )?;
-            remove_result_stage(
-                state,
-                self.scope.id,
-                ResultCreditStage::DecodedQueued,
                 self.primary_bytes,
-            );
-            reserve_bytes(state, self.scope.id, bytes, ResourceClass::Data);
-            add_result_stage(
-                state,
-                self.scope.id,
-                ResultCreditStage::ProtocolReserved,
-                combined,
-            );
-            Ok(())
+                bytes,
+            )
         });
         if let Err(error) = result {
             return Err(Self::reservation_error(error, self));
@@ -774,6 +858,175 @@ impl ResultCredit {
         self.stage = ResultCreditStage::ProtocolReserved;
         self.secondary_bytes = bytes;
         Ok(self)
+    }
+
+    /// Reserve protocol-output bytes in FIFO order, waiting through temporary
+    /// local pressure while retaining this decoded credit.
+    ///
+    /// Each invocation owns a distinct bounded registration, so several live
+    /// batches from one scope can wait concurrently. The queue head checks and
+    /// charges capacity under the authority lock, preventing a later protocol
+    /// waiter from stealing a release between notification and retry. One
+    /// absolute deadline bounds the entire operation.
+    pub async fn reserve_protocol_when_available(
+        mut self,
+        authority: &LocalResourceAuthority,
+        bytes: u64,
+    ) -> Result<Self, ResultCreditReservationError> {
+        if let Err(error) = self.require(
+            ResultCreditStage::DecodedQueued,
+            ResultCreditStage::ProtocolReserved,
+        ) {
+            return Err(Self::reservation_error(error, self));
+        }
+        if let Err(error) = self.scope.check() {
+            return Err(Self::reservation_error(error, self));
+        }
+        if !Arc::ptr_eq(&authority.inner, &self.scope.inner) {
+            return Err(Self::reservation_error(WorkError::ForeignAuthority, self));
+        }
+        if bytes == 0 {
+            return Err(Self::reservation_error(
+                WorkError::Capacity("zero-byte protocol reservation"),
+                self,
+            ));
+        }
+        let Some(combined) = self.primary_bytes.checked_add(bytes) else {
+            return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
+        };
+        let config = &self.scope.inner.resource_config;
+        let data_limit = config.total_bytes - config.control_bytes;
+        if combined > config.per_scope_bytes || combined > data_limit {
+            return Err(Self::reservation_error(
+                WorkError::Capacity("unrepresentable protocol allocation"),
+                self,
+            ));
+        }
+        let cancellation = match self.scope.cancellation() {
+            Ok(cancellation) => cancellation,
+            Err(error) => return Err(Self::reservation_error(error, self)),
+        };
+        let capacity_deadline = match tokio::time::Instant::now()
+            .checked_add(self.scope.inner.config.capacity_wait_timeout)
+        {
+            Some(deadline) => deadline,
+            None => {
+                return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
+            }
+        };
+        let wait_deadline = cancellation
+            .deadline()
+            .map_or(capacity_deadline, |deadline| {
+                deadline.min(capacity_deadline)
+            });
+
+        let start = self.scope.inner.update_facts(|state| {
+            state
+                .nodes
+                .get(&self.scope.id)
+                .ok_or(WorkError::Released)?
+                .check()?;
+            if tokio::time::Instant::now() >= wait_deadline {
+                return Err(WorkError::CapacityWaitTimeout);
+            }
+            if state.protocol_wait_queue.is_empty() {
+                match reserve_protocol_bytes(
+                    state,
+                    &self.scope.inner.resource_config,
+                    self.scope.id,
+                    self.primary_bytes,
+                    bytes,
+                ) {
+                    Ok(()) => return Ok(None),
+                    Err(WorkError::Capacity(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            register_protocol_waiter(&self.scope, state, bytes).map(Some)
+        });
+        let mut registration = match start {
+            Ok(None) => {
+                self.stage = ResultCreditStage::ProtocolReserved;
+                self.secondary_bytes = bytes;
+                return Ok(self);
+            }
+            Ok(Some(registration)) => registration,
+            Err(error) => return Err(Self::reservation_error(error, self)),
+        };
+
+        let inner = Arc::clone(&self.scope.inner);
+        let timeout = tokio::time::sleep_until(wait_deadline);
+        let cancelled = cancellation.cancelled();
+        tokio::pin!(timeout, cancelled);
+        loop {
+            let changed = inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Err(error) = self.scope.check() {
+                return Err(Self::reservation_error(error, self));
+            }
+            if tokio::time::Instant::now() >= wait_deadline {
+                return Err(Self::reservation_error(
+                    WorkError::CapacityWaitTimeout,
+                    self,
+                ));
+            }
+
+            let grant = inner.update_facts_silent(|state| {
+                let ticket = registration
+                    .ticket
+                    .expect("live protocol wait owns its queue ticket");
+                let waiter = state
+                    .resource_waiters
+                    .protocol
+                    .get(&ticket)
+                    .ok_or(WorkError::Released)?;
+                debug_assert_eq!((waiter.scope, waiter.bytes), (self.scope.id, bytes));
+                if state.protocol_wait_queue.front().copied() != Some(ticket) {
+                    return Ok(false);
+                }
+                state
+                    .nodes
+                    .get(&self.scope.id)
+                    .ok_or(WorkError::Released)?
+                    .check()?;
+                if tokio::time::Instant::now() >= wait_deadline {
+                    return Err(WorkError::CapacityWaitTimeout);
+                }
+                match reserve_protocol_bytes(
+                    state,
+                    &self.scope.inner.resource_config,
+                    self.scope.id,
+                    self.primary_bytes,
+                    bytes,
+                ) {
+                    Ok(()) => {
+                        registration.remove_locked(state);
+                        Ok(true)
+                    }
+                    Err(WorkError::Capacity(_)) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            });
+            match grant {
+                Ok(true) => {
+                    inner.notify_capacity_available();
+                    self.stage = ResultCreditStage::ProtocolReserved;
+                    self.secondary_bytes = bytes;
+                    return Ok(self);
+                }
+                Ok(false) => {}
+                Err(error) => return Err(Self::reservation_error(error, self)),
+            }
+
+            tokio::select! {
+                _ = changed => {},
+                _ = &mut timeout => {},
+                reason = &mut cancelled => {
+                    return Err(Self::reservation_error(WorkError::Cancelled(reason), self));
+                }
+            }
+        }
     }
 
     /// Convert the protocol reservation to its retained bytes without

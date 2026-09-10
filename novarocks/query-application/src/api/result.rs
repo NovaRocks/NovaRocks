@@ -344,6 +344,43 @@ impl BatchDelivery {
         }
     }
 
+    /// Reserve protocol-output capacity, asynchronously waiting through
+    /// temporary local pressure while retaining this delivery and its decoded
+    /// credit.
+    ///
+    /// The wait is attributed to the credit's original work scope and inherits
+    /// that scope's cancellation and deadline. Permanent capacity, authority,
+    /// lifecycle, and transition failures return the intact delivery so the
+    /// adapter can report an explicit failure. Dropping this future drops the
+    /// delivery and reports `Dropped` to its logical owner.
+    pub async fn reserve_protocol_when_available(
+        mut self,
+        authority: &LocalResourceAuthority,
+        bytes: u64,
+    ) -> Result<Self, BatchDeliveryReservationError> {
+        let credit = self
+            .credit
+            .take()
+            .expect("batch delivery owns credit while awaiting protocol capacity");
+        match credit
+            .reserve_protocol_when_available(authority, bytes)
+            .await
+        {
+            Ok(credit) => {
+                self.credit = Some(credit);
+                Ok(self)
+            }
+            Err(rejection) => {
+                let (error, credit) = rejection.into_parts();
+                self.credit = Some(credit);
+                Err(BatchDeliveryReservationError {
+                    error,
+                    delivery: self,
+                })
+            }
+        }
+    }
+
     pub fn begin_protocol_write(mut self, actual_bytes: u64) -> Result<Self, QueryExecutionError> {
         let credit = self
             .credit
@@ -677,7 +714,8 @@ mod tests {
     };
     use novarocks_types::{AttemptId, QueryId};
     use novarocks_workload_control::{
-        ResourceConfig, WorkClass, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
+        CancellationReason, ResourceClass, ResourceConfig, WorkClass, WorkRequest, WorkScope,
+        WorkloadConfig, WorkloadControl,
     };
 
     use super::*;
@@ -708,12 +746,16 @@ mod tests {
     }
 
     fn workload() -> WorkloadControl {
+        workload_with_limits(1024 * 1024 - 1024, 1024 * 1024 - 1024)
+    }
+
+    fn workload_with_limits(data_bytes: u64, per_scope_bytes: u64) -> WorkloadControl {
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
-                total_bytes: 1024 * 1024,
+                total_bytes: data_bytes + 1024,
                 control_bytes: 1024,
-                per_scope_bytes: 1024 * 1024 - 1024,
+                per_scope_bytes,
             },
         )
         .unwrap();
@@ -781,7 +823,10 @@ mod tests {
             bytes
         );
 
-        let delivery = delivery.reserve_protocol(&authority, bytes).unwrap();
+        let delivery = delivery
+            .reserve_protocol_when_available(&authority, bytes)
+            .await
+            .unwrap();
         let delivery = delivery.begin_protocol_write(bytes).unwrap();
         assert_eq!(
             authority.snapshot().result_credit.protocol_writing_bytes,
@@ -792,6 +837,380 @@ mod tests {
         assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Completed);
         assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
         drop(root);
+    }
+
+    #[tokio::test]
+    async fn protocol_capacity_wait_succeeds_after_capacity_release() {
+        let batch = batch();
+        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let control = workload_with_limits(bytes * 3, bytes * 2);
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let blocker_work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let authority = control.resources();
+        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
+        let blocker = authority
+            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
+            .unwrap();
+        let (delivery, receipt) =
+            BatchDelivery::try_new(execution_id(2), ResultPacketSequence::new(0), batch, credit)
+                .unwrap();
+
+        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(control.snapshot().resource_waiters, 1);
+
+        drop(blocker);
+        let delivery = waiting.await.unwrap();
+        assert_eq!(delivery.credit_stage(), ResultCreditStage::ProtocolReserved);
+        delivery.fail(QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            "test completed after capacity release",
+        ));
+        assert!(matches!(
+            receipt.await.unwrap(),
+            ResultDeliveryDisposition::Failed(_)
+        ));
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        drop((work, blocker_work));
+    }
+
+    #[tokio::test]
+    async fn protocol_capacity_waits_from_one_scope_are_fifo_and_coexist() {
+        let first_batch = batch();
+        let second_batch = batch();
+        let bytes = u64::try_from(first_batch.get_array_memory_size()).unwrap();
+        let control = workload_with_limits(bytes * 5, bytes * 4);
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let blocker_work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let authority = control.resources();
+        let first_credit = decoded_credit(&control, &work.owner.scope(), bytes);
+        let second_credit = decoded_credit(&control, &work.owner.scope(), bytes);
+        let mut blocker = authority
+            .reserve(&blocker_work.owner.scope(), bytes * 3, ResourceClass::Data)
+            .unwrap();
+        let (first, first_receipt) = BatchDelivery::try_new(
+            execution_id(8),
+            ResultPacketSequence::new(0),
+            first_batch,
+            first_credit,
+        )
+        .unwrap();
+        let (second, second_receipt) = BatchDelivery::try_new(
+            execution_id(8),
+            ResultPacketSequence::new(1),
+            second_batch,
+            second_credit,
+        )
+        .unwrap();
+
+        let mut first = Box::pin(first.reserve_protocol_when_available(&authority, bytes));
+        let mut second = Box::pin(second.reserve_protocol_when_available(&authority, bytes));
+        tokio::select! {
+            biased;
+            _ = &mut first => panic!("first protocol reservation must wait for capacity"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tokio::select! {
+            biased;
+            _ = &mut second => panic!("second protocol reservation must wait for capacity"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(control.snapshot().resource_waiters, 2);
+
+        blocker.release_unused(bytes).unwrap();
+        tokio::select! {
+            biased;
+            _ = &mut second => panic!("later protocol waiter must not bypass the queue head"),
+            _ = tokio::task::yield_now() => {}
+        }
+        let first = first.await.unwrap();
+        assert_eq!(control.snapshot().resource_waiters, 1);
+        first.fail(QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            "release the first FIFO protocol grant",
+        ));
+        assert!(matches!(
+            first_receipt.await.unwrap(),
+            ResultDeliveryDisposition::Failed(_)
+        ));
+
+        let second = second.await.unwrap();
+        assert_eq!(control.snapshot().resource_waiters, 0);
+        second.fail(QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            "release the second FIFO protocol grant",
+        ));
+        assert!(matches!(
+            second_receipt.await.unwrap(),
+            ResultDeliveryDisposition::Failed(_)
+        ));
+        drop(blocker);
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        drop((work, blocker_work));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protocol_capacity_wait_timeout_is_one_absolute_deadline() {
+        let batch = batch();
+        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let control = workload_with_limits(bytes * 3, bytes * 2);
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let blocker_work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let authority = control.resources();
+        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
+        let blocker = authority
+            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
+            .unwrap();
+        let (delivery, receipt) =
+            BatchDelivery::try_new(execution_id(9), ResultPacketSequence::new(0), batch, credit)
+                .unwrap();
+        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        for _ in 0..2 {
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+            let signal = authority
+                .reserve(&blocker_work.owner.scope(), 1, ResourceClass::Control)
+                .unwrap();
+            drop(signal);
+            tokio::select! {
+                biased;
+                _ = &mut waiting => panic!("capacity notification must not renew the wait deadline"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        let rejection = match waiting.await {
+            Ok(_) => panic!("protocol capacity wait must expire at its original deadline"),
+            Err(rejection) => rejection,
+        };
+        assert_eq!(rejection.error(), &WorkError::CapacityWaitTimeout);
+        let (_, delivery) = rejection.into_parts();
+        drop(delivery);
+        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
+        assert_eq!(control.snapshot().resource_waiters, 0);
+        drop(blocker);
+        drop((work, blocker_work));
+    }
+
+    #[tokio::test]
+    async fn protocol_capacity_wait_returns_cancelled_delivery_to_adapter() {
+        let batch = batch();
+        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let control = workload_with_limits(bytes * 3, bytes * 2);
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let blocker_work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let authority = control.resources();
+        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
+        let blocker = authority
+            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
+            .unwrap();
+        let (delivery, receipt) =
+            BatchDelivery::try_new(execution_id(3), ResultPacketSequence::new(0), batch, credit)
+                .unwrap();
+
+        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
+            _ = tokio::task::yield_now() => {}
+        }
+        work.owner.cancel(CancellationReason::Requested);
+        let rejection = match waiting.await {
+            Ok(_) => panic!("cancelled work must not reserve protocol capacity"),
+            Err(rejection) => rejection,
+        };
+        assert!(matches!(rejection.error(), WorkError::Cancelled(_)));
+        let (_, delivery) = rejection.into_parts();
+        assert_eq!(delivery.credit_stage(), ResultCreditStage::DecodedQueued);
+        assert_eq!(
+            authority.snapshot().result_credit.decoded_queued_bytes,
+            bytes
+        );
+        delivery.fail(QueryExecutionError::new(
+            QueryExecutionErrorKind::Cancelled,
+            "protocol capacity wait cancelled",
+        ));
+        assert!(matches!(
+            receipt.await.unwrap(),
+            ResultDeliveryDisposition::Failed(_)
+        ));
+        drop(blocker);
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        drop((work, blocker_work));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protocol_capacity_wait_uses_the_work_scope_deadline() {
+        let batch = batch();
+        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let control = workload_with_limits(bytes * 3, bytes * 2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let work = control
+            .try_begin_root(WorkRequest {
+                class: WorkClass::Query,
+                deadline: Some(deadline),
+            })
+            .unwrap();
+        let blocker_work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let authority = control.resources();
+        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
+        let blocker = authority
+            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
+            .unwrap();
+        let (delivery, receipt) =
+            BatchDelivery::try_new(execution_id(4), ResultPacketSequence::new(0), batch, credit)
+                .unwrap();
+
+        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let rejection = match waiting.await {
+            Ok(_) => panic!("scope deadline must bound the protocol capacity wait"),
+            Err(rejection) => rejection,
+        };
+        assert_eq!(
+            rejection.error(),
+            &WorkError::Cancelled(CancellationReason::DeadlineExceeded)
+        );
+        let (_, delivery) = rejection.into_parts();
+        assert_eq!(delivery.credit_stage(), ResultCreditStage::DecodedQueued);
+        drop(delivery);
+        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
+        assert_eq!(control.snapshot().resource_waiters, 0);
+        drop(blocker);
+        drop((work, blocker_work));
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_protocol_capacity_fails_without_waiting() {
+        let batch = batch();
+        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let control = workload_with_limits(bytes * 3, bytes * 2);
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let authority = control.resources();
+        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
+        let (delivery, receipt) =
+            BatchDelivery::try_new(execution_id(5), ResultPacketSequence::new(0), batch, credit)
+                .unwrap();
+
+        let rejection = match delivery
+            .reserve_protocol_when_available(&authority, bytes * 2)
+            .await
+        {
+            Ok(_) => panic!("unrepresentable protocol capacity must fail"),
+            Err(rejection) => rejection,
+        };
+        assert_eq!(
+            rejection.error(),
+            &WorkError::Capacity("unrepresentable protocol allocation")
+        );
+        assert_eq!(control.snapshot().resource_waiters, 0);
+        let (_, delivery) = rejection.into_parts();
+        assert_eq!(delivery.credit_stage(), ResultCreditStage::DecodedQueued);
+        drop(delivery);
+        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        drop(work);
+    }
+
+    #[tokio::test]
+    async fn dropping_protocol_capacity_wait_releases_delivery_credit() {
+        let batch = batch();
+        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let control = workload_with_limits(bytes * 3, bytes * 2);
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let blocker_work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let authority = control.resources();
+        let credit = decoded_credit(&control, &work.owner.scope(), bytes);
+        let blocker = authority
+            .reserve(&blocker_work.owner.scope(), bytes * 2, ResourceClass::Data)
+            .unwrap();
+        let (delivery, receipt) =
+            BatchDelivery::try_new(execution_id(6), ResultPacketSequence::new(0), batch, credit)
+                .unwrap();
+
+        let mut waiting = Box::pin(delivery.reserve_protocol_when_available(&authority, bytes));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("protocol reservation must wait for capacity"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(control.snapshot().resource_waiters, 1);
+        drop(waiting);
+
+        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
+        assert_eq!(control.snapshot().resource_waiters, 0);
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        assert_eq!(authority.snapshot().held_bytes(), bytes * 2);
+        drop(blocker);
+        drop((work, blocker_work));
+    }
+
+    #[tokio::test]
+    async fn foreign_protocol_capacity_authority_fails_closed() {
+        let local = workload();
+        let foreign = workload();
+        let work = local
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let batch = batch();
+        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let credit = decoded_credit(&local, &work.owner.scope(), bytes);
+        let (delivery, receipt) =
+            BatchDelivery::try_new(execution_id(7), ResultPacketSequence::new(0), batch, credit)
+                .unwrap();
+
+        let rejection = match delivery
+            .reserve_protocol_when_available(&foreign.resources(), bytes)
+            .await
+        {
+            Ok(_) => panic!("foreign authority must fail"),
+            Err(rejection) => rejection,
+        };
+        assert!(matches!(rejection.error(), WorkError::ForeignAuthority));
+        let (_, delivery) = rejection.into_parts();
+        assert_eq!(delivery.credit_stage(), ResultCreditStage::DecodedQueued);
+        drop(delivery);
+        assert_eq!(receipt.await.unwrap(), ResultDeliveryDisposition::Dropped);
+        assert_eq!(local.resources().snapshot().result_credit.held_bytes(), 0);
+        drop(work);
     }
 
     #[tokio::test]

@@ -897,10 +897,9 @@ impl LogicalExecutionState {
         Ok(packet)
     }
 
-    /// Atomically lets success win against any later failure and grants the
-    /// only success-EOF write. The actor may publish stable success only after
-    /// this exact permit completes; a protocol failure consumes it through
-    /// `fail_success_end_of_stream` and publishes failure instead.
+    /// Grants the only success-EOF write. Success remains provisional until
+    /// this exact permit completes; cancellation or a later exact failure may
+    /// consume it before protocol acceptance and publish a non-success result.
     pub(crate) fn begin_success_end_of_stream(
         &mut self,
         capability: &AttemptCapability,
@@ -1024,7 +1023,21 @@ impl LogicalExecutionState {
         &mut self,
         permit: SuccessEndOfStreamPermit,
     ) -> Result<(), DeliveryCompletionError<()>> {
+        self.conclude_success_end_of_stream(permit, LogicalConclusion::Failed)
+    }
+
+    pub(crate) fn conclude_success_end_of_stream(
+        &mut self,
+        permit: SuccessEndOfStreamPermit,
+        conclusion: LogicalConclusion,
+    ) -> Result<(), DeliveryCompletionError<()>> {
         let execution = permit.inner.execution();
+        if matches!(conclusion, LogicalConclusion::Succeeded) {
+            return Err(DeliveryCompletionError::new(
+                DeliveryGateError::WrongExecutionPhase,
+                permit.inner,
+            ));
+        }
         if !matches!(
             self.phase,
             ExecutionPhase::FinishingSuccess {
@@ -1045,7 +1058,7 @@ impl LogicalExecutionState {
             .get_mut(&execution)
             .expect("a finishing execution remains registered")
             .disposition = AttemptDisposition::Residual;
-        self.conclusion = Some(LogicalConclusion::Failed);
+        self.conclusion = Some(conclusion);
         self.phase = ExecutionPhase::Converging;
         debug_assert!(!self.delivery.has_eligible_attempt());
         Ok(())
@@ -1610,7 +1623,7 @@ mod tests {
     }
 
     #[test]
-    fn success_eos_authorization_wins_before_late_failure() {
+    fn only_the_eof_permit_can_replace_provisional_success() {
         let mut state = LogicalExecutionState::new(
             execution(1),
             RecoveryMode::NoRecovery,
@@ -1629,8 +1642,10 @@ mod tests {
             state.conclude(&initial, LogicalConclusion::Failed),
             Err(ActorStateError::SuccessAlreadyAuthorized)
         );
-        state.complete_success_end_of_stream(permit).unwrap();
-        assert_eq!(state.conclusion(), Some(LogicalConclusion::Succeeded));
+        state
+            .conclude_success_end_of_stream(permit, LogicalConclusion::Cancelled)
+            .unwrap();
+        assert_eq!(state.conclusion(), Some(LogicalConclusion::Cancelled));
     }
 
     #[test]

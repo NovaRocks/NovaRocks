@@ -601,6 +601,21 @@ fn result_credit_at(
     credit.begin_protocol_write(32).unwrap()
 }
 
+fn small_decoded_credit(control: &WorkloadControl, scope: &WorkScope) -> ResultCredit {
+    let authority = control.resources();
+    authority
+        .reserve_result_credit(scope, 24)
+        .unwrap()
+        .begin_fetch()
+        .unwrap()
+        .retain_raw(20)
+        .unwrap()
+        .reserve_decode(&authority, 24)
+        .unwrap()
+        .queue_decoded(20)
+        .unwrap()
+}
+
 #[test]
 fn result_credit_transitions_share_the_data_ledger_and_hold_slow_output() {
     let control = control();
@@ -670,6 +685,38 @@ fn result_credit_transitions_share_the_data_ledger_and_hold_slow_output() {
     credit.consume().unwrap();
     assert_eq!(authority.snapshot().held_bytes(), 0);
     assert_eq!(control.snapshot().root_responsibilities, 0);
+}
+
+#[tokio::test]
+async fn protocol_result_credit_waiters_share_a_scope_and_grant_fifo() {
+    let control = control();
+    let work = root(&control, WorkClass::Query);
+    let blocker_work = root(&control, WorkClass::Query);
+    let authority = control.resources();
+    let first = small_decoded_credit(&control, &work.owner.scope());
+    let second = small_decoded_credit(&control, &work.owner.scope());
+    let mut blocker = authority
+        .reserve(&blocker_work.owner.scope(), 72, ResourceClass::Data)
+        .unwrap();
+    let mut first = Box::pin(first.reserve_protocol_when_available(&authority, 16));
+    let mut second = Box::pin(second.reserve_protocol_when_available(&authority, 16));
+    assert!(poll(&mut first).is_pending());
+    assert!(poll(&mut second).is_pending());
+    assert_eq!(control.snapshot().resource_waiters, 2);
+
+    blocker.release_unused(16).unwrap();
+    assert!(poll(&mut second).is_pending());
+    let first = first.await.unwrap();
+    assert_eq!(first.stage(), ResultCreditStage::ProtocolReserved);
+    assert_eq!(control.snapshot().resource_waiters, 1);
+    drop(first);
+
+    let second = second.await.unwrap();
+    assert_eq!(second.stage(), ResultCreditStage::ProtocolReserved);
+    assert_eq!(control.snapshot().resource_waiters, 0);
+    drop((second, blocker));
+    assert_eq!(authority.snapshot().held_bytes(), 0);
+    drop((work, blocker_work));
 }
 
 #[test]
