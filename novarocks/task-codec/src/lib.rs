@@ -31,6 +31,7 @@
 //! Rust type.
 
 pub mod budget;
+pub mod context_convergence;
 pub mod descriptor;
 pub mod domain;
 pub mod identity;

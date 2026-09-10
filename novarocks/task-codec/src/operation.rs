@@ -2053,6 +2053,19 @@ pub fn encode_status_event(
     }
 }
 
+/// Encodes one worker query-context convergence event.
+pub fn encode_context_convergence_event(
+    value: novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceReceipt,
+) -> novarocks::TaskStatusStreamEvent {
+    novarocks::TaskStatusStreamEvent {
+        event: Some(
+            novarocks::task_status_stream_event::Event::ContextConvergence(
+                crate::context_convergence::encode_query_context_convergence_receipt(value),
+            ),
+        ),
+    }
+}
+
 /// Encodes a task-gone event.
 pub fn encode_task_gone_event(identity: TaskIdentity) -> novarocks::TaskStatusStreamEvent {
     novarocks::TaskStatusStreamEvent {
@@ -2088,6 +2101,10 @@ pub fn decode_status_event(
             )?;
             Ok(StatusStreamEvent::Gone(identity))
         }
+        novarocks::task_status_stream_event::Event::ContextConvergence(_) => Err(invalid(
+            path.field("context_convergence"),
+            "context convergence events require the convergence-aware decoder",
+        )),
     }
 }
 
@@ -2096,6 +2113,51 @@ pub fn decode_status_event(
 pub enum StatusStreamEvent {
     Status(novarocks_execution_contract::task_execution::status::TaskStatus),
     Gone(TaskIdentity),
+}
+
+/// One event from a convergence-aware task-status subscription.
+#[derive(Clone, Debug)]
+pub enum ContextAwareStatusStreamEvent {
+    Status(novarocks_execution_contract::task_execution::status::TaskStatus),
+    Gone(TaskIdentity),
+    ContextConvergence(
+        novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceReceipt,
+    ),
+}
+
+/// Decodes one task or query-context observation from a convergence-aware stream.
+pub fn decode_context_aware_status_event(
+    src: &novarocks::TaskStatusStreamEvent,
+    path: FieldPath,
+) -> Result<ContextAwareStatusStreamEvent, ProtocolError> {
+    let event = src
+        .event
+        .as_ref()
+        .ok_or_else(|| missing(path.clone(), "a status event requires a body"))?;
+    match event {
+        novarocks::task_status_stream_event::Event::TaskStatus(status) => {
+            Ok(ContextAwareStatusStreamEvent::Status(
+                crate::status::decode_task_status(status, path.field("task_status"))?,
+            ))
+        }
+        novarocks::task_status_stream_event::Event::TaskGone(gone) => {
+            let gone_path = path.field("task_gone");
+            let identity = decode_identity_field(
+                gone.identity.as_ref(),
+                gone_path,
+                "a task-gone event requires a task identity",
+            )?;
+            Ok(ContextAwareStatusStreamEvent::Gone(identity))
+        }
+        novarocks::task_status_stream_event::Event::ContextConvergence(receipt) => {
+            Ok(ContextAwareStatusStreamEvent::ContextConvergence(
+                crate::context_convergence::decode_query_context_convergence_receipt(
+                    receipt,
+                    path.field("context_convergence"),
+                )?,
+            ))
+        }
+    }
 }
 
 /// Encodes a status subscription request.
@@ -2116,7 +2178,22 @@ pub fn encode_subscribe_task_status(
             .copied()
             .map(crate::status::encode_task_status_cursor)
             .collect(),
+        context_convergence_cursor: None,
     })
+}
+
+/// Encodes a status subscription with an optional exact context cursor.
+pub fn encode_context_aware_subscribe_task_status(
+    context: QueryContextRef,
+    cursors: &[novarocks_execution_contract::task_execution::status::TaskStatusCursor],
+    context_convergence_cursor: Option<
+        novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor,
+    >,
+) -> Result<novarocks::SubscribeTaskStatusRequest, ProtocolError> {
+    let mut request = encode_subscribe_task_status(context, cursors)?;
+    request.context_convergence_cursor = context_convergence_cursor
+        .map(crate::context_convergence::encode_query_context_convergence_cursor);
+    Ok(request)
 }
 
 /// Decodes a status subscription request.
@@ -2130,6 +2207,30 @@ pub fn decode_subscribe_task_status(
     ),
     ProtocolError,
 > {
+    if src.context_convergence_cursor.is_some() {
+        return Err(invalid(
+            path.clone().field("context_convergence_cursor"),
+            "context convergence cursor requires the convergence-aware decoder",
+        ));
+    }
+    let (context, cursors, _) = decode_context_aware_subscribe_task_status(src, path)?;
+    Ok((context, cursors))
+}
+
+/// Decodes a status subscription and preserves its exact context cursor.
+pub fn decode_context_aware_subscribe_task_status(
+    src: &novarocks::SubscribeTaskStatusRequest,
+    path: FieldPath,
+) -> Result<
+    (
+        QueryContextRef,
+        Vec<novarocks_execution_contract::task_execution::status::TaskStatusCursor>,
+        Option<
+            novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor,
+        >,
+    ),
+    ProtocolError,
+>{
     let context = src.query_context.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("query_context"),
@@ -2150,5 +2251,15 @@ pub fn decode_subscribe_task_status(
             path.clone().field("cursors").index(index),
         )?);
     }
-    Ok((context, cursors))
+    let context_convergence_cursor = src
+        .context_convergence_cursor
+        .as_ref()
+        .map(|cursor| {
+            crate::context_convergence::decode_query_context_convergence_cursor(
+                cursor,
+                path.field("context_convergence_cursor"),
+            )
+        })
+        .transpose()?;
+    Ok((context, cursors, context_convergence_cursor))
 }

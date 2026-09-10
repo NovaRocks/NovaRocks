@@ -1217,6 +1217,24 @@ message TaskStatusCursor {
   uint64 current_version = 2;  // 0 means never observed
 }
 
+enum QueryContextConvergenceState {
+  QUERY_CONTEXT_CONVERGENCE_STATE_UNSPECIFIED = 0;
+  QUERY_CONTEXT_CONVERGENCE_STATE_WORKER_STOPPED_AND_CONTEXT_FENCED = 1;
+}
+
+// One immutable worker-owned convergence observation for an exact context.
+message QueryContextConvergenceReceipt {
+  QueryContextRef query_context = 1;
+  uint64 version = 2;  // nonzero
+  QueryContextConvergenceState state = 3;
+}
+
+// The frontend's observation position for one exact worker context.
+message QueryContextConvergenceCursor {
+  QueryContextRef query_context = 1;
+  uint64 current_version = 2;  // 0 means never observed
+}
+
 // One logical query-by-backend subscription. It is an observation channel only:
 // it creates no task and no context, freezes no task set, and owns no
 // admission, edge-open, terminal, or cancel authority. A new task joins it
@@ -1224,6 +1242,7 @@ message TaskStatusCursor {
 message SubscribeTaskStatusRequest {
   QueryContextRef query_context = 1;
   repeated TaskStatusCursor cursors = 2;  // <= 4096
+  QueryContextConvergenceCursor context_convergence_cursor = 3;
 }
 
 // Retained state for this task was reclaimed. Inside the legal request horizon
@@ -1237,6 +1256,7 @@ message TaskStatusStreamEvent {
   oneof event {
     TaskStatus task_status = 1;
     TaskGone task_gone = 2;
+    QueryContextConvergenceReceipt context_convergence = 3;
   }
 }
 

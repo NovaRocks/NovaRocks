@@ -22,6 +22,7 @@
 //! classifiers. It contains no generated transport model, I/O, compiler,
 //! scheduler, or execution-kernel implementation.
 
+pub mod context_convergence;
 pub mod descriptor;
 pub mod domain;
 pub mod identity;
@@ -32,6 +33,9 @@ pub mod transition;
 
 /// Stable namespace used by protocol codecs and role applications.
 pub mod task_execution {
+    pub mod context_convergence {
+        pub use crate::context_convergence::*;
+    }
     pub mod descriptor {
         pub use crate::descriptor::*;
     }
@@ -55,6 +59,7 @@ pub mod task_execution {
     }
 }
 
+pub use context_convergence::*;
 pub use descriptor::*;
 pub use domain::*;
 pub use identity::*;

@@ -30,6 +30,10 @@ use std::time::Duration;
 use novarocks_execution::exec::fragment::program::{
     FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
 };
+use novarocks_execution_contract::task_execution::context_convergence::{
+    QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QueryContextConvergenceState,
+    QueryContextConvergenceVersion,
+};
 use novarocks_execution_contract::task_execution::descriptor::{
     ExchangeInbound, ExchangeSource, ExchangeTopology, PhysicalFragmentPlan, TaskDescriptor,
 };
@@ -64,7 +68,9 @@ use super::host::{
     HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
     TaskExecutionHost,
 };
-use super::observation::{CursorObservation, TaskStatusEvent, TaskStatusSource};
+use super::observation::{
+    ContextConvergenceCursorError, CursorObservation, TaskStatusEvent, TaskStatusSource,
+};
 use super::receipt::OperationReceipt;
 use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
 use super::status::{
@@ -1351,6 +1357,20 @@ fn abort_before_establish_fences_a_later_establish_and_create() {
         0,
         "an absent abort releases the uninstalled reservation"
     );
+    assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 1);
+    assert_eq!(
+        fixture
+            .registry
+            .status_source(context)
+            .expect("the terminal fence retains its observation source")
+            .latest_context_convergence(),
+        Some(QueryContextConvergenceReceipt::new(
+            context,
+            QueryContextConvergenceVersion::FIRST,
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        )),
+        "an absent abort has no task to wait for and publishes after fencing"
+    );
 
     let late_acquire = AcquireQueryContextAdmissionTicket::new(
         TaskOperationId::new_v7(),
@@ -1523,6 +1543,10 @@ fn a_terminal_status_and_output_release_do_not_prove_actual_stop() {
     let fixture = Fixture::new();
     let context = fixture.establish(90);
     let reporter = fixture.create(fixture.identity(90, 1, 1), 5);
+    let source = fixture
+        .registry
+        .status_source(context)
+        .expect("an active context has an observation source");
     assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
     assert!(matches!(
         reporter.finished(TaskOutputFacts::new(true)),
@@ -1540,6 +1564,11 @@ fn a_terminal_status_and_output_release_do_not_prove_actual_stop() {
     assert!(fixture.registry.has_live_task(reporter.identity()));
     assert_eq!(fixture.registry.admission_reservation_count(), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 0);
+    assert_eq!(
+        source.latest_context_convergence(),
+        None,
+        "a terminal status does not prove worker or resource convergence"
+    );
 
     reporter.note_actual_stopped();
     reporter.note_resources_converged();
@@ -1553,6 +1582,21 @@ fn a_terminal_status_and_output_release_do_not_prove_actual_stop() {
     assert!(!fixture.registry.has_live_task(reporter.identity()));
     assert_eq!(fixture.registry.admission_reservation_count(), 0);
     assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 1);
+    assert_eq!(
+        source.latest_context_convergence(),
+        Some(QueryContextConvergenceReceipt::new(
+            context,
+            QueryContextConvergenceVersion::FIRST,
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        ))
+    );
+    let published = source.stats().published;
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        source.stats().published,
+        published,
+        "repeated settlement does not publish another convergence version"
+    );
 }
 
 #[test]
@@ -1849,6 +1893,65 @@ fn retention_expiry_yields_gone() {
 }
 
 #[test]
+fn gone_context_retains_convergence_until_the_context_fence_is_evicted() {
+    let fixture = Fixture::with_config(|config| {
+        config.gone_fence_capacity = 1;
+    });
+    let first = fixture.context(1);
+    let abort = fixture
+        .registry
+        .abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            first,
+            AbortCause::QueryFailed,
+        ));
+    assert_eq!(abort.outcome(), OperationOutcome::Accepted);
+    let first_source = fixture
+        .registry
+        .status_source(first)
+        .expect("a retained context has an observation source");
+    let horizon = fixture.registry.config().request_horizon.total();
+    fixture.clock.advance(horizon + Duration::from_secs(1));
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(first),
+        QueryContextState::Gone
+    );
+    assert_eq!(
+        first_source
+            .subscribe_context_aware(
+                first,
+                &[],
+                Some(QueryContextConvergenceCursor::unobserved(first)),
+            )
+            .expect("Gone retains the latest convergence receipt"),
+        vec![TaskStatusEvent::ContextConvergence(
+            QueryContextConvergenceReceipt::new(
+                first,
+                QueryContextConvergenceVersion::FIRST,
+                QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+            )
+        )]
+    );
+
+    let second = fixture.context(2);
+    let abort = fixture
+        .registry
+        .abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            second,
+            AbortCause::QueryFailed,
+        ));
+    assert_eq!(abort.outcome(), OperationOutcome::Accepted);
+    fixture.clock.advance(horizon + Duration::from_secs(1));
+    fixture.registry.advance_deadlines();
+    assert!(
+        fixture.registry.status_source(first).is_none(),
+        "after bounded Gone retention, a new subscription must fail at registry lookup"
+    );
+}
+
+#[test]
 fn retention_is_swept_by_capacity_as_well_as_by_horizon() {
     let fixture = Fixture::with_config(|config| {
         config.retained_task_capacity = 1;
@@ -1977,6 +2080,7 @@ fn a_noisy_task_cannot_starve_another_tasks_snapshot() {
                 seen.insert(status.identity());
             }
             TaskStatusEvent::Gone(_) => panic!("no task was reclaimed"),
+            TaskStatusEvent::ContextConvergence(_) => panic!("context is still active"),
         }
     }
     assert!(
@@ -2011,6 +2115,94 @@ fn a_behind_cursor_gets_the_latest_rather_than_a_replay() {
     assert_eq!(
         source.observe(TaskStatusCursor::at(identity, status.version())),
         CursorObservation::UpToDate
+    );
+}
+
+#[test]
+fn context_convergence_is_single_version_context_first_and_future_closed() {
+    let fixture = Fixture::new();
+    let source = TaskStatusSource::new();
+    let context = fixture.context(1);
+    let identity = fixture.identity(1, 1, 1);
+    source.publish(running_status(identity, 1));
+    let receipt = QueryContextConvergenceReceipt::new(
+        context,
+        QueryContextConvergenceVersion::FIRST,
+        QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+    );
+    assert!(source.publish_context_convergence(receipt));
+    assert!(!source.publish_context_convergence(receipt));
+    assert_eq!(
+        source
+            .next_subscription_event(
+                context,
+                Some(QueryContextConvergenceCursor::unobserved(context)),
+            )
+            .expect("the cursor is valid"),
+        Some(TaskStatusEvent::ContextConvergence(receipt)),
+        "context convergence is delivered before queued task snapshots"
+    );
+    assert_eq!(
+        source
+            .next_subscription_event(
+                context,
+                Some(QueryContextConvergenceCursor::unobserved(context)),
+            )
+            .expect("another stream has an independent cursor"),
+        Some(TaskStatusEvent::ContextConvergence(receipt)),
+        "one stream cannot consume another stream's convergence evidence"
+    );
+    assert!(matches!(
+        source.next_event(),
+        Some(TaskStatusEvent::Status(_))
+    ));
+
+    let catch_up = source
+        .subscribe_context_aware(
+            context,
+            &[],
+            Some(QueryContextConvergenceCursor::unobserved(context)),
+        )
+        .expect("an unobserved cursor catches up");
+    assert_eq!(catch_up, vec![TaskStatusEvent::ContextConvergence(receipt)]);
+    assert!(
+        source
+            .subscribe_context_aware(
+                context,
+                &[],
+                Some(QueryContextConvergenceCursor::at(
+                    context,
+                    QueryContextConvergenceVersion::FIRST,
+                )),
+            )
+            .expect("an equal cursor is valid")
+            .is_empty()
+    );
+    assert_eq!(
+        source
+            .next_subscription_event(
+                context,
+                Some(QueryContextConvergenceCursor::at(
+                    context,
+                    QueryContextConvergenceVersion::FIRST,
+                )),
+            )
+            .expect("an equal cursor is valid"),
+        None,
+        "an equal cursor receives no live convergence frame"
+    );
+    assert_eq!(
+        source.subscribe_context_aware(
+            context,
+            &[],
+            Some(QueryContextConvergenceCursor::at(
+                context,
+                QueryContextConvergenceVersion::FIRST
+                    .next()
+                    .expect("version two"),
+            )),
+        ),
+        Err(ContextConvergenceCursorError::FutureVersion)
     );
 }
 

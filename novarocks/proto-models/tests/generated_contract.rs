@@ -1084,7 +1084,7 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
         (
             "novarocks.TaskStatusStreamEvent",
             "event",
-            &["task_status", "task_gone"][..],
+            &["task_status", "task_gone", "context_convergence"][..],
         ),
         (
             "novarocks.TaskDomainReceipt",
@@ -1128,6 +1128,22 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
             (2, "accepted_version".to_owned()),
         ],
         "an edge-open receipt must identify both retained edges and their exact version"
+    );
+
+    let subscription = pool
+        .get_message_by_name("novarocks.SubscribeTaskStatusRequest")
+        .expect("SubscribeTaskStatusRequest descriptor");
+    let convergence_cursor = subscription
+        .get_field_by_name("context_convergence_cursor")
+        .expect("a status subscription must carry an optional context convergence cursor");
+    assert_eq!(convergence_cursor.number(), 3);
+    assert_eq!(
+        convergence_cursor
+            .kind()
+            .as_message()
+            .expect("context convergence cursor message")
+            .full_name(),
+        "novarocks.QueryContextConvergenceCursor"
     );
 }
 

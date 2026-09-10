@@ -32,17 +32,46 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
-use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::context_convergence::{
+    QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
+};
+use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::status::{TaskStatus, TaskStatusCursor};
 
 /// One immutable observation frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskStatusEvent {
+    /// The worker has closed every responsibility of this exact context.
+    ContextConvergence(QueryContextConvergenceReceipt),
     /// A full immutable snapshot, never a delta over a previous frame.
     Status(TaskStatus),
     /// Retained state for this task was reclaimed.
     Gone(TaskIdentity),
 }
+
+/// Why a context convergence cursor cannot open a subscription.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ContextConvergenceCursorError {
+    /// The cursor names another exact worker context.
+    MismatchedContext,
+    /// The cursor claims a version this worker has not published.
+    FutureVersion,
+}
+
+impl std::fmt::Display for ContextConvergenceCursorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MismatchedContext => formatter.write_str(
+                "context convergence cursor names a different context than the subscription",
+            ),
+            Self::FutureVersion => formatter.write_str(
+                "context convergence cursor is ahead of the worker's latest observation",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ContextConvergenceCursorError {}
 
 /// How a cursor read was answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +111,7 @@ impl PendingSlot {
 
 #[derive(Debug, Default)]
 struct SourceState {
+    latest_context_convergence: Option<QueryContextConvergenceReceipt>,
     latest: BTreeMap<TaskIdentity, TaskStatus>,
     reclaimed: BTreeSet<TaskIdentity>,
     pending: BTreeMap<TaskIdentity, PendingSlot>,
@@ -142,6 +172,27 @@ impl TaskStatusSource {
         self.wake.notify_waiters();
     }
 
+    /// Publishes the single closed convergence fact of this exact context.
+    ///
+    /// Re-entering settlement with the same receipt changes nothing. A
+    /// different receipt would mean the worker tried to revise an immutable
+    /// convergence fact, which is an owner invariant violation.
+    pub fn publish_context_convergence(&self, receipt: QueryContextConvergenceReceipt) -> bool {
+        let mut state = self.state.lock().expect("task status source lock");
+        if let Some(current) = state.latest_context_convergence {
+            assert_eq!(
+                current, receipt,
+                "query context convergence cannot be revised after publication"
+            );
+            return false;
+        }
+        state.latest_context_convergence = Some(receipt);
+        state.stats.published = state.stats.published.saturating_add(1);
+        drop(state);
+        self.wake.notify_waiters();
+        true
+    }
+
     /// Records that a task's retained state was reclaimed.
     pub fn mark_gone(&self, identity: TaskIdentity) {
         let mut state = self.state.lock().expect("task status source lock");
@@ -158,29 +209,70 @@ impl TaskStatusSource {
         self.wake.notify_waiters();
     }
 
-    /// Waits until a frame is owed, then takes it.
+    /// Waits for the next per-task frame without consuming a context frame.
     ///
-    /// `None` means the source was woken but another observer took the frame,
-    /// which a caller treats as "keep waiting" rather than "nothing more will
-    /// come".
-    pub async fn next_event_owned(&self) -> Option<TaskStatusEvent> {
+    /// This preserves the legacy task-only subscription while a
+    /// convergence-aware subscriber reconnects with its context cursor.
+    pub async fn next_task_event_owned(&self) -> Option<TaskStatusEvent> {
         loop {
-            // Registering before the check closes the gap where a publish
-            // lands between taking a frame and starting to wait.
             let woken = self.wake.notified();
-            if let Some(event) = self.next_event() {
+            if let Some(event) = self.next_task_event() {
                 return Some(event);
             }
             woken.await;
-            if let Some(event) = self.next_event() {
+            if let Some(event) = self.next_task_event() {
                 return Some(event);
             }
         }
     }
 
+    /// Waits for the next frame owed to one subscription's own cursor.
+    pub async fn next_subscription_event_owned(
+        &self,
+        context: QueryContextRef,
+        context_cursor: Option<QueryContextConvergenceCursor>,
+    ) -> Result<Option<TaskStatusEvent>, ContextConvergenceCursorError> {
+        loop {
+            let woken = self.wake.notified();
+            if let Some(event) = self.next_subscription_event(context, context_cursor)? {
+                return Ok(Some(event));
+            }
+            woken.await;
+            if let Some(event) = self.next_subscription_event(context, context_cursor)? {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    /// Takes one task frame or reads the context fact owed to this cursor.
+    pub fn next_subscription_event(
+        &self,
+        context: QueryContextRef,
+        context_cursor: Option<QueryContextConvergenceCursor>,
+    ) -> Result<Option<TaskStatusEvent>, ContextConvergenceCursorError> {
+        let mut state = self.state.lock().expect("task status source lock");
+        if let Some(cursor) = context_cursor
+            && let Some(receipt) = Self::context_event_locked(&state, context, cursor)?
+        {
+            state.stats.delivered = state.stats.delivered.saturating_add(1);
+            return Ok(Some(TaskStatusEvent::ContextConvergence(receipt)));
+        }
+        Ok(Self::next_task_event_locked(&mut state))
+    }
+
     /// Takes the next frame owed to an observer, round-robin across tasks.
     pub fn next_event(&self) -> Option<TaskStatusEvent> {
         let mut state = self.state.lock().expect("task status source lock");
+        Self::next_task_event_locked(&mut state)
+    }
+
+    /// Takes the next per-task frame and leaves context convergence pending.
+    pub fn next_task_event(&self) -> Option<TaskStatusEvent> {
+        let mut state = self.state.lock().expect("task status source lock");
+        Self::next_task_event_locked(&mut state)
+    }
+
+    fn next_task_event_locked(state: &mut SourceState) -> Option<TaskStatusEvent> {
         while let Some(identity) = state.order.pop_front() {
             let Some(mut slot) = state.pending.remove(&identity) else {
                 continue;
@@ -250,6 +342,58 @@ impl TaskStatusSource {
                 CursorObservation::UpToDate | CursorObservation::Unknown => None,
             })
             .collect()
+    }
+
+    /// The context-first catch-up frames one subscription owes.
+    ///
+    /// A future context cursor fails closed. Treating it as current would let
+    /// the caller claim evidence this worker has never published.
+    pub fn subscribe_context_aware(
+        &self,
+        context: QueryContextRef,
+        cursors: &[TaskStatusCursor],
+        context_cursor: Option<QueryContextConvergenceCursor>,
+    ) -> Result<Vec<TaskStatusEvent>, ContextConvergenceCursorError> {
+        let context_event = match context_cursor {
+            Some(cursor) => {
+                let state = self.state.lock().expect("task status source lock");
+                Self::context_event_locked(&state, context, cursor)?
+                    .map(TaskStatusEvent::ContextConvergence)
+            }
+            None => None,
+        };
+        let mut catch_up = Vec::new();
+        if let Some(event) = context_event {
+            catch_up.push(event);
+        }
+        catch_up.extend(self.subscribe(cursors));
+        Ok(catch_up)
+    }
+
+    fn context_event_locked(
+        state: &SourceState,
+        context: QueryContextRef,
+        cursor: QueryContextConvergenceCursor,
+    ) -> Result<Option<QueryContextConvergenceReceipt>, ContextConvergenceCursorError> {
+        if cursor.context() != context {
+            return Err(ContextConvergenceCursorError::MismatchedContext);
+        }
+        match (state.latest_context_convergence, cursor.current_version()) {
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(ContextConvergenceCursorError::FutureVersion),
+            (Some(receipt), None) => Ok(Some(receipt)),
+            (Some(receipt), Some(version)) if version < receipt.version() => Ok(Some(receipt)),
+            (Some(receipt), Some(version)) if version == receipt.version() => Ok(None),
+            (Some(_), Some(_)) => Err(ContextConvergenceCursorError::FutureVersion),
+        }
+    }
+
+    /// The retained convergence observation, if it has been published.
+    pub fn latest_context_convergence(&self) -> Option<QueryContextConvergenceReceipt> {
+        self.state
+            .lock()
+            .expect("task status source lock")
+            .latest_context_convergence
     }
 
     /// The current snapshot of one task, if this source still holds it.

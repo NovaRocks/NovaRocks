@@ -578,6 +578,7 @@ fn wire_status_identity(
     match encoded.event.as_mut()? {
         proto::task_status_stream_event::Event::TaskStatus(status) => status.identity.as_mut(),
         proto::task_status_stream_event::Event::TaskGone(gone) => gone.identity.as_mut(),
+        proto::task_status_stream_event::Event::ContextConvergence(_) => None,
     }
 }
 

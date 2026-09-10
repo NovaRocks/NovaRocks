@@ -52,6 +52,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use novarocks_execution::exec::fragment::program::FragmentSinkKind;
+use novarocks_execution_contract::task_execution::context_convergence::{
+    QueryContextConvergenceReceipt, QueryContextConvergenceState, QueryContextConvergenceVersion,
+};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::{ContentFingerprint, DomainProgression};
 use novarocks_execution_contract::task_execution::identity::{
@@ -2077,15 +2080,11 @@ impl TaskExecutionRegistry {
             // late but still legal establish or create from reviving it.
             let mut entry = ContextEntry::absent(Arc::new(TaskStatusSource::new()));
             entry.latch.latch(detail);
-            entry.state = QueryContextState::TerminalRetained;
-            entry.retired_at = Some(now);
             state.contexts.insert(context, entry);
             state
                 .context_by_execution
                 .insert(context.query_execution_id(), context);
-            state.retired_context_order.push_back(context);
-            self.task_host.close_context_admission(context);
-            self.admission_tickets.release_context(context, now);
+            self.retain_context_terminal_locked(state, context, now);
             return true;
         }
         if !matches!(
@@ -2312,38 +2311,90 @@ impl TaskExecutionRegistry {
             let ContextTransition::Apply(next) = classify_context_transition(current, event) else {
                 continue;
             };
-            let task_identities = {
+            debug_assert_eq!(next, QueryContextState::TerminalRetained);
+            if event == QueryContextEvent::AbortCompleted {
                 let entry = state
                     .contexts
-                    .get_mut(&context)
+                    .get(&context)
                     .expect("a completing context exists");
-                entry.state = next;
-                entry.retired_at = Some(now);
-                entry.lease = None;
-                entry.facts_visible = false;
-                if !entry.facts_released {
-                    // Retained on the entry: this is the only point at which
-                    // the host seals it, and the release acknowledgement that
-                    // reports it is encoded from the retired entry afterwards.
-                    entry.released_evidence = self.context_host.release(context);
-                    entry.facts_released = true;
-                }
-                entry.domains = QueryContextDomains::empty();
-                if event == QueryContextEvent::AbortCompleted {
-                    marker::context_termination_completed(
-                        context,
-                        entry.latch.cause(),
-                        entry.tasks.len(),
-                    );
-                }
-                entry.tasks.keys().copied().collect::<Vec<_>>()
-            };
-            for identity in task_identities {
-                crate::runtime::result_buffer::discard_task(identity);
+                marker::context_termination_completed(
+                    context,
+                    entry.latch.cause(),
+                    entry.tasks.len(),
+                );
             }
-            self.admission_tickets.release_context(context, now);
-            state.retired_context_order.push_back(context);
+            self.retain_context_terminal_locked(state, context, now);
         }
+    }
+
+    /// Closes every Worker responsibility before publishing context convergence.
+    ///
+    /// Every path into `TerminalRetained` comes through this helper. The
+    /// receipt is published last, after task convergence, data-plane fencing,
+    /// host release, result discard, and admission-ticket release are all
+    /// observable facts. Re-entering it is idempotent and cannot mint another
+    /// convergence version.
+    fn retain_context_terminal_locked(
+        &self,
+        state: &mut RegistryState,
+        context: QueryContextRef,
+        now: MonotonicInstant,
+    ) -> bool {
+        let Some(entry) = state.contexts.get(&context) else {
+            return false;
+        };
+        if entry.state == QueryContextState::TerminalRetained {
+            return false;
+        }
+        assert_ne!(
+            entry.state,
+            QueryContextState::Gone,
+            "a reclaimed query context cannot become retained again"
+        );
+        assert!(
+            entry.tasks.values().all(TaskEntry::is_terminal_record),
+            "query context convergence requires every task to have physically converged"
+        );
+
+        self.task_host.close_context_admission(context);
+        let (task_identities, source) = {
+            let entry = state
+                .contexts
+                .get_mut(&context)
+                .expect("a retained context exists");
+            entry.lease = None;
+            entry.facts_visible = false;
+            if !entry.facts_released {
+                entry.released_evidence = self.context_host.release(context);
+                entry.facts_released = true;
+            }
+            entry.domains = QueryContextDomains::empty();
+            (
+                entry.tasks.keys().copied().collect::<Vec<_>>(),
+                Arc::clone(&entry.source),
+            )
+        };
+        for identity in task_identities {
+            crate::runtime::result_buffer::discard_task(identity);
+        }
+        self.admission_tickets.release_context(context, now);
+
+        let entry = state
+            .contexts
+            .get_mut(&context)
+            .expect("a retained context exists");
+        entry.state = QueryContextState::TerminalRetained;
+        entry.retired_at = Some(now);
+        entry.terminating_since = None;
+        state.pending_termination.remove(&context);
+        state.retired_context_order.push_back(context);
+
+        source.publish_context_convergence(QueryContextConvergenceReceipt::new(
+            context,
+            QueryContextConvergenceVersion::FIRST,
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        ));
+        true
     }
 
     /// Releases retained records whose request horizon has elapsed.
@@ -2677,9 +2728,6 @@ impl EstablishTransaction<'_> {
         self.registry
             .rollback_context_locked(state, self.context, now);
         self.registry
-            .admission_tickets
-            .release_context(self.context, now);
-        self.registry
             .counters
             .contexts_rolled_back
             .fetch_add(1, Ordering::Relaxed);
@@ -2708,48 +2756,39 @@ impl TaskExecutionRegistry {
         context: QueryContextRef,
         now: MonotonicInstant,
     ) {
-        let Some(entry) = state.contexts.get_mut(&context) else {
-            return;
-        };
-        entry.lease = None;
-        entry.facts_visible = false;
-        entry.domains = QueryContextDomains::empty();
-        if !entry.facts_released {
-            self.context_host.release(context);
-            entry.facts_released = true;
-        }
-        let live: Vec<TaskIdentity> = entry
-            .tasks
-            .iter()
-            .filter_map(|(identity, task)| match task {
-                TaskEntry::Live(_) => Some(*identity),
-                _ => None,
-            })
-            .collect();
-        for identity in live {
-            if let Some(TaskEntry::Live(task)) = entry.tasks.remove(&identity) {
-                let mut task = *task;
-                if task.capability_installed {
-                    self.task_host.remove_inbound_capability(&task.descriptor);
-                    task.capability_installed = false;
-                }
-                if task.receiver_installed {
-                    self.task_host.remove_receiver(&task.descriptor);
-                    task.receiver_installed = false;
-                }
-                state.active_tasks = state.active_tasks.saturating_sub(1);
-                state.task_index.remove(&identity);
-            }
-        }
-        entry.tasks.retain(|_, task| task.is_terminal_record());
-        if entry.state != QueryContextState::TerminalRetained
-            && entry.state != QueryContextState::Gone
         {
-            entry.state = QueryContextState::TerminalRetained;
-            entry.retired_at = Some(now);
-            state.retired_context_order.push_back(context);
+            let Some(entry) = state.contexts.get_mut(&context) else {
+                return;
+            };
+            entry.lease = None;
+            entry.facts_visible = false;
+            entry.domains = QueryContextDomains::empty();
+            let live: Vec<TaskIdentity> = entry
+                .tasks
+                .iter()
+                .filter_map(|(identity, task)| match task {
+                    TaskEntry::Live(_) => Some(*identity),
+                    _ => None,
+                })
+                .collect();
+            for identity in live {
+                if let Some(TaskEntry::Live(task)) = entry.tasks.remove(&identity) {
+                    let mut task = *task;
+                    if task.capability_installed {
+                        self.task_host.remove_inbound_capability(&task.descriptor);
+                        task.capability_installed = false;
+                    }
+                    if task.receiver_installed {
+                        self.task_host.remove_receiver(&task.descriptor);
+                        task.receiver_installed = false;
+                    }
+                    state.active_tasks = state.active_tasks.saturating_sub(1);
+                    state.task_index.remove(&identity);
+                }
+            }
+            entry.tasks.retain(|_, task| task.is_terminal_record());
         }
-        state.pending_termination.remove(&context);
+        self.retain_context_terminal_locked(state, context, now);
     }
 }
 
