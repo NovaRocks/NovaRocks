@@ -142,6 +142,11 @@ struct AttemptState {
     secondary_failures: BTreeSet<(QueryFailureCause, String)>,
     next_failure_id: u64,
     convergence: AttemptConvergenceFacts,
+    /// Last versioned resource observation and positive lifecycle evidence for
+    /// every frozen participant. A process replacement deliberately marks the
+    /// old participant unknown; it never clears its last observed usage or
+    /// claims that its local execution stopped.
+    backend_responsibilities: BTreeMap<BackendProcessId, AttemptBackendResponsibilitySnapshot>,
 }
 
 impl AttemptState {
@@ -350,6 +355,7 @@ pub(crate) struct AttemptRouteSnapshot {
     scheduled_backends: Option<BTreeSet<BackendProcessId>>,
     primary_failure: Option<LatchedQueryFailure>,
     convergence: AttemptConvergenceFacts,
+    backend_responsibilities: BTreeMap<BackendProcessId, AttemptBackendResponsibilitySnapshot>,
 }
 
 impl AttemptRouteSnapshot {
@@ -376,6 +382,47 @@ impl AttemptRouteSnapshot {
     pub(crate) const fn convergence(&self) -> AttemptConvergenceFacts {
         self.convergence
     }
+
+    pub(crate) fn backend_responsibilities(
+        &self,
+    ) -> &BTreeMap<BackendProcessId, AttemptBackendResponsibilitySnapshot> {
+        &self.backend_responsibilities
+    }
+}
+
+/// The latest resource observation retained for one exact backend process in
+/// an attempt. Versions belong to that backend's attempt-scoped observation
+/// stream, so stale samples cannot turn an unknown residual back into known
+/// usage or replace a newer byte count.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AttemptResourceObservation {
+    pub(crate) version: u64,
+    pub(crate) last_known_usage_bytes: u64,
+}
+
+/// Positive evidence that the old execution cannot continue on one backend.
+/// A Worker publication and an independently trusted fence remain distinct so
+/// callers cannot manufacture `actual_stopped` from transport loss or an abort
+/// acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttemptStopEvidence {
+    WorkerPublished { version: u64 },
+    TrustedExecutionFence { version: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AttemptProcessReplacementEvidence {
+    pub(crate) topology_revision: u64,
+    pub(crate) replacement: BackendProcessId,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AttemptBackendResponsibilitySnapshot {
+    pub(crate) resource: Option<AttemptResourceObservation>,
+    pub(crate) current_unknown: bool,
+    pub(crate) worker_stop_version: Option<u64>,
+    pub(crate) trusted_fence_version: Option<u64>,
+    pub(crate) process_replacement: Option<AttemptProcessReplacementEvidence>,
 }
 
 #[derive(Default)]
@@ -706,6 +753,7 @@ impl FrontendQueryRegistry {
             scheduled_backends: attempt.scheduled_backends.clone(),
             primary_failure: attempt.first_failure.clone(),
             convergence: attempt.convergence,
+            backend_responsibilities: attempt.backend_responsibilities.clone(),
         })
     }
 
@@ -747,6 +795,135 @@ impl FrontendQueryRegistry {
         set_attempt_backend_ownership(attempt, backend_ownership)
     }
 
+    /// Replaces the last observation for one frozen backend only when its
+    /// backend-issued version advances. Equal observations are idempotent;
+    /// equal-version conflicts and stale observations are rejected.
+    pub(crate) fn observe_attempt_resource_usage(
+        &self,
+        registered: &RegisteredAttempt,
+        backend_process_id: BackendProcessId,
+        observation: AttemptResourceObservation,
+    ) -> Result<AttemptBackendResponsibilitySnapshot, DistributedQueryError> {
+        let mut state = self.state.lock().expect("frontend query registry lock");
+        let responsibility =
+            self.attempt_backend_responsibility_mut(&mut state, registered, backend_process_id)?;
+        match responsibility.resource {
+            None => responsibility.resource = Some(observation),
+            Some(existing) if observation.version > existing.version => {
+                responsibility.resource = Some(observation);
+            }
+            Some(existing) if observation == existing => {}
+            Some(existing) if observation.version == existing.version => {
+                return Err(contract_violation(format!(
+                    "attempt resource observation version {} has conflicting facts",
+                    observation.version
+                )));
+            }
+            Some(existing) => {
+                return Err(contract_violation(format!(
+                    "attempt resource observation version {} is older than retained version {}",
+                    observation.version, existing.version
+                )));
+            }
+        }
+        Ok(*responsibility)
+    }
+
+    /// Marks the current resource use of one participant unknown without
+    /// discarding its last versioned byte observation. Unknown is monotonic in
+    /// the registry: a later sample may update the retained byte count, while
+    /// only explicit convergence releases the residual responsibility.
+    pub(crate) fn mark_attempt_resource_unknown(
+        &self,
+        registered: &RegisteredAttempt,
+        backend_process_id: BackendProcessId,
+    ) -> Result<AttemptBackendResponsibilitySnapshot, DistributedQueryError> {
+        let mut state = self.state.lock().expect("frontend query registry lock");
+        let responsibility =
+            self.attempt_backend_responsibility_mut(&mut state, registered, backend_process_id)?;
+        responsibility.current_unknown = true;
+        Ok(*responsibility)
+    }
+
+    /// Retains only positive stop or fencing evidence for one exact frozen
+    /// backend. This does not release resource accounting; the Worker-owned
+    /// release path advances `resources_converged` separately.
+    pub(crate) fn record_attempt_stop_evidence(
+        &self,
+        registered: &RegisteredAttempt,
+        backend_process_id: BackendProcessId,
+        evidence: AttemptStopEvidence,
+    ) -> Result<AttemptBackendResponsibilitySnapshot, DistributedQueryError> {
+        let mut state = self.state.lock().expect("frontend query registry lock");
+        let responsibility =
+            self.attempt_backend_responsibility_mut(&mut state, registered, backend_process_id)?;
+        match evidence {
+            AttemptStopEvidence::WorkerPublished { version } => {
+                responsibility.worker_stop_version = Some(
+                    responsibility
+                        .worker_stop_version
+                        .map_or(version, |old| old.max(version)),
+                );
+            }
+            AttemptStopEvidence::TrustedExecutionFence { version } => {
+                responsibility.trusted_fence_version = Some(
+                    responsibility
+                        .trusted_fence_version
+                        .map_or(version, |old| old.max(version)),
+                );
+            }
+        }
+        Ok(*responsibility)
+    }
+
+    /// Records that topology revision `topology_revision` replaced one exact
+    /// process identity. The evidence revokes routing eligibility only: it
+    /// marks the old process's usage unknown and does not imply Worker stop,
+    /// resource release, or external-effect convergence.
+    pub(crate) fn record_attempt_process_replacement(
+        &self,
+        registered: &RegisteredAttempt,
+        old_backend_process_id: BackendProcessId,
+        replacement: BackendProcessId,
+        topology_revision: u64,
+    ) -> Result<AttemptBackendResponsibilitySnapshot, DistributedQueryError> {
+        if old_backend_process_id == replacement {
+            return Err(contract_violation(
+                "backend process replacement must change the exact process identity",
+            ));
+        }
+        let mut state = self.state.lock().expect("frontend query registry lock");
+        let responsibility = self.attempt_backend_responsibility_mut(
+            &mut state,
+            registered,
+            old_backend_process_id,
+        )?;
+        let evidence = AttemptProcessReplacementEvidence {
+            topology_revision,
+            replacement,
+        };
+        match responsibility.process_replacement {
+            None => responsibility.process_replacement = Some(evidence),
+            Some(existing) if topology_revision > existing.topology_revision => {
+                responsibility.process_replacement = Some(evidence);
+            }
+            Some(existing) if existing == evidence => {}
+            Some(existing) if topology_revision == existing.topology_revision => {
+                return Err(contract_violation(format!(
+                    "backend topology revision {topology_revision} has conflicting process replacement facts"
+                )));
+            }
+            Some(existing) => {
+                return Err(contract_violation(format!(
+                    "backend topology revision {topology_revision} is older than retained replacement revision {}",
+                    existing.topology_revision
+                )));
+            }
+        }
+        responsibility.current_unknown = true;
+        Ok(*responsibility)
+    }
+
     fn validate_backend_ownership(
         &self,
         backend_ownership: &[(usize, BackendProcessId)],
@@ -779,6 +956,32 @@ impl FrontendQueryRegistry {
             }
         }
         Ok(())
+    }
+
+    fn attempt_backend_responsibility_mut<'a>(
+        &self,
+        state: &'a mut RegistryState,
+        registered: &RegisteredAttempt,
+        backend_process_id: BackendProcessId,
+    ) -> Result<&'a mut AttemptBackendResponsibilitySnapshot, DistributedQueryError> {
+        let key = self.validate_registered_attempt(state, registered)?;
+        let logical = state
+            .logical
+            .get_mut(&key)
+            .expect("frontend attempt owner points at a logical entry");
+        let attempt = logical
+            .attempts
+            .get_mut(&registered.execution_id)
+            .expect("frontend attempt owner points at attempt state");
+        attempt
+            .backend_responsibilities
+            .get_mut(&backend_process_id)
+            .ok_or_else(|| {
+                contract_violation(format!(
+                    "backend process {backend_process_id} is not a frozen participant of attempt {:?}",
+                    registered.execution_id
+                ))
+            })
     }
 
     pub(crate) fn replace_live_backends(&self, revision: u64, backends: &[LiveBackendTarget]) {
@@ -1211,6 +1414,11 @@ fn set_attempt_backend_ownership(
             ));
         }
     }
+    attempt.backend_responsibilities = scheduled_backends
+        .iter()
+        .copied()
+        .map(|process_id| (process_id, AttemptBackendResponsibilitySnapshot::default()))
+        .collect();
     attempt.scheduled_backends = Some(scheduled_backends);
     Ok(())
 }
@@ -1841,6 +2049,194 @@ mod tests {
                 )
                 .is_err(),
             "a sealed empty ownership set cannot be replaced"
+        );
+    }
+
+    #[test]
+    fn residual_resource_observations_are_versioned_per_exact_backend() {
+        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(0x2b));
+        let query_id = QueryId::new(0x2b, 1);
+        let execution_id = execution(query_id, 1);
+        let registration = registry
+            .register_initial_attempt(execution_id)
+            .expect("register attempt");
+        let backend = BackendProcessId::new_v7();
+        let replacement = BackendProcessId::new_v7();
+        registry
+            .set_attempt_scheduled_backend_ownership(&registration, &[(0, backend)])
+            .expect("seal participant");
+
+        let observed = AttemptResourceObservation {
+            version: 7,
+            last_known_usage_bytes: 4096,
+        };
+        assert_eq!(
+            registry
+                .observe_attempt_resource_usage(&registration, backend, observed)
+                .expect("record usage")
+                .resource,
+            Some(observed)
+        );
+        assert_eq!(
+            registry
+                .observe_attempt_resource_usage(&registration, backend, observed)
+                .expect("replay usage")
+                .resource,
+            Some(observed),
+            "an exact observation replay is idempotent"
+        );
+        assert!(
+            registry
+                .observe_attempt_resource_usage(
+                    &registration,
+                    backend,
+                    AttemptResourceObservation {
+                        version: 7,
+                        last_known_usage_bytes: 8192,
+                    },
+                )
+                .is_err(),
+            "one backend-issued version cannot describe two byte counts"
+        );
+        assert!(
+            registry
+                .observe_attempt_resource_usage(
+                    &registration,
+                    backend,
+                    AttemptResourceObservation {
+                        version: 6,
+                        last_known_usage_bytes: 0,
+                    },
+                )
+                .is_err(),
+            "a stale observation cannot clear retained usage"
+        );
+
+        assert!(
+            registry
+                .mark_attempt_resource_unknown(&registration, backend)
+                .expect("mark usage unknown")
+                .current_unknown
+        );
+        let newer = AttemptResourceObservation {
+            version: 8,
+            last_known_usage_bytes: 2048,
+        };
+        let newer_responsibility = registry
+            .observe_attempt_resource_usage(&registration, backend, newer)
+            .expect("record a newer byte observation");
+        assert_eq!(newer_responsibility.resource, Some(newer));
+        assert!(
+            newer_responsibility.current_unknown,
+            "a byte sample cannot clear residual uncertainty"
+        );
+
+        let responsibility = registry
+            .record_attempt_process_replacement(&registration, backend, replacement, 11)
+            .expect("record exact process replacement");
+        assert_eq!(
+            responsibility.resource,
+            Some(newer),
+            "replacement preserves the last byte count and makes its currency unknown"
+        );
+        assert!(responsibility.current_unknown);
+        assert_eq!(
+            responsibility.process_replacement,
+            Some(AttemptProcessReplacementEvidence {
+                topology_revision: 11,
+                replacement,
+            })
+        );
+        let late_old_process_observation = registry
+            .observe_attempt_resource_usage(
+                &registration,
+                backend,
+                AttemptResourceObservation {
+                    version: 9,
+                    last_known_usage_bytes: 0,
+                },
+            )
+            .expect("retain a signed late observation from the exact old process");
+        assert_eq!(
+            late_old_process_observation
+                .resource
+                .expect("late resource observation")
+                .last_known_usage_bytes,
+            0
+        );
+        assert!(
+            late_old_process_observation.current_unknown,
+            "late old-process evidence cannot restore routing eligibility or clear uncertainty"
+        );
+        assert_eq!(
+            registry
+                .route_attempt(execution_id)
+                .expect("route exact residual responsibility")
+                .convergence(),
+            AttemptConvergenceFacts::default(),
+            "process replacement is not stop or resource-release evidence"
+        );
+    }
+
+    #[test]
+    fn positive_stop_evidence_remains_distinct_from_resource_convergence() {
+        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(0x2c));
+        let query_id = QueryId::new(0x2c, 1);
+        let execution_id = execution(query_id, 1);
+        let registration = registry
+            .register_initial_attempt(execution_id)
+            .expect("register attempt");
+        let backend = BackendProcessId::new_v7();
+        registry
+            .set_attempt_scheduled_backend_ownership(&registration, &[(0, backend)])
+            .expect("seal participant");
+
+        let worker_stop = registry
+            .record_attempt_stop_evidence(
+                &registration,
+                backend,
+                AttemptStopEvidence::WorkerPublished { version: 4 },
+            )
+            .expect("record Worker stop fact");
+        assert_eq!(worker_stop.worker_stop_version, Some(4));
+        let fenced = registry
+            .record_attempt_stop_evidence(
+                &registration,
+                backend,
+                AttemptStopEvidence::TrustedExecutionFence { version: 2 },
+            )
+            .expect("record trusted fence fact");
+        assert_eq!(fenced.worker_stop_version, Some(4));
+        assert_eq!(fenced.trusted_fence_version, Some(2));
+        assert_eq!(
+            registry
+                .route_attempt(execution_id)
+                .expect("route exact attempt")
+                .convergence(),
+            AttemptConvergenceFacts::default(),
+            "positive stop evidence cannot release output or resources"
+        );
+
+        let foreign_backend = BackendProcessId::new_v7();
+        assert!(
+            registry
+                .record_attempt_stop_evidence(
+                    &registration,
+                    foreign_backend,
+                    AttemptStopEvidence::WorkerPublished { version: 1 },
+                )
+                .is_err(),
+            "evidence for a process outside the frozen participant set is rejected"
+        );
+        assert_eq!(
+            registry
+                .route_attempt(execution_id)
+                .expect("route responsibility")
+                .backend_responsibilities()
+                .get(&backend)
+                .expect("backend responsibility")
+                .worker_stop_version,
+            Some(4)
         );
     }
 
