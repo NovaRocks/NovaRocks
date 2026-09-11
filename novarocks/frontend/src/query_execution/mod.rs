@@ -39,6 +39,7 @@ pub mod lifecycle_plan;
 pub mod maintenance;
 pub mod mv_assembly;
 pub mod mv_native_write;
+pub(crate) mod native_execution_adapter;
 pub mod native_fragment;
 pub(crate) mod outcome;
 pub(crate) mod pinned_connector_read;

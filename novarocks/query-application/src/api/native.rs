@@ -33,7 +33,8 @@ use std::sync::Arc;
 
 use novarocks_sql::planning::query_execution::{SealedPreparationPlanId, SealedScanIdentity};
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
-use novarocks_workload_control::{CancellationView, WorkId};
+pub use novarocks_workload_control::CancellationView;
+use novarocks_workload_control::WorkId;
 
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 use crate::coordination::{
@@ -305,6 +306,12 @@ pub type NativeAttemptConvergenceFuture<'a> = Pin<Box<dyn Future<Output = ()> + 
 /// the returned active owner and leaves the dormant owner synchronously
 /// drop-safe.
 pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
+    /// Exact process identities from the role-local topology snapshot retained
+    /// by this dormant owner. Query Application derives placement only from
+    /// this view, so activation cannot substitute a later snapshot while
+    /// keeping the already-issued schedule.
+    fn eligible_backends(&self) -> &[BackendProcessId];
+
     fn activate<'a>(
         &'a mut self,
         schedule: &'a AttemptSchedule,
@@ -722,10 +729,10 @@ impl NativeAttemptPreparationRequest {
     /// inputs. Query Application alone derives the context and Task manifest.
     pub fn bind(
         self,
-        eligible_backends: Vec<BackendProcessId>,
         scan_work: Vec<NativeScanWorkFact>,
         owner: impl DormantNativeAttemptOwner,
     ) -> Result<PreparedNativeAttempt, NativeExecutionContractError> {
+        let eligible_backends = owner.eligible_backends().to_vec();
         validate_prepared_inputs(
             self.logical_ticket.description.as_ref(),
             &eligible_backends,
@@ -881,7 +888,19 @@ mod tests {
     use tokio::sync::watch;
 
     #[derive(Debug)]
-    struct Dormant(u8);
+    struct Dormant {
+        tag: u8,
+        eligible_backends: Vec<BackendProcessId>,
+    }
+
+    impl Dormant {
+        fn new(tag: u8, eligible_backends: Vec<BackendProcessId>) -> Self {
+            Self {
+                tag,
+                eligible_backends,
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct ActiveDormant(u8);
@@ -905,12 +924,16 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for Dormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            &self.eligible_backends
+        }
+
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,
             _cancellation: CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
-            Box::pin(async move { Ok(ActivatedNativeAttempt::new(ActiveDormant(self.0))) })
+            Box::pin(async move { Ok(ActivatedNativeAttempt::new(ActiveDormant(self.tag))) })
         }
 
         fn converge<'a>(
@@ -1228,7 +1251,7 @@ mod tests {
         let (first, first_acceptance) = session.issue_attempt(execution(1, 1)).unwrap();
         let (second, _) = session.issue_attempt(execution(1, 2)).unwrap();
         let backends = prepared_inputs();
-        let prepared = second.bind(backends, Vec::new(), Dormant(2)).unwrap();
+        let prepared = second.bind(Vec::new(), Dormant::new(2, backends)).unwrap();
         assert!(matches!(
             first_acceptance.accept(prepared),
             Err(NativeExecutionContractError::ForeignAttemptTicket)
@@ -1250,14 +1273,14 @@ mod tests {
         ));
         assert_eq!(request.work_id(), session.ticket.work_id);
         let backends = prepared_inputs();
-        let dormant = Dormant(7);
-        assert_eq!(dormant.0, 7);
-        let prepared = request.bind(backends.clone(), Vec::new(), dormant).unwrap();
+        let dormant = Dormant::new(7, backends.clone());
+        assert_eq!(dormant.tag, 7);
+        let prepared = request.bind(Vec::new(), dormant).unwrap();
         let parts = acceptance.accept(prepared).unwrap();
         assert_eq!(parts.execution, exact_execution);
         assert_eq!(parts.eligible_backends.as_ref(), backends);
         assert!(parts.scan_work.is_empty());
-        assert_eq!(format!("{:?}", parts.owner), "Dormant(7)");
+        assert!(format!("{:?}", parts.owner).contains("tag: 7"));
     }
 
     #[tokio::test]
@@ -1366,13 +1389,13 @@ mod tests {
         let backends = prepared_inputs();
         let (request, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            request.bind(Vec::new(), Vec::new(), Dormant(1)),
+            request.bind(Vec::new(), Dormant::new(1, Vec::new())),
             Err(NativeExecutionContractError::EmptyEligibleBackends)
         ));
 
         let (request, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            request.bind(vec![backends[0], backends[0]], Vec::new(), Dormant(1),),
+            request.bind(Vec::new(), Dormant::new(1, vec![backends[0], backends[0]]),),
             Err(NativeExecutionContractError::DuplicateEligibleBackend)
         ));
     }
@@ -1388,14 +1411,14 @@ mod tests {
 
         let (missing, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            missing.bind(backend.clone(), Vec::new(), Dormant(1)),
+            missing.bind(Vec::new(), Dormant::new(1, backend.clone())),
             Err(NativeExecutionContractError::MissingScanWorkFact)
         ));
 
         let fact = NativeScanWorkFact::new(expected_scan, NativeScanWork::RuntimeSplits);
         let (duplicate, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            duplicate.bind(backend.clone(), vec![fact, fact], Dormant(1)),
+            duplicate.bind(vec![fact, fact], Dormant::new(1, backend.clone())),
             Err(NativeExecutionContractError::DuplicateScanWorkFact)
         ));
 
@@ -1406,7 +1429,7 @@ mod tests {
         );
         let (foreign_request, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            foreign_request.bind(backend, vec![foreign], Dormant(1)),
+            foreign_request.bind(vec![foreign], Dormant::new(1, backend)),
             Err(NativeExecutionContractError::ForeignScanWorkFact)
         ));
     }
@@ -1439,7 +1462,7 @@ mod tests {
             let backends = prepared_inputs();
             Box::pin(async move {
                 request
-                    .bind(backends, Vec::new(), Dormant(9))
+                    .bind(Vec::new(), Dormant::new(9, backends))
                     .map_err(Into::into)
             })
         }
@@ -1451,6 +1474,10 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for RetryableBorrowedConvergence {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            &[]
+        }
+
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,

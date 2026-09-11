@@ -31,7 +31,7 @@ mod task_manifest_binding;
 pub(crate) use task_manifest_binding::{
     BoundManifestBackend, BoundManifestContext, BoundManifestEdge, BoundManifestFrozenUnits,
     BoundManifestProducer, BoundManifestScanAssignment, BoundManifestScanWork, BoundManifestTask,
-    TaskManifestBinding,
+    FrozenAttemptTopology, TaskManifestBinding,
 };
 
 pub use native_submission::{
@@ -47,7 +47,7 @@ use arrow::datatypes::Field;
 use novarocks_spi::connector::{CatalogHandle, CatalogProperties};
 use sha2::{Digest, Sha256};
 
-use crate::common::backend_topology::LiveBackendTarget;
+use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
 use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
 #[cfg(test)]
 use crate::query_execution::contract::QueryId;
@@ -255,6 +255,89 @@ impl PreparedDistributedBoundAttempt {
     }
 }
 
+/// Dormant Native inputs bound to the exact topology snapshot used to expose
+/// eligible backend identities to Query Application scheduling.
+///
+/// The snapshot projection remains move-only until activation consumes it
+/// together with the request-bound Native template. A caller cannot pass a
+/// replacement snapshot to manifest binding later.
+pub(crate) struct SnapshotBoundDormantAttemptInputs {
+    native: RequestBoundNativeTemplate,
+    access: PreparedDistributedAttemptAccessOwner,
+    topology: FrozenAttemptTopology,
+}
+
+impl std::fmt::Debug for SnapshotBoundDormantAttemptInputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotBoundDormantAttemptInputs")
+            .field("execution", &self.native.execution)
+            .field("topology", &self.topology)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SnapshotBoundDormantAttemptInputs {
+    pub(crate) fn capture(
+        template: &PreparedDistributedAttemptTemplate,
+        request: &novarocks_query_application::api::NativeAttemptPreparationRequest,
+        snapshot: BackendTopologySnapshot,
+    ) -> Result<Self, DistributedQueryError> {
+        let topology = FrozenAttemptTopology::capture(snapshot)?;
+        let bound = template.bind_attempt(request)?;
+        let (native, access) = bound.into_native_and_access();
+        Ok(Self {
+            native,
+            access,
+            topology,
+        })
+    }
+
+    pub(crate) fn eligible_backends(&self) -> &[BackendProcessId] {
+        self.topology.eligible_backends()
+    }
+
+    pub(crate) const fn topology_revision(&self) -> u64 {
+        self.topology.revision()
+    }
+
+    pub(crate) fn bind_manifest(
+        self,
+        schedule: &novarocks_query_application::coordination::AttemptSchedule,
+    ) -> Result<ManifestBoundNativeAttemptInputs, DistributedQueryError> {
+        let manifest = TaskManifestBinding::bind(self.native, schedule, self.topology)?;
+        Ok(ManifestBoundNativeAttemptInputs {
+            manifest,
+            access: self.access,
+        })
+    }
+}
+
+/// Exact activation inputs after the Query Application schedule has been
+/// joined to its originating topology and Native template.
+pub(crate) struct ManifestBoundNativeAttemptInputs {
+    manifest: TaskManifestBinding,
+    access: PreparedDistributedAttemptAccessOwner,
+}
+
+impl std::fmt::Debug for ManifestBoundNativeAttemptInputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManifestBoundNativeAttemptInputs")
+            .field("manifest", &self.manifest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManifestBoundNativeAttemptInputs {
+    pub(crate) fn into_prepared_and_manifest(
+        self,
+    ) -> Result<(PreparedDistributedQuery, TaskManifestBinding), DistributedQueryError> {
+        let prepared = self.access.instantiate(&self.manifest)?;
+        Ok((prepared, self.manifest))
+    }
+}
+
 fn validate_bound_attempt_affinity(
     native: &RequestBoundNativeTemplate,
     access: &PreparedDistributedAttemptAccessOwner,
@@ -360,6 +443,45 @@ impl PreparedDistributedAttemptTemplate {
 
     pub(crate) const fn native_manifest_template(&self) -> &PreparedDistributedNativeTemplate {
         &self.native
+    }
+
+    /// Project the exact static work cardinality for every sealed scan. These
+    /// facts are supplied to Query Application before placement; no backend or
+    /// endpoint fact is consulted here.
+    pub(crate) fn native_scan_work_facts(
+        &self,
+    ) -> Result<Vec<novarocks_query_application::api::NativeScanWorkFact>, DistributedQueryError>
+    {
+        use novarocks_query_application::api::{NativeScanWork, NativeScanWorkFact};
+        use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
+
+        let prepared = self.native.prepared.as_ref();
+        let view = prepared.scheduling_view();
+        prepared
+            .sealed_scan_identities()
+            .map(|(fragment_id, scan)| {
+                let work = match view.typed_connector_work_source(fragment_id, scan.node_id()) {
+                    Some(ConnectorReadWorkSource::RuntimeSplits) => NativeScanWork::RuntimeSplits,
+                    Some(ConnectorReadWorkSource::WholeRelation) => NativeScanWork::WholeRelation,
+                    None => {
+                        let count = view
+                            .scan_ranges(fragment_id, scan.node_id())
+                            .ok_or_else(|| {
+                                contract_error(format!(
+                                    "prepared Native scan node {} has no immutable work source",
+                                    scan.node_id()
+                                ))
+                            })?
+                            .len();
+                        match std::num::NonZeroUsize::new(count) {
+                            Some(count) => NativeScanWork::FrozenUnits { count },
+                            None => NativeScanWork::Empty,
+                        }
+                    }
+                };
+                Ok(NativeScanWorkFact::new(scan, work))
+            })
+            .collect()
     }
 
     pub(crate) fn instantiate(&self) -> PreparedDistributedQuery {

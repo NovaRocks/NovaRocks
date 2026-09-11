@@ -33,7 +33,7 @@ use novarocks_sql::planning::query_execution::{SealedPreparationPlanId, SealedSc
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId, StageId};
 use novarocks_types::{NativeCompatibilityId, UniqueId};
 
-use crate::common::backend_topology::LiveBackendTarget;
+use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 
 use super::{
@@ -232,6 +232,60 @@ impl BoundManifestEdge {
     }
 }
 
+/// Move-only projection of the one topology snapshot captured while preparing
+/// a Native attempt.
+///
+/// Query Application obtains its eligible process identities from the dormant
+/// owner that retains this value. Activation then consumes the same value to
+/// bind endpoint, admission epoch, and compatibility facts into the Task
+/// manifest. There is no API that accepts a later live snapshot at activation.
+pub(crate) struct FrozenAttemptTopology {
+    revision: u64,
+    eligible_backends: Box<[BackendProcessId]>,
+    backends: BTreeMap<BackendProcessId, BoundManifestBackend>,
+}
+
+impl std::fmt::Debug for FrozenAttemptTopology {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FrozenAttemptTopology")
+            .field("revision", &self.revision)
+            .field("eligible_backends", &self.eligible_backends)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FrozenAttemptTopology {
+    pub(crate) fn capture(
+        snapshot: BackendTopologySnapshot,
+    ) -> Result<Self, DistributedQueryError> {
+        let revision = snapshot.revision();
+        let backends = validate_backend_snapshot(snapshot.targets())?;
+        let eligible_backends = backends
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            revision,
+            eligible_backends,
+            backends,
+        })
+    }
+
+    pub(crate) fn eligible_backends(&self) -> &[BackendProcessId] {
+        &self.eligible_backends
+    }
+
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn into_parts(self) -> (u64, BTreeMap<BackendProcessId, BoundManifestBackend>) {
+        (self.revision, self.backends)
+    }
+}
+
 /// Move-only result of joining one immutable Native template to one exact
 /// application-owned attempt schedule.
 ///
@@ -241,6 +295,7 @@ impl BoundManifestEdge {
 /// template carries no Connector attempt access or planning lease.
 pub(crate) struct TaskManifestBinding {
     execution: QueryExecutionId,
+    topology_revision: u64,
     native_template: RequestBoundNativeTemplate,
     tasks: Box<[BoundManifestTask]>,
     contexts: Box<[BoundManifestContext]>,
@@ -253,6 +308,7 @@ impl std::fmt::Debug for TaskManifestBinding {
         formatter
             .debug_struct("TaskManifestBinding")
             .field("execution", &self.execution)
+            .field("topology_revision", &self.topology_revision)
             .field("task_count", &self.tasks.len())
             .field("context_count", &self.contexts.len())
             .field("edge_count", &self.edges.len())
@@ -269,21 +325,28 @@ impl TaskManifestBinding {
     pub(crate) fn bind(
         bound_template: RequestBoundNativeTemplate,
         schedule: &AttemptSchedule,
-        backend_snapshot: &[LiveBackendTarget],
+        topology: FrozenAttemptTopology,
     ) -> Result<Self, DistributedQueryError> {
         let RequestBoundNativeTemplate { execution, .. } = bound_template;
         let facts = ScheduleFacts::from_schedule(schedule);
-        Self::bind_facts(bound_template, execution, facts, backend_snapshot)
+        let (topology_revision, backends) = topology.into_parts();
+        Self::bind_facts(
+            bound_template,
+            execution,
+            facts,
+            topology_revision,
+            backends,
+        )
     }
 
     fn bind_facts(
         bound_template: RequestBoundNativeTemplate,
         expected_execution: QueryExecutionId,
         schedule: ScheduleFacts,
-        backend_snapshot: &[LiveBackendTarget],
+        topology_revision: u64,
+        endpoint_by_process: BTreeMap<BackendProcessId, BoundManifestBackend>,
     ) -> Result<Self, DistributedQueryError> {
         validate_schedule_execution(expected_execution, schedule.execution)?;
-        let endpoint_by_process = validate_backend_snapshot(backend_snapshot)?;
         let prepared = PreparedManifestFacts::from_template(&bound_template.template)?;
         let expected_fragments = &prepared.fragments;
 
@@ -496,6 +559,7 @@ impl TaskManifestBinding {
 
         Ok(Self {
             execution: expected_execution,
+            topology_revision,
             native_template: bound_template,
             tasks: bound_tasks.into_boxed_slice(),
             contexts: bound_contexts.into_boxed_slice(),
@@ -506,6 +570,10 @@ impl TaskManifestBinding {
 
     pub(crate) const fn execution(&self) -> QueryExecutionId {
         self.execution
+    }
+
+    pub(crate) const fn topology_revision(&self) -> u64 {
+        self.topology_revision
     }
 
     pub(crate) fn tasks(&self) -> &[BoundManifestTask] {
@@ -1149,13 +1217,13 @@ mod tests {
     use novarocks_types::{NativeCompatibilityId, UniqueId};
 
     use super::{
-        BoundManifestFrozenUnits, PreparedManifestFacts, PreparedScanSource, ProjectedEdge,
-        ProjectedScanAssignment, ProjectedTask, derive_and_record_fragment_instance_id,
-        validate_backend_snapshot, validate_edges, validate_frozen_unit_cover,
-        validate_native_template_plan_seal, validate_scan_assignments, validate_schedule_execution,
-        validate_task_identity,
+        BoundManifestFrozenUnits, FrozenAttemptTopology, PreparedManifestFacts, PreparedScanSource,
+        ProjectedEdge, ProjectedScanAssignment, ProjectedTask,
+        derive_and_record_fragment_instance_id, validate_backend_snapshot, validate_edges,
+        validate_frozen_unit_cover, validate_native_template_plan_seal, validate_scan_assignments,
+        validate_schedule_execution, validate_task_identity,
     };
-    use crate::common::backend_topology::LiveBackendTarget;
+    use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
 
     fn execution() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -1266,6 +1334,15 @@ mod tests {
     }
 
     fn live_target(ordinal: usize, process: BackendProcessId, port: u16) -> LiveBackendTarget {
+        live_target_with_epoch(ordinal, process, port, 0x61)
+    }
+
+    fn live_target_with_epoch(
+        ordinal: usize,
+        process: BackendProcessId,
+        port: u16,
+        epoch: u8,
+    ) -> LiveBackendTarget {
         let descriptor = BackendProcessDescriptor::new(
             process,
             QueryControlEndpoint::new("127.0.0.1", port).expect("valid endpoint"),
@@ -1277,8 +1354,42 @@ mod tests {
         LiveBackendTarget::new(
             ordinal,
             descriptor,
-            AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("nonzero admission epoch"),
+            AdmissionEpochCapability::try_from_bytes([epoch; 16]).expect("nonzero admission epoch"),
         )
+    }
+
+    #[test]
+    fn frozen_attempt_topology_retains_the_exact_admission_epoch_snapshot() {
+        let process = BackendProcessId::new_v7();
+        let first = BackendTopologySnapshot::try_new(
+            41,
+            vec![live_target_with_epoch(0, process, 19010, 0x61)],
+        )
+        .expect("valid first snapshot");
+        let replacement = BackendTopologySnapshot::try_new(
+            42,
+            vec![live_target_with_epoch(0, process, 19010, 0x62)],
+        )
+        .expect("valid replacement snapshot");
+
+        let frozen = FrozenAttemptTopology::capture(first).expect("capture first snapshot");
+        let later = FrozenAttemptTopology::capture(replacement).expect("capture later snapshot");
+        assert_eq!(frozen.eligible_backends(), later.eligible_backends());
+        assert_eq!(frozen.revision(), 41);
+        assert_eq!(later.revision(), 42);
+
+        let (_, exact) = frozen.into_parts();
+        assert_eq!(
+            exact[&process].admission_epoch_capability().to_bytes(),
+            [0x61; 16]
+        );
+        let (_, replacement) = later.into_parts();
+        assert_eq!(
+            replacement[&process]
+                .admission_epoch_capability()
+                .to_bytes(),
+            [0x62; 16]
+        );
     }
 
     #[test]

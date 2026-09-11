@@ -1037,24 +1037,26 @@ mod tests {
         ) -> NativeAttemptPreparationFuture {
             let backend = self.backend;
             let dormant = FailingDormantOwner {
+                backend,
                 activated: Arc::clone(&self.activated),
                 residual_converged: Arc::clone(&self.residual_converged),
             };
-            Box::pin(async move {
-                request
-                    .bind(vec![backend], Vec::new(), dormant)
-                    .map_err(Into::into)
-            })
+            Box::pin(async move { request.bind(Vec::new(), dormant).map_err(Into::into) })
         }
     }
 
     #[derive(Debug)]
     struct FailingDormantOwner {
+        backend: BackendProcessId,
         activated: Arc<AtomicBool>,
         residual_converged: Arc<AtomicBool>,
     }
 
     impl DormantNativeAttemptOwner for FailingDormantOwner {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            std::slice::from_ref(&self.backend)
+        }
+
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,
@@ -1204,24 +1206,26 @@ mod tests {
         ) -> NativeAttemptPreparationFuture {
             let backend = self.backend;
             let owner = PanickingDormantOwner {
+                backend,
                 phase: self.phase,
                 convergence_calls: Arc::clone(&self.convergence_calls),
             };
-            Box::pin(async move {
-                request
-                    .bind(vec![backend], Vec::new(), owner)
-                    .map_err(Into::into)
-            })
+            Box::pin(async move { request.bind(Vec::new(), owner).map_err(Into::into) })
         }
     }
 
     #[derive(Debug)]
     struct PanickingDormantOwner {
+        backend: BackendProcessId,
         phase: AttemptPanicPhase,
         convergence_calls: Arc<AtomicU64>,
     }
 
     impl DormantNativeAttemptOwner for PanickingDormantOwner {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            std::slice::from_ref(&self.backend)
+        }
+
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,
@@ -1445,9 +1449,11 @@ mod tests {
             Box::pin(async move {
                 request
                     .bind(
-                        vec![backend],
                         Vec::new(),
-                        SuccessfulCompletionDormantOwner { expected_frontend },
+                        SuccessfulCompletionDormantOwner {
+                            backend,
+                            expected_frontend,
+                        },
                     )
                     .map_err(Into::into)
             })
@@ -1456,10 +1462,15 @@ mod tests {
 
     #[derive(Debug)]
     struct SuccessfulCompletionDormantOwner {
+        backend: BackendProcessId,
         expected_frontend: FrontendProcessId,
     }
 
     impl DormantNativeAttemptOwner for SuccessfulCompletionDormantOwner {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            std::slice::from_ref(&self.backend)
+        }
+
         fn activate<'a>(
             &'a mut self,
             schedule: &'a AttemptSchedule,
@@ -1617,16 +1628,22 @@ mod tests {
             let backend = self.backend;
             Box::pin(async move {
                 request
-                    .bind(vec![backend], Vec::new(), PrematureCompletionDormant)
+                    .bind(Vec::new(), PrematureCompletionDormant { backend })
                     .map_err(Into::into)
             })
         }
     }
 
     #[derive(Debug)]
-    struct PrematureCompletionDormant;
+    struct PrematureCompletionDormant {
+        backend: BackendProcessId,
+    }
 
     impl DormantNativeAttemptOwner for PrematureCompletionDormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            std::slice::from_ref(&self.backend)
+        }
+
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,
