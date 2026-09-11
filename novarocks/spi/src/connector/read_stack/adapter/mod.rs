@@ -1122,7 +1122,10 @@ mod tests {
             _dynamic_filter_columns: &BTreeSet<Self::Column>,
             _constraint: &Constraint<Self::Column>,
         ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
-            unimplemented!("attempt-access tests do not enumerate splits")
+            Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "attempt-access test provider does not enumerate splits",
+            ))
         }
     }
 
