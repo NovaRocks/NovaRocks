@@ -23,7 +23,8 @@ use super::scan::ScanExecutionBindings;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_sql::plan_read::{BoundaryContract, ColumnId, CteId, FragmentEdge, FragmentId};
 use novarocks_sql::planning::query_execution::{
-    SqlPreparedRuntimeFilterFacts, SqlRuntimeFilterBindingFacts,
+    SealedPreparationPlanId, SealedScanIdentity, SqlPreparedRuntimeFilterFacts,
+    SqlRuntimeFilterBindingFacts,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,7 +123,9 @@ struct PreparedPlanProjection {
 /// remain private; Frontend can only pass it to the native encoder paired with
 /// the matching Core-produced plan carrier.
 pub struct PreparedFragmentSet {
+    plan_seal: SealedPreparationPlanId,
     by_fragment: BTreeMap<FragmentId, PreparedFragment>,
+    sealed_scan_identities: BTreeMap<(FragmentId, i32), SealedScanIdentity>,
     scan_bindings: ScanExecutionBindings,
     projection: PreparedPlanProjection,
     // The SQL-owned sealed facts are shared with DistributedPlan. This carrier
@@ -133,7 +136,9 @@ pub struct PreparedFragmentSet {
 
 impl PreparedFragmentSet {
     pub(super) fn new(
+        plan_seal: SealedPreparationPlanId,
         by_fragment: BTreeMap<FragmentId, PreparedFragment>,
+        sealed_scan_identities: BTreeMap<(FragmentId, i32), SealedScanIdentity>,
         scan_bindings: ScanExecutionBindings,
         topological_fragment_order: Vec<FragmentId>,
         execution_anchor_fragment_id: FragmentId,
@@ -143,7 +148,9 @@ impl PreparedFragmentSet {
         native_connector_scans: super::native_encoding_view::FrozenNativeConnectorScans,
     ) -> Self {
         Self {
+            plan_seal,
             by_fragment,
+            sealed_scan_identities,
             scan_bindings,
             projection: PreparedPlanProjection {
                 topological_fragment_order,
@@ -166,6 +173,20 @@ impl PreparedFragmentSet {
 
     pub(crate) fn scan_bindings(&self) -> &ScanExecutionBindings {
         &self.scan_bindings
+    }
+
+    pub(crate) const fn plan_seal(&self) -> SealedPreparationPlanId {
+        self.plan_seal
+    }
+
+    /// Exact SQL-owned scan identities retained from the sealed preparation.
+    /// The opaque plan seal prevents attempt binding by node id alone.
+    pub(crate) fn sealed_scan_identities(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (FragmentId, SealedScanIdentity)> + '_ {
+        self.sealed_scan_identities
+            .iter()
+            .map(|(&(fragment_id, _), &identity)| (fragment_id, identity))
     }
 
     pub(crate) fn fragment_ids(&self) -> BTreeSet<FragmentId> {

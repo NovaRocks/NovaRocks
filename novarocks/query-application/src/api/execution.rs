@@ -21,6 +21,10 @@ use novarocks_workload_control::{
     CancellationReason, WorkCancellationRequester, WorkError, WorkOwner,
 };
 
+#[cfg(test)]
+use super::NativeExecutionContractError;
+use super::{NativeAttemptPreparationPort, NativeLogicalExecutionSeed};
+use crate::coordination::{AbortQueryContextEffectPort, ReplacementQualificationEffectPort};
 use crate::preparation::FrozenExecutionDescription;
 
 /// A product-independent query operation.
@@ -30,6 +34,7 @@ use crate::preparation::FrozenExecutionDescription;
 /// serialization or decoding layer.
 pub struct QueryExecutionRequest {
     description: FrozenExecutionDescription,
+    native_seed: NativeLogicalExecutionSeed,
 }
 
 impl QueryExecutionRequest {
@@ -37,18 +42,57 @@ impl QueryExecutionRequest {
         self.description.kind()
     }
 
-    /// Consume a fully frozen semantic description. Execution may instantiate
-    /// attempts from it, but has no callback into observation or compilation.
-    pub fn from_frozen_description(description: FrozenExecutionDescription) -> Self {
-        Self { description }
+    /// Atomically bind the semantic description to its role-local Native
+    /// capabilities.
+    ///
+    /// The opaque seed has no public constructor and cannot be detached from
+    /// this request. Its plan seal is copied from the already frozen
+    /// description here, including for plans that contain no scans. A rejected
+    /// request drops the exact seed; an accepted request can bind it to only
+    /// the open ticket minted for that logical execution.
+    pub fn bind_native(
+        description: FrozenExecutionDescription,
+        aborts: Arc<dyn AbortQueryContextEffectPort>,
+        replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
+        attempts: impl NativeAttemptPreparationPort,
+    ) -> Self {
+        let native_seed = NativeLogicalExecutionSeed::issue(
+            description.plan_seal(),
+            aborts,
+            replacements,
+            attempts,
+        );
+        Self {
+            description,
+            native_seed,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_from_parts(
+        description: FrozenExecutionDescription,
+        native_seed: NativeLogicalExecutionSeed,
+    ) -> Result<Self, NativeExecutionContractError> {
+        if description.plan_seal() != native_seed.plan_seal() {
+            return Err(NativeExecutionContractError::ForeignLogicalSeedPlan);
+        }
+        Ok(Self {
+            description,
+            native_seed,
+        })
     }
 
     pub const fn description(&self) -> &FrozenExecutionDescription {
         &self.description
     }
 
-    pub(crate) fn into_description(self) -> FrozenExecutionDescription {
-        self.description
+    pub(crate) fn into_parts(self) -> (FrozenExecutionDescription, NativeLogicalExecutionSeed) {
+        assert_eq!(
+            self.description.plan_seal(),
+            self.native_seed.plan_seal(),
+            "executable request must retain its atomically issued Native seed"
+        );
+        (self.description, self.native_seed)
     }
 }
 

@@ -40,7 +40,7 @@ use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_query_application::api::QueryExecutionRequest as ApplicationQueryExecutionRequest;
+use novarocks_query_application::preparation::FrozenExecutionDescription;
 use novarocks_types::BackendProcessId;
 
 #[cfg(test)]
@@ -246,20 +246,22 @@ pub struct DistributedQueryRequest {
 enum DistributedQueryPayload {
     RestartableRead(Arc<RestartableReadExecution>),
     SingleUse {
-        logical_execution: Arc<ApplicationQueryExecutionRequest>,
+        description: Arc<FrozenExecutionDescription>,
         artifacts: PreparedDistributedQuery,
         options: Arc<ResolvedQueryOptions>,
     },
 }
 
-/// Closed, immutable source for every attempt of one restartable read.
+/// Closed, immutable source for every legacy coordinator round of one
+/// restartable read.
 ///
-/// The logical description, static native template, Connector access recipes,
+/// The frozen description, static native template, Connector access recipes,
 /// resolved options and result intent are created together by the sole
-/// finalizer. Callers can clone this capability, but cannot replace any one of
-/// those inputs or combine it with a template from another logical execution.
+/// finalizer. This carrier deliberately does not pretend to be an executable
+/// query-application request: that move-only request can be created only when
+/// the production Native adapter also supplies its exact seed.
 pub(crate) struct RestartableReadExecution {
-    logical_execution: Arc<ApplicationQueryExecutionRequest>,
+    description: Arc<FrozenExecutionDescription>,
     attempt_template: PreparedDistributedAttemptTemplate,
     options: Arc<ResolvedQueryOptions>,
     intent: DistributedQueryIntent,
@@ -283,7 +285,7 @@ impl RestartableReadExecution {
     }
 
     pub(crate) fn shared_plan(&self) -> Arc<novarocks_sql::plan_read::DistributedPlan> {
-        self.logical_execution.description().shared_plan()
+        self.description.shared_plan()
     }
 
     #[cfg(test)]
@@ -293,12 +295,10 @@ impl RestartableReadExecution {
 }
 
 impl DistributedQueryRequest {
-    pub fn logical_execution(&self) -> &ApplicationQueryExecutionRequest {
+    pub fn frozen_description(&self) -> &FrozenExecutionDescription {
         match &self.payload {
-            DistributedQueryPayload::RestartableRead(read) => read.logical_execution.as_ref(),
-            DistributedQueryPayload::SingleUse {
-                logical_execution, ..
-            } => logical_execution.as_ref(),
+            DistributedQueryPayload::RestartableRead(read) => read.description.as_ref(),
+            DistributedQueryPayload::SingleUse { description, .. } => description.as_ref(),
         }
     }
 
@@ -348,20 +348,20 @@ impl DistributedQueryRequest {
     }
 
     pub fn into_parts(self) -> DistributedQueryRequestParts {
-        let (logical_execution, artifacts, options) = match self.payload {
+        let (description, artifacts, options) = match self.payload {
             DistributedQueryPayload::RestartableRead(read) => (
-                Arc::clone(&read.logical_execution),
+                Arc::clone(&read.description),
                 read.attempt_template.instantiate(),
                 Arc::clone(&read.options),
             ),
             DistributedQueryPayload::SingleUse {
-                logical_execution,
+                description,
                 artifacts,
                 options,
-            } => (logical_execution, artifacts, options),
+            } => (description, artifacts, options),
         };
         DistributedQueryRequestParts {
-            logical_execution,
+            description,
             artifacts,
             options,
             topology: self.topology,
@@ -378,7 +378,7 @@ impl DistributedQueryRequest {
 /// Consuming frontend handoff. There is deliberately no constructor,
 /// `Clone`, or inverse recombination API.
 pub struct DistributedQueryRequestParts {
-    pub logical_execution: Arc<ApplicationQueryExecutionRequest>,
+    pub description: Arc<FrozenExecutionDescription>,
     pub artifacts: PreparedDistributedQuery,
     pub options: Arc<ResolvedQueryOptions>,
     pub topology: crate::common::backend_topology::BackendTopologySnapshot,
@@ -405,25 +405,25 @@ pub(crate) fn build_request_from_finalized_execution(
             "statistics intent and typed StatisticsCollectionProgram must be present together",
         ));
     }
-    let (logical_execution, attempt_template) = finalized.into_parts();
+    let (description, attempt_template) = finalized.into_parts();
     let options = Arc::new(ResolvedQueryOptions::from_upstream(options));
     let restartable_read = matches!(
         intent,
         DistributedQueryIntent::Result | DistributedQueryIntent::Profile
-    ) && logical_execution.kind()
+    ) && description.kind()
         == novarocks_query_application::api::QueryExecutionKind::Read
-        && logical_execution.description().recovery()
+        && description.recovery()
             == novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility;
     let payload = if restartable_read {
         DistributedQueryPayload::RestartableRead(Arc::new(RestartableReadExecution {
-            logical_execution,
+            description,
             attempt_template,
             options,
             intent,
         }))
     } else {
         DistributedQueryPayload::SingleUse {
-            logical_execution,
+            description,
             artifacts: attempt_template.instantiate(),
             options,
         }

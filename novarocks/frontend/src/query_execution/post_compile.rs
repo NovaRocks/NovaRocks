@@ -171,22 +171,22 @@ struct NativeFinalizerInputs {
 }
 
 /// Move-only result of the sole semantic/native finalizer. Its constructor is
-/// private to this module, so sibling modules cannot pair a logical request
+/// private to this module, so sibling modules cannot pair a frozen description
 /// with native projection or attempt access from another assembly.
 pub(crate) struct FinalizedDistributedExecution {
-    logical_execution: Arc<novarocks_query_application::api::QueryExecutionRequest>,
+    description: Arc<novarocks_query_application::preparation::FrozenExecutionDescription>,
     attempt_template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
 }
 
 impl FinalizedDistributedExecution {
     fn new(
-        logical_execution: novarocks_query_application::api::QueryExecutionRequest,
+        description: novarocks_query_application::preparation::FrozenExecutionDescription,
         prepared: PreparedFragmentSet,
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
         attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
     ) -> Self {
         Self {
-            logical_execution: Arc::new(logical_execution),
+            description: Arc::new(description),
             attempt_template:
                 crate::query_execution::artifact::PreparedDistributedAttemptTemplate::new(
                     prepared,
@@ -199,10 +199,10 @@ impl FinalizedDistributedExecution {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        Arc<novarocks_query_application::api::QueryExecutionRequest>,
+        Arc<novarocks_query_application::preparation::FrozenExecutionDescription>,
         crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
     ) {
-        (self.logical_execution, self.attempt_template)
+        (self.description, self.attempt_template)
     }
 }
 
@@ -333,12 +333,8 @@ impl PreparedDistributedQueryAssembly {
                     resources,
                 ),
             )?;
-        let logical_execution =
-            novarocks_query_application::api::QueryExecutionRequest::from_frozen_description(
-                description,
-            );
         let finalized = FinalizedDistributedExecution::new(
-            logical_execution,
+            description,
             prepared,
             native_attachment,
             attempt_access,

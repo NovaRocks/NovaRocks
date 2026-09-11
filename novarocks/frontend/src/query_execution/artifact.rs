@@ -18,6 +18,21 @@
 //! Opaque owned handoffs and neutral scheduling projections.
 
 mod native_submission;
+#[allow(
+    dead_code,
+    reason = "T08 builds the pure dormant-attempt binding before its activation adapter lands."
+)]
+mod task_manifest_binding;
+
+#[allow(
+    unused_imports,
+    reason = "T08 activation consumes these move-only bindings in the next owner cut."
+)]
+pub(crate) use task_manifest_binding::{
+    BoundManifestBackend, BoundManifestContext, BoundManifestEdge, BoundManifestFrozenUnits,
+    BoundManifestProducer, BoundManifestScanAssignment, BoundManifestScanWork, BoundManifestTask,
+    TaskManifestBinding,
+};
 
 pub use native_submission::{
     NativeSubmissionAttachment, NativeSubmissionEncodingView, NativeSubmissionFragmentFacts,
@@ -99,16 +114,226 @@ impl RuntimeFilterBindingAttachment {
     }
 }
 
-/// Immutable inputs shared by every attempt of one logical execution.
-///
-/// Instantiation clones only the native attachment that receives attempt-local
-/// runtime-filter and schedule bindings. The prepared plan and Connector
-/// access scope retain one exact owner for the whole logical execution.
-pub(crate) struct PreparedDistributedAttemptTemplate {
-    handoff_id: u64,
+/// Static Native plan/projection shared by every attempt of one logical
+/// execution. It owns no Connector access capability or planning lease.
+pub(crate) struct PreparedDistributedNativeTemplate {
+    identity: PreparedDistributedTemplateIdentity,
     prepared: Arc<PreparedFragmentSet>,
     native_template: Arc<NativeFragmentAttachment>,
+}
+
+struct PreparedDistributedTemplateAffinity;
+
+/// Private identity shared only by the two siblings minted from one prepared
+/// logical execution. Scalar equality is insufficient: the pointer identity
+/// prevents an access factory from being spliced onto an isomorphic Native
+/// template assembled elsewhere.
+#[derive(Clone)]
+struct PreparedDistributedTemplateIdentity {
+    handoff_id: u64,
+    plan_seal: novarocks_sql::planning::query_execution::SealedPreparationPlanId,
+    affinity: Arc<PreparedDistributedTemplateAffinity>,
+}
+
+impl PreparedDistributedTemplateIdentity {
+    fn new(
+        handoff_id: u64,
+        plan_seal: novarocks_sql::planning::query_execution::SealedPreparationPlanId,
+    ) -> Self {
+        Self {
+            handoff_id,
+            plan_seal,
+            affinity: Arc::new(PreparedDistributedTemplateAffinity),
+        }
+    }
+
+    fn exactly_matches(&self, other: &Self) -> bool {
+        self.handoff_id == other.handoff_id
+            && self.plan_seal == other.plan_seal
+            && Arc::ptr_eq(&self.affinity, &other.affinity)
+    }
+}
+
+fn validate_prepared_template_affinity(
+    native: &PreparedDistributedTemplateIdentity,
+    access: &PreparedDistributedTemplateIdentity,
+) -> Result<(), DistributedQueryError> {
+    if native.exactly_matches(access) {
+        Ok(())
+    } else {
+        Err(contract_error(
+            "Connector attempt access belongs to another prepared Native template",
+        ))
+    }
+}
+
+impl PreparedDistributedNativeTemplate {
+    pub(crate) const fn plan_seal(
+        &self,
+    ) -> novarocks_sql::planning::query_execution::SealedPreparationPlanId {
+        self.identity.plan_seal
+    }
+
+    /// Bind the static Native template to the exact move-only attempt request
+    /// while the request is still available. The resulting typestate is what
+    /// the dormant owner carries into activation after `request.bind` consumes
+    /// the Query Application ticket.
+    fn fork_for_attempt(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            prepared: Arc::clone(&self.prepared),
+            native_template: Arc::clone(&self.native_template),
+        }
+    }
+
+    fn bind_request(
+        self,
+        request: &novarocks_query_application::api::NativeAttemptPreparationRequest,
+        affinity: Arc<PreparedDistributedAttemptAffinity>,
+    ) -> Result<RequestBoundNativeTemplate, DistributedQueryError> {
+        validate_native_request_match(request.matches_plan_seal(self.plan_seal()))?;
+        Ok(RequestBoundNativeTemplate {
+            execution: request.execution(),
+            template: self,
+            affinity,
+        })
+    }
+}
+
+struct PreparedDistributedAttemptAffinity;
+
+/// Move-only proof that one Native template was checked against the exact
+/// Query Application attempt request before that request was consumed.
+pub(crate) struct RequestBoundNativeTemplate {
+    execution: QueryExecutionId,
+    template: PreparedDistributedNativeTemplate,
+    affinity: Arc<PreparedDistributedAttemptAffinity>,
+}
+
+/// Per-attempt Connector access owner minted beside the request-bound Native
+/// template. It is reusable within that attempt, but cannot be paired with a
+/// sibling from another attempt or logical template.
+pub(crate) struct PreparedDistributedAttemptAccessOwner {
+    execution: QueryExecutionId,
+    template_identity: PreparedDistributedTemplateIdentity,
+    affinity: Arc<PreparedDistributedAttemptAffinity>,
     attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
+}
+
+impl PreparedDistributedAttemptAccessOwner {
+    pub(crate) fn instantiate(
+        &self,
+        manifest: &TaskManifestBinding,
+    ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
+        let native = manifest.request_bound_native();
+        validate_bound_attempt_affinity(native, self)?;
+        Ok(PreparedDistributedQuery {
+            handoff_id: native.template.identity.handoff_id,
+            prepared: Arc::clone(&native.template.prepared),
+            native_bundle: native.template.native_template.as_ref().clone(),
+            attempt_access: Arc::clone(&self.attempt_access),
+        })
+    }
+}
+
+/// One request-bound attempt handoff. Consuming it separates the dormant
+/// Native owner from the exact Connector access owner without exposing Clone
+/// on either capability.
+pub(crate) struct PreparedDistributedBoundAttempt {
+    native: RequestBoundNativeTemplate,
+    access: PreparedDistributedAttemptAccessOwner,
+}
+
+impl PreparedDistributedBoundAttempt {
+    pub(crate) fn into_native_and_access(
+        self,
+    ) -> (
+        RequestBoundNativeTemplate,
+        PreparedDistributedAttemptAccessOwner,
+    ) {
+        (self.native, self.access)
+    }
+}
+
+fn validate_bound_attempt_affinity(
+    native: &RequestBoundNativeTemplate,
+    access: &PreparedDistributedAttemptAccessOwner,
+) -> Result<(), DistributedQueryError> {
+    validate_bound_attempt_identity(
+        native.execution,
+        &native.template.identity,
+        &native.affinity,
+        access.execution,
+        &access.template_identity,
+        &access.affinity,
+    )
+}
+
+fn validate_bound_attempt_identity(
+    native_execution: QueryExecutionId,
+    native_template: &PreparedDistributedTemplateIdentity,
+    native_affinity: &Arc<PreparedDistributedAttemptAffinity>,
+    access_execution: QueryExecutionId,
+    access_template: &PreparedDistributedTemplateIdentity,
+    access_affinity: &Arc<PreparedDistributedAttemptAffinity>,
+) -> Result<(), DistributedQueryError> {
+    if native_execution == access_execution
+        && native_template.exactly_matches(access_template)
+        && Arc::ptr_eq(native_affinity, access_affinity)
+    {
+        Ok(())
+    } else {
+        Err(contract_error(
+            "Connector attempt access belongs to another request-bound Native attempt",
+        ))
+    }
+}
+
+fn validate_native_request_match(matches: bool) -> Result<(), DistributedQueryError> {
+    if matches {
+        Ok(())
+    } else {
+        Err(contract_error(
+            "attempt Native template belongs to another sealed preparation plan",
+        ))
+    }
+}
+
+/// Logical-execution owner that can materialize the Connector access view for
+/// an attempt. Keeping it separate prevents a pure task manifest from retaining
+/// catalog control leases or becoming a resource owner.
+pub(crate) struct PreparedDistributedAttemptAccessFactory {
+    identity: PreparedDistributedTemplateIdentity,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
+}
+
+impl PreparedDistributedAttemptAccessFactory {
+    fn fork_for_attempt(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            attempt_access: Arc::clone(&self.attempt_access),
+        }
+    }
+
+    fn instantiate(
+        &self,
+        native: &PreparedDistributedNativeTemplate,
+    ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
+        validate_prepared_template_affinity(&native.identity, &self.identity)?;
+        Ok(PreparedDistributedQuery {
+            handoff_id: native.identity.handoff_id,
+            prepared: Arc::clone(&native.prepared),
+            native_bundle: native.native_template.as_ref().clone(),
+            attempt_access: Arc::clone(&self.attempt_access),
+        })
+    }
+}
+
+/// Immutable logical-execution owner of both static Native facts and the
+/// separately held attempt-resource factory.
+pub(crate) struct PreparedDistributedAttemptTemplate {
+    native: PreparedDistributedNativeTemplate,
+    access: PreparedDistributedAttemptAccessFactory,
 }
 
 impl PreparedDistributedAttemptTemplate {
@@ -117,21 +342,51 @@ impl PreparedDistributedAttemptTemplate {
         native_template: NativeFragmentAttachment,
         attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
     ) -> Self {
+        let handoff_id = NEXT_HANDOFF_ID.fetch_add(1, Ordering::Relaxed);
+        let plan_seal = prepared.plan_seal();
+        let identity = PreparedDistributedTemplateIdentity::new(handoff_id, plan_seal);
         Self {
-            handoff_id: NEXT_HANDOFF_ID.fetch_add(1, Ordering::Relaxed),
-            prepared: Arc::new(prepared),
-            native_template: Arc::new(native_template),
-            attempt_access: Arc::new(attempt_access),
+            native: PreparedDistributedNativeTemplate {
+                identity: identity.clone(),
+                prepared: Arc::new(prepared),
+                native_template: Arc::new(native_template),
+            },
+            access: PreparedDistributedAttemptAccessFactory {
+                identity,
+                attempt_access: Arc::new(attempt_access),
+            },
         }
     }
 
+    pub(crate) const fn native_manifest_template(&self) -> &PreparedDistributedNativeTemplate {
+        &self.native
+    }
+
     pub(crate) fn instantiate(&self) -> PreparedDistributedQuery {
-        PreparedDistributedQuery {
-            handoff_id: self.handoff_id,
-            prepared: Arc::clone(&self.prepared),
-            native_bundle: self.native_template.as_ref().clone(),
-            attempt_access: Arc::clone(&self.attempt_access),
-        }
+        self.access
+            .instantiate(&self.native)
+            .expect("a prepared attempt template retains its exact sibling affinity")
+    }
+
+    /// Mint one fresh pair of request-bound attempt owners while retaining the
+    /// logical template for later recovery attempts.
+    pub(crate) fn bind_attempt(
+        &self,
+        request: &novarocks_query_application::api::NativeAttemptPreparationRequest,
+    ) -> Result<PreparedDistributedBoundAttempt, DistributedQueryError> {
+        let affinity = Arc::new(PreparedDistributedAttemptAffinity);
+        let native = self
+            .native
+            .fork_for_attempt()
+            .bind_request(request, Arc::clone(&affinity))?;
+        let access_factory = self.access.fork_for_attempt();
+        let access = PreparedDistributedAttemptAccessOwner {
+            execution: request.execution(),
+            template_identity: access_factory.identity,
+            affinity,
+            attempt_access: access_factory.attempt_access,
+        };
+        Ok(PreparedDistributedBoundAttempt { native, access })
     }
 }
 
@@ -1650,6 +1905,7 @@ fn build_expected_output_schema(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
@@ -1658,8 +1914,10 @@ mod tests {
     };
 
     use super::{
+        PreparedDistributedAttemptAffinity, PreparedDistributedTemplateIdentity,
         RuntimeFilterArtifactId, RuntimeFilterDeploymentAttachment, derive_fragment_instance_id,
-        merge_catalog_properties,
+        merge_catalog_properties, validate_bound_attempt_identity, validate_native_request_match,
+        validate_prepared_template_affinity,
     };
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
@@ -1669,6 +1927,8 @@ mod tests {
     use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
+    use novarocks_sql::planning::query_execution::SealedPreparationPlan;
+    use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
     use novarocks_types::UniqueId;
 
     fn catalog_properties(name: &str, version: u8, warehouse: &str) -> CatalogProperties {
@@ -1683,6 +1943,75 @@ mod tests {
             Vec::new(),
         )
         .expect("valid catalog properties")
+    }
+
+    #[test]
+    fn attempt_template_affinity_rejects_cross_assembly_splice() {
+        let plan_seal = SealedPreparationPlan::seal(
+            native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
+        )
+        .id();
+        let native_identity = PreparedDistributedTemplateIdentity::new(41, plan_seal);
+        let exact_access_identity = native_identity.clone();
+        let foreign_access_identity = PreparedDistributedTemplateIdentity::new(41, plan_seal);
+
+        validate_prepared_template_affinity(&native_identity, &exact_access_identity)
+            .expect("siblings minted together retain the same private token");
+        let error = validate_prepared_template_affinity(&native_identity, &foreign_access_identity)
+            .expect_err("equal scalar identities from separate assemblies must be rejected");
+        assert!(error.message().contains("another prepared Native template"));
+    }
+
+    #[test]
+    fn request_binding_rejects_a_foreign_plan_seal_match() {
+        validate_native_request_match(true).expect("an exact request seal match is accepted");
+        let error = validate_native_request_match(false)
+            .expect_err("a foreign request seal must not produce a bound typestate");
+        assert!(error.message().contains("another sealed preparation plan"));
+    }
+
+    #[test]
+    fn attempt_access_rejects_a_cross_attempt_native_splice() {
+        let query_id = QueryId::new(43, 79);
+        let first_execution =
+            QueryExecutionId::new(query_id, AttemptId::new(1).expect("valid first attempt"))
+                .expect("valid first execution");
+        let second_execution =
+            QueryExecutionId::new(query_id, AttemptId::new(2).expect("valid second attempt"))
+                .expect("valid second execution");
+        let plan_seal = SealedPreparationPlan::seal(
+            native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
+        )
+        .id();
+        let template = PreparedDistributedTemplateIdentity::new(47, plan_seal);
+        let exact_template = template.clone();
+        let affinity = Arc::new(PreparedDistributedAttemptAffinity);
+        let exact_affinity = Arc::clone(&affinity);
+        let foreign_affinity = Arc::new(PreparedDistributedAttemptAffinity);
+
+        validate_bound_attempt_identity(
+            first_execution,
+            &template,
+            &affinity,
+            first_execution,
+            &exact_template,
+            &exact_affinity,
+        )
+        .expect("siblings minted for one request bind are accepted");
+        let error = validate_bound_attempt_identity(
+            first_execution,
+            &template,
+            &affinity,
+            second_execution,
+            &exact_template,
+            &foreign_affinity,
+        )
+        .expect_err("access from another attempt must not splice onto the Native owner");
+        assert!(
+            error
+                .message()
+                .contains("another request-bound Native attempt")
+        );
     }
 
     fn placement(

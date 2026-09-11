@@ -164,6 +164,23 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
     let runtime_filter_facts =
         novarocks_sql::planning::query_execution::project_runtime_filter_facts(plan)?;
+    let scheduling_facts =
+        novarocks_sql::planning::query_execution::project_execution_scheduling_facts(sealed_plan)?;
+    let mut sealed_scan_identities = BTreeMap::new();
+    for fragment in scheduling_facts.fragments() {
+        for &identity in fragment.scans() {
+            if sealed_scan_identities
+                .insert((fragment.fragment_id(), identity.node_id()), identity)
+                .is_some()
+            {
+                return Err(format!(
+                    "sealed preparation repeats scan identity fragment_id={} node_id={}",
+                    fragment.fragment_id(),
+                    identity.node_id()
+                ));
+            }
+        }
+    }
     let write_root_targets = project_write_root_targets(plan)?;
     let sealed_ids = plan
         .fragments()
@@ -258,6 +275,16 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         collect_scan_nodes(fragment.fragment_id, &fragment.root, &mut scan_nodes);
         scan_nodes.sort_by_key(|(node_id, _)| *node_id);
         for (node_id, _source) in &scan_nodes {
+            let identity = sealed_scan_identities
+                .get(&(fragment.fragment_id, *node_id))
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "prepared fragment missing sealed scan identity fragment_id={} node_id={node_id}",
+                        fragment.fragment_id
+                    )
+                })?;
+            debug_assert_eq!(identity.node_id(), *node_id);
             expected_range_keys.insert((fragment.fragment_id, *node_id));
             if scan_bindings
                 .scan_ranges(fragment.fragment_id, *node_id)
@@ -333,6 +360,17 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         }
     }
 
+    let prepared_scan_keys = expected_range_keys.clone();
+    let sealed_scan_keys = sealed_scan_identities
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if sealed_scan_keys != prepared_scan_keys {
+        return Err(format!(
+            "sealed preparation scan occurrence set mismatch: expected={prepared_scan_keys:?} actual={sealed_scan_keys:?}"
+        ));
+    }
+
     validate_binding_keys(
         "scan ranges",
         &expected_range_keys,
@@ -349,7 +387,9 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         &scan_bindings.typed_scan_keys().collect(),
     )?;
     let prepared = PreparedFragmentSet::new(
+        sealed_plan.id(),
         by_fragment,
+        sealed_scan_identities,
         scan_bindings,
         topological_fragment_order,
         execution_anchor_fragment_id,
@@ -388,6 +428,8 @@ fn project_write_root_targets(
 pub(crate) fn prepared_fragment_set_for_native_encode_test(
     plan: &novarocks_sql::plan_read::DistributedPlan,
 ) -> Result<PreparedFragmentSet, String> {
+    let test_plan_seal =
+        novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(plan.clone()).id();
     let preparation_facts =
         novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
     let runtime_filter_facts =
@@ -423,7 +465,9 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
         );
     }
     Ok(PreparedFragmentSet::new(
+        test_plan_seal,
         by_fragment,
+        BTreeMap::new(),
         scan::ScanExecutionBindings::default(),
         preparation_facts.topological_fragment_order().to_vec(),
         preparation_facts.execution_anchor_fragment_id(),

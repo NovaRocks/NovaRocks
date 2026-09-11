@@ -23,7 +23,8 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, EstablishQueryContext, QueryContextRef, TaskIdentity,
+    AcquireQueryContextAdmissionTicket, EstablishQueryContext, ExchangeEdgeId, QueryContextRef,
+    TaskIdentity,
 };
 use novarocks_sql::plan_read::{FragmentId, FragmentStreamKind};
 use novarocks_sql::planning::query_execution::{SealedScanIdentity, SqlExecutionSchedulingFacts};
@@ -176,6 +177,7 @@ impl ScheduledProducer {
 /// Complete Task membership of one sealed inter-fragment exchange edge.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ScheduledEdge {
+    edge_id: ExchangeEdgeId,
     source_fragment_id: FragmentId,
     target_fragment_id: FragmentId,
     target_exchange_node_id: i32,
@@ -185,6 +187,10 @@ pub struct ScheduledEdge {
 }
 
 impl ScheduledEdge {
+    pub const fn edge_id(&self) -> ExchangeEdgeId {
+        self.edge_id
+    }
+
     pub const fn source_fragment_id(&self) -> FragmentId {
         self.source_fragment_id
     }
@@ -440,6 +446,7 @@ fn scan_fragment_parallelism(
                 scan.node_id()
             ))
         })? {
+            NativeScanWork::Empty => {}
             NativeScanWork::WholeRelation => return Ok(1),
             NativeScanWork::RuntimeSplits => parallelism = backend_count,
             NativeScanWork::FrozenUnits { count } => parallelism = parallelism.max(count.get()),
@@ -461,6 +468,7 @@ fn assign_scan_work(
                 scan.node_id()
             ))
         })? {
+            NativeScanWork::Empty => {}
             NativeScanWork::RuntimeSplits => {
                 for task in &mut assigned {
                     task.push(ScheduledScanWork {
@@ -554,9 +562,11 @@ fn schedule_edges(
         sender_sets.insert(key, (ordinals, count));
     }
 
+    let mut next_edge_id = Some(1_u32);
     sql.edges()
         .iter()
         .map(|edge| {
+            let edge_id = take_exchange_edge_id(&mut next_edge_id)?;
             let key = (edge.target_fragment_id(), edge.target_exchange_node_id());
             let (ordinals, sender_count) = &sender_sets[&key];
             let producers = tasks_by_fragment
@@ -585,6 +595,7 @@ fn schedule_edges(
                 .map(|task| task.identity)
                 .collect::<Vec<_>>();
             Ok(ScheduledEdge {
+                edge_id,
                 source_fragment_id: edge.source_fragment_id(),
                 target_fragment_id: edge.target_fragment_id(),
                 target_exchange_node_id: edge.target_exchange_node_id(),
@@ -594,6 +605,16 @@ fn schedule_edges(
             })
         })
         .collect()
+}
+
+fn take_exchange_edge_id(next: &mut Option<u32>) -> Result<ExchangeEdgeId, AttemptScheduleError> {
+    let current = next
+        .take()
+        .ok_or_else(|| AttemptScheduleError::new("exchange edge id space exhausted"))?;
+    let edge_id = ExchangeEdgeId::new(current)
+        .map_err(|error| AttemptScheduleError::new(error.to_string()))?;
+    *next = current.checked_add(1);
+    Ok(edge_id)
 }
 
 /// Narrow Native capability for actor-owned admission and Establish effects.
@@ -755,6 +776,7 @@ mod tests {
         }));
 
         let edge = &schedule.edges()[0];
+        assert_eq!(edge.edge_id().get(), 1);
         assert_eq!(edge.producers().len(), 3);
         assert_eq!(edge.destinations().len(), 1);
         assert_eq!(edge.sender_count().get(), 3);
@@ -815,6 +837,36 @@ mod tests {
             .collect::<Vec<_>>();
         units.sort_unstable();
         assert_eq!(units, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn empty_static_scan_keeps_one_fragment_task_without_scan_assignment() {
+        let execution = execution(1);
+        let frontend = FrontendProcessId::new_v7();
+        let backends = backends(3);
+        let (scheduling, scan) = scan_edge_inputs();
+        let scan_fragment_id = scheduling
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.scans().contains(&scan))
+            .unwrap()
+            .fragment_id();
+        let schedule = build_attempt_schedule(
+            execution,
+            frontend,
+            &backends,
+            &[NativeScanWorkFact::new(scan, NativeScanWork::Empty)],
+            &scheduling,
+        )
+        .unwrap();
+        let scan_fragment = schedule
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.fragment_id() == scan_fragment_id)
+            .unwrap();
+
+        assert_eq!(scan_fragment.tasks().len(), 1);
+        assert!(scan_fragment.tasks()[0].scan_work().is_empty());
     }
 
     #[test]
@@ -915,6 +967,19 @@ mod tests {
             NativeScanWork::RuntimeSplits,
         );
         assert_ne!(first.root(), second.root());
+        assert_eq!(
+            first
+                .edges()
+                .iter()
+                .map(ScheduledEdge::edge_id)
+                .collect::<Vec<_>>(),
+            second
+                .edges()
+                .iter()
+                .map(ScheduledEdge::edge_id)
+                .collect::<Vec<_>>(),
+            "the same frozen SQL edge order keeps stable attempt-local ids"
+        );
         assert!(
             first
                 .fragments()
@@ -951,6 +1016,18 @@ mod tests {
         };
 
         assert_eq!(identities(&first), identities(&second));
+        assert_eq!(
+            first
+                .edges()
+                .iter()
+                .map(|edge| edge.edge_id().get())
+                .collect::<Vec<_>>(),
+            second
+                .edges()
+                .iter()
+                .map(|edge| edge.edge_id().get())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(first.contexts(), second.contexts());
         forward.sort_unstable();
         assert_eq!(
@@ -959,6 +1036,20 @@ mod tests {
                 .into_iter()
                 .map(|backend| QueryContextRef::new(execution, frontend, backend))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn exchange_edge_ids_are_contiguous_and_exhaustion_is_explicit() {
+        let mut next = Some(1);
+        assert_eq!(take_exchange_edge_id(&mut next).unwrap().get(), 1);
+        assert_eq!(take_exchange_edge_id(&mut next).unwrap().get(), 2);
+
+        let mut last = Some(u32::MAX);
+        assert_eq!(take_exchange_edge_id(&mut last).unwrap().get(), u32::MAX);
+        assert_eq!(
+            take_exchange_edge_id(&mut last).unwrap_err().to_string(),
+            "exchange edge id space exhausted"
         );
     }
 }

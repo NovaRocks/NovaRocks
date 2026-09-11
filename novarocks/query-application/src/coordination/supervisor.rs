@@ -431,7 +431,8 @@ async fn run_logical_execution(
         Ok(execution) => execution,
         Err(error) => return fail_uninstalled_start(pending_owner, reply, error),
     };
-    let description = Arc::new(request.into_description());
+    let (description, native_seed) = request.into_parts();
+    let description = Arc::new(description);
     if !matches!(description.output(), OutputContract::CompletionOnly)
         || description.recovery() != RecoveryMode::NoRecovery
     {
@@ -453,6 +454,7 @@ async fn run_logical_execution(
         Arc::clone(&description),
         scope.id(),
         cancellation.clone(),
+        native_seed,
     );
     let opened = await_with_shutdown(native.open(open_request), &mut shutdown, &requester).await;
     let mut session =
@@ -923,12 +925,13 @@ mod tests {
         )
     }
 
-    fn completion_request() -> QueryExecutionRequest {
+    fn completion_request(attempts: impl NativeAttemptPreparationPort) -> QueryExecutionRequest {
         let plan = native_preparation_plan(NativePreparationFixture::MissingResultOutput).unwrap();
+        let plan = SealedPreparationPlan::seal(plan);
         let description =
             FrozenExecutionDescription::try_freeze(FrozenExecutionDescriptionDraft::new(
                 crate::api::QueryExecutionKind::Maintenance,
-                SealedPreparationPlan::seal(plan),
+                plan,
                 None,
                 super::super::ExecutionEffect::None,
                 RecoveryMode::NoRecovery,
@@ -937,7 +940,50 @@ mod tests {
                 ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
             ))
             .unwrap();
-        QueryExecutionRequest::from_frozen_description(description)
+        QueryExecutionRequest::bind_native(
+            description,
+            PermanentlyBackpressuredAbortEffectPort::shared(),
+            None,
+            attempts,
+        )
+    }
+
+    #[derive(Debug)]
+    struct UnreachablePreparationPort;
+
+    impl NativeAttemptPreparationPort for UnreachablePreparationPort {
+        fn prepare(
+            &mut self,
+            _request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            Box::pin(async { panic!("unreachable Native attempt preparation") })
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropTrackedPreparationPort {
+        drops: Arc<AtomicU64>,
+    }
+
+    impl Drop for DropTrackedPreparationPort {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl NativeAttemptPreparationPort for DropTrackedPreparationPort {
+        fn prepare(
+            &mut self,
+            _request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            Box::pin(async { panic!("rejected Native seed must never prepare an attempt") })
+        }
+    }
+
+    fn drop_tracked_request(drops: &Arc<AtomicU64>) -> QueryExecutionRequest {
+        completion_request(DropTrackedPreparationPort {
+            drops: Arc::clone(drops),
+        })
     }
 
     fn governance() -> (WorkloadControl, RootWork) {
@@ -966,8 +1012,6 @@ mod tests {
     #[derive(Debug)]
     struct FailingActivationNativePort {
         opened_execution_low: Arc<AtomicU64>,
-        activated: Arc<AtomicBool>,
-        residual_converged: Arc<AtomicBool>,
     }
 
     impl LogicalExecutionNativePort for FailingActivationNativePort {
@@ -975,21 +1019,7 @@ mod tests {
             let execution = request.initial_execution();
             self.opened_execution_low
                 .store(execution.query_id().low() as u64, Ordering::SeqCst);
-            let backend = BackendProcessId::new_v7();
-            let attempts = FailingActivationPreparationPort {
-                backend,
-                activated: Arc::clone(&self.activated),
-                residual_converged: Arc::clone(&self.residual_converged),
-            };
-            Box::pin(async move {
-                request
-                    .bind(
-                        PermanentlyBackpressuredAbortEffectPort::shared(),
-                        None,
-                        attempts,
-                    )
-                    .map_err(Into::into)
-            })
+            Box::pin(async move { request.bind().map_err(Into::into) })
         }
     }
 
@@ -1056,6 +1086,7 @@ mod tests {
 
     fn failing_native() -> (
         Arc<dyn LogicalExecutionNativePort>,
+        FailingActivationPreparationPort,
         Arc<AtomicU64>,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
@@ -1066,9 +1097,12 @@ mod tests {
         (
             Arc::new(FailingActivationNativePort {
                 opened_execution_low: Arc::clone(&opened),
+            }),
+            FailingActivationPreparationPort {
+                backend: BackendProcessId::new_v7(),
                 activated: Arc::clone(&activated),
                 residual_converged: Arc::clone(&residual),
-            }),
+            },
             opened,
             activated,
             residual,
@@ -1077,7 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn activation_failure_retains_residual_and_retires_exact_registry_entry() {
-        let (native, opened, activated, residual) = failing_native();
+        let (native, attempts, opened, activated, residual) = failing_native();
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             native,
@@ -1088,7 +1122,7 @@ mod tests {
         let (control, root) = governance();
         let scope = root.owner.scope();
 
-        let error = match client.start(completion_request(), root.owner).await {
+        let error = match client.start(completion_request(attempts), root.owner).await {
             Ok(_) => panic!("activation failure must not return an execution handle"),
             Err(error) => error,
         };
@@ -1108,7 +1142,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_an_accepted_reply_does_not_drop_its_work_owner() {
-        let (native, _opened, activated, residual) = failing_native();
+        let (native, attempts, _opened, activated, residual) = failing_native();
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
             native,
@@ -1118,7 +1152,7 @@ mod tests {
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
-        let future = client.start(completion_request(), root.owner);
+        let future = client.start(completion_request(attempts), root.owner);
         drop(future);
         root.business.release();
 
@@ -1148,28 +1182,11 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct PanickingAttemptNativePort {
-        phase: AttemptPanicPhase,
-        convergence_calls: Arc<AtomicU64>,
-    }
+    struct BindingNativePort;
 
-    impl LogicalExecutionNativePort for PanickingAttemptNativePort {
+    impl LogicalExecutionNativePort for BindingNativePort {
         fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-            let backend = BackendProcessId::new_v7();
-            let attempts = PanickingAttemptPreparationPort {
-                backend,
-                phase: self.phase,
-                convergence_calls: Arc::clone(&self.convergence_calls),
-            };
-            Box::pin(async move {
-                request
-                    .bind(
-                        PermanentlyBackpressuredAbortEffectPort::shared(),
-                        None,
-                        attempts,
-                    )
-                    .map_err(Into::into)
-            })
+            Box::pin(async move { request.bind().map_err(Into::into) })
         }
     }
 
@@ -1283,12 +1300,14 @@ mod tests {
         expected_message: &'static str,
     ) {
         let convergence_calls = Arc::new(AtomicU64::new(0));
+        let attempts = PanickingAttemptPreparationPort {
+            backend: BackendProcessId::new_v7(),
+            phase,
+            convergence_calls: Arc::clone(&convergence_calls),
+        };
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
-            Arc::new(PanickingAttemptNativePort {
-                phase,
-                convergence_calls: Arc::clone(&convergence_calls),
-            }),
+            Arc::new(BindingNativePort),
             QueryProcessNamespace::new(namespace),
             FrontendProcessId::new_v7(),
             supervisor_config(4),
@@ -1296,7 +1315,7 @@ mod tests {
         let (control, root) = governance();
         let scope = root.owner.scope();
 
-        let error = match client.start(completion_request(), root.owner).await {
+        let error = match client.start(completion_request(attempts), root.owner).await {
             Ok(_) => panic!("a panicking Native attempt must not return an execution handle"),
             Err(error) => error,
         };
@@ -1334,12 +1353,14 @@ mod tests {
     #[tokio::test]
     async fn convergence_poll_panic_retries_without_losing_the_active_owner() {
         let convergence_calls = Arc::new(AtomicU64::new(0));
+        let attempts = PanickingAttemptPreparationPort {
+            backend: BackendProcessId::new_v7(),
+            phase: AttemptPanicPhase::Converge,
+            convergence_calls: Arc::clone(&convergence_calls),
+        };
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
-            Arc::new(PanickingAttemptNativePort {
-                phase: AttemptPanicPhase::Converge,
-                convergence_calls: Arc::clone(&convergence_calls),
-            }),
+            Arc::new(BindingNativePort),
             QueryProcessNamespace::new(0x50),
             FrontendProcessId::new_v7(),
             supervisor_config(4),
@@ -1347,7 +1368,7 @@ mod tests {
         let (control, root) = governance();
         let scope = root.owner.scope();
 
-        let error = match client.start(completion_request(), root.owner).await {
+        let error = match client.start(completion_request(attempts), root.owner).await {
             Ok(_) => panic!("a failed Native attempt must not return an execution handle"),
             Err(error) => error,
         };
@@ -1405,30 +1426,6 @@ mod tests {
             submission
                 .worker_settled(OperationOutcome::Accepted)
                 .expect("test transport publishes exact Establish success");
-        }
-    }
-
-    #[derive(Debug)]
-    struct SuccessfulCompletionNativePort {
-        backend: BackendProcessId,
-        expected_frontend: FrontendProcessId,
-    }
-
-    impl LogicalExecutionNativePort for SuccessfulCompletionNativePort {
-        fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-            let attempts = SuccessfulCompletionPreparationPort {
-                backend: self.backend,
-                expected_frontend: self.expected_frontend,
-            };
-            Box::pin(async move {
-                request
-                    .bind(
-                        PermanentlyBackpressuredAbortEffectPort::shared(),
-                        None,
-                        attempts,
-                    )
-                    .map_err(Into::into)
-            })
         }
     }
 
@@ -1577,12 +1574,13 @@ mod tests {
     #[tokio::test]
     async fn completion_becomes_visible_only_after_exact_establish_success() {
         let frontend = FrontendProcessId::new_v7();
+        let attempts = SuccessfulCompletionPreparationPort {
+            backend: BackendProcessId::new_v7(),
+            expected_frontend: frontend,
+        };
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
-            Arc::new(SuccessfulCompletionNativePort {
-                backend: BackendProcessId::new_v7(),
-                expected_frontend: frontend,
-            }),
+            Arc::new(BindingNativePort),
             QueryProcessNamespace::new(0x50),
             frontend,
             supervisor_config(4),
@@ -1590,7 +1588,7 @@ mod tests {
         let (control, root) = governance();
         let scope = root.owner.scope();
         let mut handle = client
-            .start(completion_request(), root.owner)
+            .start(completion_request(attempts), root.owner)
             .await
             .expect("exact Establish success permits completion visibility");
         assert!(matches!(
@@ -1604,24 +1602,6 @@ mod tests {
             .unwrap();
         acknowledge_all_control(&control);
         scope.wait_released().await;
-    }
-
-    #[derive(Debug)]
-    struct PrematureCompletionNativePort;
-
-    impl LogicalExecutionNativePort for PrematureCompletionNativePort {
-        fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-            let backend = BackendProcessId::new_v7();
-            Box::pin(async move {
-                request
-                    .bind(
-                        PermanentlyBackpressuredAbortEffectPort::shared(),
-                        None,
-                        PrematureCompletionPreparationPort { backend },
-                    )
-                    .map_err(Into::into)
-            })
-        }
     }
 
     #[derive(Debug)]
@@ -1685,16 +1665,19 @@ mod tests {
 
     #[tokio::test]
     async fn completion_is_not_visible_without_exact_establish_success() {
+        let attempts = PrematureCompletionPreparationPort {
+            backend: BackendProcessId::new_v7(),
+        };
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
-            Arc::new(PrematureCompletionNativePort),
+            Arc::new(BindingNativePort),
             QueryProcessNamespace::new(0x4a),
             FrontendProcessId::new_v7(),
             supervisor_config(4),
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
-        let error = match client.start(completion_request(), root.owner).await {
+        let error = match client.start(completion_request(attempts), root.owner).await {
             Ok(_) => panic!("Native completion without Establish proof must fail closed"),
             Err(error) => error,
         };
@@ -1713,21 +1696,21 @@ mod tests {
 
     #[tokio::test]
     async fn full_and_closed_start_admission_complete_rejected_work() {
-        let (native, ..) = failing_native();
+        let seed_drops = Arc::new(AtomicU64::new(0));
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
-            native,
+            Arc::new(BindingNativePort),
             QueryProcessNamespace::new(0x48),
             FrontendProcessId::new_v7(),
             supervisor_config(1),
         );
         let (first_control, first) = governance();
         let first_scope = first.owner.scope();
-        let accepted = client.start(completion_request(), first.owner);
+        let accepted = client.start(drop_tracked_request(&seed_drops), first.owner);
         let (second_control, second) = governance();
         let second_scope = second.owner.scope();
         let second_cancellation = second_scope.cancellation().unwrap();
-        let rejected = client.start(completion_request(), second.owner);
+        let rejected = client.start(drop_tracked_request(&seed_drops), second.owner);
         let error = match rejected.await {
             Ok(_) => panic!("a full start mailbox must reject synchronously"),
             Err(error) => error,
@@ -1738,6 +1721,7 @@ mod tests {
             "full admission rejection must not manufacture cancellation work"
         );
         assert_eq!(second_cancellation.reason(), None);
+        assert_eq!(seed_drops.load(Ordering::SeqCst), 1);
         second.business.release();
         second_scope.wait_released().await;
 
@@ -1755,13 +1739,17 @@ mod tests {
             "accepted but unstarted shutdown rejection must not manufacture cancellation work"
         );
         assert_eq!(first_scope.cancellation().unwrap().reason(), None);
+        assert_eq!(seed_drops.load(Ordering::SeqCst), 2);
         first.business.release();
         first_scope.wait_released().await;
 
         let (closed_control, closed) = governance();
         let closed_scope = closed.owner.scope();
         let closed_cancellation = closed_scope.cancellation().unwrap();
-        let closed_error = match client.start(completion_request(), closed.owner).await {
+        let closed_error = match client
+            .start(drop_tracked_request(&seed_drops), closed.owner)
+            .await
+        {
             Ok(_) => panic!("a closed supervisor must reject new work"),
             Err(error) => error,
         };
@@ -1771,6 +1759,7 @@ mod tests {
             "closed admission rejection must not manufacture cancellation work"
         );
         assert_eq!(closed_cancellation.reason(), None);
+        assert_eq!(seed_drops.load(Ordering::SeqCst), 3);
         closed.business.release();
         closed_scope.wait_released().await;
     }
@@ -1790,8 +1779,6 @@ mod tests {
         first_opened: Arc<AtomicBool>,
         second_opened: Arc<AtomicBool>,
         second_gate: Arc<tokio::sync::Notify>,
-        backend: BackendProcessId,
-        expected_frontend: FrontendProcessId,
     }
 
     impl LogicalExecutionNativePort for IsolatedTaskPanicNativePort {
@@ -1800,21 +1787,11 @@ mod tests {
                 self.first_opened.store(true, Ordering::SeqCst);
                 return Box::pin(async { panic!("injected isolated logical task panic") });
             }
-            let attempts = SuccessfulCompletionPreparationPort {
-                backend: self.backend,
-                expected_frontend: self.expected_frontend,
-            };
             self.second_opened.store(true, Ordering::SeqCst);
             let gate = Arc::clone(&self.second_gate);
             Box::pin(async move {
                 gate.notified().await;
-                request
-                    .bind(
-                        PermanentlyBackpressuredAbortEffectPort::shared(),
-                        None,
-                        attempts,
-                    )
-                    .map_err(Into::into)
+                request.bind().map_err(Into::into)
             })
         }
     }
@@ -1830,8 +1807,6 @@ mod tests {
             first_opened: Arc::clone(&first_opened),
             second_opened: Arc::clone(&second_opened),
             second_gate: Arc::clone(&second_gate),
-            backend: BackendProcessId::new_v7(),
-            expected_frontend: frontend,
         });
         let (mut supervisor, client) = LogicalExecutionSupervisor::new(
             Handle::current(),
@@ -1843,7 +1818,8 @@ mod tests {
         let (first_control, first) = governance();
         let first_scope = first.owner.scope();
         let first_cancellation = first_scope.cancellation().unwrap();
-        let first_result = client.start(completion_request(), first.owner);
+        let first_result =
+            client.start(completion_request(UnreachablePreparationPort), first.owner);
         tokio::time::timeout(Duration::from_secs(1), async {
             while !first_opened.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
@@ -1855,7 +1831,13 @@ mod tests {
         let (second_control, second) = governance();
         let second_scope = second.owner.scope();
         let second_cancellation = second_scope.cancellation().unwrap();
-        let second_result = client.start(completion_request(), second.owner);
+        let second_result = client.start(
+            completion_request(SuccessfulCompletionPreparationPort {
+                backend: BackendProcessId::new_v7(),
+                expected_frontend: frontend,
+            }),
+            second.owner,
+        );
 
         let first_error = match first_result.await {
             Ok(_) => panic!("the panicking logical task must fail its own request"),
@@ -1911,7 +1893,7 @@ mod tests {
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
-        let start = client.start(completion_request(), root.owner);
+        let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
         let error = match start.await {
             Ok(_) => panic!("panicking Native open must not return an execution handle"),
             Err(error) => error,
@@ -1958,7 +1940,7 @@ mod tests {
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
-        let start = client.start(completion_request(), root.owner);
+        let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
         tokio::task::yield_now().await;
 
         assert_eq!(
@@ -2003,7 +1985,10 @@ mod tests {
         );
         let (_control, root) = governance();
         let scope = root.owner.scope();
-        let error = match client.start(completion_request(), root.owner).await {
+        let error = match client
+            .start(completion_request(UnreachablePreparationPort), root.owner)
+            .await
+        {
             Ok(_) => panic!("panicking Native open must fail the logical task"),
             Err(error) => error,
         };

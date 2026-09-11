@@ -20,8 +20,9 @@
 //! The role adapter may observe one immutable execution description and bind
 //! dormant Native owners to it. Private acceptance tickets prevent a value
 //! already bound for one request from being accepted as another request's
-//! return. Matching the concrete owner to the frozen template remains a trusted
-//! role-adapter obligation; the adapter never receives coordination authority.
+//! return. The role adapter must compare its own template seal through the
+//! request's borrowed matcher before using that template; it never receives
+//! coordination authority.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -30,7 +31,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use novarocks_sql::planning::query_execution::SealedScanIdentity;
+use novarocks_sql::planning::query_execution::{SealedPreparationPlanId, SealedScanIdentity};
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 use novarocks_workload_control::{CancellationView, WorkId};
 
@@ -190,6 +191,68 @@ pub trait LogicalExecutionNativePort: fmt::Debug + Send + Sync + 'static {
     fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture;
 }
 
+/// Move-only role-local seed for one logical Native execution.
+///
+/// A seed contains the immutable Native template/factory and process effect
+/// capabilities selected by the sole application finalizer. It must not
+/// contain a work scope, execution or attempt identity, topology, lease,
+/// credential, or attempt-local split source. Those values are supplied only
+/// after the supervisor binds this seed to its exact logical open ticket.
+///
+/// The seed is deliberately not cloneable and has no public decomposition.
+/// A process-wide [`LogicalExecutionNativePort`] can consume it only as part
+/// of the [`LogicalNativeOpenRequest`] that owns the exact ticket.
+///
+/// ```compile_fail
+/// use novarocks_query_application::api::NativeLogicalExecutionSeed;
+/// fn duplicate(seed: NativeLogicalExecutionSeed) {
+///     let _copy = seed.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use novarocks_query_application::api::NativeLogicalExecutionSeed;
+/// let _detached_constructor = NativeLogicalExecutionSeed::new;
+/// ```
+pub struct NativeLogicalExecutionSeed {
+    plan_seal: SealedPreparationPlanId,
+    aborts: Arc<dyn AbortQueryContextEffectPort>,
+    replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
+    attempts: Box<dyn NativeAttemptPreparationPort>,
+}
+
+impl fmt::Debug for NativeLogicalExecutionSeed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeLogicalExecutionSeed")
+            .field("has_replacement_port", &self.replacements.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeLogicalExecutionSeed {
+    /// Called only by the executable request constructor after it has consumed
+    /// the frozen description. A role adapter cannot mint a detached seed or
+    /// substitute a caller-declared plan seal.
+    pub(crate) fn issue(
+        plan_seal: SealedPreparationPlanId,
+        aborts: Arc<dyn AbortQueryContextEffectPort>,
+        replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
+        attempts: impl NativeAttemptPreparationPort,
+    ) -> Self {
+        Self {
+            plan_seal,
+            aborts,
+            replacements,
+            attempts: Box::new(attempts),
+        }
+    }
+
+    pub(crate) const fn plan_seal(&self) -> SealedPreparationPlanId {
+        self.plan_seal
+    }
+}
+
 /// Preparing one physical attempt returns a dormant owner. It must not submit
 /// tasks before the query application installs the logical runtime.
 pub type NativeAttemptPreparationFuture = Pin<
@@ -338,6 +401,7 @@ pub enum NativeAttemptTerminal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum NativeExecutionContractError {
+    ForeignLogicalSeedPlan,
     ForeignLogicalOpenTicket,
     ForeignAttemptTicket,
     DifferentLogicalQuery,
@@ -353,6 +417,9 @@ pub enum NativeExecutionContractError {
 impl fmt::Display for NativeExecutionContractError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
+            Self::ForeignLogicalSeedPlan => {
+                "Native logical execution seed belongs to another sealed preparation plan"
+            }
             Self::ForeignLogicalOpenTicket => {
                 "Native logical session was bound from a different open request"
             }
@@ -421,6 +488,7 @@ impl fmt::Debug for LogicalNativeTicket {
 /// ```
 pub struct LogicalNativeOpenRequest {
     ticket: Arc<LogicalNativeTicket>,
+    seed: NativeLogicalExecutionSeed,
 }
 
 impl fmt::Debug for LogicalNativeOpenRequest {
@@ -451,13 +519,11 @@ impl LogicalNativeOpenRequest {
 
     /// Consumes the only request ticket and binds the role-local attempt port
     /// to its immutable logical description.
-    pub fn bind(
-        self,
-        aborts: Arc<dyn AbortQueryContextEffectPort>,
-        replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
-        attempts: impl NativeAttemptPreparationPort,
-    ) -> Result<LogicalNativeSession, NativeExecutionContractError> {
-        match (self.ticket.description.recovery(), replacements.is_some()) {
+    pub fn bind(self) -> Result<LogicalNativeSession, NativeExecutionContractError> {
+        match (
+            self.ticket.description.recovery(),
+            self.seed.replacements.is_some(),
+        ) {
             (RecoveryMode::RestartAttemptBeforeVisibility, false) => {
                 return Err(NativeExecutionContractError::MissingReplacementPort);
             }
@@ -468,9 +534,9 @@ impl LogicalNativeOpenRequest {
         }
         Ok(LogicalNativeSession {
             ticket: self.ticket,
-            aborts,
-            replacements,
-            attempts: Box::new(attempts),
+            aborts: self.seed.aborts,
+            replacements: self.seed.replacements,
+            attempts: self.seed.attempts,
         })
     }
 
@@ -479,6 +545,7 @@ impl LogicalNativeOpenRequest {
         description: Arc<FrozenExecutionDescription>,
         work_id: WorkId,
         cancellation: CancellationView,
+        seed: NativeLogicalExecutionSeed,
     ) -> (Self, LogicalNativeOpenAcceptance) {
         let ticket = Arc::new(LogicalNativeTicket {
             initial_execution,
@@ -489,6 +556,7 @@ impl LogicalNativeOpenRequest {
         (
             Self {
                 ticket: Arc::clone(&ticket),
+                seed,
             },
             LogicalNativeOpenAcceptance { ticket },
         )
@@ -571,9 +639,15 @@ struct AttemptTicket;
 /// This is an input to Query Application scheduling, not a placement result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeScanWork {
+    /// The exact static work set is empty. The containing fragment still
+    /// retains one Task so its non-scan operators and exchange obligations
+    /// have an execution owner.
+    Empty,
     RuntimeSplits,
     WholeRelation,
-    FrozenUnits { count: NonZeroUsize },
+    FrozenUnits {
+        count: NonZeroUsize,
+    },
 }
 
 /// One scan's exact Native work fact, bound to the opaque SQL plan seal.
@@ -627,6 +701,13 @@ impl NativeAttemptPreparationRequest {
 
     pub fn description(&self) -> &FrozenExecutionDescription {
         self.logical_ticket.description.as_ref()
+    }
+
+    /// Compare the request with the role adapter's own immutable Native
+    /// template. The opaque seal is never returned to the adapter, so it
+    /// cannot replace this proof with a caller-declared identity.
+    pub fn matches_plan_seal(&self, template_plan_seal: SealedPreparationPlanId) -> bool {
+        self.logical_ticket.description.plan_seal() == template_plan_seal
     }
 
     pub fn work_id(&self) -> WorkId {
@@ -871,6 +952,15 @@ mod tests {
         )
     }
 
+    fn seed_for_description(
+        description: &FrozenExecutionDescription,
+        aborts: Arc<dyn AbortQueryContextEffectPort>,
+        replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
+        attempts: impl NativeAttemptPreparationPort,
+    ) -> NativeLogicalExecutionSeed {
+        NativeLogicalExecutionSeed::issue(description.plan_seal(), aborts, replacements, attempts)
+    }
+
     struct Governance {
         _control: WorkloadControl,
         root: Option<RootWork>,
@@ -920,11 +1010,24 @@ mod tests {
     ) {
         let governance = Governance::new();
         let scope = governance.scope();
+        let description = description(recovery);
+        let replacements = match recovery {
+            RecoveryMode::NoRecovery => None,
+            RecoveryMode::RestartAttemptBeforeVisibility => {
+                Some(BackpressuredReplacementPort::shared())
+            }
+        };
         let (request, acceptance) = LogicalNativeOpenRequest::issue(
             execution,
-            description(recovery),
+            Arc::clone(&description),
             scope.id(),
             scope.cancellation().unwrap(),
+            seed_for_description(
+                description.as_ref(),
+                PermanentlyBackpressuredAbortEffectPort::shared(),
+                replacements,
+                NoopPreparationPort,
+            ),
         );
         (governance, request, acceptance)
     }
@@ -941,9 +1044,15 @@ mod tests {
         let scope = governance.scope();
         let (request, acceptance) = LogicalNativeOpenRequest::issue(
             execution,
-            description,
+            Arc::clone(&description),
             scope.id(),
             scope.cancellation().unwrap(),
+            seed_for_description(
+                description.as_ref(),
+                PermanentlyBackpressuredAbortEffectPort::shared(),
+                None,
+                NoopPreparationPort,
+            ),
         );
         (governance, request, acceptance)
     }
@@ -962,11 +1071,28 @@ mod tests {
     fn bind_no_recovery(
         request: LogicalNativeOpenRequest,
     ) -> Result<LogicalNativeSession, NativeExecutionContractError> {
-        request.bind(
-            PermanentlyBackpressuredAbortEffectPort::shared(),
-            None,
-            NoopPreparationPort,
-        )
+        request.bind()
+    }
+
+    fn issue_with_seed(
+        execution: QueryExecutionId,
+        description: Arc<FrozenExecutionDescription>,
+        seed: NativeLogicalExecutionSeed,
+    ) -> (
+        Governance,
+        LogicalNativeOpenRequest,
+        LogicalNativeOpenAcceptance,
+    ) {
+        let governance = Governance::new();
+        let scope = governance.scope();
+        let (request, acceptance) = LogicalNativeOpenRequest::issue(
+            execution,
+            description,
+            scope.id(),
+            scope.cancellation().unwrap(),
+            seed,
+        );
+        (governance, request, acceptance)
     }
 
     #[derive(Debug)]
@@ -1013,6 +1139,87 @@ mod tests {
     }
 
     #[test]
+    fn open_acceptance_rejects_a_seed_bound_to_another_plan_seal() {
+        let first_description = scan_description();
+        let second_description = scan_description();
+        assert_ne!(
+            first_description.scans()[0].scan_identity(),
+            second_description.scans()[0].scan_identity(),
+            "the fixture must carry distinct opaque plan seals"
+        );
+        let (_first_governance, first, first_acceptance) =
+            issue_description(execution(11, 1), first_description);
+        let (_second_governance, second, _) =
+            issue_description(execution(12, 1), second_description);
+
+        let foreign_session = second.bind().unwrap();
+        assert!(matches!(
+            first_acceptance.accept(foreign_session),
+            Err(NativeExecutionContractError::ForeignLogicalOpenTicket)
+        ));
+        drop(first);
+    }
+
+    #[test]
+    fn executable_request_rejects_a_cross_seal_seed_for_identical_no_scan_plans() {
+        let first_plan = SealedPreparationPlan::seal(
+            native_preparation_plan(NativePreparationFixture::MissingResultOutput).unwrap(),
+        );
+        let second_plan = SealedPreparationPlan::seal(
+            native_preparation_plan(NativePreparationFixture::MissingResultOutput).unwrap(),
+        );
+        let second_description =
+            FrozenExecutionDescription::try_freeze(FrozenExecutionDescriptionDraft::new(
+                QueryExecutionKind::Maintenance,
+                second_plan,
+                None,
+                ExecutionEffect::None,
+                RecoveryMode::NoRecovery,
+                Vec::new(),
+                FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+                ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ))
+            .unwrap();
+        let foreign_seed = NativeLogicalExecutionSeed::issue(
+            second_description.plan_seal(),
+            PermanentlyBackpressuredAbortEffectPort::shared(),
+            None,
+            NoopPreparationPort,
+        );
+        let first_description =
+            FrozenExecutionDescription::try_freeze(FrozenExecutionDescriptionDraft::new(
+                QueryExecutionKind::Maintenance,
+                first_plan,
+                None,
+                ExecutionEffect::None,
+                RecoveryMode::NoRecovery,
+                Vec::new(),
+                FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+                ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            crate::api::QueryExecutionRequest::try_from_parts(first_description, foreign_seed),
+            Err(NativeExecutionContractError::ForeignLogicalSeedPlan)
+        ));
+    }
+
+    #[test]
+    fn attempt_request_matches_only_its_exact_no_scan_template_seal() {
+        let first = description(RecoveryMode::NoRecovery);
+        let second = description(RecoveryMode::NoRecovery);
+        assert_ne!(first.plan_seal(), second.plan_seal());
+        let (_governance, open, acceptance) =
+            issue_description(execution(21, 1), Arc::clone(&first));
+        let session = acceptance.accept(open.bind().unwrap()).unwrap();
+        let (request, _) = session.issue_attempt(execution(21, 1)).unwrap();
+
+        assert!(request.matches_plan_seal(first.plan_seal()));
+        assert!(!request.matches_plan_seal(second.plan_seal()));
+    }
+
+    #[test]
     fn attempt_acceptance_rejects_cross_request_splicing() {
         let (_governance, open, open_acceptance) = issue(execution(1, 1), RecoveryMode::NoRecovery);
         let session = open_acceptance
@@ -1055,22 +1262,20 @@ mod tests {
 
     #[tokio::test]
     async fn mutable_attempt_port_preserves_work_description_and_exact_ticket() {
-        let (_governance, open, open_acceptance) = issue(
-            execution(1, 1),
-            RecoveryMode::RestartAttemptBeforeVisibility,
-        );
         let aborts = PermanentlyBackpressuredAbortEffectPort::shared();
         let replacements = BackpressuredReplacementPort::shared();
-        let mut session = open_acceptance
-            .accept(
-                open.bind(
-                    Arc::clone(&aborts),
-                    Some(Arc::clone(&replacements)),
-                    EchoPreparationPort { calls: 0 },
-                )
-                .unwrap(),
-            )
-            .unwrap();
+        let description = description(RecoveryMode::RestartAttemptBeforeVisibility);
+        let (_governance, open, open_acceptance) = issue_with_seed(
+            execution(1, 1),
+            Arc::clone(&description),
+            seed_for_description(
+                description.as_ref(),
+                Arc::clone(&aborts),
+                Some(Arc::clone(&replacements)),
+                EchoPreparationPort { calls: 0 },
+            ),
+        );
+        let mut session = open_acceptance.accept(open.bind().unwrap()).unwrap();
         assert!(Arc::ptr_eq(&session.abort_effect_port(), &aborts));
         assert!(Arc::ptr_eq(
             &session.replacement_effect_port().unwrap(),
@@ -1088,26 +1293,35 @@ mod tests {
 
     #[test]
     fn session_bind_requires_the_recovery_modes_exact_port_shape() {
-        let (_governance, no_recovery, _) = issue(execution(1, 1), RecoveryMode::NoRecovery);
-        assert!(matches!(
-            no_recovery.bind(
+        let no_recovery_description = description(RecoveryMode::NoRecovery);
+        let (_governance, no_recovery, _) = issue_with_seed(
+            execution(1, 1),
+            Arc::clone(&no_recovery_description),
+            seed_for_description(
+                no_recovery_description.as_ref(),
                 PermanentlyBackpressuredAbortEffectPort::shared(),
                 Some(BackpressuredReplacementPort::shared()),
                 NoopPreparationPort,
             ),
+        );
+        assert!(matches!(
+            no_recovery.bind(),
             Err(NativeExecutionContractError::UnexpectedReplacementPort)
         ));
 
-        let (_governance, recoverable, _) = issue(
+        let recoverable_description = description(RecoveryMode::RestartAttemptBeforeVisibility);
+        let (_governance, recoverable, _) = issue_with_seed(
             execution(2, 1),
-            RecoveryMode::RestartAttemptBeforeVisibility,
-        );
-        assert!(matches!(
-            recoverable.bind(
+            Arc::clone(&recoverable_description),
+            seed_for_description(
+                recoverable_description.as_ref(),
                 PermanentlyBackpressuredAbortEffectPort::shared(),
                 None,
                 NoopPreparationPort,
             ),
+        );
+        assert!(matches!(
+            recoverable.bind(),
             Err(NativeExecutionContractError::MissingReplacementPort)
         ));
     }

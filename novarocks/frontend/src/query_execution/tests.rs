@@ -125,7 +125,7 @@ fn request_owns_prepared_and_native_artifacts() {
         request.options().native_submission_options().pipeline_dop(),
         3
     );
-    let description = request.logical_execution().description();
+    let description = request.frozen_description();
     assert_eq!(
         description.kind(),
         novarocks_query_application::api::QueryExecutionKind::Read
@@ -202,14 +202,14 @@ fn replacement_read_attempt_reuses_one_logical_execution_with_fresh_attempt_type
         .expect("replacement remains a restartable read");
 
     assert!(std::ptr::eq(
-        first.logical_execution(),
-        replacement.logical_execution()
+        first.frozen_description(),
+        replacement.frozen_description()
     ));
     assert_eq!(first.topology().revision(), 7);
     assert_eq!(replacement.topology().revision(), 8);
     assert!(std::ptr::eq(
-        first.logical_execution().description().plan(),
-        replacement.logical_execution().description().plan()
+        first.frozen_description().plan(),
+        replacement.frozen_description().plan()
     ));
 
     let replacement_attempt = replacement_logical_execution.instantiate_artifacts_for_test();
@@ -255,7 +255,7 @@ fn effectful_request_is_frozen_without_recovery() {
         &test_execution(QueryCancellationSource::new().view()),
     )
     .expect("effectful request should freeze");
-    let description = request.logical_execution().description();
+    let description = request.frozen_description();
     assert_eq!(
         description.kind(),
         novarocks_query_application::api::QueryExecutionKind::Write

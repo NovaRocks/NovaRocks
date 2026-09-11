@@ -25,8 +25,8 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_sql::{
     plan_read::{DistributedPlan, OutputColumn},
     planning::query_execution::{
-        SealedPreparationPlan, SealedScanContract, SealedScanIdentity, SqlExecutionSchedulingFacts,
-        project_execution_scheduling_facts,
+        SealedPreparationPlan, SealedPreparationPlanId, SealedScanContract, SealedScanIdentity,
+        SqlExecutionSchedulingFacts, project_execution_scheduling_facts,
     },
 };
 
@@ -798,6 +798,7 @@ impl FrozenExecutionDescriptionDraft {
 /// Immutable semantic input for all attempts of one logical execution.
 #[derive(Clone, Debug)]
 pub struct FrozenExecutionDescription {
+    plan_seal: SealedPreparationPlanId,
     kind: QueryExecutionKind,
     plan: Arc<DistributedPlan>,
     scheduling: Arc<SqlExecutionSchedulingFacts>,
@@ -986,6 +987,7 @@ impl FrozenExecutionDescription {
         if draft.effect == ExecutionEffect::External {
             residuals.insert(ResidualResponsibility::EffectCommit);
         }
+        let plan_seal = draft.plan.id();
         let scheduling = Arc::new(project_execution_scheduling_facts(&draft.plan)?);
         let scans = draft
             .scan_receipts
@@ -994,6 +996,7 @@ impl FrozenExecutionDescription {
             .collect::<Vec<_>>();
         let plan = draft.plan.into_shared_plan();
         Ok(Self {
+            plan_seal,
             kind: draft.kind,
             plan,
             scheduling,
@@ -1010,6 +1013,9 @@ impl FrozenExecutionDescription {
 
     pub const fn kind(&self) -> QueryExecutionKind {
         self.kind
+    }
+    pub(crate) const fn plan_seal(&self) -> SealedPreparationPlanId {
+        self.plan_seal
     }
     pub fn plan(&self) -> &DistributedPlan {
         self.plan.as_ref()
