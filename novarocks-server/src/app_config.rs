@@ -28,14 +28,19 @@ use crate::catalog_source_config::{CatalogSourceConfig, preflight_catalog_source
 use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
-use novarocks_execution::task_execution::{
-    DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait, TransportBudget,
+use novarocks_execution_contract::{LeaseValidFor, MaxWait};
+use novarocks_frontend::{
+    FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
+    StateStoreRunPolicy,
 };
-use novarocks_frontend::StateStoreRunPolicy;
 use novarocks_native_trust::NativeTransportMode;
+use novarocks_query_application::coordination::{
+    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
+};
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
 use novarocks_types::{ClusterRole, NativeEndpoint};
+use novarocks_worker::LeaseBounds;
 
 pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 
@@ -620,8 +625,10 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_state_store_configuration(&cfg)?;
     validate_application_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
+    validate_connector_blocking_io_config(&cfg.runtime)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
+    validate_result_retained_config(&cfg.runtime)?;
     validate_lake_publication_runtime_policy(&cfg.runtime)?;
     #[cfg(not(debug_assertions))]
     reject_fault_injection_environment()?;
@@ -780,6 +787,7 @@ struct ConnectorConfigWire {
 enum CatalogCredentialPurposeWire {
     CatalogControl,
     ObjectStoreData,
+    ObjectStoreMetadata,
 }
 
 impl From<CatalogCredentialPurposeWire> for CatalogCredentialPurpose {
@@ -787,6 +795,7 @@ impl From<CatalogCredentialPurposeWire> for CatalogCredentialPurpose {
         match value {
             CatalogCredentialPurposeWire::CatalogControl => Self::CatalogControl,
             CatalogCredentialPurposeWire::ObjectStoreData => Self::ObjectStoreData,
+            CatalogCredentialPurposeWire::ObjectStoreMetadata => Self::ObjectStoreMetadata,
         }
     }
 }
@@ -1045,6 +1054,76 @@ impl Default for StandaloneServerConfig {
     }
 }
 
+/// Explicit FE-local governance bounds. These are Server configuration facts,
+/// not defaults manufactured by the Frontend application host.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FrontendWorkloadRuntimeConfig {
+    pub root_limit: usize,
+    pub business_limit: usize,
+    pub preparation_limit: usize,
+    pub execution_limit: usize,
+    pub executions_per_root: usize,
+    pub waiting_limit: usize,
+    pub waiting_bytes: u64,
+    pub capacity_wait_timeout_ms: u64,
+    pub restarts_per_work: usize,
+    pub old_attempts_per_work: usize,
+    pub old_attempts_limit: usize,
+    pub unknown_creates_limit: usize,
+    pub scope_records_limit: usize,
+    pub obligation_records_limit: usize,
+    pub control_inflight_limit: usize,
+    pub control_ready_limit: usize,
+    pub control_bytes: u64,
+    pub per_scope_bytes: u64,
+    pub logical_start_capacity: usize,
+    pub logical_actor_mailbox_capacity: usize,
+    pub logical_context_admission_issue_capacity: usize,
+    pub logical_context_establish_capacity: usize,
+    pub logical_abort_effect_capacity: usize,
+    pub result_decode_worker_count: usize,
+    pub result_decode_queue_capacity: usize,
+    pub logical_rows_delivery_capacity: usize,
+    pub logical_replacement_reservation_ms: u64,
+    pub logical_result_fetch_wait_ms: u64,
+}
+
+impl Default for FrontendWorkloadRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            root_limit: 256,
+            business_limit: 256,
+            preparation_limit: 16,
+            execution_limit: 64,
+            executions_per_root: 4,
+            waiting_limit: 1024,
+            waiting_bytes: 64 * 1024 * 1024,
+            capacity_wait_timeout_ms: 30_000,
+            restarts_per_work: 2,
+            old_attempts_per_work: 2,
+            old_attempts_limit: 128,
+            unknown_creates_limit: 4096,
+            scope_records_limit: 8192,
+            obligation_records_limit: 8192,
+            control_inflight_limit: 16,
+            control_ready_limit: 256,
+            control_bytes: 64 * 1024 * 1024,
+            per_scope_bytes: 2 * 1024 * 1024 * 1024,
+            logical_start_capacity: 256,
+            logical_actor_mailbox_capacity: 64,
+            logical_context_admission_issue_capacity: 16,
+            logical_context_establish_capacity: 16,
+            logical_abort_effect_capacity: 16,
+            result_decode_worker_count: 2,
+            result_decode_queue_capacity: 32,
+            logical_rows_delivery_capacity: 32,
+            logical_replacement_reservation_ms: 30_000,
+            logical_result_fetch_wait_ms: 200,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct RuntimeConfig {
     #[serde(default = "default_exchange_wait_ms")]
@@ -1095,6 +1174,8 @@ pub struct RuntimeConfig {
     pub task_dispatch_update_permits: usize,
     #[serde(default = "default_task_dispatch_lifecycle_permits")]
     pub task_dispatch_lifecycle_permits: usize,
+    #[serde(default = "default_task_dispatch_control_permits")]
+    pub task_dispatch_control_permits: usize,
     #[serde(default = "default_task_operation_max_batch_items")]
     pub task_operation_max_batch_items: usize,
     #[serde(default = "default_task_operation_max_batch_encoded_bytes")]
@@ -1129,6 +1210,12 @@ pub struct RuntimeConfig {
     pub write_commit_evidence_max_bytes: usize,
     #[serde(default = "default_write_commit_evidence_max_entries")]
     pub write_commit_evidence_max_entries: usize,
+    /// Joint Arrow-input plus encoded-output memory allowed per root stream.
+    #[serde(default = "default_result_retained_bytes_per_root")]
+    pub result_retained_bytes_per_root: usize,
+    /// Joint Arrow-input plus encoded-output memory allowed across the BE.
+    #[serde(default = "default_result_retained_bytes_per_process")]
+    pub result_retained_bytes_per_process: usize,
     #[serde(default = "default_lake_publication_max_attempt_duration_ms")]
     pub lake_publication_max_attempt_duration_ms: u64,
     #[serde(default = "default_lake_publication_safe_gc_age_ms")]
@@ -1145,6 +1232,8 @@ pub struct RuntimeConfig {
     pub be_mem_limit_bytes: u64,
     #[serde(default = "default_optimizer_query_mem_limit_bytes")]
     pub optimizer_query_mem_limit_bytes: u64,
+    #[serde(default)]
+    pub frontend_workload: FrontendWorkloadRuntimeConfig,
     /// Maximum time a connector split source may wait for its first usable
     /// runtime-filter feedback domain. Zero disables this optimization wait.
     #[serde(default = "default_connector_split_initial_dynamic_filter_wait_cap_ms")]
@@ -1182,6 +1271,10 @@ pub struct RuntimeConfig {
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
     pub data_runtime_max_blocking_threads: usize,
+    #[serde(default = "default_connector_blocking_io_max_inflight")]
+    pub connector_blocking_io_max_inflight: usize,
+    #[serde(default = "default_connector_split_blocking_io_max_inflight")]
+    pub connector_split_blocking_io_max_inflight: usize,
     #[serde(default = "default_spill_io_threads")]
     pub spill_io_threads: usize,
     #[serde(default = "default_spill_io_queue_size")]
@@ -1370,44 +1463,48 @@ fn default_task_dispatch_lifecycle_permits() -> usize {
     DispatchBudget::DEFAULT.lifecycle_permits()
 }
 
+fn default_task_dispatch_control_permits() -> usize {
+    DispatchBudget::DEFAULT.control_permits()
+}
+
 fn default_task_operation_max_batch_items() -> usize {
-    TransportBudget::DEFAULT.max_batch_items()
+    FrontendTaskTransportBudget::DEFAULT.max_batch_items()
 }
 
 fn default_task_operation_max_batch_encoded_bytes() -> usize {
-    TransportBudget::DEFAULT.max_batch_encoded_bytes()
+    FrontendTaskTransportBudget::DEFAULT.max_batch_encoded_bytes()
 }
 
 fn default_task_descriptor_max_encoded_bytes() -> usize {
-    TransportBudget::DEFAULT.max_descriptor_encoded_bytes()
+    FrontendTaskTransportBudget::DEFAULT.max_descriptor_encoded_bytes()
 }
 
 fn default_task_query_backend_max_queued_operations() -> usize {
-    TransportBudget::DEFAULT.max_query_backend_queued_operations()
+    FrontendTaskTransportBudget::DEFAULT.max_query_backend_queued_operations()
 }
 
 fn default_task_query_backend_max_queued_bytes() -> usize {
-    TransportBudget::DEFAULT.max_query_backend_queued_bytes()
+    FrontendTaskTransportBudget::DEFAULT.max_query_backend_queued_bytes()
 }
 
 fn default_task_backend_max_queued_operations() -> usize {
-    TransportBudget::DEFAULT.max_backend_queued_operations()
+    FrontendTaskTransportBudget::DEFAULT.max_backend_queued_operations()
 }
 
 fn default_task_backend_max_queued_bytes() -> usize {
-    TransportBudget::DEFAULT.max_backend_queued_bytes()
+    FrontendTaskTransportBudget::DEFAULT.max_backend_queued_bytes()
 }
 
 fn default_task_max_tasks_per_context() -> usize {
-    TransportBudget::DEFAULT.max_tasks_per_context()
+    FrontendTaskTransportBudget::DEFAULT.max_tasks_per_context()
 }
 
 fn default_task_max_active_tasks_per_backend() -> usize {
-    TransportBudget::DEFAULT.max_active_tasks_per_backend()
+    FrontendTaskTransportBudget::DEFAULT.max_active_tasks_per_backend()
 }
 
 fn default_task_operation_queue_residence_ms() -> u64 {
-    duration_millis(TransportBudget::DEFAULT.frontend_queue_residence())
+    duration_millis(FrontendTaskTransportBudget::DEFAULT.frontend_queue_residence())
 }
 
 /// `OperationWaitCaps` exposes no accessor for either cap, so both defaults
@@ -1433,7 +1530,7 @@ fn default_task_lease_max_ms() -> u64 {
 /// No neutral type owns this number: the protocol requires the budget to be
 /// bounded without fixing its size, so the deployment owns it.
 fn default_task_status_subscription_error_budget() -> u32 {
-    novarocks_execution::task_execution::DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET
+    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET
 }
 
 fn duration_millis(value: Duration) -> u64 {
@@ -1444,8 +1541,10 @@ fn duration_millis(value: Duration) -> u64 {
 ///
 /// Every count and every duration must be positive, and every paired bound
 /// must be ordered: a per-query bound cannot exceed its per-process total, a
-/// descriptor cannot be larger than the batch that would carry it, and a lease
-/// range cannot be inverted.
+/// descriptor cannot be larger than the batch that would carry it, the
+/// process transport can retain one maximum ordinary and one maximum control
+/// batch in both queue-side and encoded form, and a lease range cannot be
+/// inverted.
 fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
     let nonzero_counts = [
         (
@@ -1459,6 +1558,10 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
         (
             "runtime.task_dispatch_lifecycle_permits",
             runtime.task_dispatch_lifecycle_permits,
+        ),
+        (
+            "runtime.task_dispatch_control_permits",
+            runtime.task_dispatch_control_permits,
         ),
         (
             "runtime.task_operation_max_batch_items",
@@ -1551,6 +1654,26 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
             "runtime.task_query_backend_max_queued_bytes must not exceed runtime.task_backend_max_queued_bytes"
         );
     }
+    let minimum_process_items = runtime
+        .task_operation_max_batch_items
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("runtime.task_operation_max_batch_items overflows"))?;
+    if minimum_process_items > runtime.task_backend_max_queued_operations {
+        bail!(
+            "runtime.task_backend_max_queued_operations must fit one maximum ordinary batch and one maximum control batch"
+        );
+    }
+    let minimum_process_retained_bytes = runtime
+        .task_operation_max_batch_encoded_bytes
+        .checked_mul(4)
+        .ok_or_else(|| {
+            anyhow::anyhow!("runtime.task_operation_max_batch_encoded_bytes overflows retention")
+        })?;
+    if minimum_process_retained_bytes > runtime.task_backend_max_queued_bytes {
+        bail!(
+            "runtime.task_backend_max_queued_bytes must retain queued and encoded forms of one maximum ordinary batch and one maximum control batch"
+        );
+    }
     let wait_ceiling = duration_millis(MaxWait::MAX_REPRESENTABLE);
     if runtime.task_operation_create_wait_cap_ms > wait_ceiling
         || runtime.task_operation_update_wait_cap_ms > wait_ceiling
@@ -1560,6 +1683,39 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
     let lease_ceiling = duration_millis(LeaseValidFor::MAX_REPRESENTABLE);
     if runtime.task_lease_max_ms > lease_ceiling {
         bail!("runtime.task_lease_max_ms must not exceed {lease_ceiling} ms");
+    }
+    Ok(())
+}
+
+fn validate_connector_blocking_io_config(runtime: &RuntimeConfig) -> Result<()> {
+    let budget = novarocks_frontend::task_execution::ConnectorBlockingIoBudget::try_new(
+        runtime.connector_blocking_io_max_inflight,
+        runtime.connector_split_blocking_io_max_inflight,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if runtime.data_runtime_max_blocking_threads < budget.total() {
+        anyhow::bail!(
+            "runtime.data_runtime_max_blocking_threads must be at least \
+             runtime.connector_blocking_io_max_inflight"
+        );
+    }
+    Ok(())
+}
+
+fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
+    novarocks_backend::BackendResultRetainedLimits::try_new(
+        runtime.result_retained_bytes_per_root,
+        runtime.result_retained_bytes_per_process,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("validate native result retained-byte limits")?;
+    let per_root = u64::try_from(runtime.result_retained_bytes_per_root)
+        .context("runtime.result_retained_bytes_per_root exceeds u64")?;
+    if per_root > FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES {
+        bail!(
+            "runtime.result_retained_bytes_per_root {per_root} exceeds the Native root-result payload limit {}",
+            FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
+        );
     }
     Ok(())
 }
@@ -1752,6 +1908,14 @@ fn default_write_commit_evidence_max_entries() -> usize {
     novarocks_spi::connector::DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES
 }
 
+fn default_result_retained_bytes_per_root() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_result_retained_bytes_per_process() -> usize {
+    256 * 1024 * 1024
+}
+
 fn default_lake_publication_max_attempt_duration_ms() -> u64 {
     30 * 60 * 1_000
 }
@@ -1782,6 +1946,14 @@ fn default_data_runtime_worker_threads() -> usize {
 
 fn default_data_runtime_max_blocking_threads() -> usize {
     64
+}
+
+fn default_connector_blocking_io_max_inflight() -> usize {
+    16
+}
+
+fn default_connector_split_blocking_io_max_inflight() -> usize {
+    12
 }
 
 fn default_spill_io_threads() -> usize {
@@ -1883,6 +2055,7 @@ impl Default for RuntimeConfig {
             task_dispatch_create_permits: default_task_dispatch_create_permits(),
             task_dispatch_update_permits: default_task_dispatch_update_permits(),
             task_dispatch_lifecycle_permits: default_task_dispatch_lifecycle_permits(),
+            task_dispatch_control_permits: default_task_dispatch_control_permits(),
             task_operation_max_batch_items: default_task_operation_max_batch_items(),
             task_operation_max_batch_encoded_bytes: default_task_operation_max_batch_encoded_bytes(
             ),
@@ -1902,6 +2075,8 @@ impl Default for RuntimeConfig {
             task_status_subscription_error_budget: default_task_status_subscription_error_budget(),
             write_commit_evidence_max_bytes: default_write_commit_evidence_max_bytes(),
             write_commit_evidence_max_entries: default_write_commit_evidence_max_entries(),
+            result_retained_bytes_per_root: default_result_retained_bytes_per_root(),
+            result_retained_bytes_per_process: default_result_retained_bytes_per_process(),
             lake_publication_max_attempt_duration_ms:
                 default_lake_publication_max_attempt_duration_ms(),
             lake_publication_safe_gc_age_ms: default_lake_publication_safe_gc_age_ms(),
@@ -1912,6 +2087,7 @@ impl Default for RuntimeConfig {
             mem_limit: default_mem_limit(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
+            frontend_workload: FrontendWorkloadRuntimeConfig::default(),
             connector_split_initial_dynamic_filter_wait_cap_ms:
                 default_connector_split_initial_dynamic_filter_wait_cap_ms(),
             optimizer_effective_backend_count: default_optimizer_effective_backend_count(),
@@ -1932,6 +2108,9 @@ impl Default for RuntimeConfig {
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
+            connector_blocking_io_max_inflight: default_connector_blocking_io_max_inflight(),
+            connector_split_blocking_io_max_inflight:
+                default_connector_split_blocking_io_max_inflight(),
             spill_io_threads: default_spill_io_threads(),
             spill_io_queue_size: default_spill_io_queue_size(),
             scan_submit_fail_max: default_scan_submit_fail_max(),
@@ -2029,13 +2208,16 @@ impl ExecutionServicesConfig {
 }
 
 impl RuntimeConfig {
+    pub fn effective_process_mem_limit_bytes(&self) -> Result<u64> {
+        crate::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
+            .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
+    }
+
     pub fn effective_be_mem_limit_bytes(&self) -> Result<u64> {
         if self.be_mem_limit_bytes > 0 {
             return Ok(self.be_mem_limit_bytes);
         }
-
-        crate::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
-            .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
+        self.effective_process_mem_limit_bytes()
     }
 
     pub fn effective_be_mem_limit_bytes_for_visible_memory(
@@ -2224,9 +2406,11 @@ impl Default for CacheConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait,
-        NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
-        TransportBudget, validate_query_control_config, validate_task_execution_config,
+        DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES,
+        FrontendTaskTransportBudget, LeaseBounds, LeaseValidFor, MaxWait, NovaRocksConfig,
+        RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
+        validate_connector_blocking_io_config, validate_query_control_config,
+        validate_result_retained_config, validate_task_execution_config,
     };
     use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
     use novarocks_types::ClusterRole;
@@ -2324,6 +2508,55 @@ session_token = "token"
     }
 
     #[test]
+    fn frontend_metadata_credentials_are_explicit_and_generation_exact() {
+        let config: NovaRocksConfig = toml::from_str(
+            r#"
+[cluster]
+role = "fe"
+
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "warehouse-metadata"
+generation = "blue"
+kind = "s3"
+access_key_id = "access"
+access_key_secret = "secret"
+"#,
+        )
+        .expect("parse FE metadata credential registry");
+        let registry = config
+            .connector
+            .credential_registry(ClusterRole::Fe)
+            .expect("FE registry");
+        assert!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreMetadata,
+                    &StaticCredentialReference::try_new("warehouse-metadata", "blue").unwrap(),
+                )
+                .and_then(|material| material.as_s3())
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreMetadata,
+                    &StaticCredentialReference::try_new("warehouse-metadata", "green").unwrap(),
+                )
+                .is_none()
+        );
+        assert!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    &StaticCredentialReference::try_new("warehouse-metadata", "blue").unwrap(),
+                )
+                .is_none(),
+            "metadata credentials must not fall back to the data purpose"
+        );
+    }
+
+    #[test]
     fn connector_credentials_reject_legacy_and_invalid_role_local_startup_config() {
         let cases = [
             (
@@ -2351,6 +2584,23 @@ kind = "iceberg-rest-bearer"
 token = "token"
 "#,
                 "role Be cannot own CatalogControl credential",
+            ),
+            (
+                "backend-object-store-metadata",
+                r#"
+[cluster]
+role = "be"
+frontend_endpoint = "127.0.0.1:9070"
+
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "warehouse-metadata"
+generation = "blue"
+kind = "s3"
+access_key_id = "access"
+access_key_secret = "secret"
+"#,
+                "role Be cannot own ObjectStoreMetadata credential",
             ),
             (
                 "duplicate-static-reference",
@@ -2389,6 +2639,21 @@ access_key_id = "access"
 access_key_secret = "secret"
 "#,
                 "does not accept material kind S3",
+            ),
+            (
+                "metadata-wrong-kind",
+                r#"
+[cluster]
+role = "fe"
+
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "warehouse-metadata"
+generation = "blue"
+kind = "iceberg-rest-bearer"
+token = "token"
+"#,
+                "does not accept material kind IcebergRestBearer",
             ),
             (
                 "empty-secret",
@@ -2515,7 +2780,7 @@ access_key_secret = ""
     #[test]
     fn task_execution_config_defaults_to_the_frozen_contract_values() {
         let runtime = RuntimeConfig::default();
-        let frozen = TransportBudget::DEFAULT;
+        let frozen = FrontendTaskTransportBudget::DEFAULT;
 
         assert_eq!(
             runtime.task_dispatch_create_permits,
@@ -2528,6 +2793,10 @@ access_key_secret = ""
         assert_eq!(
             runtime.task_dispatch_lifecycle_permits,
             DispatchBudget::DEFAULT.lifecycle_permits()
+        );
+        assert_eq!(
+            runtime.task_dispatch_control_permits,
+            DispatchBudget::DEFAULT.control_permits()
         );
         assert_eq!(
             runtime.task_operation_max_batch_items,
@@ -2587,6 +2856,47 @@ access_key_secret = ""
         );
         assert!(runtime.task_status_subscription_error_budget > 0);
         validate_task_execution_config(&runtime).expect("the frozen defaults are valid");
+        validate_result_retained_config(&runtime)
+            .expect("the default native result retained-byte hierarchy is valid");
+    }
+
+    #[test]
+    fn result_retained_config_rejects_zero_and_inverted_limits() {
+        let mut runtime = RuntimeConfig {
+            result_retained_bytes_per_root: 0,
+            ..Default::default()
+        };
+        let error = validate_result_retained_config(&runtime)
+            .expect_err("a zero per-root retained-byte cap must fail");
+        assert!(format!("{error:#}").contains("per-root"));
+
+        runtime = RuntimeConfig {
+            result_retained_bytes_per_process: 0,
+            ..Default::default()
+        };
+        let error = validate_result_retained_config(&runtime)
+            .expect_err("a zero per-process retained-byte cap must fail");
+        assert!(format!("{error:#}").contains("per-process"));
+
+        runtime = RuntimeConfig {
+            result_retained_bytes_per_root: 33,
+            result_retained_bytes_per_process: 32,
+            ..Default::default()
+        };
+        let error = validate_result_retained_config(&runtime)
+            .expect_err("a per-root cap above the process cap must fail");
+        assert!(format!("{error:#}").contains("must not exceed"));
+
+        let above_wire = usize::try_from(FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES + 1)
+            .expect("the Native wire bound fits usize");
+        runtime = RuntimeConfig {
+            result_retained_bytes_per_root: above_wire,
+            result_retained_bytes_per_process: above_wire,
+            ..Default::default()
+        };
+        let error = validate_result_retained_config(&runtime)
+            .expect_err("a root payload above the Native decode envelope must fail");
+        assert!(format!("{error:#}").contains("Native root-result payload limit"));
     }
 
     #[test]
@@ -2595,7 +2905,7 @@ access_key_secret = ""
         reason = "The table-driven validation fixture keeps each field mutator explicit."
     )]
     fn task_execution_config_rejects_zero_values() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 18] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 19] = [
             ("task_dispatch_create_permits", |runtime| {
                 runtime.task_dispatch_create_permits = 0;
             }),
@@ -2604,6 +2914,9 @@ access_key_secret = ""
             }),
             ("task_dispatch_lifecycle_permits", |runtime| {
                 runtime.task_dispatch_lifecycle_permits = 0;
+            }),
+            ("task_dispatch_control_permits", |runtime| {
+                runtime.task_dispatch_control_permits = 0;
             }),
             ("task_operation_max_batch_items", |runtime| {
                 runtime.task_operation_max_batch_items = 0;
@@ -2670,7 +2983,7 @@ access_key_secret = ""
         reason = "The table-driven validation fixture keeps each inverted pair explicit."
     )]
     fn task_execution_config_rejects_inverted_bounds() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 5] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 7] = [
             ("task_lease_max_ms", |runtime| {
                 runtime.task_lease_min_ms = 30_000;
                 runtime.task_lease_max_ms = 29_999;
@@ -2686,6 +2999,18 @@ access_key_secret = ""
             ("task_query_backend_max_queued_operations", |runtime| {
                 runtime.task_backend_max_queued_operations =
                     runtime.task_query_backend_max_queued_operations - 1;
+            }),
+            ("task_backend_max_queued_operations", |runtime| {
+                runtime.task_query_backend_max_queued_operations =
+                    runtime.task_operation_max_batch_items;
+                runtime.task_backend_max_queued_operations =
+                    runtime.task_operation_max_batch_items * 2 - 1;
+            }),
+            ("task_backend_max_queued_bytes", |runtime| {
+                runtime.task_query_backend_max_queued_bytes =
+                    runtime.task_operation_max_batch_encoded_bytes;
+                runtime.task_backend_max_queued_bytes =
+                    runtime.task_operation_max_batch_encoded_bytes * 4 - 1;
             }),
             ("task_lease_max_ms", |runtime| {
                 runtime.task_lease_max_ms =
@@ -3046,6 +3371,8 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 0);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 64);
+        assert_eq!(cfg.runtime.connector_blocking_io_max_inflight, 16);
+        assert_eq!(cfg.runtime.connector_split_blocking_io_max_inflight, 12);
     }
 
     #[test]
@@ -3055,11 +3382,39 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
 [runtime]
 data_runtime_worker_threads = 6
 data_runtime_max_blocking_threads = 99
+connector_blocking_io_max_inflight = 8
+connector_split_blocking_io_max_inflight = 5
 "#,
         )
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 6);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 99);
+        assert_eq!(cfg.runtime.connector_blocking_io_max_inflight, 8);
+        assert_eq!(cfg.runtime.connector_split_blocking_io_max_inflight, 5);
+    }
+
+    #[test]
+    fn connector_blocking_io_config_reserves_protected_capacity() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.connector_split_blocking_io_max_inflight =
+            runtime.connector_blocking_io_max_inflight;
+        let error = validate_connector_blocking_io_config(&runtime)
+            .expect_err("ordinary work must leave protected capacity");
+        assert!(
+            error.to_string().contains("leave protected capacity"),
+            "{error}"
+        );
+
+        let mut runtime = RuntimeConfig::default();
+        runtime.data_runtime_max_blocking_threads = runtime.connector_blocking_io_max_inflight - 1;
+        let error = validate_connector_blocking_io_config(&runtime)
+            .expect_err("the Tokio blocking pool must fit the whole supervisor budget");
+        assert!(
+            error
+                .to_string()
+                .contains("data_runtime_max_blocking_threads"),
+            "{error}"
+        );
     }
 
     #[test]

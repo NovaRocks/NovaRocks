@@ -14,6 +14,7 @@ pub mod task_execution;
 
 pub use application::{
     BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-    BackendServerConfig, run_backend_server_until_shutdown, run_backend_server_until_signal,
+    BackendResultRetainedLimits, BackendServerConfig, run_backend_server_until_shutdown,
+    run_backend_server_until_signal,
 };
 pub use rpc::runtime::{BackendDataRuntime, BackendNativeTransport};

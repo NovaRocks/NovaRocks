@@ -641,7 +641,7 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
         let error = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             None,
             &registry,
-            FrontendExecutionConfig::new(
+            FrontendExecutionConfig::new_for_test(
                 "127.0.0.1",
                 19090,
                 std::num::NonZeroUsize::new(1).expect("one worker"),

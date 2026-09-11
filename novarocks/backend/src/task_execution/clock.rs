@@ -27,7 +27,7 @@ use std::fmt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use novarocks_execution::task_execution::lease::MonotonicInstant;
+use novarocks_worker::MonotonicInstant;
 
 /// The backend-local monotonic timeline.
 pub trait BackendMonotonicClock: fmt::Debug + Send + Sync {

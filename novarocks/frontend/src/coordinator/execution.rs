@@ -28,12 +28,11 @@ use crate::common::backend_topology::{
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
 };
 use crate::native::fragment_transport::{
-    ExpectedOutputSchemaView, FinalTaskInfoRead, FragmentDispatcher, NativeTaskResultTransport,
-    RootResultOutcome, TaskReadGrace, TaskResultTransport,
+    FinalTaskInfoRead, FragmentDispatcher, NativeTaskResultTransport, RootResultOutcome,
+    TaskReadGrace, TaskResultTransport,
 };
 use crate::query_execution::artifact::{
-    PreparedDistributedQuery, RuntimeFilterDeploymentReadyDistributedQuery,
-    ValidatedFragmentSchedule, ValidatedNativeSubmission,
+    RuntimeFilterDeploymentReadyDistributedQuery, ValidatedNativeSubmission,
 };
 use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptReservation};
 use crate::query_execution::contract::{
@@ -44,7 +43,7 @@ use crate::query_execution::contract::{
 use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
-use crate::query_execution::split_assignment::{RoundSplitSource, TaskUpdateTransport};
+use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::runtime::statement_result::StatementResult;
 use crate::task_execution::sources::AttemptEstablishFacts;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
@@ -60,9 +59,6 @@ use super::query_registry::{
     RuntimeFilterTerminalRollupUnavailable,
 };
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
-use super::split_assignment_round::{
-    RoundSplitAssignmentPlan, SplitAssignmentRoundGuard, assignment_endpoints, assignment_targets,
-};
 use super::task_round::{
     AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
 };
@@ -75,13 +71,19 @@ use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::task_transport::AttemptWireFacts;
 use crate::native::transport::new_fragment_dispatcher;
+use crate::query_execution::attempt_initialization::{
+    AttemptInitializing, RoundCredentialLeaseSource,
+};
 use crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions;
+use crate::query_execution::split_assignment_round::{
+    RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
+};
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
-use crate::task_execution::completion::{WriteCompletionTracker, accept_final_info};
+use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict, accept_final_info};
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::ReleasedRuntimeFilterContributions;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
@@ -91,8 +93,12 @@ use crate::task_execution::round::{TaskRound, TurnReport};
 use crate::task_execution::split_transport::SplitDeliveryBridge;
 use crate::task_execution::status_intake::{CondvarWake, StatusIntakeWake};
 use novarocks_execution::task_execution::{
-    AbortCause, FinalTaskInfo, MaxWait, OperationKind, TaskIdentity,
+    AbortCause, FinalTaskInfo, MaxWait, OperationKind, ResultByteLimit, ResultPacketSequence,
+    TaskIdentity, TaskState, TerminationDetail,
 };
+
+#[cfg(test)]
+const TEST_RESULT_FETCH_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> Result<QueryId, DistributedQueryError>;
@@ -312,7 +318,9 @@ pub struct FrontendDistributedQueryCoordinator {
     ///
     /// Held rather than read per attempt so a deployment's bounds cannot change
     /// while the process runs.
-    task_execution_budgets: novarocks_execution::task_execution::TaskExecutionBudgets,
+    coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
+    transport_budget: novarocks_task_codec::TransportBudget,
+    result_fetch_byte_limit: ResultByteLimit,
     /// This frontend process's own identity, minted once per process.
     ///
     /// It is half of every query context reference, so a backend can tell one
@@ -322,38 +330,6 @@ pub struct FrontendDistributedQueryCoordinator {
     task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
     connector_split_initial_dynamic_filter_wait_cap: Duration,
     native_compatibility_id: NativeCompatibilityId,
-}
-
-/// Credential material stays under its planning collector until the round has
-/// opened every connector split source. Opening a source may read Iceberg
-/// manifests through the request-bound resolver and may observe the vended
-/// response that must be sealed into the same Init manifest.
-enum RoundCredentialLeaseSource {
-    Frozen(QueryCredentialLeases),
-    Reservation {
-        reservation: QueryAttemptReservation,
-        observed_collected: Option<Arc<AtomicBool>>,
-    },
-}
-
-impl RoundCredentialLeaseSource {
-    fn into_credential_leases(self) -> Result<QueryCredentialLeases, DistributedQueryError> {
-        match self {
-            Self::Frozen(leases) => Ok(leases),
-            Self::Reservation {
-                reservation,
-                observed_collected,
-            } => {
-                if let Some(observed_collected) = observed_collected {
-                    observed_collected.store(
-                        reservation.has_collected_credential_leases(),
-                        Ordering::Release,
-                    );
-                }
-                reservation.into_credential_leases()
-            }
-        }
-    }
 }
 
 impl FrontendDistributedQueryCoordinator {
@@ -366,7 +342,9 @@ impl FrontendDistributedQueryCoordinator {
         native_compatibility_id: NativeCompatibilityId,
         task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
         connector_split_initial_dynamic_filter_wait_cap: Duration,
-        task_execution_budgets: novarocks_execution::task_execution::TaskExecutionBudgets,
+        coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
+        transport_budget: novarocks_task_codec::TransportBudget,
+        result_fetch_byte_limit: ResultByteLimit,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, DistributedQueryError> {
@@ -391,7 +369,9 @@ impl FrontendDistributedQueryCoordinator {
             query_ids: Arc::new(query_id_source),
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
             data_runtime,
-            task_execution_budgets,
+            coordination_budgets,
+            transport_budget,
+            result_fetch_byte_limit,
             frontend_process_id: FrontendProcessId::new_v7(),
             task_update_retry_policy,
             connector_split_initial_dynamic_filter_wait_cap,
@@ -442,8 +422,11 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: crate::common::backend_topology::BackendTopologyService,
     ) -> Self {
         Self {
-            task_execution_budgets:
-                novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
+            coordination_budgets:
+                novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
+            transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
+            result_fetch_byte_limit: ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
+                .expect("the test result byte limit is nonzero"),
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
             backend_services: Some(BackendServicesSource::Fixed {
@@ -506,8 +489,11 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: crate::common::backend_topology::BackendTopologyService,
     ) -> Self {
         Self {
-            task_execution_budgets:
-                novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
+            coordination_budgets:
+                novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
+            transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
+            result_fetch_byte_limit: ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
+                .expect("the test result byte limit is nonzero"),
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
             backend_services: Some(BackendServicesSource::Sequence {
@@ -574,7 +560,7 @@ impl FrontendDistributedQueryCoordinator {
             request,
             None,
             RoundCredentialLeaseSource::Reservation {
-                reservation,
+                reservation: Some(reservation),
                 observed_collected: None,
             },
         )
@@ -635,9 +621,17 @@ impl FrontendDistributedQueryCoordinator {
         let _query = self
             .registry
             .register(query_id, intent, Arc::clone(&dispatcher))?;
-        let schedule = backend_services
-            .scheduler
-            .schedule(parts.artifacts.scheduling_view(), execution_id)?;
+        let schedule = crate::preparation_diagnostics::observe_result(
+            "attempt_instantiation",
+            "schedule_attempt",
+            "not-applicable",
+            Some(execution_id),
+            || {
+                backend_services
+                    .scheduler
+                    .schedule(parts.artifacts.scheduling_view(), execution_id)
+            },
+        )?;
         let scheduled_backend_ownership = backend_services
             .scheduler
             .scheduled_backend_ownership(&schedule.backend_ids())?;
@@ -653,32 +647,55 @@ impl FrontendDistributedQueryCoordinator {
             RuntimeFilterFeedbackState::new(execution_id, Default::default())
                 .expect("empty runtime filter feedback declaration is valid"),
         );
-        let split_assignment_plan = prepare_round_split_assignment(
-            &parts.artifacts,
-            &schedule,
+        let connector_context = crate::connector::connector_request_context_for_deadline(
+            statement_deadline,
+            parts.cancellation.clone(),
+        )
+        .map_err(failed)?;
+        let connector_context =
+            credential_lease_source.connector_request_context(connector_context);
+        let initializing = AttemptInitializing::new(
+            execution_id,
+            parts.artifacts,
+            schedule,
             self.task_update_retry_policy,
             Arc::clone(&feedback_state),
             self.connector_split_initial_dynamic_filter_wait_cap,
+            connector_context,
+            parts.cancellation.clone(),
+            self.data_runtime.clone(),
+            credential_lease_source,
         )?;
-        // A source open may load manifest metadata under the request-local
-        // resolver and collect one exact vended response. Seal that collector
-        // only after every source is open, then hand its leases to Init.
-        let credential_leases = credential_lease_source.into_credential_leases()?;
-        if !credential_leases.is_empty()
-            && !self
-                .data_runtime
-                .native_transport()
-                .permits_confidential_credential_leases()
+        // The synchronous statement worker is the remaining T12 bridge. The
+        // async initializer performs no Connector I/O on that worker and adds
+        // no semaphore-waiter helper task, but this bridge still waits on the
+        // actor and therefore does not complete the per-query thread cut.
+        let ready = self
+            .data_runtime
+            .block_on(initializing.initialize())
+            .map_err(failed)??;
+        let (
+            ready_execution_id,
+            artifacts,
+            schedule,
+            ready_feedback_state,
+            split_assignment_plan,
+            credential_leases,
+        ) = ready.into_parts();
+        if ready_execution_id != execution_id
+            || !Arc::ptr_eq(&ready_feedback_state, &feedback_state)
         {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
-                "vended credential lease admission requires TLS Native transport",
+                "attempt initializer returned readiness for another attempt",
             ));
         }
+        self.backend_topology
+            .validate_snapshot(&parts.topology)
+            .map_err(pre_ready_topology_validation_error)?;
         let binding_attachment =
-            encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
-        let scheduled = parts
-            .artifacts
+            encode_binding_attachment(artifacts.runtime_filter_binding_view())?;
+        let scheduled = artifacts
             .attach_runtime_filter_bindings(binding_attachment)?
             .bind_schedule(schedule)?;
         let deployment = compile_scheduled_runtime_filter_deployment(
@@ -741,12 +758,18 @@ impl FrontendDistributedQueryCoordinator {
         // runtime for the handle its own plan carries.
         let init_options = match write_stack_session.as_ref() {
             Some(session) => {
-                let catalog_set = novarocks_proto_codec::catalog::CatalogSet::new([session
+                let backend_catalog = session
                     .catalog_properties()
-                    .clone()])
-                .map_err(|error| {
-                    failed(format!("write session catalog set is invalid: {error}"))
-                })?;
+                    .backend_execution_projection()
+                    .map_err(|error| {
+                        failed(format!(
+                            "project write catalog for backend execution: {error}"
+                        ))
+                    })?;
+                let catalog_set =
+                    novarocks_proto_codec::catalog::CatalogSet::new([backend_catalog]).map_err(
+                        |error| failed(format!("write session catalog set is invalid: {error}")),
+                    )?;
                 init_options.with_catalog_set(catalog_set)
             }
             None => init_options,
@@ -844,6 +867,7 @@ impl FrontendDistributedQueryCoordinator {
             .copied()
             .collect::<BTreeMap<usize, BackendProcessId>>();
         let mut backends = Vec::with_capacity(backend_process_ids.len());
+        let mut admission_epochs = BTreeMap::new();
         for target in &backend_services.live_backends {
             let Some(&process_id) = backend_process_ids.get(&target.backend_idx()) else {
                 // Live but not scheduled. Freezing it would let an operation
@@ -854,6 +878,7 @@ impl FrontendDistributedQueryCoordinator {
                 .endpoint()
                 .map_err(|error| failed(error.to_string()))?;
             backends.push((process_id, endpoint));
+            admission_epochs.insert(process_id, target.admission_epoch_capability());
         }
         if backends.len() != backend_process_ids.len() {
             return Err(failed(
@@ -955,15 +980,16 @@ impl FrontendDistributedQueryCoordinator {
             prepared.scheduling_plan(),
             prepared.fragment_edges(),
             &backend_process_ids,
+            &admission_epochs,
             &backends,
             submissions,
             establish,
             Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
             AttemptTransport {
-                budget: self.task_execution_budgets.dispatch,
-                transport: self.task_execution_budgets.transport,
+                budget: self.coordination_budgets.dispatch,
+                transport: self.transport_budget,
                 status_subscription_error_budget: self
-                    .task_execution_budgets
+                    .coordination_budgets
                     .status_subscription_error_budget,
                 attempt,
                 data_runtime: self.data_runtime.clone(),
@@ -974,15 +1000,27 @@ impl FrontendDistributedQueryCoordinator {
             NativeTaskResultTransport::new(
                 &backends,
                 self.data_runtime.clone(),
-                TaskReadGrace::new(
-                    self.task_execution_budgets
-                        .transport
-                        .frontend_queue_residence(),
-                ),
+                TaskReadGrace::new(self.transport_budget.frontend_queue_residence()),
             )
             .map_err(failed)?,
         );
         let root_task = round.root_task();
+
+        // Split enumeration is another per-attempt owner on the same serial
+        // turn. Its synchronous Connector calls run under process admission,
+        // while TaskUpdate submission and acknowledgement observation remain
+        // outside that permit.
+        let mut split_assignment = split_assignment_plan.and_then(|plan| {
+            SplitAssignmentRoundGuard::install(
+                &mut round,
+                execution_id,
+                plan,
+                Arc::clone(&split_delivery) as Arc<dyn TaskUpdateTransport>,
+                self.data_runtime.clone(),
+                Arc::clone(&wake)
+                    as Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
+            )
+        });
 
         // The two per-attempt feedback loops. Both hang on the runner's one
         // pump seam rather than on call sites in the drive loop below: see
@@ -1017,18 +1055,6 @@ impl FrontendDistributedQueryCoordinator {
             None
         };
 
-        // Started as soon as the substrate exists rather than after a staging
-        // barrier this path does not have: a delivery for a task that is still
-        // creating is queued on that task and drains when its create is
-        // acknowledged.
-        let mut split_assignment = split_assignment_plan.and_then(|plan| {
-            SplitAssignmentRoundGuard::start(
-                execution_id,
-                plan,
-                Arc::clone(&split_delivery) as Arc<dyn TaskUpdateTransport>,
-            )
-        });
-
         let mut final_task_info = FinalTaskInfoCollector::new(
             result_transport.as_ref(),
             intent == DistributedQueryIntent::Profile,
@@ -1042,10 +1068,7 @@ impl FrontendDistributedQueryCoordinator {
         // The membership owner gets the same window the old Init RPC had to
         // prove a replacement, taken from the task protocol's own establish
         // cap rather than a second number invented here.
-        let establish_wait = self.task_execution_budgets.wait_caps.clamp(
-            OperationKind::UpdateQueryContext,
-            MaxWait::default_for(OperationKind::UpdateQueryContext),
-        );
+        let establish_wait = MaxWait::default_for(OperationKind::UpdateQueryContext).get();
         let mut batches = Vec::new();
         // Recorded rather than inferred, exactly as the old path recorded it: a
         // write commits on the strength of this fact.
@@ -1059,7 +1082,13 @@ impl FrontendDistributedQueryCoordinator {
         let root_output_schema = Arc::clone(expected_output.fetch_view().chunk_schema());
         let mut root_result_polls: Option<RootResultPolls> = None;
         let mut wait_witness = TaskRoundWaitWitness::new(
-            task_round_wait_facts(&round, root_task, 0, last_root_poll),
+            task_round_wait_facts(
+                &round,
+                root_task,
+                0,
+                last_root_poll,
+                write_completion.as_mut(),
+            ),
             Instant::now(),
         );
         let outcome = loop {
@@ -1099,8 +1128,13 @@ impl FrontendDistributedQueryCoordinator {
                 // time. A completion rule that waits on absent facts has to
                 // say which one was absent, or its timeout is indistinguishable
                 // from every other timeout.
-                let waiting_on =
-                    task_round_wait_facts(&round, root_task, batches.len(), last_root_poll);
+                let waiting_on = task_round_wait_facts(
+                    &round,
+                    root_task,
+                    batches.len(),
+                    last_root_poll,
+                    write_completion.as_mut(),
+                );
                 break Err(self.fail_task_round(
                     query_id,
                     &mut round,
@@ -1150,7 +1184,15 @@ impl FrontendDistributedQueryCoordinator {
                 cancellation: &cancellation,
             };
             if let Some(detail) = round.failure_cause() {
-                let detail = format!("task execution terminated: {detail:?}");
+                let waiting_on = task_round_wait_facts(
+                    &round,
+                    root_task,
+                    batches.len(),
+                    last_root_poll,
+                    write_completion.as_mut(),
+                );
+                let detail =
+                    format!("task execution terminated: {detail:?}; terminal_round={waiting_on}");
                 break Err(self.fail_task_round(
                     query_id,
                     &mut round,
@@ -1167,7 +1209,7 @@ impl FrontendDistributedQueryCoordinator {
             // a worker that stopped because every source went terminal is the
             // normal case and says nothing about the query.
             let delivery_failure = split_assignment
-                .as_mut()
+                .as_ref()
                 .and_then(SplitAssignmentRoundGuard::failure)
                 .map(|error| format!("split assignment stopped delivering: {error}"));
             if let Some(detail) = delivery_failure {
@@ -1197,9 +1239,10 @@ impl FrontendDistributedQueryCoordinator {
                 match RootResultPolls::start(
                     Arc::clone(&result_transport) as Arc<dyn TaskResultTransport>,
                     root_task,
-                    Arc::clone(&root_output_schema),
                     statement_deadline,
+                    self.result_fetch_byte_limit,
                     Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                    self.data_runtime.clone(),
                 ) {
                     Ok(polls) => {
                         emit_distributed_write_phase_marker(
@@ -1228,10 +1271,8 @@ impl FrontendDistributedQueryCoordinator {
             // parking on the wake the poller raised.
             if let Some(answer) = root_result_polls.as_mut().and_then(RootResultPolls::take) {
                 match answer {
-                    Ok(RootResultOutcome::Ready {
-                        packet_sequence,
-                        batch,
-                    }) => {
+                    Ok(RootResultOutcome::Ready(packet)) => {
+                        let packet_sequence = packet.packet_sequence().get();
                         if let Err(error) = round.consume_root_result_packet(packet_sequence, false)
                         {
                             emit_distributed_write_phase_marker(
@@ -1250,6 +1291,25 @@ impl FrontendDistributedQueryCoordinator {
                                 format!("root result packet was refused: {error}"),
                             ));
                         }
+                        let batch = match packet.decode(Some(
+                            crate::native::fragment_transport::ExpectedOutputSchemaView::new(
+                                &root_output_schema,
+                            ),
+                        )) {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                break Err(self.fail_task_round(
+                                    query_id,
+                                    &mut round,
+                                    &split_delivery,
+                                    classification,
+                                    QueryFailureCause::RemoteTransportObservation,
+                                    format!(
+                                        "root result packet for task {root_task} decode failed: {error}"
+                                    ),
+                                ));
+                            }
+                        };
                         root_batch_count = root_batch_count.saturating_add(1);
                         let mut batch_rows = 0;
                         if let Some(decoder) = statistics_decoder.as_mut() {
@@ -1305,6 +1365,38 @@ impl FrontendDistributedQueryCoordinator {
                                 execution_started,
                                 Some((root_batch_count, root_row_count)),
                             );
+                        }
+                        if let Err(error) = root_result_polls
+                            .as_ref()
+                            .expect("a root result answer requires its poll owner")
+                            .acknowledge(packet_sequence)
+                        {
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error,
+                            ));
+                        }
+                        last_root_poll = RootResultPoll::Packet(packet_sequence);
+                        moved = true;
+                    }
+                    Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) => {
+                        if let Err(error) = root_result_polls
+                            .as_ref()
+                            .expect("a root result answer requires its poll owner")
+                            .acknowledge(packet_sequence)
+                        {
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error,
+                            ));
                         }
                         last_root_poll = RootResultPoll::Packet(packet_sequence);
                         moved = true;
@@ -1435,23 +1527,50 @@ impl FrontendDistributedQueryCoordinator {
 
             wait_witness.observe(
                 execution_id,
-                task_round_wait_facts(&round, root_task, batches.len(), last_root_poll),
+                task_round_wait_facts(
+                    &round,
+                    root_task,
+                    batches.len(),
+                    last_root_poll,
+                    write_completion.as_mut(),
+                ),
                 Instant::now(),
             );
 
             if round.client_visible_completion() {
                 match write_completion.as_mut() {
                     // A write's completion is not the read's. Every declared
-                    // writer and the root finish task must have published
-                    // FINISHED, so this keeps turning while one has not.
+                    // writer must reach a success-compatible terminal and the
+                    // root finish task must publish FINISHED. The independently
+                    // decoded Root prepared set later proves that every writer
+                    // output actually arrived.
                     Some(tracker) => {
                         observe_write_statuses(&round, tracker);
-                        if tracker
-                            .execution_verdict(round.failure_cause().is_some())
-                            .is_complete()
-                        {
+                        let verdict = tracker.execution_verdict(round.failure_cause().is_some());
+                        if verdict.is_complete() {
                             break Ok(());
                         }
+                        if !verdict.is_pending() {
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                format!(
+                                    "distributed write reached a non-committable terminal: {verdict}"
+                                ),
+                            ));
+                        }
+                    }
+                    None if intent == DistributedQueryIntent::Statistics
+                        && !statistics_tasks_are_terminal(&round) =>
+                    {
+                        // Root EOF proves the statistics artifact stream is
+                        // complete, but an upstream stand-down can still be
+                        // converging through CANCELING. Wait for the frozen
+                        // task set to reach terminals before classifying those
+                        // terminals as success-compatible or failed.
                     }
                     None => break Ok(()),
                 }
@@ -1491,9 +1610,7 @@ impl FrontendDistributedQueryCoordinator {
             &wake,
             split_assignment.as_ref(),
             statement_deadline,
-            self.task_execution_budgets
-                .transport
-                .frontend_queue_residence(),
+            self.transport_budget.frontend_queue_residence(),
             execution_id,
             &mut final_task_info,
         );
@@ -1527,10 +1644,11 @@ impl FrontendDistributedQueryCoordinator {
                     execution_started,
                     None,
                 );
-                if !assignment.is_finished() {
+                let abandoned = !assignment.is_finished();
+                if abandoned {
                     split_delivery.abandon("split assignment round ended with the attempt");
                 }
-                match assignment.finish() {
+                match assignment.finish_after_attempt(abandoned) {
                     Ok(profile) => {
                         emit_distributed_write_phase_marker(
                             intent,
@@ -1580,7 +1698,7 @@ impl FrontendDistributedQueryCoordinator {
                         "distributed write execution has no write completion tracker",
                     )
                 })?;
-                let mut decoder = write_decoder.take().ok_or_else(|| {
+                let decoder = write_decoder.take().ok_or_else(|| {
                     DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
                         "distributed write execution lost its Root decoder",
@@ -1590,21 +1708,6 @@ impl FrontendDistributedQueryCoordinator {
                 let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
                 observe_write_statuses(&round, tracker);
                 let execution_verdict = tracker.execution_verdict(round.failure_cause().is_some());
-                if execution_verdict.is_complete() {
-                    decoder.observe_execution_success().map_err(|error| {
-                        emit_distributed_write_phase_marker(
-                            intent,
-                            execution_id,
-                            "root_failure",
-                            execution_started,
-                            Some((root_batch_count, root_row_count)),
-                        );
-                        DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            error,
-                        )
-                    })?;
-                }
                 emit_distributed_write_phase_marker(
                     intent,
                     execution_id,
@@ -1692,20 +1795,8 @@ impl FrontendDistributedQueryCoordinator {
                 completion.profile(result, builder.finish())
             }
             DistributedQueryIntent::Statistics => {
-                let all_tasks_finished = round.execution().graph().tasks().all(|task| {
-                    round
-                        .execution()
-                        .task(task.task_id())
-                        .is_some_and(|remote| {
-                            remote.task_state()
-                                == novarocks_execution::task_execution::TaskState::Finished
-                        })
-                });
-                if !all_tasks_finished || round.failure_cause().is_some() {
-                    return Err(DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "statistics execution did not reach all-success on its frozen task set",
-                    ));
+                if let Some(error) = statistics_all_success_error(&round) {
+                    return Err(error);
                 }
                 let mut decoder = statistics_decoder.take().ok_or_else(|| {
                     DistributedQueryError::new(
@@ -1869,13 +1960,13 @@ impl FrontendDistributedQueryCoordinator {
 }
 
 impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
-    fn reserve_initial_attempt(
+    fn reserve_logical_query(
         &self,
-    ) -> Result<crate::query_execution::completion::QueryAttemptReservation, DistributedQueryError>
+    ) -> Result<crate::query_execution::completion::LogicalQueryReservation, DistributedQueryError>
     {
-        crate::query_execution::completion::QueryAttemptReservation::first(
-            self.query_ids.next_query_id()?,
-        )
+        let query_id = self.query_ids.next_query_id()?;
+        crate::preparation_diagnostics::bind_logical_query(query_id);
+        Ok(crate::query_execution::completion::LogicalQueryReservation::new(query_id))
     }
 
     fn execute(
@@ -1897,21 +1988,17 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
     ) -> Result<StatementResult, DistributedQueryError> {
-        let (first_request, first_completion, mut round_factory, reservation) =
+        let (first_request, first_completion, mut attempt_factory, logical_reservation) =
             operation.into_parts();
-        let reservation = match reservation {
-            Some(reservation) => reservation,
-            None => crate::query_execution::completion::QueryAttemptReservation::first(
-                self.query_ids.next_query_id()?,
-            )?,
-        };
-        let query_id = reservation.query_id();
-        let first_execution_id = reservation.execution_id();
+        let query_id = logical_reservation.into_query_id();
         let first_revision = first_request.topology().revision();
         let retry_deadline = statement_deadline_for_request(&first_request)?;
-        let first_retry_boundary = round_factory
+        let first_retry_boundary = attempt_factory
             .as_deref()
             .map(|factory| factory as &dyn PreReadyRetryBoundary);
+        let first_reservation =
+            crate::query_execution::completion::QueryAttemptReservation::first(query_id)?;
+        let first_execution_id = first_reservation.execution_id();
         match self.execute_round(
             query_id,
             first_execution_id,
@@ -1919,7 +2006,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
             first_request,
             first_retry_boundary,
             RoundCredentialLeaseSource::Reservation {
-                reservation,
+                reservation: Some(first_reservation),
                 observed_collected: None,
             },
         ) {
@@ -1931,7 +2018,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                 if first_error.pre_ready_topology_outcome().is_none() {
                     return Err(first_error);
                 }
-                let Some(factory) = round_factory.as_deref_mut() else {
+                let Some(factory) = attempt_factory.as_deref_mut() else {
                     return Err(first_error);
                 };
                 let reason = pre_ready_topology_reason(
@@ -1957,41 +2044,15 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                         )
                     })?;
                 observe_waiting_for_backend(waiting_started_at.elapsed());
-                let replan_started_at = Instant::now();
+                let instantiation_started_at = Instant::now();
+                let replacement = factory.instantiate(fresh_topology);
+                observe_pre_ready_replan(instantiation_started_at.elapsed());
+                let replacement = replacement?;
+                let (replacement_request, replacement_completion) = replacement.into_parts();
                 let replacement_reservation =
                     crate::query_execution::completion::QueryAttemptReservation::retry(
                         query_id, 2,
                     )?;
-                let replacement = factory.replan(fresh_topology, replacement_reservation);
-                observe_pre_ready_replan(replan_started_at.elapsed());
-                let replacement = replacement?;
-                let (
-                    replacement_request,
-                    replacement_completion,
-                    replacement_factory,
-                    replacement_reservation,
-                ) = replacement.into_parts();
-                if replacement_factory.is_some() {
-                    return Err(DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "replacement distributed round must not retain another automatic retry factory",
-                    ));
-                }
-                let replacement_reservation = replacement_reservation.ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "replacement distributed round lost its reserved attempt identity",
-                    )
-                })?;
-                if replacement_reservation.query_id() != query_id
-                    || replacement_reservation.execution_id().attempt_id()
-                        != execution_id_for_round(query_id, 2)?.attempt_id()
-                {
-                    return Err(DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "replacement distributed round changed its reserved attempt identity",
-                    ));
-                }
                 let replacement_execution_id = replacement_reservation.execution_id();
                 self.execute_round(
                     query_id,
@@ -2000,7 +2061,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                     replacement_request,
                     None,
                     RoundCredentialLeaseSource::Reservation {
-                        reservation: replacement_reservation,
+                        reservation: Some(replacement_reservation),
                         observed_collected: None,
                     },
                 )
@@ -2034,7 +2095,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
             first_request,
             Some(round_factory.as_ref() as &dyn PreReadyRetryBoundary),
             RoundCredentialLeaseSource::Reservation {
-                reservation,
+                reservation: Some(reservation),
                 observed_collected: Some(Arc::clone(&retry_collected_vended_credentials)),
             },
         ) {
@@ -2192,6 +2253,112 @@ fn distributed_write_phase_marker(
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StatisticsTaskCompletionFact {
+    identity: TaskIdentity,
+    terminal: bool,
+    success_compatible_terminal: bool,
+    state: Option<TaskState>,
+    failure_cause: Option<TerminationDetail>,
+}
+
+fn statistics_tasks_are_terminal(round: &TaskRound) -> bool {
+    round.execution().graph().tasks().all(|task| {
+        round
+            .execution()
+            .task(task.task_id())
+            .is_some_and(|remote| remote.is_terminal())
+    })
+}
+
+fn statistics_all_success_error(round: &TaskRound) -> Option<DistributedQueryError> {
+    let facts = round
+        .execution()
+        .graph()
+        .tasks()
+        .map(|task| {
+            let remote = round.execution().task(task.task_id());
+            StatisticsTaskCompletionFact {
+                identity: task.identity(),
+                terminal: remote.is_some_and(|remote| remote.is_terminal()),
+                success_compatible_terminal: remote
+                    .and_then(|remote| remote.status())
+                    .is_some_and(|status| status.is_success_compatible_terminal()),
+                state: remote.map(|remote| remote.task_state()),
+                failure_cause: remote
+                    .and_then(|remote| remote.status())
+                    .and_then(|status| status.termination())
+                    .cloned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    statistics_all_success_failure_message(&facts, round.failure_cause()).map(|message| {
+        DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
+    })
+}
+
+fn statistics_all_success_failure_message(
+    facts: &[StatisticsTaskCompletionFact],
+    round_failure_cause: Option<&TerminationDetail>,
+) -> Option<String> {
+    let incompatible = facts
+        .iter()
+        .filter(|fact| !statistics_task_is_success_compatible(fact))
+        .map(format_statistics_task_completion_fact)
+        .collect::<Vec<_>>();
+    if incompatible.is_empty() && round_failure_cause.is_none() {
+        return None;
+    }
+    Some(format!(
+        "statistics execution did not reach a success-compatible terminal set; \
+         incompatible_tasks=[{}]; round_failure_cause={}",
+        incompatible.join(", "),
+        format_termination_detail(round_failure_cause),
+    ))
+}
+
+/// Whether this task's terminal is compatible with the already-complete Root
+/// result remaining successful.
+///
+/// The Root reached `FINISHED` before this predicate can run. A non-root task
+/// may then be stood down with `UPSTREAM_NO_LONGER_NEEDED`: the Root aggregate
+/// has already consumed every sender through exchange EOS, so that terminal
+/// closes work the result no longer depends on. An abort, a failure, a missing
+/// status, or a task that has not reached a terminal still refuses statistics
+/// publication.
+fn statistics_task_is_success_compatible(fact: &StatisticsTaskCompletionFact) -> bool {
+    fact.terminal && fact.success_compatible_terminal
+}
+
+fn format_statistics_task_completion_fact(fact: &StatisticsTaskCompletionFact) -> String {
+    let execution_id = fact.identity.query_execution_id();
+    format!(
+        "{{identity={{query_id={}, attempt_id={}, stage_id={}, task_id={}, \
+         backend_process_id={}}}, terminal={}, state={}, failure_cause={}}}",
+        execution_id.query_id(),
+        execution_id.attempt_id().get(),
+        fact.identity.stage_id(),
+        fact.identity.task_id(),
+        fact.identity.backend_process_id(),
+        fact.terminal,
+        fact.state.map_or("MISSING", TaskState::as_str),
+        format_termination_detail(fact.failure_cause.as_ref()),
+    )
+}
+
+fn format_termination_detail(detail: Option<&TerminationDetail>) -> String {
+    match detail {
+        Some(TerminationDetail::Canceled(reason)) => format!("CANCELED(reason={reason})"),
+        Some(TerminationDetail::Aborted(cause)) => format!("ABORTED(cause={cause})"),
+        Some(TerminationDetail::Failed(failure)) => format!(
+            "FAILED(category={}, detail={})",
+            failure.category(),
+            failure.detail()
+        ),
+        None => "NONE".to_owned(),
+    }
+}
+
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
@@ -2343,8 +2510,10 @@ mod tests {
 
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
-        QueryIdSource, UniqueQueryIdSource, distributed_write_phase_marker,
+        QueryIdSource, ResultByteLimit, ResultPacketSequence, StatisticsTaskCompletionFact,
+        TEST_RESULT_FETCH_BYTE_LIMIT, UniqueQueryIdSource, distributed_write_phase_marker,
         fail_closed_one_shot_topology_retry, pre_ready_topology_validation_error,
+        statistics_all_success_failure_message,
     };
     use crate::common::backend_topology::{
         BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
@@ -2358,8 +2527,9 @@ mod tests {
         FinalTaskInfoRead, FragmentDispatcher, RootResultOutcome,
     };
     use crate::query_execution::completion::{
-        PreReadyRetryBoundary, PreparedDistributedQuery, PreparedDistributedRequestFactory,
-        PreparedDistributedRoundFactory, PreparedQueryCompletion,
+        LogicalQueryReservation, PreReadyRetryBoundary, PreparedDistributedAttempt,
+        PreparedDistributedAttemptFactory, PreparedDistributedQuery,
+        PreparedDistributedRequestFactory, PreparedQueryCompletion,
         PreparedRetriableDistributedRequest,
     };
     use crate::query_execution::contract::{
@@ -2370,7 +2540,10 @@ mod tests {
     use crate::query_execution::preparation::{ScanPreparationOptions, prepare_fragments};
     use crate::topology::ClusterBackendService;
     use novarocks_execution::task_execution::domain::DomainVersion;
-    use novarocks_execution::task_execution::{MaxWait, TaskIdentity};
+    use novarocks_execution::task_execution::{
+        AbortCause, CancelReason, MaxWait, SafeDetail, TaskFailure, TaskFailureCategory,
+        TaskIdentity, TaskState, TerminationDetail,
+    };
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
@@ -2392,6 +2565,170 @@ mod tests {
             distributed_write_phase_marker(execution_id, "root_eof", 37, Some((3, 19))),
             "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi=7 query_lo=11 attempt=2 phase=root_eof elapsed_ms=37 root_batches=3 root_rows=19"
         );
+    }
+
+    #[test]
+    fn statistics_failure_preserves_every_incompatible_task_and_round_cause() {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(7, 11),
+            AttemptId::new(2).expect("nonzero attempt"),
+        )
+        .expect("nonzero execution identity");
+        let stage_id = StageId::new(3).expect("nonzero stage");
+        let finished_identity = TaskIdentity::new(
+            execution_id,
+            stage_id,
+            TaskId::new(1).expect("nonzero task"),
+            BackendProcessId::new_v7(),
+        );
+        let failed_identity = TaskIdentity::new(
+            execution_id,
+            stage_id,
+            TaskId::new(2).expect("nonzero task"),
+            BackendProcessId::new_v7(),
+        );
+        let aborted_identity = TaskIdentity::new(
+            execution_id,
+            stage_id,
+            TaskId::new(3).expect("nonzero task"),
+            BackendProcessId::new_v7(),
+        );
+        let task_failure = TerminationDetail::Failed(TaskFailure::new(
+            TaskFailureCategory::ResourceExhausted,
+            SafeDetail::new("memory pool exhausted").expect("bounded safe detail"),
+        ));
+        let facts = vec![
+            StatisticsTaskCompletionFact {
+                identity: finished_identity,
+                terminal: true,
+                success_compatible_terminal: true,
+                state: Some(TaskState::Finished),
+                failure_cause: None,
+            },
+            StatisticsTaskCompletionFact {
+                identity: failed_identity,
+                terminal: true,
+                success_compatible_terminal: false,
+                state: Some(TaskState::Failed),
+                failure_cause: Some(task_failure.clone()),
+            },
+            StatisticsTaskCompletionFact {
+                identity: aborted_identity,
+                terminal: true,
+                success_compatible_terminal: false,
+                state: Some(TaskState::Aborted),
+                failure_cause: Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+            },
+        ];
+
+        let message = statistics_all_success_failure_message(&facts, Some(&task_failure))
+            .expect("non-finished tasks reject statistics completion");
+        assert!(!message.contains("task_id=1,"));
+        assert!(message.contains(&format!(
+            "identity={{query_id={}, attempt_id=2, stage_id=3, task_id=2, backend_process_id={}}}, terminal=true, state=FAILED, failure_cause=FAILED(category=RESOURCE_EXHAUSTED, detail=memory pool exhausted)",
+            execution_id.query_id(),
+            failed_identity.backend_process_id(),
+        )));
+        assert!(message.contains(&format!(
+            "identity={{query_id={}, attempt_id=2, stage_id=3, task_id=3, backend_process_id={}}}, terminal=true, state=ABORTED, failure_cause=ABORTED(cause=PEER_TASK_FAILED)",
+            execution_id.query_id(),
+            aborted_identity.backend_process_id(),
+        )));
+        assert!(message.ends_with(
+            "round_failure_cause=FAILED(category=RESOURCE_EXHAUSTED, detail=memory pool exhausted)"
+        ));
+        assert!(
+            statistics_all_success_failure_message(&facts[..1], None).is_none(),
+            "a FINISHED task set with no round failure is successful"
+        );
+    }
+
+    #[test]
+    fn statistics_accepts_only_the_closed_success_compatible_cancel_terminal() {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(13, 17),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("nonzero execution identity");
+        let stage_id = StageId::new(2).expect("nonzero stage");
+        let finished_root = StatisticsTaskCompletionFact {
+            identity: TaskIdentity::new(
+                execution_id,
+                stage_id,
+                TaskId::new(1).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            ),
+            terminal: true,
+            success_compatible_terminal: true,
+            state: Some(TaskState::Finished),
+            failure_cause: None,
+        };
+        let canceled_producer = StatisticsTaskCompletionFact {
+            identity: TaskIdentity::new(
+                execution_id,
+                stage_id,
+                TaskId::new(2).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            ),
+            terminal: true,
+            success_compatible_terminal: true,
+            state: Some(TaskState::Canceled),
+            failure_cause: Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+        };
+        assert!(
+            statistics_all_success_failure_message(
+                &[finished_root.clone(), canceled_producer],
+                None,
+            )
+            .is_none(),
+            "a producer stood down after Root EOF is success-compatible"
+        );
+
+        let aborted_producer = StatisticsTaskCompletionFact {
+            identity: TaskIdentity::new(
+                execution_id,
+                stage_id,
+                TaskId::new(3).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            ),
+            terminal: true,
+            success_compatible_terminal: false,
+            state: Some(TaskState::Aborted),
+            failure_cause: Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+        };
+        let message =
+            statistics_all_success_failure_message(&[finished_root, aborted_producer], None)
+                .expect("query cancellation is not a success-compatible stand-down");
+        assert!(message.contains("ABORTED(cause=QUERY_FAILED)"));
+    }
+
+    #[test]
+    fn statistics_does_not_classify_a_cancel_until_it_reaches_terminal() {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(19, 23),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("nonzero execution identity");
+        let canceling = StatisticsTaskCompletionFact {
+            identity: TaskIdentity::new(
+                execution_id,
+                StageId::new(2).expect("nonzero stage"),
+                TaskId::new(1).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            ),
+            terminal: false,
+            success_compatible_terminal: false,
+            state: Some(TaskState::Canceling),
+            failure_cause: Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+        };
+        let message = statistics_all_success_failure_message(&[canceling], None)
+            .expect("a canceling task is not yet classifiable as success");
+        assert!(message.contains("terminal=false"));
+        assert!(message.contains("state=CANCELING"));
     }
 
     #[test]
@@ -2538,21 +2875,19 @@ mod tests {
             Arc<Mutex<Vec<crate::common::backend_topology::BackendTopologySnapshot>>>,
     }
 
-    impl PreparedDistributedRoundFactory for RecordingRetryFactory {
-        fn replan(
+    impl PreparedDistributedAttemptFactory for RecordingRetryFactory {
+        fn instantiate(
             &mut self,
             topology: crate::common::backend_topology::BackendTopologySnapshot,
-            reservation: crate::query_execution::completion::QueryAttemptReservation,
-        ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
+        ) -> Result<PreparedDistributedAttempt, DistributedQueryError> {
             self.replanned_topologies
                 .lock()
                 .expect("replanned topologies")
                 .push(topology.clone());
-            Ok(PreparedDistributedQuery::new(
+            Ok(PreparedDistributedAttempt::new(
                 fresh_result_request(topology)?,
                 PreparedQueryCompletion::result(),
-            )
-            .with_attempt_reservation(reservation))
+            ))
         }
     }
 
@@ -2605,6 +2940,10 @@ mod tests {
             descriptor.clone(),
             BackendReportedState::Running,
             2,
+            novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                [0x61; 16],
+            )
+            .expect("nonzero epoch"),
             now_ms,
         );
     }
@@ -2625,21 +2964,23 @@ mod tests {
             ScanPreparationOptions::single_backend_fixture(),
         )
         .expect("prepared result fixture");
-        let native = crate::query_execution::native_fragment::native_fragment_attachment_for_test(
-            [novarocks_proto_models::plan::PlanFragment {
-                fragment_id: 7,
-                // The task protocol refuses a fragment plan with no sink, so a
-                // fixture without one would fail at graph assembly and never
-                // reach the behaviour these tests are about.
-                sink: Some(novarocks_proto_models::plan::DataSink {
-                    kind: Some(novarocks_proto_models::plan::data_sink::Kind::Result(true)),
-                }),
-                ..Default::default()
-            }],
-            &BTreeSet::from([7]),
-            None,
-        )
-        .expect("native fragment fixture");
+        let encoding =
+            crate::query_execution::post_compile::NativeFragmentEncodingInput::new(prepared);
+        let native = encoding
+            .native_attachment_for_test(
+                [novarocks_proto_models::plan::PlanFragment {
+                    fragment_id: 7,
+                    // The task protocol refuses a fragment plan with no sink, so a
+                    // fixture without one would fail at graph assembly and never
+                    // reach the behaviour these tests are about.
+                    sink: Some(novarocks_proto_models::plan::DataSink {
+                        kind: Some(novarocks_proto_models::plan::data_sink::Kind::Result(true)),
+                    }),
+                    ..Default::default()
+                }],
+                &BTreeSet::from([7]),
+            )
+            .expect("native fragment fixture");
         let cancellation = QueryCancellationSource::new();
         let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
             ClusterRole::Fe,
@@ -2652,7 +2993,7 @@ mod tests {
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
         );
         build_distributed_query_request_with_execution(
-            prepared,
+            encoding,
             native,
             None,
             DistributedQueryIntent::Result,
@@ -2781,7 +3122,7 @@ mod tests {
         assert!(
             cancelled.is_none(),
             "a cancelled attempt is never reclassified into topology-retry evidence, \
-             because a replan must never re-run a statement the client killed"
+             because replacement must never re-run a statement the client killed"
         );
         assert!(
             elapsed < OBSERVATION / 4,
@@ -2791,7 +3132,7 @@ mod tests {
     }
 
     #[test]
-    fn a_replaced_captured_process_replans_the_round_once_before_establish() {
+    fn a_replaced_captured_process_instantiates_one_attempt_before_establish() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2816,6 +3157,10 @@ mod tests {
             FrontendBackendSnapshot::from_live_targets(vec![LiveBackendTarget::new(
                 0,
                 replacement_for_scheduler,
+                novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                    [0x61; 16],
+                )
+                .expect("nonzero epoch"),
             )])
             .expect("replacement scheduler"),
         );
@@ -2829,8 +3174,8 @@ mod tests {
                 Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
             );
         // The membership owner replaces the captured process. Published before
-        // the round starts because that is the only ordering a test can pin;
-        // what matters is that the replan rests on this fact rather than on a
+        // the attempt starts because that is the only ordering a test can pin;
+        // what matters is that replacement rests on this fact rather than on a
         // transport's own report of it.
         topology
             .record_announce(replacement.clone(), BackendReportedState::Running)
@@ -2843,8 +3188,9 @@ mod tests {
         let operation = PreparedDistributedQuery::new(
             fresh_result_request(first_snapshot.clone()).expect("first request"),
             PreparedQueryCompletion::result(),
+            LogicalQueryReservation::for_test(QueryId::new(7, 11)),
         )
-        .with_round_factory(Box::new(RecordingRetryFactory {
+        .with_attempt_factory(Box::new(RecordingRetryFactory {
             permits: Arc::clone(&permits),
             control_ready_closures: Arc::clone(&control_ready_closures),
             stage_or_start_closures: Arc::clone(&stage_or_start_closures),
@@ -2853,10 +3199,10 @@ mod tests {
 
         let error = coordinator
             .execute_prepared(operation)
-            .expect_err("the replanned round has no backend to reach");
-        // The second round runs on the task substrate against an endpoint
+            .expect_err("the replacement attempt has no backend to reach");
+        // The replacement attempt runs on the task substrate against an endpoint
         // nothing listens on, so it ends at its own deadline. What this test
-        // is about happened before that: one permit, one replan, onto the
+        // is about happened before that: one permit, one replacement, onto the
         // process the membership owner named.
         assert!(
             error.message().contains("query timed out after"),
@@ -2865,7 +3211,7 @@ mod tests {
         );
         assert_eq!(permits.load(Ordering::SeqCst), 1);
         // Neither gate may close: no query context was ever established, so
-        // the window in which a replan is still legal never ended.
+        // the window in which a replacement is still legal never ended.
         assert_eq!(control_ready_closures.load(Ordering::SeqCst), 0);
         assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 0);
         let replanned = replanned_topologies.lock().expect("replanned topologies");
@@ -2909,6 +3255,10 @@ mod tests {
             FrontendBackendSnapshot::from_live_targets(vec![LiveBackendTarget::new(
                 0,
                 replacement.clone(),
+                novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                    [0x62; 16],
+                )
+                .expect("nonzero replacement epoch"),
             )])
             .expect("replacement scheduler"),
         );
@@ -3005,8 +3355,9 @@ mod tests {
         let operation = PreparedDistributedQuery::new(
             fresh_result_request(snapshot).expect("first request"),
             PreparedQueryCompletion::result(),
+            LogicalQueryReservation::for_test(QueryId::new(7, 12)),
         )
-        .with_round_factory(Box::new(RecordingRetryFactory {
+        .with_attempt_factory(Box::new(RecordingRetryFactory {
             permits: Arc::new(AtomicUsize::new(0)),
             control_ready_closures: Arc::clone(&control_ready_closures),
             stage_or_start_closures: Arc::clone(&stage_or_start_closures),
@@ -3034,6 +3385,7 @@ mod tests {
         /// Received once per poll before it answers.
         releases: Mutex<std::sync::mpsc::Receiver<()>>,
         polls: AtomicUsize,
+        acknowledgements: Mutex<Vec<Option<ResultPacketSequence>>>,
     }
 
     impl super::TaskResultTransport for ScriptedRootResult {
@@ -3041,19 +3393,34 @@ mod tests {
             &self,
             _root_task: TaskIdentity,
             _max_wait: MaxWait,
-            _expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
-        ) -> Result<RootResultOutcome, String> {
-            self.releases
+            acknowledged: Option<ResultPacketSequence>,
+            _max_result_bytes: ResultByteLimit,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<RootResultOutcome, String>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let answer = self
+                .releases
                 .lock()
                 .expect("scripted release lock")
                 .recv()
-                .map_err(|_| "the test stopped releasing polls".to_owned())?;
-            self.polls.fetch_add(1, Ordering::SeqCst);
-            self.answers
-                .lock()
-                .expect("scripted answer lock")
-                .pop_front()
-                .ok_or_else(|| "the script ran out of answers".to_owned())
+                .map_err(|_| "the test stopped releasing polls".to_owned())
+                .and_then(|()| {
+                    self.polls.fetch_add(1, Ordering::SeqCst);
+                    self.acknowledgements
+                        .lock()
+                        .expect("scripted acknowledgement lock")
+                        .push(acknowledged);
+                    self.answers
+                        .lock()
+                        .expect("scripted answer lock")
+                        .pop_front()
+                        .ok_or_else(|| "the script ran out of answers".to_owned())
+                });
+            Box::pin(async move { answer })
         }
 
         fn final_task_info(&self, _identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
@@ -3103,20 +3470,19 @@ mod tests {
     }
 
     /// The defect this pins: one root result poll asks a backend to hold its
-    /// answer for up to `MAX_ROOT_RESULT_WAIT`, and an attempt has exactly
-    /// one thread -- the one that turns its task state machine. While that
-    /// thread waited out a poll it dispatched nothing, so every decision made
-    /// by another thread meanwhile waited for the poll instead of for its own
-    /// facts. A distributed `SELECT` opens its producers' exchange edges
+    /// answer for up to `MAX_ROOT_RESULT_WAIT`, while the attempt owner must
+    /// keep turning its task state machine. When the owner waited out a poll
+    /// it dispatched nothing, so every decision made elsewhere meanwhile
+    /// waited for the poll instead of for its own facts. A distributed
+    /// `SELECT` opens its producers' exchange edges
     /// exactly there: each edge-open decision cost one whole poll wait, and
     /// the cost was invisible as anything but latency. Measured on a 1FE+3BE
     /// cluster, every statement of the `filter` suite took ~0.85 s of which
     /// ~0.05 s was work, and the suite took 92 s against its baseline's 4 s.
     ///
-    /// So the answers must reach the loop without the loop ever waiting for
-    /// one, and the polls must stop themselves once the read is over: a poll
-    /// after the end of the stream is refused by a backend that has already
-    /// handed its result over.
+    /// Answers must therefore reach the loop without the loop waiting for
+    /// one. A following poll must also wait for the owner to accept the exact
+    /// prior sequence; enqueueing an answer is not an acknowledgement.
     #[test]
     fn root_result_polls_answer_a_loop_that_never_waits_for_one() {
         let (release, releases) = std::sync::mpsc::channel();
@@ -3124,6 +3490,7 @@ mod tests {
             answers: Mutex::new(
                 [
                     RootResultOutcome::NotReady,
+                    RootResultOutcome::EndOfStreamPending { packet_sequence: 7 },
                     RootResultOutcome::EndOfStream { packet_sequence: 7 },
                 ]
                 .into_iter()
@@ -3131,14 +3498,21 @@ mod tests {
             ),
             releases: Mutex::new(releases),
             polls: AtomicUsize::new(0),
+            acknowledgements: Mutex::new(Vec::new()),
         });
         let wake = Arc::new(crate::task_execution::status_intake::CountingWake::default());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("root result poll runtime");
         let mut polls = super::RootResultPolls::start(
             Arc::clone(&transport) as Arc<dyn super::TaskResultTransport>,
             root_task_for_test(),
-            Arc::new(novarocks_execution::exec::chunk::ChunkSchema::empty()),
             Instant::now() + Duration::from_secs(60),
+            ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
+                .expect("the test result byte limit is nonzero"),
             Arc::clone(&wake) as Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
+            crate::native::data_runtime::FrontendDataRuntime::new(runtime.handle().clone()),
         )
         .expect("the poller starts");
 
@@ -3170,9 +3544,29 @@ mod tests {
         assert!(
             matches!(
                 second,
-                Ok(RootResultOutcome::EndOfStream { packet_sequence: 7 })
+                Ok(RootResultOutcome::EndOfStreamPending { packet_sequence: 7 })
             ),
             "actual: {second:?}"
+        );
+        assert_eq!(
+            transport.polls.load(Ordering::SeqCst),
+            2,
+            "the next poll must wait until the owner accepts pending EOS"
+        );
+        polls
+            .acknowledge(7)
+            .expect("the attempt owner acknowledges pending EOS");
+        release
+            .send(())
+            .expect("the accepted EOS acknowledgement starts the final poll");
+        let third = answer_within(&mut polls, Duration::from_secs(10))
+            .expect("the final answer reaches the loop");
+        assert!(
+            matches!(
+                third,
+                Ok(RootResultOutcome::EndOfStream { packet_sequence: 7 })
+            ),
+            "actual: {third:?}"
         );
 
         // Nothing is polled after the end of the stream. The poller has let
@@ -3189,8 +3583,15 @@ mod tests {
         );
         assert_eq!(
             transport.polls.load(Ordering::SeqCst),
-            2,
-            "exactly the two polls this test released"
+            3,
+            "exactly the three polls this test released"
+        );
+        assert_eq!(
+            *transport
+                .acknowledgements
+                .lock()
+                .expect("scripted acknowledgement lock"),
+            vec![None, None, Some(ResultPacketSequence::new(7))]
         );
     }
 }
@@ -3261,6 +3662,7 @@ struct TaskRoundWaitFacts {
     contexts_established: bool,
     tasks_created: bool,
     read: crate::task_execution::completion::ReadVerdict,
+    write: Option<WriteVerdict>,
     /// `None` means no task of the root's id is in this attempt's state at
     /// all, which is a different fault from a root that is still creating.
     root_create: Option<RemoteTaskState>,
@@ -3270,6 +3672,7 @@ struct TaskRoundWaitFacts {
         TaskIdentity,
         RemoteTaskState,
         novarocks_execution::task_execution::TaskState,
+        bool,
     )>,
 }
 
@@ -3277,9 +3680,13 @@ impl std::fmt::Display for TaskRoundWaitFacts {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "read={:?} contexts_established={} tasks_created={} root_create={} \
+            "read={:?} write={} contexts_established={} tasks_created={} root_create={} \
              last_root_poll={} packets={} tasks=[",
             self.read,
+            self.write.map_or_else(
+                || "not-applicable".to_owned(),
+                |verdict| verdict.to_string(),
+            ),
             self.contexts_established,
             self.tasks_created,
             match self.root_create {
@@ -3289,11 +3696,14 @@ impl std::fmt::Display for TaskRoundWaitFacts {
             self.last_root_poll,
             self.packets,
         )?;
-        for (index, (identity, create, state)) in self.tasks.iter().enumerate() {
+        for (index, (identity, create, state, output_complete)) in self.tasks.iter().enumerate() {
             if index > 0 {
                 formatter.write_str(", ")?;
             }
-            write!(formatter, "{identity} {create:?}/{state}")?;
+            write!(
+                formatter,
+                "{identity} {create:?}/{state}/output_complete={output_complete}"
+            )?;
         }
         formatter.write_str("]")
     }
@@ -3306,6 +3716,7 @@ fn task_round_wait_facts(
     root_task: TaskIdentity,
     packets: usize,
     last_root_poll: RootResultPoll,
+    write_completion: Option<&mut WriteCompletionTracker>,
 ) -> TaskRoundWaitFacts {
     let mut tasks = Vec::new();
     for stage in round.execution().graph().stages() {
@@ -3313,13 +3724,23 @@ fn task_round_wait_facts(
             continue;
         };
         for (_, task) in execution_stage.tasks() {
-            tasks.push((task.identity(), task.state(), task.task_state()));
+            tasks.push((
+                task.identity(),
+                task.state(),
+                task.task_state(),
+                task.output_released(),
+            ));
         }
     }
+    let write = write_completion.map(|tracker| {
+        observe_write_statuses(round, tracker);
+        tracker.execution_verdict(round.failure_cause().is_some())
+    });
     TaskRoundWaitFacts {
         contexts_established: round.contexts_established(),
         tasks_created: round.tasks_created(),
         read: round.execution().read_completion(),
+        write,
         root_create: round
             .execution()
             .task(root_task.task_id())
@@ -3537,14 +3958,13 @@ fn max_root_result_wait(now: Instant, deadline: Instant) -> MaxWait {
     MaxWait::new(wait).unwrap_or_else(|_| MaxWait::default_for(OperationKind::GetFinalTaskInfo))
 }
 
-/// One attempt's root result polls, run beside the loop that owns the attempt.
+/// One attempt's root result polls, run as an async task beside its owner.
 ///
 /// A poll asks the root task's backend to hold the request until it has
-/// something to say, for up to [`MAX_ROOT_RESULT_WAIT`]. An attempt has
-/// exactly one thread, and it is the thread that turns the task state
-/// machine: waiting out the poll on it stops that machine for the whole wait,
-/// and turning it is what dispatches an edge open, settles an
-/// acknowledgement and folds status.
+/// something to say, for up to [`MAX_ROOT_RESULT_WAIT`]. The async transport
+/// future parks on the process runtime, so it does not occupy the thread that
+/// turns the task state machine, dispatches edge opens, settles task
+/// acknowledgements, and folds status.
 ///
 /// Every one of those decisions is made by another thread -- a create
 /// acknowledgement arriving, a status event published -- so each one that
@@ -3554,12 +3974,13 @@ fn max_root_result_wait(now: Instant, deadline: Instant) -> MaxWait {
 /// nowhere except as latency: measured on a 1FE+3BE cluster, every statement
 /// of the `filter` suite took ~0.85 s, of which ~0.05 s was work.
 ///
-/// So the polls run here instead. One is in flight at a time, in order, and
-/// each answer wakes the loop -- the read is exactly as sequential and as
-/// prompt as it was, while the loop stays free to move a decision the moment
-/// it is made.
+/// One poll is in flight at a time, in order, and each answer wakes the loop.
+/// Data and pending EOS additionally wait for the owner to accept their exact
+/// sequence before the following request may acknowledge it.
 struct RootResultPolls {
-    answers: std::sync::mpsc::Receiver<Result<RootResultOutcome, String>>,
+    answers: tokio::sync::mpsc::Receiver<Result<RootResultOutcome, String>>,
+    acknowledgements: tokio::sync::mpsc::Sender<ResultPacketSequence>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl RootResultPolls {
@@ -3571,48 +3992,77 @@ impl RootResultPolls {
     fn start(
         transport: Arc<dyn TaskResultTransport>,
         root_task: TaskIdentity,
-        expected_output_schema: novarocks_execution::exec::chunk::ChunkSchemaRef,
         statement_deadline: Instant,
+        max_result_bytes: ResultByteLimit,
         wake: Arc<dyn StatusIntakeWake>,
+        data_runtime: FrontendDataRuntime,
     ) -> Result<Self, String> {
-        // One answer of slack, so the next poll may already be in flight
-        // while the loop folds the last one. More would buy nothing: the
-        // answers are one ordered stream with one consumer.
-        let (sender, answers) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("root-result-polls".to_owned())
-            .spawn(move || {
-                loop {
-                    let now = Instant::now();
-                    if now >= statement_deadline {
-                        break;
-                    }
-                    let answer = transport.fetch_root_result(
+        // Both queues are one item wide because the root stream is ordered.
+        // A following fetch cannot carry an ACK until the attempt owner has
+        // taken and accepted the preceding packet.
+        let (sender, answers) = tokio::sync::mpsc::channel(1);
+        let (acknowledgements, mut acknowledged_packets) = tokio::sync::mpsc::channel(1);
+        let task = data_runtime.spawn(async move {
+            let mut acknowledged = None;
+            loop {
+                let now = Instant::now();
+                if now >= statement_deadline {
+                    break;
+                }
+                let answer = transport
+                    .fetch_root_result(
                         root_task,
                         max_root_result_wait(now, statement_deadline),
-                        Some(ExpectedOutputSchemaView::new(&expected_output_schema)),
-                    );
-                    // Nothing is polled after an answer the loop cannot ask
-                    // to be repeated. The stream has ended or the read
-                    // failed, and a poll past that point is refused by a
-                    // backend that has already handed its result over -- an
-                    // error the loop would read as this query's failure.
-                    let last = !matches!(
-                        answer,
-                        Ok(RootResultOutcome::Ready { .. } | RootResultOutcome::NotReady)
-                    );
-                    if sender.send(answer).is_err() {
-                        // The loop stopped reading, so this attempt is over.
-                        break;
+                        acknowledged,
+                        max_result_bytes,
+                    )
+                    .await;
+                let expected_acknowledgement = match &answer {
+                    Ok(
+                        RootResultOutcome::Ready(packet)
+                    ) => Some(packet.packet_sequence()),
+                    Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) => {
+                        Some(ResultPacketSequence::new(*packet_sequence))
                     }
-                    wake.wake();
-                    if last {
-                        break;
+                    _ => None,
+                };
+                let last = !matches!(
+                    &answer,
+                    Ok(
+                        RootResultOutcome::Ready(_)
+                            | RootResultOutcome::NotReady
+                            | RootResultOutcome::EndOfStreamPending { .. }
+                    )
+                );
+                if sender.send(answer).await.is_err() {
+                    break;
+                }
+                wake.wake();
+                if let Some(expected) = expected_acknowledgement {
+                    match acknowledged_packets.recv().await {
+                        Some(actual) if actual == expected => acknowledged = Some(actual),
+                        Some(actual) => {
+                            let _ = sender
+                                .send(Err(format!(
+                                    "root result acknowledgement {actual:?} does not match pending {expected:?}"
+                                )))
+                                .await;
+                            wake.wake();
+                            break;
+                        }
+                        None => break,
                     }
                 }
-            })
-            .map(|_| Self { answers })
-            .map_err(|error| format!("root result poller thread could not start: {error}"))
+                if last {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            answers,
+            acknowledgements,
+            task,
+        })
     }
 
     /// The next answer, if one has arrived.
@@ -3622,6 +4072,18 @@ impl RootResultPolls {
     /// statement deadline the loop checks itself.
     fn take(&mut self) -> Option<Result<RootResultOutcome, String>> {
         self.answers.try_recv().ok()
+    }
+
+    fn acknowledge(&self, packet_sequence: u64) -> Result<(), String> {
+        self.acknowledgements
+            .try_send(ResultPacketSequence::new(packet_sequence))
+            .map_err(|error| format!("root result acknowledgement could not be queued: {error}"))
+    }
+}
+
+impl Drop for RootResultPolls {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -3827,96 +4289,4 @@ fn abort_task_round(round: &mut TaskRound, reason: &str) {
             );
         }
     }
-}
-/// Open one lazy split source per typed connector scan of this round.
-///
-/// Enumeration itself does not happen here: `get_splits` hands back a source
-/// the round pumps. Returning `None` means this query reads nothing through a
-/// connector, so no pump thread is started at all.
-///
-/// The session is minted per round rather than reused from preparation:
-/// preparation runs before the execution id exists, so there is no session to
-/// inherit, and enumeration must not borrow an identity that named a different
-/// attempt.
-fn prepare_round_split_assignment(
-    artifacts: &PreparedDistributedQuery,
-    schedule: &ValidatedFragmentSchedule,
-    retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
-    feedback: Arc<RuntimeFilterFeedbackState>,
-    initial_dynamic_filter_wait_cap: Duration,
-) -> Result<Option<RoundSplitAssignmentPlan>, DistributedQueryError> {
-    let scan_nodes = artifacts
-        .typed_scans()
-        .map(|(fragment_id, plan_node_id, _)| (fragment_id, plan_node_id))
-        .collect::<Vec<_>>();
-    if scan_nodes.is_empty() {
-        return Ok(None);
-    }
-    let session = crate::query_execution::compiler::typed_connector_session().map_err(failed)?;
-    let mut sources = Vec::with_capacity(scan_nodes.len());
-    for (_, plan_node_id, scan) in artifacts.typed_scans() {
-        let table_scan = &scan.prepared.table_scan;
-        let source = scan
-            .prepared
-            .split_manager
-            .get_splits(
-                &session,
-                table_scan.table().relation().table(),
-                table_scan.assignments(),
-                &table_scan.dynamic_filter_columns(),
-                &scan.prepared.constraint,
-            )
-            .map_err(|error| {
-                failed(format!(
-                    "typed connector scan node_id={plan_node_id} cannot open its split source: {error}"
-                ))
-            })?;
-        sources.push(RoundSplitSource {
-            plan_node_id,
-            source,
-            encoder: Arc::clone(&scan.prepared.encoder),
-            feedback: Arc::clone(&feedback),
-            feedback_bindings: feedback_bindings(table_scan),
-            initial_wait_deadline: None,
-        });
-    }
-    let targets = assignment_targets(schedule, &scan_nodes);
-    // Every scan node must have somewhere to send its work. An empty task set
-    // would silently drop every split of that scan.
-    for plan_node_id in sources.iter().map(|source| source.plan_node_id) {
-        if targets
-            .get(&plan_node_id)
-            .is_none_or(|targets| targets.is_empty())
-        {
-            return Err(failed(format!(
-                "typed connector scan node_id={plan_node_id} has no admitted task in this schedule"
-            )));
-        }
-    }
-    Ok(Some(RoundSplitAssignmentPlan::new(
-        targets,
-        sources,
-        retry_policy,
-        initial_dynamic_filter_wait_cap,
-        assignment_endpoints(schedule),
-    )))
-}
-
-fn feedback_bindings(
-    table_scan: &crate::query_execution::connector_domain::TableScanNode,
-) -> Vec<(
-    u32,
-    novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-)> {
-    table_scan
-        .dynamic_filters()
-        .iter()
-        .filter_map(|binding| {
-            table_scan
-                .assignments()
-                .iter()
-                .find(|assignment| assignment.variable() == binding.variable())
-                .map(|assignment| (binding.filter_id(), assignment.column().clone()))
-        })
-        .collect()
 }

@@ -419,7 +419,9 @@ mod plan_tests {
             predicates: vec![],
             required_columns: None,
             variant_columns: vec![],
-            mv_rewritten_from: Some("mv_orders_rollup".to_string()),
+            mv_rewritten_from: Some(crate::planner::payload::MvRewriteSelection::unverified(
+                "mv_orders_rollup".to_string(),
+            )),
         });
 
         let LogicalPlanKind::Scan(scan) = node else {

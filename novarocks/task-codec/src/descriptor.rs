@@ -19,7 +19,7 @@
 //!
 //! [`WireFragmentPlan`] is the one place in this protocol where a generated
 //! message is the stored representation of a value. The reason is recorded in
-//! ADR-0135: the only transport-neutral plan form in this engine, `ExecPlan`,
+//! ADR-0146: the only transport-neutral plan form in this engine, `ExecPlan`,
 //! is not a value — its scan, writer, and finish nodes hold `Arc<dyn ..>`
 //! leaves implemented only in the backend, and it carries no serde — so the
 //! frontend has nothing neutral to author instead.
@@ -30,23 +30,21 @@
 //! the descriptor. The backend's own plan decoder is the single consumer that
 //! reads the message back out, which is what [`WireFragmentPlan::plan`] and
 //! [`WireFragmentPlan::instance_params`] exist for.
-// Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
+// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
-use novarocks_execution::exec::fragment::program::{
-    FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
-};
-use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_execution::task_execution::descriptor::{
+use novarocks_execution_contract::DataStreamPartitionType;
+use novarocks_execution_contract::RuntimeEndpoint;
+use novarocks_execution_contract::task_execution::descriptor::{
     ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource, ExchangeTopology,
     PhysicalFragmentPlan, TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES, TaskDescriptor,
 };
-use novarocks_execution::task_execution::domain::{
+use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ContentFingerprint, ExchangeEdgeId, PlanNodeId,
 };
+use novarocks_execution_contract::{FragmentContractVersion, FragmentNodeId, FragmentSinkKind};
 use novarocks_proto_models::{novarocks, plan};
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -415,9 +413,17 @@ fn decode_inbound(
             source_path.field("fragment_instance_id"),
             "exchange source requires a fragment instance id",
         )?;
-        sources.push(ExchangeSource::new(task, key));
+        sources.push(ExchangeSource::new(task, key, source.sender_ordinal));
     }
-    ExchangeInbound::try_new(node, sources).map_err(|error| duplicate(path, error.to_string()))
+    ExchangeInbound::try_new(node, sources).map_err(|error| match error {
+        novarocks_execution_contract::task_execution::descriptor::DescriptorError::DuplicateInboundSource(
+            _,
+        ) => duplicate(path, error.to_string()),
+        novarocks_execution_contract::task_execution::descriptor::DescriptorError::InvalidInboundSenderOrdinals {
+            ..
+        } => inconsistent(path, error.to_string()),
+        _ => inconsistent(path, error.to_string()),
+    })
 }
 
 fn encode_inbound(value: &ExchangeInbound) -> novarocks::TaskExchangeInbound {
@@ -429,6 +435,7 @@ fn encode_inbound(value: &ExchangeInbound) -> novarocks::TaskExchangeInbound {
             .map(|source| novarocks::TaskExchangeSource {
                 task: Some(encode_task_identity(source.task())),
                 fragment_instance_id: Some(encode_unique_id(source.fragment_instance_id())),
+                sender_ordinal: source.sender_ordinal(),
             })
             .collect(),
     }

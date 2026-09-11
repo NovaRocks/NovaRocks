@@ -29,56 +29,28 @@
 //! their own runtime state machines built on top of them; only immutable
 //! values, this module's pure validation, and the central codec are shared
 //! across the process boundary.
-// Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
+// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
-pub mod descriptor;
-pub mod domain;
-pub mod identity;
-pub mod lease;
-pub mod operation;
-pub mod status;
-pub mod transition;
+pub mod descriptor {
+    pub use novarocks_execution_contract::descriptor::*;
+}
+pub mod domain {
+    pub use novarocks_execution_contract::domain::*;
+}
+pub mod identity {
+    pub use novarocks_execution_contract::identity::*;
+}
+pub mod lease {
+    pub use novarocks_execution_contract::lease::*;
+}
+pub mod operation {
+    pub use novarocks_execution_contract::operation::*;
+}
+pub mod status {
+    pub use novarocks_execution_contract::status::*;
+}
+pub mod transition {
+    pub use novarocks_execution_contract::transition::*;
+}
 
-pub use descriptor::{
-    DescriptorError, ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource,
-    ExchangeTopology, IngressRejection, PhysicalFragmentPlan, TaskDescriptor,
-};
-pub use domain::{
-    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomain, CredentialEpoch,
-    CredentialLeaseId, DomainConflict, DomainProgression, DomainVersion, EdgeOpenVersion,
-    EdgeSendPermission, ExchangeEdgeDomain, ExchangeEdgeId, PlanNodeId, QueryContextDomainKind,
-    ScalarDomain, SplitDomain, SplitOffer, SplitSequence, SplitWatermark, TaskDomainKind,
-};
-pub use identity::{
-    IdentityField, IdentityMismatch, QueryContextRef, StageRef, TaskIdentity, TaskOperationId,
-    TaskOperationIdError,
-};
-pub use lease::{
-    InstalledLease, LeaseBounds, LeaseProgression, LeaseReceipt, LeaseSequence, LeaseValidFor,
-    LeaseValidForError, MonotonicInstant, RenewSchedule, RequestHorizon,
-};
-pub use operation::{
-    AbortQueryContext, AdvanceQueryContextDomain, CancelTask, CreateTask, CreateTaskReceipt,
-    CredentialUpdate, DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget, DispatchLane,
-    EstablishQueryContext, FetchTaskDynamicFilters, FrontendAction, GetFinalTaskInfo, MaxWait,
-    MaxWaitError, OperationEnvelope, OperationKind, OperationOutcome, OperationWaitCaps,
-    PlanNodeSplitReceipt, QueryContextDomainReceipt, QueryContextDomainUpdate, QueryContextReceipt,
-    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, RequestError,
-    SplitAssignmentIntent, TaskDomainReceipt, TaskDomainUpdate, TaskExecutionBudgets,
-    TransportBudget, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
-};
-pub use status::{
-    AbortCause, CancelReason, DynamicFilterAdvertisement, FinalInfoDisagreement, FinalTaskInfo,
-    FinalTaskInfoError, GoneObservation, OperatorStatistics, ResultPacketVerdict, RootResultStream,
-    SafeDetail, SafeFieldPath, SafeTextTooLong, StatusObservation, TaskFailure,
-    TaskFailureCategory, TaskOutputFacts, TaskResourceFacts, TaskState, TaskStatus,
-    TaskStatusCursor, TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
-    classify_gone, classify_observation, verify_final_info,
-};
-pub use transition::{
-    AttemptDrainFacts, ContextOperationKind, ContextTransition, LatchOutcome, OperationAdmission,
-    QueryContextEvent, QueryContextState, RootDrainAction, RootReadFacts, StageState,
-    TaskTransition, TerminationLatch, WriteCompletionFacts, classify_context_transition,
-    classify_operation_admission, classify_root_drain, classify_task_transition,
-    derive_stage_state, parent_released_children, terminals_are_success_compatible,
-};
+pub use novarocks_execution_contract::*;

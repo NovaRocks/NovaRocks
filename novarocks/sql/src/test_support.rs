@@ -424,8 +424,171 @@ pub fn native_scan_plan(fixture: NativeScanFixture) -> Result<DistributedPlan, S
     }
 }
 
+/// Build two scan occurrences of the same fully-qualified source and the same
+/// SQL binding token. The plan node identities are the only correct way to
+/// distinguish the self-join occurrences.
+pub fn native_self_join_scan_plan() -> Result<DistributedPlan, String> {
+    let source = test_sql_scan_source(SqlScanKind::ConnectorRead);
+    let make_scan = |node_id: i32, column_id: u32, alias: &str| DistributedNode {
+        node_id,
+        fragment_id: 0,
+        tuple_ids: vec![node_id],
+        nullable_tuple_ids: Vec::new(),
+        limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+        children: Vec::new(),
+        stats: physical_stats(),
+        payload: DistributedNodeKind::Scan(PlanScanNode {
+            database: "db".to_string(),
+            table: TableDef {
+                name: "orders".to_string(),
+                columns: vec![column_def("id", DataType::Int64, false)],
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: source.clone(),
+            },
+            alias: Some(alias.to_string()),
+            columns: vec![output_column(column_id, "id", DataType::Int64)],
+            predicates: Vec::new(),
+            required_columns: None,
+            variant_columns: Vec::new(),
+            mv_rewritten_from: None,
+        }),
+    };
+    let output_columns = vec![
+        output_column(1, "left_id", DataType::Int64),
+        output_column(2, "right_id", DataType::Int64),
+    ];
+    let root = DistributedNode {
+        node_id: 30,
+        fragment_id: 0,
+        tuple_ids: vec![30],
+        nullable_tuple_ids: Vec::new(),
+        limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+        children: vec![
+            make_scan(10, 1, "left_orders"),
+            make_scan(20, 2, "right_orders"),
+        ],
+        stats: physical_stats(),
+        payload: DistributedNodeKind::HashJoin(Box::new(PhysicalHashJoinNode {
+            join_type: JoinKind::Inner,
+            eq_conditions: Vec::new(),
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+            execution_mode: None,
+            build_runtime_filters: Vec::new(),
+            output_columns: output_columns.clone(),
+        })),
+    };
+    seal_fixture_plan(vec![PlanFragment {
+        fragment_id: 0,
+        root,
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Result,
+        output_exprs: None,
+        output_columns,
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    }])
+}
+
+/// Build a final scan plan carrying the marker emitted by the optimizer's MV
+/// rewrite path. Downstream tests can obtain an opaque rewrite action only
+/// through the sealed scan contract.
+pub fn native_mv_rewritten_scan_plan() -> Result<DistributedPlan, String> {
+    let plan = native_scan_fixture_plan(
+        SqlScanKind::ConnectorRead,
+        vec![column_def("id", DataType::Int64, false)],
+        vec![output_column(1, "id", DataType::Int64)],
+        None,
+        Vec::new(),
+    )?;
+    let fragment = plan.fragments()[0].clone();
+    let mut root = fragment.root;
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        unreachable!("MV rewrite fixture is a scan")
+    };
+    let crate::planner::table::ScanSource::Sql(source) = &scan.table.source;
+    let occurrence =
+        crate::planner::payload::SqlScanOccurrence::from_scan(source.binding, &scan.columns)
+            .expect("MV rewrite fixture scan has an occurrence anchor");
+    let publication = crate::compiler::SqlMvRewriteSelectionFacts::try_new_for_target(
+        [7; 16],
+        [9; 32],
+        vec!["ice.db.orders".to_string()],
+        "test_catalog.test_db.test_table".to_string(),
+    )?;
+    scan.mv_rewritten_from = Some(crate::planner::payload::MvRewriteSelection::selected(
+        "mv_orders".to_string(),
+        [7; 16],
+        [9; 32],
+        vec![(occurrence, 0)],
+        publication.publication_inputs().to_vec(),
+        publication.publication_target().clone(),
+    ));
+    seal_fixture_plan(vec![PlanFragment { root, ..fragment }])
+}
+
+/// Build a malformed final MV scan whose annotation lacks publication proof.
+/// It exists only to prove that SQL sealing rejects the pre-UEA unverified
+/// marker rather than exposing it as an executable rewrite action.
+pub fn native_unverified_mv_rewritten_scan_plan() -> Result<DistributedPlan, String> {
+    let plan = native_scan_fixture_plan(
+        SqlScanKind::ConnectorRead,
+        vec![column_def("id", DataType::Int64, false)],
+        vec![output_column(1, "id", DataType::Int64)],
+        None,
+        Vec::new(),
+    )?;
+    let fragment = plan.fragments()[0].clone();
+    let mut root = fragment.root;
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        unreachable!("MV rewrite fixture is a scan")
+    };
+    scan.mv_rewritten_from = Some(crate::planner::payload::MvRewriteSelection::unverified(
+        "mv_orders".to_string(),
+    ));
+    seal_fixture_plan(vec![PlanFragment { root, ..fragment }])
+}
+
+/// Build the same final MV scan with an explicit optimizer-owned mapping from
+/// pre-rewrite scan occurrences. This exists only for cross-crate contract
+/// tests of self-join and mapping transplantation.
+pub fn native_mv_rewritten_scan_plan_with_inputs(
+    input_mapping: Vec<(crate::planning::query_execution::SqlScanOccurrence, usize)>,
+) -> Result<DistributedPlan, String> {
+    let plan = native_scan_fixture_plan(
+        SqlScanKind::ConnectorRead,
+        vec![column_def("id", DataType::Int64, false)],
+        vec![output_column(1, "id", DataType::Int64)],
+        None,
+        Vec::new(),
+    )?;
+    let fragment = plan.fragments()[0].clone();
+    let mut root = fragment.root;
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        unreachable!("MV rewrite fixture is a scan")
+    };
+    let publication = crate::compiler::SqlMvRewriteSelectionFacts::try_new_for_target(
+        [7; 16],
+        [9; 32],
+        vec!["ice.db.orders".to_string()],
+        "test_catalog.test_db.test_table".to_string(),
+    )?;
+    scan.mv_rewritten_from = Some(crate::planner::payload::MvRewriteSelection::selected(
+        "mv_orders".to_string(),
+        [7; 16],
+        [9; 32],
+        input_mapping,
+        publication.publication_inputs().to_vec(),
+        publication.publication_target().clone(),
+    ));
+    seal_fixture_plan(vec![PlanFragment { root, ..fragment }])
+}
+
 fn native_join_refresh_coalesce_plan() -> Result<DistributedPlan, String> {
-    let allocator = crate::binding::SqlTableBindingAllocator::try_new(
+    let allocator = crate::binding::SqlTableBindingAllocator::try_new_for_test(
         NonZeroU64::new(1).expect("fixture scope"),
     )?;
     let (optimized, _) = crate::planner::imv_rewrite::entrypoint::tests::tests_support::

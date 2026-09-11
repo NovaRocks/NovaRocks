@@ -26,9 +26,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_execution::task_execution::operation::CredentialUpdate;
-use novarocks_execution::task_execution::{DispatchBudget, TransportBudget};
+use novarocks_execution::task_execution::{AdmissionEpochCapability, operation::CredentialUpdate};
+use novarocks_query_application::coordination::DispatchBudget;
 use novarocks_sql::plan_read::FragmentEdge;
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecutionId};
 
 use crate::native::data_runtime::FrontendDataRuntime;
@@ -121,6 +122,12 @@ pub(crate) fn install_attempt_pumps(
     // The credential rotation owner. Without it a query that outlives its
     // vended credential keeps reading with material the provider has stopped
     // honouring, and fails somewhere inside a connector instead.
+    let blocking_io = pumps.credential_storage.as_ref().map(|_| {
+        round
+            .connector_blocking_io()
+            .expect("a production attempt with credentials owns blocking-I/O admission")
+            .clone()
+    });
     let credential = pumps.credential_storage.and_then(|storage| {
         CredentialRotationPump::new(
             pumps.execution_id,
@@ -130,6 +137,7 @@ pub(crate) fn install_attempt_pumps(
             ),
             storage,
             Arc::new(ProcessMonotonicClock::new()),
+            blocking_io.expect("credential storage requires blocking-I/O admission"),
         )
     });
     if let Some(pump) = &credential {
@@ -151,6 +159,7 @@ pub(crate) fn assemble_round(
     schedule: &SchedulingPlan,
     edges: &[FragmentEdge],
     backend_process_ids: &BTreeMap<usize, BackendProcessId>,
+    admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
     backends: &[(BackendProcessId, RuntimeEndpoint)],
     submissions: Vec<ValidatedNativeSubmission>,
     establish: AttemptEstablishFacts,
@@ -174,8 +183,10 @@ pub(crate) fn assemble_round(
     // kernel-key addresses, and the substrate takes the graph's descriptors
     // away in `QueryTaskExecution::new`.
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
+    let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
 
     let acks = TaskAckIntake::new(Arc::clone(&wake));
+    let native_compatibility_id = transport.attempt.native_compatibility_id;
     let sink = NativeTaskOperationSink::new(
         backends,
         transport.transport,
@@ -201,6 +212,8 @@ pub(crate) fn assemble_round(
         graph,
         transport.budget,
         transport.transport,
+        native_compatibility_id,
+        admission_epochs,
         Arc::new(ProcessMonotonicClock::new()),
         sink,
         intake,
@@ -212,7 +225,8 @@ pub(crate) fn assemble_round(
         Box::new(establish),
         subscriber as Arc<dyn StatusSubscriptions>,
     )
-    .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>);
+    .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>)
+    .with_connector_blocking_io(connector_blocking_io);
     Ok(AssembledRound {
         round,
         split_delivery,

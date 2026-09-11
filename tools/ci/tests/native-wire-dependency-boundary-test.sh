@@ -92,6 +92,15 @@ jq '
 assert_rejected "$proto_missing_spi" \
   "novarocks-proto-codec internal normal dependencies must be exactly"
 
+task_codec_execution="$tmpdir/task-codec-execution.json"
+jq '
+  (.packages[] | select(.name == "novarocks-task-codec") | .dependencies) += [{
+    name: "novarocks-execution", kind: null, optional: false
+  }]
+' "$base_metadata" >"$task_codec_execution"
+assert_rejected "$task_codec_execution" \
+  "novarocks-task-codec internal normal dependencies must be exactly"
+
 for role in novarocks-frontend novarocks-backend; do
   role_missing_models="$tmpdir/${role}-missing-models.json"
   jq --arg role "$role" '
@@ -128,6 +137,29 @@ for forbidden in \
     "novarocks-proto-codec normal dependency closure contains forbidden packages:"
   grep -Fq "$forbidden" "$proto_forbidden.stderr"
 done
+
+# Task Codec owns the exact Task wire conversion and may depend on the neutral
+# execution contract, but neither a direct nor transitive normal edge may pull
+# the execution kernel into its closure.
+task_codec_execution_closure="$tmpdir/task-codec-execution-closure.json"
+add_normal_resolve_edge novarocks-task-codec novarocks-execution "$task_codec_execution_closure"
+assert_rejected "$task_codec_execution_closure" \
+  "novarocks-task-codec normal dependency closure contains forbidden packages:"
+grep -Fq "novarocks-execution" "$task_codec_execution_closure.stderr"
+
+contract_execution_closure="$tmpdir/contract-execution-closure.json"
+add_normal_resolve_edge novarocks-execution-contract novarocks-execution \
+  "$contract_execution_closure"
+assert_rejected "$contract_execution_closure" \
+  "novarocks-execution-contract normal dependency closure contains forbidden packages:"
+grep -Fq "novarocks-execution" "$contract_execution_closure.stderr"
+
+contract_wire_closure="$tmpdir/contract-wire-closure.json"
+add_normal_resolve_edge novarocks-execution-contract novarocks-proto-models \
+  "$contract_wire_closure"
+assert_rejected "$contract_wire_closure" \
+  "novarocks-execution-contract normal dependency closure contains forbidden packages:"
+grep -Fq "novarocks-proto-models" "$contract_wire_closure.stderr"
 
 # Lower-layer owners must never acquire either wire crate, including through a
 # transitive normal edge. ADR-0114 deliberately excludes Iceberg and

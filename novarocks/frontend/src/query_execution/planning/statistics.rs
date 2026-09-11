@@ -367,7 +367,7 @@ mod unified_tests {
     }
 
     fn local_binding(catalog: &str, namespace: &str, table: &str, seed: u64) -> QueryTableBinding {
-        let mut allocator = novarocks_sql::binding::SqlTableBindingAllocator::try_new(
+        let mut allocator = novarocks_sql::binding::SqlTableBindingAllocator::try_new_for_test(
             NonZeroU64::new(seed).expect("non-zero fixture scope"),
         )
         .expect("binding allocator");

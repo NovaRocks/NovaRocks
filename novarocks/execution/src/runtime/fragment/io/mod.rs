@@ -31,6 +31,6 @@ pub use exchange_receiver::{
 };
 pub use result::{
     FragmentResultSession, FragmentResultWriter, ResultAbort, ResultPresentation, ResultProjection,
-    ResultWriteSpec,
+    ResultWriteAdmission, ResultWriteCredit, ResultWriteSpec,
 };
 pub use scan::{ScanRegistrationPort, UnavailableScanRegistrationPort};

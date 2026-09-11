@@ -18,6 +18,7 @@
 pub mod actors;
 mod cli;
 mod config;
+mod performance;
 mod runner;
 pub mod scenario;
 mod scenarios;

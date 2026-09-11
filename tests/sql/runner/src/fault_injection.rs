@@ -711,7 +711,13 @@ where
                 }
                 drop(server);
                 loop {
+                    if worker_fault_state.query_is_done() {
+                        return Ok(());
+                    }
                     if Instant::now() >= deadline {
+                        if worker_fault_state.query_is_done() {
+                            return Ok(());
+                        }
                         let server = worker_server
                             .lock()
                             .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
@@ -734,9 +740,6 @@ where
                         deadline,
                         &mut deadline_cancel_sent,
                     )?;
-                    if worker_fault_state.query_is_done() {
-                        return Ok(());
-                    }
                     sleep(POST_FRAGMENT_START_POLL_INTERVAL);
                 }
             }
@@ -1418,15 +1421,22 @@ mod tests {
             .expect("active-query fault execution");
 
         assert_eq!(result, 42);
+        let state = state.0.lock().expect("active query state");
+        let events = &state.events;
+        let query_start = events
+            .iter()
+            .position(|event| *event == "query:start")
+            .expect("the query started");
+        assert!(
+            events[..query_start]
+                .iter()
+                .all(|event| *event == "marker:baseline"),
+            "polling before the query starts may only observe the baseline: {events:?}"
+        );
+        assert!(!events[..query_start].is_empty());
         assert_eq!(
-            state.0.lock().expect("active query state").events,
-            vec![
-                "marker:baseline",
-                "query:start",
-                "marker:fresh",
-                "kill",
-                "query:end",
-            ]
+            &events[query_start..],
+            &["query:start", "marker:fresh", "kill", "query:end"]
         );
     }
 

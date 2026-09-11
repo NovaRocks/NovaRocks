@@ -39,9 +39,10 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     ExchangeDestination, ExchangeEdge, ExchangeEdgeId, ExchangeInbound, ExchangeSource,
     ExchangeTopology, PhysicalFragmentPlan, PlanNodeId, QueryContextRef, StageRef, TaskDescriptor,
-    TaskIdentity, TransportBudget,
+    TaskIdentity,
 };
 use novarocks_sql::plan_read::{FragmentEdge, FragmentId, PartitionKind};
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::{
     BackendProcessId, FrontendProcessId, QueryExecutionId, StageId, TaskId,
@@ -49,6 +50,7 @@ use novarocks_types::identity::{
 
 use super::error::{CapacityBound, TaskExecutionError, schedule_error};
 use crate::query_execution::FragmentInstancePlacement;
+use crate::query_execution::artifact::{BoundManifestPartitionKind, TaskManifestBinding};
 use crate::query_execution::schedule::SchedulingPlan;
 
 /// The plan facts a fragment's tasks are created with.
@@ -90,7 +92,6 @@ pub struct TaskNode {
     context: QueryContextRef,
     fragment_id: FragmentId,
     instance_index: usize,
-    backend_idx: usize,
     fragment_instance_id: UniqueId,
     split_plan_nodes: Vec<PlanNodeId>,
 }
@@ -118,10 +119,6 @@ impl TaskNode {
 
     pub const fn instance_index(&self) -> usize {
         self.instance_index
-    }
-
-    pub const fn backend_idx(&self) -> usize {
-        self.backend_idx
     }
 
     /// The execution kernel's key for this task, taken from the frozen
@@ -446,7 +443,6 @@ pub fn build_task_graph(
                     context,
                     fragment_id,
                     instance_index: placement.instance_index,
-                    backend_idx: placement.backend_idx,
                     fragment_instance_id: placement.finst_id,
                     split_plan_nodes,
                 },
@@ -534,6 +530,299 @@ pub fn build_task_graph(
     Ok(TaskGraph {
         execution_id: inputs.execution_id,
         frontend_process_id: inputs.frontend_process_id,
+        root_task,
+        tasks,
+        stages,
+        edges,
+        producer_stages,
+        contexts,
+        descriptors,
+    })
+}
+
+/// Builds the Task protocol graph from the exact application-bound manifest.
+///
+/// Unlike [`build_task_graph`], this path mints no identity and consults no
+/// scheduling plan. Every Task, context, endpoint, edge id, and sender ordinal
+/// is projected from the manifest that already joined the actor schedule to
+/// its originating topology snapshot.
+pub(crate) fn build_task_graph_from_manifest(
+    manifest: &TaskManifestBinding,
+    plans: &dyn FragmentPlanSource,
+    transport_budget: TransportBudget,
+) -> Result<TaskGraph, TaskExecutionError> {
+    let frontend_process_id = manifest
+        .contexts()
+        .first()
+        .ok_or_else(|| TaskExecutionError::Schedule("attempt manifest has no context".to_owned()))?
+        .context()
+        .frontend_process_id();
+    let mut endpoints_by_process = BTreeMap::new();
+    let mut contexts = BTreeSet::new();
+    for context in manifest.contexts() {
+        if context.context().query_execution_id() != manifest.execution()
+            || context.context().frontend_process_id() != frontend_process_id
+            || context.context().backend_process_id() != context.backend().process_id()
+        {
+            return Err(TaskExecutionError::Schedule(format!(
+                "attempt manifest context {} disagrees with its execution or backend binding",
+                context.context()
+            )));
+        }
+        if endpoints_by_process
+            .insert(
+                context.backend().process_id(),
+                context.backend().endpoint().clone(),
+            )
+            .is_some()
+        {
+            return Err(TaskExecutionError::Schedule(format!(
+                "attempt manifest repeats backend process {}",
+                context.backend().process_id()
+            )));
+        }
+        contexts.insert(context.context());
+    }
+
+    let mut tasks = BTreeMap::<TaskId, TaskNode>::new();
+    let mut tasks_by_identity = BTreeMap::<TaskIdentity, TaskId>::new();
+    let mut stage_fragments = BTreeMap::<StageId, FragmentId>::new();
+    let mut stage_tasks = BTreeMap::<StageId, Vec<TaskId>>::new();
+    let mut kernel_keys = BTreeMap::<UniqueId, TaskId>::new();
+    let mut context_task_counts = BTreeMap::<QueryContextRef, usize>::new();
+    for task in manifest.tasks() {
+        let identity = task.identity();
+        if identity.query_execution_id() != manifest.execution()
+            || identity.backend_process_id() != task.context().backend_process_id()
+            || !contexts.contains(&task.context())
+        {
+            return Err(TaskExecutionError::Schedule(format!(
+                "attempt manifest task {identity} disagrees with its execution or context"
+            )));
+        }
+        match stage_fragments.insert(identity.stage_id(), task.fragment_id()) {
+            Some(fragment) if fragment != task.fragment_id() => {
+                return Err(TaskExecutionError::Schedule(format!(
+                    "attempt manifest stage {} names both fragments {fragment} and {}",
+                    identity.stage_id(),
+                    task.fragment_id()
+                )));
+            }
+            _ => {}
+        }
+        let count = context_task_counts.entry(task.context()).or_default();
+        *count += 1;
+        if *count > transport_budget.max_tasks_per_context() {
+            return Err(CapacityBound::TasksPerContext {
+                limit: transport_budget.max_tasks_per_context(),
+            }
+            .into());
+        }
+        if kernel_keys
+            .insert(task.fragment_instance_id(), identity.task_id())
+            .is_some()
+        {
+            return Err(TaskExecutionError::Schedule(format!(
+                "attempt manifest repeats fragment instance {}",
+                task.fragment_instance_id()
+            )));
+        }
+        let split_plan_nodes = task
+            .scan_work()
+            .iter()
+            .map(|work| {
+                PlanNodeId::new(work.scan().node_id())
+                    .map_err(|error| TaskExecutionError::Schedule(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let node = TaskNode {
+            identity,
+            context: task.context(),
+            fragment_id: task.fragment_id(),
+            instance_index: task.instance_index(),
+            fragment_instance_id: task.fragment_instance_id(),
+            split_plan_nodes,
+        };
+        if tasks.insert(identity.task_id(), node).is_some()
+            || tasks_by_identity
+                .insert(identity, identity.task_id())
+                .is_some()
+        {
+            return Err(TaskExecutionError::Schedule(format!(
+                "attempt manifest repeats task identity {identity}"
+            )));
+        }
+        stage_tasks
+            .entry(identity.stage_id())
+            .or_default()
+            .push(identity.task_id());
+    }
+    let root_task = tasks_by_identity
+        .get(&manifest.root())
+        .copied()
+        .ok_or_else(|| {
+            TaskExecutionError::Schedule("attempt manifest root is absent".to_owned())
+        })?;
+
+    let mut edges = BTreeMap::<ExchangeEdgeId, EdgeNode>::new();
+    let mut outbound = BTreeMap::<TaskId, Vec<ExchangeEdge>>::new();
+    let mut inbound_sources = BTreeMap::<(TaskId, i32), Vec<ExchangeSource>>::new();
+    for edge in manifest.edges() {
+        let producer_stage = edge
+            .producers()
+            .first()
+            .ok_or_else(|| {
+                TaskExecutionError::Schedule("manifest edge has no producer".to_owned())
+            })?
+            .task()
+            .stage_id();
+        let consumer_stage = edge
+            .destinations()
+            .first()
+            .ok_or_else(|| {
+                TaskExecutionError::Schedule("manifest edge has no destination".to_owned())
+            })?
+            .stage_id();
+        let node_id = FragmentNodeId::new(edge.target_exchange_node_id());
+        for producer in edge.producers() {
+            let producer_task = *tasks_by_identity.get(&producer.task()).ok_or_else(|| {
+                TaskExecutionError::Schedule(format!(
+                    "manifest edge {} names missing producer {}",
+                    edge.edge_id(),
+                    producer.task()
+                ))
+            })?;
+            let destinations = edge
+                .destinations()
+                .iter()
+                .map(|destination| {
+                    let task_id = *tasks_by_identity.get(destination).ok_or_else(|| {
+                        TaskExecutionError::Schedule(format!(
+                            "manifest edge {} names missing destination {destination}",
+                            edge.edge_id()
+                        ))
+                    })?;
+                    let destination_node = &tasks[&task_id];
+                    let endpoint = endpoints_by_process
+                        .get(&destination.backend_process_id())
+                        .ok_or_else(|| {
+                            TaskExecutionError::Schedule(format!(
+                                "manifest destination {destination} has no frozen endpoint"
+                            ))
+                        })?;
+                    ExchangeDestination::try_new(
+                        *destination,
+                        destination_node.fragment_instance_id,
+                        endpoint.clone(),
+                        node_id,
+                        producer.sender_ordinal(),
+                        edge.sender_count(),
+                    )
+                    .map_err(TaskExecutionError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            outbound
+                .entry(producer_task)
+                .or_default()
+                .push(ExchangeEdge::try_new(
+                    edge.edge_id(),
+                    node_id,
+                    manifest_partition_type(edge.partition_kind()),
+                    destinations,
+                )?);
+            for destination in edge.destinations() {
+                let destination_task = tasks_by_identity[destination];
+                inbound_sources
+                    .entry((destination_task, edge.target_exchange_node_id()))
+                    .or_default()
+                    .push(ExchangeSource::new(
+                        producer.task(),
+                        tasks[&producer_task].fragment_instance_id,
+                        producer.sender_ordinal(),
+                    ));
+            }
+        }
+        if edges
+            .insert(
+                edge.edge_id(),
+                EdgeNode {
+                    edge_id: edge.edge_id(),
+                    producer_stage,
+                    consumer_stage,
+                    destination_node_id: node_id,
+                    producers: edge.producers().iter().map(|p| p.task()).collect(),
+                    destinations: edge.destinations().to_vec(),
+                },
+            )
+            .is_some()
+        {
+            return Err(TaskExecutionError::Schedule(format!(
+                "attempt manifest repeats exchange edge {}",
+                edge.edge_id()
+            )));
+        }
+    }
+    let mut inbound = BTreeMap::<TaskId, Vec<ExchangeInbound>>::new();
+    for ((task_id, node_id), sources) in inbound_sources {
+        inbound
+            .entry(task_id)
+            .or_default()
+            .push(ExchangeInbound::try_new(
+                FragmentNodeId::new(node_id),
+                sources,
+            )?);
+    }
+
+    let mut descriptors = BTreeMap::new();
+    for task in manifest.tasks() {
+        let facts = plans.plan_for(task.fragment_id(), task.instance_index())?;
+        if facts.plan.encoded_len() > transport_budget.max_descriptor_encoded_bytes() {
+            return Err(CapacityBound::DescriptorBytes {
+                limit: transport_budget.max_descriptor_encoded_bytes(),
+                actual: facts.plan.encoded_len(),
+            }
+            .into());
+        }
+        let task_id = task.identity().task_id();
+        descriptors.insert(
+            task_id,
+            TaskDescriptor::try_new(
+                task.identity(),
+                task.fragment_instance_id(),
+                facts.pipeline_dop,
+                tasks[&task_id].split_plan_nodes.clone(),
+                ExchangeTopology::try_new(
+                    outbound.remove(&task_id).unwrap_or_default(),
+                    inbound.remove(&task_id).unwrap_or_default(),
+                )?,
+                facts.plan,
+            )?,
+        );
+    }
+
+    let stages = stage_tasks
+        .into_iter()
+        .map(|(stage_id, task_ids)| {
+            (
+                stage_id,
+                StageNode {
+                    stage: StageRef::new(manifest.execution(), stage_id),
+                    fragment_id: stage_fragments[&stage_id],
+                    tasks: task_ids,
+                },
+            )
+        })
+        .collect();
+    let mut producer_stages = BTreeMap::<StageId, BTreeSet<StageId>>::new();
+    for edge in edges.values() {
+        producer_stages
+            .entry(edge.consumer_stage)
+            .or_default()
+            .insert(edge.producer_stage);
+    }
+    Ok(TaskGraph {
+        execution_id: manifest.execution(),
+        frontend_process_id,
         root_task,
         tasks,
         stages,
@@ -709,9 +998,16 @@ fn build_topologies(
                 .entry((consumer, fragment_edge.target_exchange_node_id))
                 .or_default();
             for &producer in &producers {
+                let sender_ordinal = *senders.ordinals.get(&producer).ok_or_else(|| {
+                    TaskExecutionError::Schedule(format!(
+                        "producer task {producer} is absent from the sender set of exchange node {}",
+                        fragment_edge.target_exchange_node_id
+                    ))
+                })?;
                 sources.push(ExchangeSource::new(
                     tasks[&producer].identity,
                     tasks[&producer].fragment_instance_id,
+                    sender_ordinal,
                 ));
             }
         }
@@ -766,5 +1062,13 @@ const fn partition_type(kind: PartitionKind) -> DataStreamPartitionType {
         PartitionKind::Unpartitioned => DataStreamPartitionType::Unpartitioned,
         PartitionKind::Random => DataStreamPartitionType::Random,
         PartitionKind::Hash => DataStreamPartitionType::HashPartitioned,
+    }
+}
+
+const fn manifest_partition_type(kind: BoundManifestPartitionKind) -> DataStreamPartitionType {
+    match kind {
+        BoundManifestPartitionKind::Unpartitioned => DataStreamPartitionType::Unpartitioned,
+        BoundManifestPartitionKind::Random => DataStreamPartitionType::Random,
+        BoundManifestPartitionKind::Hash => DataStreamPartitionType::HashPartitioned,
     }
 }

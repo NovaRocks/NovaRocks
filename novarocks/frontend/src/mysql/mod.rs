@@ -45,7 +45,9 @@ use tracing::{info, warn};
 
 use novarocks_version as version;
 
-use self::encoding::write_query_result;
+use self::encoding::{
+    write_governed_query_result, write_query_result, write_streaming_query_result,
+};
 use self::error_mapping::error_kind_for_code;
 use self::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
@@ -616,6 +618,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
         };
         let outcome = match session.execute_batch(query).await {
             Ok(StatementResult::Query(result)) => write_query_result(result, results).await,
+            Ok(StatementResult::GovernedQuery(result)) => {
+                write_governed_query_result(result, results).await
+            }
+            Ok(StatementResult::StreamingQuery(result)) => {
+                write_streaming_query_result(result, results).await
+            }
             Ok(StatementResult::Ok) => results.completed(OkResponse::default()).await,
             Err(error) => {
                 results

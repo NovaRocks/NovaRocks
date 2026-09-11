@@ -1,0 +1,16 @@
+[package]
+name = "novarocks-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+novarocks-execution-contract.workspace = true
+novarocks-types.workspace = true
+uuid = { workspace = true, features = ["v4"] }

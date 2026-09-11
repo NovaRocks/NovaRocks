@@ -19,9 +19,17 @@
 
 use std::sync::{Arc, OnceLock};
 
+#[derive(Default)]
+struct QueryCancellationState {
+    reason: OnceLock<QueryCancellationReason>,
+    changed: tokio::sync::Notify,
+}
+
 /// The actor that first requested cancellation for a statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryCancellationReason {
+    ExecutionCancellationRequested,
+    ExecutionOwnerDropped,
     ExplicitKill {
         requester_connection_id: u32,
     },
@@ -50,7 +58,7 @@ pub enum QueryCancellationRequestResult {
 /// The write capability for one statement cancellation lifetime.
 #[derive(Clone, Default)]
 pub struct QueryCancellationSource {
-    reason: Arc<OnceLock<QueryCancellationReason>>,
+    state: Arc<QueryCancellationState>,
 }
 
 impl QueryCancellationSource {
@@ -60,15 +68,19 @@ impl QueryCancellationSource {
 
     pub fn view(&self) -> QueryCancellationView {
         QueryCancellationView {
-            reason: Arc::clone(&self.reason),
+            inner: QueryCancellationViewInner::Legacy(Arc::clone(&self.state)),
         }
     }
 
     pub fn request(&self, reason: QueryCancellationReason) -> QueryCancellationRequestResult {
-        match self.reason.set(reason) {
-            Ok(()) => QueryCancellationRequestResult::Requested,
+        match self.state.reason.set(reason) {
+            Ok(()) => {
+                self.state.changed.notify_waiters();
+                QueryCancellationRequestResult::Requested
+            }
             Err(_) => QueryCancellationRequestResult::AlreadyRequested(
-                self.reason
+                self.state
+                    .reason
                     .get()
                     .expect("cancellation reason is present after rejected set")
                     .clone(),
@@ -85,16 +97,98 @@ impl QueryCancellationSource {
 /// it. Those consumers leave with CLS-R5 and CLS-R4 respectively.
 #[derive(Clone)]
 pub struct QueryCancellationView {
-    reason: Arc<OnceLock<QueryCancellationReason>>,
+    inner: QueryCancellationViewInner,
+}
+
+#[derive(Clone)]
+enum QueryCancellationViewInner {
+    Legacy(Arc<QueryCancellationState>),
+    Governed {
+        view: novarocks_workload_control::CancellationView,
+        timeout_ms: Option<u64>,
+    },
 }
 
 impl QueryCancellationView {
+    pub(crate) fn governed(
+        view: novarocks_workload_control::CancellationView,
+        timeout_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            inner: QueryCancellationViewInner::Governed { view, timeout_ms },
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
-        self.reason.get().is_some()
+        self.reason().is_some()
     }
 
     pub fn reason(&self) -> Option<QueryCancellationReason> {
-        self.reason.get().cloned()
+        match &self.inner {
+            QueryCancellationViewInner::Legacy(state) => state.reason.get().cloned(),
+            QueryCancellationViewInner::Governed { view, timeout_ms } => view
+                .reason()
+                .map(|reason| governed_reason(reason, *timeout_ms)),
+        }
+    }
+
+    /// Wait for the first cancellation without losing a transition that races
+    /// subscription setup.
+    pub async fn cancelled(&self) -> QueryCancellationReason {
+        match &self.inner {
+            QueryCancellationViewInner::Legacy(state) => loop {
+                let changed = state.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if let Some(reason) = state.reason.get().cloned() {
+                    return reason;
+                }
+                changed.await;
+            },
+            QueryCancellationViewInner::Governed { view, timeout_ms } => {
+                governed_reason(view.cancelled().await, *timeout_ms)
+            }
+        }
+    }
+}
+
+fn governed_reason(
+    reason: novarocks_workload_control::CancellationReason,
+    timeout_ms: Option<u64>,
+) -> QueryCancellationReason {
+    match reason {
+        novarocks_workload_control::CancellationReason::ExplicitKill {
+            requester_connection_id,
+        } => QueryCancellationReason::ExplicitKill {
+            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
+        },
+        novarocks_workload_control::CancellationReason::ExplicitKillConnection {
+            requester_connection_id,
+        } => QueryCancellationReason::ExplicitKillConnection {
+            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
+        },
+        novarocks_workload_control::CancellationReason::ClientDisconnected => {
+            QueryCancellationReason::ClientDisconnected
+        }
+        novarocks_workload_control::CancellationReason::DeadlineExceeded => {
+            QueryCancellationReason::DeadlineExceeded {
+                timeout_ms: timeout_ms.unwrap_or(0),
+            }
+        }
+        novarocks_workload_control::CancellationReason::FrontendDrainDeadlineExceeded => {
+            QueryCancellationReason::FrontendDrainDeadlineExceeded {
+                timeout_ms: timeout_ms.unwrap_or(0),
+            }
+        }
+        novarocks_workload_control::CancellationReason::ServerShutdown => {
+            QueryCancellationReason::ServerShutdown
+        }
+        novarocks_workload_control::CancellationReason::Requested => {
+            QueryCancellationReason::ExecutionCancellationRequested
+        }
+        novarocks_workload_control::CancellationReason::OwnerDropped => {
+            QueryCancellationReason::ExecutionOwnerDropped
+        }
     }
 }
 
@@ -148,5 +242,32 @@ mod tests {
             .count();
         assert_eq!(requested, 1);
         assert!(source.view().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn async_observer_sees_completion_before_subscription() {
+        let source = QueryCancellationSource::new();
+        let view = source.view();
+        source.request(QueryCancellationReason::ServerShutdown);
+
+        assert_eq!(
+            view.cancelled().await,
+            QueryCancellationReason::ServerShutdown
+        );
+    }
+
+    #[tokio::test]
+    async fn async_observer_wakes_after_subscription() {
+        let source = QueryCancellationSource::new();
+        let view = source.view();
+        let observer = tokio::spawn(async move { view.cancelled().await });
+        tokio::task::yield_now().await;
+
+        source.request(QueryCancellationReason::ClientDisconnected);
+
+        assert_eq!(
+            observer.await.expect("cancellation observer"),
+            QueryCancellationReason::ClientDisconnected
+        );
     }
 }

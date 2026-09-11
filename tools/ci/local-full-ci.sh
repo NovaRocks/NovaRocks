@@ -476,6 +476,10 @@ run_cargo_gates() {
     tools/ci/check-native-wire-dependency-boundary.py
   run_fail_fast_stage "native wire dependency boundary mutations" "native-wire-dependency-boundary-test.log" \
     tools/ci/tests/native-wire-dependency-boundary-test.sh
+  run_fail_fast_stage "application domain dependency boundary" "application-domain-dependency-boundary.log" \
+    tools/ci/check-application-domain-dependency-boundary.py
+  run_fail_fast_stage "application domain dependency boundary mutations" "application-domain-dependency-boundary-test.log" \
+    tools/ci/tests/application-domain-dependency-boundary-test.sh
   run_fail_fast_stage "native trust dependency boundary" "native-trust-dependency-boundary.log" \
     tools/ci/check-native-trust-dependency-boundary.py
   run_fail_fast_stage "native trust dependency boundary mutations" "native-trust-dependency-boundary-test.log" \

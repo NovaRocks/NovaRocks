@@ -26,9 +26,9 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use hmac::{Hmac, Mac};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -57,6 +57,31 @@ pub struct IsolatedIcebergRestEndpoints {
     pub rest_warehouse: String,
     pub minio_endpoint: String,
     pub compose_project: String,
+}
+
+/// Safe, immutable identity of one image actually running in the fixture.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct IsolatedIcebergRestImageIdentity {
+    pub image_id: String,
+    pub image_reference: String,
+}
+
+/// Provider facts that are safe to place in a benchmark artifact.
+///
+/// This deliberately contains neither the compose project nor endpoints,
+/// ports, warehouses, access keys, or other generated configuration. Image
+/// identities come from live containers, while the three hashes bind the
+/// checked-in fixture implementation that started them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct IsolatedIcebergRestRuntimeIdentity {
+    pub schema_version: u32,
+    pub images: BTreeMap<String, IsolatedIcebergRestImageIdentity>,
+    pub compose_sha256: String,
+    pub scripts_sha256: String,
+    pub model_sha256: String,
+    pub rest_version: String,
+    pub minio_version: String,
+    pub capabilities: BTreeSet<String>,
 }
 
 impl fmt::Debug for IsolatedIcebergRestEndpoints {
@@ -246,6 +271,107 @@ impl IsolatedIcebergRestFixture {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// Observes the exact live provider runtime without returning generated
+    /// network or credential material.
+    pub fn runtime_identity(&self) -> Result<IsolatedIcebergRestRuntimeIdentity> {
+        self.assert_owned_paths()?;
+        ensure!(self.active, "isolated provider runtime is no longer active");
+        let mut images = ["minio", "rest", "spark"]
+            .into_iter()
+            .map(|service| {
+                Ok((
+                    service.to_string(),
+                    live_service_image(&self.repo_root, &self.compose_project, service)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mc_container =
+            completed_service_container(&self.repo_root, &self.compose_project, "mc")?;
+        images.insert(
+            "mc".to_string(),
+            container_image(&self.repo_root, &mc_container, "mc")?,
+        );
+
+        let minio_container =
+            live_service_container(&self.repo_root, &self.compose_project, "minio")?;
+        let minio_version = minio_runtime_version(&self.repo_root, &minio_container)?;
+        let rest_container =
+            live_service_container(&self.repo_root, &self.compose_project, "rest")?;
+        let rest_environment = container_string_array(
+            &self.repo_root,
+            &rest_container,
+            "{{json .Config.Env}}",
+            "REST environment",
+        )?;
+        ensure!(
+            rest_environment
+                .iter()
+                .any(|value| value == "CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO")
+                && rest_environment
+                    .iter()
+                    .any(|value| value == "CATALOG_S3_PATH__STYLE__ACCESS=true"),
+            "isolated REST runtime does not expose the required S3FileIO path-style capability"
+        );
+        let rest_image = images
+            .get("rest")
+            .context("isolated REST image identity is absent")?;
+        let rest_version = image_tag(&rest_image.image_reference)
+            .context("isolated REST image reference has no immutable version tag")?;
+        ensure!(
+            rest_version != "latest",
+            "isolated REST image does not expose a concrete runtime version"
+        );
+
+        let fixture_root = self.repo_root.join("docker/iceberg-rest");
+        let compose_path = fixture_root.join("compose.yml");
+        let compose_sha256 = hash_named_files(&self.repo_root, &[compose_path.clone()])?;
+        let mut scripts = Vec::new();
+        for entry in fs::read_dir(&fixture_root)
+            .with_context(|| format!("read fixture scripts from {}", fixture_root.display()))?
+        {
+            let path = entry.context("read fixture script entry")?.path();
+            if path.extension().is_some_and(|extension| extension == "sh") {
+                scripts.push(path);
+            }
+        }
+        scripts.sort();
+        ensure!(
+            !scripts.is_empty(),
+            "isolated fixture has no checked-in scripts"
+        );
+        let scripts_sha256 = hash_named_files(&self.repo_root, &scripts)?;
+        let model_sha256 = hash_named_files(
+            &self.repo_root,
+            &[compose_path, fixture_root.join("spark/Dockerfile")],
+        )?;
+        let capabilities = [
+            "iceberg-rest-v1",
+            "minio-s3",
+            "path-style-s3",
+            "spark-iceberg-bootstrap",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        Ok(IsolatedIcebergRestRuntimeIdentity {
+            schema_version: 1,
+            images,
+            compose_sha256,
+            scripts_sha256,
+            model_sha256,
+            rest_version,
+            minio_version,
+            capabilities,
+        })
+    }
+
+    /// Returns the static object-store identity owned by this isolated
+    /// fixture. Test scenarios use it to install the same explicit credential
+    /// generation in every process before creating a REST catalog.
+    pub fn static_s3_identity(&self) -> IsolatedS3Identity {
+        self.minio_root_identity.clone()
     }
 
     /// Creates two distinct, valid MinIO STS identities. The fixture first
@@ -978,6 +1104,199 @@ fn fixture_owner_pid(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+fn live_service_container(
+    repo_root: &Path,
+    compose_project: &str,
+    service: &str,
+) -> Result<String> {
+    let project_label = format!("label=com.docker.compose.project={compose_project}");
+    let service_label = format!("label=com.docker.compose.service={service}");
+    let containers = docker_ids(
+        repo_root,
+        &[
+            "ps",
+            "-q",
+            "--filter",
+            &project_label,
+            "--filter",
+            &service_label,
+        ],
+    )?;
+    ensure!(
+        containers.len() == 1,
+        "isolated fixture service {service} has {} live containers",
+        containers.len()
+    );
+    Ok(containers[0].clone())
+}
+
+fn completed_service_container(
+    repo_root: &Path,
+    compose_project: &str,
+    service: &str,
+) -> Result<String> {
+    let project_label = format!("label=com.docker.compose.project={compose_project}");
+    let service_label = format!("label=com.docker.compose.service={service}");
+    let containers = docker_ids(
+        repo_root,
+        &[
+            "ps",
+            "-aq",
+            "--filter",
+            &project_label,
+            "--filter",
+            &service_label,
+        ],
+    )?;
+    ensure!(
+        containers.len() == 1,
+        "isolated fixture service {service} has {} containers",
+        containers.len()
+    );
+    let container = containers[0].clone();
+    ensure!(
+        docker_inspect_scalar(
+            repo_root,
+            &container,
+            "{{.State.Status}}",
+            "completed service state"
+        )? == "exited"
+            && docker_inspect_scalar(
+                repo_root,
+                &container,
+                "{{.State.ExitCode}}",
+                "completed service exit code"
+            )? == "0",
+        "isolated fixture service {service} did not complete successfully"
+    );
+    Ok(container)
+}
+
+fn live_service_image(
+    repo_root: &Path,
+    compose_project: &str,
+    service: &str,
+) -> Result<IsolatedIcebergRestImageIdentity> {
+    let container = live_service_container(repo_root, compose_project, service)?;
+    container_image(repo_root, &container, service)
+}
+
+fn container_image(
+    repo_root: &Path,
+    container: &str,
+    service: &str,
+) -> Result<IsolatedIcebergRestImageIdentity> {
+    let image_id = docker_inspect_scalar(repo_root, &container, "{{.Image}}", "image id")?;
+    ensure!(
+        image_id.strip_prefix("sha256:").is_some_and(
+            |digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        ),
+        "isolated fixture service {service} did not report an immutable image id"
+    );
+    let image_reference = docker_inspect_scalar(
+        repo_root,
+        &container,
+        "{{.Config.Image}}",
+        "image reference",
+    )?;
+    ensure!(
+        !image_reference.trim().is_empty(),
+        "isolated fixture service {service} has an empty image reference"
+    );
+    Ok(IsolatedIcebergRestImageIdentity {
+        image_id,
+        image_reference,
+    })
+}
+
+fn docker_inspect_scalar(
+    repo_root: &Path,
+    object: &str,
+    format: &str,
+    fact: &str,
+) -> Result<String> {
+    let output = run_docker(repo_root, &["inspect", "--format", format, object])?;
+    ensure!(
+        output.status.success(),
+        "docker inspect for {fact} exited with {}",
+        output.status
+    );
+    let value = String::from_utf8(output.stdout)
+        .with_context(|| format!("decode Docker {fact}"))?
+        .trim()
+        .to_string();
+    ensure!(!value.is_empty(), "Docker {fact} is empty");
+    Ok(value)
+}
+
+fn container_string_array(
+    repo_root: &Path,
+    container: &str,
+    format: &str,
+    fact: &str,
+) -> Result<Vec<String>> {
+    let json = docker_inspect_scalar(repo_root, container, format, fact)?;
+    serde_json::from_str(&json).with_context(|| format!("decode Docker {fact}"))
+}
+
+fn minio_runtime_version(repo_root: &Path, container: &str) -> Result<String> {
+    let output = run_docker(repo_root, &["exec", container, "minio", "--version"])?;
+    ensure!(
+        output.status.success(),
+        "read isolated MinIO version exited with {}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).context("decode isolated MinIO version")?;
+    let version = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.trim().strip_prefix("minio version "))
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .context("isolated MinIO version output has no version")?;
+    Ok(version.to_string())
+}
+
+fn image_tag(reference: &str) -> Option<String> {
+    let (repository, tag) = reference.rsplit_once(':')?;
+    (!repository.is_empty()
+        && repository != "sha256"
+        && !reference.contains('@')
+        && !tag.is_empty()
+        && !tag.contains('/'))
+    .then(|| tag.to_string())
+}
+
+fn hash_named_files(repo_root: &Path, paths: &[PathBuf]) -> Result<String> {
+    ensure!(!paths.is_empty(), "fixture identity file set is empty");
+    let mut paths = paths.to_vec();
+    paths.sort();
+    paths.dedup();
+    let mut hasher = Sha256::new();
+    for path in paths {
+        ensure!(
+            path.starts_with(repo_root),
+            "fixture identity refuses a file outside the repository"
+        );
+        let relative = path
+            .strip_prefix(repo_root)
+            .context("derive fixture identity relative path")?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("read fixture identity input {}", path.display()))?;
+        ensure!(
+            !bytes.is_empty(),
+            "fixture identity input {} is empty",
+            path.display()
+        );
+        let relative = relative.to_string_lossy();
+        hasher.update((relative.len() as u64).to_le_bytes());
+        hasher.update(relative.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
 /// Runs one `docker` command and returns its non-empty output lines.
 fn docker_ids(repo_root: &Path, args: &[&str]) -> Result<Vec<String>> {
     let output = run_docker(repo_root, args)?;
@@ -1515,5 +1834,79 @@ mod tests {
             .join("docker/iceberg-rest/runtime")
             .join("cca1-vended-rest-0-0-0");
         remove_runtime_entry(&repo_root, &missing).expect("removing a missing entry is a no-op");
+    }
+
+    #[test]
+    fn provider_runtime_identity_serialization_is_safe_and_exact() {
+        let identity = IsolatedIcebergRestRuntimeIdentity {
+            schema_version: 1,
+            images: BTreeMap::from([(
+                "rest".to_string(),
+                IsolatedIcebergRestImageIdentity {
+                    image_id: format!("sha256:{}", "a".repeat(64)),
+                    image_reference: "apache/iceberg-rest-fixture:1.10.1".to_string(),
+                },
+            )]),
+            compose_sha256: "b".repeat(64),
+            scripts_sha256: "c".repeat(64),
+            model_sha256: "d".repeat(64),
+            rest_version: "1.10.1".to_string(),
+            minio_version: "RELEASE.2025-09-07T16-13-09Z".to_string(),
+            capabilities: BTreeSet::from(["iceberg-rest-v1".to_string()]),
+        };
+        let value = serde_json::to_value(identity).expect("serialize runtime identity");
+        let keys = value
+            .as_object()
+            .expect("runtime identity object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "capabilities",
+                "compose_sha256",
+                "images",
+                "minio_version",
+                "model_sha256",
+                "rest_version",
+                "schema_version",
+                "scripts_sha256",
+            ])
+        );
+        let text = value.to_string();
+        for forbidden in ["endpoint", "port", "project", "secret", "warehouse"] {
+            assert!(!text.to_ascii_lowercase().contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn provider_model_hash_is_order_independent_but_content_sensitive() {
+        let repo_root = repository_root().expect("repository root");
+        let compose = repo_root.join("docker/iceberg-rest/compose.yml");
+        let dockerfile = repo_root.join("docker/iceberg-rest/spark/Dockerfile");
+        let forward = hash_named_files(&repo_root, &[compose.clone(), dockerfile.clone()])
+            .expect("hash model");
+        let reverse = hash_named_files(&repo_root, &[dockerfile, compose.clone()])
+            .expect("hash reversed model");
+        let compose_only =
+            hash_named_files(&repo_root, &[compose]).expect("hash compose-only model");
+        assert_eq!(forward, reverse);
+        assert_ne!(forward, compose_only);
+        assert_eq!(forward.len(), 64);
+    }
+
+    #[test]
+    fn provider_version_requires_an_explicit_image_tag() {
+        assert_eq!(
+            image_tag("apache/iceberg-rest-fixture:1.10.1").as_deref(),
+            Some("1.10.1")
+        );
+        assert_eq!(
+            image_tag("registry:5000/team/rest:2.0").as_deref(),
+            Some("2.0")
+        );
+        assert_eq!(image_tag("apache/iceberg-rest-fixture"), None);
+        assert_eq!(image_tag("sha256:abcdef"), None);
     }
 }

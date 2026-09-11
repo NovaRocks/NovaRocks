@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessServerHandle,
-    NativeTrustFixture, ServerHandle,
+    LaunchProfile, NativeTrustFixture, ServerHandle,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -25,6 +25,16 @@ pub struct ScenarioBinaryLayout {
 
 pub trait Scenario: Send + Sync {
     fn name(&self) -> &'static str;
+
+    /// Validates runner-wide inputs before any selected scenario launches a
+    /// process. Scenarios with special profiles or manifests fail here.
+    fn validate_runner_inputs(
+        &self,
+        _launch_profile: LaunchProfile,
+        _uea1_workload_manifest: Option<&Path>,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// External-fixture scenarios remain discoverable and runnable by exact
     /// selector, but do not turn the normal no-Docker system baseline into a
@@ -79,6 +89,9 @@ pub struct ScenarioContext {
     base_config_path: PathBuf,
     cluster_size: usize,
     startup_timeout: Duration,
+    launch_profile: LaunchProfile,
+    uea1_workload_manifest: Option<PathBuf>,
+    uea1_preparation_diagnostic_secret: Option<String>,
 }
 
 impl ScenarioContext {
@@ -92,6 +105,9 @@ impl ScenarioContext {
         other_island_binary: Option<PathBuf>,
         base_config_path: PathBuf,
         cluster_size: usize,
+        launch_profile: LaunchProfile,
+        uea1_workload_manifest: Option<PathBuf>,
+        uea1_preparation_diagnostic_secret: Option<String>,
     ) -> Self {
         Self {
             name,
@@ -105,6 +121,9 @@ impl ScenarioContext {
             base_config_path,
             cluster_size,
             startup_timeout: timeout,
+            launch_profile,
+            uea1_workload_manifest,
+            uea1_preparation_diagnostic_secret,
         }
     }
 
@@ -114,6 +133,37 @@ impl ScenarioContext {
 
     pub fn handle(&mut self) -> &mut CrossProcessServerHandle {
         &mut self.handle
+    }
+
+    pub fn process_ids(&self) -> novarocks_cluster_harness::process_resources::ClusterProcessIds {
+        self.handle.process_ids()
+    }
+
+    pub fn process_launch_identities(
+        &self,
+    ) -> (
+        &novarocks_cluster_harness::process_resources::ProcessLaunchIdentity,
+        &[novarocks_cluster_harness::process_resources::ProcessLaunchIdentity],
+    ) {
+        self.handle.process_launch_identities()
+    }
+
+    pub fn process_resource_identities(
+        &self,
+    ) -> Result<novarocks_cluster_harness::process_resources::ClusterProcessIdentities> {
+        self.handle.process_resource_identities()
+    }
+
+    pub fn recheck_live_process_launch_identities(
+        &self,
+    ) -> Result<Vec<novarocks_cluster_harness::process_resources::ProcessLaunchIdentity>> {
+        self.handle.recheck_live_process_launch_identities()
+    }
+
+    pub fn effective_launch_config_evidence(
+        &self,
+    ) -> &novarocks_cluster_harness::EffectiveLaunchConfigEvidence {
+        self.handle.effective_launch_config_evidence()
     }
 
     pub fn mysql_port(&self) -> u16 {
@@ -150,6 +200,30 @@ impl ScenarioContext {
 
     pub fn scenario_root(&self) -> &Path {
         &self.scenario_root
+    }
+
+    pub fn primary_binary(&self) -> &Path {
+        &self.binary
+    }
+
+    pub fn base_config_path(&self) -> &Path {
+        &self.base_config_path
+    }
+
+    pub fn launch_profile(&self) -> LaunchProfile {
+        self.launch_profile
+    }
+
+    pub fn uea1_workload_manifest(&self) -> Option<&Path> {
+        self.uea1_workload_manifest.as_deref()
+    }
+
+    pub fn uea1_preparation_diagnostic_secret(&self) -> Option<&str> {
+        self.uea1_preparation_diagnostic_secret.as_deref()
+    }
+
+    pub fn fe_http_port(&self) -> u16 {
+        self.handle.runtime().fe_http_port
     }
 
     pub fn diagnostics(&self) -> String {
@@ -197,8 +271,7 @@ impl ScenarioContext {
             base_config_path: self.base_config_path.clone(),
             runtime_root,
             cluster_size: self.cluster_size,
-            query_lifecycle_faults_enabled: true,
-            cleanup_faults_enabled: true,
+            launch_profile: self.launch_profile,
             startup_timeout: self.startup_timeout,
             child_environment: launch_config.child_environment,
             config_overlay: launch_config.config_overlay,

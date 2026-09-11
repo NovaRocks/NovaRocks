@@ -45,6 +45,7 @@ mod read_session;
 mod resources;
 mod row_mutation;
 mod scalar;
+mod semantic_revision;
 mod staged_create;
 mod statistics;
 mod view_metadata;
@@ -58,7 +59,8 @@ pub use binding::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlWriteBinding,
     ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
     ConnectorMaterializationError, ConnectorMaterializationErrorClass,
-    ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
+    ConnectorMaterializationRetryDisposition, ConnectorReadAttemptAccess,
+    ConnectorReadAttemptCapabilities, MaterializationContext, NormalizedCatalogProperties,
 };
 pub use catalog::{
     CATALOG_VERSION_BYTES, CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion,
@@ -93,8 +95,9 @@ pub use codec::{
     MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
 };
 pub use context::{
-    ConnectorCancellation, ConnectorRequestContext, ConnectorRequestScope,
-    ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
+    ConnectorAttemptContext, ConnectorCancellation, ConnectorPlanningContext,
+    ConnectorRequestContext, ConnectorRequestScope, ConnectorStorageResolver,
+    ResolvedVendedS3Access, StorageAccessRequest,
 };
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
@@ -282,6 +285,10 @@ pub use row_mutation::{
     MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
+pub use semantic_revision::{
+    ConnectorExactSemanticRevision, ConnectorSemanticFact,
+    MAX_CONNECTOR_SEMANTIC_FACT_FORMAT_BYTES, MAX_CONNECTOR_SEMANTIC_FACT_VALUE_BYTES,
+};
 pub use staged_create::{
     CONNECTOR_CTAS_UNANCHORED_CLEANUP_CONTRACT_VERSION, CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
     ConnectorCtasUnanchoredCleanupOutcome, ConnectorCtasUnanchoredCleanupRequest,

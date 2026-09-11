@@ -12,6 +12,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+bytes.workspace = true
 prost.workspace = true
 
 [dev-dependencies]

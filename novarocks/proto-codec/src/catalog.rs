@@ -66,7 +66,7 @@ impl CatalogSet {
             catalogs: catalogs
                 .into_iter()
                 .map(encode_catalog_properties)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 
@@ -295,8 +295,10 @@ pub fn decode_catalog_handle(
     ))
 }
 
-pub fn encode_catalog_properties(properties: CatalogProperties) -> wire::CatalogProperties {
-    wire::CatalogProperties {
+pub fn encode_catalog_properties(
+    properties: CatalogProperties,
+) -> Result<wire::CatalogProperties, ProtocolError> {
+    Ok(wire::CatalogProperties {
         handle: Some(encode_catalog_handle(properties.handle())),
         provider_id: properties.provider_id().as_str().to_owned(),
         config_format_version: properties.config_format_version(),
@@ -313,8 +315,8 @@ pub fn encode_catalog_properties(properties: CatalogProperties) -> wire::Catalog
             .iter()
             .cloned()
             .map(encode_catalog_credential_binding)
-            .collect(),
-    }
+            .collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
 pub fn decode_catalog_properties(
@@ -370,7 +372,15 @@ pub fn decode_catalog_properties(
 
 fn encode_catalog_credential_binding(
     binding: CatalogCredentialBinding,
-) -> wire::CatalogCredentialBinding {
+) -> Result<wire::CatalogCredentialBinding, ProtocolError> {
+    if binding.purpose() != CatalogCredentialPurpose::ObjectStoreData
+        || binding.consumer_role() != CredentialConsumerRole::Backend
+    {
+        return Err(invalid(
+            FieldPath::root("catalog_properties").field("credential_bindings"),
+            "backend CatalogSet credential bindings must use object-store-data with backend consumer role",
+        ));
+    }
     let mode = match binding.mode() {
         CatalogCredentialMode::Static(reference) => {
             wire::catalog_credential_binding::Mode::StaticCredential(
@@ -384,20 +394,27 @@ fn encode_catalog_credential_binding(
             wire::catalog_credential_binding::Mode::VendedCredential(wire::VendedCredential {})
         }
     };
-    wire::CatalogCredentialBinding {
-        purpose: encode_credential_purpose(binding.purpose()) as i32,
-        consumer_role: encode_consumer_role(binding.consumer_role()) as i32,
+    Ok(wire::CatalogCredentialBinding {
+        purpose: wire::CatalogCredentialPurpose::ObjectStoreData as i32,
+        consumer_role: wire::CredentialConsumerRole::Backend as i32,
         mode: Some(mode),
-    }
+    })
 }
 
 fn decode_catalog_credential_binding(
     raw: wire::CatalogCredentialBinding,
     root: FieldPath,
 ) -> Result<CatalogCredentialBinding, ProtocolError> {
-    let purpose = decode_credential_purpose(raw.purpose, root.clone().field("purpose"))?;
-    let consumer_role =
-        decode_consumer_role(raw.consumer_role, root.clone().field("consumer_role"))?;
+    if wire::CatalogCredentialPurpose::try_from(raw.purpose)
+        != Ok(wire::CatalogCredentialPurpose::ObjectStoreData)
+        || wire::CredentialConsumerRole::try_from(raw.consumer_role)
+            != Ok(wire::CredentialConsumerRole::Backend)
+    {
+        return Err(invalid(
+            root.clone(),
+            "backend CatalogSet credential bindings must use object-store-data with backend consumer role",
+        ));
+    }
     let mode = match raw
         .mode
         .ok_or_else(|| missing(root.clone().field("mode"), "credential mode is required"))?
@@ -414,56 +431,12 @@ fn decode_catalog_credential_binding(
             CatalogCredentialMode::Vended
         }
     };
-    CatalogCredentialBinding::try_new(purpose, consumer_role, mode)
-        .map_err(|error| invalid(root, error.to_string()))
-}
-
-fn encode_credential_purpose(value: CatalogCredentialPurpose) -> wire::CatalogCredentialPurpose {
-    match value {
-        CatalogCredentialPurpose::CatalogControl => wire::CatalogCredentialPurpose::CatalogControl,
-        CatalogCredentialPurpose::ObjectStoreData => {
-            wire::CatalogCredentialPurpose::ObjectStoreData
-        }
-    }
-}
-
-fn decode_credential_purpose(
-    value: i32,
-    root: FieldPath,
-) -> Result<CatalogCredentialPurpose, ProtocolError> {
-    match wire::CatalogCredentialPurpose::try_from(value) {
-        Ok(wire::CatalogCredentialPurpose::CatalogControl) => {
-            Ok(CatalogCredentialPurpose::CatalogControl)
-        }
-        Ok(wire::CatalogCredentialPurpose::ObjectStoreData) => {
-            Ok(CatalogCredentialPurpose::ObjectStoreData)
-        }
-        _ => Err(invalid(root, "catalog credential purpose is invalid")),
-    }
-}
-
-fn encode_consumer_role(value: CredentialConsumerRole) -> wire::CredentialConsumerRole {
-    match value {
-        CredentialConsumerRole::Frontend => wire::CredentialConsumerRole::Frontend,
-        CredentialConsumerRole::Backend => wire::CredentialConsumerRole::Backend,
-        CredentialConsumerRole::FrontendAndBackend => {
-            wire::CredentialConsumerRole::FrontendAndBackend
-        }
-    }
-}
-
-fn decode_consumer_role(
-    value: i32,
-    root: FieldPath,
-) -> Result<CredentialConsumerRole, ProtocolError> {
-    match wire::CredentialConsumerRole::try_from(value) {
-        Ok(wire::CredentialConsumerRole::Frontend) => Ok(CredentialConsumerRole::Frontend),
-        Ok(wire::CredentialConsumerRole::Backend) => Ok(CredentialConsumerRole::Backend),
-        Ok(wire::CredentialConsumerRole::FrontendAndBackend) => {
-            Ok(CredentialConsumerRole::FrontendAndBackend)
-        }
-        _ => Err(invalid(root, "catalog credential consumer role is invalid")),
-    }
+    CatalogCredentialBinding::try_new(
+        CatalogCredentialPurpose::ObjectStoreData,
+        CredentialConsumerRole::Backend,
+        mode,
+    )
+    .map_err(|error| invalid(root, error.to_string()))
 }
 
 fn invalid(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
@@ -507,7 +480,7 @@ mod tests {
             vec![
                 CatalogCredentialBinding::try_new(
                     CatalogCredentialPurpose::ObjectStoreData,
-                    CredentialConsumerRole::FrontendAndBackend,
+                    CredentialConsumerRole::Backend,
                     CatalogCredentialMode::Static(
                         StaticCredentialReference::try_new("object_store", "v1").unwrap(),
                     ),
@@ -540,11 +513,71 @@ mod tests {
 
         let raw = wire::CatalogSet {
             catalogs: vec![
-                encode_catalog_properties(properties("beta", 2)),
-                encode_catalog_properties(properties("alpha", 1)),
+                encode_catalog_properties(properties("beta", 2)).unwrap(),
+                encode_catalog_properties(properties("alpha", 1)).unwrap(),
             ],
         };
         assert!(CatalogSet::parse(raw).is_err());
+    }
+
+    #[test]
+    fn frontend_credentials_cannot_enter_the_backend_catalog_wire() {
+        for (purpose, name) in [
+            (CatalogCredentialPurpose::CatalogControl, "control"),
+            (CatalogCredentialPurpose::ObjectStoreMetadata, "metadata"),
+        ] {
+            let frontend = CatalogProperties::new(
+                CatalogHandle::new(
+                    ConnectorInstanceId::try_from_canonical(name).unwrap(),
+                    CatalogVersion::from_bytes([1; CATALOG_VERSION_BYTES]),
+                ),
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                1,
+                vec![],
+                vec![
+                    CatalogCredentialBinding::try_new(
+                        purpose,
+                        CredentialConsumerRole::Frontend,
+                        CatalogCredentialMode::Static(
+                            StaticCredentialReference::try_new(name, "v1").unwrap(),
+                        ),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+
+            let error =
+                CatalogSet::new([frontend]).expect_err("frontend-only credential must fail closed");
+            assert!(error.detail().contains("object-store-data"), "{error}");
+        }
+    }
+
+    #[test]
+    fn backend_catalog_wire_rejects_non_data_or_non_backend_bindings() {
+        let valid = CatalogSet::new([properties("alpha", 1)])
+            .unwrap()
+            .as_proto()
+            .clone();
+        for (purpose, consumer_role) in [
+            (
+                wire::CatalogCredentialPurpose::CatalogControl as i32,
+                wire::CredentialConsumerRole::Frontend as i32,
+            ),
+            (
+                wire::CatalogCredentialPurpose::ObjectStoreData as i32,
+                wire::CredentialConsumerRole::Frontend as i32,
+            ),
+            (2, wire::CredentialConsumerRole::Frontend as i32),
+        ] {
+            let mut raw = valid.clone();
+            let binding = &mut raw.catalogs[0].credential_bindings[0];
+            binding.purpose = purpose;
+            binding.consumer_role = consumer_role;
+
+            let error = CatalogSet::parse(raw).expect_err("invalid BE binding must fail closed");
+            assert!(error.detail().contains("object-store-data"), "{error}");
+        }
     }
 
     #[test]

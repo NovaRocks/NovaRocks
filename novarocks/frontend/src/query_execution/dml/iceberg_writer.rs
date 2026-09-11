@@ -466,7 +466,9 @@ impl PreparedIcebergWriteNativeEncoding<'_> {
                     &plan,
                 )
                 .expect("test native INSERT fixture must prepare");
-            crate::query_execution::compiler::NativeFragmentEncodingInput::new(plan, prepared)
+            crate::query_execution::compiler::NativeFragmentEncodingInput::new_for_test(
+                plan, prepared,
+            )
         });
         Ok(PreparedIcebergWriteNativeEncoding {
             inner: PreparedIcebergWriteNativeEncodingInner::TestFixture(input),

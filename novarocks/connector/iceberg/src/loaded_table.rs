@@ -157,6 +157,25 @@ impl IcebergLoadedTableMaterialization {
             )),
         }
     }
+
+    /// Inspect only the immutable object identity from a fresh Catalog
+    /// response. The placeholder FileIO is never used for data or metadata I/O;
+    /// it lets the vendored value complete its move-only table construction
+    /// without retaining an admitted request's resolver in a lease refresher.
+    fn into_table_uuid_for_identity_check(self) -> Result<uuid::Uuid, ConnectorError> {
+        match self {
+            Self::Materialized(table) => Ok(table.metadata().uuid()),
+            Self::DeferredRest(materialization) => materialization
+                .materialize_with_file_io(crate::iceberg::io::FileIO::new_with_memory())
+                .map(|table| table.metadata().uuid())
+                .map_err(|error| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        format!("inspect REST Iceberg table identity: {error}"),
+                    )
+                }),
+        }
+    }
 }
 
 /// Provider-private, redacted source for one vended S3 query lease.
@@ -176,6 +195,24 @@ pub(crate) struct IcebergVendedCredentialLeaseSeed {
 pub(crate) struct IcebergVendedS3RefreshScope {
     prefixes: Vec<StorageCredentialScopePrefix>,
     endpoint: Arc<str>,
+}
+
+/// Non-secret scope retained when the declared REST generation has no
+/// independent credentials endpoint and must renew through `load_table`.
+///
+/// The exact table identity is kept by the refresher itself. This value only
+/// proves that a later response did not expand or retarget storage authority.
+#[derive(Clone)]
+pub(crate) struct IcebergVendedS3LoadTableScope {
+    prefixes: Vec<StorageCredentialScopePrefix>,
+}
+
+/// Closed renewal paths supported by one parsed REST delegation response.
+/// Callers select exactly one path and never probe another after failure.
+#[derive(Clone)]
+pub(crate) enum IcebergVendedS3RenewalCapability {
+    CredentialsEndpoint(IcebergVendedS3RefreshScope),
+    LoadTableDelegation(IcebergVendedS3LoadTableScope),
 }
 
 impl IcebergVendedCredentialLeaseSeed {
@@ -222,6 +259,54 @@ impl IcebergVendedCredentialLeaseSeed {
                     .collect(),
                 endpoint: Arc::clone(endpoint),
             })
+    }
+
+    pub(crate) fn load_table_refresh_scope(&self) -> IcebergVendedS3LoadTableScope {
+        IcebergVendedS3LoadTableScope {
+            prefixes: self
+                .credentials
+                .iter()
+                .map(|entry| entry.prefix.clone())
+                .collect(),
+        }
+    }
+
+    pub(crate) fn renewal_capability(&self) -> IcebergVendedS3RenewalCapability {
+        match self.refresh_scope() {
+            Some(scope) => IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope),
+            None => IcebergVendedS3RenewalCapability::LoadTableDelegation(
+                self.load_table_refresh_scope(),
+            ),
+        }
+    }
+
+    /// A staged target has no stable table endpoint until publication. It can
+    /// therefore continue only when this response declares an independent
+    /// credentials endpoint.
+    pub(crate) fn staged_refresh_scope(
+        &self,
+    ) -> Result<IcebergVendedS3RefreshScope, ConnectorError> {
+        match self.renewal_capability() {
+            IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope) => Ok(scope),
+            IcebergVendedS3RenewalCapability::LoadTableDelegation(_) => Err(invalid(
+                "REST staged create vended credentials have no independent renewal endpoint",
+            )),
+        }
+    }
+
+    /// Prove that this response authorizes the immutable table facts an
+    /// attempt is about to use. The catalog may have returned a newer metadata
+    /// location; callers pass the already-bound table when reacquiring an
+    /// attempt so the check remains against the original resources.
+    pub(crate) fn validate_table_access(
+        &self,
+        table: &crate::iceberg::table::Table,
+    ) -> Result<(), ConnectorError> {
+        self.select_for_location(table.metadata().location())?;
+        if let Some(metadata_location) = table.metadata_location() {
+            self.select_for_location(metadata_location)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn not_after_unix_ms(&self) -> u64 {
@@ -295,7 +380,7 @@ impl IcebergVendedS3RefreshScope {
         &self.endpoint
     }
 
-    fn matches_seed(&self, seed: &IcebergVendedCredentialLeaseSeed) -> bool {
+    pub(crate) fn matches_seed(&self, seed: &IcebergVendedCredentialLeaseSeed) -> bool {
         // The credentials endpoint is capability carried by the initial table
         // response.  A standard refresh response need only rotate the
         // credentials themselves (Trino's provider retains the endpoint from
@@ -305,6 +390,47 @@ impl IcebergVendedS3RefreshScope {
         seed.refresh_endpoint
             .as_deref()
             .is_none_or(|endpoint| endpoint == self.endpoint())
+            && seed.credentials.len() == self.prefixes.len()
+            && seed
+                .credentials
+                .iter()
+                .zip(&self.prefixes)
+                .all(|(credential, prefix)| credential.prefix == *prefix)
+    }
+
+    /// Bind a newly acquired attempt to the declared credentials endpoint.
+    ///
+    /// A new attempt proves coverage of its frozen resources independently;
+    /// it does not inherit the preceding attempt's prefix set. The endpoint
+    /// remains the declared acquisition path, while the fresh response becomes
+    /// the scope that later renewals for this attempt must preserve.
+    pub(crate) fn reacquired_for_seed(
+        &self,
+        seed: &IcebergVendedCredentialLeaseSeed,
+    ) -> Result<Self, ConnectorError> {
+        if seed
+            .refresh_endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint != self.endpoint())
+        {
+            return Err(invalid(
+                "vended REST credential reacquisition changed the credentials endpoint",
+            ));
+        }
+        Ok(Self {
+            prefixes: seed
+                .credentials
+                .iter()
+                .map(|entry| entry.prefix.clone())
+                .collect(),
+            endpoint: Arc::clone(&self.endpoint),
+        })
+    }
+}
+
+impl IcebergVendedS3LoadTableScope {
+    fn matches_seed(&self, seed: &IcebergVendedCredentialLeaseSeed) -> bool {
+        seed.refresh_endpoint.is_none()
             && seed.credentials.len() == self.prefixes.len()
             && seed
                 .credentials
@@ -364,6 +490,87 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestVendedS3LeaseRefre
         if !self.scope.matches_seed(&refreshed) {
             return Err(invalid(
                 "vended REST credential refresh changed prefix scope or endpoint",
+            ));
+        }
+        let (entries, _) = refreshed
+            .into_vended_s3_credential_lease_contribution()?
+            .into_parts();
+        VendedS3CredentialLeaseRefresh::try_new(entries)
+    }
+}
+
+/// FE-local renewal path for REST catalogs that vend credentials only from
+/// `load_table` responses.
+///
+/// The response table is used solely to verify the exact object identity. Its
+/// metadata location and snapshot never replace the logical execution's
+/// frozen binding.
+pub(crate) struct IcebergRestLoadTableVendedS3LeaseRefresher {
+    catalog: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+    runtime: crate::resources::IcebergCatalogRuntime,
+    table: crate::iceberg::TableIdent,
+    expected_table_uuid: uuid::Uuid,
+    scope: IcebergVendedS3LoadTableScope,
+}
+
+impl IcebergRestLoadTableVendedS3LeaseRefresher {
+    pub(crate) fn new(
+        catalog: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+        runtime: crate::resources::IcebergCatalogRuntime,
+        table: crate::iceberg::TableIdent,
+        expected_table_uuid: uuid::Uuid,
+        scope: IcebergVendedS3LoadTableScope,
+    ) -> Self {
+        Self {
+            catalog,
+            runtime,
+            table,
+            expected_table_uuid,
+            scope,
+        }
+    }
+}
+
+impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3LeaseRefresher {
+    fn refresh_vended_s3_credentials(
+        &self,
+    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
+        let catalog = Arc::clone(&self.catalog);
+        let table = self.table.clone();
+        let response = self
+            .runtime
+            .block_on(async move {
+                catalog
+                    .load_table_deferred_with_access_delegation(&table)
+                    .await
+            })
+            .map_err(|error| {
+                unavailable(format!(
+                    "run Iceberg REST load-table credential refresh: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                unavailable(format!("load Iceberg REST table credentials: {error}"))
+            })?;
+        let (materialization, delegation) = response.into_parts();
+        let refreshed = match parse_vended_access_delegation(&delegation)? {
+            IcebergAccessDelegation::Vended(seed) => seed,
+            IcebergAccessDelegation::Static => {
+                return Err(invalid(
+                    "vended REST load-table refresh returned static access delegation",
+                ));
+            }
+        };
+        if !self.scope.matches_seed(&refreshed) {
+            return Err(invalid(
+                "vended REST load-table refresh changed prefix scope or acquisition path",
+            ));
+        }
+        let observed_uuid = IcebergLoadedTableMaterialization::DeferredRest(materialization)
+            .into_table_uuid_for_identity_check()?;
+        if observed_uuid != self.expected_table_uuid {
+            return Err(invalid(
+                "vended REST load-table refresh returned a different table UUID",
             ));
         }
         let (entries, _) = refreshed
@@ -633,14 +840,157 @@ fn unavailable(message: String) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct IcebergPhysicalTable {
     pub table: crate::iceberg::table::Table,
+    attempt_access: Option<IcebergVendedS3RenewalCapability>,
+}
+
+/// Provider-private, resource-free retry recipe. It retains the exact table
+/// identity and metadata selected during preparation, but never that request's
+/// FileIO, cancellation scope, storage resolver, or resource ledger.
+#[derive(Clone)]
+pub(crate) struct IcebergAttemptTableAccess {
+    identifier: crate::iceberg::TableIdent,
+    metadata: crate::iceberg::spec::TableMetadataRef,
+    metadata_location: Option<String>,
+    readonly: bool,
+    renewal: Option<IcebergVendedS3RenewalCapability>,
+}
+
+impl IcebergAttemptTableAccess {
+    pub(crate) fn freeze(table: IcebergPhysicalTable) -> Self {
+        Self {
+            identifier: table.table.identifier().clone(),
+            metadata: table.table.metadata_ref(),
+            metadata_location: table.table.metadata_location().map(str::to_owned),
+            readonly: table.table.readonly(),
+            renewal: table.attempt_access_if_vended(),
+        }
+    }
+
+    pub(crate) fn identifier(&self) -> &crate::iceberg::TableIdent {
+        &self.identifier
+    }
+
+    pub(crate) fn renewal(&self) -> Option<IcebergVendedS3RenewalCapability> {
+        self.renewal.clone()
+    }
+
+    pub(crate) fn metadata(&self) -> &crate::iceberg::spec::TableMetadata {
+        &self.metadata
+    }
+
+    pub(crate) fn validate_table_access(
+        &self,
+        seed: &IcebergVendedCredentialLeaseSeed,
+    ) -> Result<(), ConnectorError> {
+        seed.select_for_location(self.metadata.location())?;
+        if let Some(metadata_location) = &self.metadata_location {
+            seed.select_for_location(metadata_location)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reacquired_request_scoped(
+        &self,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        let file_io_location = self
+            .metadata_location
+            .as_deref()
+            .unwrap_or_else(|| self.metadata.location());
+        let mut builder = crate::iceberg::table::Table::builder()
+            .identifier(self.identifier.clone())
+            .metadata(Arc::clone(&self.metadata))
+            .readonly(self.readonly)
+            .file_io(crate::fs_io::build_file_io_for_location(
+                file_io_location,
+                binding,
+            ));
+        if let Some(metadata_location) = &self.metadata_location {
+            builder = builder.metadata_location(metadata_location.clone());
+        }
+        builder
+            .build()
+            .map(IcebergPhysicalTable::new)
+            .map(|table| match &self.renewal {
+                Some(renewal) => table.with_attempt_access(renewal.clone()),
+                None => table,
+            })
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("rebuild request-scoped Iceberg table: {error}"),
+                )
+            })
+    }
+
+    pub(crate) fn validate_attempt_reacquisition(
+        &self,
+        observed: &crate::iceberg::table::Table,
+        delegation: &IcebergVendedCredentialLeaseSeed,
+    ) -> Result<(), ConnectorError> {
+        if observed.metadata().uuid() != self.metadata.uuid() {
+            return Err(invalid(
+                "vended REST load-table delegation returned a different table UUID",
+            ));
+        }
+        let Some(IcebergVendedS3RenewalCapability::LoadTableDelegation(_)) = self.renewal() else {
+            return Err(invalid(
+                "frozen table requires credentials-endpoint attempt access",
+            ));
+        };
+        if delegation.refresh_endpoint().is_some() {
+            return Err(invalid(
+                "vended REST load-table delegation changed its acquisition path",
+            ));
+        }
+        self.validate_table_access(delegation)
+    }
+}
+
+impl Debug for IcebergPhysicalTable {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IcebergPhysicalTable")
+            .field("table", &self.table)
+            .field(
+                "attempt_access",
+                &self
+                    .attempt_access
+                    .as_ref()
+                    .map(|capability| match capability {
+                        IcebergVendedS3RenewalCapability::CredentialsEndpoint(_) => {
+                            "credentials-endpoint"
+                        }
+                        IcebergVendedS3RenewalCapability::LoadTableDelegation(_) => {
+                            "load-table-delegation"
+                        }
+                    }),
+            )
+            .finish()
+    }
 }
 
 impl IcebergPhysicalTable {
     pub fn new(table: crate::iceberg::table::Table) -> Self {
-        Self { table }
+        Self {
+            table,
+            attempt_access: None,
+        }
+    }
+
+    pub(crate) fn with_attempt_access(
+        mut self,
+        capability: IcebergVendedS3RenewalCapability,
+    ) -> Self {
+        self.attempt_access = Some(capability);
+        self
+    }
+
+    pub(crate) fn attempt_access_if_vended(&self) -> Option<IcebergVendedS3RenewalCapability> {
+        self.attempt_access.clone()
     }
 
     pub fn into_table(self) -> crate::iceberg::table::Table {
@@ -678,16 +1028,6 @@ impl IcebergPhysicalTable {
                 format!("rebuild request-scoped Iceberg table: {error}"),
             )
         })
-    }
-
-    /// Rebuild a REST-vended table's FileIO from the request-local resolver.
-    /// The source table is consumed so it cannot be retained by a generation
-    /// cache or reused by another attempt.
-    pub(crate) fn into_request_scoped(
-        self,
-        binding: crate::access_binding::IcebergReadBinding,
-    ) -> Result<Self, ConnectorError> {
-        Self::request_scoped(&self.table, binding)
     }
 }
 
@@ -766,7 +1106,8 @@ fn cache_key(namespace_name: &str, table_name: &str) -> Result<(String, String),
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
 
     use super::{
         CLIENT_REFRESH_CREDENTIALS_ENABLED, CLIENT_REFRESH_CREDENTIALS_ENDPOINT,
@@ -802,6 +1143,65 @@ mod tests {
             IcebergAccessDelegation::Vended(seed) => seed,
             IcebergAccessDelegation::Static => panic!("vended response must create a seed"),
         }
+    }
+
+    fn physical_table(metadata_location: &str) -> super::IcebergPhysicalTable {
+        let binding = fresh_binding();
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                1,
+                "id",
+                crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "s3://warehouse/data/table".to_string(),
+            crate::iceberg::spec::FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = crate::iceberg::table::Table::builder()
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).expect("identifier"))
+            .file_io(crate::fs_io::build_file_io_for_location(
+                "s3://warehouse/data/table",
+                binding,
+            ))
+            .metadata(metadata)
+            .metadata_location(metadata_location.to_string())
+            .build()
+            .expect("table");
+        super::IcebergPhysicalTable::new(table)
+    }
+
+    fn fresh_binding() -> crate::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        crate::access_binding::IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
+        )
+    }
+
+    fn table_with_metadata_location(
+        source: &super::IcebergPhysicalTable,
+        metadata_location: &str,
+    ) -> crate::iceberg::table::Table {
+        crate::iceberg::table::Table::builder()
+            .identifier(source.table.identifier().clone())
+            .file_io(source.table.file_io().clone())
+            .metadata(source.table.metadata_ref())
+            .metadata_location(metadata_location.to_string())
+            .build()
+            .expect("table")
     }
 
     #[test]
@@ -879,6 +1279,140 @@ mod tests {
         );
         disabled.config.remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
         assert!(!seed(vec![disabled]).refresh_capable());
+    }
+
+    #[test]
+    fn load_table_refresh_is_a_closed_acquisition_path() {
+        let mut load_only = input("s3://warehouse/data", 600, "load-only");
+        load_only.config.remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
+        let load_only = seed(vec![load_only]);
+        let scope = load_only.load_table_refresh_scope();
+        assert!(scope.matches_seed(&load_only));
+        assert!(matches!(
+            load_only.renewal_capability(),
+            super::IcebergVendedS3RenewalCapability::LoadTableDelegation(_)
+        ));
+        assert!(load_only.staged_refresh_scope().is_err());
+
+        let endpoint = seed(vec![input("s3://warehouse/data", 700, "endpoint-refresh")]);
+        assert!(!scope.matches_seed(&endpoint));
+        assert!(matches!(
+            endpoint.renewal_capability(),
+            super::IcebergVendedS3RenewalCapability::CredentialsEndpoint(_)
+        ));
+        assert!(endpoint.staged_refresh_scope().is_ok());
+    }
+
+    #[test]
+    fn load_table_reacquisition_keeps_the_frozen_metadata_binding() {
+        let mut delegation = input("s3://warehouse/data", 600, "same-object");
+        delegation
+            .config
+            .remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
+        let delegation = seed(vec![delegation]);
+        let frozen = physical_table("s3://warehouse/data/table/metadata/v1.json")
+            .with_attempt_access(delegation.renewal_capability());
+        let observed =
+            table_with_metadata_location(&frozen, "s3://warehouse/data/table/metadata/v2.json");
+        let access = super::IcebergAttemptTableAccess::freeze(frozen.clone());
+
+        access
+            .validate_attempt_reacquisition(&observed, &delegation)
+            .expect("same UUID and original resource scope");
+        assert_eq!(
+            frozen.table.metadata_location(),
+            Some("s3://warehouse/data/table/metadata/v1.json")
+        );
+
+        let different_object = physical_table("s3://warehouse/data/table/metadata/v3.json");
+        let error = access
+            .validate_attempt_reacquisition(&different_object.table, &delegation)
+            .expect_err("a same-name table with a different UUID must be rejected");
+        assert!(error.to_string().contains("different table UUID"));
+
+        let mut broader_scope = input("s3://warehouse/", 600, "broader-scope");
+        broader_scope
+            .config
+            .remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
+        let broader_scope = seed(vec![broader_scope]);
+        access
+            .validate_attempt_reacquisition(&observed, &broader_scope)
+            .expect("a later attempt may receive a different scope that covers frozen resources");
+
+        let mut outside_scope = input("s3://other/data", 600, "wrong-scope");
+        outside_scope
+            .config
+            .remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
+        let outside_scope = seed(vec![outside_scope]);
+        let error = access
+            .validate_attempt_reacquisition(&observed, &outside_scope)
+            .expect_err("delegation must cover the original bound resources");
+        assert!(error.to_string().contains("no matching prefix"));
+    }
+
+    #[test]
+    fn credentials_endpoint_reacquisition_adopts_new_covering_prefixes() {
+        let initial = seed(vec![input("s3://warehouse/data/", 600, "initial")]);
+        let original_scope = initial.refresh_scope().expect("initial refresh scope");
+        let mut broader = input("s3://warehouse/", 900, "replacement");
+        broader.config.remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
+        let broader = seed(vec![broader]);
+
+        assert!(!original_scope.matches_seed(&broader));
+        let replacement_scope = original_scope
+            .reacquired_for_seed(&broader)
+            .expect("replacement attempt scope");
+        assert!(replacement_scope.matches_seed(&broader));
+        assert_eq!(
+            replacement_scope.endpoint(),
+            "https://catalog.example.test/v1/credentials"
+        );
+
+        let mut changed_endpoint = input("s3://warehouse/", 900, "changed-endpoint");
+        changed_endpoint.config.insert(
+            CLIENT_REFRESH_CREDENTIALS_ENDPOINT.to_string(),
+            "https://other.example.test/v1/credentials".to_string(),
+        );
+        assert!(
+            replacement_scope
+                .reacquired_for_seed(&seed(vec![changed_endpoint]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reacquired_request_scope_rebinds_access_without_changing_frozen_metadata() {
+        let mut delegation = input("s3://warehouse/data", 600, "first-attempt");
+        delegation
+            .config
+            .remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
+        let delegation = seed(vec![delegation]);
+        let frozen = physical_table("s3://warehouse/data/table/metadata/v1.json")
+            .with_attempt_access(delegation.renewal_capability());
+        let old_file_io = frozen.table.file_io() as *const _;
+        let access = super::IcebergAttemptTableAccess::freeze(frozen.clone());
+
+        let reacquired = access
+            .reacquired_request_scoped(fresh_binding())
+            .expect("a new request scope can bind the frozen object");
+
+        assert_eq!(
+            reacquired.table.metadata_location(),
+            frozen.table.metadata_location()
+        );
+        assert_eq!(
+            reacquired.table.metadata().uuid(),
+            frozen.table.metadata().uuid()
+        );
+        assert_eq!(
+            reacquired.table.metadata().current_snapshot_id(),
+            frozen.table.metadata().current_snapshot_id()
+        );
+        assert_ne!(
+            reacquired.table.file_io() as *const _,
+            old_file_io,
+            "the replacement attempt must own a newly rebound FileIO"
+        );
     }
 
     #[test]

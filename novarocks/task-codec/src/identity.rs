@@ -17,8 +17,8 @@
 
 //! Task protocol identity codec.
 
-use novarocks_execution::task_execution::identity::{
-    QueryContextRef, TaskIdentity, TaskOperationId,
+use novarocks_execution_contract::task_execution::identity::{
+    AdmissionEpochCapability, AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
 };
 use novarocks_proto_models::novarocks;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, StageId, TaskId};
@@ -30,8 +30,9 @@ use novarocks_proto_codec::{FieldPath, ProtocolError};
 
 use crate::{invalid, missing};
 
-/// Every process and operation identity on this wire is exactly 16 bytes of a
-/// non-nil UUIDv7. The width is checked before anything interprets the value.
+/// Every process identity, operation identity, and opaque admission nonce on
+/// this wire is exactly 16 bytes. Each typed decoder applies its own semantic
+/// validation after this width check.
 fn decode_identity_bytes(value: &[u8], path: FieldPath) -> Result<[u8; 16], ProtocolError> {
     value
         .try_into()
@@ -66,6 +67,40 @@ pub fn decode_task_operation_id(
 
 pub fn encode_task_operation_id(value: TaskOperationId) -> novarocks::TaskOperationId {
     novarocks::TaskOperationId {
+        value: value.to_bytes().to_vec(),
+    }
+}
+
+/// Decodes an opaque worker admission ticket identity.
+pub fn decode_admission_ticket_id(
+    src: &novarocks::AdmissionTicketId,
+    path: FieldPath,
+) -> Result<AdmissionTicketId, ProtocolError> {
+    let bytes = decode_identity_bytes(&src.value, path.clone().field("value"))?;
+    AdmissionTicketId::try_from_bytes(bytes)
+        .map_err(|error| invalid(path.field("value"), error.to_string()))
+}
+
+pub fn encode_admission_ticket_id(value: AdmissionTicketId) -> novarocks::AdmissionTicketId {
+    novarocks::AdmissionTicketId {
+        value: value.to_bytes().to_vec(),
+    }
+}
+
+/// Decodes the opaque worker admission issuance epoch.
+pub fn decode_admission_epoch_capability(
+    src: &novarocks::AdmissionEpochCapability,
+    path: FieldPath,
+) -> Result<AdmissionEpochCapability, ProtocolError> {
+    let bytes = decode_identity_bytes(&src.value, path.clone().field("value"))?;
+    AdmissionEpochCapability::try_from_bytes(bytes)
+        .map_err(|error| invalid(path.field("value"), error.to_string()))
+}
+
+pub fn encode_admission_epoch_capability(
+    value: AdmissionEpochCapability,
+) -> novarocks::AdmissionEpochCapability {
+    novarocks::AdmissionEpochCapability {
         value: value.to_bytes().to_vec(),
     }
 }

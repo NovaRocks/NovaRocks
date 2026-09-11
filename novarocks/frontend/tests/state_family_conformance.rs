@@ -231,7 +231,7 @@ async fn open_application(
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
         Some(input),
         &registry,
-        FrontendExecutionConfig::new(
+        FrontendExecutionConfig::new_for_test(
             "127.0.0.1",
             19310,
             std::num::NonZeroUsize::new(1).unwrap(),
@@ -260,7 +260,7 @@ async fn opening_the_whole_frontend_writes_no_durable_record_at_all() {
     // retirement bought. A scan-for-strays assertion here would have passed
     // trivially against an empty store and proven nothing.
     let input = state_store_fixture::input("state-family-conformance-application");
-    let host = open_application(input.clone()).await;
+    let mut host = open_application(input.clone()).await;
     let store = host.state_store().expect("configured StateStore");
     let keys = scan_all_keys(&store).await;
     assert!(
@@ -277,7 +277,7 @@ async fn opening_the_whole_frontend_writes_no_durable_record_at_all() {
 
     // Reopening is the other place a retired family would resurface, through a
     // startup decoder rather than a bootstrap write.
-    let reopened = open_application(input).await;
+    let mut reopened = open_application(input).await;
     let store = reopened.state_store().expect("configured StateStore");
     assert!(
         scan_all_keys(&store).await.is_empty(),

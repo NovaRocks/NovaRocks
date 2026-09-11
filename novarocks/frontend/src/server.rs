@@ -227,15 +227,11 @@ pub fn build_frontend_query_session_factory(
         }),
     );
     if let Err(error) = maintenance_service.start(Arc::clone(&maintenance_engine)) {
-        let primary = FrontendApplicationError::server(format!(
+        // The application Host owns this worker lifecycle. Its caller drives
+        // the same owner through the shared bounded shutdown path.
+        return Err(FrontendApplicationError::server(format!(
             "start table maintenance service failed: {error}"
-        ));
-        return match maintenance_service.shutdown() {
-            Ok(()) => Err(primary),
-            Err(cleanup_error) => Err(primary.with_cleanup_context(format!(
-                "shutdown table maintenance service after startup failure: {cleanup_error}"
-            ))),
-        };
+        )));
     }
     if let Some(sink) = host.mv_background_engine_sink()
         && let Err(error) = core_capabilities::bind_mv_background_engine(
@@ -252,15 +248,11 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&maintenance_engine),
         )
     {
-        let primary = FrontendApplicationError::server(format!(
+        // Do not start a private blocking join here. Returning preserves the
+        // exact worker owner for the Host's deadline-aware cleanup.
+        return Err(FrontendApplicationError::server(format!(
             "bind frontend MV background engine failed: {error}"
-        ));
-        return match maintenance_service.shutdown() {
-            Ok(()) => Err(primary),
-            Err(cleanup_error) => Err(primary.with_cleanup_context(format!(
-                "shutdown table maintenance service after MV background bind failure: {cleanup_error}"
-            ))),
-        };
+        )));
     }
 
     let query_compiler =
@@ -358,6 +350,9 @@ pub fn build_frontend_query_session_factory(
             host.query_control_service(),
             client_connection_control,
             query_execution,
+            host.logical_read_launcher(),
+            host.workload_root_admission(),
+            host.workload_resources(),
             role,
             topology,
             host.dml_service(),
@@ -372,11 +367,7 @@ pub fn build_frontend_query_session_factory(
         )
         .with_serving_lifecycle((*host.serving_lifecycle()).clone()),
     );
-    host.serving_lifecycle().mark_ready().map_err(|error| {
-        FrontendApplicationError::server(format!(
-            "mark frontend serving lifecycle ready after bootstrap: {error:?}"
-        ))
-    })?;
+    host.mark_ready()?;
     Ok(query_service)
 }
 
@@ -410,7 +401,7 @@ where
     let cleanup_timeout = config.frontend_cleanup_timeout;
     let (serving_reader, island_reader, convergence_reader, mut metrics_http_server) =
         start_early_management_server(&config)?;
-    let host = match open_frontend_application_for_server(&config, data_runtime).await {
+    let mut host = match open_frontend_application_for_server(&config, data_runtime).await {
         Ok(host) => host,
         Err(error) => {
             let cleanup = metrics_http_server
@@ -420,9 +411,8 @@ where
         }
     };
     if let Err(error) = serving_reader.install(host.serving_lifecycle()) {
-        let shutdown = host
-            .shutdown_until(std::time::Instant::now() + cleanup_timeout)
-            .await;
+        let shutdown =
+            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
         let cleanup = metrics_http_server
             .stop()
             .map_err(FrontendApplicationError::server);
@@ -434,9 +424,8 @@ where
         );
     }
     if let Err(error) = island_reader.install(host.backend_island_snapshot_reader()) {
-        let shutdown = host
-            .shutdown_until(std::time::Instant::now() + cleanup_timeout)
-            .await;
+        let shutdown =
+            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
         let cleanup = metrics_http_server
             .stop()
             .map_err(FrontendApplicationError::server);
@@ -448,9 +437,8 @@ where
         );
     }
     if let Err(error) = convergence_reader.install(host.lifecycle_convergence_reader()) {
-        let shutdown = host
-            .shutdown_until(std::time::Instant::now() + cleanup_timeout)
-            .await;
+        let shutdown =
+            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
         let cleanup = metrics_http_server
             .stop()
             .map_err(FrontendApplicationError::server);
@@ -469,9 +457,8 @@ where
         &mut metrics_http_server,
     )
     .await;
-    let shutdown_result = host
-        .shutdown_until(std::time::Instant::now() + cleanup_timeout)
-        .await;
+    let shutdown_result =
+        shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
     let metrics_stop = metrics_http_server
         .stop()
         .map_err(FrontendApplicationError::server);
@@ -493,7 +480,7 @@ where
     let cleanup_timeout = config.frontend_cleanup_timeout;
     let (serving_reader, island_reader, convergence_reader, mut metrics_http_server) =
         start_early_management_server(&config)?;
-    let host = match open_frontend_application_for_server(&config, Handle::current()).await {
+    let mut host = match open_frontend_application_for_server(&config, Handle::current()).await {
         Ok(host) => host,
         Err(error) => {
             let cleanup = metrics_http_server
@@ -503,9 +490,8 @@ where
         }
     };
     if let Err(error) = serving_reader.install(host.serving_lifecycle()) {
-        let shutdown = host
-            .shutdown_until(std::time::Instant::now() + cleanup_timeout)
-            .await;
+        let shutdown =
+            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
         let cleanup = metrics_http_server
             .stop()
             .map_err(FrontendApplicationError::server);
@@ -517,9 +503,8 @@ where
         );
     }
     if let Err(error) = island_reader.install(host.backend_island_snapshot_reader()) {
-        let shutdown = host
-            .shutdown_until(std::time::Instant::now() + cleanup_timeout)
-            .await;
+        let shutdown =
+            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
         let cleanup = metrics_http_server
             .stop()
             .map_err(FrontendApplicationError::server);
@@ -531,9 +516,8 @@ where
         );
     }
     if let Err(error) = convergence_reader.install(host.lifecycle_convergence_reader()) {
-        let shutdown = host
-            .shutdown_until(std::time::Instant::now() + cleanup_timeout)
-            .await;
+        let shutdown =
+            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
         let cleanup = metrics_http_server
             .stop()
             .map_err(FrontendApplicationError::server);
@@ -554,9 +538,8 @@ where
         )
     })
     .await;
-    let shutdown_result = host
-        .shutdown_until(std::time::Instant::now() + cleanup_timeout)
-        .await;
+    let shutdown_result =
+        shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
     let metrics_stop = metrics_http_server
         .stop()
         .map_err(FrontendApplicationError::server);
@@ -564,6 +547,48 @@ where
         combine_server_and_shutdown(server_result, shutdown_result),
         metrics_stop,
     )
+}
+
+/// Drives the exact Frontend owner graph to convergence before the production
+/// runner is allowed to drop it.
+///
+/// `frontend_cleanup_timeout` bounds each of two graceful convergence passes.
+/// The first error remains visible to the caller. If the same owner graph still
+/// cannot converge on the second pass, the runner explicitly commits to
+/// process exit and releases process-local joins through the Host's final-exit
+/// boundary. That boundary is never available to a reusable application Host.
+async fn shutdown_frontend_application_to_convergence(
+    host: &mut FrontendApplicationHost,
+    attempt_timeout: Duration,
+) -> Result<(), FrontendApplicationError> {
+    let first_error = match host
+        .shutdown_until(std::time::Instant::now() + attempt_timeout)
+        .await
+    {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    tracing::warn!(
+        error = %first_error,
+        ?attempt_timeout,
+        "frontend bounded shutdown did not converge; retaining the exact Host owner graph for one final pass"
+    );
+
+    match host
+        .shutdown_until(std::time::Instant::now() + attempt_timeout)
+        .await
+    {
+        Ok(()) => Err(first_error),
+        Err(final_error) => {
+            tracing::error!(
+                error = %final_error,
+                ?attempt_timeout,
+                "frontend Host remained unconverged; committing the runner to process exit"
+            );
+            host.abandon_for_process_exit();
+            Err(first_error.with_cleanup_context(final_error))
+        }
+    }
 }
 
 fn start_early_management_server(
@@ -928,18 +953,19 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::num::NonZeroUsize;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
     };
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::UnavailableMvStorageObservationPort;
+    use novarocks_workload_control::{WorkClass, WorkRequest};
 
     use super::{
         FrontendServerConfig, build_frontend_query_session_factory, run_frontend_server,
         run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
-        run_frontend_server_with_signal_and_ports,
+        run_frontend_server_with_signal_and_ports, shutdown_frontend_application_to_convergence,
     };
     use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use crate::native::transport::FrontendNativeTransport;
@@ -990,7 +1016,7 @@ mod tests {
 
     fn frontend_config() -> FrontendServerConfig {
         FrontendServerConfig {
-            execution: FrontendExecutionConfig::new(
+            execution: FrontendExecutionConfig::new_for_test(
                 "127.0.0.1",
                 0,
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
@@ -1093,10 +1119,10 @@ mod tests {
     async fn cp2_production_composition_owns_catalog_ddl_through_the_state_store_attachment() {
         let state_store = test_state_store_input("cp2-cutover");
         let registry = test_state_store_registry();
-        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+        let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             Some(state_store),
             &registry,
-            FrontendExecutionConfig::new(
+            FrontendExecutionConfig::new_for_test(
                 "127.0.0.1",
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
@@ -1196,10 +1222,10 @@ mod tests {
     async fn frontend_report_endpoint_binds_loopback_without_core_transport_facade() {
         let state_store = test_state_store_input("frontend-report-listener");
         let registry = test_state_store_registry();
-        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+        let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             Some(state_store),
             &registry,
-            FrontendExecutionConfig::new(
+            FrontendExecutionConfig::new_for_test(
                 "127.0.0.1",
                 0,
                 std::num::NonZeroUsize::new(1).unwrap(),
@@ -1245,10 +1271,10 @@ mod tests {
     async fn sqlx2_application_frontend_services_inject_statistics_application_port() {
         let state_store = test_state_store_input("statistics-application-port");
         let registry = test_state_store_registry();
-        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+        let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             Some(state_store),
             &registry,
-            FrontendExecutionConfig::new(
+            FrontendExecutionConfig::new_for_test(
                 "127.0.0.1",
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
@@ -1370,6 +1396,56 @@ mod tests {
             events.lock().expect("events lock").as_slice(),
             ["server_started", "server_drained", "store_shutdown"]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_shutdown_has_a_finite_process_exit_boundary() {
+        let registry = test_state_store_registry();
+        let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            Some(test_state_store_input("server-bounded-shutdown-owner")),
+            &registry,
+            FrontendExecutionConfig::new_for_test(
+                "127.0.0.1",
+                0,
+                NonZeroUsize::new(1).unwrap(),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
+            ),
+            frontend_backend_open_config(),
+            Vec::new(),
+            tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
+        )
+        .await
+        .expect("open frontend application host");
+        host.mark_ready().expect("mark frontend host ready");
+        let work = host
+            .workload_root_admission()
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("admit one governed root");
+        let started = Instant::now();
+        let shutdown_error = tokio::time::timeout(
+            Duration::from_millis(100),
+            shutdown_frontend_application_to_convergence(&mut host, Duration::from_millis(1)),
+        )
+        .await
+        .expect("production shutdown must reach its finite process-exit boundary")
+        .expect_err("the first bounded deadline remains observable");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            shutdown_error.kind(),
+            FrontendApplicationErrorKind::Shutdown
+        );
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("shutdown deadline exceeded")
+        );
+        drop(work);
+        // The explicit process-exit boundary makes every fail-closed local
+        // owner drop-safe without waiting forever for the held responsibility.
+        drop(host);
     }
 
     #[tokio::test]

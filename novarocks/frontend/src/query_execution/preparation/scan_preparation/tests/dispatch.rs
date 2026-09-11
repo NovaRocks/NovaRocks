@@ -16,6 +16,10 @@
 // under the License.
 
 use super::super::collect_scan_bindings;
+use super::super::{
+    ConnectorAttemptAccessPlanBuilder, FrozenDescriptionInputsBuilder,
+    FrozenNativeConnectorScansBuilder,
+};
 use super::*;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -155,6 +159,11 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
     for (node_id, _) in &scan_facts {
         assert!(prepared.scan_bindings().binding(*node_id).is_some());
     }
+    assert_eq!(
+        prepared.negotiation_receipt_count(),
+        scan_facts.len(),
+        "every production typed scan must carry one frozen negotiation outcome"
+    );
     let scheduling = prepared.scheduling_view();
     for (fragment_id, node_id, _) in prepared.scan_bindings().typed_scans() {
         assert!(
@@ -229,6 +238,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
     )
     .expect("exact query binding must plan the scan");
     let typed = prepared.typed_scan(0, 10).expect("prepared typed scan");
+    let access = prepared.access(0, 10).expect("prepared attempt access");
     let DistributedNodeKind::Scan(scan) = &plan.fragments()[0].root.payload else {
         panic!("sealed fixture must retain its scan root");
     };
@@ -239,7 +249,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
     // relation names are all the one the query already admitted -- never a
     // generation acquired now.
     assert_eq!(
-        typed.planning_lease.binding().incarnation(),
+        access.planning_lease().binding().incarnation(),
         expected.binding().incarnation()
     );
     assert_eq!(
@@ -249,6 +259,66 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
             .catalog_handle()
             .expect("fixture lease carries a catalog handle")
     );
+}
+
+#[test]
+fn negotiation_rejects_handle_from_another_admitted_runtime_generation() {
+    let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
+    let controls = crate::connector::FixtureControlResolver::new(registry);
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary fixture");
+    let bindings = fixture_query_table_bindings(&plan, &controls);
+
+    let error = match super::super::prepare_scan_bindings(
+        &plan,
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&bindings),
+        None,
+        &fixture_scan_preparation_options(foreign_fixture_control_role_host(&plan, &controls)),
+        &[],
+    ) {
+        Ok(_) => {
+            panic!("a foreign typed handle must not be relabeled as this query's admitted scan")
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error.contains("another admitted runtime generation"),
+        "{error}"
+    );
+}
+
+#[test]
+fn frozen_description_binding_is_jointly_resolved_from_plan_token_and_statement_store() {
+    let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
+    let controls = crate::connector::FixtureControlResolver::new(registry);
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary fixture");
+    let bindings = fixture_query_table_bindings(&plan, &controls);
+    let sealed_plan = novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(plan);
+    bindings.seal_for_topology_replan();
+    let receipts = bindings
+        .sealed_exact_binding_receipts()
+        .expect("binding receipts are semantically sealed");
+
+    let resolved = novarocks_query_application::preparation::resolve_plan_scan_bindings(
+        &sealed_plan,
+        &receipts,
+    )
+    .expect("sealed scan token must resolve through its exact statement store");
+    let contract = sealed_plan
+        .scan_contracts()
+        .expect("sealed scan contracts")
+        .remove(0);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].node_id(), 10);
+    let object_parts = resolved[0].occurrence().binding().object().parts();
+    assert_eq!(object_parts.len(), 3);
+    assert_eq!(object_parts[0].as_ref(), contract.catalog());
+    assert_eq!(object_parts[1].as_ref(), contract.namespace());
+    assert_eq!(object_parts[2].as_ref(), contract.table());
 }
 
 #[test]
@@ -356,12 +426,7 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
         &context,
         Some(&bindings),
         None,
-        &super::super::ScanPreparationOptions::new(
-            true,
-            std::num::NonZeroUsize::new(3).expect("non-zero topology target"),
-            None,
-        )
-        .with_typed_connector_control(
+        &super::super::ScanPreparationOptions::new(true, None).with_typed_connector_control(
             typed_control,
             novarocks_spi::connector::read_stack::ConnectorSession::try_new(
                 "fixture-query",
@@ -382,6 +447,8 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
     // replacement registered above.
     let first_typed = first.typed_scan(0, 10).expect("first typed scan");
     let second_typed = second.typed_scan(0, 10).expect("second typed scan");
+    let first_access = first.access(0, 10).expect("first attempt access");
+    let second_access = second.access(0, 10).expect("second attempt access");
     let admitted_catalog = admitted
         .admission
         .exact_planning_lease()
@@ -390,8 +457,14 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
         .catalog_handle()
         .expect("first admission has catalog handle")
         .clone();
-    assert_eq!(first_typed.catalog_properties.handle(), &admitted_catalog);
-    assert_eq!(second_typed.catalog_properties.handle(), &admitted_catalog);
+    assert_eq!(
+        first_access.catalog_properties().handle(),
+        &admitted_catalog
+    );
+    assert_eq!(
+        second_access.catalog_properties().handle(),
+        &admitted_catalog
+    );
     let first_relation = first_typed.prepared.table_scan.table().relation();
     let second_relation = second_typed.prepared.table_scan.table().relation();
     assert_eq!(second_relation.kind(), first_relation.kind());
@@ -412,12 +485,38 @@ fn duplicate_scan_node_defense_reports_exact_error() {
     let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
         .expect("sealed ordinary fixture");
     let root = plan.fragments()[0].root.clone();
+    let sealed_plan =
+        novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(plan.clone());
     let registry = registry(vec![data_file("s3://bucket/explicit.parquet")]);
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
     let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
     let context = crate::connector::test_request_context();
     let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let query_bindings = fixture_query_table_bindings(&plan, &controls);
+    let limits = novarocks_query_application::observation::PreparationLimits::new(
+        novarocks_query_application::observation::PreparationCountLimits::new(
+            std::num::NonZeroU32::new(8).unwrap(),
+            std::num::NonZeroUsize::new(8).unwrap(),
+            std::num::NonZeroUsize::new(8).unwrap(),
+            std::num::NonZeroUsize::new(8).unwrap(),
+        ),
+        novarocks_query_application::observation::PreparationByteLimits::new(
+            std::num::NonZeroUsize::new(1024).unwrap(),
+            std::num::NonZeroUsize::new(1024).unwrap(),
+            std::num::NonZeroUsize::new(64 * 1024).unwrap(),
+        ),
+        context.deadline(),
+    );
+    let options = fixture_scan_preparation_options(fixture_control_role_host(&plan, &controls))
+        .with_preparation_budget(
+            novarocks_query_application::observation::PreparationBudget::new(limits),
+        );
+
+    query_bindings.seal_for_topology_replan();
+
+    let mut native_connector_scans = FrozenNativeConnectorScansBuilder::new();
+    let mut attempt_access = ConnectorAttemptAccessPlanBuilder::new();
+    let mut description_inputs = FrozenDescriptionInputsBuilder::new();
 
     collect_scan_bindings(
         0,
@@ -426,10 +525,14 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &context,
         Some(&query_bindings),
         None,
-        &fixture_scan_preparation_options(fixture_control_role_host(&plan, &controls)),
+        &options,
+        &sealed_plan,
         &[],
         &mut seen_scan_node_ids,
         &mut bindings,
+        &mut native_connector_scans,
+        &mut attempt_access,
+        &mut description_inputs,
     )
     .expect("first scan preparation");
     let err = collect_scan_bindings(
@@ -439,10 +542,14 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &context,
         Some(&query_bindings),
         None,
-        &fixture_scan_preparation_options(fixture_control_role_host(&plan, &controls)),
+        &options,
+        &sealed_plan,
         &[],
         &mut seen_scan_node_ids,
         &mut bindings,
+        &mut native_connector_scans,
+        &mut attempt_access,
+        &mut description_inputs,
     )
     .expect_err("duplicate scan node must fail before re-planning");
 

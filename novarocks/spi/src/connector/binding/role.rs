@@ -18,8 +18,9 @@
 use std::sync::Arc;
 
 use crate::connector::read_stack::{
-    ConnectorReadMetadata, ConnectorReadProviderFactory, ConnectorReadRequestControlFactory,
-    ConnectorReadSplitManager,
+    ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadBinding,
+    ConnectorReadMetadata, ConnectorReadProviderFactory, ConnectorReadRequestControl,
+    ConnectorReadRequestControlFactory, ConnectorReadSplitManager, ConnectorReadTableHandle,
 };
 use crate::connector::write_stack::{
     ConnectorWriteControl as ConnectorWriteSessionControl,
@@ -34,6 +35,7 @@ use crate::connector::{
 /// The complete FE typed-read group for one exact control generation.
 #[derive(Clone)]
 pub struct ConnectorControlReadBinding {
+    binding: ConnectorReadBinding,
     metadata: Arc<dyn ConnectorReadMetadata>,
     splits: Arc<dyn ConnectorReadSplitManager>,
     request_factory: Option<Arc<dyn ConnectorReadRequestControlFactory>>,
@@ -47,7 +49,9 @@ impl ConnectorControlReadBinding {
         request_factory: Option<Arc<dyn ConnectorReadRequestControlFactory>>,
         encoder: Arc<dyn ConnectorReadWireEncoder>,
     ) -> Self {
+        let binding = metadata.binding().clone();
         Self {
+            binding,
             metadata,
             splits,
             request_factory,
@@ -59,12 +63,95 @@ impl ConnectorControlReadBinding {
         Arc::clone(&self.metadata)
     }
 
+    pub const fn binding(&self) -> &ConnectorReadBinding {
+        &self.binding
+    }
+
     pub fn splits(&self) -> Arc<dyn ConnectorReadSplitManager> {
         Arc::clone(&self.splits)
     }
 
     pub fn request_factory(&self) -> Option<Arc<dyn ConnectorReadRequestControlFactory>> {
         self.request_factory.as_ref().map(Arc::clone)
+    }
+
+    pub fn encoder(&self) -> Arc<dyn ConnectorReadWireEncoder> {
+        Arc::clone(&self.encoder)
+    }
+
+    /// Seal the final negotiated handle into the only per-attempt access path
+    /// for this installed read generation.
+    pub fn seal_attempt_access(
+        &self,
+        request_control: &ConnectorReadRequestControl,
+        frozen: &ConnectorReadTableHandle,
+    ) -> Result<ConnectorReadAttemptAccess, ConnectorError> {
+        if self.metadata.binding() != &self.binding
+            || self.splits.binding() != &self.binding
+            || request_control.binding() != &self.binding
+            || frozen.binding() != &self.binding
+        {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "Connector read role binding cannot combine generations",
+            ));
+        }
+        Ok(ConnectorReadAttemptAccess {
+            source: request_control.seal_attempt_access(frozen)?,
+            encoder: Arc::clone(&self.encoder),
+        })
+    }
+}
+
+/// Process-local ability to reacquire one immutable read for a new attempt.
+/// It contains no secret and exposes no way to choose a different handle.
+pub struct ConnectorReadAttemptAccess {
+    source: ConnectorReadAttemptAccessSource,
+    encoder: Arc<dyn ConnectorReadWireEncoder>,
+}
+
+impl ConnectorReadAttemptAccess {
+    pub const fn frozen(&self) -> &ConnectorReadTableHandle {
+        self.source.frozen()
+    }
+
+    pub fn for_attempt(
+        &self,
+        request: &crate::connector::ConnectorAttemptContext,
+        generation: &crate::connector::ConnectorControlPlanningLease,
+    ) -> Result<ConnectorReadAttemptCapabilities, ConnectorError> {
+        let binding = generation.binding();
+        if binding.descriptor() != self.source.frozen().binding().descriptor()
+            || binding.catalog_handle()? != self.source.frozen().binding().catalog_handle()
+        {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "Connector read attempt access requires its exact Catalog generation guard",
+            ));
+        }
+        Ok(ConnectorReadAttemptCapabilities {
+            frozen: self.source.frozen().clone(),
+            runtime: self.source.for_attempt(request)?,
+            encoder: Arc::clone(&self.encoder),
+        })
+    }
+}
+
+/// Complete request-bound read capabilities for one attempt and one exact
+/// final handle.
+pub struct ConnectorReadAttemptCapabilities {
+    frozen: ConnectorReadTableHandle,
+    runtime: ConnectorReadAttemptRuntime,
+    encoder: Arc<dyn ConnectorReadWireEncoder>,
+}
+
+impl ConnectorReadAttemptCapabilities {
+    pub const fn frozen(&self) -> &ConnectorReadTableHandle {
+        &self.frozen
+    }
+
+    pub fn splits(&self) -> Arc<dyn ConnectorReadSplitManager> {
+        self.runtime.splits()
     }
 
     pub fn encoder(&self) -> Arc<dyn ConnectorReadWireEncoder> {

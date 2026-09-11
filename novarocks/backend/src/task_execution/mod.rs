@@ -21,7 +21,7 @@
 //! creation transaction, per-task status, the observation channel, and
 //! terminal retention. It owns no transport: every entry point takes a neutral
 //! typed request from
-//! `novarocks_execution::task_execution::operation` and returns a neutral
+//! `novarocks_execution_contract::task_execution::operation` and returns a neutral
 //! typed receipt, so it is fully drivable by an in-process caller and a
 //! transport adapter adds only encoding.
 //!
@@ -39,9 +39,10 @@
 //! fragment-based lifecycle stack still owns every query, and binding this
 //! owner to execution, then retiring the stack it replaces, are separate
 //! steps.
-// Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
+// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
 mod clock;
+mod completion;
 mod context_host;
 mod credential_slot;
 mod domains;
@@ -62,6 +63,7 @@ mod status;
 mod tests;
 
 pub use clock::{BackendMonotonicClock, ManualClock, ProcessMonotonicClock};
+pub(crate) use completion::TaskCompletionSupervisor;
 pub use context_host::NativeQueryContextHost;
 pub use credential_slot::QueryContextCredentialSlot;
 pub use execution_host::{

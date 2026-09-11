@@ -501,23 +501,25 @@ fn assert_idle_session_statement_is_rejected(connection: &mut mysql::Conn) -> Re
 }
 
 fn static_snapshot_launch_config(snapshot: &Path) -> ScenarioLaunchConfig {
-    let object_store_data_credential = r#"
+    let object_store_metadata_credential = r#"
 [[connector.credentials]]
-purpose = "object-store-data"
+purpose = "object-store-metadata"
 name = "iceberg-test-data"
 generation = "v1"
 kind = "s3"
 access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
 access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 "#;
+    let object_store_data_credential =
+        object_store_metadata_credential.replace("object-store-metadata", "object-store-data");
     ScenarioLaunchConfig {
         config_overlay: CrossProcessConfigOverlay {
             fe: Some(format!(
                 "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{}",
                 snapshot.display(),
-                object_store_data_credential,
+                object_store_metadata_credential,
             )),
-            be: Some(object_store_data_credential.to_string()),
+            be: Some(object_store_data_credential),
             ..Default::default()
         },
         ..Default::default()
@@ -551,8 +553,14 @@ fn write_rest_static_snapshot(snapshot: &Path, instance_id: &str) -> Result<()> 
              \"aws.s3.endpoint\" = \"{s3_endpoint}\"\n\
              \"aws.s3.enable_path_style_access\" = \"true\"\n\
              [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-metadata\"\n\
+             consumer_role = \"frontend\"\n\
+             mode = \"static\"\n\
+             name = \"iceberg-test-data\"\n\
+             generation = \"v1\"\n\
+             [[catalogs.credential_bindings]]\n\
              purpose = \"object-store-data\"\n\
-             consumer_role = \"frontend-and-backend\"\n\
+             consumer_role = \"backend\"\n\
              mode = \"static\"\n\
              name = \"iceberg-test-data\"\n\
              generation = \"v1\"\n"

@@ -47,12 +47,14 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadRuntime, ProviderReadSplitSource, ProviderReadSystemTablePlan,
 };
 use novarocks_spi::connector::read_stack::{
-    Assignment, Bound, ConnectorExpression, ConnectorReadChangeWindow,
+    Assignment, Bound, ConnectorExpression, ConnectorReadAttemptAccessMint,
+    ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
+    ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
     ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
-    ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource, ConnectorTableHandle as _,
-    ConnectorValue, ConnectorValueType, Constraint, Domain, DynamicFilterSnapshot,
-    OrderedAssignments, Range, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
-    ValueSet,
+    ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource,
+    ConnectorTableHandle as _, ConnectorValue, ConnectorValueType, Constraint, Domain,
+    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SplitWeight,
+    SystemTableDistribution, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
@@ -66,7 +68,7 @@ use crate::iceberg::spec::{
     StructType, TableMetadata, Transform, Type,
 };
 use crate::iceberg::table::Table;
-use crate::loaded_table::IcebergPhysicalTable;
+use crate::loaded_table::{IcebergAttemptTableAccess, IcebergPhysicalTable};
 use crate::metadata_context::IcebergMetadataContext;
 use crate::read_model::{IcebergReadFile, IcebergReadSnapshot};
 use crate::ref_snapshot::resolve_branch_head_snapshot_id;
@@ -246,6 +248,41 @@ impl IcebergTypedBoundary {
             request_pinned_physical_tables: Some(Arc::new(Mutex::new(HashMap::new()))),
             split_source_options: self.split_source_options,
         }
+    }
+
+    fn for_request_with_pinned_table(
+        &self,
+        request_context: ConnectorRequestContext,
+        name: SchemaTableName,
+        table: IcebergPhysicalTable,
+    ) -> Self {
+        let tables = Arc::new(Mutex::new(HashMap::from([(name, table)])));
+        Self {
+            descriptor: self.descriptor.clone(),
+            incarnation: self.incarnation,
+            catalog_handle: self.catalog_handle.clone(),
+            transaction: self.transaction.clone(),
+            runtime: Arc::clone(&self.runtime),
+            request_context: Some(request_context),
+            request_pinned_physical_tables: Some(tables),
+            split_source_options: self.split_source_options,
+        }
+    }
+
+    fn pinned_table_for_attempt(
+        &self,
+        name: &SchemaTableName,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        self.request_pinned_physical_tables
+            .as_ref()
+            .ok_or_else(|| invalid("Iceberg attempt access requires request-bound table state"))?
+            .lock()
+            .expect("request-pinned Iceberg table cache lock")
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                invalid("Iceberg attempt access was sealed before the exact table was frozen")
+            })
     }
 
     /// Session knobs that change how files are cut, never what they contain.
@@ -564,18 +601,92 @@ impl IcebergTypedRequestControlFactory {
 }
 
 impl ConnectorReadRequestControlFactory for IcebergTypedRequestControlFactory {
-    fn for_request(
+    fn for_planning(
         &self,
-        request: &ConnectorRequestContext,
+        request: &novarocks_spi::connector::ConnectorPlanningContext,
     ) -> Result<ConnectorReadRequestControl, ConnectorError> {
-        let adapter =
-            Arc::new(Arc::new(self.template.for_request(request.clone())).read_runtime_adapter());
-        Ok(ConnectorReadRequestControl::new(
-            Arc::clone(&adapter)
-                as Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadMetadata>,
-            adapter as Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadSplitManager>,
+        let boundary = Arc::new(self.template.for_request(request.request().clone()));
+        Ok(iceberg_request_control(
+            Arc::clone(&self.template),
+            boundary,
         ))
     }
+}
+
+struct IcebergAttemptAccessSealer {
+    template: Arc<IcebergTypedBoundary>,
+    boundary: Arc<IcebergTypedBoundary>,
+    adapter: Arc<
+        novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter<IcebergTypedBoundary>,
+    >,
+}
+
+impl ConnectorReadAttemptAccessSealer for IcebergAttemptAccessSealer {
+    fn seal(
+        &self,
+        frozen: &ConnectorReadTableHandle,
+        mint: ConnectorReadAttemptAccessMint,
+    ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError> {
+        let relation = self.adapter.table(frozen)?;
+        let name = relation.schema_table_name().clone();
+        let access =
+            IcebergAttemptTableAccess::freeze(self.boundary.pinned_table_for_attempt(&name)?);
+        Ok(mint.seal(Arc::new(IcebergAttemptAccessReacquirer {
+            template: Arc::clone(&self.template),
+            name,
+            access,
+        })))
+    }
+}
+
+struct IcebergAttemptAccessReacquirer {
+    template: Arc<IcebergTypedBoundary>,
+    name: SchemaTableName,
+    access: IcebergAttemptTableAccess,
+}
+
+impl ConnectorReadAttemptAccessReacquirer for IcebergAttemptAccessReacquirer {
+    fn for_attempt(
+        &self,
+        request: &novarocks_spi::connector::ConnectorAttemptContext,
+    ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
+        let request = request.request();
+        let physical = self
+            .template
+            .runtime
+            .reacquire_table_access_for_request(
+                self.name.schema_name(),
+                self.name.table_name(),
+                &self.access,
+                request,
+            )
+            .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
+        let boundary = Arc::new(self.template.for_request_with_pinned_table(
+            request.clone(),
+            self.name.clone(),
+            physical,
+        ));
+        let control = iceberg_request_control(Arc::clone(&self.template), boundary);
+        Ok(ConnectorReadAttemptRuntime::new(control.splits()))
+    }
+}
+
+fn iceberg_request_control(
+    template: Arc<IcebergTypedBoundary>,
+    boundary: Arc<IcebergTypedBoundary>,
+) -> ConnectorReadRequestControl {
+    let adapter = Arc::new(Arc::clone(&boundary).read_runtime_adapter());
+    let sealer = Arc::new(IcebergAttemptAccessSealer {
+        template,
+        boundary,
+        adapter: Arc::clone(&adapter),
+    });
+    ConnectorReadRequestControl::provider_reacquire_attempt_access(
+        Arc::clone(&adapter)
+            as Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadMetadata>,
+        adapter as Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadSplitManager>,
+        sealer,
+    )
 }
 
 /// The provider type family is entirely Iceberg-owned.  The generic SPI
@@ -2518,6 +2629,235 @@ fn not_found(message: impl Into<String>) -> ConnectorError {
 
 fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message)
+}
+
+#[cfg(test)]
+mod attempt_access_tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Weak};
+    use std::time::{Duration, Instant};
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorInstanceId,
+        ConnectorProviderId, ConnectorRequestResources, ConnectorResourceCheckpoint,
+        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    };
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct AttemptScopeMarker(u8);
+
+    struct TrackedAttemptResources {
+        cancelled: AtomicBool,
+    }
+
+    impl TrackedAttemptResources {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                cancelled: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl ConnectorCancellation for TrackedAttemptResources {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
+    impl ConnectorResourceLedger for TrackedAttemptResources {
+        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+            Ok(ConnectorResourceCheckpoint::new(1))
+        }
+
+        fn try_reserve(
+            &self,
+            _class: ConnectorResourceClass,
+            bytes: u64,
+        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+            Ok(Box::new(NoopLease(bytes)))
+        }
+    }
+
+    struct NoopLease(u64);
+
+    impl ConnectorResourceLease for NoopLease {
+        fn bytes(&self) -> u64 {
+            self.0
+        }
+
+        fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+            self.0 = self.0.saturating_add(additional);
+            Ok(())
+        }
+
+        fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+            self.0 = bytes;
+            Ok(())
+        }
+    }
+
+    fn request_context(resources: &Arc<TrackedAttemptResources>) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::clone(resources) as Arc<dyn ConnectorCancellation>,
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("attempt context")
+        .with_resources(ConnectorRequestResources::new(
+            Arc::clone(resources) as Arc<dyn ConnectorResourceLedger>
+        ))
+    }
+
+    fn physical_table(
+        binding: crate::access_binding::IcebergReadBinding,
+        metadata_location: &str,
+    ) -> IcebergPhysicalTable {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "s3://warehouse/data/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = crate::iceberg::table::Table::builder()
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).expect("identifier"))
+            .file_io(crate::fs_io::build_file_io_for_location(
+                "s3://warehouse/data/table",
+                binding,
+            ))
+            .metadata(metadata)
+            .metadata_location(metadata_location.to_string())
+            .build()
+            .expect("table");
+        IcebergPhysicalTable::new(table)
+    }
+
+    #[test]
+    fn attempt_boundary_uses_the_new_request_scope_and_exact_pinned_table() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let resources =
+            crate::resources::IcebergMetadataResources::new(binding, runtime.handle().clone());
+        let metadata_context = Arc::new(
+            IcebergMetadataContext::try_new(
+                crate::catalog_control::IcebergCatalogControlState::new(configuration),
+                resources,
+            )
+            .expect("metadata context"),
+        );
+        let catalog_id = ConnectorInstanceId::parse("ice").expect("catalog ID");
+        let template = IcebergTypedBoundary::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+                instance_id: catalog_id.clone(),
+            },
+            ProviderBindingEpoch::new(),
+            CatalogHandle::new(catalog_id, CatalogVersion::from_bytes([1; 32])),
+            HiveTransactionHandle::new(true, [2; 16]),
+            Arc::clone(&metadata_context),
+        );
+        let name = SchemaTableName::try_new("db", "t").expect("table name");
+        let old_resources = TrackedAttemptResources::new();
+        let old_resources_weak: Weak<TrackedAttemptResources> = Arc::downgrade(&old_resources);
+        let old_attempt = request_context(&old_resources);
+        let old_marker =
+            old_attempt.request_scope_extension_or_insert_with(|| AttemptScopeMarker(3));
+        let old_marker_weak = Arc::downgrade(&old_marker);
+        let old_binding = template
+            .runtime
+            .resources()
+            .planning_binding()
+            .for_request(old_attempt.clone());
+        let physical = physical_table(old_binding, "s3://warehouse/data/table/metadata/v1.json");
+        let old_file_io = physical.table.file_io() as *const _;
+        let frozen_uuid = physical.table.metadata().uuid();
+        let frozen_snapshot = physical.table.metadata().current_snapshot_id();
+        let access = IcebergAttemptTableAccess::freeze(physical.clone());
+        old_resources.cancelled.store(true, Ordering::Release);
+
+        let new_resources = TrackedAttemptResources::new();
+        let attempt = request_context(&new_resources);
+        let marker = attempt.request_scope_extension_or_insert_with(|| AttemptScopeMarker(7));
+        let wrong_identity = metadata_context
+            .reacquire_table_access_for_request("db", "other", &access, &attempt)
+            .expect_err("static recipe must remain bound to its exact table identity");
+        assert_eq!(wrong_identity.0, ConnectorErrorKind::InvalidRequest);
+        let rebound = metadata_context
+            .reacquire_table_access_for_request("db", "t", &access, &attempt)
+            .expect("static access must rebind under the new request");
+        assert_ne!(rebound.table.file_io() as *const _, old_file_io);
+        assert_eq!(rebound.table.metadata().uuid(), frozen_uuid);
+        assert_eq!(
+            rebound.table.metadata().current_snapshot_id(),
+            frozen_snapshot
+        );
+        assert_eq!(
+            rebound.table.metadata_location(),
+            Some("s3://warehouse/data/table/metadata/v1.json")
+        );
+        let boundary = template.for_request_with_pinned_table(attempt, name.clone(), rebound);
+
+        let rebound_marker = boundary
+            .request_context
+            .as_ref()
+            .expect("request-bound boundary")
+            .request_scope_extension_or_insert_with(|| AttemptScopeMarker(9));
+        assert!(Arc::ptr_eq(&marker, &rebound_marker));
+        assert_eq!(rebound_marker.0, 7);
+        let pinned = boundary
+            .load_pinned_relation(&name)
+            .expect("split planning reads the preinstalled physical table");
+        assert_eq!(
+            pinned.table.metadata_location(),
+            Some("s3://warehouse/data/table/metadata/v1.json")
+        );
+        assert_eq!(
+            pinned.table.metadata().uuid(),
+            physical.table.metadata().uuid()
+        );
+
+        drop(pinned);
+        drop(boundary);
+        drop(physical);
+        drop(old_attempt);
+        drop(old_marker);
+        drop(old_resources);
+        assert!(old_marker_weak.upgrade().is_none());
+        assert!(old_resources_weak.upgrade().is_none());
+    }
 }
 
 #[cfg(test)]

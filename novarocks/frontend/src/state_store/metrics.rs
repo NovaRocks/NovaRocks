@@ -117,6 +117,24 @@ impl StateStoreMetrics {
     }
 }
 
+impl novarocks_state_store_runtime::StateStoreRunMetrics for StateStoreMetrics {
+    fn record_retry(&self) {
+        StateStoreMetrics::record_retry(self);
+    }
+
+    fn record_saturated_retry(&self) {
+        StateStoreMetrics::record_saturated_retry(self);
+    }
+
+    fn record_deadline(&self) {
+        StateStoreMetrics::record_deadline(self);
+    }
+
+    fn record_unresolved(&self) {
+        StateStoreMetrics::record_unresolved(self);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

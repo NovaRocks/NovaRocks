@@ -11,7 +11,7 @@ workspace = true
 doctest = false
 
 [dependencies]
-novarocks-execution.workspace = true
+novarocks-execution-contract.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-spi.workspace = true

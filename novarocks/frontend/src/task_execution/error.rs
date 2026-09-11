@@ -22,11 +22,14 @@
 //! default, and no message-text classification anywhere in this module.
 
 use std::fmt;
+use std::time::Duration;
 
 use novarocks_execution::task_execution::{
-    DescriptorError, DomainConflict, ExchangeEdgeId, FinalInfoDisagreement, IdentityMismatch,
-    OperationKind, OperationOutcome, RequestError, ResultPacketVerdict, StatusObservation,
-    TaskState,
+    DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
+    OperationOutcome, RequestError, TaskOperationId, TaskState,
+};
+use novarocks_query_application::coordination::{
+    DispatchLane, FinalInfoDisagreement, ResultPacketVerdict, StatusObservation,
 };
 use novarocks_types::identity::{BackendProcessId, TaskId};
 
@@ -48,11 +51,22 @@ pub enum TaskExecutionError {
     KernelKeyCollision { first: TaskId, second: TaskId },
     /// A capacity bound of the operation transport was reached.
     Capacity(CapacityBound),
+    /// A locally queued operation reached its residence deadline before any
+    /// transport accepted it. No Worker receipt is fabricated for this
+    /// frontend-owned failure.
+    QueueResidenceExpired {
+        operation_id: TaskOperationId,
+        kind: OperationKind,
+        waited: Duration,
+    },
     /// An acknowledgement named an operation this owner never sent, or named
     /// one that is already settled.
     UnknownOperation,
     /// An acknowledgement carried the wrong receipt shape for its operation.
     MissingReceipt(OperationKind),
+    /// A Worker receipt did not settle the immutable domain intent that this
+    /// query coordinator released.
+    DomainReceipt(String),
     /// A receipt addressed a different task, stage, query, or process.
     Identity(IdentityMismatch),
     /// An update would move one of a task's domains backwards.
@@ -129,6 +143,10 @@ pub enum CapacityBound {
     },
     /// One descriptor's encoded plan.
     DescriptorBytes { limit: usize, actual: usize },
+    /// One operation's queue-side carrier.
+    OperationBytes { limit: usize, actual: usize },
+    /// The process-wide Native transport could not retain this queued carrier.
+    ProcessTransportQueue { lane: DispatchLane, bytes: usize },
     /// Edge-open versions one producer task can mint.
     ///
     /// A task mints one per edge-open decision and never reuses one, so this
@@ -172,6 +190,14 @@ impl fmt::Display for CapacityBound {
                 formatter,
                 "descriptor plan is {actual} bytes, limit is {limit}"
             ),
+            Self::OperationBytes { limit, actual } => write!(
+                formatter,
+                "operation queue carrier is {actual} bytes, limit is {limit}"
+            ),
+            Self::ProcessTransportQueue { lane, bytes } => write!(
+                formatter,
+                "process Native transport cannot retain a {bytes}-byte {lane:?} operation"
+            ),
             Self::EdgeOpenVersions { limit } => {
                 write!(formatter, "edge-open versions for one task reached {limit}")
             }
@@ -202,11 +228,25 @@ impl fmt::Display for TaskExecutionError {
                 "tasks {first} and {second} derive the same fragment instance id"
             ),
             Self::Capacity(bound) => write!(formatter, "task protocol capacity bound: {bound}"),
+            Self::QueueResidenceExpired {
+                operation_id,
+                kind,
+                waited,
+            } => write!(
+                formatter,
+                "{kind} operation {operation_id} waited {waited:?} in the frontend queue and expired before transport acceptance"
+            ),
             Self::UnknownOperation => {
                 formatter.write_str("acknowledgement names an operation this owner did not send")
             }
             Self::MissingReceipt(kind) => {
                 write!(formatter, "{kind} was accepted without its receipt")
+            }
+            Self::DomainReceipt(detail) => {
+                write!(
+                    formatter,
+                    "task domain receipt does not settle its intent: {detail}"
+                )
             }
             Self::Identity(mismatch) => write!(formatter, "task protocol receipt {mismatch}"),
             Self::DomainRegression {

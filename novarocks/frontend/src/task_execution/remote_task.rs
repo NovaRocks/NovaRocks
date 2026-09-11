@@ -24,22 +24,29 @@
 //! only by an exact create acknowledgement, and the accumulated facts then
 //! drain one at a time in the order their domains progressed. `Terminal`
 //! discards what was never sent and lets what is already in flight converge
-//! on its own retained receipt.
+//! on its own retained receipt. An update rejected because the backend task
+//! already terminated stops further sends while the owner waits for the
+//! terminal status; the rejection itself is not a second terminal authority.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
-    CancelReason, CancelTask, CreateTask, DomainConflict, DomainProgression, DomainVersion,
-    ExchangeEdgeDomain, ExchangeEdgeId, FrontendAction, GoneObservation, OperationKind,
-    OperationOutcome, QueryContextRef, SplitDomain, StatusObservation, TaskDescriptor,
-    TaskDomainKind, TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus,
-    TaskStatusCursor, TaskTransition, TerminationDetail, UpdateTask, classify_gone,
-    classify_observation, classify_task_transition,
+    CancelReason, CancelTask, CreateTask, DomainConflict, DomainProgression, ExchangeEdgeId,
+    OperationKind, OperationOutcome, QueryContextRef, TaskDescriptor, TaskDomainKind,
+    TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor,
+    TerminationDetail, UpdateTask,
+};
+use novarocks_query_application::coordination::{
+    FrontendAction, GoneObservation, ObservedTaskTransition, StatusObservation,
+    TaskDomainIntentTracker, TaskDomainReceiptExpectation, classify_gone, classify_observation,
+    classify_observed_task_transition, frontend_action, verify_task_domain_receipt,
 };
 
 use super::error::{CapacityBound, TaskExecutionError};
-use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
+use super::intent::{
+    AckPayload, OperationAcknowledgement, OperationIntent, TaskOperationQueuePermit,
+};
 
 /// The three states of one remote task.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -74,6 +81,9 @@ pub enum UpdateSettlement {
     /// The task went terminal while this request was in flight, so its
     /// outcome no longer changes anything.
     ConvergedAfterTerminal,
+    /// The backend says the task is terminal, but the frontend has not yet
+    /// observed the authoritative terminal status.
+    AwaitingTerminalStatus,
     /// The operation failed closed and this task is terminal.
     FailedClosed(OperationOutcome),
 }
@@ -93,6 +103,7 @@ pub struct TaskTerminalReport {
 struct ReleasedUpdate {
     operation_id: TaskOperationId,
     request: Arc<UpdateTask>,
+    expected_receipt: TaskDomainReceiptExpectation,
     /// Whether this request is released and its outcome not yet known.
     ///
     /// A retained request is handed out again only after a genuinely unknown
@@ -102,15 +113,11 @@ struct ReleasedUpdate {
     awaiting_outcome: bool,
 }
 
-/// The frontend's view of how far each of this task's domains has progressed.
-///
-/// Enqueueing checks a fact against this view, so a regression is refused
-/// where it is produced rather than discovered as a wire conflict.
-#[derive(Debug, Default)]
-struct DomainProgress {
-    splits: SplitDomain,
-    dynamic_filter: Option<DomainVersion>,
-    edges: ExchangeEdgeDomain,
+#[derive(Debug)]
+struct PendingUpdate {
+    update: TaskDomainUpdate,
+    expected_receipt: TaskDomainReceiptExpectation,
+    queue_permit: Box<dyn TaskOperationQueuePermit>,
 }
 
 /// The frontend's owner of one remote task.
@@ -123,13 +130,14 @@ pub struct RemoteTask {
     state: RemoteTaskState,
     create_in_flight: Option<TaskOperationId>,
     create_acknowledged: bool,
-    pending: VecDeque<TaskDomainUpdate>,
+    pending: VecDeque<PendingUpdate>,
     released_update: Option<ReleasedUpdate>,
     cancel_in_flight: Option<TaskOperationId>,
     cancel_requested: bool,
     status: Option<TaskStatus>,
     cursor: TaskStatusCursor,
-    progress: DomainProgress,
+    domains: TaskDomainIntentTracker,
+    awaiting_terminal_status: bool,
     discarded_updates: usize,
     converged_after_terminal: usize,
 }
@@ -150,7 +158,7 @@ fn edge_regression(
 /// A split-domain refusal that names the offer it refused.
 fn split_regression(
     intent: &novarocks_execution::task_execution::SplitAssignmentIntent,
-    watermark: novarocks_execution::task_execution::SplitWatermark,
+    watermark: novarocks_query_application::coordination::SentSplitWatermark,
     conflict: DomainConflict,
 ) -> TaskExecutionError {
     TaskExecutionError::DomainRegression {
@@ -174,16 +182,14 @@ impl RemoteTask {
     pub fn new(
         descriptor: TaskDescriptor,
         context: QueryContextRef,
-        initial_domains: Vec<TaskDomainUpdate>,
     ) -> Result<Self, TaskExecutionError> {
         let identity = descriptor.identity();
-        let edges = ExchangeEdgeDomain::from_frozen_edges(descriptor.topology().edge_ids());
-        let create = CreateTask::try_new(
-            TaskOperationId::new_v7(),
-            context,
-            descriptor,
-            initial_domains,
-        )?;
+        let domains = TaskDomainIntentTracker::new(
+            descriptor.split_plan_nodes().iter().copied(),
+            descriptor.topology().edge_ids(),
+        );
+        let create =
+            CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())?;
         Ok(Self {
             create: Arc::new(create),
             state: RemoteTaskState::Creating,
@@ -195,10 +201,8 @@ impl RemoteTask {
             cancel_requested: false,
             status: None,
             cursor: TaskStatusCursor::unobserved(identity),
-            progress: DomainProgress {
-                edges,
-                ..DomainProgress::default()
-            },
+            domains,
+            awaiting_terminal_status: false,
             discarded_updates: 0,
             converged_after_terminal: 0,
         })
@@ -227,6 +231,17 @@ impl RemoteTask {
 
     pub const fn state(&self) -> RemoteTaskState {
         self.state
+    }
+
+    /// Whether this frontend has historically accepted the exact CreateTask
+    /// receipt for this task.
+    ///
+    /// Lifecycle state is intentionally not used as a substitute: a task may
+    /// move directly from Creating to Terminal when status observation races
+    /// ahead of its create acknowledgement, while the later exact receipt
+    /// still proves that the task was admitted.
+    pub const fn create_acknowledged(&self) -> bool {
+        self.create_acknowledged
     }
 
     /// This task's last observed lifecycle state.
@@ -293,12 +308,17 @@ impl RemoteTask {
     pub fn enqueue_update(
         &mut self,
         update: TaskDomainUpdate,
+        queue_permit: Box<dyn TaskOperationQueuePermit>,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
-        if matches!(self.state, RemoteTaskState::Terminal) {
+        if matches!(self.state, RemoteTaskState::Terminal) || self.awaiting_terminal_status {
             return Ok(UpdateAdmission::DiscardedTerminal);
         }
-        self.admit_domain(&update)?;
-        self.pending.push_back(update);
+        let expected_receipt = self.admit_domain(&update)?;
+        self.pending.push_back(PendingUpdate {
+            update,
+            expected_receipt,
+            queue_permit,
+        });
         Ok(UpdateAdmission::Queued)
     }
 
@@ -312,49 +332,43 @@ impl RemoteTask {
     /// creation. Giving every one of those decisions the first version would
     /// replay that version with a different edge set, which is
     /// `SameTokenDifferentContent` and fails the whole attempt.
-    pub fn enqueue_edge_open(
-        &mut self,
+    pub fn prepare_edge_open(
+        &self,
         edge: ExchangeEdgeId,
-    ) -> Result<UpdateAdmission, TaskExecutionError> {
-        if matches!(self.state, RemoteTaskState::Terminal) {
-            return Ok(UpdateAdmission::DiscardedTerminal);
-        }
-        let version =
-            self.progress
-                .edges
-                .next_open_version()
-                .ok_or(TaskExecutionError::Capacity(
-                    CapacityBound::EdgeOpenVersions { limit: u32::MAX },
-                ))?;
-        self.enqueue_update(TaskDomainUpdate::OpenExchangeEdges {
+    ) -> Result<TaskDomainUpdate, TaskExecutionError> {
+        let version = self
+            .domains
+            .next_edge_open_version()
+            .ok_or(TaskExecutionError::Capacity(
+                CapacityBound::EdgeOpenVersions { limit: u32::MAX },
+            ))?;
+        Ok(TaskDomainUpdate::OpenExchangeEdges {
             version,
             edges: vec![edge],
         })
     }
 
-    fn admit_domain(&mut self, update: &TaskDomainUpdate) -> Result<(), TaskExecutionError> {
-        match update {
+    fn admit_domain(
+        &mut self,
+        update: &TaskDomainUpdate,
+    ) -> Result<TaskDomainReceiptExpectation, TaskExecutionError> {
+        let split_watermark = match update {
             TaskDomainUpdate::SplitAssignment(intent) => {
-                if !self.descriptor().accepts_split_plan_node(intent.node()) {
-                    return Err(split_regression(
-                        intent,
-                        self.progress.splits.watermark(intent.node()),
-                        DomainConflict::UnknownMember,
-                    ));
-                }
-                let watermark = self.progress.splits.watermark(intent.node());
+                Some(self.domains.split_watermark(intent.node()))
+            }
+            _ => None,
+        };
+        let progression = self.domains.record(update);
+        let admitted = match update {
+            TaskDomainUpdate::SplitAssignment(intent) => {
+                let watermark = split_watermark.expect("a split update has a prior watermark");
                 // The same rule the backend applies. Judging by the range
                 // alone rejects the terminal marker every task of a plan node
                 // receives once its splits already arrived, and that task's
                 // scan then waits forever for a seal it was already told
                 // about.
-                match watermark.classify_offer(intent.offer()) {
-                    DomainProgression::Apply => {
-                        self.progress
-                            .splits
-                            .set_watermark(intent.node(), watermark.apply_offer(intent.offer()));
-                        Ok(())
-                    }
+                match progression {
+                    DomainProgression::Apply => Ok(()),
                     // An offer this owner already applied. ADR-0123 makes the
                     // identical request the recovery for an unknown outcome,
                     // and by then this side's watermark has advanced, so the
@@ -381,47 +395,41 @@ impl RemoteTask {
                 }
             }
             TaskDomainUpdate::TaskDynamicFilter { version, .. } => {
-                // Same rule as the split domain: re-offering the accepted
-                // version is this owner's own resend; only a strictly older
-                // one reverses a decision.
-                if self
-                    .progress
-                    .dynamic_filter
-                    .is_some_and(|accepted| *version < accepted)
-                {
-                    return Err(TaskExecutionError::DomainRegression {
+                // A same-version re-offer is a replay only when the immutable
+                // payload fingerprint is also identical. A producer cannot
+                // reuse the token for different content.
+                match progression {
+                    DomainProgression::Apply | DomainProgression::Idempotent => Ok(()),
+                    DomainProgression::Older => Err(TaskExecutionError::DomainRegression {
                         domain: "task_dynamic_filter",
-                        token: format!(
-                            "version={} accepted={:?}",
-                            version.get(),
-                            self.progress.dynamic_filter.map(|v| v.get())
-                        ),
+                        token: format!("version={}", version.get()),
                         conflict: DomainConflict::NotMonotonic,
-                    });
-                }
-                self.progress.dynamic_filter = Some(*version);
-                Ok(())
-            }
-            TaskDomainUpdate::OpenExchangeEdges { version, edges } => {
-                match self.progress.edges.classify_open(*version, edges) {
-                    DomainProgression::Apply => {
-                        self.progress.edges.apply_open(*version, edges);
-                        Ok(())
-                    }
-                    DomainProgression::Idempotent => Err(TaskExecutionError::EdgeAlreadyOpened(
-                        *edges.first().expect("a validated edge set is nonempty"),
-                    )),
-                    DomainProgression::Older => Err(edge_regression(
-                        *version,
-                        edges,
-                        DomainConflict::NotMonotonic,
-                    )),
+                    }),
                     DomainProgression::Conflict(conflict) => {
-                        Err(edge_regression(*version, edges, conflict))
+                        Err(TaskExecutionError::DomainRegression {
+                            domain: "task_dynamic_filter",
+                            token: format!("version={}", version.get()),
+                            conflict,
+                        })
                     }
                 }
             }
-        }
+            TaskDomainUpdate::OpenExchangeEdges { version, edges } => match progression {
+                DomainProgression::Apply => Ok(()),
+                DomainProgression::Idempotent => Err(TaskExecutionError::EdgeAlreadyOpened(
+                    *edges.first().expect("a validated edge set is nonempty"),
+                )),
+                DomainProgression::Older => Err(edge_regression(
+                    *version,
+                    edges,
+                    DomainConflict::NotMonotonic,
+                )),
+                DomainProgression::Conflict(conflict) => {
+                    Err(edge_regression(*version, edges, conflict))
+                }
+            },
+        };
+        admitted.map(|()| self.domains.receipt_expectation(update))
     }
 
     /// The next update to send, if any may be sent right now.
@@ -429,8 +437,13 @@ impl RemoteTask {
     /// One domain change per request and at most one request in flight. That
     /// keeps a receipt attributable to exactly one domain and keeps a slow
     /// task from accumulating unacknowledged work.
-    pub fn next_update_intent(&mut self) -> Result<Option<OperationIntent>, TaskExecutionError> {
-        if !matches!(self.state, RemoteTaskState::Created) {
+    pub fn next_update_intent(
+        &mut self,
+    ) -> Result<
+        Option<(OperationIntent, Option<Box<dyn TaskOperationQueuePermit>>)>,
+        TaskExecutionError,
+    > {
+        if !matches!(self.state, RemoteTaskState::Created) || self.awaiting_terminal_status {
             return Ok(None);
         }
         if let Some(released) = &mut self.released_update {
@@ -438,30 +451,60 @@ impl RemoteTask {
                 return Ok(None);
             }
             released.awaiting_outcome = true;
-            return Ok(Some(OperationIntent::UpdateTask(Arc::clone(
-                &released.request,
-            ))));
+            return Ok(Some((
+                OperationIntent::UpdateTask(Arc::clone(&released.request)),
+                None,
+            )));
         }
-        let Some(update) = self.pending.pop_front() else {
+        let Some(pending) = self.pending.pop_front() else {
             return Ok(None);
         };
         let operation_id = TaskOperationId::new_v7();
         let request = Arc::new(UpdateTask::try_new(
             operation_id,
             self.identity(),
-            vec![update],
+            vec![pending.update],
         )?);
         self.released_update = Some(ReleasedUpdate {
             operation_id,
             request: Arc::clone(&request),
+            expected_receipt: pending.expected_receipt,
             awaiting_outcome: true,
         });
-        Ok(Some(OperationIntent::UpdateTask(request)))
+        Ok(Some((
+            OperationIntent::UpdateTask(request),
+            Some(pending.queue_permit),
+        )))
+    }
+
+    /// Rolls back a request that never crossed process queue admission.
+    ///
+    /// The immutable request remains retained for exact re-release. The only
+    /// exception is cancellation: an unsent cancellation has no remote effect,
+    /// so clearing its local marker lets the stage mint a fresh request later.
+    pub(crate) fn rollback_unsent(&mut self, operation_id: TaskOperationId) {
+        if self.create_in_flight == Some(operation_id) {
+            self.create_in_flight = None;
+            return;
+        }
+        if let Some(released) = &mut self.released_update
+            && released.operation_id == operation_id
+        {
+            released.awaiting_outcome = false;
+            return;
+        }
+        if self.cancel_in_flight == Some(operation_id) {
+            self.cancel_in_flight = None;
+            self.cancel_requested = false;
+        }
     }
 
     /// Stands this task down normally, once.
     pub fn cancel_intent(&mut self, reason: CancelReason) -> Option<OperationIntent> {
-        if self.cancel_requested || matches!(self.state, RemoteTaskState::Terminal) {
+        if self.cancel_requested
+            || matches!(self.state, RemoteTaskState::Terminal)
+            || self.awaiting_terminal_status
+        {
             return None;
         }
         let operation_id = TaskOperationId::new_v7();
@@ -512,11 +555,14 @@ impl RemoteTask {
             self.observe_status(receipt.current_status())?;
             return Ok(CreateSettlement::Created);
         }
-        match ack.outcome().frontend_action() {
+        match frontend_action(ack.dispatch_result()) {
             FrontendAction::RetryExactRequest => Ok(CreateSettlement::RetryExactRequest),
             _ => {
                 self.enter_terminal();
-                Ok(CreateSettlement::FailedClosed(ack.outcome()))
+                Ok(CreateSettlement::FailedClosed(
+                    ack.worker_outcome()
+                        .expect("a failed Worker receipt has an outcome"),
+                ))
             }
         }
     }
@@ -542,30 +588,48 @@ impl RemoteTask {
                 ));
             };
             identity.verify_matches(receipt.identity())?;
+            let [intent] = released.request.domains() else {
+                return Err(TaskExecutionError::DomainReceipt(format!(
+                    "one update operation carried {} domains",
+                    released.request.domains().len()
+                )));
+            };
+            verify_task_domain_receipt(intent, &released.expected_receipt, receipt.domains())
+                .map_err(|error| TaskExecutionError::DomainReceipt(error.to_string()))?;
             self.released_update = None;
             return Ok(UpdateSettlement::Applied);
         }
-        if matches!(
-            ack.outcome().frontend_action(),
-            FrontendAction::RetryExactRequest
-        ) {
-            if matches!(self.state, RemoteTaskState::Terminal) {
-                // A terminal task owes nothing further, so an unknown outcome
-                // is abandoned rather than replayed at a task that can no
-                // longer apply it.
+        match frontend_action(ack.dispatch_result()) {
+            FrontendAction::RetryExactRequest => {
+                if matches!(self.state, RemoteTaskState::Terminal) {
+                    // A terminal task owes nothing further, so an unknown
+                    // outcome is abandoned rather than replayed at a task that
+                    // can no longer apply it.
+                    self.released_update = None;
+                    self.converged_after_terminal += 1;
+                    return Ok(UpdateSettlement::ConvergedAfterTerminal);
+                }
+                return Ok(UpdateSettlement::RetryExactRequest);
+            }
+            FrontendAction::StopSendingAndReconcile | FrontendAction::Settled => {
                 self.released_update = None;
                 self.converged_after_terminal += 1;
+                if !matches!(self.state, RemoteTaskState::Terminal) {
+                    self.await_terminal_status();
+                    return Ok(UpdateSettlement::AwaitingTerminalStatus);
+                }
                 return Ok(UpdateSettlement::ConvergedAfterTerminal);
             }
-            return Ok(UpdateSettlement::RetryExactRequest);
+            FrontendAction::FailOperationClosed
+            | FrontendAction::FailAttempt
+            | FrontendAction::RetryAfterProgress => {}
         }
         self.released_update = None;
-        if matches!(self.state, RemoteTaskState::Terminal) {
-            self.converged_after_terminal += 1;
-            return Ok(UpdateSettlement::ConvergedAfterTerminal);
-        }
         self.enter_terminal();
-        Ok(UpdateSettlement::FailedClosed(ack.outcome()))
+        Ok(UpdateSettlement::FailedClosed(
+            ack.worker_outcome()
+                .expect("a failed Worker receipt has an outcome"),
+        ))
     }
 
     /// Settles one cancel acknowledgement.
@@ -620,8 +684,8 @@ impl RemoteTask {
         // became a lost query.
         //
         // What is deliberately still enforced across a gap: a terminal state
-        // never becomes anything else, which `classify_task_transition`
-        // reports as `AlreadyTerminal` rather than `Illegal`, and the terminal
+        // never becomes anything else, which the observed-transition
+        // classifier reports separately from `Illegal`, and the terminal
         // content agreement the final-info acceptance checks. Neither depends
         // on adjacency.
         let adjacent = self
@@ -632,8 +696,8 @@ impl RemoteTask {
         if adjacent
             && let Some(held) = &self.status
             && matches!(
-                classify_task_transition(held.state(), observed.state()),
-                TaskTransition::Illegal
+                classify_observed_task_transition(held.state(), observed.state()),
+                ObservedTaskTransition::Illegal
             )
         {
             return Err(TaskExecutionError::IllegalTaskTransition {
@@ -652,6 +716,13 @@ impl RemoteTask {
 
     fn enter_terminal(&mut self) {
         self.state = RemoteTaskState::Terminal;
+        self.awaiting_terminal_status = false;
+        self.discarded_updates += self.pending.len();
+        self.pending.clear();
+    }
+
+    fn await_terminal_status(&mut self) {
+        self.awaiting_terminal_status = true;
         self.discarded_updates += self.pending.len();
         self.pending.clear();
     }
@@ -679,7 +750,10 @@ impl RemoteTask {
 
     /// Which domains still hold unsent facts, for diagnostics.
     pub fn pending_domains(&self) -> Vec<TaskDomainKind> {
-        self.pending.iter().map(TaskDomainUpdate::kind).collect()
+        self.pending
+            .iter()
+            .map(|pending| pending.update.kind())
+            .collect()
     }
 }
 

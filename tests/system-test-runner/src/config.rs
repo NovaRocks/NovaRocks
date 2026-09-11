@@ -1,5 +1,6 @@
 use crate::cli::Cli;
 use anyhow::{Context, Result, bail};
+use novarocks_cluster_harness::LaunchProfile;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,6 +13,8 @@ pub struct RunnerConfig {
     pub artifact_root: PathBuf,
     pub cluster_size: usize,
     pub timeout: Duration,
+    pub launch_profile: LaunchProfile,
+    pub uea1_workload_manifest: Option<PathBuf>,
 }
 
 impl RunnerConfig {
@@ -49,6 +52,8 @@ impl RunnerConfig {
             artifact_root,
             cluster_size: cli.cluster_size,
             timeout: Duration::from_secs(cli.timeout_secs),
+            launch_profile: cli.launch_profile,
+            uea1_workload_manifest: cli.uea1_workload_manifest.clone(),
         })
     }
 }

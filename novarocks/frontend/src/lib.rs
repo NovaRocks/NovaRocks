@@ -34,6 +34,7 @@ pub mod metrics;
 pub mod mv;
 mod mysql;
 mod native;
+mod preparation_diagnostics;
 pub mod query;
 pub mod query_control;
 pub mod query_execution;
@@ -54,8 +55,10 @@ pub mod view;
 pub mod workload_lifecycle;
 
 pub use application::{
-    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig, FrontendQueryControlTimeouts,
+    FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendApplicationError,
+    FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
+    FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
+    FrontendTaskTransportBudget,
 };
 pub use client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,

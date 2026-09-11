@@ -22,7 +22,7 @@ use super::*;
 /// `ScanExecutionBindings` holds connector leases and split managers, so it is
 /// deliberately not `Debug`; a refusal is therefore asserted through a match.
 fn expect_preparation_error(
-    result: Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String>,
+    result: Result<super::super::PreparedScanSet, String>,
     expectation: &str,
 ) -> String {
     match result {
@@ -33,7 +33,7 @@ fn expect_preparation_error(
 
 /// The one scan node every single-scan fixture plan has.
 pub(super) fn only_scan_node(
-    bindings: &crate::query_execution::preparation::scan::ScanExecutionBindings,
+    bindings: &super::super::PreparedScanSet,
 ) -> (novarocks_sql::plan_read::FragmentId, i32) {
     let mut keys = bindings.typed_scan_keys().collect::<Vec<_>>();
     assert_eq!(keys.len(), 1, "the fixture plan has exactly one scan");
@@ -116,6 +116,9 @@ fn an_ordinary_iceberg_scan_lowers_to_a_typed_data_relation() {
     let typed = bindings
         .typed_scan(fragment_id, node_id)
         .expect("typed connector scan");
+    let access = bindings
+        .access(fragment_id, node_id)
+        .expect("typed connector access");
     assert_eq!(
         typed.prepared.table_scan.table().relation_kind(),
         novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table
@@ -128,7 +131,7 @@ fn an_ordinary_iceberg_scan_lowers_to_a_typed_data_relation() {
             .catalog()
             .catalog_name()
             .as_str(),
-        typed.catalog_properties.handle().catalog_name().as_str(),
+        access.catalog_properties().handle().catalog_name().as_str(),
         "the frozen relation and its declaration name one generation"
     );
 }
@@ -153,13 +156,26 @@ fn preparation_enumerates_no_split() {
     let typed = bindings
         .typed_scan(fragment_id, node_id)
         .expect("typed connector scan");
+    let capabilities = bindings
+        .access(fragment_id, node_id)
+        .expect("typed connector access")
+        .access()
+        .for_attempt(
+            &novarocks_spi::connector::ConnectorAttemptContext::from_admitted_request(
+                crate::connector::test_request_context(),
+            ),
+            bindings
+                .access(fragment_id, node_id)
+                .expect("typed connector access")
+                .planning_lease(),
+        )
+        .expect("fixture attempt access");
     let source = typed.prepared.table_scan.source();
     // The fixture control fails any enumeration attempt, so a prepared scan
     // proves preparation never called it.
     assert!(
-        typed
-            .prepared
-            .split_manager
+        capabilities
+            .splits()
             .get_splits(
                 &novarocks_spi::connector::read_stack::ConnectorSession::try_new(
                     "probe",
@@ -169,7 +185,7 @@ fn preparation_enumerates_no_split() {
                     std::time::SystemTime::UNIX_EPOCH,
                 )
                 .expect("probe session"),
-                typed.prepared.table_scan.table().relation().table(),
+                capabilities.frozen(),
                 source.assignments(),
                 &typed.prepared.table_scan.dynamic_filter_columns(),
                 &typed.prepared.constraint,
@@ -347,7 +363,7 @@ fn a_scan_whose_catalog_handle_does_not_resolve_fails_closed() {
         "an uninstalled catalog handle cannot be planned",
     );
     assert!(
-        error.contains("no complete typed control generation"),
+        error.contains("NotFound: Catalog generation is not available"),
         "unexpected error: {error}"
     );
 }

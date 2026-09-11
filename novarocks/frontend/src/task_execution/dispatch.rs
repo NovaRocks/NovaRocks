@@ -17,8 +17,9 @@
 
 //! Bounded, fair per-backend dispatch.
 //!
-//! Every backend keeps three bounded queues, one per [`DispatchLane`], and a
-//! weighted round robin releases work from them. A lane's weight is its
+//! Every backend keeps four queues, one per [`DispatchLane`]. A weighted round
+//! robin releases ordinary work; cancellation has its own control lane and is
+//! selected first. A lane's weight is its
 //! permit count from [`DispatchBudget`], and a lane may never have more
 //! operations in flight than it has permits, so a large create burst can
 //! neither exhaust the lifecycle permits nor take more than its share of a
@@ -31,19 +32,22 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use novarocks_execution::task_execution::{
-    DispatchBudget, DispatchLane, MonotonicInstant, TaskOperationId, TransportBudget,
-};
+use novarocks_execution::task_execution::TaskOperationId;
+use novarocks_query_application::coordination::{DispatchBudget, DispatchLane, MonotonicInstant};
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::BackendProcessId;
 
 use super::error::{CapacityBound, TaskExecutionError};
-use super::intent::{DispatchBatch, OperationIntent};
+use super::intent::{
+    DispatchAcceptance, DispatchBatch, OperationIntent, TaskOperationQueueRequest,
+};
 
 /// Every lane, in rotation order.
-const LANES: [DispatchLane; 3] = [
+const LANES: [DispatchLane; 4] = [
     DispatchLane::Create,
     DispatchLane::Update,
     DispatchLane::Lifecycle,
+    DispatchLane::Control,
 ];
 
 const fn lane_index(lane: DispatchLane) -> usize {
@@ -51,13 +55,15 @@ const fn lane_index(lane: DispatchLane) -> usize {
         DispatchLane::Create => 0,
         DispatchLane::Update => 1,
         DispatchLane::Lifecycle => 2,
+        DispatchLane::Control => 3,
     }
 }
 
 /// One intent waiting in a bounded queue.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct QueuedOperation {
     intent: OperationIntent,
+    queue_permit: Box<dyn super::intent::TaskOperationQueuePermit>,
     queued_at: MonotonicInstant,
     queued_bytes: usize,
 }
@@ -67,17 +73,34 @@ struct QueuedOperation {
 /// It is reported rather than sent late: the backend would time it out on its
 /// own deadline anyway, and failing closed locally keeps the frontend's own
 /// error budget honest.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ExpiredOperation {
-    pub intent: OperationIntent,
-    pub waited: std::time::Duration,
+    intent: OperationIntent,
+    waited: std::time::Duration,
+    /// The process reservation remains live until the serial owner consumes
+    /// this local failure receipt and rolls back the unsent owner marker.
+    _queue_permit: Box<dyn super::intent::TaskOperationQueuePermit>,
+}
+
+impl ExpiredOperation {
+    pub fn operation_id(&self) -> TaskOperationId {
+        self.intent.operation_id()
+    }
+
+    pub fn kind(&self) -> novarocks_execution::task_execution::OperationKind {
+        self.intent.kind()
+    }
+
+    pub const fn waited(&self) -> std::time::Duration {
+        self.waited
+    }
 }
 
 #[derive(Debug)]
 struct BackendQueues {
-    lanes: [VecDeque<QueuedOperation>; 3],
-    in_flight: [usize; 3],
-    credits: [usize; 3],
+    lanes: [VecDeque<QueuedOperation>; 4],
+    in_flight: [usize; 4],
+    credits: [usize; 4],
     cursor: usize,
     queued_items: usize,
     queued_bytes: usize,
@@ -87,12 +110,18 @@ struct BackendQueues {
 impl BackendQueues {
     fn new(budget: DispatchBudget) -> Self {
         Self {
-            lanes: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
-            in_flight: [0; 3],
+            lanes: [
+                VecDeque::new(),
+                VecDeque::new(),
+                VecDeque::new(),
+                VecDeque::new(),
+            ],
+            in_flight: [0; 4],
             credits: [
                 budget.permits_for(DispatchLane::Create),
                 budget.permits_for(DispatchLane::Update),
                 budget.permits_for(DispatchLane::Lifecycle),
+                budget.permits_for(DispatchLane::Control),
             ],
             cursor: 0,
             queued_items: 0,
@@ -114,13 +143,20 @@ struct InFlightSlot {
     lane: DispatchLane,
 }
 
+/// Exact carrier ownership for one operation inside the attempt dispatcher.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum DispatchOperationState {
+    Queued,
+    InFlight,
+    Absent,
+}
+
 /// The per-attempt dispatcher.
 ///
 /// It is scoped to one query execution, so its per-backend queues are exactly
-/// the protocol's per-query-per-backend queues. The process-wide bounds are
-/// applied to its own totals, which is a strictly tighter bound for a single
-/// attempt; aggregating them across concurrent attempts belongs to the
-/// transport owner that will host these dispatchers.
+/// the protocol's per-query-per-backend queues. Its local bounds protect one
+/// attempt. Every production enqueue also carries a reservation from the
+/// process transport supervisor, which is the authority across attempts.
 #[derive(Debug)]
 pub struct OperationDispatcher {
     budget: DispatchBudget,
@@ -167,24 +203,35 @@ impl OperationDispatcher {
     }
 
     /// Queues one intent behind everything already waiting on its lane.
+    #[cfg(test)]
     pub fn enqueue(
         &mut self,
         intent: OperationIntent,
         now: MonotonicInstant,
     ) -> Result<(), TaskExecutionError> {
-        self.admit(intent, now, false)
+        self.admit(intent, now, false, Box::new(UntrackedTestQueuePermit))
+    }
+
+    pub(super) fn enqueue_reserved(
+        &mut self,
+        intent: OperationIntent,
+        now: MonotonicInstant,
+        queue_permit: Box<dyn super::intent::TaskOperationQueuePermit>,
+    ) -> Result<(), TaskExecutionError> {
+        self.admit(intent, now, false, queue_permit)
     }
 
     /// Queues one intent ahead of everything waiting on its lane.
     ///
     /// Only a forced stand-down uses this. It reorders the queue; it never
     /// preempts an operation that was already released.
-    pub fn enqueue_priority(
+    pub(super) fn enqueue_priority_reserved(
         &mut self,
         intent: OperationIntent,
         now: MonotonicInstant,
+        queue_permit: Box<dyn super::intent::TaskOperationQueuePermit>,
     ) -> Result<(), TaskExecutionError> {
-        self.admit(intent, now, true)
+        self.admit(intent, now, true, queue_permit)
     }
 
     fn admit(
@@ -192,15 +239,10 @@ impl OperationDispatcher {
         intent: OperationIntent,
         now: MonotonicInstant,
         front: bool,
+        queue_permit: Box<dyn super::intent::TaskOperationQueuePermit>,
     ) -> Result<(), TaskExecutionError> {
+        self.validate_operation_carrier(&intent)?;
         let queued_bytes = intent.queued_bytes();
-        if let OperationIntent::CreateTask(request) = &intent {
-            let limit = self.transport.max_descriptor_encoded_bytes();
-            let actual = request.descriptor().plan().encoded_len();
-            if actual > limit {
-                return Err(CapacityBound::DescriptorBytes { limit, actual }.into());
-            }
-        }
         let backend = intent.backend_process_id();
         let lane = lane_index(intent.lane());
 
@@ -230,6 +272,7 @@ impl OperationDispatcher {
         }
         let entry = QueuedOperation {
             intent,
+            queue_permit,
             queued_at: now,
             queued_bytes,
         };
@@ -243,6 +286,143 @@ impl OperationDispatcher {
         self.queued_items += 1;
         self.queued_bytes += queued_bytes;
         Ok(())
+    }
+
+    /// Validates the one-operation carrier before process admission.
+    ///
+    /// Production callers use this before asking the shared supervisor for a
+    /// reservation; `admit` repeats the same authority check so test and
+    /// alternate in-crate callers cannot bypass it.
+    pub(super) fn validate_operation_carrier(
+        &self,
+        intent: &OperationIntent,
+    ) -> Result<(), TaskExecutionError> {
+        self.validate_queue_request(intent.queue_request())?;
+        if let OperationIntent::CreateTask(request) = &intent {
+            let limit = self.transport.max_descriptor_encoded_bytes();
+            let actual = request.descriptor().plan().encoded_len();
+            if actual > limit {
+                return Err(CapacityBound::DescriptorBytes { limit, actual }.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates a bounded reservation request before an owner retains the
+    /// corresponding operation payload.
+    pub(super) fn validate_queue_request(
+        &self,
+        request: TaskOperationQueueRequest,
+    ) -> Result<(), TaskExecutionError> {
+        let queued_bytes = request.queued_bytes();
+        let operation_limit = self.transport.max_operation_queued_bytes();
+        if queued_bytes > operation_limit {
+            return Err(CapacityBound::OperationBytes {
+                limit: operation_limit,
+                actual: queued_bytes,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Whether one exact urgent operation can enter and immediately use its
+    /// lane on this serial turn.
+    ///
+    /// This is checked before an external owner hands its payload to the task
+    /// substrate. The caller separately obtains the process transport's queue
+    /// permit; this predicate is only the attempt-local dispatcher authority.
+    /// Because one TaskRound is the dispatcher's sole mutator, the capacity
+    /// cannot change between this check and the matching enqueue.
+    pub(super) fn priority_capacity_available(
+        &self,
+        intent: &OperationIntent,
+    ) -> Result<bool, TaskExecutionError> {
+        self.validate_operation_carrier(intent)?;
+        let queued_bytes = intent.queued_bytes();
+        if self.queued_items + 1 > self.transport.max_backend_queued_operations()
+            || self.queued_bytes + queued_bytes > self.transport.max_backend_queued_bytes()
+        {
+            return Ok(false);
+        }
+        let backend = intent.backend_process_id();
+        let lane = lane_index(intent.lane());
+        let Some(queues) = self.backends.get(&backend) else {
+            return Ok(false);
+        };
+        if queues.queued_items + 1 > self.transport.max_query_backend_queued_operations()
+            || queues.queued_bytes + queued_bytes > self.transport.max_query_backend_queued_bytes()
+        {
+            return Ok(false);
+        }
+        if queues.in_flight[lane] >= self.budget.permits_for(intent.lane()) {
+            return Ok(false);
+        }
+        Ok(queued_bytes <= self.transport.max_batch_encoded_bytes())
+    }
+
+    /// Reports whether an exact operation is still locally queued or has
+    /// crossed the process-transport acceptance boundary.
+    pub(super) fn operation_state(
+        &self,
+        operation_id: TaskOperationId,
+    ) -> Result<DispatchOperationState, TaskExecutionError> {
+        let queued = self
+            .backends
+            .values()
+            .flat_map(|queues| queues.lanes.iter())
+            .flat_map(|lane| lane.iter())
+            .filter(|entry| entry.intent.operation_id() == operation_id)
+            .count();
+        let in_flight = usize::from(self.in_flight.contains_key(&operation_id));
+        match queued + in_flight {
+            0 => Ok(DispatchOperationState::Absent),
+            1 if queued == 1 => Ok(DispatchOperationState::Queued),
+            1 => Ok(DispatchOperationState::InFlight),
+            _ => Err(TaskExecutionError::Schedule(
+                "one operation identity has multiple dispatcher owners".to_owned(),
+            )),
+        }
+    }
+
+    /// Removes one exact operation that has not crossed process transport.
+    /// Dropping its queue permit here returns process capacity before the
+    /// application effect is resolved by an older generation's receipt.
+    pub(super) fn cancel_queued(
+        &mut self,
+        operation_id: TaskOperationId,
+    ) -> Result<OperationIntent, TaskExecutionError> {
+        if self.operation_state(operation_id)? != DispatchOperationState::Queued {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        let mut removed = None;
+        'backend: for queues in self.backends.values_mut() {
+            for lane in &mut queues.lanes {
+                let Some(index) = lane
+                    .iter()
+                    .position(|entry| entry.intent.operation_id() == operation_id)
+                else {
+                    continue;
+                };
+                let entry = lane
+                    .remove(index)
+                    .expect("queued operation index came from the same lane");
+                queues.queued_items -= 1;
+                queues.queued_bytes -= entry.queued_bytes;
+                removed = Some(entry);
+                break 'backend;
+            }
+        }
+        let QueuedOperation {
+            intent,
+            queue_permit,
+            queued_bytes,
+            ..
+        } = removed.ok_or(TaskExecutionError::UnknownOperation)?;
+        self.queued_items -= 1;
+        self.queued_bytes -= queued_bytes;
+        drop(queue_permit);
+        Ok(intent)
     }
 
     fn backend_entry(&mut self, backend: BackendProcessId) -> &mut BackendQueues {
@@ -276,6 +456,7 @@ impl OperationDispatcher {
                         expired.push(ExpiredOperation {
                             intent: entry.intent,
                             waited,
+                            _queue_permit: entry.queue_permit,
                         });
                     } else {
                         kept.push_back(entry);
@@ -294,6 +475,17 @@ impl OperationDispatcher {
         if self.rotation.is_empty() {
             return None;
         }
+        // Scan control first across the whole attempt. Backend rotation still
+        // decides among cancellations, but ordinary work on another backend
+        // cannot hide a cancellation from the process control reserve.
+        for offset in 0..self.rotation.len() {
+            let index = (self.rotation_cursor + offset) % self.rotation.len();
+            let backend = self.rotation[index];
+            if let Some(batch) = self.take_backend_control_batch(backend) {
+                self.rotation_cursor = (index + 1) % self.rotation.len();
+                return Some(batch);
+            }
+        }
         for offset in 0..self.rotation.len() {
             let index = (self.rotation_cursor + offset) % self.rotation.len();
             let backend = self.rotation[index];
@@ -306,66 +498,190 @@ impl OperationDispatcher {
     }
 
     fn take_backend_batch(&mut self, backend: BackendProcessId) -> Option<DispatchBatch> {
-        let budget = self.budget;
-        let max_items = self.transport.max_batch_items();
-        let max_bytes = self.transport.max_batch_encoded_bytes();
-        let (lane, operations, queued_bytes) = {
+        let lane = {
             let queues = self.backends.get_mut(&backend)?;
             if queues.is_empty() {
                 return None;
             }
-            let lane = Self::pick_lane(queues, budget)?;
-            let permits = budget.permits_for(LANES[lane]);
+            Self::pick_lane(queues, self.budget)?
+        };
+        self.take_backend_lane_batch(backend, lane)
+    }
+
+    fn take_backend_control_batch(&mut self, backend: BackendProcessId) -> Option<DispatchBatch> {
+        self.take_backend_lane_batch(backend, lane_index(DispatchLane::Control))
+    }
+
+    /// Takes from one exact lane without letting unrelated ordinary work hide
+    /// an urgent lifecycle operation queued for the same backend.
+    pub(super) fn take_priority_lane_batch(
+        &mut self,
+        backend: BackendProcessId,
+        lane: DispatchLane,
+    ) -> Option<DispatchBatch> {
+        let lane_index = lane_index(lane);
+        let queues = self.backends.get_mut(&backend)?;
+        if queues.credits[lane_index] == 0 {
+            queues.credits[lane_index] = self.budget.permits_for(lane);
+        }
+        self.take_backend_lane_batch(backend, lane_index)
+    }
+
+    fn take_backend_lane_batch(
+        &mut self,
+        backend: BackendProcessId,
+        lane: usize,
+    ) -> Option<DispatchBatch> {
+        let max_items = self.transport.max_batch_items();
+        let max_bytes = self.transport.max_batch_encoded_bytes();
+        let (operations, queue_permits, queued_bytes, queued_at) = {
+            let queues = self.backends.get_mut(&backend)?;
+            if queues.lanes[lane].is_empty() {
+                return None;
+            }
+            let permits = self.budget.permits_for(LANES[lane]);
             let headroom = permits.saturating_sub(queues.in_flight[lane]);
             let allowance = headroom.min(queues.credits[lane]).min(max_items);
             if allowance == 0 {
                 return None;
             }
             let mut operations = Vec::new();
+            let mut queue_permits = Vec::new();
             let mut queued_bytes = 0_usize;
+            let mut queued_at = None;
+            let requires_control_progress = queues.lanes[lane]
+                .front()
+                .expect("the lane was observed nonempty")
+                .intent
+                .requires_control_progress();
             while operations.len() < allowance {
                 let Some(entry) = queues.lanes[lane].front() else {
                     break;
                 };
-                // The first operation always goes, so a payload at the
-                // descriptor bound can still leave the queue; every later one
-                // has to fit.
-                if !operations.is_empty() && queued_bytes + entry.queued_bytes > max_bytes {
+                // A Native request is admitted as one process-level class.
+                // Do not let ordinary updates hitch a ride on the capacity
+                // reserved for a cancellation that shares their historical
+                // attempt-local lane.
+                if !operations.is_empty()
+                    && entry.intent.requires_control_progress() != requires_control_progress
+                {
+                    break;
+                }
+                // Enqueueing already proved one operation fits. The aggregate
+                // check keeps the queue-side carrier of the whole batch under
+                // the same hard bound as its encoded request.
+                if queued_bytes.saturating_add(entry.queued_bytes) > max_bytes {
                     break;
                 }
                 let entry = queues.lanes[lane]
                     .pop_front()
                     .expect("the front entry was just observed");
                 queued_bytes += entry.queued_bytes;
+                queued_at = Some(queued_at.map_or(entry.queued_at, |oldest| {
+                    std::cmp::min(oldest, entry.queued_at)
+                }));
                 queues.queued_items -= 1;
                 queues.queued_bytes -= entry.queued_bytes;
                 operations.push(entry.intent);
+                queue_permits.push(entry.queue_permit);
             }
             if operations.is_empty() {
                 return None;
             }
-            queues.credits[lane] -= operations.len();
-            queues.in_flight[lane] += operations.len();
             queues.cursor = (lane + 1) % LANES.len();
-            (lane, operations, queued_bytes)
+            (
+                operations,
+                queue_permits,
+                queued_bytes,
+                queued_at.expect("a nonempty batch has a queue timestamp"),
+            )
         };
         self.queued_items -= operations.len();
         self.queued_bytes -= queued_bytes;
-        for intent in &operations {
-            self.in_flight.insert(
-                intent.operation_id(),
-                InFlightSlot {
-                    backend,
-                    lane: LANES[lane],
-                },
-            );
-        }
-        Some(DispatchBatch::new(
+        Some(DispatchBatch::with_queued_at(
             backend,
             LANES[lane],
             operations,
+            queue_permits,
             queued_bytes,
+            queued_at,
         ))
+    }
+
+    /// Commits transport acceptance and only then consumes dispatch permits.
+    pub(crate) fn accept(
+        &mut self,
+        accepted: DispatchAcceptance,
+    ) -> Result<(), TaskExecutionError> {
+        let queues = self
+            .backends
+            .get_mut(&accepted.backend)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let lane = lane_index(accepted.lane);
+        let count = accepted.operation_ids.len();
+        if count == 0
+            || count > queues.credits[lane]
+            || queues.in_flight[lane].saturating_add(count) > self.budget.permits_for(accepted.lane)
+            || accepted
+                .operation_ids
+                .iter()
+                .any(|operation_id| self.in_flight.contains_key(operation_id))
+        {
+            return Err(TaskExecutionError::Schedule(
+                "transport accepted a batch outside its dispatcher reservation".to_owned(),
+            ));
+        }
+        queues.credits[lane] -= count;
+        queues.in_flight[lane] += count;
+        for operation_id in accepted.operation_ids {
+            self.in_flight.insert(
+                operation_id,
+                InFlightSlot {
+                    backend: accepted.backend,
+                    lane: accepted.lane,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Restores an unaccepted batch at the head of its original lane.
+    ///
+    /// No dispatch permit was consumed, so this is a pure ownership return.
+    /// The oldest residence timestamp is retained for every restored item to
+    /// prevent repeated process-level backpressure from extending deadlines.
+    pub(super) fn restore_backpressured(&mut self, batch: DispatchBatch) {
+        let backend = batch.backend();
+        let lane = lane_index(batch.lane());
+        let queued_at = batch.queued_at();
+        let batch_queued_bytes = batch.queued_bytes();
+        let (operations, queue_permits) = batch.into_queue_parts();
+        let item_count = operations.len();
+        let recomputed_bytes = operations
+            .iter()
+            .map(OperationIntent::queued_bytes)
+            .sum::<usize>();
+        assert_eq!(
+            batch_queued_bytes, recomputed_bytes,
+            "a refused batch must retain its exact queued-byte ownership"
+        );
+        {
+            let queues = self.backend_entry(backend);
+            for (intent, queue_permit) in operations.into_iter().zip(queue_permits).rev() {
+                let queued_bytes = intent.queued_bytes();
+                let entry = QueuedOperation {
+                    intent,
+                    queue_permit,
+                    queued_at,
+                    queued_bytes,
+                };
+                queues.lanes[lane].push_front(entry);
+                queues.queued_items += 1;
+                queues.queued_bytes += queued_bytes;
+            }
+        }
+        self.queued_items += item_count;
+        self.queued_bytes += batch_queued_bytes;
     }
 
     /// Picks the next lane in weighted rotation.
@@ -440,4 +756,13 @@ impl OperationDispatcher {
     pub fn backends(&self) -> impl ExactSizeIterator<Item = BackendProcessId> + '_ {
         self.rotation.iter().copied()
     }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct UntrackedTestQueuePermit;
+
+#[cfg(test)]
+impl super::intent::TaskOperationQueuePermit for UntrackedTestQueuePermit {
+    fn mark_in_flight(&mut self) {}
 }

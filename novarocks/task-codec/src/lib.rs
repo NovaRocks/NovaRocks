@@ -30,12 +30,16 @@
 //! recorded exception; every other value crosses this boundary as a neutral
 //! Rust type.
 
+pub mod budget;
+pub mod context_convergence;
 pub mod descriptor;
 pub mod domain;
 pub mod identity;
 pub mod lease;
 pub mod operation;
 pub mod status;
+
+pub use budget::TransportBudget;
 
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 
@@ -67,35 +71,40 @@ pub(crate) fn duplicate(path: FieldPath, detail: impl Into<String>) -> ProtocolE
 mod tests {
     use super::descriptor::{decode_task_descriptor, decode_topology, encode_topology};
     use super::identity::{
-        decode_query_context_ref, decode_task_identity, encode_query_context_ref,
-        encode_task_identity,
+        decode_query_context_ref, decode_task_identity, encode_admission_ticket_id,
+        encode_query_context_ref, encode_task_identity,
     };
     use super::lease::{
         LeaseGrant, decode_lease_grant, decode_lease_receipt, encode_lease_grant,
         encode_lease_receipt,
     };
     use super::operation::{
-        DecodedOperation, DecodedUpdateQueryContext, decode_fetch_task_result,
-        decode_get_final_task_info, decode_operation_batch, decode_receipt_batch,
-        encode_fetch_task_result, encode_get_final_task_info, encode_operation_outcome,
-        encode_query_context_state,
+        DecodedOperation, DecodedUpdateQueryContext, MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES,
+        decode_fetch_task_result, decode_get_final_task_info, decode_operation_batch,
+        decode_operation_outcome, decode_query_context_admission_ticket_ack, decode_receipt_batch,
+        encode_acquire_query_context_admission_ticket, encode_fetch_task_result,
+        encode_get_final_task_info, encode_operation_outcome,
+        encode_query_context_admission_ticket_ack, encode_query_context_state,
     };
     use super::status::{decode_task_status, encode_task_status};
-    use novarocks_execution::task_execution::domain::{
+    use novarocks_execution_contract::task_execution::domain::{
         CredentialEpoch, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId,
     };
-    use novarocks_execution::task_execution::identity::{
-        QueryContextRef, TaskIdentity, TaskOperationId,
+    use novarocks_execution_contract::task_execution::identity::{
+        AdmissionEpochCapability, AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
     };
-    use novarocks_execution::task_execution::lease::{LeaseReceipt, LeaseSequence, LeaseValidFor};
-    use novarocks_execution::task_execution::operation::{
-        MaxWait, OperationKind, OperationOutcome, ReleaseOutcome, TransportBudget,
+    use novarocks_execution_contract::task_execution::lease::{
+        LeaseReceipt, LeaseSequence, LeaseValidFor,
     };
-    use novarocks_execution::task_execution::status::{
+    use novarocks_execution_contract::task_execution::operation::{
+        AcquireQueryContextAdmissionTicket, MaxWait, OperationKind, OperationOutcome,
+        QueryContextAdmissionTicketReceipt, ReleaseOutcome, ResultByteLimit, ResultPacketSequence,
+    };
+    use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
         TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
     };
-    use novarocks_execution::task_execution::transition::QueryContextState;
+    use novarocks_execution_contract::task_execution::transition::QueryContextState;
     use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
     use novarocks_proto_models::{catalog, common, filter, novarocks, plan};
     use novarocks_types::NativeCompatibilityId;
@@ -103,6 +112,8 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use std::time::Duration;
+
+    use crate::TransportBudget;
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 
@@ -393,10 +404,18 @@ mod tests {
             }],
             inbound: vec![novarocks::TaskExchangeInbound {
                 destination_node_id: 30,
-                sources: vec![novarocks::TaskExchangeSource {
-                    task: Some(encode_task_identity(identity(1, 1, process))),
-                    fragment_instance_id: Some(unique(1, 1)),
-                }],
+                sources: vec![
+                    novarocks::TaskExchangeSource {
+                        task: Some(encode_task_identity(identity(1, 1, process))),
+                        fragment_instance_id: Some(unique(1, 1)),
+                        sender_ordinal: 0,
+                    },
+                    novarocks::TaskExchangeSource {
+                        task: Some(encode_task_identity(identity(1, 2, process))),
+                        fragment_instance_id: Some(unique(1, 2)),
+                        sender_ordinal: 1,
+                    },
+                ],
             }],
         };
         let decoded = decode_topology(&wire, FieldPath::root("topology")).expect("legal topology");
@@ -405,7 +424,7 @@ mod tests {
             decoded.outbound()[0].destinations()[0].fragment_instance_id(),
             novarocks_types::UniqueId::new(3, 1)
         );
-        assert_eq!(decoded.inbound()[0].expected_sender_count().get(), 1);
+        assert_eq!(decoded.inbound()[0].expected_sender_count().get(), 2);
         assert_eq!(encode_topology(&decoded), wire);
 
         let mut duplicate = wire.clone();
@@ -414,12 +433,22 @@ mod tests {
             .push(novarocks::TaskExchangeSource {
                 task: Some(encode_task_identity(identity(1, 1, process))),
                 fragment_instance_id: Some(unique(1, 1)),
+                sender_ordinal: 0,
             });
         assert_eq!(
             decode_topology(&duplicate, FieldPath::root("topology"))
                 .expect_err("a repeated source inflates the sender count")
                 .kind(),
             ProtocolErrorKind::DuplicateField
+        );
+
+        let mut wrong_ordinal = wire.clone();
+        wrong_ordinal.inbound[0].sources[1].sender_ordinal = 0;
+        assert_eq!(
+            decode_topology(&wrong_ordinal, FieldPath::root("topology"))
+                .expect_err("each source owns exactly one ordinal")
+                .kind(),
+            ProtocolErrorKind::InconsistentFields
         );
 
         let mut unspecified = wire;
@@ -775,7 +804,7 @@ mod tests {
     #[test]
     fn one_operator_row_count_survives_the_wire_without_the_other() {
         use super::status::{decode_final_task_info, encode_final_task_info};
-        use novarocks_execution::task_execution::{FinalTaskInfo, OperatorStatistics};
+        use novarocks_execution_contract::{FinalTaskInfo, OperatorStatistics};
 
         let process = backend();
         let task = identity(2, 5, process);
@@ -812,23 +841,37 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_state_and_the_client_only_outcomes_have_no_wire_form() {
+    fn an_absent_state_has_no_wire_form_and_every_worker_outcome_round_trips() {
         assert_eq!(encode_query_context_state(QueryContextState::Absent), None);
         assert!(encode_query_context_state(QueryContextState::Active).is_some());
-        for client_only in [
-            OperationOutcome::RetryableTransportUnknown,
-            OperationOutcome::RetryableObservationLoss,
-            OperationOutcome::NormalDestinationCanceled,
-            OperationOutcome::DestinationFailure,
+        for outcome in [
+            OperationOutcome::Accepted,
+            OperationOutcome::Idempotent,
+            OperationOutcome::OperationTimedOut,
+            OperationOutcome::IdentityMismatch,
+            OperationOutcome::CompatibilityMismatch,
+            OperationOutcome::CreateConflict,
+            OperationOutcome::ContextNotEstablished,
+            OperationOutcome::ContextConflict,
+            OperationOutcome::DomainConflict,
+            OperationOutcome::LeaseExpired,
+            OperationOutcome::ReleaseNotReady,
+            OperationOutcome::ContextTerminalReceipt,
+            OperationOutcome::InvalidStateOrRequest,
+            OperationOutcome::TerminalRejected,
+            OperationOutcome::Gone,
+            OperationOutcome::ResourceExhausted,
+            OperationOutcome::AdmissionTicketStillActive,
         ] {
             assert_eq!(
-                encode_operation_outcome(client_only),
-                None,
-                "{client_only:?} is not a server-reported category"
+                decode_operation_outcome(
+                    encode_operation_outcome(outcome),
+                    FieldPath::root("operation_outcome"),
+                ),
+                Ok(outcome),
+                "{outcome:?} must have one exact Worker receipt encoding"
             );
         }
-        assert!(encode_operation_outcome(OperationOutcome::Accepted).is_some());
-        assert!(encode_operation_outcome(OperationOutcome::ResourceExhausted).is_some());
     }
 
     #[test]
@@ -836,17 +879,28 @@ mod tests {
         let process = backend();
         let root = identity(4, 7, process);
 
-        let poll = encode_fetch_task_result(root, MaxWait::default_for(OperationKind::CancelTask));
-        let (decoded, max_wait) =
+        let acknowledged = ResultPacketSequence::new(19);
+        let max_result_bytes = ResultByteLimit::new(4096).expect("result byte limit");
+        let poll = encode_fetch_task_result(
+            root,
+            MaxWait::default_for(OperationKind::CancelTask),
+            Some(acknowledged),
+            max_result_bytes,
+        );
+        let (decoded, max_wait, decoded_acknowledged, decoded_max_result_bytes) =
             decode_fetch_task_result(&poll, FieldPath::root("fetch")).expect("a legal poll");
         assert_eq!(decoded, root);
         assert_eq!(max_wait, MaxWait::DEFAULT_UPDATE);
+        assert_eq!(decoded_acknowledged, Some(acknowledged));
+        assert_eq!(decoded_max_result_bytes, max_result_bytes);
 
         // A poll that names no task cannot be answered from "the" result
         // buffer, because the address is the only thing that says which one.
         let anonymous = novarocks::FetchTaskResultRequest {
             root_task: None,
             max_wait_millis: 1_000,
+            acknowledged_packet_sequence: None,
+            max_result_bytes: 4096,
         };
         assert_eq!(
             decode_fetch_task_result(&anonymous, FieldPath::root("fetch"))
@@ -859,8 +913,36 @@ mod tests {
         let zero = novarocks::FetchTaskResultRequest {
             root_task: Some(encode_task_identity(root)),
             max_wait_millis: 0,
+            acknowledged_packet_sequence: None,
+            max_result_bytes: 4096,
         };
         assert!(decode_fetch_task_result(&zero, FieldPath::root("fetch")).is_err());
+
+        let zero_bytes = novarocks::FetchTaskResultRequest {
+            root_task: Some(encode_task_identity(root)),
+            max_wait_millis: 1_000,
+            acknowledged_packet_sequence: None,
+            max_result_bytes: 0,
+        };
+        assert_eq!(
+            decode_fetch_task_result(&zero_bytes, FieldPath::root("fetch"))
+                .expect_err("zero is not a payload credit")
+                .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+
+        let oversized = novarocks::FetchTaskResultRequest {
+            root_task: Some(encode_task_identity(root)),
+            max_wait_millis: 1_000,
+            acknowledged_packet_sequence: None,
+            max_result_bytes: MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES + 1,
+        };
+        assert_eq!(
+            decode_fetch_task_result(&oversized, FieldPath::root("fetch"))
+                .expect_err("the request must fit the Native response envelope")
+                .kind(),
+            ProtocolErrorKind::OutOfRange
+        );
 
         let read = encode_get_final_task_info(root);
         let operation = TaskOperationId::new_v7();
@@ -873,7 +955,9 @@ mod tests {
     fn envelope(kind: OperationKind) -> (TaskOperationId, novarocks::TaskOperationEnvelope) {
         let id = TaskOperationId::new_v7();
         let millis = match kind {
-            OperationKind::CreateTask | OperationKind::UpdateQueryContext => 15_000,
+            OperationKind::AcquireQueryContextAdmissionTicket
+            | OperationKind::CreateTask
+            | OperationKind::UpdateQueryContext => 15_000,
             _ => 5_000,
         };
         (
@@ -883,6 +967,190 @@ mod tests {
                 max_wait_millis: millis,
             },
         )
+    }
+
+    #[test]
+    fn admission_ticket_request_and_receipt_round_trip_the_exact_grant() {
+        let query_context = context(backend());
+        let valid_for = LeaseValidFor::new(Duration::from_secs(12)).expect("representable");
+        let native_compatibility_id = NativeCompatibilityId::new([0x47; 32]);
+        let admission_epoch_capability =
+            AdmissionEpochCapability::try_from_bytes([0x51; 16]).expect("nonzero epoch");
+        let request = AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            query_context,
+            valid_for,
+            native_compatibility_id,
+            admission_epoch_capability,
+        );
+        let wire = encode_acquire_query_context_admission_ticket(request);
+        let decoded = decode_operation_batch(
+            &novarocks::ApplyTaskOperationsRequest {
+                operations: vec![wire.clone()],
+            },
+            TransportBudget::DEFAULT,
+            FieldPath::root("batch"),
+        )
+        .expect("the acquisition request is legal");
+        let DecodedOperation::AcquireQueryContextAdmissionTicket(decoded_request) = decoded[0]
+        else {
+            panic!("fixture carries an admission ticket acquisition");
+        };
+        assert_eq!(decoded_request.context(), query_context);
+        assert_eq!(decoded_request.valid_for(), valid_for);
+        assert_eq!(
+            decoded_request.native_compatibility_id(),
+            native_compatibility_id
+        );
+        assert_eq!(
+            decoded_request.admission_epoch_capability(),
+            admission_epoch_capability
+        );
+
+        let mut missing_epoch = wire.clone();
+        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
+            missing_epoch.operation.as_mut()
+        else {
+            panic!("fixture carries an admission ticket acquisition");
+        };
+        acquire.admission_epoch_capability = None;
+        assert_eq!(
+            decode_operation_batch(
+                &novarocks::ApplyTaskOperationsRequest {
+                    operations: vec![missing_epoch],
+                },
+                TransportBudget::DEFAULT,
+                FieldPath::root("batch"),
+            )
+            .expect_err("admission epoch is required before worker admission")
+            .kind(),
+            ProtocolErrorKind::MissingField
+        );
+
+        let mut zero_epoch = wire.clone();
+        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
+            zero_epoch.operation.as_mut()
+        else {
+            panic!("fixture carries an admission ticket acquisition");
+        };
+        acquire.admission_epoch_capability =
+            Some(novarocks::AdmissionEpochCapability { value: vec![0; 16] });
+        assert_eq!(
+            decode_operation_batch(
+                &novarocks::ApplyTaskOperationsRequest {
+                    operations: vec![zero_epoch],
+                },
+                TransportBudget::DEFAULT,
+                FieldPath::root("batch"),
+            )
+            .expect_err("an all-zero admission epoch must fail")
+            .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+
+        let mut missing_compatibility = wire.clone();
+        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
+            missing_compatibility.operation.as_mut()
+        else {
+            panic!("fixture carries an admission ticket acquisition");
+        };
+        acquire.native_compatibility_id = None;
+        assert_eq!(
+            decode_operation_batch(
+                &novarocks::ApplyTaskOperationsRequest {
+                    operations: vec![missing_compatibility],
+                },
+                TransportBudget::DEFAULT,
+                FieldPath::root("batch"),
+            )
+            .expect_err("compatibility is required before worker admission")
+            .kind(),
+            ProtocolErrorKind::MissingField
+        );
+
+        let mut malformed_compatibility = wire.clone();
+        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
+            malformed_compatibility.operation.as_mut()
+        else {
+            panic!("fixture carries an admission ticket acquisition");
+        };
+        acquire.native_compatibility_id = Some(novarocks::NativeCompatibilityId {
+            value: vec![0x47; 31],
+        });
+        assert_eq!(
+            decode_operation_batch(
+                &novarocks::ApplyTaskOperationsRequest {
+                    operations: vec![malformed_compatibility],
+                },
+                TransportBudget::DEFAULT,
+                FieldPath::root("batch"),
+            )
+            .expect_err("compatibility must be exactly 32 bytes")
+            .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+
+        let ticket_id = AdmissionTicketId::try_from_bytes([0x54; 16]).expect("nonzero ticket");
+        let receipt = QueryContextAdmissionTicketReceipt::new(ticket_id, query_context, valid_for);
+        let wire_ack = encode_query_context_admission_ticket_ack(receipt);
+        let decoded_receipt = decode_query_context_admission_ticket_ack(
+            &wire_ack,
+            request,
+            FieldPath::root("receipt.query_context_admission_ticket"),
+        )
+        .expect("the acknowledgement binds the exact request");
+        assert_eq!(decoded_receipt, receipt);
+
+        let mut zero_ticket = wire_ack.clone();
+        zero_ticket.ticket_id = Some(novarocks::AdmissionTicketId { value: vec![0; 16] });
+        assert_eq!(
+            decode_query_context_admission_ticket_ack(
+                &zero_ticket,
+                request,
+                FieldPath::root("receipt.query_context_admission_ticket"),
+            )
+            .expect_err("an all-zero ticket nonce must fail")
+            .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+
+        let other_valid_for = LeaseValidFor::new(Duration::from_secs(13)).expect("representable");
+        let wrong_validity = AcquireQueryContextAdmissionTicket::new(
+            request.envelope().operation_id(),
+            query_context,
+            other_valid_for,
+            native_compatibility_id,
+            admission_epoch_capability,
+        );
+        assert_eq!(
+            decode_query_context_admission_ticket_ack(
+                &wire_ack,
+                wrong_validity,
+                FieldPath::root("receipt.query_context_admission_ticket"),
+            )
+            .expect_err("a receipt for different requested validity must fail")
+            .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+
+        let other_context = context(BackendProcessId::new_v7());
+        let wrong_context = AcquireQueryContextAdmissionTicket::new(
+            request.envelope().operation_id(),
+            other_context,
+            valid_for,
+            native_compatibility_id,
+            admission_epoch_capability,
+        );
+        assert_eq!(
+            decode_query_context_admission_ticket_ack(
+                &wire_ack,
+                wrong_context,
+                FieldPath::root("receipt.query_context_admission_ticket"),
+            )
+            .expect_err("a receipt for another context must fail")
+            .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
     }
 
     #[test]
@@ -1031,6 +1299,7 @@ mod tests {
     #[test]
     fn an_establish_must_carry_lease_sequence_zero_and_one_envelope_per_descriptor() {
         let process = backend();
+        let ticket_id = AdmissionTicketId::try_from_bytes([0x55; 16]).expect("nonzero ticket");
         let (_, envelope_value) = envelope(OperationKind::UpdateQueryContext);
         let establish = |sequence: u64,
                          descriptors: usize,
@@ -1078,6 +1347,9 @@ mod tests {
                                                 value: [0x71; 32].to_vec(),
                                             },
                                         ),
+                                        admission_ticket_id: Some(encode_admission_ticket_id(
+                                            ticket_id,
+                                        )),
                                     },
                                 ),
                             ),
@@ -1102,6 +1374,31 @@ mod tests {
             request.native_compatibility_id(),
             NativeCompatibilityId::new([0x71; 32]),
             "the exact typed compatibility identity reaches admission"
+        );
+        assert_eq!(request.admission_ticket_id(), ticket_id);
+
+        let mut missing_ticket = establish(0, 1, 1);
+        let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+            missing_ticket.operations[0].operation.as_mut()
+        else {
+            panic!("fixture carries an update query context");
+        };
+        let Some(novarocks::update_query_context_request::Command::Establish(establish_request)) =
+            update.command.as_mut()
+        else {
+            panic!("fixture carries an establish");
+        };
+        establish_request.admission_ticket_id = None;
+        let error = decode_operation_batch(
+            &missing_ticket,
+            TransportBudget::DEFAULT,
+            FieldPath::root("batch"),
+        )
+        .expect_err("an establish must carry its admission ticket id");
+        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(
+            error.path().to_string(),
+            "batch.operations[0].update_query_context.establish.admission_ticket_id"
         );
 
         let mut missing_compatibility = establish(0, 1, 1);
@@ -1548,7 +1845,7 @@ mod tests {
             encode_cancel_task, encode_create_task, encode_operation_batch,
             encode_release_query_context, encode_renew_lease,
         };
-        use novarocks_execution::task_execution::operation::{
+        use novarocks_execution_contract::task_execution::operation::{
             CancelTask, CreateTask, ReleaseQueryContext, RenewQueryExecutionLease,
         };
 
@@ -1635,7 +1932,7 @@ mod tests {
     #[test]
     fn an_encoded_batch_over_the_budget_is_refused_before_the_wire() {
         use super::operation::{encode_cancel_task, encode_operation_batch};
-        use novarocks_execution::task_execution::operation::CancelTask;
+        use novarocks_execution_contract::task_execution::operation::CancelTask;
 
         let process = backend();
         let one = encode_cancel_task(CancelTask::new(
@@ -1660,8 +1957,10 @@ mod tests {
     #[test]
     fn a_credential_receipt_reports_its_lease_and_epoch() {
         use super::operation::encode_query_context_domain_receipt;
-        use novarocks_execution::task_execution::domain::{CredentialLeaseId, DomainProgression};
-        use novarocks_execution::task_execution::operation::QueryContextDomainReceipt;
+        use novarocks_execution_contract::task_execution::domain::{
+            CredentialLeaseId, DomainProgression,
+        };
+        use novarocks_execution_contract::task_execution::operation::QueryContextDomainReceipt;
 
         let receipt = QueryContextDomainReceipt::Credential {
             lease_id: CredentialLeaseId::new(7),
@@ -1670,7 +1969,7 @@ mod tests {
         };
         let encoded =
             encode_query_context_domain_receipt(&receipt).expect("an applied receipt encodes");
-        match encoded.receipt.clone().expect("a receipt body") {
+        match encoded.receipt.expect("a receipt body") {
             novarocks::query_context_domain_receipt::Receipt::Credential(credential) => {
                 assert_eq!(
                     credential.lease_id, 7,
@@ -1742,10 +2041,10 @@ mod tests {
             decode_query_context_domain_receipt, decode_task_domain_receipt,
             encode_query_context_domain_receipt, encode_task_domain_receipt,
         };
-        use novarocks_execution::task_execution::domain::{
+        use novarocks_execution_contract::task_execution::domain::{
             CredentialLeaseId, DomainProgression, SplitSequence, SplitWatermark,
         };
-        use novarocks_execution::task_execution::operation::{
+        use novarocks_execution_contract::task_execution::operation::{
             PlanNodeSplitReceipt, QueryContextDomainReceipt, TaskDomainReceipt,
         };
 
@@ -1778,6 +2077,7 @@ mod tests {
                     progression,
                 },
                 TaskDomainReceipt::OpenExchangeEdges {
+                    accepted_version: EdgeOpenVersion::new(6).expect("nonzero"),
                     opened: vec![
                         ExchangeEdgeId::new(1).expect("nonzero"),
                         ExchangeEdgeId::new(4).expect("nonzero"),
@@ -1817,6 +2117,20 @@ mod tests {
                 assert_eq!(decoded, case, "a context domain receipt lost information");
             }
         }
+
+        let zero_edge_version = novarocks::TaskDomainReceipt {
+            receipt: Some(novarocks::task_domain_receipt::Receipt::OpenExchangeEdges(
+                novarocks::OpenExchangeEdgesReceipt {
+                    opened_edge_ids: vec![1],
+                    accepted_version: 0,
+                },
+            )),
+            progression: novarocks::AcceptedDomainProgression::Apply as i32,
+        };
+        assert!(
+            decode_task_domain_receipt(&zero_edge_version, FieldPath::root("receipt"),).is_err(),
+            "zero cannot be decoded as an accepted edge-open version"
+        );
     }
 
     #[test]
@@ -1825,8 +2139,10 @@ mod tests {
             encode_create_task_ack, encode_query_context_domain_receipt,
             encode_task_domain_receipt, encode_update_task_ack,
         };
-        use novarocks_execution::task_execution::domain::{DomainConflict, DomainProgression};
-        use novarocks_execution::task_execution::operation::{
+        use novarocks_execution_contract::task_execution::domain::{
+            DomainConflict, DomainProgression,
+        };
+        use novarocks_execution_contract::task_execution::operation::{
             CreateTaskReceipt, QueryContextDomainReceipt, TaskDomainReceipt, UpdateTaskReceipt,
         };
 
@@ -1885,7 +2201,7 @@ mod tests {
             decode_create_task_ack, decode_query_context_ack, decode_update_task_ack,
             encode_create_task_ack, encode_query_context_ack, encode_update_task_ack,
         };
-        use novarocks_execution::task_execution::operation::{
+        use novarocks_execution_contract::task_execution::operation::{
             CreateTaskReceipt, QueryContextReceipt, UpdateTaskReceipt,
         };
 
@@ -1947,7 +2263,7 @@ mod tests {
             decode_query_context_ack, decode_release_ack, encode_query_context_ack,
             encode_release_ack,
         };
-        use novarocks_execution::task_execution::operation::QueryContextReceipt;
+        use novarocks_execution_contract::task_execution::operation::QueryContextReceipt;
 
         // The cause is the only statement of why a context the frontend still
         // believed in is gone. Validating and discarding it would leave the

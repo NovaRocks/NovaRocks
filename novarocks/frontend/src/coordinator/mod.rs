@@ -23,7 +23,6 @@ mod scheduler;
     dead_code,
     reason = "Wired into execute_round by the typed producer cut in the same PR."
 )]
-pub(crate) mod split_assignment_round;
 pub(crate) mod task_round;
 
 pub use execution::FrontendDistributedQueryCoordinator;

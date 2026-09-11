@@ -476,7 +476,7 @@ mv_refresh_scheduler_failure_backoff_ms = 500
 mv_refresh_scheduler_max_failure_backoff_ms = 2000
 
 [[connector.credentials]]
-purpose = "object-store-data"
+purpose = "object-store-metadata"
 name = "iceberg-test-data"
 generation = "v1"
 kind = "s3"

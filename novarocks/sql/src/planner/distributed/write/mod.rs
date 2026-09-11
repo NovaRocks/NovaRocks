@@ -25,7 +25,7 @@ pub(crate) mod sink;
 pub(crate) use auxiliary::WriterAuxiliaryPlan;
 #[allow(
     unused_imports,
-    reason = "T08 exposes the lowering entrypoint for the later write-session integration task."
+    reason = "the writer application boundary consumes this lowering entrypoint"
 )]
 pub use auxiliary::{
     WriteUnpivotMapping, WriterFinalAggregateCall, WriterFinalAggregatePlan,

@@ -496,16 +496,23 @@ impl ProcessorOperator for ExchangeSourceOperator {
                 }
                 None => {
                     if self.idle_deadline.is_expired() {
+                        let snapshot = self
+                            .binding
+                            .receiver_port
+                            .snapshot(receiver_key(self.binding.key));
                         debug!(
-                            "ExchangeSource timeout waiting for senders: finst_id={} node_id={} timeout={:?}",
+                            "ExchangeSource timeout waiting for senders: finst_id={} node_id={} timeout={:?} expected_senders={} snapshot={:?}",
                             self.binding.key.finst_uuid(),
                             self.node.node_id,
-                            self.node.timeout
+                            self.node.timeout,
+                            self.binding.expected_senders,
+                            snapshot,
                         );
                         return Err(format!(
-                            "exchange timeout waiting for senders: finst_id={} node_id={}",
+                            "exchange timeout waiting for senders: finst_id={} node_id={} expected_senders={} snapshot={snapshot:?}",
                             self.binding.key.finst_uuid(),
-                            self.node.node_id
+                            self.node.node_id,
+                            self.binding.expected_senders,
                         ));
                     }
                     let first_none = !self.logged_first_none;

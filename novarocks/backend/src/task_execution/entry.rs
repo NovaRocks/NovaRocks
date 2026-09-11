@@ -23,22 +23,24 @@
 //! terminal record, and `Gone` is the retirement fence that keeps a legal late
 //! request from being mistaken for a brand new task.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use novarocks_execution::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution::task_execution::domain::{
-    ConfidentialContent, ContentFingerprint, CredentialDomain, ScalarDomain,
+use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
+use novarocks_execution_contract::task_execution::domain::ContentFingerprint;
+use novarocks_execution_contract::task_execution::identity::{
+    AdmissionTicketId, TaskIdentity, TaskOperationId,
 };
-use novarocks_execution::task_execution::identity::{TaskIdentity, TaskOperationId};
-use novarocks_execution::task_execution::lease::{InstalledLease, LeaseValidFor, MonotonicInstant};
-use novarocks_execution::task_execution::operation::{
-    CreateTaskReceipt, EstablishQueryContext, OperationOutcome,
+use novarocks_execution_contract::task_execution::operation::{
+    CreateTaskReceipt, EstablishQueryContext, EstablishSemanticIdentity, OperationOutcome,
+    QueryContextReceipt,
 };
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, FinalTaskInfo, TaskStatus, TerminationDetail,
 };
-use novarocks_execution::task_execution::transition::{QueryContextState, TerminationLatch};
+use novarocks_execution_contract::task_execution::transition::QueryContextState;
+use novarocks_types::identity::{StageId, TaskId};
+use novarocks_worker::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
 
 use super::domains::{InitialDomainKey, TaskDomains};
 use super::host::{ReleasedContextEvidence, RunnableTask};
@@ -50,42 +52,31 @@ use super::status::TaskStatusOwner;
 /// The credential material is deliberately absent: it cannot be
 /// fingerprinted, so an exact replay is recognised by comparing the live
 /// material through [`ConfidentialContent::matches`] instead.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct EstablishRecord {
     pub(super) operation: TaskOperationId,
-    pub(super) catalog: ContentFingerprint,
-    pub(super) runtime_filter: ContentFingerprint,
-    pub(super) query_options: ContentFingerprint,
-    pub(super) credential_lease: novarocks_execution::task_execution::domain::CredentialLeaseId,
-    pub(super) credential_epoch: novarocks_execution::task_execution::domain::CredentialEpoch,
-    pub(super) lease_valid_for: LeaseValidFor,
+    pub(super) admission_ticket_id: AdmissionTicketId,
+    pub(super) semantic_identity: EstablishSemanticIdentity,
+    pub(super) original_receipt: Option<QueryContextReceipt>,
 }
 
 impl EstablishRecord {
     pub(super) fn of(request: &EstablishQueryContext) -> Self {
         Self {
             operation: request.envelope().operation_id(),
-            catalog: request.catalog_binding().fingerprint(),
-            runtime_filter: request.initial_runtime_filter().fingerprint(),
-            query_options: request.query_options().fingerprint(),
-            credential_lease: request.initial_credential().lease_id(),
-            credential_epoch: request.initial_credential().epoch(),
-            lease_valid_for: request.initial_lease_valid_for(),
+            admission_ticket_id: request.admission_ticket_id(),
+            semantic_identity: request.semantic_identity(),
+            original_receipt: None,
         }
     }
 
     /// Whether two establishes are the same immutable request.
     ///
-    /// The operation id is deliberately not compared: two concurrent
-    /// establishes of the identical content are the same creation, and the
-    /// frontend's own retry reuses its id anyway.
-    pub(super) fn same_content(&self, other: &Self) -> bool {
-        self.catalog == other.catalog
-            && self.runtime_filter == other.runtime_filter
-            && self.query_options == other.query_options
-            && self.credential_lease == other.credential_lease
-            && self.credential_epoch == other.credential_epoch
-            && self.lease_valid_for == other.lease_valid_for
+    /// Only the original operation and every immutable fact may replay.
+    pub(super) fn same_request(&self, other: &Self) -> bool {
+        self.operation == other.operation
+            && self.admission_ticket_id == other.admission_ticket_id
+            && self.semantic_identity == other.semantic_identity
     }
 }
 
@@ -141,6 +132,11 @@ pub(super) struct LiveTask {
     pub(super) fingerprint: ContentFingerprint,
     pub(super) initial_domains: Vec<InitialDomainKey>,
     pub(super) receipt: CreateTaskReceipt,
+    /// The immutable create verdict when this worker was submitted after its
+    /// context had already closed. The worker remains owned until physical
+    /// convergence, but neither the winner nor a replay may turn that losing
+    /// create into an acknowledgement.
+    pub(super) creation_failure: Option<CreationFailure>,
     pub(super) status: Arc<TaskStatusOwner>,
     pub(super) runnable: Arc<dyn RunnableTask>,
     pub(super) domains: TaskDomains,
@@ -153,13 +149,15 @@ pub(super) struct LiveTask {
 /// It is secret-free by construction: the descriptor, the plan, the split
 /// payloads, and every credential are dropped at retirement and only the
 /// receipt, the descriptor fingerprint, the immutable terminal status, the
-/// final info, and the retirement instant survive.
+/// final info, the result-owner bit, and the retirement instant survive.
 pub(super) struct RetiredTask {
     pub(super) fingerprint: ContentFingerprint,
     pub(super) initial_domains: Vec<InitialDomainKey>,
     pub(super) receipt: CreateTaskReceipt,
+    pub(super) creation_failure: Option<CreationFailure>,
     pub(super) status: TaskStatus,
     pub(super) final_info: Option<FinalTaskInfo>,
+    pub(super) result_owner: bool,
     pub(super) retired_at: MonotonicInstant,
     pub(super) bytes: usize,
 }
@@ -175,6 +173,25 @@ pub(super) enum TaskEntry {
     /// that never existed. It deliberately carries nothing else: its content
     /// is exactly the fact that this identity was used and is finished.
     Gone,
+}
+
+/// The part of a task identity not already fixed by its owning context.
+///
+/// Query execution and backend process are identical for every member of one
+/// context, so retaining them 4096 times would add no fencing strength.
+#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SpentTaskIdentity {
+    stage: StageId,
+    task: TaskId,
+}
+
+impl SpentTaskIdentity {
+    const fn of(identity: TaskIdentity) -> Self {
+        Self {
+            stage: identity.stage_id(),
+            task: identity.task_id(),
+        }
+    }
 }
 
 impl TaskEntry {
@@ -209,8 +226,9 @@ pub(super) fn estimate_retained_bytes(
     if let Some(info) = final_info {
         bytes += size_of::<FinalTaskInfo>();
         for statistics in info.operator_statistics() {
-            bytes += size_of::<novarocks_execution::task_execution::status::OperatorStatistics>()
-                + statistics.operator().as_str().len();
+            bytes += size_of::<
+                novarocks_execution_contract::task_execution::status::OperatorStatistics,
+            >() + statistics.operator().as_str().len();
         }
         bytes += termination_bytes(info.final_status().termination());
     }
@@ -232,12 +250,14 @@ pub(super) struct ContextEntry {
     pub(super) establish: Option<EstablishRecord>,
     /// Shared facts become observable only when the context reaches `Active`.
     pub(super) facts_visible: bool,
-    pub(super) catalog: ScalarDomain,
-    pub(super) shared_filter: ScalarDomain,
-    pub(super) credential: Option<CredentialDomain>,
-    pub(super) credential_material: Option<Arc<dyn ConfidentialContent>>,
+    pub(super) domains: QueryContextDomains,
     pub(super) source: Arc<TaskStatusSource>,
     pub(super) tasks: BTreeMap<TaskIdentity, TaskEntry>,
+    /// Compact, context-lifetime anti-replay fence for every task identity
+    /// that reached an installed worker. Detailed terminal records may be
+    /// reclaimed independently; an identity in this set cannot be created a
+    /// second time while the context remains addressable.
+    spent_tasks: BTreeSet<SpentTaskIdentity>,
     pub(super) retired_at: Option<MonotonicInstant>,
     /// When this context entered `ABORTING`. It bounds how long an
     /// uncooperative task may delay cleanup.
@@ -267,12 +287,10 @@ impl ContextEntry {
             lease: None,
             establish: None,
             facts_visible: false,
-            catalog: ScalarDomain::empty(),
-            shared_filter: ScalarDomain::empty(),
-            credential: None,
-            credential_material: None,
+            domains: QueryContextDomains::empty(),
             source,
             tasks: BTreeMap::new(),
+            spent_tasks: BTreeSet::new(),
             retired_at: None,
             terminating_since: None,
             last_retire_revision: None,
@@ -281,15 +299,33 @@ impl ContextEntry {
         }
     }
 
-    /// How many task identities this context currently occupies.
+    /// How many task identities this context has cumulatively occupied.
     ///
-    /// A creation in progress counts: two concurrent creates must not both
-    /// slip past the per-context bound.
+    /// A creation in progress counts before it becomes spent, and every
+    /// installed worker remains counted after its detailed record is
+    /// reclaimed. Two concurrent creates therefore cannot slip past the
+    /// bound, and retirement cannot replenish the context's identity budget.
     pub(super) fn occupied_slots(&self) -> usize {
-        self.tasks
-            .values()
-            .filter(|entry| !matches!(entry, TaskEntry::Gone))
-            .count()
+        self.spent_tasks.len()
+            + self
+                .tasks
+                .iter()
+                .filter(|(identity, entry)| {
+                    !self.has_spent(**identity) && matches!(entry, TaskEntry::Creating(_))
+                })
+                .count()
+    }
+
+    pub(super) fn has_spent(&self, identity: TaskIdentity) -> bool {
+        self.spent_tasks.contains(&SpentTaskIdentity::of(identity))
+    }
+
+    pub(super) fn mark_spent(&mut self, identity: TaskIdentity) {
+        self.spent_tasks.insert(SpentTaskIdentity::of(identity));
+    }
+
+    pub(super) fn clear_spent(&mut self) {
+        self.spent_tasks.clear();
     }
 
     /// The abort cause a terminal receipt reports.

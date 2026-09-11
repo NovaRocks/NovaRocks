@@ -98,6 +98,32 @@ impl ConnectorStorageResolver for AttemptCredentialLeaseStorageRoute {
     }
 }
 
+/// Secret-free contribution capability for provider calls that may outlive
+/// their attempt actor. The route never keeps the collector alive; an offer
+/// arriving after cancellation fails closed instead of extending credential
+/// lifetime through an uninterruptible Connector call.
+struct AttemptCredentialLeaseSinkRoute {
+    owner: Weak<AttemptCredentialLeaseCollector>,
+}
+
+impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseSinkRoute {
+    fn offer_vended_s3_credential_lease(
+        &self,
+        catalog_properties: &CatalogProperties,
+        contribution: VendedS3CredentialLeaseContribution,
+    ) -> Result<(), ConnectorError> {
+        self.owner
+            .upgrade()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "attempt credential collector is no longer available",
+                )
+            })?
+            .offer_vended_s3_credential_lease(catalog_properties, contribution)
+    }
+}
+
 /// Move-only FE collection state for credentials obtained during one candidate
 /// attempt's metadata observation. The SPI sees only the sink trait; table,
 /// plan, cache, and Core request types cannot recover these values.
@@ -105,6 +131,7 @@ pub(crate) struct AttemptCredentialLeaseCollector {
     execution_id: QueryExecutionId,
     state: Mutex<AttemptCredentialLeaseCollectorState>,
     route: Arc<AttemptCredentialLeaseStorageRoute>,
+    sink_route: Arc<AttemptCredentialLeaseSinkRoute>,
 }
 
 struct AttemptCredentialLeaseCollectorState {
@@ -128,6 +155,9 @@ impl AttemptCredentialLeaseCollector {
             route: Arc::new(AttemptCredentialLeaseStorageRoute::new_planning(
                 collector.clone(),
             )),
+            sink_route: Arc::new(AttemptCredentialLeaseSinkRoute {
+                owner: collector.clone(),
+            }),
         })
     }
 
@@ -160,8 +190,8 @@ impl AttemptCredentialLeaseCollector {
         )
     }
 
-    pub(crate) fn sink(self: &Arc<Self>) -> Arc<dyn ConnectorVendedCredentialLeaseSink> {
-        Arc::clone(self) as Arc<dyn ConnectorVendedCredentialLeaseSink>
+    pub(crate) fn sink(&self) -> Arc<dyn ConnectorVendedCredentialLeaseSink> {
+        Arc::clone(&self.sink_route) as Arc<dyn ConnectorVendedCredentialLeaseSink>
     }
 
     /// The collector is also the FE-local storage authority while planning is
@@ -200,7 +230,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             .iter()
             .find(|binding| {
                 binding.purpose() == CatalogCredentialPurpose::ObjectStoreData
-                    && binding.consumer_role() == CredentialConsumerRole::FrontendAndBackend
+                    && binding.consumer_role() == CredentialConsumerRole::Backend
                     && matches!(binding.mode(), CatalogCredentialMode::Vended)
             })
             .cloned()
@@ -218,13 +248,8 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             .iter()
             .map(|property| CatalogNonSecretProperty::try_new(property.key(), property.value()))
             .collect::<Result<Vec<_>, _>>()?;
-        let (entries, refresh_endpoint, provider_refresher) =
+        let (entries, _refresh_endpoint, provider_refresher) =
             contribution.into_parts_with_refresher();
-        if refresh_endpoint.is_some() != provider_refresher.is_some() {
-            return Err(collector_error(
-                "vended S3 credential refresh endpoint and provider source differ",
-            ));
-        }
         let mut state = self
             .state
             .lock()
@@ -254,7 +279,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             )
             .map(|input| input.derive_access_domain())?;
             let lease_id = credential_lease_id(self.execution_id, &owner, &prefix)?;
-            let refresh_capable = refresh_endpoint.is_some();
+            let refresh_capable = provider_refresher.is_some();
             let descriptor = CredentialLeaseDescriptor::try_new(
                 lease_id,
                 1,
@@ -982,7 +1007,7 @@ impl QueryCatalogLease {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::{AttemptCredentialLeaseCollector, QueryCatalogLease, QueryInitOptions};
     use crate::common::backend_topology::LiveBackendTarget;
@@ -995,9 +1020,10 @@ mod tests {
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
         CatalogProperties, CatalogVersion, ConnectorControlPlanningLease, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorVendedCredentialLeaseSink, CredentialConsumerRole,
-        StorageAccessRequest, StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
-        VendedS3CredentialLeaseEntry,
+        ConnectorProviderId, ConnectorVendedCredentialLeaseSink,
+        ConnectorVendedS3CredentialLeaseRefresher, CredentialConsumerRole, StorageAccessRequest,
+        StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
+        VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
     };
     use novarocks_types::BackendProcessId;
 
@@ -1040,7 +1066,7 @@ mod tests {
             vec![
                 CatalogCredentialBinding::try_new(
                     CatalogCredentialPurpose::ObjectStoreData,
-                    CredentialConsumerRole::FrontendAndBackend,
+                    CredentialConsumerRole::Backend,
                     CatalogCredentialMode::Vended,
                 )
                 .expect("vended binding"),
@@ -1071,6 +1097,36 @@ mod tests {
         .expect("contribution")
     }
 
+    struct ProviderLocalRefresher;
+
+    impl ConnectorVendedS3CredentialLeaseRefresher for ProviderLocalRefresher {
+        fn refresh_vended_s3_credentials(
+            &self,
+        ) -> Result<VendedS3CredentialLeaseRefresh, novarocks_spi::connector::ConnectorError>
+        {
+            panic!("the capability is not invoked by this collection test")
+        }
+    }
+
+    struct DropTrackedRefresher {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropTrackedRefresher {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl ConnectorVendedS3CredentialLeaseRefresher for DropTrackedRefresher {
+        fn refresh_vended_s3_credentials(
+            &self,
+        ) -> Result<VendedS3CredentialLeaseRefresh, novarocks_spi::connector::ConnectorError>
+        {
+            panic!("the drop-tracked refresher is never invoked")
+        }
+    }
+
     #[test]
     fn attempt_collector_deduplicates_scope_and_drains_once() {
         let collector = AttemptCredentialLeaseCollector::new(execution_id());
@@ -1084,7 +1140,59 @@ mod tests {
 
         let leases = collector.into_credential_leases().expect("one-time drain");
         assert_eq!(leases.leases().len(), 1);
+        assert!(
+            !leases.leases()[0].descriptor().refresh_capable(),
+            "an endpoint-free contribution without a provider source is not refreshable"
+        );
         assert!(collector.into_credential_leases().is_err());
+    }
+
+    #[test]
+    fn provider_sink_does_not_keep_a_cancelled_attempt_collector_alive() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let weak_collector = Arc::downgrade(&collector);
+        let sink = collector.sink();
+        let refresher_dropped = Arc::new(AtomicBool::new(false));
+        let contribution = vended_contribution("accepted-before-cancel")
+            .with_refresher(Arc::new(DropTrackedRefresher {
+                dropped: Arc::clone(&refresher_dropped),
+            }))
+            .expect("drop-tracked provider refresher");
+        sink.offer_vended_s3_credential_lease(&vended_catalog_properties(), contribution)
+            .expect("credential is collected before cancellation");
+        drop(collector);
+
+        assert!(
+            weak_collector.upgrade().is_none(),
+            "a provider-held sink must not extend the attempt collector lifetime"
+        );
+        assert!(
+            refresher_dropped.load(Ordering::SeqCst),
+            "credential-owned provider state must be released with the cancelled attempt"
+        );
+        let error = sink
+            .offer_vended_s3_credential_lease(
+                &vended_catalog_properties(),
+                vended_contribution("late-provider"),
+            )
+            .expect_err("late contribution fails after its attempt is gone");
+        assert!(error.to_string().contains("no longer available"), "{error}");
+    }
+
+    #[test]
+    fn provider_local_refresh_capability_does_not_require_a_public_endpoint() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let properties = vended_catalog_properties();
+        let contribution = vended_contribution("load-table")
+            .with_refresher(Arc::new(ProviderLocalRefresher))
+            .expect("provider-local refresher");
+        collector
+            .offer_vended_s3_credential_lease(&properties, contribution)
+            .expect("provider-local contribution");
+
+        let leases = collector.into_credential_leases().expect("one-time drain");
+        assert!(leases.leases()[0].descriptor().refresh_capable());
+        assert!(leases.leases()[0].refresher().is_some());
     }
 
     #[test]
@@ -1155,6 +1263,10 @@ mod tests {
                 novarocks_types::NativeCompatibilityId::new([0x72; 32]),
             )
             .expect("valid descriptor"),
+            novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                [0x61; 16],
+            )
+            .expect("nonzero epoch"),
         );
 
         let error = match QueryInitOptions::new(

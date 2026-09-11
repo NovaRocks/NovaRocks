@@ -196,7 +196,6 @@ pub(crate) struct RootWriteResultDecoder {
     body_bytes: usize,
     property_bytes: usize,
     root_eof: bool,
-    execution_succeeded: bool,
 }
 
 impl RootWriteResultDecoder {
@@ -211,7 +210,6 @@ impl RootWriteResultDecoder {
             body_bytes: 0,
             property_bytes: 0,
             root_eof: false,
-            execution_succeeded: false,
         }
     }
 
@@ -414,19 +412,9 @@ impl RootWriteResultDecoder {
         Ok(())
     }
 
-    pub(crate) fn observe_execution_success(&mut self) -> Result<(), String> {
-        if std::mem::replace(&mut self.execution_succeeded, true) {
-            return Err("write execution success was observed twice".into());
-        }
-        Ok(())
-    }
-
     pub(crate) fn finish(self) -> Result<DecodedPreparedWriteSet, String> {
         if !self.root_eof {
             return Err("write Root EOF was not observed".into());
-        }
-        if !self.execution_succeeded {
-            return Err("write execution did not reach all-success".into());
         }
         self.membership
             .finish()
@@ -653,7 +641,6 @@ mod tests {
 
     fn finish(mut decoder: RootWriteResultDecoder) -> Result<DecodedPreparedWriteSet, String> {
         decoder.observe_root_eof()?;
-        decoder.observe_execution_success()?;
         decoder.finish()
     }
 
@@ -714,7 +701,6 @@ mod tests {
             ])),
             CompletionFact::RootEof => decoder.observe_root_eof(),
             CompletionFact::ExecutionAllSuccess => {
-                decoder.observe_execution_success()?;
                 barrier.observe_execution_terminals(true);
                 Ok(())
             }
@@ -936,10 +922,9 @@ mod tests {
     }
 
     #[test]
-    fn eof_and_all_success_are_independent_completion_facts() {
+    fn the_decoder_requires_eof_and_does_not_own_task_success() {
         let mut no_eof = new_decoder(1);
         no_eof.apply_chunk(&chunk(vec![summary(0)])).expect("row");
-        no_eof.observe_execution_success().expect("success");
         assert!(
             no_eof
                 .finish()
@@ -947,16 +932,17 @@ mod tests {
                 .contains("EOF was not observed")
         );
 
-        let mut no_success = new_decoder(1);
-        no_success
+        let mut complete_root = new_decoder(1);
+        complete_root
             .apply_chunk(&chunk(vec![summary(0)]))
             .expect("row");
-        no_success.observe_root_eof().expect("EOF");
-        assert!(
-            no_success
+        complete_root.observe_root_eof().expect("EOF");
+        assert_eq!(
+            complete_root
                 .finish()
-                .unwrap_err()
-                .contains("did not reach all-success")
+                .expect("complete Root relation")
+                .row_count(),
+            0
         );
     }
 
@@ -1035,7 +1021,7 @@ mod tests {
                     CompletionFact::TaskFailure,
                 ],
                 3,
-                "did not reach all-success",
+                "did not reach a success-compatible terminal",
             ),
             (
                 "cancellation",

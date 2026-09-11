@@ -31,16 +31,19 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_spi::connector::ConnectorControlReadBinding;
+use novarocks_query_application::observation::PreparationBudget;
+use novarocks_query_application::preparation::{NegotiatedScanReceipt, ScanNegotiationSession};
 use novarocks_spi::connector::ConnectorPinnedFileSet;
 use novarocks_spi::connector::read_stack::{
     Assignment, ConnectorReadChangeWindow, ConnectorReadColumnBinding, ConnectorReadConstraint,
-    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadSplitManager,
-    ConnectorReadTableExecuteProcedure, ConnectorReadWorkSource, ConnectorSession,
-    ConnectorValueType, SchemaTableName, SystemTableDistribution, TupleDomain,
+    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadTableExecuteProcedure,
+    ConnectorReadWorkSource, ConnectorSession, ConnectorValueType, SchemaTableName,
+    SystemTableDistribution, TupleDomain,
 };
+use novarocks_spi::connector::{ConnectorControlReadBinding, ConnectorReadAttemptAccess};
 use novarocks_sql::plan_read::PlanScanNode;
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::query_execution::connector_domain::{
     CatalogHandle, DynamicFilterBinding, TableHandle, TableScanNode,
 };
@@ -124,12 +127,6 @@ pub(crate) struct PreparedTypedScan {
     /// The fragment-plan scan node, carrying the frozen relation handle and
     /// the ordered assignments.
     pub(crate) table_scan: TableScanNode,
-    /// The connector's lazy split enumerator entry point. Preparation never
-    /// calls it; the execution round does.
-    pub(crate) split_manager: Arc<dyn ConnectorReadSplitManager>,
-    /// The only conversion authority for this exact binding.  It is retained
-    /// solely for fragment and TaskUpdate egress; planning never calls it.
-    pub(crate) encoder: Arc<dyn novarocks_spi::connector::ConnectorReadWireEncoder>,
     /// The constraint that was offered to the connector, kept so the round
     /// driver enumerates splits under exactly what planning pushed down.
     pub(crate) constraint: ConnectorReadConstraint,
@@ -177,6 +174,40 @@ impl std::fmt::Debug for PreparedTypedScan {
     }
 }
 
+/// Module-private result of Connector planning negotiation.
+///
+/// It cannot cross the preparation boundary: finalization consumes it, encodes
+/// the immutable native scan source once, and separates the pure prepared scan
+/// from the process-local attempt capability and its lineage receipt.
+pub(super) struct NegotiatedTypedScanDraft {
+    prepared: PreparedTypedScan,
+    encoder: Arc<dyn novarocks_spi::connector::ConnectorReadWireEncoder>,
+    attempt_access: ConnectorReadAttemptAccess,
+    negotiation_receipt: NegotiatedScanReceipt,
+}
+
+pub(super) struct FinalizedTypedScan {
+    pub(super) prepared: PreparedTypedScan,
+    pub(super) encoder: Arc<dyn novarocks_spi::connector::ConnectorReadWireEncoder>,
+    pub(super) attempt_access: ConnectorReadAttemptAccess,
+    pub(super) negotiation_receipt: NegotiatedScanReceipt,
+}
+
+impl NegotiatedTypedScanDraft {
+    pub(super) fn prepared(&self) -> &PreparedTypedScan {
+        &self.prepared
+    }
+
+    pub(super) fn finalize(self) -> FinalizedTypedScan {
+        FinalizedTypedScan {
+            prepared: self.prepared,
+            encoder: self.encoder,
+            attempt_access: self.attempt_access,
+            negotiation_receipt: self.negotiation_receipt,
+        }
+    }
+}
+
 /// Lower one SQL scan into a typed connector scan node.
 ///
 /// `physical_columns` is the scan's ordered *physical* output: the columns the
@@ -192,7 +223,7 @@ impl std::fmt::Debug for PreparedTypedScan {
     clippy::too_many_arguments,
     reason = "Every argument is a distinct frozen fact of one scan; grouping them would hide which of them the connector sees."
 )]
-pub(crate) fn prepare_typed_scan(
+pub(super) fn prepare_typed_scan(
     session: &ConnectorSession,
     catalog: CatalogHandle,
     control: &ConnectorControlReadBinding,
@@ -203,8 +234,11 @@ pub(crate) fn prepare_typed_scan(
     relation: &SchemaTableName,
     freeze: TypedRelationFreeze<'_>,
     limit: Option<u64>,
+    scan_contract: novarocks_sql::planning::query_execution::SealedScanContract,
     dynamic_filters: &[(u32, String)],
-) -> Result<PreparedTypedScan, String> {
+    preparation_budget: &PreparationBudget,
+    query_table_bindings: &QueryTableBindingStore,
+) -> Result<NegotiatedTypedScanDraft, String> {
     let relation_kind = freeze.relation_kind();
     let metadata = request_control.metadata();
     let relation_name = format!("{}.{}", relation.schema_name(), relation.table_name());
@@ -216,10 +250,11 @@ pub(crate) fn prepare_typed_scan(
     //    How this scan's work reaches a backend is decided here too, because
     //    only the connector knows it: a system relation it resolves to one
     //    task has no split at all.
-    let (mut handle, work_source) = match freeze {
+    let (handle, work_source) = match freeze {
         TypedRelationFreeze::Table { version, reference } => {
-            let handle = metadata
-                .get_table_handle(session, relation, version, reference)
+            let handle = observe_provider_negotiation(preparation_budget, &relation_name, "get_table_handle", || {
+                metadata.get_table_handle(session, relation, version, reference)
+            })
                 .map_err(|error| {
                     format!("typed scan cannot freeze relation {relation_name}: {error}")
                 })?
@@ -231,8 +266,12 @@ pub(crate) fn prepare_typed_scan(
             (handle, ConnectorReadWorkSource::RuntimeSplits)
         }
         TypedRelationFreeze::PinnedFileSet(pinned) => {
-            let handle = metadata
-                .get_pinned_file_set_handle(session, relation, pinned)
+            let handle = observe_provider_negotiation(
+                preparation_budget,
+                &relation_name,
+                "get_pinned_file_set_handle",
+                || metadata.get_pinned_file_set_handle(session, relation, pinned),
+            )
                 .map_err(|error| {
                     format!(
                         "typed scan cannot freeze relation {relation_name} restricted to the {} data files pinned at version {}: {error}",
@@ -248,8 +287,12 @@ pub(crate) fn prepare_typed_scan(
             (handle, ConnectorReadWorkSource::RuntimeSplits)
         }
         TypedRelationFreeze::ChangeWindow(window) => {
-            let handle = metadata
-                .get_change_window_plan(session, relation, window)
+            let handle = observe_provider_negotiation(
+                preparation_budget,
+                &relation_name,
+                "get_change_window_plan",
+                || metadata.get_change_window_plan(session, relation, window),
+            )
                 .map_err(|error| {
                     format!(
                         "typed scan cannot freeze the change window of relation {relation_name} from snapshot {} to snapshot {}: {error}",
@@ -267,8 +310,12 @@ pub(crate) fn prepare_typed_scan(
             (handle, ConnectorReadWorkSource::RuntimeSplits)
         }
         TypedRelationFreeze::TableExecute(procedure) => {
-            let handle = metadata
-                .get_table_execute_plan(session, relation, procedure)
+            let handle = observe_provider_negotiation(
+                preparation_budget,
+                &relation_name,
+                "get_table_execute_plan",
+                || metadata.get_table_execute_plan(session, relation, procedure),
+            )
                 .map_err(|error| {
                     format!(
                         "typed scan cannot freeze the table-execute relation of {relation_name}: {error}"
@@ -282,18 +329,20 @@ pub(crate) fn prepare_typed_scan(
             (handle, ConnectorReadWorkSource::RuntimeSplits)
         }
         TypedRelationFreeze::SystemTable => {
-            let plan = metadata
-                .get_system_table_plan(session, relation)
-                .map_err(|error| {
-                    format!(
-                        "typed scan cannot freeze system relation {relation_name}: {error}"
-                    )
-                })?
-                .ok_or_else(|| {
-                    format!(
-                        "typed scan relation {relation_name} is not a system relation of this connector"
-                    )
-                })?;
+            let plan = observe_provider_negotiation(
+                preparation_budget,
+                &relation_name,
+                "get_system_table_plan",
+                || metadata.get_system_table_plan(session, relation),
+            )
+            .map_err(|error| {
+                format!("typed scan cannot freeze system relation {relation_name}: {error}")
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "typed scan relation {relation_name} is not a system relation of this connector"
+                )
+            })?;
             // `SingleCoordinator` means one backend reads one immutable
             // metadata file with no split; spreading it would duplicate every
             // row. `AllNodes` is real distributable I/O and enumerates.
@@ -308,11 +357,15 @@ pub(crate) fn prepare_typed_scan(
     };
 
     // 2. Resolve the relation's columns.
-    let column_bindings = metadata
-        .get_column_bindings(session, &handle)
-        .map_err(|error| {
-            format!("typed scan cannot read the columns of relation {relation_name}: {error}")
-        })?;
+    let column_bindings = observe_provider_negotiation(
+        preparation_budget,
+        &relation_name,
+        "get_column_bindings",
+        || metadata.get_column_bindings(session, &handle),
+    )
+    .map_err(|error| {
+        format!("typed scan cannot read the columns of relation {relation_name}: {error}")
+    })?;
 
     // 3. Build the ordered assignments. `scan.columns` order is the output
     //    authority, and the connector produces exactly its physical subset, so
@@ -388,15 +441,28 @@ pub(crate) fn prepare_typed_scan(
     // 4. Lower the scan's own conjuncts into the offered summary.
     let mut lowered = lower_scan_predicates(scan, &columns_by_name, &value_types_by_name);
     let constraint = ConnectorReadConstraint::of_summary(lowered.summary.clone());
+    if scan_contract.node_id() != plan_node_id {
+        return Err(format!(
+            "typed scan node {plan_node_id} received sealed contract for node {}",
+            scan_contract.node_id()
+        ));
+    }
+    let admitted_scan = query_table_bindings.admit_scan_handle(scan_contract, handle)?;
+    let mut negotiation = ScanNegotiationSession::begin(
+        admitted_scan,
+        lowered.residual_ordinals.clone(),
+        metadata.as_ref(),
+        session,
+        preparation_budget,
+        &relation_name,
+    )?;
 
     // 5. Offer the filter. Whatever the connector hands back stays the
     //    reader's own work: `unenforced_predicate` is applied by the backend
     //    scan, `enforced_predicate` records only what the connector took.
-    let (enforced_predicate, unenforced_predicate, remaining_expression) = match metadata
-        .apply_filter(session, &handle, &constraint)
-        .map_err(|error| {
-            format!("typed scan filter pushdown on relation {relation_name} failed: {error}")
-        })? {
+    let filter_application = negotiation.apply_filter(&constraint)?;
+    let (enforced_predicate, unenforced_predicate, remaining_expression) = match filter_application
+    {
         // Nothing was accepted, so the engine keeps the whole predicate — and
         // keeping it means evaluating it, not handing it to the reader.
         //
@@ -422,44 +488,37 @@ pub(crate) fn prepare_typed_scan(
             let enforced = lowered
                 .summary
                 .filter_columns(|column| unenforced.domain_for(column).is_none());
-            handle = application.into_handle();
             (enforced, unenforced, remaining_expression)
         }
     };
 
     // 6. Offer the projection. A narrowed handle is a pushdown fact; the
     //    ordered assignments above remain the output authority either way.
-    if let Some(narrowed) = metadata
-        .apply_projection(session, &handle, &assignments)
-        .map_err(|error| {
-            format!("typed scan projection pushdown on relation {relation_name} failed: {error}")
-        })?
-    {
-        handle = narrowed;
-    }
+    negotiation.apply_projection(&assignments)?;
 
     // 7. Offer the limit. Only the connector's own answer may drop the
     //    engine's limit operator.
-    let mut limit_guaranteed = false;
-    if let Some(limit) = limit
-        && let Some(application) =
-            metadata
-                .apply_limit(session, &handle, limit)
-                .map_err(|error| {
-                    format!("typed scan limit pushdown on relation {relation_name} failed: {error}")
-                })?
-    {
-        limit_guaranteed = application.limit_guaranteed();
-        handle = application.into_handle();
-    }
+    let limit_guaranteed = negotiation.apply_limit(limit)?;
+
+    let negotiation_receipt = negotiation.finish()?;
 
     // 8. Bind dynamic filters and freeze the exact relation.  The metadata
     // service alone can pair the opaque table with its installed transaction;
     // frontend code never sees or constructs the transaction payload.
     let (dynamic_filter_bindings, dynamic_filter_outputs) =
         bind_dynamic_filters(dynamic_filters, &variables_by_name, &relation_name)?;
-    let relation = metadata
-        .relation(relation_kind, handle)
+    let final_handle = negotiation_receipt.final_handle();
+    let attempt_access = control
+        .seal_attempt_access(request_control, final_handle)
+        .map_err(|error| {
+            format!(
+                "typed scan cannot seal per-attempt access for relation {relation_name}: {error}"
+            )
+        })?;
+    let relation =
+        observe_provider_negotiation(preparation_budget, &relation_name, "relation", || {
+            metadata.relation(relation_kind, final_handle.clone())
+        })
         .map_err(|error| format!("typed scan cannot freeze relation {relation_name}: {error}"))?;
     let table_scan = TableScanNode::new(
         plan_node_id,
@@ -476,15 +535,54 @@ pub(crate) fn prepare_typed_scan(
     .map_err(|error| format!("typed scan node {plan_node_id}: {error}"))?;
 
     // 9. Take the enumerator entry point without enumerating anything.
-    Ok(PreparedTypedScan {
-        table_scan,
-        split_manager: request_control.splits(),
+    Ok(NegotiatedTypedScanDraft {
+        prepared: PreparedTypedScan {
+            table_scan,
+            constraint,
+            residual_ordinals: lowered.residual_ordinals,
+            limit_guaranteed,
+            dynamic_filter_outputs,
+        },
         encoder: control.encoder(),
-        constraint,
-        residual_ordinals: lowered.residual_ordinals,
-        limit_guaranteed,
-        dynamic_filter_outputs,
+        attempt_access,
+        negotiation_receipt,
     })
+}
+
+fn observe_provider_negotiation<R, E: std::fmt::Display>(
+    budget: &PreparationBudget,
+    relation_name: &str,
+    operation: &str,
+    call: impl FnOnce() -> Result<R, E>,
+) -> Result<R, String> {
+    budget
+        .begin_negotiation(operation.len().saturating_add(relation_name.len()))
+        .map_err(|error| error.to_string())?;
+    let result = crate::preparation_diagnostics::observe_result_lazy(
+        "connector_planning_negotiation",
+        || format!("{operation}:{relation_name}"),
+        "not-applicable",
+        None,
+        call,
+    );
+    match result {
+        Ok(value) => {
+            // The legacy synchronous Connector surface cannot report the heap
+            // footprint of opaque handles. Charge its configured observation
+            // weight; this is post-call accounting, not a memory reservation.
+            budget
+                .charge_unmeasured_response_weight()
+                .map_err(|error| error.to_string())?;
+            Ok(value)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            budget
+                .record_response(message.len())
+                .map_err(|budget_error| budget_error.to_string())?;
+            Err(message)
+        }
+    }
 }
 
 /// The one connector column an output column names.

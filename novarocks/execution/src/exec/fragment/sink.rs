@@ -22,6 +22,7 @@ use arrow::datatypes::DataType;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::runtime::endpoint::FragmentDestination;
+pub use novarocks_execution_contract::DataStreamPartitionType;
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
@@ -41,34 +42,6 @@ impl FragmentSinkProgram {
             Self::MultiCastDataStream(program) => program.validate(),
             Self::SplitDataStream(program) => program.validate(),
         }
-    }
-}
-
-/// Construction-time exchange partitioning contract. The implementation lives
-/// in the private operator module, but decoders construct this neutral value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DataStreamPartitionType {
-    Unpartitioned,
-    Random,
-    HashPartitioned,
-    BucketShuffleHashPartitioned,
-}
-
-impl DataStreamPartitionType {
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::Unpartitioned => "UNPARTITIONED",
-            Self::Random => "RANDOM",
-            Self::HashPartitioned => "HASH_PARTITIONED",
-            Self::BucketShuffleHashPartitioned => "BUCKET_SHUFFLE_HASH_PARTITIONED",
-        }
-    }
-
-    pub const fn requires_exprs(self) -> bool {
-        matches!(
-            self,
-            Self::HashPartitioned | Self::BucketShuffleHashPartitioned
-        )
     }
 }
 

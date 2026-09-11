@@ -24,7 +24,6 @@
 // Design: ADR-0040 (docs/adr/ADR-0040-sql-compiler-dependency-inversion.md)
 
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -46,7 +45,8 @@ pub use mv_rewrite::{
     SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
     SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
     SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
-    SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
+    SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationRelation,
+    SqlMvRewriteSelectionFacts,
 };
 
 /// SQL's read-only observation of statement cancellation.
@@ -408,10 +408,10 @@ pub struct SqlSessionContext {
     pub optimizer_settings: SessionOptimizerSettings,
 }
 
-/// Deployment facts consumed by planning without exposing topology objects.
+/// The execution environment selected for SQL planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlPlanningEnvironment {
-    Distributed { backend_count: NonZeroUsize },
+    Distributed,
     NotApplicable,
 }
 
@@ -659,6 +659,163 @@ pub(crate) struct SqlDistributedOutput {
     pub(crate) mv_rewrite_diagnostics: Vec<mv_rewrite::SqlMvRewriteDiagnostic>,
 }
 
+/// Why one selected-plan cost dimension could not be projected into a known
+/// application fact. Unknown is explicit so an unwired or invalid estimate
+/// cannot silently become a zero-cost query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlPlanCostUnknownReason {
+    MissingRootFragment,
+    FallbackRowEstimate,
+    MissingCostEstimate,
+    NonFinite,
+    Negative,
+}
+
+/// One immutable cost dimension projected from the selected distributed plan.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SqlPlanCostValue {
+    Known(f64),
+    Unknown(SqlPlanCostUnknownReason),
+}
+
+impl SqlPlanCostValue {
+    pub const fn known(self) -> Option<f64> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Unknown(_) => None,
+        }
+    }
+
+    pub const fn unknown_reason(self) -> Option<SqlPlanCostUnknownReason> {
+        match self {
+            Self::Known(_) => None,
+            Self::Unknown(reason) => Some(reason),
+        }
+    }
+}
+
+/// Cost facts derived only from the final selected distributed plan.
+///
+/// These values contain no optimizer tree or mutable statistics source. The
+/// final plan remains the authority for both its shape and any MV selection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SqlPlanCostFacts {
+    root_rows: SqlPlanCostValue,
+    cpu: SqlPlanCostValue,
+    memory: SqlPlanCostValue,
+    network: SqlPlanCostValue,
+}
+
+impl SqlPlanCostFacts {
+    fn from_distributed_plan(plan: &crate::planner::distributed::DistributedPlan) -> Self {
+        let Some(root) = plan
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.fragment_id == plan.root_fragment_id())
+            .map(|fragment| &fragment.root)
+        else {
+            return Self::all_unknown(SqlPlanCostUnknownReason::MissingRootFragment);
+        };
+        Self::from_root_stats(&root.stats)
+    }
+
+    fn from_root_stats(stats: &crate::planner::physical::PhysicalPlanStats) -> Self {
+        let root_rows = if stats.row_count_confidence
+            == crate::planner::physical::PlannerConfidence::Fallback
+        {
+            SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::FallbackRowEstimate)
+        } else {
+            project_non_negative_cost_value(stats.output_row_count)
+        };
+        let Some(cost) = stats.cost_estimate.as_ref() else {
+            return Self {
+                root_rows,
+                cpu: SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::MissingCostEstimate),
+                memory: SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::MissingCostEstimate),
+                network: SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::MissingCostEstimate),
+            };
+        };
+        Self {
+            root_rows,
+            cpu: project_non_negative_cost_value(cost.cpu_cost),
+            memory: project_non_negative_cost_value(cost.memory_cost),
+            network: project_non_negative_cost_value(cost.network_cost),
+        }
+    }
+
+    const fn all_unknown(reason: SqlPlanCostUnknownReason) -> Self {
+        Self {
+            root_rows: SqlPlanCostValue::Unknown(reason),
+            cpu: SqlPlanCostValue::Unknown(reason),
+            memory: SqlPlanCostValue::Unknown(reason),
+            network: SqlPlanCostValue::Unknown(reason),
+        }
+    }
+
+    pub const fn root_rows(self) -> SqlPlanCostValue {
+        self.root_rows
+    }
+
+    pub const fn cpu(self) -> SqlPlanCostValue {
+        self.cpu
+    }
+
+    pub const fn memory(self) -> SqlPlanCostValue {
+        self.memory
+    }
+
+    pub const fn network(self) -> SqlPlanCostValue {
+        self.network
+    }
+}
+
+fn project_non_negative_cost_value(value: f64) -> SqlPlanCostValue {
+    if !value.is_finite() {
+        SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::NonFinite)
+    } else if value < 0.0 {
+        SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::Negative)
+    } else {
+        SqlPlanCostValue::Known(value)
+    }
+}
+
+/// Move-only terminal for one successfully compiled distributed query.
+///
+/// It owns the single selected `DistributedPlan` and its derived cost facts.
+/// MV selection validity is deliberately not copied into this carrier; callers
+/// inspect the sealed scan actions on `distributed_plan`.
+pub struct SqlDistributedQueryTerminal {
+    distributed_plan: crate::planner::distributed::DistributedPlan,
+    cost: SqlPlanCostFacts,
+}
+
+impl SqlDistributedQueryTerminal {
+    fn new(distributed_plan: crate::planner::distributed::DistributedPlan) -> Self {
+        let cost = SqlPlanCostFacts::from_distributed_plan(&distributed_plan);
+        Self {
+            distributed_plan,
+            cost,
+        }
+    }
+
+    pub const fn distributed_plan(&self) -> &crate::planner::distributed::DistributedPlan {
+        &self.distributed_plan
+    }
+
+    pub const fn cost(&self) -> SqlPlanCostFacts {
+        self.cost
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        crate::planner::distributed::DistributedPlan,
+        SqlPlanCostFacts,
+    ) {
+        (self.distributed_plan, self.cost)
+    }
+}
+
 /// SQL-owned compiler facts. Native DTOs/bytes, lifecycle state and result
 /// buffers are intentionally absent; application owns post-compile assembly.
 ///
@@ -869,6 +1026,19 @@ impl SqlCompileOutput {
             SqlCompileOutputKind::Distributed(output) => Ok(output.distributed_plan),
             _ => Err(SqlCompileError::InvalidRequest(
                 "SQL compilation did not produce a distributed plan".to_string(),
+            )),
+        }
+    }
+
+    /// Consume the distributed compiler output without discarding the cost
+    /// facts projected from its final selected plan.
+    pub fn into_distributed_query(self) -> Result<SqlDistributedQueryTerminal, SqlCompileError> {
+        match self.kind {
+            SqlCompileOutputKind::Distributed(output) => {
+                Ok(SqlDistributedQueryTerminal::new(output.distributed_plan))
+            }
+            _ => Err(SqlCompileError::InvalidRequest(
+                "SQL compilation did not produce a distributed query terminal".to_string(),
             )),
         }
     }
@@ -1209,12 +1379,12 @@ impl SqlCompiler {
                 },
             )));
         }
-        let mut settings = request.session.optimizer_settings.clone();
+        let settings = request.session.optimizer_settings.clone();
         if !matches!(request.intent, SqlCompileIntent::LogicalOnly)
             && (!logical_input
                 || !matches!(request.environment, SqlPlanningEnvironment::NotApplicable))
         {
-            apply_planning_environment(&mut settings, request.environment)?;
+            validate_planning_environment(request.environment)?;
         }
         let mut change_stream = if logical_input {
             {
@@ -1598,24 +1768,19 @@ fn collect_statistics(
     Ok(plan)
 }
 
-fn apply_planning_environment(
-    settings: &mut SessionOptimizerSettings,
+fn validate_planning_environment(
     environment: SqlPlanningEnvironment,
 ) -> Result<(), SqlCompileError> {
     match environment {
-        SqlPlanningEnvironment::Distributed { backend_count } => {
-            settings.effective_backend_count = Some(backend_count.get() as f64);
-            Ok(())
-        }
+        SqlPlanningEnvironment::Distributed => Ok(()),
         SqlPlanningEnvironment::NotApplicable => Err(SqlCompileError::InvalidRequest(
-            "distributed SQL compilation requires a frozen non-zero backend count".to_string(),
+            "distributed SQL compilation requires a distributed planning environment".to_string(),
         )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock};
     use std::time::{Duration, Instant};
@@ -1761,9 +1926,7 @@ mod tests {
                 current_database: "db".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
             },
-            SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(3).unwrap(),
-            },
+            SqlPlanningEnvironment::Distributed,
             &CATALOG,
             &FUNCTIONS,
             noop_constant_evaluator(),
@@ -1791,9 +1954,7 @@ mod tests {
                 current_database: "db".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
             },
-            SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(3).unwrap(),
-            },
+            SqlPlanningEnvironment::Distributed,
             catalog,
             &FUNCTIONS,
             noop_constant_evaluator(),
@@ -1871,10 +2032,7 @@ mod tests {
         let cancellation = Arc::new(Cancellation::default());
         let request = request(control(None, &cancellation));
         assert_eq!(request.check_control(), Ok(()));
-        assert!(matches!(
-            request.environment,
-            SqlPlanningEnvironment::Distributed { backend_count } if backend_count.get() == 3
-        ));
+        assert_eq!(request.environment, SqlPlanningEnvironment::Distributed);
     }
 
     #[test]
@@ -2053,6 +2211,124 @@ mod tests {
     }
 
     #[test]
+    fn distributed_query_terminal_consumes_the_selected_plan_with_known_costs() {
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let cancellation = Arc::new(Cancellation::default());
+        let terminal = analyze_then_optimize(SqlAnalyzeRequest::new(
+            SqlStatementInput::sql("select 1"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "default".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &catalog_snapshot,
+            crate::functions::builtin_sql_function_catalog(),
+            noop_constant_evaluator(),
+            None,
+            control(None, &cancellation),
+        ))
+        .expect("compile distributed query")
+        .into_distributed_query()
+        .expect("consume distributed query terminal");
+
+        assert!(matches!(
+            terminal.cost().root_rows(),
+            SqlPlanCostValue::Known(rows) if rows >= 0.0
+        ));
+        assert!(matches!(terminal.cost().cpu(), SqlPlanCostValue::Known(_)));
+        assert!(matches!(
+            terminal.cost().memory(),
+            SqlPlanCostValue::Known(_)
+        ));
+        assert!(matches!(
+            terminal.cost().network(),
+            SqlPlanCostValue::Known(_)
+        ));
+        let root_fragment_id = terminal.distributed_plan().root_fragment_id();
+        let (plan, cost) = terminal.into_parts();
+        assert_eq!(plan.root_fragment_id(), root_fragment_id);
+        assert!(cost.root_rows().known().is_some());
+    }
+
+    #[test]
+    fn distributed_query_terminal_preserves_missing_cost_as_unknown() {
+        let output = SqlCompileOutput::distributed(SqlDistributedOutput {
+            distributed_plan: crate::test_support::native_preparation_plan(
+                crate::test_support::NativePreparationFixture::MissingResultOutput,
+            )
+            .expect("sealed distributed fixture"),
+            statistics: SqlStatisticsPlan::empty(),
+            mv_rewrite_diagnostics: Vec::new(),
+        });
+        let terminal = output
+            .into_distributed_query()
+            .expect("consume distributed query terminal");
+
+        assert_eq!(
+            terminal.cost().cpu().unknown_reason(),
+            Some(SqlPlanCostUnknownReason::MissingCostEstimate)
+        );
+        assert_eq!(
+            terminal.cost().root_rows().unknown_reason(),
+            Some(SqlPlanCostUnknownReason::FallbackRowEstimate)
+        );
+        assert_eq!(
+            terminal.cost().memory().unknown_reason(),
+            Some(SqlPlanCostUnknownReason::MissingCostEstimate)
+        );
+        assert_eq!(
+            terminal.cost().network().unknown_reason(),
+            Some(SqlPlanCostUnknownReason::MissingCostEstimate)
+        );
+    }
+
+    #[test]
+    fn distributed_query_cost_projection_marks_each_invalid_dimension_unknown() {
+        let stats = crate::planner::physical::PhysicalPlanStats {
+            output_row_count: f64::NAN,
+            row_count_confidence: crate::planner::physical::PlannerConfidence::Estimated,
+            column_statistics: std::collections::HashMap::new(),
+            cost_estimate: Some(crate::planner::physical::PlannerCostEstimate {
+                cpu_cost: -1.0,
+                memory_cost: f64::INFINITY,
+                network_cost: 3.0,
+            }),
+            broadcast_decision: None,
+        };
+        let cost = SqlPlanCostFacts::from_root_stats(&stats);
+
+        assert_eq!(
+            cost.root_rows().unknown_reason(),
+            Some(SqlPlanCostUnknownReason::NonFinite)
+        );
+        assert_eq!(
+            cost.cpu().unknown_reason(),
+            Some(SqlPlanCostUnknownReason::Negative)
+        );
+        assert_eq!(
+            cost.memory().unknown_reason(),
+            Some(SqlPlanCostUnknownReason::NonFinite)
+        );
+        assert_eq!(cost.network(), SqlPlanCostValue::Known(3.0));
+    }
+
+    #[test]
+    fn distributed_query_terminal_rejects_the_wrong_output_shape() {
+        let error = match SqlCompileOutput::immediate_explain(vec!["EXPLAIN".to_string()])
+            .into_distributed_query()
+        {
+            Ok(_) => panic!("explain output must not become a distributed query terminal"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SqlCompileError::InvalidRequest(_)));
+        let _: fn(SqlCompileOutput) -> Result<SqlDistributedQueryTerminal, SqlCompileError> =
+            SqlCompileOutput::into_distributed_query;
+    }
+
+    #[test]
     fn imv_refresh_explain_terminal_keeps_logical_rewrite_inside_sql() {
         let mut statements = novarocks_parser::parse("SELECT 1").expect("query fixture parses");
         let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
@@ -2219,9 +2495,7 @@ mod tests {
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
             },
-            SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
-            },
+            SqlPlanningEnvironment::Distributed,
             &catalog_snapshot,
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
@@ -2271,9 +2545,7 @@ mod tests {
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
             },
-            SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
-            },
+            SqlPlanningEnvironment::Distributed,
             &catalog_snapshot,
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
@@ -2301,9 +2573,7 @@ mod tests {
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
             },
-            SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
-            },
+            SqlPlanningEnvironment::Distributed,
             &catalog_snapshot,
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
@@ -2350,9 +2620,7 @@ mod tests {
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
             },
-            SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
-            },
+            SqlPlanningEnvironment::Distributed,
             &catalog_snapshot,
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),

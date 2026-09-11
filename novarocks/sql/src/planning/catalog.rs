@@ -777,7 +777,7 @@ mod tests {
     use crate::planner::table::{ScanSource, SqlScanKind};
 
     fn test_binding_allocator() -> crate::binding::SqlTableBindingAllocator {
-        crate::binding::SqlTableBindingAllocator::try_new(
+        crate::binding::SqlTableBindingAllocator::try_new_for_test(
             NonZeroU64::new(17).expect("test scope is nonzero"),
         )
         .expect("test allocator")

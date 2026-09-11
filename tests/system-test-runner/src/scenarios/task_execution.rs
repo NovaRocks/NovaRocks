@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext};
@@ -53,50 +55,14 @@ const IO_TIMEOUT_CAP: Duration = Duration::from_secs(30);
 const SHALLOW_QUERY: &str =
     "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3) t ORDER BY v";
 
-/// Candidate deep fixtures, measured rather than assumed.
-///
-/// Which shape actually stacks exchanges is the optimizer's decision, not this
-/// scenario's: grouping every level on the same key lets it keep one
-/// partitioning and collapse the chain. So the scenario explains every
-/// candidate, picks the one that really is deepest, and records what it
-/// picked. That keeps the pair honest across optimizer changes instead of
-/// silently measuring a flat plan under a name that claims depth.
-///
-/// Every candidate stays tiny on purpose: this measures startup, not scan
-/// throughput. Each must return at least one row so there is a first row to
-/// time.
-const DEEP_CANDIDATES: &[(&str, &str)] = &[
-    (
-        "regrouped-levels",
-        "SELECT SUM(c3) AS total FROM ( \
-           SELECT g3, SUM(c2) AS c3 FROM ( \
-             SELECT k2 % 3 AS g3, SUM(c1) AS c2 FROM ( \
-               SELECT k1 * 7 AS k2, SUM(v) AS c1 FROM ( \
-                 SELECT 1 AS k1, 1 AS v UNION ALL SELECT 2, 2 UNION ALL \
-                 SELECT 3, 3 UNION ALL SELECT 4, 4 UNION ALL SELECT 5, 5 \
-               ) leaf GROUP BY k1 \
-             ) lvl1 GROUP BY k2 % 3 \
-           ) lvl2 GROUP BY g3 \
-         ) lvl3",
-    ),
-    (
-        "distinct-then-regroup",
-        "SELECT COUNT(*) AS total FROM ( \
-           SELECT DISTINCT k % 2 AS g FROM ( \
-             SELECT DISTINCT k * 3 AS k FROM ( \
-               SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 \
-             ) leaf \
-           ) lvl1 \
-         ) lvl2",
-    ),
-    (
-        "shuffle-join-chain",
-        "SELECT COUNT(*) AS total FROM \
+/// A closed fixture identity and SQL selected before B0/candidate comparison.
+/// Both sides execute this exact SQL; a planner change may change the reported
+/// plan hash, but cannot silently cause the harness to select a different query.
+const DEEP_FIXTURE_ID: &str = "shuffle-join-chain-v1";
+const DEEP_QUERY: &str = "SELECT COUNT(*) AS total FROM \
            (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) a \
            JOIN (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) b ON a.k = b.k \
-           JOIN (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) c ON b.k = c.k",
-    ),
-];
+           JOIN (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) c ON b.k = c.k";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![Box::new(StartupBaseline)]
@@ -116,6 +82,8 @@ struct FixtureReport {
     name: &'static str,
     plan_fragments: usize,
     exchange_levels: usize,
+    query_sha256: String,
+    plan_sha256: String,
     warmup: Vec<RunSample>,
     measured: Vec<RunSample>,
 }
@@ -126,6 +94,17 @@ impl Scenario for StartupBaseline {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        let fixture_spec = serde_json::to_vec(&(DEEP_FIXTURE_ID, SHALLOW_QUERY, DEEP_QUERY))?;
+        let fixture_sha256 = format!("{:x}", Sha256::digest(&fixture_spec));
+        let run_manifest = crate::performance::provenance::begin_run_manifest(
+            context,
+            self.name(),
+            &fixture_sha256,
+            &fixture_spec,
+            &fixture_spec,
+            true,
+            crate::performance::provenance::RunManifestKind::StartupBaseline,
+        )?;
         require_backends(context)?;
 
         let connect_timeout = bounded_timeout(context, "connect the baseline MySQL client")?;
@@ -136,27 +115,13 @@ impl Scenario for StartupBaseline {
         let shallow_shape = measure_plan_shape(&mut connection, SHALLOW_QUERY)
             .context("explain the shallow fixture")?;
 
-        // Pick the candidate the optimizer actually plans deepest, and record
-        // how deep every candidate came out.
-        let mut candidates = Vec::with_capacity(DEEP_CANDIDATES.len());
-        for (name, query) in DEEP_CANDIDATES {
-            let shape = measure_plan_shape(&mut connection, query)
-                .with_context(|| format!("explain the {name} deep candidate"))?;
-            context.action(format!(
-                "deep candidate {name}: {} plan fragments, {} exchange levels",
-                shape.plan_fragments, shape.exchange_levels
-            ));
-            candidates.push((*name, *query, shape));
-        }
-        let deepest = candidates
-            .into_iter()
-            .max_by_key(|(_, _, shape)| (shape.exchange_levels, shape.plan_fragments))
-            .expect("the candidate list is not empty");
+        let deep_shape = measure_plan_shape(&mut connection, DEEP_QUERY)
+            .with_context(|| format!("explain fixed deep fixture {DEEP_FIXTURE_ID}"))?;
 
         let mut reports = Vec::new();
         for (name, query, shape) in [
             ("shallow", SHALLOW_QUERY, shallow_shape),
-            (deepest.0, deepest.1, deepest.2),
+            (DEEP_FIXTURE_ID, DEEP_QUERY, deep_shape),
         ] {
             let report = measure_fixture(context, &mut connection, name, query, shape)?;
             context.action(format!(
@@ -178,8 +143,8 @@ impl Scenario for StartupBaseline {
         ensure!(
             deep.exchange_levels > shallow.exchange_levels,
             "no deep candidate stacks more exchange levels than the shallow fixture \
-             (deepest was {} with {} levels against {}), so the pair would not measure \
-             plan depth. Add a candidate the optimizer cannot flatten.",
+             (fixed fixture was {} with {} levels against {}), so the frozen fixture no longer \
+             measures plan depth. Revise the fixture as a new explicit version before measuring.",
             deep.name,
             deep.exchange_levels,
             shallow.exchange_levels
@@ -188,7 +153,14 @@ impl Scenario for StartupBaseline {
         let resources = context.handle().query_execution_resource_snapshot()?;
         let backend_count = resources.map_or(0, |snapshot| snapshot.backends.len());
 
-        write_report(context.scenario_root(), &reports, backend_count)?;
+        let run_manifest = run_manifest.finish_success()?;
+        write_report(
+            context.scenario_root(),
+            &reports,
+            backend_count,
+            &run_manifest.run_id,
+            &run_manifest.sha256,
+        )?;
         context.action(format!(
             "wrote startup-baseline.csv and startup-baseline.md under {}",
             context.scenario_root().display()
@@ -222,6 +194,7 @@ fn bounded_timeout(context: &ScenarioContext, operation: &str) -> Result<Duratio
 struct PlanShape {
     plan_fragments: usize,
     exchange_levels: usize,
+    plan_sha256: String,
 }
 
 fn measure_plan_shape(connection: &mut mysql::Conn, query: &str) -> Result<PlanShape> {
@@ -238,6 +211,7 @@ fn measure_plan_shape(connection: &mut mysql::Conn, query: &str) -> Result<PlanS
         .iter()
         .filter(|line| line.contains("EXCHANGE"))
         .count();
+    let plan_sha256 = format!("{:x}", Sha256::digest(lines.join("\n").as_bytes()));
     ensure!(
         plan_fragments > 0,
         "EXPLAIN VERBOSE produced no plan fragments, so the fixture is not \
@@ -252,6 +226,7 @@ fn measure_plan_shape(connection: &mut mysql::Conn, query: &str) -> Result<PlanS
     Ok(PlanShape {
         plan_fragments,
         exchange_levels,
+        plan_sha256,
     })
 }
 
@@ -276,6 +251,8 @@ fn measure_fixture(
         name,
         plan_fragments: shape.plan_fragments,
         exchange_levels: shape.exchange_levels,
+        query_sha256: format!("{:x}", Sha256::digest(query.as_bytes())),
+        plan_sha256: shape.plan_sha256,
         warmup,
         measured,
     })
@@ -328,7 +305,13 @@ fn percentile(
     values[rank.min(values.len() - 1)]
 }
 
-fn write_report(root: &Path, reports: &[FixtureReport], backend_count: usize) -> Result<()> {
+fn write_report(
+    root: &Path,
+    reports: &[FixtureReport],
+    backend_count: usize,
+    run_id: &str,
+    run_manifest_sha256: &str,
+) -> Result<()> {
     let mut csv = String::from("fixture,phase,run,first_row_micros,total_micros\n");
     for report in reports {
         for (index, sample) in report.warmup.iter().enumerate() {
@@ -353,18 +336,57 @@ fn write_report(root: &Path, reports: &[FixtureReport], backend_count: usize) ->
     fs::write(root.join("startup-baseline.csv"), csv)
         .context("write the startup baseline samples")?;
 
+    #[derive(Serialize)]
+    struct FixtureIdentity<'a> {
+        fixture_id: &'a str,
+        query_sha256: &'a str,
+        plan_sha256: &'a str,
+        plan_fragments: usize,
+        exchange_levels: usize,
+    }
+    #[derive(Serialize)]
+    struct StartupIdentity<'a> {
+        schema_version: u32,
+        run_id: &'a str,
+        run_manifest_sha256: &'a str,
+        fixtures: Vec<FixtureIdentity<'a>>,
+    }
+    let identity = StartupIdentity {
+        schema_version: 1,
+        run_id,
+        run_manifest_sha256,
+        fixtures: reports
+            .iter()
+            .map(|report| FixtureIdentity {
+                fixture_id: report.name,
+                query_sha256: &report.query_sha256,
+                plan_sha256: &report.plan_sha256,
+                plan_fragments: report.plan_fragments,
+                exchange_levels: report.exchange_levels,
+            })
+            .collect(),
+    };
+    fs::write(
+        root.join("startup-baseline-fixtures.json"),
+        serde_json::to_vec_pretty(&identity)?,
+    )
+    .context("write startup fixture identities")?;
+
     let mut summary = String::from("# Native distributed startup baseline\n\n");
     summary.push_str(&format!(
         "Topology: 1 FE + {backend_count} BE, separate processes.\n\
          Runs per fixture: {WARMUP_RUNS} warm-up (recorded, excluded) + {MEASURED_RUNS} measured.\n\
-         Time to first row is measured client-side on a lazy row iterator.\n\n"
+         Time to first row is measured client-side on a lazy row iterator.\n\
+         Run identity: `{run_id}`; run manifest SHA256: `{run_manifest_sha256}`.\n\n"
     ));
-    summary.push_str("| fixture | plan fragments | exchange levels | median first row | p95 first row | median total | p95 total |\n");
-    summary.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+    summary.push_str("| fixture | SQL SHA256 | plan SHA256 | plan fragments | exchange levels | median first row | p95 first row | median total | p95 total |\n");
+    summary.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|\n");
     for report in reports {
         summary.push_str(&format!(
-            "| {} | {} | {} | {:?} | {:?} | {:?} | {:?} |\n",
+            "| {} | `{}` | `{}` | {} | {} | {:?} | {:?} | {:?} | {:?} |\n",
             report.name,
+            report.query_sha256,
+            report.plan_sha256,
             report.plan_fragments,
             report.exchange_levels,
             median(&report.measured, |sample| sample.first_row),

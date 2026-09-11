@@ -165,9 +165,11 @@ mod tests {
             Err("not used".to_string())
         }
 
-        fn shutdown(&self) -> Result<(), String> {
+        async fn shutdown_until(&self, _deadline: std::time::Instant) -> Result<(), String> {
             Ok(())
         }
+
+        fn request_shutdown_for_process_exit(&self) {}
     }
 
     #[test]

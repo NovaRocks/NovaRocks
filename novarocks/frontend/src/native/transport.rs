@@ -33,7 +33,8 @@ use novarocks_types::{BackendProcessId, NativeEndpoint, UniqueId};
 use super::data_runtime::FrontendDataRuntime;
 use super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
-const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MESSAGE_BYTES: usize =
+    novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 
 /// One best-effort response from a Backend catalog reachability prune.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,24 +337,29 @@ pub(crate) fn heartbeat(
     data_runtime: &FrontendDataRuntime,
     process_id: BackendProcessId,
     endpoint: RuntimeEndpoint,
+    timeout: Duration,
 ) -> HeartbeatOutcome {
     let started = Instant::now();
     let outcome = (|| -> Result<_, String> {
         let client = Client::new(endpoint.native_endpoint().clone(), data_runtime.clone());
         data_runtime.block_on(async {
-            let mut grpc = client.grpc().await?;
-            grpc.heartbeat(Request::new(
-                novarocks_proto_models::novarocks::HeartbeatRequest {
-                    expected_process_id: Some(
-                        ProtocolBackendProcessId::from_domain(process_id)
-                            .as_proto()
-                            .clone(),
-                    ),
-                },
-            ))
+            tokio::time::timeout(timeout, async {
+                let mut grpc = client.grpc().await?;
+                grpc.heartbeat(Request::new(
+                    novarocks_proto_models::novarocks::HeartbeatRequest {
+                        expected_process_id: Some(
+                            ProtocolBackendProcessId::from_domain(process_id)
+                                .as_proto()
+                                .clone(),
+                        ),
+                    },
+                ))
+                .await
+                .map(|value| value.into_inner())
+                .map_err(|error| format!("heartbeat rpc failed: {error}"))
+            })
             .await
-            .map(|value| value.into_inner())
-            .map_err(|error| format!("heartbeat rpc failed: {error}"))
+            .map_err(|_| format!("heartbeat did not complete within {timeout:?}"))?
         })?
     })();
     observe_backend_heartbeat_rtt(started.elapsed());
@@ -368,11 +374,27 @@ pub(crate) fn heartbeat(
                 parse_reported_state(response.reported_state)
                     .map(|reported_state| (descriptor, reported_state))
                     .map_err(|error| error.to_string())
+            })
+            .and_then(|(descriptor, reported_state)| {
+                let capability = response
+                    .admission_epoch_capability
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "heartbeat response missing admission epoch capability".to_string()
+                    })?;
+                let capability = novarocks_task_codec::identity::decode_admission_epoch_capability(
+                    capability,
+                    novarocks_proto_codec::FieldPath::root("heartbeat_response")
+                        .field("admission_epoch_capability"),
+                )
+                .map_err(|error| error.to_string())?;
+                Ok((descriptor, reported_state, capability))
             }) {
-            Ok((descriptor, reported_state)) => HeartbeatOutcome::Ok {
+            Ok((descriptor, reported_state, admission_epoch_capability)) => HeartbeatOutcome::Ok {
                 descriptor,
                 reported_state,
                 num_cores: response.num_cores,
+                admission_epoch_capability,
                 now_ms: now_millis(),
             },
             Err(err) => HeartbeatOutcome::Failed { err },

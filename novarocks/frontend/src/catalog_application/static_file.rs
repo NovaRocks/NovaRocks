@@ -204,10 +204,12 @@ fn parse_credential_binding(
     let purpose = match wire.purpose.as_str() {
         "catalog-control" => CatalogCredentialPurpose::CatalogControl,
         "object-store-data" => CatalogCredentialPurpose::ObjectStoreData,
+        "object-store-metadata" => CatalogCredentialPurpose::ObjectStoreMetadata,
         _ => return Err(whole_file_error("unknown catalog credential purpose")),
     };
     let consumer_role = match wire.consumer_role.as_str() {
         "frontend" => CredentialConsumerRole::Frontend,
+        "backend" => CredentialConsumerRole::Backend,
         "frontend-and-backend" => CredentialConsumerRole::FrontendAndBackend,
         _ => return Err(whole_file_error("unknown catalog credential consumer role")),
     };
@@ -267,7 +269,7 @@ display_name = "Analytics"
 config_format_version = 3
 [[catalogs.credential_bindings]]
 purpose = "object-store-data"
-consumer_role = "frontend-and-backend"
+consumer_role = "backend"
 mode = "static"
 name = "warehouse-data"
 generation = "blue"
@@ -276,6 +278,12 @@ purpose = "catalog-control"
 consumer_role = "frontend"
 mode = "static"
 name = "rest-control"
+generation = "blue"
+[[catalogs.credential_bindings]]
+purpose = "object-store-metadata"
+consumer_role = "frontend"
+mode = "static"
+name = "warehouse-metadata"
 generation = "blue"
 [catalogs.properties]
 z = "last"
@@ -297,9 +305,15 @@ name = "rest-control"
 generation = "blue"
 [[catalogs.credential_bindings]]
 purpose = "object-store-data"
-consumer_role = "frontend-and-backend"
+consumer_role = "backend"
 mode = "static"
 name = "warehouse-data"
+generation = "blue"
+[[catalogs.credential_bindings]]
+purpose = "object-store-metadata"
+consumer_role = "frontend"
+mode = "static"
+name = "warehouse-metadata"
 generation = "blue"
 [catalogs.properties]
 a = "first"
@@ -313,7 +327,7 @@ z = "last"
         let second_entry = two.into_entries().next().expect("second entry");
         assert_ne!(first_entry.identity(), second_entry.identity());
         assert_eq!(first_entry.config(), second_entry.config());
-        assert_eq!(first_entry.config().credential_bindings().len(), 2);
+        assert_eq!(first_entry.config().credential_bindings().len(), 3);
 
         let dynamic_attachment = crate::catalog_attachment::CatalogAttachment {
             attachment_id: Uuid::now_v7(),
@@ -386,8 +400,9 @@ type = "iceberg"
             b"format_version = 1\ncatalogs = []\n".as_slice(),
             b"format_version = 3\nunknown = true\ncatalogs = []\n".as_slice(),
             b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'frontend-and-backend'\nmode = 'static'\nname = 'BAD'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
-            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'backend'\nmode = 'static'\nname = 'warehouse-data'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'frontend-and-backend'\nmode = 'static'\nname = 'warehouse-data'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
             b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'frontend-and-backend'\nmode = 'vended'\nname = 'forbidden'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-metadata'\nconsumer_role = 'frontend'\nmode = 'vended'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
             b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\ncredential_bindings = []\n[catalogs.properties]\ncredential.secret = 'nope'\n".as_slice(),
         ] {
             let file = write_file(contents);

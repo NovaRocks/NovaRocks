@@ -197,6 +197,13 @@ impl ExecutionRuntime {
         Arc::clone(&self.driver_executor)
     }
 
+    /// Stop accepting driver work and wait a bounded time for driver scheduling
+    /// threads to join. A reaper retains join ownership after a timeout.
+    /// Application shutdown invokes this before releasing the runtime owner.
+    pub fn shutdown_driver_execution(&self) -> Result<(), String> {
+        self.driver_executor.shutdown()
+    }
+
     pub fn scan_executor(&self) -> Arc<ScanExecutor> {
         Arc::clone(&self.scan_executor)
     }
@@ -283,10 +290,24 @@ impl std::error::Error for ExecutionRuntimeConfigError {}
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use super::{
         ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
         test_execution_function_set,
     };
+
+    fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+            thread::yield_now();
+        }
+        predicate()
+    }
 
     fn config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
@@ -339,5 +360,34 @@ mod tests {
         config.local_exchange_max_buffered_rows = -1;
         ExecutionRuntime::new(config, test_execution_function_set())
             .expect("-1 preserves the unlimited local exchange contract");
+    }
+
+    #[test]
+    fn runtime_drop_and_rebuild_join_driver_scheduler_threads() {
+        for _ in 0..4 {
+            let runtime = ExecutionRuntime::new(config(), test_execution_function_set())
+                .expect("valid runtime config");
+            let probes = runtime.driver_executor.exit_probes();
+
+            drop(runtime);
+
+            assert!(wait_until(Duration::from_secs(1), || probes.all_exited()));
+        }
+    }
+
+    #[test]
+    fn runtime_driver_shutdown_is_explicit_and_idempotent() {
+        let runtime = ExecutionRuntime::new(config(), test_execution_function_set())
+            .expect("valid runtime config");
+        let probes = runtime.driver_executor.exit_probes();
+
+        runtime
+            .shutdown_driver_execution()
+            .expect("first driver shutdown");
+        runtime
+            .shutdown_driver_execution()
+            .expect("repeated driver shutdown");
+
+        assert!(probes.all_exited());
     }
 }

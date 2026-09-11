@@ -26,6 +26,7 @@
 //! timed out, or finished -- it moves the state machine and lets the caller
 //! read the verdicts the machine already computes.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::identity::TaskIdentity;
@@ -33,12 +34,21 @@ use novarocks_execution::task_execution::status::TerminationDetail;
 
 use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::status::TaskStatusCursor;
+use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
+use novarocks_query_application::coordination::{
+    AcceptedAttemptFailure, AcceptedRootStatusSender, AcceptedRootStatusSource,
+    OperationDispatchResult, accepted_root_status_projection_with_seal_port,
+};
 
+use super::abort_effect::{
+    NativeAbortEffect, NativeAbortEffectIntake, NativeAbortEffectSettleError,
+    NativeAbortEffectSettlement, NativeLateAbortEffect, closing_receipt, settle_late_abort_receipt,
+};
+use super::blocking_io::ConnectorBlockingIoSupervisor;
 use super::context_owner::{ContextEstablishSource, QueryContextOwner};
 use super::error::TaskExecutionError;
-use super::execution::QueryTaskExecution;
-use super::intent::OperationAcknowledgement;
-use super::remote_task::RemoteTaskState;
+use super::execution::{ActorAbortDispatchState, QueryTaskExecution, QueuedContextAcknowledgement};
+use super::intent::{AckPayload, OperationAcknowledgement};
 use crate::native::task_transport::{SubscriptionState, TaskAckIntake, TaskStatusSubscriber};
 
 /// Something that must see every acknowledgement this runner settles.
@@ -103,6 +113,14 @@ pub(crate) trait StatusSubscriptions: Send + Sync {
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String>;
 
+    /// Replaces a subscription after the local intake reported observation
+    /// loss, replaying from the serial runner's authoritative cursors.
+    fn resubscribe(
+        &self,
+        context: QueryContextRef,
+        cursors: Vec<TaskStatusCursor>,
+    ) -> Result<(), String>;
+
     /// The subscription's state once it has settled somewhere resubscribing
     /// cannot repair, and `None` while it can still recover.
     ///
@@ -123,6 +141,14 @@ impl StatusSubscriptions for TaskStatusSubscriber {
         Self::ensure(self, context, cursors)
     }
 
+    fn resubscribe(
+        &self,
+        context: QueryContextRef,
+        cursors: Vec<TaskStatusCursor>,
+    ) -> Result<(), String> {
+        Self::resubscribe(self, context, cursors)
+    }
+
     fn settled_fatally(&self, context: QueryContextRef) -> Option<SubscriptionState> {
         Self::state(self, context).filter(|state| state.is_fatal())
     }
@@ -136,12 +162,21 @@ impl StatusSubscriptions for TaskStatusSubscriber {
 /// takes it.
 const STATUS_EVENTS_PER_TURN: usize = 256;
 
+/// One actor-owned lifecycle effect may enter per turn. The dispatcher's
+/// lifecycle lane remains priority-selected, while this bound prevents an
+/// actor stand-down burst from hiding status and pump progress indefinitely.
+const ABORT_EFFECTS_PER_TURN: usize = 1;
+
 /// What one turn moved.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TurnReport {
     pub(crate) operations: usize,
     pub(crate) acknowledgements: usize,
     pub(crate) status_events: usize,
+    pub(crate) resubscriptions: usize,
+    /// Actor-owned Abort effects moved from their bounded adapter into the
+    /// task dispatcher's priority lifecycle lane.
+    pub(crate) abort_effects: usize,
     /// What the per-attempt pumps moved: filter versions ingested, credential
     /// rotations started or advanced.
     pub(crate) pumped: usize,
@@ -157,6 +192,8 @@ impl TurnReport {
         self.operations == 0
             && self.acknowledgements == 0
             && self.status_events == 0
+            && self.resubscriptions == 0
+            && self.abort_effects == 0
             && self.pumped == 0
     }
 }
@@ -170,6 +207,21 @@ pub(crate) struct TaskRound {
     observers: Vec<Arc<dyn AcknowledgementObserver>>,
     pumps: Vec<Box<dyn TurnPump>>,
     pumps_sealed: bool,
+    connector_blocking_io: Option<ConnectorBlockingIoSupervisor>,
+    root_status_sender: Option<AcceptedRootStatusSender>,
+    root_status_source: Option<AcceptedRootStatusSource>,
+    pending_success_seal:
+        Option<novarocks_query_application::coordination::AcceptedRootSuccessSealRequest>,
+    abort_effect_intake: Option<NativeAbortEffectIntake>,
+    abort_effects:
+        BTreeMap<novarocks_execution::task_execution::TaskOperationId, NativeAbortEffect>,
+    late_abort_settlements:
+        BTreeMap<novarocks_execution::task_execution::TaskOperationId, Vec<NativeLateAbortEffect>>,
+    /// Exact definitive Worker receipt for an Abort operation. It suppresses
+    /// an already-authorized replay and absorbs the later ACK of a replay that
+    /// was already in flight when an older send finally answered.
+    abort_closing_receipts:
+        BTreeMap<novarocks_execution::task_execution::TaskOperationId, OperationAcknowledgement>,
 }
 
 impl TaskRound {
@@ -179,6 +231,11 @@ impl TaskRound {
         establish: Box<dyn ContextEstablishSource>,
         subscriber: Arc<dyn StatusSubscriptions>,
     ) -> Self {
+        let (root_status_sender, root_status_source) =
+            accepted_root_status_projection_with_seal_port(
+                execution.graph().root_identity(),
+                Arc::new(execution.intake().handle()),
+            );
         Self {
             execution,
             acks,
@@ -187,7 +244,49 @@ impl TaskRound {
             observers: Vec::new(),
             pumps: Vec::new(),
             pumps_sealed: false,
+            connector_blocking_io: None,
+            root_status_sender: Some(root_status_sender),
+            root_status_source: Some(root_status_source),
+            pending_success_seal: None,
+            abort_effect_intake: None,
+            abort_effects: BTreeMap::new(),
+            late_abort_settlements: BTreeMap::new(),
+            abort_closing_receipts: BTreeMap::new(),
         }
+    }
+
+    /// Installs the single actor-to-Native Abort intake for this attempt.
+    pub(crate) fn with_abort_effect_intake(mut self, intake: NativeAbortEffectIntake) -> Self {
+        self.install_abort_effect_intake(intake);
+        self
+    }
+
+    /// Installs the actor-owned Abort intake while an attempt is assembled
+    /// from its exact manifest.
+    pub(crate) fn install_abort_effect_intake(&mut self, intake: NativeAbortEffectIntake) {
+        assert!(
+            self.abort_effect_intake.replace(intake).is_none(),
+            "one TaskRound may own only one Native Abort effect intake"
+        );
+    }
+
+    /// Transfers the single accepted-root projection to the result-pump
+    /// owner. The round retains only its sender and remains the sole publisher.
+    pub(crate) fn take_root_status_source(&mut self) -> Option<AcceptedRootStatusSource> {
+        self.root_status_source.take()
+    }
+
+    /// Installs the process owner used by blocking Connector calls.
+    pub(crate) fn with_connector_blocking_io(
+        mut self,
+        supervisor: ConnectorBlockingIoSupervisor,
+    ) -> Self {
+        self.connector_blocking_io = Some(supervisor);
+        self
+    }
+
+    pub(crate) fn connector_blocking_io(&self) -> Option<&ConnectorBlockingIoSupervisor> {
+        self.connector_blocking_io.as_ref()
     }
 
     /// Adds one owner that must see every acknowledgement this runner settles.
@@ -242,6 +341,13 @@ impl TaskRound {
         self.pumps.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn queued_abort_effects(&self) -> usize {
+        self.abort_effect_intake
+            .as_ref()
+            .map_or(0, NativeAbortEffectIntake::queued)
+    }
+
     /// Steps the attempt once.
     ///
     /// The order is deliberate. Acknowledgements settle first, because a
@@ -270,25 +376,98 @@ impl TaskRound {
 
         for ack in self.acks.drain() {
             report.acknowledgements += 1;
+            let queued_context = self
+                .execution
+                .classify_queued_context_acknowledgement(&ack)?;
+            if queued_context == QueuedContextAcknowledgement::IgnoreOlderTransportUnknown {
+                // This fact belongs to an older transport generation. The
+                // unchanged replay and its actor authorization remain owned by
+                // the current queued generation.
+                continue;
+            }
             // Before the state machine settles it: settling can fail the
             // attempt, and an observer that learned nothing in that case would
             // leave a blocked owner waiting for a verdict that did arrive.
             for observer in &self.observers {
-                observer
-                    .observe_acknowledgement(&ack)
-                    .map_err(TaskExecutionError::Schedule)?;
+                if let Err(error) = observer.observe_acknowledgement(&ack) {
+                    self.fail_closed_abort_operation(ack.operation_id())?;
+                    return Err(TaskExecutionError::Schedule(error));
+                }
+            }
+            if self.process_abort_ack(&ack)? {
+                continue;
+            }
+            if queued_context == QueuedContextAcknowledgement::ApplyDefinitive {
+                self.execution.acknowledge_queued_context_replay(&ack)?;
+                continue;
             }
             self.execution.acknowledge(&ack)?;
         }
 
-        let status = self.execution.apply_status(STATUS_EVENTS_PER_TURN)?;
+        for _ in 0..ABORT_EFFECTS_PER_TURN {
+            report.abort_effects += self.drive_actor_abort_effect()?;
+        }
+
+        for context in self.execution.take_status_reconciliations() {
+            self.subscriber
+                .resubscribe(context, self.execution.status_cursors(context))
+                .map_err(TaskExecutionError::Schedule)?;
+            report.resubscriptions += 1;
+        }
+
+        let status_budget = if self.pending_success_seal.is_some() {
+            1
+        } else {
+            STATUS_EVENTS_PER_TURN
+        };
+        let status = self.execution.apply_status(status_budget)?;
         report.status_events = status.accepted + status.ignored;
+        if let Some(request) = status.success_seal {
+            if self.pending_success_seal.replace(request).is_some() {
+                return Err(TaskExecutionError::Schedule(
+                    "more than one result success-seal request reached one TaskRound".to_owned(),
+                ));
+            }
+        }
+        if status.resubscribe
+            && let Some(request) = self.pending_success_seal.take()
+        {
+            request.reject(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "success seal refused because Task status observation was incomplete before its linearization point",
+            ));
+        }
+        self.publish_root_status()?;
+        if !status.resubscribe {
+            self.try_settle_success_seal()?;
+        }
+        if status.resubscribe {
+            for &context in self.execution.graph().contexts() {
+                if self
+                    .execution
+                    .owner(context)
+                    .is_none_or(QueryContextOwner::needs_establish)
+                {
+                    continue;
+                }
+                self.subscriber
+                    .resubscribe(context, self.execution.status_cursors(context))
+                    .map_err(TaskExecutionError::Schedule)?;
+                report.resubscriptions += 1;
+            }
+        }
 
         for pump in &mut self.pumps {
             report.pumped += pump.drive(&mut self.execution)?;
         }
 
-        let pumped = self.execution.pump(self.establish.as_ref())?;
+        let pumped = match self.execution.pump(self.establish.as_ref()) {
+            Ok(pumped) => pumped,
+            Err(error) => {
+                self.settle_definitely_unsent_expired_actor_aborts()?;
+                return Err(error);
+            }
+        };
         report.operations = pumped.operations;
 
         // Every context that exists needs its one subscription. Starting it
@@ -331,6 +510,405 @@ impl TaskRound {
         Ok(report)
     }
 
+    fn drive_actor_abort_effect(&mut self) -> Result<usize, TaskExecutionError> {
+        let Some(intake) = self.abort_effect_intake.as_mut() else {
+            return Ok(0);
+        };
+        let preview = match intake.front_intent() {
+            Ok(preview) => preview,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(0),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return Err(TaskExecutionError::Schedule(
+                    "Native Abort effect intake closed while its TaskRound remained active"
+                        .to_owned(),
+                ));
+            }
+        };
+        if let Some(receipt) = self
+            .abort_closing_receipts
+            .get(&preview.operation_id())
+            .cloned()
+        {
+            let effect = intake.try_recv().map_err(|error| {
+                TaskExecutionError::Schedule(format!(
+                    "closed Native Abort replay disappeared from its adapter: {error}"
+                ))
+            })?;
+            let settlement = effect.settle(&receipt).map_err(Self::abort_settle_error)?;
+            if !matches!(settlement, NativeAbortEffectSettlement::WorkerSettled) {
+                return Err(TaskExecutionError::Schedule(
+                    "closed Native Abort replay did not produce a Worker settlement".to_owned(),
+                ));
+            }
+            return Ok(1);
+        }
+        let Some(reservation) = self.execution.try_reserve_actor_abort(&preview)? else {
+            // Both the preview and its actor-owned settlement remain inside
+            // the adapter. A process-capacity wake or a later ACK drives the
+            // next bounded turn.
+            return Ok(0);
+        };
+        let effect = intake.try_recv().map_err(|error| {
+            TaskExecutionError::Schedule(format!(
+                "Native Abort effect disappeared after exact capacity reservation: {error}"
+            ))
+        })?;
+        if effect.intent().operation_id() != preview.operation_id() {
+            return Err(TaskExecutionError::Schedule(
+                "Native Abort effect differs from the capacity-reserved preview".to_owned(),
+            ));
+        }
+        let operation_id = effect.intent().operation_id();
+        self.execution
+            .enqueue_actor_abort(effect.intent().clone(), reservation)?;
+        if self.abort_effects.insert(operation_id, effect).is_some() {
+            return Err(TaskExecutionError::Schedule(
+                "Native Abort effect replaced an unsettled exact operation".to_owned(),
+            ));
+        }
+        Ok(1)
+    }
+
+    fn abort_settle_error(error: NativeAbortEffectSettleError) -> TaskExecutionError {
+        let detail = error.to_string();
+        let fail_closed = error.fail_closed();
+        TaskExecutionError::Schedule(match fail_closed {
+            Ok(()) => format!("Native Abort effect settlement failed closed: {detail}"),
+            Err(error) => format!(
+                "Native Abort effect settlement failed closed: {detail}; actor failure settlement also failed: {error}"
+            ),
+        })
+    }
+
+    fn process_abort_ack(
+        &mut self,
+        acknowledgement: &OperationAcknowledgement,
+    ) -> Result<bool, TaskExecutionError> {
+        let operation_id = acknowledgement.operation_id();
+
+        let replay_dispatch_state = if self.abort_effects.contains_key(&operation_id)
+            && self.late_abort_settlements.contains_key(&operation_id)
+        {
+            match self.execution.actor_abort_dispatch_state(operation_id) {
+                Ok(state) => state,
+                Err(error) => {
+                    self.fail_closed_abort_operation(operation_id)?;
+                    return Err(TaskExecutionError::Schedule(format!(
+                        "Native Abort replay ownership failed closed: {error}"
+                    )));
+                }
+            }
+        } else {
+            ActorAbortDispatchState::InFlight
+        };
+
+        if replay_dispatch_state == ActorAbortDispatchState::Queued {
+            // The current generation has not crossed process transport. An
+            // unknown result therefore belongs to an older generation and
+            // carries no new fact; retain both exact owners unchanged.
+            if acknowledgement.dispatch_result() == OperationDispatchResult::TransportUnknown {
+                return Ok(true);
+            }
+            let effect = self
+                .abort_effects
+                .get(&operation_id)
+                .expect("queued actor Abort was found in the same effect map");
+            if let Err(reason) = effect.validate_acknowledgement(acknowledgement) {
+                self.fail_closed_abort_operation(operation_id)?;
+                return Err(TaskExecutionError::Schedule(format!(
+                    "late Native Abort acknowledgement failed closed before queued replay cancellation: {reason:?}"
+                )));
+            }
+            if let Err(error) = self.execution.cancel_queued_actor_abort(operation_id) {
+                self.fail_closed_abort_operation(operation_id)?;
+                return Err(TaskExecutionError::Schedule(format!(
+                    "queued Native Abort replay cancellation failed closed: {error}"
+                )));
+            }
+            let effect = self
+                .abort_effects
+                .remove(&operation_id)
+                .expect("cancelled queued Abort retains its actor effect");
+            if let Err(error) = self.settle_late_abort_ack(acknowledgement) {
+                let fail_closed = effect.fail_closed();
+                return Err(TaskExecutionError::Schedule(match fail_closed {
+                    Ok(()) => format!(
+                        "queued Native Abort replay failed closed after late settlement error: {error}"
+                    ),
+                    Err(settlement_error) => format!(
+                        "queued Native Abort replay late settlement failed: {error}; current actor failure settlement also failed: {settlement_error}"
+                    ),
+                }));
+            }
+            effect.resolved_by_other_generation();
+            return Ok(true);
+        }
+
+        if let Some(effect) = self.abort_effects.get(&operation_id) {
+            if let Err(reason) = effect.validate_acknowledgement(acknowledgement) {
+                let effect = self
+                    .abort_effects
+                    .remove(&operation_id)
+                    .expect("validated Native Abort came from the same operation map");
+                let fail_closed = effect.fail_closed();
+                return Err(TaskExecutionError::Schedule(match fail_closed {
+                    Ok(()) => format!(
+                        "Native Abort acknowledgement failed closed before dispatcher settlement: {reason:?}"
+                    ),
+                    Err(error) => format!(
+                        "Native Abort acknowledgement was rejected as {reason:?}; actor failure settlement also failed: {error}"
+                    ),
+                }));
+            }
+            if let Err(error) = self.execution.acknowledge(acknowledgement) {
+                let effect = self
+                    .abort_effects
+                    .remove(&operation_id)
+                    .expect("dispatcher failure retains the same Native Abort effect");
+                let fail_closed = effect.fail_closed();
+                return Err(TaskExecutionError::Schedule(match fail_closed {
+                    Ok(()) => format!("Native Abort dispatcher settlement failed closed: {error}"),
+                    Err(settlement_error) => format!(
+                        "Native Abort dispatcher settlement failed: {error}; actor failure settlement also failed: {settlement_error}"
+                    ),
+                }));
+            }
+            let effect = self
+                .abort_effects
+                .remove(&operation_id)
+                .expect("settled dispatcher retains the same Native Abort effect");
+            match effect
+                .settle(acknowledgement)
+                .map_err(Self::abort_settle_error)?
+            {
+                NativeAbortEffectSettlement::WorkerSettled => {
+                    if let Some(settlements) = self.late_abort_settlements.remove(&operation_id) {
+                        for settlement in settlements {
+                            settlement.resolved_by_other_generation();
+                        }
+                    }
+                    self.abort_closing_receipts
+                        .insert(operation_id, acknowledgement.clone());
+                }
+                NativeAbortEffectSettlement::TransportUnknown(late) => {
+                    self.late_abort_settlements
+                        .entry(operation_id)
+                        .or_default()
+                        .push(late);
+                }
+            }
+            return Ok(true);
+        }
+
+        if self.late_abort_settlements.contains_key(&operation_id) {
+            self.settle_late_abort_ack(acknowledgement)?;
+            return Ok(true);
+        }
+
+        if let Some(closing) = self.abort_closing_receipts.get(&operation_id) {
+            Self::validate_closing_tombstone(closing, acknowledgement)?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn settle_late_abort_ack(
+        &mut self,
+        acknowledgement: &OperationAcknowledgement,
+    ) -> Result<(), TaskExecutionError> {
+        let operation_id = acknowledgement.operation_id();
+        let mut settlements = self
+            .late_abort_settlements
+            .remove(&operation_id)
+            .expect("late Abort route was selected from the same operation map");
+        let settlement = settlements.remove(0);
+        if let Err(error) = settle_late_abort_receipt(settlement, acknowledgement) {
+            let detail = error.to_string();
+            let fail_closed = error.fail_closed();
+            for settlement in settlements {
+                settlement.resolved_by_other_generation();
+            }
+            return Err(TaskExecutionError::Schedule(match fail_closed {
+                Ok(()) => format!("late Native Abort effect settlement failed closed: {detail}"),
+                Err(error) => format!(
+                    "late Native Abort effect settlement failed: {detail}; actor failure settlement also failed: {error}"
+                ),
+            }));
+        }
+        // A definitive closing receipt for the exact operation and context
+        // resolves every transport-unknown generation of that same replay.
+        for settlement in settlements {
+            settlement.resolved_by_other_generation();
+        }
+        self.abort_closing_receipts
+            .insert(operation_id, acknowledgement.clone());
+        Ok(())
+    }
+
+    fn validate_closing_tombstone(
+        closing: &OperationAcknowledgement,
+        acknowledgement: &OperationAcknowledgement,
+    ) -> Result<(), TaskExecutionError> {
+        if acknowledgement.operation_id() != closing.operation_id()
+            || acknowledgement.kind() != closing.kind()
+        {
+            return Err(TaskExecutionError::Schedule(
+                "Native Abort acknowledgement conflicts with its exact closing tombstone"
+                    .to_owned(),
+            ));
+        }
+        if acknowledgement.dispatch_result() == OperationDispatchResult::TransportUnknown {
+            return Ok(());
+        }
+        let AckPayload::Context(expected) = closing.payload() else {
+            return Err(TaskExecutionError::Schedule(
+                "Native Abort closing tombstone lost its context receipt".to_owned(),
+            ));
+        };
+        closing_receipt(expected.context(), acknowledgement).map_err(|reason| {
+            TaskExecutionError::Schedule(format!(
+                "Native Abort replay acknowledgement conflicts with its closing tombstone: {reason:?}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn fail_closed_abort_operation(
+        &mut self,
+        operation_id: novarocks_execution::task_execution::TaskOperationId,
+    ) -> Result<(), TaskExecutionError> {
+        if let Some(effect) = self.abort_effects.remove(&operation_id) {
+            effect.fail_closed().map_err(|error| {
+                TaskExecutionError::Schedule(format!(
+                    "Native Abort actor failure settlement failed: {error}"
+                ))
+            })?;
+        }
+        if let Some(mut settlements) = self.late_abort_settlements.remove(&operation_id) {
+            if !settlements.is_empty() {
+                let settlement = settlements.remove(0);
+                settlement.fail_closed().map_err(|error| {
+                    TaskExecutionError::Schedule(format!(
+                        "late Native Abort actor failure settlement failed: {error}"
+                    ))
+                })?;
+            }
+            for settlement in settlements {
+                settlement.resolved_by_other_generation();
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_definitely_unsent_expired_actor_aborts(&mut self) -> Result<(), TaskExecutionError> {
+        for operation_id in self.execution.take_expired_actor_aborts() {
+            let effect = self.abort_effects.remove(&operation_id).ok_or_else(|| {
+                TaskExecutionError::Schedule(format!(
+                    "expired Native Abort operation {operation_id:?} lost its actor settlement"
+                ))
+            })?;
+            effect.definitely_unsent().map_err(|error| {
+                TaskExecutionError::Schedule(format!(
+                    "expired Native Abort definitely-unsent settlement failed: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Publishes the root snapshot only after the whole bounded status fold
+    /// has updated the attempt failure latch. Re-reading the held root on every
+    /// turn is intentional: a derived root failure may first be published as
+    /// pending, then be refined at the same status version when another task
+    /// supplies the authoritative non-derived cause on a later turn.
+    fn publish_root_status(&mut self) -> Result<(), TaskExecutionError> {
+        let Some(sender) = self.root_status_sender.as_ref() else {
+            // Status ordered after the consumed seal is residual convergence
+            // information. It cannot revise the already fixed business result.
+            return Ok(());
+        };
+        let root = self.execution.graph().root_identity();
+        let Some(task) = self.execution.task(root.task_id()) else {
+            return Err(TaskExecutionError::Schedule(
+                "the frozen root Task is absent from its TaskRound".to_owned(),
+            ));
+        };
+        if !task.create_acknowledged() {
+            return Ok(());
+        }
+        let Some(status) = task.status().cloned() else {
+            return Ok(());
+        };
+        let attempt_failure = match self.execution.failure_cause() {
+            Some(cause) if cause.is_derived() => AcceptedAttemptFailure::DerivedPending,
+            Some(authoritative) => AcceptedAttemptFailure::Authoritative(authoritative.clone()),
+            None => AcceptedAttemptFailure::None,
+        };
+        sender
+            .publish_attempt_observation(status, attempt_failure)
+            .map_err(|error| {
+                TaskExecutionError::Schedule(format!(
+                    "publish accepted root Task status projection failed: {error}"
+                ))
+            })
+    }
+
+    fn try_settle_success_seal(&mut self) -> Result<(), TaskExecutionError> {
+        if self.pending_success_seal.is_none() {
+            return Ok(());
+        }
+        let root = self.execution.graph().root_identity();
+        let root_status = self
+            .execution
+            .task(root.task_id())
+            .and_then(|task| task.status());
+        let root_finished = root_status.is_some_and(|status| {
+            status.identity() == root
+                && status.state() == novarocks_execution::task_execution::TaskState::Finished
+        });
+        if root_finished && self.execution.failure_cause().is_none() && self.tasks_created() {
+            let sender = self.root_status_sender.take().ok_or_else(|| {
+                TaskExecutionError::Schedule(
+                    "success seal reached TaskRound after its publisher was consumed".to_owned(),
+                )
+            })?;
+            return self
+                .pending_success_seal
+                .take()
+                .expect("the success request was checked before settlement")
+                .accept(sender)
+                .map_err(|error| {
+                    TaskExecutionError::Schedule(format!(
+                        "seal accepted root Task success projection failed: {error}"
+                    ))
+                });
+        }
+        let terminal_without_success = match self.execution.failure_cause() {
+            // A derived cause deliberately freezes the decision until the
+            // same attempt owner learns the originating cause. Rejecting the
+            // seal here would turn an incomplete failure fact into a final
+            // classification.
+            Some(cause) if cause.is_derived() => false,
+            Some(_) => true,
+            None => root_status.is_some_and(|status| {
+                status.is_terminal()
+                    && status.state() != novarocks_execution::task_execution::TaskState::Finished
+            }),
+        };
+        if terminal_without_success {
+            let error = QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "success seal reached TaskRound without exact root Finished and an empty attempt failure latch",
+            );
+            self.pending_success_seal
+                .take()
+                .expect("the success request was checked before rejection")
+                .reject(error);
+        }
+        Ok(())
+    }
+
     /// Whether every query context of this attempt has been established.
     ///
     /// This is the task protocol's ControlReady: past it, every backend that
@@ -345,18 +923,29 @@ impl TaskRound {
         })
     }
 
-    /// Whether every task of this attempt has been created.
+    /// Whether every task of this attempt has acknowledged its exact create.
     ///
     /// This is the task protocol's Stage and Start: past it, every backend
-    /// holds the exact task the schedule placed on it. A task that already
-    /// went terminal does not count as created -- the question is whether the
-    /// attempt finished starting, and one that lost a task did not.
+    /// holds or historically held the exact task the schedule placed on it.
+    /// Lifecycle status cannot answer this: a task may skip the locally
+    /// visible Created state and reach Terminal before its create receipt is
+    /// settled, while the later receipt still proves admission.
     pub(crate) fn tasks_created(&self) -> bool {
         self.execution.graph().tasks().all(|task| {
             self.execution
                 .task(task.task_id())
-                .is_some_and(|task| matches!(task.state(), RemoteTaskState::Created))
+                .is_some_and(|task| task.create_acknowledged())
         })
+    }
+
+    /// The historical create-receipt barrier for starting result fetches.
+    pub(crate) fn result_pump_ready(&self) -> bool {
+        self.tasks_created()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_success_sealed(&self) -> bool {
+        self.root_status_sender.is_none()
     }
 
     /// The root task the client's result comes from.
@@ -378,6 +967,18 @@ impl TaskRound {
     /// Whether the client may be told the read is complete.
     pub(crate) fn client_visible_completion(&self) -> bool {
         self.execution.client_visible_completion()
+    }
+
+    /// Whether the result owner and this Task owner fixed the accepted root's
+    /// successful terminal observation together.
+    ///
+    /// The sender is consumed only by `try_settle_success_seal`; transferring
+    /// the source to the result pump does not affect it. This gives the async
+    /// active owner a non-circular completion fact: it continues driving the
+    /// round until the result pump's seal request is accepted, then publishes
+    /// `NativeAttemptTerminal::Completed` back to that same pump.
+    pub(crate) fn accepted_root_success_sealed(&self) -> bool {
+        self.root_status_sender.is_none()
     }
 
     /// Whether every task terminated and every context was released.

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -52,14 +52,18 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 
 use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::observable::Observable;
-use novarocks_types::SlotId;
 use novarocks_types::format_uuid;
+use novarocks_types::{SlotId, UniqueId};
 use tracing::debug;
+
+mod result_ipc_preflight;
+pub use result_ipc_preflight::{TypedRootResultDecodeBounds, preflight_typed_root_result_decode};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ExchangeKey {
@@ -72,6 +76,65 @@ impl ExchangeKey {
     #[inline]
     pub fn finst_uuid(&self) -> String {
         format_uuid(self.finst_id_hi, self.finst_id_lo)
+    }
+}
+
+/// The sender whose schema and end-of-stream facts this receiver observes.
+///
+/// Native frames use the immutable source fragment identity and the ordinal
+/// frozen by the task graph. Local execution has no native fragment identity,
+/// so it remains an explicit, disjoint identity instead of overloading a
+/// native sender field.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ExchangeSenderIdentity {
+    Native {
+        source_fragment_instance_id: UniqueId,
+        sender_ordinal: u32,
+    },
+    Local {
+        sender_id: i32,
+        backend_number: i32,
+    },
+}
+
+impl ExchangeSenderIdentity {
+    pub const fn native(source_fragment_instance_id: UniqueId, sender_ordinal: u32) -> Self {
+        Self::Native {
+            source_fragment_instance_id,
+            sender_ordinal,
+        }
+    }
+
+    pub const fn local(sender_id: i32, backend_number: i32) -> Self {
+        Self::Local {
+            sender_id,
+            backend_number,
+        }
+    }
+}
+
+impl std::fmt::Display for ExchangeSenderIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native {
+                source_fragment_instance_id,
+                sender_ordinal,
+            } => write!(
+                formatter,
+                "native(source_finst={}, ordinal={sender_ordinal})",
+                format_uuid(
+                    source_fragment_instance_id.high(),
+                    source_fragment_instance_id.low()
+                )
+            ),
+            Self::Local {
+                sender_id,
+                backend_number,
+            } => write!(
+                formatter,
+                "local(sender_id={sender_id}, backend_number={backend_number})"
+            ),
+        }
     }
 }
 
@@ -189,8 +252,8 @@ struct DecodedExchangePayload<'a> {
 struct ReceiverState {
     expected_senders: usize,
     expected_chunk_schema: Option<ChunkSchemaRef>,
-    sender_wire_meta: HashMap<(i32, i32), ExchangeWireMeta>,
-    finished: HashSet<(i32, i32)>, // (sender_id, be_number)
+    sender_wire_meta: HashMap<ExchangeSenderIdentity, ExchangeWireMeta>,
+    finished: HashSet<ExchangeSenderIdentity>,
     chunks: VecDeque<Chunk>,
     recv_request_count: u128,
     recv_payload_bytes: u128,
@@ -439,12 +502,11 @@ impl ExecutionExchangeRegistry {
     pub fn push_chunks(
         &self,
         key: ExchangeKey,
-        sender_id: i32,
-        be_number: i32,
+        sender: ExchangeSenderIdentity,
         chunks: Vec<Chunk>,
         eos: bool,
     ) {
-        self.push_chunks_with_stats(key, sender_id, be_number, chunks, eos, 0, 0);
+        self.push_chunks_with_stats(key, sender, chunks, eos, 0, 0);
     }
 
     #[expect(
@@ -454,8 +516,7 @@ impl ExecutionExchangeRegistry {
     pub fn push_chunks_with_stats(
         &self,
         key: ExchangeKey,
-        sender_id: i32,
-        be_number: i32,
+        sender: ExchangeSenderIdentity,
         mut chunks: Vec<Chunk>,
         eos: bool,
         payload_bytes: usize,
@@ -470,11 +531,10 @@ impl ExecutionExchangeRegistry {
         let should_notify = chunks_len != 0 || eos;
 
         debug!(
-            "push_chunks: finst={} node_id={} sender_id={} be_number={} chunks={} rows={} eos={}",
+            "push_chunks: finst={} node_id={} sender={} chunks={} rows={} eos={}",
             key.finst_uuid(),
             key.node_id,
-            sender_id,
-            be_number,
+            sender,
             chunks_len,
             row_count,
             eos
@@ -496,8 +556,8 @@ impl ExecutionExchangeRegistry {
         let hold_start = Instant::now();
         if st.canceled {
             debug!(
-                "push_chunks: CANCELED, dropping {} chunks ({} rows) from sender_id={}",
-                chunks_len, row_count, sender_id
+                "push_chunks: CANCELED, dropping {} chunks ({} rows) from sender={}",
+                chunks_len, row_count, sender
             );
             return;
         }
@@ -515,11 +575,10 @@ impl ExecutionExchangeRegistry {
             st.chunks.extend(chunks);
         }
         let eos_snapshot = if eos {
-            st.finished.insert((sender_id, be_number));
+            st.finished.insert(sender);
             debug!(
-                "push_chunks: sender_id={} be_number={} marked as FINISHED, total finished={}/{}",
-                sender_id,
-                be_number,
+                "push_chunks: sender={} marked as FINISHED, total finished={}/{}",
+                sender,
                 st.finished.len(),
                 st.expected_senders
             );
@@ -551,11 +610,10 @@ impl ExecutionExchangeRegistry {
         {
             emit_exchange_snapshot_marker(|| {
                 format!(
-                    "event=push_eos finst={} node_id={} sender_id={} be_number={} expected_senders={} finished_senders={:?} queued_chunks={} queued_rows={} receiver_generation_before_notify={}",
+                    "event=push_eos finst={} node_id={} sender={} expected_senders={} finished_senders={:?} queued_chunks={} queued_rows={} receiver_generation_before_notify={}",
                     key.finst_uuid(),
                     key.node_id,
-                    sender_id,
-                    be_number,
+                    sender,
                     expected_senders,
                     finished,
                     queued_chunks,
@@ -984,6 +1042,105 @@ fn encode_exchange_payload_envelope(
     out
 }
 
+/// One exchange payload encoded into a single bounded backing allocation.
+///
+/// `retained_bytes` is the capacity of the allocation transferred into
+/// `Bytes`, rather than only its visible length. A result owner can therefore
+/// retain the exact credit that still backs the payload after encoding.
+#[derive(Debug)]
+pub struct BoundedExchangePayload {
+    bytes: Bytes,
+    retained_bytes: usize,
+}
+
+impl BoundedExchangePayload {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    pub fn into_parts(self) -> (Bytes, usize) {
+        (self.bytes, self.retained_bytes)
+    }
+}
+
+struct BoundedPayloadWriter {
+    buffer: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedPayloadWriter {
+    fn try_new(limit: usize, initial_capacity: usize) -> Result<Self, String> {
+        if initial_capacity > limit {
+            return Err(format!(
+                "bounded exchange payload initial capacity {initial_capacity} exceeds packet cap {limit}"
+            ));
+        }
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(initial_capacity).map_err(|error| {
+            format!(
+                "failed to reserve {initial_capacity} bytes for bounded exchange payload: {error}"
+            )
+        })?;
+        if buffer.capacity() > limit {
+            return Err(format!(
+                "bounded exchange payload allocation of {} bytes exceeds packet cap {limit}",
+                buffer.capacity()
+            ));
+        }
+        Ok(Self { buffer, limit })
+    }
+
+    fn into_payload(self) -> BoundedExchangePayload {
+        let retained_bytes = self.buffer.capacity();
+        BoundedExchangePayload {
+            bytes: Bytes::from(self.buffer),
+            retained_bytes,
+        }
+    }
+}
+
+impl Write for BoundedPayloadWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let required = self
+            .buffer
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("bounded exchange payload length overflow"))?;
+        if required > self.limit {
+            return Err(std::io::Error::other(format!(
+                "bounded exchange payload of at least {required} bytes exceeds packet cap {}",
+                self.limit
+            )));
+        }
+        if required > self.buffer.capacity() {
+            self.buffer
+                .try_reserve_exact(required - self.buffer.len())
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to grow bounded exchange payload to {required} bytes: {error}"
+                    ))
+                })?;
+            if self.buffer.capacity() < required || self.buffer.capacity() > self.limit {
+                return Err(std::io::Error::other(format!(
+                    "bounded exchange payload allocation of {} bytes cannot satisfy required {required} bytes within packet cap {}",
+                    self.buffer.capacity(),
+                    self.limit
+                )));
+            }
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn decode_exchange_payload_envelope(bytes: &[u8]) -> Result<DecodedExchangePayload<'_>, String> {
     if bytes.is_empty() {
         return Ok(DecodedExchangePayload {
@@ -1181,11 +1338,19 @@ fn is_exchange_dictionary_carrier_for_expected(expected: &DataType, actual: &Dat
 }
 
 fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
+    let mut buffer = Vec::new();
+    encode_arrow_ipc_chunks_to(chunks, &mut buffer)?;
+    Ok(buffer)
+}
+
+fn encode_arrow_ipc_chunks_to<W: std::io::Write>(
+    chunks: &[Chunk],
+    output: &mut W,
+) -> Result<(), String> {
     if chunks.is_empty() {
-        return Ok(vec![]);
+        return Ok(());
     }
 
-    let mut buffer = Vec::new();
     let schema = exchange_wire_schema_from_first_chunk(chunks)?;
     let mut batches = Vec::with_capacity(chunks.len());
     let writer_schema = if schema.fields().is_empty() {
@@ -1205,7 +1370,7 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
             .map(|batch| batch.schema())
             .unwrap_or(schema)
     };
-    let mut writer = StreamWriter::try_new(&mut buffer, &writer_schema)
+    let mut writer = StreamWriter::try_new(output, &writer_schema)
         .map_err(|e| format!("failed to create Arrow IPC writer: {e}"))?;
 
     for batch in batches {
@@ -1219,7 +1384,7 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
         .finish()
         .map_err(|e| format!("failed to finish Arrow IPC writer: {e}"))?;
 
-    Ok(buffer)
+    Ok(())
 }
 
 fn decode_arrow_ipc_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, String> {
@@ -1433,10 +1598,92 @@ pub fn encode_chunks(chunks: &[Chunk], include_slot_ids: bool) -> Result<Vec<u8>
     ))
 }
 
+/// Encodes chunks directly into one allocation that cannot grow beyond
+/// `packet_cap` through this writer.
+///
+/// This is used by retained result streams after the owner has reserved the
+/// complete packet cap. It avoids the unbounded encoder's Arrow-payload plus
+/// envelope copy and fails while writing as soon as the cap would be crossed.
+pub fn encode_chunks_bounded(
+    chunks: &[Chunk],
+    include_slot_ids: bool,
+    packet_cap: usize,
+) -> Result<BoundedExchangePayload, String> {
+    if chunks.is_empty() {
+        return Ok(BoundedExchangePayload {
+            bytes: Bytes::new(),
+            retained_bytes: 0,
+        });
+    }
+
+    let wire_meta = if include_slot_ids {
+        ExchangeWireMeta::from_chunks(chunks)?
+    } else {
+        None
+    };
+    let slot_id_bytes = wire_meta
+        .as_ref()
+        .map(|meta| {
+            meta.slot_ids_by_index
+                .len()
+                .saturating_mul(std::mem::size_of::<u32>())
+        })
+        .unwrap_or(0);
+    let envelope_bytes = EXCHANGE_PAYLOAD_MAGIC
+        .len()
+        .saturating_add(2)
+        .saturating_add(std::mem::size_of::<u32>())
+        .saturating_add(slot_id_bytes);
+    let logical_bytes = chunks.iter().fold(0usize, |total, chunk| {
+        total.saturating_add(chunk.logical_bytes())
+    });
+    let initial_capacity = envelope_bytes
+        .saturating_add(logical_bytes)
+        .saturating_add(4096)
+        .min(packet_cap);
+    let mut output = BoundedPayloadWriter::try_new(packet_cap, initial_capacity)?;
+
+    output
+        .write_all(EXCHANGE_PAYLOAD_MAGIC)
+        .map_err(|error| format!("failed to write exchange payload magic: {error}"))?;
+    output
+        .write_all(&[EXCHANGE_PAYLOAD_VERSION])
+        .map_err(|error| format!("failed to write exchange payload version: {error}"))?;
+    output
+        .write_all(&[if wire_meta.is_some() {
+            EXCHANGE_PAYLOAD_FLAG_SLOT_IDS
+        } else {
+            0
+        }])
+        .map_err(|error| format!("failed to write exchange payload flags: {error}"))?;
+    let slot_count = wire_meta
+        .as_ref()
+        .map(|meta| meta.slot_ids_by_index.len() as u32)
+        .unwrap_or(0);
+    output
+        .write_all(&slot_count.to_le_bytes())
+        .map_err(|error| format!("failed to write exchange payload slot count: {error}"))?;
+    if let Some(meta) = wire_meta.as_ref() {
+        for slot_id in &meta.slot_ids_by_index {
+            output
+                .write_all(&slot_id.as_u32().to_le_bytes())
+                .map_err(|error| format!("failed to write exchange payload slot id: {error}"))?;
+        }
+    }
+    encode_arrow_ipc_chunks_to(chunks, &mut output)?;
+    Ok(output.into_payload())
+}
+
 pub fn decode_root_result_chunks(
     bytes: &[u8],
     expected_chunk_schema: Option<&ChunkSchemaRef>,
 ) -> Result<Vec<Chunk>, String> {
+    let exact_payload_limit = novarocks_execution_contract::ResultByteLimit::new(
+        u64::try_from(bytes.len())
+            .map_err(|_| "typed root result payload length does not fit u64".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    preflight_typed_root_result_decode(bytes, exact_payload_limit)?;
     let DecodedExchangePayload {
         wire_meta,
         arrow_payload,
@@ -1482,8 +1729,7 @@ impl ExecutionExchangeRegistry {
     pub fn decode_chunks_for_sender(
         &self,
         key: ExchangeKey,
-        sender_id: i32,
-        be_number: i32,
+        sender: ExchangeSenderIdentity,
         bytes: &[u8],
     ) -> Result<Vec<Chunk>, String> {
         let DecodedExchangePayload {
@@ -1500,35 +1746,32 @@ impl ExecutionExchangeRegistry {
         {
             let mut st = receiver.mu.lock().expect("exchange receiver lock");
             if let Some(meta) = decoded_wire_meta {
-                match st.sender_wire_meta.get(&(sender_id, be_number)) {
+                match st.sender_wire_meta.get(&sender) {
                     Some(existing) if existing != &meta => {
                         return Err(format!(
-                            "exchange sender wire meta changed unexpectedly: finst={} node_id={} sender_id={} be_number={}",
+                            "exchange sender wire meta changed unexpectedly: finst={} node_id={} sender={}",
                             key.finst_uuid(),
                             key.node_id,
-                            sender_id,
-                            be_number
+                            sender
                         ));
                     }
                     Some(_) => {}
                     None => {
-                        st.sender_wire_meta
-                            .insert((sender_id, be_number), meta.clone());
+                        st.sender_wire_meta.insert(sender, meta.clone());
                     }
                 }
                 wire_meta = meta;
             } else {
                 wire_meta = st
                 .sender_wire_meta
-                .get(&(sender_id, be_number))
+                    .get(&sender)
                 .cloned()
                 .ok_or_else(|| {
                     format!(
-                        "exchange wire meta missing before first data chunk: finst={} node_id={} sender_id={} be_number={}",
+                        "exchange wire meta missing before first data chunk: finst={} node_id={} sender={}",
                         key.finst_uuid(),
                         key.node_id,
-                        sender_id,
-                        be_number
+                        sender
                     )
                 })?;
             }
@@ -1587,7 +1830,12 @@ pub fn push_chunks(
     chunks: Vec<Chunk>,
     eos: bool,
 ) {
-    test_registry().push_chunks(key, sender_id, backend_number, chunks, eos);
+    test_registry().push_chunks(
+        key,
+        ExchangeSenderIdentity::local(sender_id, backend_number),
+        chunks,
+        eos,
+    );
 }
 
 #[cfg(test)]
@@ -1610,7 +1858,11 @@ pub fn decode_chunks_for_sender(
     backend_number: i32,
     bytes: &[u8],
 ) -> Result<Vec<Chunk>, String> {
-    test_registry().decode_chunks_for_sender(key, sender_id, backend_number, bytes)
+    test_registry().decode_chunks_for_sender(
+        key,
+        ExchangeSenderIdentity::local(sender_id, backend_number),
+        bytes,
+    )
 }
 
 #[cfg(test)]
@@ -1626,13 +1878,20 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use super::result_ipc_preflight::{
+        ARROW_IPC_CONTINUATION_MARKER, MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES,
+        MAX_TYPED_ROOT_RESULT_SCHEMA_FIELDS,
+    };
     use super::{
-        ExchangeKey, ExchangePopResult, cancel_exchange_key, decode_chunks,
-        decode_chunks_for_sender, decode_root_result_chunks, encode_chunks, get_receiver_handle,
+        BoundedPayloadWriter, ExchangeKey, ExchangePopResult, ExchangeSenderIdentity,
+        ExchangeWireMeta, ExecutionExchangeRegistry, cancel_exchange_key, decode_chunks,
+        decode_chunks_for_sender, decode_root_result_chunks, encode_chunks, encode_chunks_bounded,
+        encode_exchange_payload_envelope, get_receiver_handle, preflight_typed_root_result_decode,
         push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
     };
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-    use novarocks_types::SlotId;
+    use novarocks_types::{SlotId, UniqueId};
+    use std::io::Write as _;
 
     const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
         SlotId::new(33),
@@ -1836,6 +2095,287 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn bounded_encode_uses_one_capped_backing_payload() {
+        let chunk = exchange_test_chunk("name");
+        let expected = encode_chunks(std::slice::from_ref(&chunk), true).expect("encode payload");
+        let packet_cap = expected.len() + 1024;
+        let encoded = encode_chunks_bounded(&[chunk], true, packet_cap).expect("bounded encode");
+        let (payload, retained_bytes) = encoded.into_parts();
+
+        assert_eq!(payload.as_ref(), expected.as_slice());
+        assert!(retained_bytes >= payload.len());
+        assert!(retained_bytes <= packet_cap);
+    }
+
+    #[test]
+    fn bounded_encode_fails_while_crossing_packet_cap() {
+        let error = encode_chunks_bounded(&[exchange_test_chunk("name")], true, 32)
+            .expect_err("Arrow payload must exceed the bounded packet cap");
+
+        assert!(error.contains("exceeds packet cap"), "{error}");
+    }
+
+    fn preflight_typed_test_payload(
+        payload: &[u8],
+    ) -> Result<super::TypedRootResultDecodeBounds, String> {
+        let limit = novarocks_execution_contract::ResultByteLimit::new(
+            u64::try_from(payload.len())
+                .map_err(|_| "test payload length does not fit u64".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        preflight_typed_root_result_decode(payload, limit)
+    }
+
+    #[test]
+    fn typed_root_result_preflight_bounds_encoder_round_trip_backing_bytes() {
+        let cases = vec![
+            exchange_test_chunk("name"),
+            exchange_test_zero_column_chunk(7),
+            decimal128_chunk_with_over_precision_value(123_456_789),
+            dictionary_status_chunk(
+                SlotId::new(91),
+                vec![Some(0), Some(1), None, Some(0)],
+                vec!["READY", "RUNNING"],
+            ),
+        ];
+
+        for chunk in cases {
+            let payload = encode_chunks(&[chunk], true).expect("encode typed root result");
+            let bounds = preflight_typed_test_payload(&payload)
+                .expect("current encoder output must pass preflight");
+            let decoded = decode_root_result_chunks(&payload, None).expect("decode root result");
+            let actual_backing = decoded.iter().fold(0usize, |total, chunk| {
+                total.saturating_add(chunk.logical_bytes())
+            });
+
+            assert!(
+                u64::try_from(actual_backing).unwrap() <= bounds.retained_backing_upper_bound(),
+                "decoded backing {actual_backing} exceeds {:?}",
+                bounds
+            );
+            assert!(bounds.decode_operation_upper_bound() >= bounds.retained_backing_upper_bound());
+        }
+    }
+
+    #[test]
+    fn typed_root_result_preflight_rejects_non_current_stream_shapes() {
+        let chunk = exchange_test_chunk("name");
+
+        let mut missing_slot_flag = encode_chunks(std::slice::from_ref(&chunk), true).unwrap();
+        missing_slot_flag[5] = 0;
+        let error = preflight_typed_test_payload(&missing_slot_flag)
+            .expect_err("slot metadata is mandatory");
+        assert!(error.contains("requires exactly slot-id flag"), "{error}");
+
+        let multiple_batches = encode_chunks(&[chunk.clone(), chunk.clone()], true).unwrap();
+        let error = preflight_typed_test_payload(&multiple_batches)
+            .expect_err("one fetch packet cannot contain multiple record batches");
+        assert!(error.contains("exactly one record batch"), "{error}");
+
+        let mut trailing = encode_chunks(&[chunk], true).unwrap();
+        trailing.push(0);
+        let error = preflight_typed_test_payload(&trailing)
+            .expect_err("terminal marker must end the stream");
+        assert!(
+            error.contains("terminal marker has trailing bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn typed_root_result_preflight_enforces_caller_payload_limit() {
+        let payload = encode_chunks(&[exchange_test_chunk("name")], true).unwrap();
+        let limit = novarocks_execution_contract::ResultByteLimit::new(
+            u64::try_from(payload.len() - 1).unwrap(),
+        )
+        .unwrap();
+
+        let error = preflight_typed_root_result_decode(&payload, limit)
+            .expect_err("caller payload limit must remain authoritative");
+        assert!(error.contains("exceeding hard limit"), "{error}");
+    }
+
+    #[test]
+    fn typed_root_result_preflight_rejects_compressed_stream() {
+        let chunk = exchange_test_chunk("name");
+        let schema = chunk.batch.schema();
+        let options = arrow::ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(Some(arrow::ipc::CompressionType::ZSTD))
+            .expect("compression support");
+        let mut arrow_payload = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
+            &mut arrow_payload,
+            schema.as_ref(),
+            options,
+        )
+        .expect("compressed stream writer");
+        writer.write(&chunk.batch).expect("compressed batch");
+        writer.finish().expect("finish compressed stream");
+        let wire_meta = ExchangeWireMeta::from_chunks(std::slice::from_ref(&chunk))
+            .expect("wire metadata")
+            .expect("typed wire metadata");
+        let payload = encode_exchange_payload_envelope(&arrow_payload, Some(&wire_meta));
+
+        let error = preflight_typed_test_payload(&payload)
+            .expect_err("compressed root result must fail closed");
+        assert!(error.contains("compression is not allowed"), "{error}");
+    }
+
+    #[test]
+    fn typed_root_result_preflight_rejects_exaggerated_and_negative_lengths() {
+        let payload = encode_chunks(&[exchange_test_chunk("name")], true).unwrap();
+        let arrow_offset = typed_test_arrow_payload_offset(&payload);
+
+        let mut exaggerated_metadata = payload.clone();
+        exaggerated_metadata[arrow_offset + 4..arrow_offset + 8].copy_from_slice(
+            &u32::try_from(MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES + 64)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        let error = preflight_typed_test_payload(&exaggerated_metadata)
+            .expect_err("exaggerated metadata must fail closed");
+        assert!(error.contains("per-message hard limit"), "{error}");
+
+        let mut negative_body = payload;
+        mutate_record_batch_body_length(&mut negative_body, -1);
+        let error = preflight_typed_test_payload(&negative_body)
+            .expect_err("negative body length must fail closed");
+        assert!(error.contains("body length is negative"), "{error}");
+        let error = decode_root_result_chunks(&negative_body, None)
+            .expect_err("the production decode entry must enforce preflight");
+        assert!(error.contains("body length is negative"), "{error}");
+
+        let mut oversized_body =
+            encode_chunks(&[exchange_test_chunk("name")], true).expect("fresh payload");
+        let oversized_body_length = i64::try_from(oversized_body.len() + 64).unwrap();
+        mutate_record_batch_body_length(&mut oversized_body, oversized_body_length);
+        let error = preflight_typed_test_payload(&oversized_body)
+            .expect_err("oversized body length must fail closed");
+        assert!(error.contains("exceeding hard limit"), "{error}");
+
+        let mut negative_buffer =
+            encode_chunks(&[exchange_test_chunk("name")], true).expect("fresh payload");
+        mutate_unique_record_batch_buffer_length(&mut negative_buffer, -1);
+        let error = preflight_typed_test_payload(&negative_buffer)
+            .expect_err("negative buffer length must fail closed");
+        assert!(
+            error.contains("buffer") && error.contains("negative"),
+            "{error}"
+        );
+
+        let mut excessive_structure =
+            encode_chunks(&[exchange_test_chunk("name")], true).expect("fresh payload");
+        excessive_structure[6..10].copy_from_slice(
+            &u32::try_from(MAX_TYPED_ROOT_RESULT_SCHEMA_FIELDS + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        let error = preflight_typed_test_payload(&excessive_structure)
+            .expect_err("excessive slot structure must fail closed");
+        assert!(
+            error.contains("slot count") && error.contains("hard limit"),
+            "{error}"
+        );
+    }
+
+    fn typed_test_arrow_payload_offset(payload: &[u8]) -> usize {
+        let slot_count = u32::from_le_bytes(payload[6..10].try_into().unwrap()) as usize;
+        10 + slot_count * std::mem::size_of::<u32>()
+    }
+
+    fn mutate_record_batch_body_length(payload: &mut [u8], replacement: i64) {
+        let mut offset = typed_test_arrow_payload_offset(payload);
+        loop {
+            assert_eq!(payload[offset..offset + 4], ARROW_IPC_CONTINUATION_MARKER);
+            let metadata_len =
+                u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            assert_ne!(metadata_len, 0, "record batch must precede terminal marker");
+            let metadata_start = offset + 8;
+            let metadata_end = metadata_start + metadata_len;
+            let message = arrow::ipc::root_as_message(&payload[metadata_start..metadata_end])
+                .expect("valid metadata before mutation");
+            let body_len = usize::try_from(message.bodyLength()).unwrap();
+            if message.header_type() == arrow::ipc::MessageHeader::RecordBatch {
+                let needle = message.bodyLength().to_le_bytes();
+                let matches = payload[metadata_start..metadata_end]
+                    .windows(needle.len())
+                    .enumerate()
+                    .filter_map(|(index, bytes)| (bytes == needle).then_some(index))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "body length must have one metadata encoding"
+                );
+                let start = metadata_start + matches[0];
+                payload[start..start + 8].copy_from_slice(&replacement.to_le_bytes());
+                return;
+            }
+            offset = metadata_end + body_len;
+        }
+    }
+
+    fn mutate_unique_record_batch_buffer_length(payload: &mut [u8], replacement: i64) {
+        let mut offset = typed_test_arrow_payload_offset(payload);
+        loop {
+            assert_eq!(payload[offset..offset + 4], ARROW_IPC_CONTINUATION_MARKER);
+            let metadata_len =
+                u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            assert_ne!(metadata_len, 0, "record batch must precede terminal marker");
+            let metadata_start = offset + 8;
+            let metadata_end = metadata_start + metadata_len;
+            let message = arrow::ipc::root_as_message(&payload[metadata_start..metadata_end])
+                .expect("valid metadata before mutation");
+            let body_len = usize::try_from(message.bodyLength()).unwrap();
+            if let Some(batch) = message.header_as_record_batch() {
+                for descriptor in batch.buffers().expect("record-batch buffers").iter() {
+                    let needle = descriptor.0;
+                    let matches = payload[metadata_start..metadata_end]
+                        .windows(needle.len())
+                        .enumerate()
+                        .filter_map(|(index, bytes)| (bytes == needle).then_some(index))
+                        .collect::<Vec<_>>();
+                    if matches.len() == 1 {
+                        let length_start = metadata_start + matches[0] + 8;
+                        payload[length_start..length_start + 8]
+                            .copy_from_slice(&replacement.to_le_bytes());
+                        return;
+                    }
+                }
+                panic!("record batch must contain one uniquely encoded buffer descriptor");
+            }
+            offset = metadata_end + body_len;
+        }
+    }
+
+    #[test]
+    fn bounded_writer_grows_from_spare_capacity_without_unbounded_extend() {
+        let mut writer = BoundedPayloadWriter::try_new(10, 8).expect("bounded writer");
+        writer.write_all(&[1; 4]).expect("initial write");
+        assert_eq!(writer.buffer.len(), 4);
+        assert_eq!(writer.buffer.capacity(), 8);
+
+        writer.write_all(&[2; 6]).expect("bounded growth");
+        assert_eq!(writer.buffer.len(), 10);
+        assert_eq!(writer.buffer.capacity(), 10);
+    }
+
+    #[test]
+    fn bounded_writer_rejects_over_cap_without_mutating_buffer() {
+        let mut writer = BoundedPayloadWriter::try_new(10, 8).expect("bounded writer");
+        writer.write_all(&[1; 4]).expect("initial write");
+        let before_len = writer.buffer.len();
+        let before_capacity = writer.buffer.capacity();
+
+        let error = writer
+            .write_all(&[2; 7])
+            .expect_err("write beyond cap must fail");
+        assert!(error.to_string().contains("exceeds packet cap"));
+        assert_eq!(writer.buffer.len(), before_len);
+        assert_eq!(writer.buffer.capacity(), before_capacity);
     }
 
     #[test]
@@ -2612,5 +3152,44 @@ mod tests {
         assert_eq!(snapshot.finished_senders, 2);
 
         cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn native_senders_keep_independent_wire_metadata_by_exact_identity() {
+        let key = ExchangeKey {
+            finst_id_hi: 501,
+            finst_id_lo: 502,
+            node_id: 31,
+        };
+        let registry = ExecutionExchangeRegistry::default();
+        let first = exchange_test_chunk("_cse_0");
+        let second_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            first.batch.schema().as_ref(),
+            &[
+                SlotId::new(133),
+                SlotId::new(134),
+                SlotId::new(131),
+                SlotId::new(132),
+            ],
+        )
+        .expect("second sender schema");
+        let second = Chunk::new_with_chunk_schema(first.batch.clone(), second_schema);
+        let first_payload = encode_chunks(&[first], true).expect("first sender payload");
+        let second_payload = encode_chunks(&[second], true).expect("second sender payload");
+        let first_sender = ExchangeSenderIdentity::native(UniqueId::new(1, 1), 0);
+        let second_sender = ExchangeSenderIdentity::native(UniqueId::new(2, 2), 1);
+
+        registry
+            .decode_chunks_for_sender(key, first_sender, &first_payload)
+            .expect("first sender establishes its own wire metadata");
+        registry
+            .decode_chunks_for_sender(key, second_sender, &second_payload)
+            .expect("second sender may carry different wire metadata");
+        assert!(
+            registry
+                .decode_chunks_for_sender(key, first_sender, &second_payload)
+                .expect_err("one exact sender cannot change its wire metadata")
+                .contains("sender wire meta changed unexpectedly")
+        );
     }
 }

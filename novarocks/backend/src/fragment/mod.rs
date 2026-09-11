@@ -22,3 +22,5 @@ mod result_io;
 
 pub(crate) use io::grpc_exchange_transmitter;
 pub(crate) use result_io::native_result_writer;
+#[cfg(test)]
+pub(crate) use result_io::test_native_result_writer;

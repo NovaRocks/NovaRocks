@@ -37,6 +37,10 @@ fn main() {
     // Connector maps are generated as BTreeMap so map fields retain a
     // deterministic key order for canonical codecs and structural validation.
     config.btree_map([".novarocks.connector_read", ".novarocks.connector_write"]);
+    // Root result packets are retained until an explicit frontend ACK. Bytes
+    // lets the backend replay the same allocation through Tonic instead of
+    // cloning an untracked Vec for every poll.
+    config.bytes([".novarocks.FetchResultResponse.result_arrow_ipc"]);
     config
         .compile_protos(&proto_paths, &[PathBuf::from(IDL_DIR)])
         .expect("compile NovaRocks native protobuf DTOs");

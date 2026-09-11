@@ -44,6 +44,8 @@ novarocks-secret.workspace = true
 novarocks-types.workspace = true
 novarocks-version.workspace = true
 prost.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tonic = { workspace = true, features = ["transport"] }

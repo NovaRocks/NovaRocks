@@ -42,7 +42,7 @@ fn server_load_resolves_environment_references_once_without_secret_diagnostics()
                     .map_err(anyhow::Error::msg)?;
                 let reference = StaticCredentialReference::try_new("warehouse", "blue")?;
                 let object_store = registry
-                    .resolve(CatalogCredentialPurpose::ObjectStoreData, &reference)
+                    .resolve(CatalogCredentialPurpose::ObjectStoreMetadata, &reference)
                     .and_then(|material| material.as_s3())
                     .expect("object-store credential");
                 assert_eq!(object_store.access_key_id().expose_secret(), CANARY);
@@ -62,7 +62,7 @@ fn server_load_resolves_environment_references_once_without_secret_diagnostics()
             "success",
             r#"
 [[connector.credentials]]
-purpose = "object-store-data"
+purpose = "object-store-metadata"
 name = "warehouse"
 generation = "blue"
 kind = "s3"
@@ -76,7 +76,7 @@ access_key_secret = "${ENV:NOVAROCKS_NWT1_ACCESS_SECRET}"
             "missing",
             r#"
 [[connector.credentials]]
-purpose = "object-store-data"
+purpose = "object-store-metadata"
 name = "warehouse"
 generation = "blue"
 kind = "s3"
@@ -90,7 +90,7 @@ access_key_secret = "secret"
             "empty",
             r#"
 [[connector.credentials]]
-purpose = "object-store-data"
+purpose = "object-store-metadata"
 name = "warehouse"
 generation = "blue"
 kind = "s3"
@@ -104,7 +104,7 @@ access_key_secret = "secret"
             "malformed",
             r#"
 [[connector.credentials]]
-purpose = "object-store-data"
+purpose = "object-store-metadata"
 name = "warehouse"
 generation = "blue"
 kind = "s3"

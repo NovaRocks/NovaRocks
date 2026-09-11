@@ -31,11 +31,11 @@
 //! Nothing else in the backend may name a wire type to get at a payload.
 
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_execution::task_execution::descriptor::PhysicalFragmentPlan;
-use novarocks_execution::task_execution::domain::CodecOwnedContent;
-use novarocks_execution::task_execution::identity::TaskIdentity;
-use novarocks_execution::task_execution::operation::CredentialUpdate;
-use novarocks_execution::task_execution::status::TaskFailureCategory;
+use novarocks_execution_contract::task_execution::descriptor::PhysicalFragmentPlan;
+use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
+use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::operation::CredentialUpdate;
+use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_models::novarocks as proto;
@@ -167,11 +167,11 @@ mod tests {
 
     use std::sync::Arc;
 
-    use novarocks_execution::task_execution::domain::{
+    use novarocks_execution_contract::task_execution::domain::{
         CodecOwnedContent, CredentialEpoch, CredentialLeaseId, DomainVersion,
     };
-    use novarocks_execution::task_execution::identity::TaskIdentity;
-    use novarocks_execution::task_execution::operation::CredentialUpdate;
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_execution_contract::task_execution::operation::CredentialUpdate;
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter, novarocks as proto};
     use novarocks_task_codec::domain::{WireContent, WireCredential};
@@ -291,8 +291,7 @@ mod tests {
         let update = CredentialUpdate::new(
             CredentialLeaseId::new(1),
             CredentialEpoch::FIRST,
-            Arc::clone(&material)
-                as Arc<dyn novarocks_execution::task_execution::ConfidentialContent>,
+            Arc::clone(&material) as Arc<dyn novarocks_execution_contract::ConfidentialContent>,
         );
 
         let recovered = credential_material(&update).expect("codec-produced material");
@@ -310,8 +309,8 @@ mod tests {
         use novarocks_execution::exec::fragment::program::{
             FragmentContractVersion, FragmentSinkKind,
         };
-        use novarocks_execution::task_execution::descriptor::PhysicalFragmentPlan;
-        use novarocks_execution::task_execution::domain::ContentFingerprint;
+        use novarocks_execution_contract::task_execution::descriptor::PhysicalFragmentPlan;
+        use novarocks_execution_contract::task_execution::domain::ContentFingerprint;
         use novarocks_proto_models::plan;
         use novarocks_task_codec::descriptor::WireFragmentPlan;
 

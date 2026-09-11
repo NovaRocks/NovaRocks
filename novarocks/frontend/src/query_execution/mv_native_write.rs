@@ -83,14 +83,8 @@ impl PreparedMvNativeWriteAssembly {
         self,
         native_bundle: NativeFragmentAttachment,
     ) -> Result<PreparedMvSessionWrite, String> {
-        if !self.encoding.matches_native_attachment(&native_bundle) {
-            return Err(
-                "native fragment bundle does not match the sealed MV encoding input".into(),
-            );
-        }
-        let (_, prepared) = self.encoding.into_parts();
         Ok(PreparedMvSessionWrite {
-            prepared,
+            encoding: self.encoding,
             native_bundle,
             query_options: self.query_options,
             session: self.session,
@@ -103,7 +97,7 @@ impl PreparedMvNativeWriteAssembly {
 /// The session rides along as the request's single commit authority, so no
 /// operation, cohort, or attempt identity reaches the writer data plane.
 pub struct PreparedMvSessionWrite {
-    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput,
     native_bundle: NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
@@ -116,7 +110,7 @@ impl PreparedMvSessionWrite {
     ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
         let request =
             crate::query_execution::contract::build_distributed_query_request_with_execution(
-                self.prepared,
+                self.encoding,
                 self.native_bundle,
                 self.query_options,
                 crate::query_execution::contract::DistributedQueryIntent::Write,

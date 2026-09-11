@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "artifacts": {
+    "run_manifest": "run-manifest.json",
+    "performance": "uea1-performance.json",
+    "resources": "process-resources.json",
+    "effective_launch_config": "effective-launch-config.json",
+    "fixture_realization": "fixture-realization.json",
+    "raw_artifact_inventory": "raw-artifact-inventory.json",
+    "completion": "run-completion.json"
+  },
+  "expected": {
+    "scenario": "performance/uea1-short-concurrent",
+    "window_count": 15,
+    "roles": ["fe", "be-0", "be-1", "be-2"]
+  },
+  "metric_resolutions": {
+    "first_row_p50_micros": 1,
+    "first_row_p95_micros": 1,
+    "first_row_p99_micros": 1,
+    "total_p50_micros": 1,
+    "total_p95_micros": 1,
+    "total_p99_micros": 1,
+    "throughput_queries_per_second": 0.008333333333333333,
+    "fe_peak_rss_bytes": 1024,
+    "max_be_peak_rss_bytes": 1024
+  },
+  "absolute_gates": {
+    "fe_peak_threads": {
+      "unit": "threads",
+      "direction": "at_most",
+      "limit": 1114
+    },
+    "max_be_peak_threads": {
+      "unit": "threads",
+      "direction": "at_most",
+      "limit": 103578
+    }
+  }
+}

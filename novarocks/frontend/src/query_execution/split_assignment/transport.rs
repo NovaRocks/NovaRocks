@@ -22,7 +22,6 @@
 //! a live backend, and keeps native transport ownership with the coordinator.
 
 use std::fmt;
-use std::time::Duration;
 
 use super::driver::AssignmentTarget;
 use super::driver::SplitAssignmentStop;
@@ -63,6 +62,14 @@ pub(crate) enum TaskUpdateOutcome {
         detail: String,
     },
 }
+
+/// One transport-owned immutable delivery.
+///
+/// The caller keeps its request and asks the same transport to observe this
+/// token. A retry of an unknown outcome must attach to this same delivery,
+/// never allocate a second sequence or enumerate another batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaskUpdateTicket(pub(crate) u64);
 
 /// Whether a TaskUpdate failure has an unknown remote outcome and may be
 /// retried with the exact same immutable request.
@@ -133,14 +140,21 @@ impl fmt::Display for TaskUpdateTransportError {
 impl std::error::Error for TaskUpdateTransportError {}
 
 pub(crate) trait TaskUpdateTransport: Send + Sync {
-    fn send(
+    /// Opens or reattaches to one exact immutable request without waiting for
+    /// its acknowledgement.
+    fn begin(
         &self,
         execution_id: QueryExecutionId,
         target: &AssignmentTarget,
         request: &TaskUpdateRequest,
-        timeout: Duration,
+    ) -> Result<TaskUpdateTicket, TaskUpdateTransportError>;
+
+    /// Observes a delivery. `None` means it is still owned by the substrate.
+    fn poll(
+        &self,
+        ticket: TaskUpdateTicket,
         stop: &SplitAssignmentStop,
-    ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError>;
+    ) -> Option<Result<TaskUpdateOutcome, TaskUpdateTransportError>>;
 }
 
 #[cfg(test)]
@@ -153,19 +167,25 @@ mod tests {
     }
 
     impl TaskUpdateTransport for RecordingTransport {
-        fn send(
+        fn begin(
             &self,
             _execution_id: QueryExecutionId,
             _target: &AssignmentTarget,
             request: &TaskUpdateRequest,
-            _timeout: Duration,
-            _stop: &SplitAssignmentStop,
-        ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+        ) -> Result<TaskUpdateTicket, TaskUpdateTransportError> {
             self.observed_request_addresses
                 .lock()
                 .expect("recording transport lock")
                 .push(std::ptr::from_ref(request).addr());
-            Ok(TaskUpdateOutcome::Accepted(Vec::new()))
+            Ok(TaskUpdateTicket(1))
+        }
+
+        fn poll(
+            &self,
+            _ticket: TaskUpdateTicket,
+            _stop: &SplitAssignmentStop,
+        ) -> Option<Result<TaskUpdateOutcome, TaskUpdateTransportError>> {
+            Some(Ok(TaskUpdateOutcome::Accepted(Vec::new())))
         }
     }
 
@@ -203,25 +223,11 @@ mod tests {
             fragment_instance_id: UniqueId::new(5, 6),
         };
         let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
-        let stop = SplitAssignmentStop::default();
-
         transport
-            .send(
-                execution_id,
-                &target,
-                &request,
-                Duration::from_millis(10),
-                &stop,
-            )
+            .begin(execution_id, &target, &request)
             .expect("first borrowed send");
         transport
-            .send(
-                execution_id,
-                &target,
-                &request,
-                Duration::from_millis(10),
-                &stop,
-            )
+            .begin(execution_id, &target, &request)
             .expect("second borrowed send");
 
         assert_eq!(

@@ -29,13 +29,13 @@
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks_execution::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
-use novarocks_execution::task_execution::identity::QueryContextRef;
-use novarocks_execution::task_execution::operation::{
+use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
+use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_execution_contract::task_execution::identity::QueryContextRef;
+use novarocks_execution_contract::task_execution::operation::{
     CredentialUpdate, QueryContextDomainUpdate, TaskDomainUpdate,
 };
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
@@ -213,8 +213,14 @@ pub trait QueryContextHost: Send + Sync {
 /// A submitted, runnable task.
 ///
 /// The handle is deliberately narrow: the owner publishes status and decides
-/// terminal outcomes, so a running task can only be asked to stand down.
+/// terminal outcomes. The registry opens its completion gate at creation
+/// commit and may otherwise only ask the running task to stand down.
 pub trait RunnableTask: fmt::Debug + Send + Sync {
+    /// Opens completion processing after the registry has installed the task
+    /// as a live creation. A fragment may physically stop before this call;
+    /// its exact completion slot retains the fact until commit.
+    fn commit_creation(&self);
+
     fn cancel(&self, reason: CancelReason);
 
     fn abort(&self, cause: AbortCause);
@@ -224,9 +230,18 @@ pub trait RunnableTask: fmt::Debug + Send + Sync {
 ///
 /// The three install steps are called in exactly the order the creation
 /// transaction commits them, and `submit_runnable` is last: it is the only one
-/// that can start a thread, so a failure in any earlier step is reported
+/// that starts executable work, so a failure in any earlier step is reported
 /// before a worker exists to clean up.
 pub trait TaskExecutionHost: Send + Sync {
+    /// Closes data-plane admission for every task of this exact query
+    /// execution. The registry calls this while it linearizes context
+    /// termination, before any per-task capability can be withdrawn.
+    fn close_context_admission(&self, context: QueryContextRef);
+
+    /// Reclaims the compact context fence after the registry has forgotten
+    /// the context itself. No task capability for the execution may remain.
+    fn forget_context_admission(&self, context: QueryContextRef);
+
     fn install_receiver(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection>;
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);

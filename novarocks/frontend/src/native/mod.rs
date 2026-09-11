@@ -10,6 +10,7 @@ pub(crate) mod fragment_transport;
 pub(crate) mod report_server;
 pub(crate) mod task_transport;
 pub(crate) mod transport;
+pub(crate) mod transport_supervisor;
 
 pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));

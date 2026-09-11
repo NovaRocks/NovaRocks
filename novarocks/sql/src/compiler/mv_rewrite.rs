@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_parser::ast::Query;
-use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 
 use crate::binding::SqlTableBindingId;
 use crate::catalog::PlannerTableProvider;
@@ -34,6 +34,150 @@ use crate::optimizer::cascades_rules::mv_rewrite::{
     MvRewriteCandidate, descriptor::SpjgDescriptor,
 };
 use crate::planner::logical::LogicalPlanNode;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvRewritePublicationRelation {
+    table_fqn: String,
+    revision: ConnectorExactSemanticRevision,
+}
+
+impl SqlMvRewritePublicationRelation {
+    pub fn new(
+        table_fqn: String,
+        revision: ConnectorExactSemanticRevision,
+    ) -> Result<Self, String> {
+        if table_fqn.is_empty() {
+            return Err("MV rewrite publication relation has no table identity".to_string());
+        }
+        Ok(Self {
+            table_fqn,
+            revision,
+        })
+    }
+
+    pub fn table_fqn(&self) -> &str {
+        &self.table_fqn
+    }
+
+    pub const fn revision(&self) -> &ConnectorExactSemanticRevision {
+        &self.revision
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvRewriteSelectionFacts {
+    publication_id: [u8; 16],
+    definition_fingerprint: [u8; 32],
+    publication_inputs: Vec<SqlMvRewritePublicationRelation>,
+    publication_target: SqlMvRewritePublicationRelation,
+}
+
+impl SqlMvRewriteSelectionFacts {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn try_new(
+        publication_id: [u8; 16],
+        definition_fingerprint: [u8; 32],
+        publication_inputs: Vec<String>,
+    ) -> Result<Self, String> {
+        Self::try_new_for_target(
+            publication_id,
+            definition_fingerprint,
+            publication_inputs,
+            "ice.ns.mv".to_string(),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn try_new_for_target(
+        publication_id: [u8; 16],
+        definition_fingerprint: [u8; 32],
+        publication_inputs: Vec<String>,
+        publication_target: String,
+    ) -> Result<Self, String> {
+        use bytes::Bytes;
+
+        let provider = novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+            .map_err(|error| format!("construct test MV provider: {error}"))?;
+        let publication_inputs = publication_inputs
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, table_fqn)| {
+                let object =
+                    ConnectorTableObjectId::try_new(Bytes::from(format!("test-input-{ordinal}")))
+                        .map_err(|error| error.to_string())?;
+                SqlMvRewritePublicationRelation::new(
+                    table_fqn,
+                    ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                        provider.clone(),
+                        &object,
+                        Some(101),
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let target_object = ConnectorTableObjectId::try_new(Bytes::from_static(b"test-target"))
+            .map_err(|error| error.to_string())?;
+        Self::try_new_with_publication(
+            publication_id,
+            definition_fingerprint,
+            publication_inputs,
+            SqlMvRewritePublicationRelation::new(
+                publication_target,
+                ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                    provider,
+                    &target_object,
+                    Some(201),
+                )
+                .map_err(|error| error.to_string())?,
+            )?,
+        )
+    }
+
+    pub fn try_new_with_publication(
+        publication_id: [u8; 16],
+        definition_fingerprint: [u8; 32],
+        publication_inputs: Vec<SqlMvRewritePublicationRelation>,
+        publication_target: SqlMvRewritePublicationRelation,
+    ) -> Result<Self, String> {
+        if publication_id == [0; 16] || definition_fingerprint == [0; 32] {
+            return Err("MV rewrite selection identity cannot be zero".to_string());
+        }
+        if publication_inputs.is_empty() {
+            return Err("MV rewrite selection must name every publication input".to_string());
+        }
+        let mut unique = publication_inputs
+            .iter()
+            .map(|input| input.table_fqn.as_str())
+            .collect::<Vec<_>>();
+        unique.sort_unstable();
+        if unique.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("MV rewrite selection repeats a publication input".to_string());
+        }
+        Ok(Self {
+            publication_id,
+            definition_fingerprint,
+            publication_inputs,
+            publication_target,
+        })
+    }
+
+    pub(crate) const fn publication_id(&self) -> [u8; 16] {
+        self.publication_id
+    }
+
+    pub(crate) const fn definition_fingerprint(&self) -> [u8; 32] {
+        self.definition_fingerprint
+    }
+
+    pub(crate) fn publication_inputs(&self) -> &[SqlMvRewritePublicationRelation] {
+        &self.publication_inputs
+    }
+
+    pub(crate) const fn publication_target(&self) -> &SqlMvRewritePublicationRelation {
+        &self.publication_target
+    }
+}
 use crate::planner::table::ScanSource;
 
 use super::{SqlFunctionCatalog, SqlStatisticsPlan, SqlStatisticsSnapshot};
@@ -2083,6 +2227,8 @@ pub struct SqlMvRewriteDefinitionFacts {
     last_refresh_snapshots: BTreeMap<String, i64>,
     last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     base_table_states: BTreeMap<String, SqlMvRewriteBaseTableFacts>,
+    selection: Option<SqlMvRewriteSelectionFacts>,
+    selection_unavailable: Option<String>,
 }
 
 impl SqlMvRewriteDefinitionFacts {
@@ -2116,7 +2262,28 @@ impl SqlMvRewriteDefinitionFacts {
             last_refresh_snapshots,
             last_refresh_table_object_ids,
             base_table_states,
+            selection: None,
+            selection_unavailable: None,
         })
+    }
+
+    pub fn with_selection_facts(mut self, selection: SqlMvRewriteSelectionFacts) -> Self {
+        self.selection = Some(selection);
+        self.selection_unavailable = None;
+        self
+    }
+
+    pub fn with_selection_unavailable(
+        mut self,
+        message: impl Into<String>,
+    ) -> Result<Self, String> {
+        let message = message.into();
+        if message.trim().is_empty() {
+            return Err("MV rewrite selection diagnostic cannot be empty".to_string());
+        }
+        self.selection = None;
+        self.selection_unavailable = Some(message);
+        Ok(self)
     }
 
     fn into_definition(self) -> MvRewriteDefinition {
@@ -2135,6 +2302,8 @@ impl SqlMvRewriteDefinitionFacts {
                 .into_iter()
                 .map(|(fqn, state)| (fqn, state.into_state()))
                 .collect(),
+            selection: self.selection,
+            selection_unavailable: self.selection_unavailable,
         }
     }
 }
@@ -2169,6 +2338,8 @@ pub(crate) struct MvRewriteDefinition {
         reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
     )]
     pub(crate) base_table_states: BTreeMap<String, MvRewriteBaseTableState>,
+    pub(crate) selection: Option<SqlMvRewriteSelectionFacts>,
+    pub(crate) selection_unavailable: Option<String>,
 }
 
 /// Repository-order-preserving MV definition snapshot for one compiler request.
@@ -2199,6 +2370,7 @@ struct AnalyzedMvRewriteCandidate {
     target_database: String,
     target_table: crate::planner::table::TableDef,
     factory_after_analysis: ColumnRefFactory,
+    selection: Option<SqlMvRewriteSelectionFacts>,
 }
 
 #[expect(
@@ -2278,6 +2450,21 @@ pub(crate) fn analyze_candidates(
             entries.push(SqlMvRewriteAnalysisEntry::Ignored);
             continue;
         }
+        let Some(_) = definition.selection.as_ref() else {
+            entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(
+                SqlMvRewriteDiagnostic {
+                    mv_id: Some(definition.mv_id),
+                    message: format!(
+                        "mv rewrite: skipping frozen candidate without publication proof: {}",
+                        definition
+                            .selection_unavailable
+                            .as_deref()
+                            .unwrap_or("selection facts were not supplied")
+                    ),
+                },
+            ));
+            continue;
+        };
         match build_candidate(
             analyzer_catalog,
             current_database,
@@ -2329,6 +2516,7 @@ pub(crate) fn attach_candidate_statistics(
                     target_database: candidate.target_database,
                     target_table: candidate.target_table,
                     target_stats_ref,
+                    selection: candidate.selection,
                 });
             }
             SqlMvRewriteAnalysisEntry::Diagnostic(diagnostic) => diagnostics.push(diagnostic),
@@ -2409,6 +2597,7 @@ fn build_candidate(
         target_database: namespace.to_string(),
         target_table,
         factory_after_analysis: returned,
+        selection: definition.selection.clone(),
     }))
 }
 
@@ -2565,7 +2754,15 @@ mod tests {
                     SqlMvRewriteBaseTableFacts::resolved(Some(42), None),
                 )]),
             )
-            .expect("candidate definition"),
+            .expect("candidate definition")
+            .with_selection_facts(
+                SqlMvRewriteSelectionFacts::try_new(
+                    [7; 16],
+                    [9; 32],
+                    vec!["iceberg.db.base".to_string()],
+                )
+                .expect("candidate publication proof"),
+            ),
         ])
         .expect("candidate index")
     }
@@ -2759,6 +2956,48 @@ mod tests {
             catalog.resolutions.load(Ordering::Acquire),
             resolutions_before_attachment,
             "statistics attachment must not reenter the catalog"
+        );
+    }
+
+    #[test]
+    fn missing_publication_proof_is_diagnostic_and_never_materializes_a_candidate() {
+        let catalog = CandidateCatalog::new();
+        let (logical, factory) = main_candidate_query(&catalog);
+        let mut index = candidate_index();
+        index.definitions[0].selection = None;
+        index.definitions[0].selection_unavailable =
+            Some("MV rewrite target has no published version".to_string());
+
+        let analysis = analyze_candidates(
+            &index,
+            &catalog,
+            "db",
+            &logical,
+            &factory,
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::optimizer::options::SessionOptimizerSettings::default(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("optional MV proof failure must preserve the base query");
+        let (prepared, _) = attach_candidate_statistics(
+            analysis,
+            &crate::planning::dml::DmlStatisticsSnapshot::empty(),
+            &mut SqlStatisticsPlan::empty(),
+            factory,
+        )
+        .expect("optional MV proof failure needs no target statistics");
+
+        assert!(prepared.candidates.is_empty());
+        assert_eq!(prepared.diagnostics.len(), 1);
+        assert!(
+            prepared.diagnostics[0]
+                .message
+                .contains("no published version")
+        );
+        assert_eq!(
+            catalog.resolutions.load(Ordering::Acquire),
+            1,
+            "only the base query may enter catalog analysis"
         );
     }
 

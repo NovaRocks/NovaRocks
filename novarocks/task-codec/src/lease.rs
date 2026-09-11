@@ -19,7 +19,9 @@
 
 use std::time::Duration;
 
-use novarocks_execution::task_execution::lease::{LeaseReceipt, LeaseSequence, LeaseValidFor};
+use novarocks_execution_contract::task_execution::lease::{
+    LeaseReceipt, LeaseSequence, LeaseValidFor,
+};
 use novarocks_proto_models::novarocks;
 
 use novarocks_proto_codec::{FieldPath, ProtocolError};

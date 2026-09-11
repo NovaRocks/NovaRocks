@@ -5,11 +5,21 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use novarocks_native_trust::NativeTrust;
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Channel;
 
 use super::transport::FrontendNativeTransport;
+use super::transport_supervisor::NativeTransportSupervisor;
+use crate::task_execution::blocking_io::{
+    ConnectorBlockingIoBudget, ConnectorBlockingIoSupervisor,
+};
+
+/// Process-wide root-result I/O concurrency. Long polls are parked async, but
+/// their channels and response buffers still consume finite process capacity.
+const MAX_CONCURRENT_RESULT_FETCHES: usize = 16;
 
 /// The Frontend role's explicitly composed Tokio runtime capability.
 ///
@@ -22,6 +32,9 @@ pub(crate) struct FrontendDataRuntime {
     native_trust: Arc<NativeTrust>,
     native_transport: FrontendNativeTransport,
     channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
+    task_transport_supervisor: NativeTransportSupervisor,
+    result_fetch_permits: Arc<Semaphore>,
+    connector_blocking_io: ConnectorBlockingIoSupervisor,
 }
 
 impl FrontendDataRuntime {
@@ -29,13 +42,22 @@ impl FrontendDataRuntime {
         handle: Handle,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
-    ) -> Self {
-        Self {
+        task_transport_budget: TransportBudget,
+        connector_blocking_io_budget: ConnectorBlockingIoBudget,
+    ) -> Result<Self, String> {
+        let connector_blocking_io =
+            ConnectorBlockingIoSupervisor::new(handle.clone(), connector_blocking_io_budget);
+        Ok(Self {
             handle,
             native_trust,
             native_transport,
             channels: Arc::new(Mutex::new(HashMap::new())),
-        }
+            task_transport_supervisor: NativeTransportSupervisor::from_transport(
+                task_transport_budget,
+            )?,
+            result_fetch_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RESULT_FETCHES)),
+            connector_blocking_io,
+        })
     }
 
     #[cfg(test)]
@@ -56,7 +78,10 @@ impl FrontendDataRuntime {
             handle,
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
+            TransportBudget::DEFAULT,
+            ConnectorBlockingIoBudget::default(),
         )
+        .expect("the default task transport budget is valid")
     }
 
     pub(crate) fn native_trust(&self) -> &Arc<NativeTrust> {
@@ -65,6 +90,21 @@ impl FrontendDataRuntime {
 
     pub(crate) fn native_transport(&self) -> &FrontendNativeTransport {
         &self.native_transport
+    }
+
+    pub(crate) fn task_transport_supervisor(&self) -> &NativeTransportSupervisor {
+        &self.task_transport_supervisor
+    }
+
+    pub(crate) async fn acquire_result_fetch(&self) -> Result<OwnedSemaphorePermit, String> {
+        Arc::clone(&self.result_fetch_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| "frontend result-fetch supervisor is closed".to_owned())
+    }
+
+    pub(crate) fn connector_blocking_io(&self) -> &ConnectorBlockingIoSupervisor {
+        &self.connector_blocking_io
     }
 
     pub(crate) fn block_on<F>(&self, future: F) -> Result<F::Output, String>
@@ -117,10 +157,12 @@ mod tests {
         DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
     };
     use novarocks_secret::SecretValue;
+    use novarocks_task_codec::TransportBudget;
     use novarocks_types::NativeEndpoint;
 
     use super::FrontendDataRuntime;
     use crate::native::transport::FrontendNativeTransport;
+    use crate::task_execution::ConnectorBlockingIoBudget;
 
     fn data_runtime(handle: tokio::runtime::Handle) -> FrontendDataRuntime {
         let trust = NativeTrust::new(
@@ -134,7 +176,10 @@ mod tests {
             handle,
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
+            TransportBudget::DEFAULT,
+            ConnectorBlockingIoBudget::default(),
         )
+        .expect("the default task transport budget is valid")
     }
 
     #[test]
@@ -154,6 +199,29 @@ mod tests {
             data_runtime.block_on(async { 11_u8 }).expect("block_on"),
             11
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cloned_role_runtime_shares_one_result_fetch_limit() {
+        let runtime = data_runtime(tokio::runtime::Handle::current());
+        let mut permits = Vec::new();
+        for _ in 0..super::MAX_CONCURRENT_RESULT_FETCHES {
+            permits.push(runtime.acquire_result_fetch().await.expect("fetch permit"));
+        }
+
+        let waiting_runtime = runtime.clone();
+        let mut waiting = Box::pin(waiting_runtime.acquire_result_fetch());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err(),
+            "a clone must not create a separate result-fetch pool"
+        );
+        permits.pop();
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("released process capacity wakes the waiter")
+            .expect("fetch permit after release");
     }
 
     #[test]

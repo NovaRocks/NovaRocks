@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 
-use novarocks_spi::connector::read_stack::SchemaTableName;
+use novarocks_spi::connector::read_stack::{ConnectorTableHandle, SchemaTableName};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorResourceReservation};
 use paimon::Table;
 use paimon::spec::{DataField, DataType, TableSchema};
@@ -33,18 +33,69 @@ use crate::schema::PaimonDataType;
 
 pub const MAX_PAIMON_FROZEN_METADATA_BYTES: u64 = 32 * 1024 * 1024;
 
-/// One FE planning transaction's immutable table, output schema, and exact
-/// snapshot. The SDK table carries the exact numeric `scan.snapshot-id` while
-/// preserving the frozen catalog-visible output schema; consumers must not
-/// replace it with a current catalog table.
-pub struct PaimonFrozenRead {
-    sdk_table: Arc<Table>,
+/// Resource-free semantic recipe retained by a logical scan. It contains no
+/// SDK table, FileIO, cancellation authority, or resource reservation, so a
+/// later attempt must rebuild access inside its own request scope.
+#[derive(Clone, Debug)]
+pub(crate) struct PaimonFrozenReadRecipe {
     table: PaimonTable,
     view: PaimonReadView,
     columns: Arc<[PaimonColumn]>,
     output_schema: Arc<TableSchema>,
     snapshot_schema: Arc<TableSchema>,
     options: PaimonReadOptions,
+}
+
+impl PaimonFrozenReadRecipe {
+    pub(crate) fn table(&self) -> &PaimonTable {
+        &self.table
+    }
+
+    pub(crate) fn view(&self) -> &PaimonReadView {
+        &self.view
+    }
+
+    pub(crate) fn columns(&self) -> &[PaimonColumn] {
+        &self.columns
+    }
+
+    pub(crate) fn output_schema(&self) -> &Arc<TableSchema> {
+        &self.output_schema
+    }
+
+    pub(crate) fn snapshot_schema(&self) -> &Arc<TableSchema> {
+        &self.snapshot_schema
+    }
+
+    pub(crate) fn options(&self) -> &PaimonReadOptions {
+        &self.options
+    }
+
+    pub(crate) fn ensure_same_scan(&self, other: &Self) -> Result<(), ConnectorError> {
+        let same = self.table.schema_table_name() == other.table.schema_table_name()
+            && self.table.location() == other.table.location()
+            && self.view.snapshot_id() == other.view.snapshot_id()
+            && self.view.schema_id() == other.view.schema_id()
+            && self.view.schema_fingerprint() == other.view.schema_fingerprint()
+            && self.view.read_recipe_digest() == other.view.read_recipe_digest();
+        if same {
+            Ok(())
+        } else {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Paimon attempt access received another frozen scan recipe",
+            ))
+        }
+    }
+}
+
+/// One FE planning transaction's immutable table, output schema, and exact
+/// snapshot. The SDK table carries the exact numeric `scan.snapshot-id` while
+/// preserving the frozen catalog-visible output schema; consumers must not
+/// replace it with a current catalog table.
+pub struct PaimonFrozenRead {
+    sdk_table: Arc<Table>,
+    recipe: PaimonFrozenReadRecipe,
     _reservation: Mutex<ConnectorResourceReservation>,
 }
 
@@ -54,29 +105,33 @@ impl PaimonFrozenRead {
     }
 
     pub fn table(&self) -> &PaimonTable {
-        &self.table
+        self.recipe.table()
     }
 
     pub fn view(&self) -> &PaimonReadView {
-        &self.view
+        self.recipe.view()
     }
 
     /// Complete frozen catalog-visible schema. Query projection is supplied
     /// separately by the read adapter and may be empty for COUNT(*).
     pub fn columns(&self) -> &[PaimonColumn] {
-        &self.columns
+        self.recipe.columns()
     }
 
     pub fn output_schema(&self) -> &Arc<TableSchema> {
-        &self.output_schema
+        self.recipe.output_schema()
     }
 
     pub fn snapshot_schema(&self) -> &Arc<TableSchema> {
-        &self.snapshot_schema
+        self.recipe.snapshot_schema()
     }
 
     pub fn options(&self) -> &PaimonReadOptions {
-        &self.options
+        self.recipe.options()
+    }
+
+    pub(crate) fn recipe(&self) -> &PaimonFrozenReadRecipe {
+        &self.recipe
     }
 }
 
@@ -84,9 +139,9 @@ impl std::fmt::Debug for PaimonFrozenRead {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PaimonFrozenRead")
-            .field("table", &self.table)
-            .field("view", &self.view)
-            .field("columns", &self.columns)
+            .field("table", self.table())
+            .field("view", self.view())
+            .field("columns", &self.columns())
             .finish_non_exhaustive()
     }
 }
@@ -181,12 +236,58 @@ pub async fn freeze_table(
     resources.checkpoint()?;
     Ok(PaimonFrozenRead {
         sdk_table: Arc::new(sdk_table),
-        table: table_handle,
-        view,
-        columns: Arc::from(columns),
-        output_schema,
-        snapshot_schema,
-        options,
+        recipe: PaimonFrozenReadRecipe {
+            table: table_handle,
+            view,
+            columns: Arc::from(columns),
+            output_schema,
+            snapshot_schema,
+            options,
+        },
+        _reservation: Mutex::new(reservation),
+    })
+}
+
+/// Rebuild exact snapshot access with a new request's FileIO and resource
+/// authority. This never observes `latest` and never changes the frozen
+/// catalog-visible schema or scan selector.
+pub(crate) fn rebind_table(
+    file_io: paimon::io::FileIO,
+    recipe: &PaimonFrozenReadRecipe,
+    resources: PaimonRequestResources,
+) -> Result<PaimonFrozenRead, ConnectorError> {
+    resources.checkpoint()?;
+    let name = recipe.table().schema_table_name();
+    let identifier = paimon::catalog::Identifier::new(name.schema_name(), name.table_name());
+    let table = Table::new(
+        file_io,
+        identifier,
+        recipe.table().location().to_owned(),
+        recipe.output_schema().as_ref().clone(),
+        None,
+    );
+    let sdk_table = match recipe.view().snapshot_id() {
+        Some(snapshot_id) => table.copy_with_options(HashMap::from([(
+            "scan.snapshot-id".to_string(),
+            snapshot_id.to_string(),
+        )])),
+        None => table,
+    };
+    let retained = estimate_schema_bytes(recipe.output_schema())
+        .checked_add(estimate_schema_bytes(recipe.snapshot_schema()))
+        .and_then(|bytes| bytes.checked_add(recipe.table().location().len() as u64))
+        .and_then(|bytes| {
+            bytes.checked_add((recipe.columns().len() * size_of::<PaimonColumn>()) as u64)
+        })
+        .ok_or_else(|| exhausted("Paimon rebound metadata size overflow"))?;
+    if retained > MAX_PAIMON_FROZEN_METADATA_BYTES {
+        return Err(exhausted("Paimon rebound metadata exceeds the hard limit"));
+    }
+    let reservation = resources.reserve_metadata(retained.max(1))?;
+    resources.checkpoint()?;
+    Ok(PaimonFrozenRead {
+        sdk_table: Arc::new(sdk_table),
+        recipe: recipe.clone(),
         _reservation: Mutex::new(reservation),
     })
 }
@@ -395,8 +496,99 @@ fn exhausted(message: &'static str) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorRequestResources, ConnectorResourceCheckpoint,
+        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    };
+    use paimon::io::FileIOBuilder;
+
     use super::*;
     use paimon::spec::{IntType, Schema, VarCharType};
+
+    struct TestLedger {
+        retained: Arc<AtomicU64>,
+        cancelled: AtomicBool,
+    }
+
+    impl TestLedger {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                retained: Arc::new(AtomicU64::new(0)),
+                cancelled: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl ConnectorCancellation for TestLedger {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
+    impl ConnectorResourceLedger for TestLedger {
+        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+            if self.is_cancelled() {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::Cancelled,
+                    "test request cancelled",
+                ))
+            } else {
+                Ok(ConnectorResourceCheckpoint::new(1))
+            }
+        }
+
+        fn try_reserve(
+            &self,
+            _class: ConnectorResourceClass,
+            bytes: u64,
+        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+            self.retained.fetch_add(bytes, Ordering::AcqRel);
+            Ok(Box::new(TestLease {
+                retained: Arc::clone(&self.retained),
+                bytes,
+            }))
+        }
+    }
+
+    struct TestLease {
+        retained: Arc<AtomicU64>,
+        bytes: u64,
+    }
+
+    impl ConnectorResourceLease for TestLease {
+        fn bytes(&self) -> u64 {
+            self.bytes
+        }
+
+        fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+            self.retained.fetch_add(additional, Ordering::AcqRel);
+            self.bytes += additional;
+            Ok(())
+        }
+
+        fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+            self.retained
+                .fetch_sub(self.bytes.saturating_sub(bytes), Ordering::AcqRel);
+            self.bytes = bytes;
+            Ok(())
+        }
+    }
+
+    impl Drop for TestLease {
+        fn drop(&mut self) {
+            self.retained.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+
+    fn test_resources(ledger: &Arc<TestLedger>) -> PaimonRequestResources {
+        PaimonRequestResources::new(
+            ConnectorRequestResources::new(ledger.clone()),
+            ledger.clone(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+    }
 
     fn table_schema(id: i64, add_nullable: bool) -> TableSchema {
         let mut builder = Schema::builder()
@@ -429,6 +621,98 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::Unsupported
         );
+    }
+
+    #[test]
+    fn rebound_recipe_uses_new_request_resources_and_keeps_exact_snapshot() {
+        let schema = Arc::new(table_schema(7, false));
+        let columns = columns_from_schema(&schema).expect("columns");
+        let properties = schema
+            .options()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let primary_keys = resolve_key_ids(&schema, schema.primary_keys()).expect("primary keys");
+        let partitions = resolve_key_ids(&schema, schema.partition_keys()).expect("partition keys");
+        let options = PaimonReadOptions::analyze(&properties, &columns, &primary_keys, &partitions)
+            .expect("read options");
+        let table = PaimonTable::try_new(
+            SchemaTableName::try_new("db", "events").expect("name"),
+            "memory:/attempt-rebind/db.db/events",
+            options.merge_engine,
+            options.bucket_mode,
+            primary_keys,
+            partitions,
+        )
+        .expect("table");
+        let snapshot_id = 41;
+        let view = PaimonReadView::try_new(
+            table.location(),
+            Some(snapshot_id),
+            schema.id(),
+            schema_digest(&schema).expect("schema digest"),
+            recipe_digest(&table, Some(snapshot_id), &options, &columns),
+            options.sequence_field_id,
+        )
+        .expect("view");
+        let recipe = PaimonFrozenReadRecipe {
+            table,
+            view,
+            columns: Arc::from(columns),
+            output_schema: Arc::clone(&schema),
+            snapshot_schema: schema,
+            options,
+        };
+
+        let mut other = recipe.clone();
+        other.view = PaimonReadView::try_new(
+            other.table.location(),
+            Some(snapshot_id + 1),
+            other.view.schema_id(),
+            *other.view.schema_fingerprint(),
+            *other.view.read_recipe_digest(),
+            other.view.sequence_field_id(),
+        )
+        .expect("other view");
+        assert_eq!(
+            recipe.ensure_same_scan(&other).unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+
+        let old = TestLedger::new();
+        let old_bound = rebind_table(
+            FileIOBuilder::new("memory").build().expect("old FileIO"),
+            &recipe,
+            test_resources(&old),
+        )
+        .expect("old attempt binding");
+        let retained_recipe = old_bound.recipe().clone();
+        assert!(old.retained.load(Ordering::Acquire) > 0);
+        drop(old_bound);
+        assert_eq!(old.retained.load(Ordering::Acquire), 0);
+        old.cancelled.store(true, Ordering::Release);
+
+        let new = TestLedger::new();
+        let new_bound = rebind_table(
+            FileIOBuilder::new("memory").build().expect("new FileIO"),
+            &retained_recipe,
+            test_resources(&new),
+        )
+        .expect("new attempt binding");
+
+        assert_eq!(new_bound.view().snapshot_id(), Some(snapshot_id));
+        assert_eq!(
+            new_bound
+                .sdk_table()
+                .schema()
+                .options()
+                .get("scan.snapshot-id")
+                .map(String::as_str),
+            Some("41")
+        );
+        assert!(new.retained.load(Ordering::Acquire) > 0);
+        drop(new_bound);
+        assert_eq!(new.retained.load(Ordering::Acquire), 0);
     }
 
     #[test]

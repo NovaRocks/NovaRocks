@@ -140,19 +140,14 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
         frame: super::ExchangeReceiverFrame,
     ) -> Result<(), String> {
         let key = Self::key(key);
-        let chunks = self.registry.decode_chunks_for_sender(
-            key,
-            frame.sender_id,
-            frame.backend_number,
-            &frame.payload,
-        )?;
-        self.registry.push_chunks(
-            key,
-            frame.sender_id,
-            frame.backend_number,
-            chunks,
-            frame.eos,
+        let sender = crate::runtime::exchange::ExchangeSenderIdentity::native(
+            frame.source_fragment_instance_id,
+            frame.sender_ordinal,
         );
+        let chunks = self
+            .registry
+            .decode_chunks_for_sender(key, sender, &frame.payload)?;
+        self.registry.push_chunks(key, sender, chunks, frame.eos);
         Ok(())
     }
 
@@ -190,13 +185,53 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
         chunks: Vec<crate::exec::chunk::Chunk>,
         eos: bool,
     ) {
-        self.registry
-            .push_chunks(Self::key(key), sender_id, backend_number, chunks, eos);
+        self.registry.push_chunks(
+            Self::key(key),
+            crate::runtime::exchange::ExchangeSenderIdentity::local(sender_id, backend_number),
+            chunks,
+            eos,
+        );
     }
     fn snapshot(
         &self,
         key: super::ExchangeReceiverKey,
     ) -> Option<crate::runtime::exchange::ExchangeReceiverSnapshot> {
         self.registry.snapshot_receiver_state(Self::key(key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_process_test_exchange_receiver_port;
+    use crate::runtime::fragment::io::{ExchangeReceiverFrame, ExchangeReceiverKey};
+    use novarocks_types::UniqueId;
+
+    #[test]
+    fn native_eos_uses_exact_source_identity_when_legacy_sender_fields_collide() {
+        let port = in_process_test_exchange_receiver_port();
+        let key = ExchangeReceiverKey {
+            fragment_instance_id: UniqueId::new(50, 60),
+            node_id: 70,
+        };
+        let frame = |source_fragment_instance_id, sender_ordinal| ExchangeReceiverFrame {
+            source_fragment_instance_id,
+            sender_ordinal,
+            sender_count: 2,
+            // These legacy fields intentionally collide. Native completion
+            // identity must not use either of them.
+            sender_id: 7,
+            backend_number: 11,
+            sequence: 0,
+            eos: true,
+            payload: Vec::new(),
+        };
+
+        port.push(key, frame(UniqueId::new(1, 1), 0))
+            .expect("first native eos");
+        port.push(key, frame(UniqueId::new(2, 2), 1))
+            .expect("second native eos");
+
+        let snapshot = port.snapshot(key).expect("receiver snapshot");
+        assert_eq!(snapshot.finished_senders, 2);
     }
 }

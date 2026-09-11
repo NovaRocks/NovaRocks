@@ -48,8 +48,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use novarocks_execution::task_execution::domain::CredentialEpoch;
 use novarocks_execution::task_execution::identity::{QueryContextRef, TaskOperationId};
-use novarocks_execution::task_execution::lease::MonotonicInstant;
 use novarocks_execution::task_execution::operation::{OperationOutcome, QueryContextDomainReceipt};
+use novarocks_query_application::coordination::MonotonicInstant;
 use novarocks_spi::connector::CredentialLeaseId as StorageLeaseId;
 use novarocks_types::QueryExecutionId;
 
@@ -57,6 +57,7 @@ use crate::query_execution::lifecycle_plan::{
     AttemptCredentialStorage, QueryCredentialLeaseRefresh,
 };
 
+use super::blocking_io::{ConnectorBlockingIoJob, ConnectorBlockingIoSupervisor};
 use super::clock::TaskProtocolClock;
 use super::credential::{CredentialRefreshOwner, RefreshRefusal, refresh_timing};
 use super::error::TaskExecutionError;
@@ -75,7 +76,7 @@ const PROVIDER_RETRY_MAX: Duration = Duration::from_secs(5);
 /// What one provider call produced.
 ///
 /// The refresh is boxed: it is much larger than a failure detail, and this
-/// value only ever travels once, from the provider thread into the slot the
+/// value only ever travels once, from the process supervisor into the slot the
 /// turn reads.
 enum VendOutcome {
     Refreshed(Box<QueryCredentialLeaseRefresh>),
@@ -93,7 +94,10 @@ enum VendOutcome {
 struct VendingRound {
     /// When the epoch being replaced stops being usable.
     hard_deadline: MonotonicInstant,
-    outcome: Arc<Mutex<Option<VendOutcome>>>,
+    outcome: ConnectorBlockingIoJob<VendOutcome>,
+    /// A completed outcome staged by deterministic unit tests.
+    #[cfg(test)]
+    staged_outcome: Option<Result<VendOutcome, super::blocking_io::ConnectorBlockingIoError>>,
 }
 
 struct RotationState {
@@ -128,6 +132,7 @@ pub(crate) struct CredentialRotationPump {
     execution_id: QueryExecutionId,
     storage: Arc<AttemptCredentialStorage>,
     clock: Arc<dyn TaskProtocolClock>,
+    blocking_io: ConnectorBlockingIoSupervisor,
     state: Mutex<RotationState>,
 }
 
@@ -146,6 +151,7 @@ impl CredentialRotationPump {
         owner: CredentialRefreshOwner,
         storage: Arc<AttemptCredentialStorage>,
         clock: Arc<dyn TaskProtocolClock>,
+        blocking_io: ConnectorBlockingIoSupervisor,
     ) -> Option<Arc<Self>> {
         if storage.refreshable().is_empty() {
             return None;
@@ -154,6 +160,7 @@ impl CredentialRotationPump {
             execution_id,
             storage,
             clock,
+            blocking_io,
             state: Mutex::new(RotationState {
                 owner,
                 vending: None,
@@ -178,6 +185,42 @@ impl CredentialRotationPump {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .rotations_applied
+    }
+
+    #[cfg(test)]
+    pub(crate) fn minted_epoch(&self) -> CredentialEpoch {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .owner
+            .minted_epoch()
+    }
+
+    /// Moves a completed provider outcome into the serial owner's state.
+    ///
+    /// This exposes no production state transition. It lets a manual-clock
+    /// test prove that the provider has already returned before advancing the
+    /// clock past the hard deadline, without racing the blocking worker.
+    #[cfg(test)]
+    pub(crate) fn stage_provider_outcome_for_test(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(round) = state.vending.as_mut() else {
+            return false;
+        };
+        if round.staged_outcome.is_none() {
+            round.staged_outcome = round.outcome.try_take();
+        }
+        round.staged_outcome.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_hard_deadline_for_test(&self) -> Option<MonotonicInstant> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .vending
+            .as_ref()
+            .map(|round| round.hard_deadline)
     }
 
     /// Stops rotating and drops the material.
@@ -234,15 +277,17 @@ impl CredentialRotationPump {
         state: &mut RotationState,
         now: MonotonicInstant,
     ) -> Result<usize, TaskExecutionError> {
-        let Some(round) = state.vending.as_ref() else {
+        let Some(round) = state.vending.as_mut() else {
             return Ok(0);
         };
         let hard_deadline = round.hard_deadline;
+        #[cfg(test)]
         let outcome = round
-            .outcome
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+            .staged_outcome
+            .take()
+            .or_else(|| round.outcome.try_take());
+        #[cfg(not(test))]
+        let outcome = round.outcome.try_take();
         let Some(outcome) = outcome else {
             if now >= hard_deadline {
                 return Err(self.rotation_failed(
@@ -253,68 +298,86 @@ impl CredentialRotationPump {
             return Ok(0);
         };
         state.vending = None;
+        if now >= hard_deadline {
+            return Err(self.rotation_failed(
+                "the credential provider answered after the credential stopped being usable",
+            ));
+        }
         match outcome {
-            VendOutcome::Refreshed(refreshed) => {
-                // The attempt's own table first: it is the frontend's read path
-                // as well as the source of the material the backends install,
-                // and a table that lagged the backends would leave this process
-                // reading with the epoch it just replaced.
-                self.storage
-                    .apply_refresh(refreshed.as_ref())
-                    .map_err(|error| {
-                        self.rotation_failed(&format!(
-                            "refreshed credential is not installable: {}",
-                            error.message()
-                        ))
-                    })?;
-                let material = self.storage.freeze_material().map_err(|error| {
-                    self.rotation_failed(&format!(
-                        "refreshed credential batch is not installable: {}",
-                        error.message()
-                    ))
-                })?;
-                match state.owner.rotate(Arc::new(material), hard_deadline) {
-                    Ok(epoch) => {
-                        state.retry_delay = PROVIDER_RETRY_INITIAL;
-                        state.next_attempt_at = None;
-                        tracing::debug!(
-                            execution_id = ?self.execution_id,
-                            epoch = epoch.get(),
-                            "credential domain minted a rotation"
-                        );
-                        Ok(1)
-                    }
-                    // Every context has left. There is nothing to rotate for,
-                    // and no expiry left to beat.
-                    Err(RefreshRefusal::NoParticipants) => {
-                        state.finished = true;
-                        state.owner.wipe();
-                        Ok(0)
-                    }
-                    Err(refusal) => Err(self.rotation_failed(&refusal.to_string())),
-                }
-            }
-            VendOutcome::Retryable(detail) => {
-                if now >= hard_deadline {
-                    return Err(self.rotation_failed(&format!(
-                        "the credential provider failed and the credential stopped being usable: \
-                         {detail}"
-                    )));
-                }
+            Err(error) => {
                 tracing::warn!(
                     execution_id = ?self.execution_id,
-                    detail,
-                    "credential rotation will be retried"
+                    detail = %error,
+                    "credential rotation worker failed and will be retried"
                 );
-                // Never past the point the material stops being usable: the
-                // next attempt recomputes its own deadline from what is left of
-                // the lease, so a backoff that overshot this one would spend
-                // the whole remaining lifetime waiting to try again.
                 state.next_attempt_at =
                     Some(now.saturating_add(state.retry_delay).min(hard_deadline));
                 state.retry_delay = state.retry_delay.saturating_mul(2).min(PROVIDER_RETRY_MAX);
                 Ok(0)
             }
+            Ok(outcome) => match outcome {
+                VendOutcome::Refreshed(refreshed) => {
+                    // The attempt's own table first: it is the frontend's read path
+                    // as well as the source of the material the backends install,
+                    // and a table that lagged the backends would leave this process
+                    // reading with the epoch it just replaced.
+                    self.storage
+                        .apply_refresh(refreshed.as_ref())
+                        .map_err(|error| {
+                            self.rotation_failed(&format!(
+                                "refreshed credential is not installable: {}",
+                                error.message()
+                            ))
+                        })?;
+                    let material = self.storage.freeze_material().map_err(|error| {
+                        self.rotation_failed(&format!(
+                            "refreshed credential batch is not installable: {}",
+                            error.message()
+                        ))
+                    })?;
+                    match state.owner.rotate(Arc::new(material), hard_deadline) {
+                        Ok(epoch) => {
+                            state.retry_delay = PROVIDER_RETRY_INITIAL;
+                            state.next_attempt_at = None;
+                            tracing::debug!(
+                                execution_id = ?self.execution_id,
+                                epoch = epoch.get(),
+                                "credential domain minted a rotation"
+                            );
+                            Ok(1)
+                        }
+                        // Every context has left. There is nothing to rotate for,
+                        // and no expiry left to beat.
+                        Err(RefreshRefusal::NoParticipants) => {
+                            state.finished = true;
+                            state.owner.wipe();
+                            Ok(0)
+                        }
+                        Err(refusal) => Err(self.rotation_failed(&refusal.to_string())),
+                    }
+                }
+                VendOutcome::Retryable(detail) => {
+                    if now >= hard_deadline {
+                        return Err(self.rotation_failed(&format!(
+                            "the credential provider failed and the credential stopped being \
+                             usable: {detail}"
+                        )));
+                    }
+                    tracing::warn!(
+                        execution_id = ?self.execution_id,
+                        detail,
+                        "credential rotation will be retried"
+                    );
+                    // Never past the point the material stops being usable: the
+                    // next attempt recomputes its own deadline from what is left of
+                    // the lease, so a backoff that overshot this one would spend
+                    // the whole remaining lifetime waiting to try again.
+                    state.next_attempt_at =
+                        Some(now.saturating_add(state.retry_delay).min(hard_deadline));
+                    state.retry_delay = state.retry_delay.saturating_mul(2).min(PROVIDER_RETRY_MAX);
+                    Ok(0)
+                }
+            },
         }
     }
 
@@ -346,31 +409,20 @@ impl CredentialRotationPump {
                 "the credential table lost the refresh source of a lease it reported refreshable",
             ));
         };
-        let slot = Arc::new(Mutex::new(None));
-        let published = Arc::clone(&slot);
-        let execution_id = self.execution_id;
         // The provider call is blocking and must not be made on the turn: the
         // same thread owns the result loop, and a provider that took a second
         // would stop settling acknowledgements and opening edges for a second.
-        std::thread::Builder::new()
-            .name(format!(
-                "credential-rotate-{}-{}",
-                execution_id.query_id().high(),
-                execution_id.attempt_id().get()
-            ))
-            .spawn(move || {
-                let outcome = match refresher.refresh(&descriptor) {
+        let outcome =
+            self.blocking_io
+                .spawn_protected(move || match refresher.refresh(&descriptor) {
                     Ok(refreshed) => VendOutcome::Refreshed(Box::new(refreshed)),
                     Err(detail) => VendOutcome::Retryable(detail),
-                };
-                *published.lock().unwrap_or_else(|error| error.into_inner()) = Some(outcome);
-            })
-            .map_err(|error| {
-                self.rotation_failed(&format!("spawn credential rotation worker failed: {error}"))
-            })?;
+                });
         state.vending = Some(VendingRound {
             hard_deadline,
-            outcome: slot,
+            outcome,
+            #[cfg(test)]
+            staged_outcome: None,
         });
         state.next_attempt_at = None;
         Ok(1)
@@ -464,7 +516,10 @@ impl AcknowledgementObserver for CredentialRotationPump {
             return Ok(());
         };
         if !ack.is_applied() {
-            if ack.outcome().is_retryable() {
+            if matches!(
+                ack.dispatch_result(),
+                novarocks_query_application::coordination::OperationDispatchResult::TransportUnknown
+            ) {
                 // Recorded, not sent: the next turn hands out the identical
                 // retained request, which is the only legal answer to a
                 // genuinely unknown outcome.
@@ -477,8 +532,8 @@ impl AcknowledgementObserver for CredentialRotationPump {
             // stall every later rotation behind it and then fail the attempt
             // on that rotation's hard deadline.
             if matches!(
-                ack.outcome(),
-                OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone
+                ack.worker_outcome(),
+                Some(OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone)
             ) {
                 state.owner.retire(context);
                 // Retiring the last laggard is what settles the rotation, so
@@ -488,7 +543,7 @@ impl AcknowledgementObserver for CredentialRotationPump {
             }
             return Err(format!(
                 "credential rotation for {context} failed closed as {:?}",
-                ack.outcome()
+                ack.worker_outcome()
             ));
         }
         let AckPayload::Context(receipt) = ack.payload() else {

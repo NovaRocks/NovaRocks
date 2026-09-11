@@ -23,44 +23,52 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use novarocks_execution::exec::fragment::program::{FragmentContractVersion, FragmentSinkKind};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
-    AbortCause, CancelReason, CodecOwnedContent, ConfidentialContent, ContentFingerprint,
-    CreateTaskReceipt, CredentialEpoch, CredentialLeaseId, CredentialUpdate, DispatchBudget,
-    DispatchLane, DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion, ExchangeEdgeId,
-    LeaseReceipt, LeaseSequence, LeaseValidFor, MonotonicInstant, OperationKind, OperationOutcome,
-    PhysicalFragmentPlan, PlanNodeId, QueryContextReceipt, QueryContextRef, QueryContextState,
-    ReleaseOutcome, RenewSchedule, SplitAssignmentIntent, SplitOffer, SplitSequence, StageState,
-    TaskDomainUpdate, TaskIdentity, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
-    TerminationDetail, TransportBudget, UpdateTaskReceipt,
+    AbortCause, AdmissionEpochCapability, AdmissionTicketId, CancelReason, CodecOwnedContent,
+    ConfidentialContent, ContentFingerprint, CreateTaskReceipt, CredentialEpoch, CredentialLeaseId,
+    CredentialUpdate, DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion, ExchangeEdgeId,
+    LeaseReceipt, LeaseSequence, LeaseValidFor, OperationKind, OperationOutcome,
+    PhysicalFragmentPlan, PlanNodeId, PlanNodeSplitReceipt, QueryContextAdmissionTicketReceipt,
+    QueryContextReceipt, QueryContextRef, QueryContextState, ReleaseOutcome, SplitAssignmentIntent,
+    SplitOffer, SplitSequence, SplitWatermark, TaskDomainReceipt, TaskDomainUpdate, TaskIdentity,
+    TaskOperationId, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
+    UpdateTaskReceipt,
+};
+use novarocks_query_application::coordination::{
+    DispatchBudget, DispatchLane, MonotonicInstant, RenewSchedule, StageState,
 };
 use novarocks_sql::plan_read::{
     DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
 };
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{
     BackendProcessId, FrontendProcessId, QueryExecutionId, StageId, TaskId,
 };
-use novarocks_types::{AttemptId, QueryId};
+use novarocks_types::{AttemptId, NativeCompatibilityId, QueryId};
 
+use super::blocking_io::{ConnectorBlockingIoBudget, ConnectorBlockingIoSupervisor};
 use super::clock::{ManualClock, TaskProtocolClock};
 use super::context_owner::{
     ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
 };
 use super::dispatch::OperationDispatcher;
 use super::error::{CapacityBound, TaskExecutionError};
-use super::execution::QueryTaskExecution;
+use super::execution::{AbortSubmission, QueryTaskExecution};
 use super::graph::{
     FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, build_task_graph,
 };
 use super::intent::{
     AckPayload, DispatchBatch, OPERATION_FIXED_BYTES, OperationAcknowledgement, OperationIntent,
-    TaskOperationSink,
+    TaskOperationQueueAdmission, TaskOperationQueuePermit, TaskOperationQueueRequest,
+    TaskOperationSink, TaskOperationSubmit, test_queue_permit,
 };
-use super::remote_task::RemoteTaskState;
+use super::remote_task::{RemoteTaskState, UpdateAdmission};
 use super::split_domain::{assignment_targets, delivery_action};
 use super::status_intake::{
     CountingWake, StatusEvent, StatusIntake, StatusIntakeAdmission, StatusIntakeWake,
@@ -77,6 +85,22 @@ const LEAF_TO_MIDDLE_NODE: i32 = 20;
 const MIDDLE_TO_ROOT_NODE: i32 = 30;
 const LEAF_TO_ROOT_NODE: i32 = 31;
 const SCAN_NODE: i32 = 5;
+
+fn test_connector_blocking_io() -> ConnectorBlockingIoSupervisor {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(8)
+            .enable_all()
+            .build()
+            .expect("test Connector blocking-I/O runtime")
+    });
+    ConnectorBlockingIoSupervisor::new(
+        runtime.handle().clone(),
+        ConnectorBlockingIoBudget::default(),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -199,6 +223,32 @@ impl ContextEstablishSource for FakeEstablish {
     }
 }
 
+fn grant_admission(owner: &mut QueryContextOwner, now: MonotonicInstant) {
+    let intent = owner
+        .admission_intent(now)
+        .expect("an admission request can be built")
+        .expect("the admission request is released");
+    let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent else {
+        unreachable!("admission releases its exact request");
+    };
+    owner
+        .on_admission_ack(
+            &OperationAcknowledgement::worker_receipt(
+                request.envelope().operation_id(),
+                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationOutcome::Accepted,
+                AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+                    AdmissionTicketId::try_from_bytes([0x54; 16])
+                        .expect("the test ticket is nonzero"),
+                    request.context(),
+                    request.valid_for(),
+                )),
+            ),
+            now,
+        )
+        .expect("the admission request settles");
+}
+
 /// Records what the dispatcher released, and nothing else.
 #[derive(Debug, Default)]
 struct RecordingSink {
@@ -212,11 +262,158 @@ impl RecordingSink {
 }
 
 impl TaskOperationSink for RecordingSink {
-    fn submit(&self, batch: &DispatchBatch) {
+    fn try_reserve_queue(
+        &self,
+        _request: TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        TaskOperationQueueAdmission::Admitted(test_queue_permit())
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+        let lane = batch.lane();
+        let operations = batch.into_operations();
         self.batches
             .lock()
             .expect("recording sink")
-            .push((batch.lane(), batch.operations().to_vec()));
+            .push((lane, operations));
+        TaskOperationSubmit::Accepted
+    }
+}
+
+#[derive(Debug, Default)]
+struct BackpressureOnceSink {
+    attempts: AtomicUsize,
+    refused: Mutex<Vec<TaskOperationId>>,
+    accepted: Mutex<Vec<Vec<TaskOperationId>>>,
+}
+
+#[derive(Debug, Default)]
+struct QueueBackpressureOnceSink {
+    reserve_attempts: AtomicUsize,
+    submitted_operations: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct SwitchableQueueSink {
+    queue_open: std::sync::atomic::AtomicBool,
+    submit_open: std::sync::atomic::AtomicBool,
+    batches: Mutex<Vec<(DispatchLane, Vec<OperationIntent>)>>,
+    live_queue_permits: Arc<AtomicUsize>,
+}
+
+impl Default for SwitchableQueueSink {
+    fn default() -> Self {
+        Self {
+            queue_open: std::sync::atomic::AtomicBool::new(true),
+            submit_open: std::sync::atomic::AtomicBool::new(true),
+            batches: Mutex::new(Vec::new()),
+            live_queue_permits: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SwitchableQueuePermit {
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for SwitchableQueuePermit {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl TaskOperationQueuePermit for SwitchableQueuePermit {
+    fn mark_in_flight(&mut self) {}
+}
+
+impl SwitchableQueueSink {
+    fn set_queue_open(&self, open: bool) {
+        self.queue_open.store(open, Ordering::SeqCst);
+    }
+
+    fn set_submit_open(&self, open: bool) {
+        self.submit_open.store(open, Ordering::SeqCst);
+    }
+
+    fn take(&self) -> Vec<(DispatchLane, Vec<OperationIntent>)> {
+        std::mem::take(&mut *self.batches.lock().expect("switchable sink"))
+    }
+
+    fn live_queue_permits(&self) -> usize {
+        self.live_queue_permits.load(Ordering::SeqCst)
+    }
+}
+
+impl TaskOperationSink for SwitchableQueueSink {
+    fn try_reserve_queue(
+        &self,
+        _request: TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        if self.queue_open.load(Ordering::SeqCst) {
+            self.live_queue_permits.fetch_add(1, Ordering::SeqCst);
+            TaskOperationQueueAdmission::Admitted(Box::new(SwitchableQueuePermit {
+                live: Arc::clone(&self.live_queue_permits),
+            }))
+        } else {
+            TaskOperationQueueAdmission::Backpressured
+        }
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+        if !self.submit_open.load(Ordering::SeqCst) {
+            return TaskOperationSubmit::Backpressured(batch);
+        }
+        let lane = batch.lane();
+        let operations = batch.into_operations();
+        self.batches
+            .lock()
+            .expect("switchable sink")
+            .push((lane, operations));
+        TaskOperationSubmit::Accepted
+    }
+}
+
+impl TaskOperationSink for QueueBackpressureOnceSink {
+    fn try_reserve_queue(
+        &self,
+        _request: TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        if self.reserve_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            TaskOperationQueueAdmission::Backpressured
+        } else {
+            TaskOperationQueueAdmission::Admitted(test_queue_permit())
+        }
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+        self.submitted_operations
+            .fetch_add(batch.operations().len(), Ordering::SeqCst);
+        TaskOperationSubmit::Accepted
+    }
+}
+
+impl TaskOperationSink for BackpressureOnceSink {
+    fn try_reserve_queue(
+        &self,
+        _request: TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        TaskOperationQueueAdmission::Admitted(test_queue_permit())
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+        let ids = batch
+            .operations()
+            .iter()
+            .map(OperationIntent::operation_id)
+            .collect::<Vec<_>>();
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            *self.refused.lock().expect("refused batch") = ids;
+            TaskOperationSubmit::Backpressured(batch)
+        } else {
+            self.accepted.lock().expect("accepted batches").push(ids);
+            TaskOperationSubmit::Accepted
+        }
     }
 }
 
@@ -275,6 +472,10 @@ fn backends(count: usize) -> BTreeMap<usize, BackendProcessId> {
     (0..count)
         .map(|index| (index, BackendProcessId::new_v7()))
         .collect()
+}
+
+fn admission_epoch() -> AdmissionEpochCapability {
+    AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("nonzero epoch")
 }
 
 /// One fragment's placements, taking the kernel key from the same derivation
@@ -441,10 +642,16 @@ impl Harness {
         let clock = Arc::new(ManualClock::new());
         let wake = Arc::new(CountingWake::default());
         let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+        let admission_epochs = graph
+            .contexts()
+            .map(|context| (context.backend_process_id(), admission_epoch()))
+            .collect::<BTreeMap<_, _>>();
         let execution = QueryTaskExecution::new(
             graph,
             DispatchBudget::DEFAULT,
             TransportBudget::DEFAULT,
+            NativeCompatibilityId::new([0x41; 32]),
+            &admission_epochs,
             Arc::clone(&clock) as Arc<dyn TaskProtocolClock>,
             Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
             intake,
@@ -461,6 +668,46 @@ impl Harness {
     }
 
     fn pump(&mut self) -> Vec<(DispatchLane, Vec<OperationIntent>)> {
+        let mut visible = Vec::new();
+        loop {
+            let batches = self.pump_once();
+            let mut acquired = false;
+            for (lane, operations) in batches {
+                let mut remaining = Vec::new();
+                for intent in operations {
+                    if let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent {
+                        acquired = true;
+                        let ticket_id = AdmissionTicketId::try_from_bytes([0x54; 16])
+                            .expect("the test ticket is nonzero");
+                        self.execution
+                            .acknowledge(&OperationAcknowledgement::worker_receipt(
+                                request.envelope().operation_id(),
+                                OperationKind::AcquireQueryContextAdmissionTicket,
+                                OperationOutcome::Accepted,
+                                AckPayload::AdmissionTicket(
+                                    QueryContextAdmissionTicketReceipt::new(
+                                        ticket_id,
+                                        request.context(),
+                                        request.valid_for(),
+                                    ),
+                                ),
+                            ))
+                            .expect("an admission acknowledgement settles");
+                    } else {
+                        remaining.push(intent);
+                    }
+                }
+                if !remaining.is_empty() {
+                    visible.push((lane, remaining));
+                }
+            }
+            if !acquired {
+                return visible;
+            }
+        }
+    }
+
+    fn pump_once(&mut self) -> Vec<(DispatchLane, Vec<OperationIntent>)> {
         self.execution
             .pump(&self.establish)
             .expect("pumping produces intents");
@@ -480,30 +727,35 @@ impl Harness {
     /// rotation on purpose: a create may legitimately reach a backend before
     /// its establish and wait on the creation gate there.
     fn context_ack(&mut self, intent: &OperationIntent, effective: Duration) {
-        let OperationIntent::UpdateQueryContext(request) = intent else {
-            unreachable!("an update-context intent carries its request");
+        let (context, may_create) = match intent {
+            OperationIntent::EstablishQueryContext(request) => (request.context(), true),
+            OperationIntent::UpdateQueryContext(request) => {
+                (request.context(), request.may_create())
+            }
+            _ => unreachable!("a context intent carries its request"),
         };
         let sequence = self
             .execution
-            .owner(request.context())
+            .owner(context)
             .expect("the context has an owner")
             .lease_sequence();
-        let sequence = if request.may_create() {
+        let sequence = if may_create {
             LeaseSequence::INITIAL
         } else {
             sequence.next().expect("the lease sequence advances")
         };
-        let receipt = QueryContextReceipt::new(request.context(), QueryContextState::Active)
-            .with_lease(LeaseReceipt::new(
+        let receipt = QueryContextReceipt::new(context, QueryContextState::Active).with_lease(
+            LeaseReceipt::new(
                 sequence,
-                LeaseValidFor::new(if request.may_create() {
+                LeaseValidFor::new(if may_create {
                     Duration::from_secs(30)
                 } else {
                     Duration::from_secs(5)
                 })
                 .expect("a legal request"),
                 effective,
-            ));
+            ),
+        );
         self.execution
             .acknowledge(&OperationAcknowledgement::new(
                 intent.operation_id(),
@@ -570,7 +822,10 @@ impl Harness {
             outcome,
             OperationOutcome::Accepted | OperationOutcome::Idempotent
         ) {
-            AckPayload::Update(UpdateTaskReceipt::new(request.identity(), Vec::new()))
+            AckPayload::Update(UpdateTaskReceipt::new(
+                request.identity(),
+                request.domains().iter().map(task_domain_receipt).collect(),
+            ))
         } else {
             AckPayload::None
         };
@@ -591,6 +846,17 @@ impl Harness {
                 AckPayload::None,
             ))
             .expect("a cancel acknowledgement settles");
+    }
+
+    fn transport_unknown_ack(
+        &mut self,
+        intent: &OperationIntent,
+    ) -> Result<(), TaskExecutionError> {
+        self.execution
+            .acknowledge(&OperationAcknowledgement::transport_unknown(
+                intent.operation_id(),
+                intent.kind(),
+            ))
     }
 
     /// Answers everything one pump released, and reports what it answered.
@@ -705,6 +971,36 @@ impl Harness {
             .stage(StageId::new(stage_id).expect("a nonzero stage id"))
             .expect("the stage is owned")
             .state()
+    }
+}
+
+fn task_domain_receipt(update: &TaskDomainUpdate) -> TaskDomainReceipt {
+    match update {
+        TaskDomainUpdate::SplitAssignment(intent) => {
+            let watermark = match intent.offer() {
+                SplitOffer::Batch { last, no_more, .. } => {
+                    SplitWatermark::empty().apply_batch(last, no_more)
+                }
+                SplitOffer::Seal => SplitWatermark::empty().apply_no_more(),
+            };
+            TaskDomainReceipt::SplitAssignment {
+                nodes: vec![PlanNodeSplitReceipt::new(intent.node(), watermark)],
+                progression: novarocks_execution::task_execution::DomainProgression::Apply,
+            }
+        }
+        TaskDomainUpdate::TaskDynamicFilter { version, .. } => {
+            TaskDomainReceipt::TaskDynamicFilter {
+                accepted_version: Some(*version),
+                progression: novarocks_execution::task_execution::DomainProgression::Apply,
+            }
+        }
+        TaskDomainUpdate::OpenExchangeEdges { version, edges } => {
+            TaskDomainReceipt::OpenExchangeEdges {
+                accepted_version: *version,
+                opened: edges.clone(),
+                progression: novarocks_execution::task_execution::DomainProgression::Apply,
+            }
+        }
     }
 }
 
@@ -1041,7 +1337,7 @@ fn no_update_is_released_while_a_create_outcome_is_unknown() {
 
     // A split assignment arrives while the create's outcome is unknown.
     harness
-        .create_ack(&leaf_create, OperationOutcome::RetryableTransportUnknown)
+        .transport_unknown_ack(&leaf_create)
         .expect("an unknown outcome settles without failing");
     harness
         .execution
@@ -1080,7 +1376,7 @@ fn an_unknown_create_outcome_retries_the_identical_request() {
         .find(|intent| matches!(intent.kind(), OperationKind::CreateTask))
         .expect("a create was released");
     harness
-        .create_ack(&first, OperationOutcome::RetryableTransportUnknown)
+        .transport_unknown_ack(&first)
         .expect("an unknown outcome settles without failing");
 
     let second = harness
@@ -1207,6 +1503,68 @@ fn a_terminal_task_discards_never_sent_updates_and_converges_what_is_in_flight()
         .expect("a released update still settles after the task went terminal");
 }
 
+#[test]
+fn a_terminal_rejected_update_waits_for_the_task_status_authority() {
+    let mut harness = Harness::new(&[0], &[0], 512);
+    harness.settle_until_quiet(Duration::from_secs(10));
+
+    let leaf = harness.stage_tasks(1)[0];
+    harness
+        .execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
+        .expect("the first split batch is recorded");
+    harness
+        .execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 2, true))
+        .expect("the second split batch is recorded");
+    let in_flight = harness
+        .released()
+        .into_iter()
+        .find(|intent| matches!(intent.kind(), OperationKind::UpdateTask))
+        .expect("one update is released");
+
+    harness
+        .update_ack(&in_flight, OperationOutcome::TerminalRejected)
+        .expect("a terminal rejection stops delivery without failing the attempt");
+    let task = harness.execution.task(leaf).expect("the leaf is owned");
+    assert_eq!(task.state(), RemoteTaskState::Created);
+    assert!(!task.is_terminal(), "only a task status proves termination");
+    assert_eq!(task.pending_updates(), 0);
+    assert_eq!(task.discarded_updates(), 1);
+    assert_eq!(task.converged_after_terminal(), 1);
+    let context = task.context();
+    assert_eq!(
+        harness.execution.take_status_reconciliations(),
+        [context].into_iter().collect(),
+        "StopSendingAndReconcile requests an immediate status replay"
+    );
+
+    assert_eq!(
+        harness
+            .execution
+            .enqueue_task_update(leaf, split_update(SCAN_NODE, 3, true))
+            .expect("a late split is classified"),
+        UpdateAdmission::DiscardedTerminal
+    );
+    assert!(
+        harness
+            .released()
+            .iter()
+            .all(|intent| !matches!(intent.kind(), OperationKind::UpdateTask)),
+        "the owner must not send after the backend says the task terminated"
+    );
+
+    harness.publish(leaf, TaskState::Running, None, false);
+    harness.publish(leaf, TaskState::Flushing, None, false);
+    harness.publish(leaf, TaskState::Finished, None, true);
+    let task = harness.execution.task(leaf).expect("the leaf is owned");
+    assert_eq!(task.state(), RemoteTaskState::Terminal);
+    assert_eq!(
+        task.terminal_report().expect("terminal facts").state,
+        TaskState::Finished
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Lease
 // ---------------------------------------------------------------------------
@@ -1220,8 +1578,8 @@ fn renewal_is_scheduled_from_the_effective_duration_and_the_local_send_time() {
         .find(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext))
         .expect("an establish was released")
         .clone();
-    let OperationIntent::UpdateQueryContext(request) = &establish else {
-        unreachable!("an update-context intent carries its request");
+    let OperationIntent::EstablishQueryContext(request) = &establish else {
+        unreachable!("an establish intent carries its exact request");
     };
     let context = request.context();
 
@@ -1288,7 +1646,7 @@ fn a_renewal_is_not_blocked_by_an_unsettled_domain_update() {
         .find(|intent| matches!(intent.kind(), OperationKind::UpdateTask))
         .expect("one update is released");
     harness
-        .update_ack(&update, OperationOutcome::RetryableTransportUnknown)
+        .transport_unknown_ack(&update)
         .expect("an unknown outcome settles without failing");
 
     // The renewal falls due while that update's outcome is still unknown.
@@ -1317,15 +1675,21 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(context, 2);
+    let mut owner = QueryContextOwner::new(
+        context,
+        2,
+        NativeCompatibilityId::new([0x41; 32]),
+        admission_epoch(),
+    );
     assert!(
-        owner.release_intent().is_none(),
+        owner.release_intent(MonotonicInstant::ORIGIN).is_none(),
         "a release may not precede the establish acknowledgement"
     );
 
     let facts = FakeEstablish
         .facts_for(context)
         .expect("the fake source has facts");
+    grant_admission(&mut owner, MonotonicInstant::ORIGIN);
     let intent = owner
         .establish_intent(facts, MonotonicInstant::ORIGIN)
         .expect("an establish is produced")
@@ -1349,13 +1713,13 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
 
     owner.note_create_acknowledged();
     assert!(
-        owner.release_intent().is_none(),
+        owner.release_intent(MonotonicInstant::ORIGIN).is_none(),
         "creates are not closed while one is outstanding"
     );
     owner.note_create_acknowledged();
     assert!(owner.creates_closed());
     assert!(
-        owner.release_intent().is_none(),
+        owner.release_intent(MonotonicInstant::ORIGIN).is_none(),
         "closure alone is not drain"
     );
 
@@ -1363,12 +1727,12 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
     owner.note_task_drained();
     owner.note_output_released();
     assert!(
-        owner.release_intent().is_none(),
+        owner.release_intent(MonotonicInstant::ORIGIN).is_none(),
         "one output responsibility is still open"
     );
     owner.note_output_released();
     let release = owner
-        .release_intent()
+        .release_intent(MonotonicInstant::ORIGIN)
         .expect("closure and drain release the context");
 
     let not_ready = OperationAcknowledgement::new(
@@ -1385,7 +1749,7 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
     );
     assert_eq!(
         owner
-            .on_release_ack(&not_ready)
+            .on_release_ack(&not_ready, MonotonicInstant::ORIGIN)
             .expect("a not-ready answer settles"),
         ReleaseSettlement::NotReadyKeepRenewing
     );
@@ -1399,28 +1763,65 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
         "a not-ready release keeps the lease alive"
     );
     assert!(
-        owner.release_intent().is_none(),
-        "the identical release waits for local state to advance"
+        owner
+            .release_intent(MonotonicInstant::from_origin(Duration::from_millis(49)))
+            .is_none(),
+        "the identical release observes its retry backoff"
     );
 
-    // Once local state advances the identical request goes out again.
-    owner.note_output_released();
+    // Backend-local in-flight work can settle without advancing a frontend
+    // progress fact. The timer still releases the exact same request.
     let retry = owner
-        .release_intent()
-        .expect("progress re-releases the identical request");
+        .release_intent(MonotonicInstant::from_origin(Duration::from_millis(50)))
+        .expect("the retry timer re-releases the identical request");
     assert_eq!(retry.operation_id(), release.operation_id());
 
+    assert_eq!(
+        owner
+            .on_release_ack(
+                &not_ready,
+                MonotonicInstant::from_origin(Duration::from_millis(50)),
+            )
+            .expect("a second not-ready answer settles"),
+        ReleaseSettlement::NotReadyKeepRenewing
+    );
+    assert!(
+        owner
+            .release_intent(MonotonicInstant::from_origin(Duration::from_millis(149)))
+            .is_none(),
+        "a repeated not-ready answer increases the retry backoff"
+    );
+    let backed_off_retry = owner
+        .release_intent(MonotonicInstant::from_origin(Duration::from_millis(150)))
+        .expect("the increased retry backoff eventually expires");
+    assert_eq!(backed_off_retry.operation_id(), release.operation_id());
+
     owner
-        .on_release_ack(&OperationAcknowledgement::new(
-            retry.operation_id(),
-            OperationKind::ReleaseQueryContext,
-            OperationOutcome::Accepted,
-            AckPayload::Release {
-                receipt: QueryContextReceipt::new(context, QueryContextState::TerminalRetained),
-                outcome: ReleaseOutcome::Released,
-                runtime_filter: Some(fixture_runtime_filter_contribution()),
-            },
-        ))
+        .on_release_ack(
+            &not_ready,
+            MonotonicInstant::from_origin(Duration::from_millis(150)),
+        )
+        .expect("a third not-ready answer settles");
+    owner.note_output_released();
+    let progress_retry = owner
+        .release_intent(MonotonicInstant::from_origin(Duration::from_millis(150)))
+        .expect("frontend progress bypasses the outstanding retry timer");
+    assert_eq!(progress_retry.operation_id(), release.operation_id());
+
+    owner
+        .on_release_ack(
+            &OperationAcknowledgement::new(
+                progress_retry.operation_id(),
+                OperationKind::ReleaseQueryContext,
+                OperationOutcome::Accepted,
+                AckPayload::Release {
+                    receipt: QueryContextReceipt::new(context, QueryContextState::TerminalRetained),
+                    outcome: ReleaseOutcome::Released,
+                    runtime_filter: Some(fixture_runtime_filter_contribution()),
+                },
+            ),
+            MonotonicInstant::from_origin(Duration::from_millis(50)),
+        )
         .expect("a released answer settles");
     assert!(!owner.must_keep_renewing());
     assert!(owner.is_released());
@@ -1436,6 +1837,332 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
             .available()
             .is_some(),
         "the retained contribution must be the available one the backend sent"
+    );
+}
+
+#[test]
+fn an_admission_transport_unknown_replays_exactly_and_only_the_next_turn_establishes() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let compatibility = NativeCompatibilityId::new([0x42; 32]);
+    let mut owner = QueryContextOwner::new(context, 0, compatibility, admission_epoch());
+    let first = owner
+        .admission_intent(MonotonicInstant::ORIGIN)
+        .expect("the request is legal")
+        .expect("admission is required");
+    let OperationIntent::AcquireQueryContextAdmissionTicket(first_request) = first else {
+        unreachable!("admission has its own operation kind");
+    };
+    assert_eq!(first_request.valid_for().get(), Duration::from_secs(10));
+    assert_eq!(first_request.native_compatibility_id(), compatibility);
+
+    owner
+        .on_admission_ack(
+            &OperationAcknowledgement::transport_unknown(
+                first_request.envelope().operation_id(),
+                OperationKind::AcquireQueryContextAdmissionTicket,
+            ),
+            MonotonicInstant::from_origin(Duration::from_millis(1)),
+        )
+        .expect("transport unknown preserves the request");
+    let second = owner
+        .admission_intent(MonotonicInstant::from_origin(Duration::from_millis(2)))
+        .expect("the exact retry is legal")
+        .expect("the exact retry is released");
+    let OperationIntent::AcquireQueryContextAdmissionTicket(second_request) = second else {
+        unreachable!("admission has its own operation kind");
+    };
+    assert_eq!(second_request.envelope(), first_request.envelope());
+    assert_eq!(second_request.context(), first_request.context());
+    assert_eq!(second_request.valid_for(), first_request.valid_for());
+    assert_eq!(
+        second_request.native_compatibility_id(),
+        first_request.native_compatibility_id()
+    );
+
+    let ticket_id =
+        AdmissionTicketId::try_from_bytes([0x55; 16]).expect("the test ticket is nonzero");
+    owner
+        .on_admission_ack(
+            &OperationAcknowledgement::worker_receipt(
+                second_request.envelope().operation_id(),
+                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationOutcome::Accepted,
+                AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+                    ticket_id,
+                    context,
+                    second_request.valid_for(),
+                )),
+            ),
+            MonotonicInstant::from_origin(Duration::from_millis(3)),
+        )
+        .expect("the exact grant settles");
+    assert_eq!(owner.state(), QueryContextState::Absent);
+
+    let establish = owner
+        .establish_intent(
+            FakeEstablish.facts_for(context).expect("frozen facts"),
+            MonotonicInstant::from_origin(Duration::from_millis(4)),
+        )
+        .expect("the grant is current")
+        .expect("the next owner turn starts establish");
+    let OperationIntent::EstablishQueryContext(request) = establish else {
+        unreachable!("the granted owner releases an establish");
+    };
+    assert_eq!(request.admission_ticket_id(), ticket_id);
+}
+
+#[test]
+fn an_unconsumed_expired_admission_is_reissued_after_the_worker_ticket_must_be_gone() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x42; 32]),
+        admission_epoch(),
+    );
+    let first = owner
+        .admission_intent(MonotonicInstant::ORIGIN)
+        .expect("the request is legal")
+        .expect("admission is required");
+    let first_operation = first.operation_id();
+    owner
+        .on_admission_ack(
+            &admission_ack(&first),
+            MonotonicInstant::from_origin(Duration::from_secs(1)),
+        )
+        .expect("the admission grant settles");
+
+    assert!(
+        owner
+            .establish_intent(
+                FakeEstablish.facts_for(context).expect("frozen facts"),
+                MonotonicInstant::from_origin(Duration::from_secs(10)),
+            )
+            .expect("expiry schedules a replacement grant")
+            .is_none()
+    );
+    assert_eq!(owner.state(), QueryContextState::Absent);
+    assert!(!owner.is_released());
+    assert!(
+        owner
+            .admission_intent(MonotonicInstant::from_origin(Duration::from_millis(10_999)))
+            .expect("the wait remains valid")
+            .is_none(),
+        "the Worker may still hold the old ticket"
+    );
+    let replacement = owner
+        .admission_intent(MonotonicInstant::from_origin(Duration::from_secs(11)))
+        .expect("the reissue is legal")
+        .expect("a fresh grant is requested after the safe bound");
+    assert_ne!(replacement.operation_id(), first_operation);
+}
+
+#[test]
+fn a_grant_received_after_its_conservative_expiry_waits_before_reissue() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x42; 32]),
+        admission_epoch(),
+    );
+    let first = owner
+        .admission_intent(MonotonicInstant::ORIGIN)
+        .expect("the request is legal")
+        .expect("admission is required");
+    let first_operation = first.operation_id();
+    owner
+        .on_admission_ack(
+            &admission_ack(&first),
+            MonotonicInstant::from_origin(Duration::from_secs(11)),
+        )
+        .expect("a late definitive grant keeps the attempt authorized");
+
+    assert_eq!(owner.state(), QueryContextState::Absent);
+    assert!(!owner.is_released());
+    assert!(
+        owner
+            .admission_intent(MonotonicInstant::from_origin(Duration::from_millis(20_999)))
+            .expect("the wait remains valid")
+            .is_none()
+    );
+    let replacement = owner
+        .admission_intent(MonotonicInstant::from_origin(Duration::from_secs(21)))
+        .expect("the reissue is legal")
+        .expect("a fresh grant is requested after the late receipt's safe bound");
+    assert_ne!(replacement.operation_id(), first_operation);
+}
+
+#[test]
+fn a_late_establish_receipt_closes_a_queued_exact_replay() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph =
+        build_graph(&schedule, &chain_edges(), &processes, 16).expect("the test graph is valid");
+    let sink = Arc::new(SwitchableQueueSink::default());
+    let clock = Arc::new(ManualClock::new());
+    let wake = Arc::new(CountingWake::default());
+    let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::DEFAULT,
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        clock as Arc<dyn TaskProtocolClock>,
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        intake,
+    )
+    .expect("the graph composes into one execution");
+    let acks = TaskAckIntake::new(Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let ack_handle = acks.handle();
+    let mut round = TaskRound::new(
+        execution,
+        acks,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()),
+    );
+    round.seal_pumps();
+
+    round.turn().expect("initial dispatch");
+    let admission = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .find(|intent| {
+            matches!(
+                intent,
+                OperationIntent::AcquireQueryContextAdmissionTicket(_)
+            )
+        })
+        .expect("the context admission was sent");
+    let OperationIntent::AcquireQueryContextAdmissionTicket(request) = admission else {
+        unreachable!()
+    };
+    let ticket = QueryContextAdmissionTicketReceipt::new(
+        AdmissionTicketId::try_from_bytes([0x55; 16]).unwrap(),
+        request.context(),
+        request.valid_for(),
+    );
+    ack_handle.publish(OperationAcknowledgement::worker_receipt(
+        request.envelope().operation_id(),
+        OperationKind::AcquireQueryContextAdmissionTicket,
+        OperationOutcome::Accepted,
+        AckPayload::AdmissionTicket(ticket),
+    ));
+
+    round
+        .turn()
+        .expect("admission settles and Establish dispatches");
+    let establish = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .find(|intent| matches!(intent, OperationIntent::EstablishQueryContext(_)))
+        .expect("the establish was sent");
+    sink.set_submit_open(false);
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        establish.operation_id(),
+        OperationKind::UpdateQueryContext,
+    ));
+    round
+        .turn()
+        .expect("the exact replay remains queued under backpressure");
+    let OperationIntent::EstablishQueryContext(establish_request) = &establish else {
+        unreachable!()
+    };
+    let receipt = OperationAcknowledgement::worker_receipt(
+        establish.operation_id(),
+        OperationKind::UpdateQueryContext,
+        OperationOutcome::Accepted,
+        AckPayload::Context(
+            QueryContextReceipt::new(establish_request.context(), QueryContextState::Active)
+                .with_lease(LeaseReceipt::new(
+                    LeaseSequence::INITIAL,
+                    LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+                    Duration::from_secs(10),
+                )),
+        ),
+    );
+    ack_handle.publish(receipt);
+    round
+        .turn()
+        .expect("the older definitive receipt closes the queued replay");
+    assert!(round.contexts_established());
+    assert!(
+        sink.take().is_empty(),
+        "the definitely-unsent replay must not cross process transport"
+    );
+}
+
+#[test]
+fn a_round_never_emits_establish_before_each_context_grant() {
+    let mut harness = Harness::new(&[0], &[0], 512);
+    let first = harness
+        .pump_once()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .collect::<Vec<_>>();
+    assert!(first.iter().any(|intent| matches!(
+        intent,
+        OperationIntent::AcquireQueryContextAdmissionTicket(_)
+    )));
+    assert!(
+        first
+            .iter()
+            .all(|intent| !matches!(intent, OperationIntent::EstablishQueryContext(_)))
+    );
+
+    for intent in first {
+        let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent else {
+            continue;
+        };
+        harness
+            .execution
+            .acknowledge(&OperationAcknowledgement::worker_receipt(
+                request.envelope().operation_id(),
+                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationOutcome::Accepted,
+                AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+                    AdmissionTicketId::try_from_bytes([0x56; 16]).expect("the ticket is nonzero"),
+                    request.context(),
+                    request.valid_for(),
+                )),
+            ))
+            .expect("the context grant settles");
+    }
+    assert!(
+        harness.sink.take().is_empty(),
+        "a receipt does not send work"
+    );
+    let second = harness
+        .pump_once()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .collect::<Vec<_>>();
+    assert!(
+        second
+            .iter()
+            .any(|intent| matches!(intent, OperationIntent::EstablishQueryContext(_)))
     );
 }
 
@@ -1627,6 +2354,151 @@ fn a_create_burst_never_starves_a_lifecycle_operation() {
 }
 
 #[test]
+fn process_backpressure_restores_the_exact_batch_without_in_flight_or_spin() {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 512).expect("legal graph");
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(BackpressureOnceSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let mut execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::DEFAULT,
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::new(ManualClock::new()),
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        intake,
+    )
+    .expect("compose execution");
+
+    let first = execution.pump(&FakeEstablish).expect("first pump");
+    assert_eq!(first.operations, 0);
+    assert_eq!(sink.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(execution.dispatcher().in_flight_operations(), 0);
+    assert!(execution.dispatcher().queued_items() > 0);
+
+    let second = execution.pump(&FakeEstablish).expect("capacity wake turn");
+    assert!(second.operations > 0);
+    let refused = sink.refused.lock().expect("refused batch").clone();
+    let accepted = sink.accepted.lock().expect("accepted batches");
+    assert!(
+        accepted.iter().any(|ids| ids == &refused),
+        "the refused batch must later be accepted with the same operation ids and order"
+    );
+    assert!(execution.dispatcher().in_flight_operations() > 0);
+}
+
+#[test]
+fn process_queue_backpressure_rolls_back_every_unadmitted_owner_transition() {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 512).expect("legal graph");
+    let stage_ids = graph
+        .stages()
+        .map(|stage| stage.stage_id())
+        .collect::<Vec<_>>();
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(QueueBackpressureOnceSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let mut execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::DEFAULT,
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::new(ManualClock::new()),
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        intake,
+    )
+    .expect("compose execution");
+
+    let first = execution
+        .pump(&FakeEstablish)
+        .expect("queue backpressure is a retryable local admission result");
+    assert_eq!(first.operations, 0);
+    assert_eq!(execution.dispatcher().queued_items(), 0);
+    assert_eq!(execution.dispatcher().in_flight_operations(), 0);
+    for stage_id in stage_ids {
+        assert!(
+            execution
+                .stage(stage_id)
+                .expect("the stage is owned")
+                .tasks()
+                .all(|(_, task)| !task.has_released_operation()),
+            "no task may retain create/update/cancel state before process admission"
+        );
+    }
+
+    let second = execution
+        .pump(&FakeEstablish)
+        .expect("the capacity-change turn can release the same owner work");
+    assert!(second.operations > 0);
+    assert!(sink.submitted_operations.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn task_update_process_rejection_precedes_remote_task_retention() {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 512).expect("legal graph");
+    let leaf = graph
+        .tasks()
+        .find(|task| task.stage_id() == StageId::new(1).expect("stage one"))
+        .map(|task| task.task_id())
+        .expect("the graph has one leaf task");
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(QueueBackpressureOnceSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let mut execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::DEFAULT,
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::new(ManualClock::new()),
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        intake,
+    )
+    .expect("compose execution");
+
+    let error = execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
+        .expect_err("the first process reservation is refused");
+    assert!(matches!(
+        error,
+        TaskExecutionError::Capacity(CapacityBound::ProcessTransportQueue { .. })
+    ));
+    assert_eq!(
+        execution
+            .task(leaf)
+            .expect("the task is owned")
+            .pending_updates(),
+        0,
+        "a rejected process reservation must leave no per-attempt payload"
+    );
+    assert_eq!(
+        execution
+            .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
+            .expect("the unchanged domain update can be admitted later"),
+        UpdateAdmission::Queued
+    );
+}
+
+#[test]
 fn an_abort_jumps_the_queue_without_preempting_a_released_operation() {
     let leaves = (0..64).map(|_| 0_usize).collect::<Vec<_>>();
     let mut harness = Harness::new(&leaves, &[0], 512);
@@ -1643,17 +2515,18 @@ fn an_abort_jumps_the_queue_without_preempting_a_released_operation() {
         .contexts()
         .next()
         .expect("the attempt has a context");
-    let batch = harness
+    let submission = harness
         .execution
         .abort_context(context, AbortCause::QueryFailed)
-        .expect("an abort is admitted")
-        .expect("the abort is released immediately");
-    assert_eq!(batch.lane(), DispatchLane::Lifecycle);
-    assert_eq!(batch.operations().len(), 1);
-    assert_eq!(
-        batch.operations()[0].kind(),
-        OperationKind::AbortQueryContext
-    );
+        .expect("an abort is admitted");
+    assert_eq!(submission, AbortSubmission::Accepted);
+    let batches = harness.sink.take();
+    let [(lane, operations)] = batches.as_slice() else {
+        panic!("the accepted abort must reach exactly one transport batch");
+    };
+    assert_eq!(*lane, DispatchLane::Lifecycle);
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].kind(), OperationKind::AbortQueryContext);
 
     // Nothing already released was withdrawn: it is still tracked in flight.
     assert!(
@@ -1766,10 +2639,16 @@ fn an_establish_accounts_for_its_query_options_payload() {
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(context, 0);
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x41; 32]),
+        admission_epoch(),
+    );
     let facts = FakeEstablish
         .facts_for(context)
         .expect("the fake source has facts");
+    grant_admission(&mut owner, MonotonicInstant::ORIGIN);
     let intent = owner
         .establish_intent(facts, MonotonicInstant::ORIGIN)
         .expect("an establish is produced")
@@ -1779,6 +2658,42 @@ fn an_establish_accounts_for_its_query_options_payload() {
         intent.queued_bytes(),
         OPERATION_FIXED_BYTES + 64 + 32 + 48 + 32,
         "the bounded queue must account for every establish payload"
+    );
+}
+
+#[test]
+fn one_operation_cannot_exceed_the_queue_side_carrier_bound() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x42; 32]),
+        admission_epoch(),
+    );
+    grant_admission(&mut owner, MonotonicInstant::ORIGIN);
+    let intent = owner
+        .establish_intent(
+            FakeEstablish
+                .facts_for(context)
+                .expect("the fake source has facts"),
+            MonotonicInstant::ORIGIN,
+        )
+        .expect("an establish is produced")
+        .expect("the establish intent exists");
+    let transport = TransportBudget::new(1, 255, 1, 1, 255, 2, 1020, 1, 2, Duration::from_secs(1))
+        .expect("the process has one ordinary and one control retained window");
+    let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
+    let actual = intent.queued_bytes();
+    let error = dispatcher
+        .enqueue(intent, MonotonicInstant::ORIGIN)
+        .expect_err("an oversized queue-side carrier must fail before it can become head-of-line");
+    assert_eq!(
+        error,
+        TaskExecutionError::Capacity(CapacityBound::OperationBytes { limit: 255, actual })
     );
 }
 
@@ -1803,15 +2718,8 @@ fn a_queued_byte_bound_fails_closed_instead_of_being_exceeded() {
     );
 }
 
-/// Not a defect: this expiry is observational on purpose.
-///
-/// Refusing here instead -- on the reasoning that a dropped queue entry is
-/// unrecoverable -- was measured as `distributed-resilience` 16/16 -> 4/16.
-/// The owner that minted the operation is still waiting for its outcome and
-/// re-mints it on its own retry, and a fault that deliberately drops an
-/// acknowledgement is exactly the case whose recovery is that replay.
 #[test]
-fn an_operation_that_outlives_the_queue_residence_bound_is_reported_not_sent_late() {
+fn an_operation_that_outlives_queue_residence_fails_typed_and_rolls_back_its_owner() {
     let leaves = (0..64).map(|_| 0_usize).collect::<Vec<_>>();
     let mut harness = Harness::new(&leaves, &[0], 512);
     let released = harness.pump();
@@ -1822,20 +2730,20 @@ fn an_operation_that_outlives_the_queue_residence_bound_is_reported_not_sent_lat
     harness
         .clock
         .advance(TransportBudget::DEFAULT.frontend_queue_residence());
-    let report = harness
+    let error = harness
         .execution
         .pump(&FakeEstablish)
-        .expect("an expired queue entry is reported, not a failure of the attempt");
-    assert!(
-        !report.expired.is_empty(),
-        "a queue-resident operation is reported rather than sent late"
-    );
-    assert!(
-        report
-            .expired
-            .iter()
-            .all(|expired| expired.waited >= TransportBudget::DEFAULT.frontend_queue_residence())
-    );
+        .expect_err("queue expiry is a typed local failure, not a silent drop");
+    let TaskExecutionError::QueueResidenceExpired { kind, waited, .. } = error else {
+        panic!("expected a queue-expiry receipt, got {error:?}");
+    };
+    assert_eq!(kind, OperationKind::CreateTask);
+    assert!(waited >= TransportBudget::DEFAULT.frontend_queue_residence());
+    harness
+        .execution
+        .pump(&FakeEstablish)
+        .expect("every expired owner marker was rolled back before failure returned");
+    assert!(harness.execution.dispatcher().queued_items() > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1888,11 +2796,12 @@ fn intake_overflow_is_reported_as_observation_loss_rather_than_a_silent_gap() {
     );
 
     let mut runner = intake.try_enter().expect("the runner slot is free");
+    let (observation_loss, _) = runner.drain_statuses(2);
     assert!(
-        runner.take_observation_loss(),
+        observation_loss,
         "overflow tells the runner to resubscribe with its cursors"
     );
-    assert!(!runner.take_observation_loss());
+    assert!(!runner.drain_statuses(2).0);
 }
 
 #[test]
@@ -1960,7 +2869,7 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
             .tasks()
             .find(|task| task.fragment_instance_id() == target.fragment_instance_id)
             .expect("every target addresses a graph task");
-        assert_eq!(task.backend_idx(), target.backend_idx);
+        assert_eq!(task.identity(), target.identity);
         assert_eq!(task.fragment_id(), LEAF_FRAGMENT);
     }
     assert!(
@@ -1969,24 +2878,28 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
 
     // Only a genuinely unknown transport outcome is replayable, and that
     // verdict comes from the delivery owner rather than being restated here.
+    let legacy_driver_target = crate::query_execution::split_assignment::AssignmentTarget {
+        backend_idx: 0,
+        fragment_instance_id: targets[0].fragment_instance_id,
+    };
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::Transport {
-            target: targets[0].clone(),
+            target: legacy_driver_target.clone(),
             detail: "acknowledgement lost".to_owned(),
         }),
-        novarocks_execution::task_execution::FrontendAction::RetryExactRequest
+        novarocks_query_application::coordination::FrontendAction::RetryExactRequest
     );
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::Rejected {
-            target: targets[0].clone(),
+            target: legacy_driver_target,
             reason: "watermark".to_owned(),
             detail: "gap".to_owned(),
         }),
-        novarocks_execution::task_execution::FrontendAction::FailAttempt
+        novarocks_query_application::coordination::FrontendAction::FailAttempt
     );
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 9 }),
-        novarocks_execution::task_execution::FrontendAction::FailAttempt
+        novarocks_query_application::coordination::FrontendAction::FailAttempt
     );
 }
 
@@ -2036,6 +2949,7 @@ fn an_accepted_create_without_its_receipt_is_refused() {
 #[derive(Debug, Default)]
 struct RecordingSubscriptions {
     ensured: Mutex<Vec<(QueryContextRef, usize)>>,
+    resubscribed: Mutex<Vec<(QueryContextRef, usize)>>,
     /// What a settled subscription reports, so a test can put a backend out
     /// of observation without a transport.
     settled: Mutex<Option<crate::native::task_transport::SubscriptionState>>,
@@ -2050,6 +2964,18 @@ impl crate::task_execution::round::StatusSubscriptions for RecordingSubscription
         self.ensured
             .lock()
             .expect("subscription ledger")
+            .push((context, cursors.len()));
+        Ok(())
+    }
+
+    fn resubscribe(
+        &self,
+        context: QueryContextRef,
+        cursors: Vec<novarocks_execution::task_execution::TaskStatusCursor>,
+    ) -> Result<(), String> {
+        self.resubscribed
+            .lock()
+            .expect("resubscription ledger")
             .push((context, cursors.len()));
         Ok(())
     }
@@ -2129,13 +3055,9 @@ fn a_create_receipt_snapshot_older_than_the_observed_one_is_ignored_not_adopted(
 /// A fresh attempt's establish creates its context, so its lease sequence is
 /// the initial one and nothing has to be read back out of the execution.
 fn establish_ack(intent: &OperationIntent) -> OperationAcknowledgement {
-    let OperationIntent::UpdateQueryContext(request) = intent else {
-        unreachable!("an update-context intent carries its request");
+    let OperationIntent::EstablishQueryContext(request) = intent else {
+        unreachable!("an establish intent carries its exact request");
     };
-    assert!(
-        request.may_create(),
-        "a fresh attempt's establish creates its context"
-    );
     let receipt = QueryContextReceipt::new(request.context(), QueryContextState::Active)
         .with_lease(LeaseReceipt::new(
             LeaseSequence::INITIAL,
@@ -2150,6 +3072,37 @@ fn establish_ack(intent: &OperationIntent) -> OperationAcknowledgement {
     )
 }
 
+/// Builds the exact Worker acknowledgement for one released admission request.
+fn admission_ack(intent: &OperationIntent) -> OperationAcknowledgement {
+    let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent else {
+        unreachable!("an admission intent carries its exact request");
+    };
+    OperationAcknowledgement::worker_receipt(
+        intent.operation_id(),
+        OperationKind::AcquireQueryContextAdmissionTicket,
+        OperationOutcome::Accepted,
+        AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+            AdmissionTicketId::try_from_bytes([0x54; 16]).expect("the test ticket is nonzero"),
+            request.context(),
+            request.valid_for(),
+        )),
+    )
+}
+
+/// Every admission intent one sink recorded.
+fn released_admissions(sink: &RecordingSink) -> Vec<OperationIntent> {
+    sink.take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .filter(|intent| {
+            matches!(
+                intent.kind(),
+                OperationKind::AcquireQueryContextAdmissionTicket
+            )
+        })
+        .collect()
+}
+
 /// Every establish intent one sink recorded.
 fn released_establishes(sink: &RecordingSink) -> Vec<OperationIntent> {
     sink.take()
@@ -2157,6 +3110,22 @@ fn released_establishes(sink: &RecordingSink) -> Vec<OperationIntent> {
         .flat_map(|(_, operations)| operations)
         .filter(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext))
         .collect()
+}
+
+fn accepted_create_ack(intent: &OperationIntent) -> OperationAcknowledgement {
+    let OperationIntent::CreateTask(request) = intent else {
+        unreachable!("a create intent carries its request");
+    };
+    OperationAcknowledgement::new(
+        intent.operation_id(),
+        OperationKind::CreateTask,
+        OperationOutcome::Accepted,
+        AckPayload::Create(CreateTaskReceipt::new(
+            request.identity(),
+            Vec::new(),
+            TaskStatus::created(request.identity()),
+        )),
+    )
 }
 
 /// The defect this catches: the runner subscribed to task status for every
@@ -2195,18 +3164,27 @@ fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
     let first = round.turn().expect("a turn on a fresh attempt");
     assert!(
         first.operations > 0,
-        "the first turn owes an establish to every context"
+        "the first turn owes an admission request to every context"
     );
     assert!(
         subscriptions.ensured.lock().expect("ledger").is_empty(),
         "a released establish is not an acknowledged one, so no context may be subscribed yet"
     );
 
+    let admissions = released_admissions(&sink);
+    assert_eq!(admissions.len(), contexts);
+    for intent in &admissions {
+        acks.publish(admission_ack(intent));
+    }
+    round
+        .turn()
+        .expect("admission receipts release every establish");
+
     // Answer exactly one establish. Only that context becomes subscribable;
     // the other is still a context its backend does not hold.
     let establishes = released_establishes(&sink);
     assert_eq!(establishes.len(), contexts);
-    let OperationIntent::UpdateQueryContext(first_request) = &establishes[0] else {
+    let OperationIntent::EstablishQueryContext(first_request) = &establishes[0] else {
         unreachable!("an establish carries its request");
     };
     let established_context = first_request.context();
@@ -2274,7 +3252,15 @@ fn a_backend_whose_subscription_settled_fatally_fails_the_attempt_by_name() {
     );
     round.seal_pumps();
 
-    round.turn().expect("a turn on a fresh attempt");
+    round
+        .turn()
+        .expect("a turn that releases every admission request");
+    for intent in released_admissions(&sink) {
+        acks.publish(admission_ack(&intent));
+    }
+    round
+        .turn()
+        .expect("admission receipts release every establish");
     for intent in released_establishes(&sink) {
         acks.publish(establish_ack(&intent));
     }
@@ -2339,10 +3325,16 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
     let first = round.turn().expect("a turn on a fresh attempt");
     assert!(
         first.operations > 0,
-        "the first turn owes an establish to every context"
+        "the first turn owes an admission request to every context"
     );
     assert!(!first.is_idle());
 
+    for intent in released_admissions(&sink) {
+        acks.publish(admission_ack(&intent));
+    }
+    round
+        .turn()
+        .expect("admission receipts release every establish");
     for intent in released_establishes(&sink) {
         acks.publish(establish_ack(&intent));
     }
@@ -2378,6 +3370,73 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
     // is a gap rather than something to absorb.
     assert!(round.consume_root_result_packet(1, false).is_err());
     let _ = round.execution_mut();
+}
+
+#[test]
+fn a_turn_replaces_every_established_subscription_after_local_observation_loss() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let contexts = graph.contexts().count();
+    let harness = Harness::from_graph(graph);
+    let sink = Arc::clone(&harness.sink);
+    let wake = Arc::clone(&harness.wake);
+    let status_handle = harness.execution.intake().handle();
+    let identity = harness.identity(harness.stage_tasks(1)[0]);
+    let subscriptions = Arc::new(RecordingSubscriptions::default());
+    let intake = TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>);
+    let acks = intake.handle();
+    let mut round = TaskRound::new(
+        harness.execution,
+        intake,
+        Box::new(FakeEstablish),
+        Arc::clone(&subscriptions) as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+    round.seal_pumps();
+
+    round
+        .turn()
+        .expect("a turn releases context admission requests");
+    for intent in released_admissions(&sink) {
+        acks.publish(admission_ack(&intent));
+    }
+    round
+        .turn()
+        .expect("admission receipts release context establishes");
+    for intent in released_establishes(&sink) {
+        acks.publish(establish_ack(&intent));
+    }
+    round.turn().expect("the contexts become established");
+
+    for _ in 0..64 {
+        assert_eq!(
+            status_handle.publish(StatusEvent::Published(TaskStatus::created(identity))),
+            StatusIntakeAdmission::Enqueued
+        );
+    }
+    assert_eq!(
+        status_handle.publish(StatusEvent::Published(TaskStatus::created(identity))),
+        StatusIntakeAdmission::Overflowed
+    );
+
+    let report = round
+        .turn()
+        .expect("observation loss replaces the subscriptions");
+    assert_eq!(report.resubscriptions, contexts);
+    let resubscribed = subscriptions
+        .resubscribed
+        .lock()
+        .expect("resubscription ledger");
+    assert_eq!(resubscribed.len(), contexts);
+    assert!(
+        resubscribed
+            .iter()
+            .all(|(_, cursor_count)| *cursor_count > 0),
+        "every replacement replays the runner's task cursors"
+    );
 }
 
 #[test]
@@ -2730,11 +3789,997 @@ fn round_of(harness: Harness) -> (TaskRoundForTest, Arc<CountingWake>) {
         Box::new(FakeEstablish),
         Arc::new(RecordingSubscriptions::default())
             as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
-    );
+    )
+    .with_connector_blocking_io(test_connector_blocking_io());
     (round, wake)
 }
 
+async fn actor_abort_round_at_first_dispatch() -> (
+    crate::task_execution::round::TaskRound,
+    Arc<SwitchableQueueSink>,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    novarocks_query_application::test_support::LogicalExecutionTestHarness,
+    QueryContextRef,
+    OperationIntent,
+    Arc<ManualClock>,
+) {
+    use novarocks_execution::task_execution::{
+        AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor,
+        QueryContextAdmissionTicketReceipt,
+    };
+    use novarocks_query_application::coordination::{
+        AbortQueryContextEffectPort, AdmissionIssueSettlement, ExecutionEffect,
+        LogicalExecutionActorConfig,
+    };
+    use novarocks_query_application::test_support::LogicalExecutionTestHarness;
+    use novarocks_workload_control::{
+        ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::abort_effect::NativeAbortEffectAdapter;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let exact_context = *graph.contexts().next().expect("one attempt context");
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(SwitchableQueueSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let clock = Arc::new(ManualClock::new());
+    let status = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::new(16, 12, 1, 4).expect("nonzero dispatch budget"),
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::clone(&clock) as Arc<dyn TaskProtocolClock>,
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        status,
+    )
+    .expect("compose execution");
+    let acks = TaskAckIntake::new(Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let ack_handle = acks.handle();
+    let (adapter, abort_intake) = NativeAbortEffectAdapter::bounded(
+        NonZeroUsize::new(2).unwrap(),
+        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+    );
+    let mut round = TaskRound::new(
+        execution,
+        acks,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()),
+    )
+    .with_abort_effect_intake(abort_intake);
+    round.seal_pumps();
+    round.turn().expect("startup releases admission");
+    let admission = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .find(|intent| {
+            matches!(
+                intent.kind(),
+                OperationKind::AcquireQueryContextAdmissionTicket
+            )
+        })
+        .expect("startup releases admission");
+
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1 << 30,
+            control_bytes: 1 << 20,
+            per_scope_bytes: 1 << 28,
+        },
+    )
+    .expect("valid workload control");
+    control.mark_ready().expect("workload control ready");
+    let governed = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .expect("query work admitted");
+    let execution_stage = governed
+        .owner
+        .scope()
+        .try_acquire(Stage::Execution)
+        .expect("execution stage admitted");
+    let config = LogicalExecutionActorConfig::single_attempt_completion(
+        execution_id(),
+        ExecutionEffect::None,
+        NonZeroUsize::new(2).unwrap(),
+        vec![exact_context],
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        governed.owner,
+        execution_stage,
+    )
+    .expect("valid actor configuration")
+    .with_abort_query_context_effect_port(
+        Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
+        NonZeroUsize::new(3).unwrap(),
+    );
+    let mut logical = LogicalExecutionTestHarness::install(
+        tokio::runtime::Handle::current(),
+        config,
+        execution_id(),
+        vec![exact_context],
+    )
+    .expect("install logical execution");
+    logical.activate_initial().await.expect("activate");
+    let actor_admission = AcquireQueryContextAdmissionTicket::new(
+        TaskOperationId::new_v7(),
+        exact_context,
+        LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+        NativeCompatibilityId::new([7; 32]),
+        AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
+    );
+    let (activation, pending) = logical
+        .begin_admission_issue_and_abandon(actor_admission)
+        .await
+        .expect("begin actor admission");
+    logical
+        .settle_late_admission_issue(
+            activation,
+            pending,
+            AdmissionIssueSettlement::applied(
+                pending.operation_id(),
+                OperationOutcome::Accepted,
+                QueryContextAdmissionTicketReceipt::new(
+                    AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+                    exact_context,
+                    LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+                ),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("settle actor admission");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    ack_handle.publish(admission_ack(&admission));
+    round
+        .turn()
+        .expect("admission ACK frees lifecycle capacity");
+    let first_abort = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .find(|intent| matches!(intent.kind(), OperationKind::AbortQueryContext))
+        .expect("first actor Abort reaches transport");
+    (
+        round,
+        sink,
+        ack_handle,
+        logical,
+        exact_context,
+        first_abort,
+        clock,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
+    use novarocks_execution::task_execution::{
+        AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor,
+        QueryContextAdmissionTicketReceipt,
+    };
+    use novarocks_query_application::coordination::{
+        AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState,
+        ExecutionEffect, LogicalExecutionActorConfig,
+    };
+    use novarocks_query_application::test_support::LogicalExecutionTestHarness;
+    use novarocks_workload_control::{
+        ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::abort_effect::NativeAbortEffectAdapter;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let exact_context = *graph.contexts().next().expect("one attempt context");
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(SwitchableQueueSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let status = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::new(16, 12, 1, 4).expect("nonzero dispatch budget"),
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::new(ManualClock::new()),
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        status,
+    )
+    .expect("compose execution");
+    let acks = TaskAckIntake::new(Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let ack_handle = acks.handle();
+    let (adapter, abort_intake) = NativeAbortEffectAdapter::bounded(
+        NonZeroUsize::new(2).unwrap(),
+        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+    );
+    let mut round = TaskRound::new(
+        execution,
+        acks,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()),
+    )
+    .with_abort_effect_intake(abort_intake);
+    round.seal_pumps();
+
+    // Occupy the only real lifecycle permit with TaskRound's admission. An
+    // adapter slot exists independently and must not be mistaken for it.
+    round.turn().expect("startup releases one admission");
+    let mut startup = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .collect::<Vec<_>>();
+    let admission = startup
+        .iter()
+        .find(|intent| {
+            matches!(
+                intent.kind(),
+                OperationKind::AcquireQueryContextAdmissionTicket
+            )
+        })
+        .cloned()
+        .expect("startup releases admission");
+
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1 << 30,
+            control_bytes: 1 << 20,
+            per_scope_bytes: 1 << 28,
+        },
+    )
+    .expect("valid workload control");
+    control.mark_ready().expect("workload control ready");
+    let governed = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .expect("query work admitted");
+    let execution_stage = governed
+        .owner
+        .scope()
+        .try_acquire(Stage::Execution)
+        .expect("execution stage admitted");
+    let config = LogicalExecutionActorConfig::single_attempt_completion(
+        execution_id(),
+        ExecutionEffect::None,
+        NonZeroUsize::new(2).unwrap(),
+        vec![exact_context],
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        governed.owner,
+        execution_stage,
+    )
+    .expect("valid actor configuration")
+    .with_abort_query_context_effect_port(
+        Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
+        NonZeroUsize::new(2).unwrap(),
+    );
+    let mut logical = LogicalExecutionTestHarness::install(
+        tokio::runtime::Handle::current(),
+        config,
+        execution_id(),
+        vec![exact_context],
+    )
+    .expect("install logical execution");
+    logical.activate_initial().await.expect("activate");
+    let actor_admission = AcquireQueryContextAdmissionTicket::new(
+        TaskOperationId::new_v7(),
+        exact_context,
+        LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+        NativeCompatibilityId::new([7; 32]),
+        AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
+    );
+    let (activation, pending) = logical
+        .begin_admission_issue_and_abandon(actor_admission)
+        .await
+        .expect("begin actor admission");
+    logical
+        .settle_late_admission_issue(
+            activation,
+            pending,
+            AdmissionIssueSettlement::applied(
+                pending.operation_id(),
+                OperationOutcome::Accepted,
+                QueryContextAdmissionTicketReceipt::new(
+                    AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+                    exact_context,
+                    LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+                ),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("settle actor admission");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(round.queued_abort_effects(), 1, "actor publishes one Abort");
+
+    let blocked = round
+        .turn()
+        .expect("full lifecycle lane leaves the adapter untouched");
+    assert_eq!(blocked.abort_effects, 0);
+    assert_eq!(round.queued_abort_effects(), 1);
+
+    sink.set_queue_open(false);
+    ack_handle.publish(admission_ack(&admission));
+    let process_blocked = round
+        .turn()
+        .expect("process backpressure leaves the adapter untouched");
+    assert_eq!(process_blocked.abort_effects, 0);
+    assert_eq!(round.queued_abort_effects(), 1);
+
+    sink.set_queue_open(true);
+    let admitted = round
+        .turn()
+        .expect("the freed lifecycle permit admits the actor Abort");
+    assert_eq!(admitted.abort_effects, 1);
+    assert_eq!(round.queued_abort_effects(), 0);
+    startup = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .collect();
+    let first_abort = startup
+        .iter()
+        .find(|intent| matches!(intent.kind(), OperationKind::AbortQueryContext))
+        .cloned()
+        .expect("priority lifecycle dispatch releases the actor Abort");
+    assert_eq!(startup[0].operation_id(), first_abort.operation_id());
+    let operation_id = first_abort.operation_id();
+
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    round
+        .turn()
+        .expect("unknown outcome is published to the actor");
+
+    let mut replay = None;
+    for _ in 0..100 {
+        for intent in sink
+            .take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+        {
+            match intent.kind() {
+                OperationKind::AbortQueryContext => replay = Some(intent),
+                OperationKind::UpdateQueryContext => {
+                    ack_handle.publish(establish_ack(&intent));
+                }
+                _ => {}
+            }
+        }
+        if replay.is_some() {
+            break;
+        }
+        round.turn().expect("bounded retry turn");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let replay = replay.expect("the actor replays after unknown outcome");
+    assert_eq!(replay.operation_id(), operation_id);
+    let OperationIntent::AbortQueryContext(first_request) = first_abort else {
+        unreachable!()
+    };
+    let OperationIntent::AbortQueryContext(replay_request) = replay else {
+        unreachable!()
+    };
+    assert_eq!(
+        replay_request.envelope().operation_id(),
+        first_request.envelope().operation_id()
+    );
+    assert_eq!(replay_request.context(), first_request.context());
+    assert_eq!(replay_request.cause(), first_request.cause());
+
+    // A definitive receipt from the original send races with replay gen2
+    // already in flight. It may settle the same exact logical operation; the
+    // later gen2 transport callback must then hit the closing tombstone rather
+    // than fail as UnknownOperation.
+    ack_handle.publish(OperationAcknowledgement::worker_receipt(
+        operation_id,
+        OperationKind::AbortQueryContext,
+        OperationOutcome::ContextTerminalReceipt,
+        AckPayload::Context(QueryContextReceipt::new(
+            exact_context,
+            QueryContextState::TerminalRetained,
+        )),
+    ));
+    let closed = round
+        .turn()
+        .expect("the original receipt closes the in-flight exact replay");
+    assert_eq!(closed.acknowledgements, 1);
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    let tombstoned = round
+        .turn()
+        .expect("replay gen2's later callback is absorbed by the exact closing tombstone");
+    assert_eq!(tombstoned.acknowledgements, 1);
+    for _ in 0..100 {
+        if logical
+            .stand_down_snapshot(exact_context)
+            .await
+            .expect("stand-down snapshot")
+            .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        logical
+            .stand_down_snapshot(exact_context)
+            .await
+            .unwrap()
+            .unwrap()
+            .closure(),
+        ContextClosureState::TerminalRetained
+    );
+    assert_eq!(
+        round.queued_abort_effects(),
+        0,
+        "the late receipt settles before another replay enters the adapter"
+    );
+    assert!(
+        sink.take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+            .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
+        "the settled actor must not leave another Abort in process dispatch"
+    );
+    logical
+        .observe_worker_stopped_and_context_fenced(exact_context)
+        .await
+        .unwrap();
+    logical
+        .finish_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn definitive_late_receipt_consumes_an_adapter_queued_replay() {
+    use novarocks_query_application::coordination::ContextClosureState;
+
+    let (mut round, sink, ack_handle, mut logical, exact_context, first_abort, _clock) =
+        actor_abort_round_at_first_dispatch().await;
+    let operation_id = first_abort.operation_id();
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    round.turn().expect("first Abort becomes transport-unknown");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(round.queued_abort_effects(), 1, "replay waits in adapter");
+
+    ack_handle.publish(OperationAcknowledgement::worker_receipt(
+        operation_id,
+        OperationKind::AbortQueryContext,
+        OperationOutcome::ContextTerminalReceipt,
+        AckPayload::Context(QueryContextReceipt::new(
+            exact_context,
+            QueryContextState::TerminalRetained,
+        )),
+    ));
+    let settled = round
+        .turn()
+        .expect("late receipt settles and consumes the adapter replay");
+    assert_eq!(settled.acknowledgements, 1);
+    assert_eq!(settled.abort_effects, 1);
+    assert_eq!(round.queued_abort_effects(), 0);
+    assert!(
+        sink.take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+            .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
+        "a replay closed in the adapter must never reach process transport"
+    );
+    for _ in 0..100 {
+        if logical
+            .stand_down_snapshot(exact_context)
+            .await
+            .unwrap()
+            .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    logical
+        .observe_worker_stopped_and_context_fenced(exact_context)
+        .await
+        .unwrap();
+    logical
+        .finish_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn definitive_late_receipt_cancels_a_dispatcher_queued_replay() {
+    use novarocks_query_application::coordination::ContextClosureState;
+
+    let (mut round, sink, ack_handle, mut logical, exact_context, first_abort, _clock) =
+        actor_abort_round_at_first_dispatch().await;
+    let operation_id = first_abort.operation_id();
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    round.turn().expect("first Abort becomes transport-unknown");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(round.queued_abort_effects(), 1, "actor authorizes replay");
+
+    // Release the real lifecycle lane, then make process submission refuse
+    // the replay after TaskRound has moved it out of the adapter.
+    for intent in sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+    {
+        if intent.kind() == OperationKind::UpdateQueryContext {
+            ack_handle.publish(establish_ack(&intent));
+        }
+    }
+    sink.set_submit_open(false);
+    let queued = round
+        .turn()
+        .expect("process backpressure restores replay to dispatcher");
+    assert_eq!(queued.abort_effects, 1);
+    assert_eq!(round.queued_abort_effects(), 0);
+    assert_eq!(
+        sink.live_queue_permits(),
+        1,
+        "dispatcher-queued replay retains its process reservation"
+    );
+
+    ack_handle.publish(OperationAcknowledgement::worker_receipt(
+        operation_id,
+        OperationKind::AbortQueryContext,
+        OperationOutcome::ContextTerminalReceipt,
+        AckPayload::Context(QueryContextReceipt::new(
+            exact_context,
+            QueryContextState::TerminalRetained,
+        )),
+    ));
+    let settled = round
+        .turn()
+        .expect("late receipt cancels the definitely-unsent queued replay");
+    assert_eq!(settled.acknowledgements, 1);
+    assert_eq!(
+        sink.live_queue_permits(),
+        0,
+        "cancelling the queued carrier returns process capacity"
+    );
+
+    sink.set_submit_open(true);
+    round
+        .turn()
+        .expect("a later turn has no closed replay to send");
+    assert!(
+        sink.take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+            .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
+        "the cancelled dispatcher replay must never reach process transport"
+    );
+    for _ in 0..100 {
+        if logical
+            .stand_down_snapshot(exact_context)
+            .await
+            .unwrap()
+            .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    logical
+        .observe_worker_stopped_and_context_fenced(exact_context)
+        .await
+        .unwrap();
+    logical
+        .finish_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_actor_abort_expiry_returns_definitely_unsent_for_bounded_replay() {
+    use novarocks_query_application::coordination::{
+        AbortQueryContextIssueState, ContextClosureState,
+    };
+
+    let (mut round, sink, ack_handle, mut logical, exact_context, first_abort, clock) =
+        actor_abort_round_at_first_dispatch().await;
+    let operation_id = first_abort.operation_id();
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    round.turn().expect("first Abort becomes transport-unknown");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(round.queued_abort_effects(), 1, "actor authorizes replay");
+
+    for intent in sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+    {
+        if intent.kind() == OperationKind::UpdateQueryContext {
+            ack_handle.publish(establish_ack(&intent));
+        }
+    }
+    sink.set_submit_open(false);
+    let queued = round
+        .turn()
+        .expect("process backpressure retains replay in dispatcher");
+    assert_eq!(queued.abort_effects, 1);
+    assert_eq!(round.queued_abort_effects(), 0);
+    clock.advance(TransportBudget::DEFAULT.frontend_queue_residence());
+    let error = round
+        .turn()
+        .expect_err("expired actor Abort is a typed local failure");
+    assert!(matches!(
+        error,
+        TaskExecutionError::QueueResidenceExpired {
+            kind: OperationKind::AbortQueryContext,
+            ..
+        }
+    ));
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1
+            && logical
+                .stand_down_snapshot(exact_context)
+                .await
+                .unwrap()
+                .is_some_and(|snapshot| {
+                    snapshot.closure() == ContextClosureState::AbortPending
+                        && snapshot.issue_state()
+                            == Some(AbortQueryContextIssueState::TransportOwned)
+                })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        round.queued_abort_effects(),
+        1,
+        "definitely-unsent returns the exact Abort to bounded actor replay"
+    );
+    logical
+        .observe_worker_process_replaced(exact_context)
+        .await
+        .unwrap();
+    logical
+        .finish_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn closed_actor_abort_intake_fails_the_active_round() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::abort_effect::NativeAbortEffectAdapter;
+    use crate::task_execution::round::TaskRound;
+
+    let harness = Harness::new(&[0], &[0], 64);
+    let wake = Arc::clone(&harness.wake);
+    let (adapter, abort_intake) = NativeAbortEffectAdapter::bounded(
+        NonZeroUsize::MIN,
+        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+    );
+    drop(adapter);
+    let mut round = TaskRound::new(
+        harness.execution,
+        TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>),
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()),
+    )
+    .with_abort_effect_intake(abort_intake);
+    round.seal_pumps();
+
+    let error = round
+        .turn()
+        .expect_err("a disconnected effect owner cannot be treated as no work");
+    assert!(error.to_string().contains("Abort effect intake closed"));
+}
+
 type TaskRoundForTest = crate::task_execution::round::TaskRound;
+
+fn round_waiting_on_creates(
+    harness: Harness,
+) -> (
+    TaskRoundForTest,
+    crate::task_execution::status_intake::StatusIntakeHandle,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    Vec<OperationIntent>,
+) {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    let expected_creates = harness.execution.graph().tasks().count();
+    let sink = Arc::clone(&harness.sink);
+    let status = harness.execution.intake().handle();
+    let intake = TaskAckIntake::new(Arc::clone(&harness.wake) as Arc<dyn StatusIntakeWake>);
+    let acks = intake.handle();
+    let mut round = TaskRound::new(
+        harness.execution,
+        intake,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default())
+            as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+    round.seal_pumps();
+
+    let mut creates = Vec::new();
+    for _ in 0..8 {
+        if creates.len() == expected_creates {
+            break;
+        }
+        round
+            .turn()
+            .expect("a bounded startup turn releases task work");
+        let released = sink
+            .take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+            .collect::<Vec<_>>();
+        for intent in released {
+            match intent.kind() {
+                OperationKind::AcquireQueryContextAdmissionTicket => {
+                    acks.publish(admission_ack(&intent));
+                }
+                OperationKind::UpdateQueryContext => acks.publish(establish_ack(&intent)),
+                OperationKind::CreateTask => creates.push(intent),
+                kind => panic!("attempt startup unexpectedly released {kind}"),
+            }
+        }
+    }
+    assert_eq!(
+        creates.len(),
+        expected_creates,
+        "every scheduled task must release its exact create"
+    );
+    (round, status, acks, creates)
+}
+
+#[test]
+fn result_pump_gate_remembers_create_ack_after_root_skips_created() {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let harness = Harness::from_graph(graph);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let _projection = round
+        .take_root_status_source()
+        .expect("one result owner takes the root projection");
+    assert!(round.take_root_status_source().is_none());
+
+    let root = round.root_task();
+    let finished = TaskStatus::try_new(
+        root,
+        TaskStatusVersion::new(2).expect("v2"),
+        TaskState::Finished,
+        None,
+        TaskOutputFacts::new(true),
+    )
+    .expect("a valid finished status");
+    assert_eq!(
+        status.publish(StatusEvent::Published(finished)),
+        StatusIntakeAdmission::Enqueued
+    );
+    round
+        .turn()
+        .expect("a terminal root status may race ahead of create ACK");
+    assert!(!round.result_pump_ready());
+
+    for intent in &creates {
+        acks.publish(accepted_create_ack(intent));
+    }
+    round
+        .turn()
+        .expect("the exact create ACK completes the historical gate");
+    assert!(round.result_pump_ready());
+    assert_eq!(
+        round
+            .execution()
+            .task(root.task_id())
+            .expect("the root remains owned")
+            .state(),
+        RemoteTaskState::Terminal,
+        "the gate must not require the transient Created lifecycle state"
+    );
+}
+
+#[test]
+fn root_pending_failure_refines_at_the_same_status_version() {
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let harness = Harness::from_graph(graph);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let _projection = round
+        .take_root_status_source()
+        .expect("the result owner takes one projection");
+    for intent in &creates {
+        acks.publish(accepted_create_ack(intent));
+    }
+    round.turn().expect("all create ACKs settle");
+    assert!(round.result_pump_ready());
+
+    let root = round.root_task();
+    let root_derived = TaskStatus::try_new(
+        root,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Aborted,
+        Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+        TaskOutputFacts::new(false),
+    )
+    .expect("a valid derived terminal");
+    assert_eq!(
+        status.publish(StatusEvent::Published(root_derived)),
+        StatusIntakeAdmission::Enqueued
+    );
+    round
+        .turn()
+        .expect("the root's derived failure is published as pending");
+    assert!(
+        round
+            .failure_cause()
+            .is_some_and(TerminationDetail::is_derived)
+    );
+
+    let origin = round
+        .execution()
+        .graph()
+        .tasks()
+        .map(|task| task.identity())
+        .find(|identity| *identity != root)
+        .expect("the chain has a non-root task");
+    let authoritative =
+        TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
+            novarocks_execution::task_execution::TaskFailureCategory::Execution,
+            novarocks_execution::task_execution::SafeDetail::new("originating failure")
+                .expect("safe detail"),
+        ));
+    let origin_failed = TaskStatus::try_new(
+        origin,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Failed,
+        Some(authoritative.clone()),
+        TaskOutputFacts::new(false),
+    )
+    .expect("a valid originating failure");
+    assert_eq!(
+        status.publish(StatusEvent::Published(origin_failed)),
+        StatusIntakeAdmission::Enqueued
+    );
+    round
+        .turn()
+        .expect("the same root version refines to the authoritative attempt cause");
+    assert_eq!(round.failure_cause(), Some(&authoritative));
+}
+
+#[test]
+fn finished_root_projection_is_refined_by_a_later_attempt_failure() {
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let harness = Harness::from_graph(graph);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let _projection = round
+        .take_root_status_source()
+        .expect("the result owner takes one projection");
+    for intent in &creates {
+        acks.publish(accepted_create_ack(intent));
+    }
+    round.turn().expect("all create ACKs settle");
+
+    let root = round.root_task();
+    let non_roots = round
+        .execution()
+        .graph()
+        .tasks()
+        .map(|task| task.identity())
+        .filter(|identity| *identity != root)
+        .collect::<Vec<_>>();
+    let derived_origin = non_roots[0];
+    let authoritative_origin = *non_roots
+        .get(1)
+        .expect("the chain has another upstream task");
+    let finished = TaskStatus::try_new(
+        root,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Finished,
+        None,
+        TaskOutputFacts::new(true),
+    )
+    .expect("a valid finished root");
+    status.publish(StatusEvent::Published(finished));
+    let derived = TaskStatus::try_new(
+        derived_origin,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Aborted,
+        Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+        TaskOutputFacts::new(false),
+    )
+    .expect("a valid derived upstream terminal");
+    status.publish(StatusEvent::Published(derived));
+    round
+        .turn()
+        .expect("the Finished root is atomically published with a pending attempt failure");
+    assert!(
+        round
+            .failure_cause()
+            .is_some_and(TerminationDetail::is_derived)
+    );
+    assert!(
+        !round.root_success_sealed(),
+        "an upstream derived failure must freeze success until its cause is authoritative"
+    );
+
+    let authoritative =
+        TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
+            novarocks_execution::task_execution::TaskFailureCategory::Execution,
+            novarocks_execution::task_execution::SafeDetail::new("late upstream failure")
+                .expect("safe detail"),
+        ));
+    let origin_failed = TaskStatus::try_new(
+        authoritative_origin,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Failed,
+        Some(authoritative.clone()),
+        TaskOutputFacts::new(false),
+    )
+    .expect("a valid originating failure");
+    status.publish(StatusEvent::Published(origin_failed));
+    round
+        .turn()
+        .expect("the same Finished root snapshot accepts attempt-failure refinement");
+    assert_eq!(round.failure_cause(), Some(&authoritative));
+}
 
 #[test]
 fn a_runner_refuses_to_turn_until_its_per_turn_owners_are_declared() {
@@ -3257,6 +5302,41 @@ fn credential_ack(
         .expect("the state machine releases the permit");
 }
 
+/// Reports that transport lost the outcome of one credential advance.
+fn credential_unknown_ack(
+    execution: &mut QueryTaskExecution,
+    observer: &dyn crate::task_execution::round::AcknowledgementObserver,
+    intent: &OperationIntent,
+) {
+    let ack = OperationAcknowledgement::transport_unknown(
+        intent.operation_id(),
+        OperationKind::UpdateQueryContext,
+    );
+    observer
+        .observe_acknowledgement(&ack)
+        .expect("the rotation owner retains an unknown advance");
+    execution
+        .acknowledge(&ack)
+        .expect("the state machine releases the unknown transport slot");
+}
+
+fn credential_material(intent: &OperationIntent) -> &Arc<dyn ConfidentialContent> {
+    use novarocks_execution::task_execution::operation::{
+        QueryContextDomainUpdate, UpdateQueryContext,
+    };
+
+    let OperationIntent::UpdateQueryContext(request) = intent else {
+        panic!("a credential advance is a context update")
+    };
+    let UpdateQueryContext::AdvanceDomain(advance) = request.as_ref() else {
+        panic!("a rotation is an advance")
+    };
+    let QueryContextDomainUpdate::Credential(update) = advance.domain() else {
+        panic!("a rotation carries the credential domain")
+    };
+    update.material()
+}
+
 fn is_credential_advance(intent: &OperationIntent) -> bool {
     use novarocks_execution::task_execution::operation::{
         QueryContextDomainUpdate, UpdateQueryContext,
@@ -3328,6 +5408,7 @@ fn a_credential_rotation_reaches_every_context_and_is_reported_once() {
         CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
         Arc::clone(&storage),
         clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
     )
     .expect("a refreshable lease means there is something to rotate");
     let mut driver = Arc::clone(&pump);
@@ -3356,7 +5437,43 @@ fn a_credential_rotation_reaches_every_context_and_is_reported_once() {
     );
     assert_eq!(pump.rotations_applied(), 0, "nothing has accepted it yet");
 
-    for intent in &advances {
+    // Lose one acknowledgement and prove the complete immutable request is
+    // replayed. A fresh operation id at the same epoch is not a retry: it is a
+    // second claim on one domain transition.
+    credential_unknown_ack(
+        &mut harness.execution,
+        pump.as_ref() as &dyn AcknowledgementObserver,
+        &advances[0],
+    );
+    driver
+        .drive(&mut harness.execution)
+        .expect("an unknown advance is retried");
+    let retry = harness
+        .released()
+        .into_iter()
+        .filter(is_credential_advance)
+        .collect::<Vec<_>>();
+    assert_eq!(retry.len(), 1, "only the unknown advance is replayed");
+    assert_eq!(
+        retry[0].operation_id(),
+        advances[0].operation_id(),
+        "the retry keeps the original operation identity"
+    );
+    assert!(
+        Arc::ptr_eq(
+            credential_material(&retry[0]),
+            credential_material(&advances[0])
+        ),
+        "the retry keeps the exact credential material"
+    );
+
+    credential_ack(
+        &mut harness.execution,
+        pump.as_ref() as &dyn AcknowledgementObserver,
+        &retry[0],
+        OperationOutcome::Accepted,
+    );
+    for intent in &advances[1..] {
         credential_ack(
             &mut harness.execution,
             pump.as_ref() as &dyn AcknowledgementObserver,
@@ -3406,6 +5523,7 @@ fn a_rotation_that_cannot_be_accepted_before_its_hard_deadline_fails_the_attempt
         CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
         storage,
         clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);
@@ -3428,6 +5546,84 @@ fn a_rotation_that_cannot_be_accepted_before_its_hard_deadline_fails_the_attempt
     assert!(
         error.to_string().contains("stopped being usable"),
         "{error}"
+    );
+}
+
+#[test]
+fn a_provider_success_settled_at_the_hard_deadline_is_not_installed() {
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::round::TurnPump;
+
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let (storage, credential, refresher) = refreshable_credential_storage_with_refresher(60_000);
+    let storage_lease_id = storage.refreshable()[0].0;
+    let before = storage
+        .refresh_source(storage_lease_id)
+        .expect("the lease is refreshable")
+        .0;
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts),
+        Arc::clone(&storage),
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
+    )
+    .expect("a refreshable lease");
+    let mut driver = Arc::clone(&pump);
+
+    driver
+        .drive(&mut harness.execution)
+        .expect("the first turn schedules the soft deadline");
+    clock.advance(Duration::from_secs(120));
+    driver
+        .drive(&mut harness.execution)
+        .expect("the due turn starts the provider call");
+    for _ in 0..600 {
+        if pump.stage_provider_outcome_for_test() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        pump.stage_provider_outcome_for_test(),
+        "the successful provider outcome must be present before time advances"
+    );
+    assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Settlement, not the instant the blocking provider returned, owns the
+    // mutation. Once that turn reaches the hard deadline the successful value
+    // is stale and must be discarded before it can alter either authority.
+    let hard_deadline = pump
+        .provider_hard_deadline_for_test()
+        .expect("the finished provider call retains its hard deadline");
+    clock.set(hard_deadline.since_origin());
+    let error = driver
+        .drive(&mut harness.execution)
+        .expect_err("a late provider success fails closed");
+    assert!(error.to_string().contains("answered after"), "{error}");
+
+    let after = storage
+        .refresh_source(storage_lease_id)
+        .expect("the original lease remains installed")
+        .0;
+    assert_eq!(after.epoch(), before.epoch(), "storage epoch must not move");
+    assert_eq!(
+        after.not_after_unix_ms(),
+        before.not_after_unix_ms(),
+        "storage material must not be replaced"
+    );
+    assert_eq!(
+        pump.minted_epoch(),
+        CredentialEpoch::FIRST,
+        "the credential domain epoch must not be minted"
     );
 }
 
@@ -3455,6 +5651,7 @@ fn a_wiped_rotation_owner_stops_driving_the_credential_domain() {
         CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
         storage,
         clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);
@@ -3497,6 +5694,7 @@ fn a_context_that_is_already_over_is_retired_rather_than_failing_the_rotation() 
         CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
         storage,
         clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);

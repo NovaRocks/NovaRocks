@@ -175,7 +175,7 @@ pub fn validate_credential_lease_descriptors(
             })?;
         let has_vended_data_binding = owner.credential_bindings().iter().any(|binding| {
             binding.purpose() == CatalogCredentialPurpose::ObjectStoreData
-                && binding.consumer_role() == CredentialConsumerRole::FrontendAndBackend
+                && binding.consumer_role() == CredentialConsumerRole::Backend
                 && matches!(binding.mode(), CatalogCredentialMode::Vended)
         });
         if !has_vended_data_binding {

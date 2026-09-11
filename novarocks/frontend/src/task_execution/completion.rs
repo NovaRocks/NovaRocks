@@ -29,22 +29,24 @@
 //!   or abort was latched. It does not wait for upstream tasks to finish
 //!   standing down, which is what makes a `LIMIT` return without waiting on
 //!   whatever was still scanning.
-//! * A **write** gets none of that. Every writer and the root finish task must
-//!   be `FINISHED`, the prepared write set must be complete, and the external
-//!   commit must have succeeded. A cancelled writer can never be counted as
-//!   success, because a write that stood down early published less than the
-//!   statement asked for.
+//! * A **write** combines two independent proofs. Every writer must reach a
+//!   success-compatible terminal and the root finish task must be `FINISHED`;
+//!   separately, the root relation must yield a complete prepared write set.
+//!   `TableFinish` emits that set only after every writer sender reached EOS,
+//!   so a writer canceled by downstream release after that point cannot erase
+//!   the receiver-side proof that its output arrived. The external commit must
+//!   then succeed.
 //!
 //! Draining the attempt is a third, separate question owned by
-//! [`AttemptDrainFacts`](novarocks_execution::task_execution::AttemptDrainFacts):
+//! [`AttemptDrainFacts`](novarocks_query_application::coordination::AttemptDrainFacts):
 //! it closes internal resources and never gates a completion that has already
 //! been linearized.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use novarocks_execution::task_execution::{
-    FinalTaskInfo, ResultPacketVerdict, RootResultStream, TaskIdentity, TaskState, TaskStatus,
-    verify_final_info,
+use novarocks_execution::task_execution::{FinalTaskInfo, TaskIdentity, TaskState, TaskStatus};
+use novarocks_query_application::coordination::{
+    ResultPacketVerdict, RootResultStream, verify_final_info,
 };
 
 use super::error::TaskExecutionError;
@@ -161,10 +163,6 @@ pub enum WriteVerdict {
         task: TaskIdentity,
         state: TaskState,
     },
-    /// A writer stood down normally. That is compatible with a read's early
-    /// completion and never with a write: rows it had not written yet are
-    /// simply missing.
-    WriterCanceled(TaskIdentity),
     /// A task outside the declared writer set reported writer facts, so the
     /// declared set is not the real one and "every writer finished" cannot be
     /// decided from it.
@@ -174,6 +172,36 @@ pub enum WriteVerdict {
 impl WriteVerdict {
     pub const fn is_complete(self) -> bool {
         matches!(self, Self::Complete)
+    }
+
+    /// Whether this verdict can still become complete from a later status.
+    ///
+    /// Silence and live task states are pending. Every other non-complete
+    /// verdict is already conclusive and must fail the statement immediately;
+    /// waiting for a deadline cannot produce a different terminal fact.
+    pub const fn is_pending(self) -> bool {
+        matches!(
+            self,
+            Self::TaskNotFinished { state, .. } if !state.is_terminal()
+        )
+    }
+}
+
+impl std::fmt::Display for WriteVerdict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Complete => formatter.write_str("complete"),
+            Self::AttemptFailed => formatter.write_str("attempt failed"),
+            Self::TaskNotFinished { task, state } => {
+                write!(formatter, "task {task} is {state}")
+            }
+            Self::UndeclaredWriter(task) => {
+                write!(
+                    formatter,
+                    "undeclared writer task {task} reported write facts"
+                )
+            }
+        }
     }
 }
 
@@ -188,8 +216,7 @@ impl WriteVerdict {
 pub struct WriteCompletionTracker {
     writers: BTreeSet<TaskIdentity>,
     root_finish: TaskIdentity,
-    states: BTreeMap<TaskIdentity, TaskState>,
-    canceled_writers: BTreeSet<TaskIdentity>,
+    statuses: BTreeMap<TaskIdentity, TaskStatus>,
     undeclared_writers: BTreeSet<TaskIdentity>,
 }
 
@@ -212,8 +239,7 @@ impl WriteCompletionTracker {
         Ok(Self {
             writers,
             root_finish,
-            states: BTreeMap::new(),
-            canceled_writers: BTreeSet::new(),
+            statuses: BTreeMap::new(),
             undeclared_writers: BTreeSet::new(),
         })
     }
@@ -235,10 +261,7 @@ impl WriteCompletionTracker {
         let identity = status.identity();
         let is_declared = self.writers.contains(&identity) || identity == self.root_finish;
         if is_declared {
-            self.states.insert(identity, status.state());
-            if self.writers.contains(&identity) && status.state() == TaskState::Canceled {
-                self.canceled_writers.insert(identity);
-            }
+            self.statuses.insert(identity, status.clone());
             return;
         }
         if status.writer().is_some() {
@@ -258,20 +281,37 @@ impl WriteCompletionTracker {
         if let Some(&undeclared) = self.undeclared_writers.iter().next() {
             return WriteVerdict::UndeclaredWriter(undeclared);
         }
-        if let Some(&canceled) = self.canceled_writers.iter().next() {
-            return WriteVerdict::WriterCanceled(canceled);
-        }
-        for task in self.writers.iter().copied().chain([self.root_finish]) {
+        for task in self.writers.iter().copied() {
             // An unobserved task is `PLANNED` here rather than absent: not
             // having heard from a writer is not evidence that it finished.
-            let state = self
-                .states
-                .get(&task)
-                .copied()
-                .unwrap_or(TaskState::Planned);
-            if state != TaskState::Finished {
-                return WriteVerdict::TaskNotFinished { task, state };
+            let Some(status) = self.statuses.get(&task) else {
+                return WriteVerdict::TaskNotFinished {
+                    task,
+                    state: TaskState::Planned,
+                };
+            };
+            if status.state() == TaskState::Finished {
+                continue;
             }
+            if status.state() == TaskState::Canceled {
+                if status.is_success_compatible_terminal() {
+                    continue;
+                }
+            }
+            return WriteVerdict::TaskNotFinished {
+                task,
+                state: status.state(),
+            };
+        }
+        let root_state = self
+            .statuses
+            .get(&self.root_finish)
+            .map_or(TaskState::Planned, TaskStatus::state);
+        if root_state != TaskState::Finished {
+            return WriteVerdict::TaskNotFinished {
+                task: self.root_finish,
+                state: root_state,
+            };
         }
         WriteVerdict::Complete
     }
@@ -295,10 +335,11 @@ mod tests {
     use super::{ReadCompletionTracker, ReadVerdict, WriteCompletionTracker, WriteVerdict};
     use crate::task_execution::error::TaskExecutionError;
     use novarocks_execution::task_execution::{
-        AbortCause, CancelReason, FinalTaskInfo, IdentityField, IdentityMismatch,
-        ResultPacketVerdict, TaskIdentity, TaskOutputFacts, TaskState, TaskStatus,
-        TaskStatusVersion, TaskWriterFacts, TerminationDetail,
+        AbortCause, CancelReason, FinalTaskInfo, IdentityField, IdentityMismatch, TaskIdentity,
+        TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TaskWriterFacts,
+        TerminationDetail,
     };
+    use novarocks_query_application::coordination::ResultPacketVerdict;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
@@ -496,22 +537,52 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_writer_can_never_be_counted_as_a_successful_write() {
+    fn a_success_compatible_writer_cancel_is_accepted_by_the_task_half() {
         let backend = BackendProcessId::new_v7();
         let writer = identity(2, 1, backend);
         let root = identity(1, 3, backend);
         let mut tracker =
             WriteCompletionTracker::try_new(root, [writer]).expect("a declared writer set");
 
-        // The exact shape a read is allowed to succeed through: a normal
-        // upstream stand-down. For a write it means rows that were never
-        // written.
+        // The task verdict is only one half of the write gate. This normal
+        // stand-down is accepted here because the other half -- a complete
+        // Root prepared set -- can exist only after this writer's sender
+        // reached EOS.
         tracker.observe_status(&status(writer, 2, TaskState::Canceled));
-        tracker.observe_status(&status(root, 3, TaskState::Finished));
         assert_eq!(
             tracker.execution_verdict(false),
-            WriteVerdict::WriterCanceled(writer)
+            WriteVerdict::TaskNotFinished {
+                task: root,
+                state: TaskState::Planned,
+            },
+            "a normal writer cancel is not sufficient without the Root terminal"
         );
+        tracker.observe_status(&status(root, 3, TaskState::Finished));
+        assert!(tracker.execution_verdict(false).is_complete());
+    }
+
+    #[test]
+    fn a_writer_cancel_with_redundant_output_evidence_is_also_accepted() {
+        let backend = BackendProcessId::new_v7();
+        let writer = identity(2, 1, backend);
+        let root = identity(1, 3, backend);
+        let mut tracker =
+            WriteCompletionTracker::try_new(root, [writer]).expect("a declared writer set");
+
+        let completed_then_canceled = TaskStatus::try_new(
+            writer,
+            TaskStatusVersion::new(2).expect("nonzero version"),
+            TaskState::Canceled,
+            Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+            TaskOutputFacts::new(true),
+        )
+        .expect("a legal terminal");
+        tracker.observe_status(&completed_then_canceled);
+        tracker.observe_status(&status(root, 3, TaskState::Finished));
+
+        assert!(tracker.execution_verdict(false).is_complete());
     }
 
     #[test]
@@ -562,6 +633,37 @@ mod tests {
         // would call it complete.
         assert!(tracker.execution_verdict(false).is_complete());
         assert_eq!(tracker.execution_verdict(true), WriteVerdict::AttemptFailed);
+    }
+
+    #[test]
+    fn only_live_or_absent_task_states_are_pending_write_verdicts() {
+        let task = identity(2, 1, BackendProcessId::new_v7());
+        for state in [
+            TaskState::Planned,
+            TaskState::Running,
+            TaskState::Flushing,
+            TaskState::Canceling,
+            TaskState::Aborting,
+            TaskState::Failing,
+        ] {
+            assert!(
+                WriteVerdict::TaskNotFinished { task, state }.is_pending(),
+                "{state} may still publish a later terminal"
+            );
+        }
+        for state in [
+            TaskState::Finished,
+            TaskState::Canceled,
+            TaskState::Aborted,
+            TaskState::Failed,
+        ] {
+            assert!(
+                !WriteVerdict::TaskNotFinished { task, state }.is_pending(),
+                "{state} is conclusive"
+            );
+        }
+        assert!(!WriteVerdict::AttemptFailed.is_pending());
+        assert!(!WriteVerdict::UndeclaredWriter(task).is_pending());
     }
 
     #[test]

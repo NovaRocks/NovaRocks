@@ -200,15 +200,12 @@ fn build_iceberg_control_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
-    let binding = crate::composition::compose_iceberg_access_template(
-        config,
-        runtime.clone(),
-        ClusterRole::Fe,
-    )?;
+    let metadata_binding =
+        crate::composition::compose_iceberg_metadata_access_template(config, runtime.clone())?;
     let max_inflight = NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight)
         .ok_or_else(|| anyhow::anyhow!("catalog materialization max inflight must be nonzero"))?;
     Ok(Arc::new(IcebergControlRoleBindingFactory::new(
-        IcebergMetadataResources::new(binding, runtime),
+        IcebergMetadataResources::new(metadata_binding, runtime),
         max_inflight,
     )))
 }

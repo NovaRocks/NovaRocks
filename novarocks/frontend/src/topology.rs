@@ -31,13 +31,16 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
 use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, NativeEndpoint};
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 
 use crate::common::backend_topology::{
-    BackendTopologyError, BackendTopologyMetricsSnapshot, BackendTopologyPort,
-    BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
+    BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+    BackendTopologyMetricsSnapshot, BackendTopologyPort, BackendTopologySnapshot,
+    BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
     publish_backend_topology_metrics,
 };
 use crate::metrics::{record_backend_announce, record_backend_heartbeat};
@@ -244,6 +247,7 @@ struct BackendFacts {
     /// A stale old process may not reclaim it by announcing again.
     superseded: bool,
     num_cores: u32,
+    admission_epoch_capability: Option<AdmissionEpochCapability>,
     last_heartbeat_ms: i64,
     missed_heartbeats: u32,
     scheduled_fragments: u64,
@@ -257,6 +261,7 @@ impl BackendFacts {
             && self.reported_state == BackendReportedState::Running
             && self.compatibility.is_compatible()
             && self.endpoint_owned
+            && self.admission_epoch_capability.is_some()
     }
 }
 
@@ -290,6 +295,7 @@ pub(crate) struct ClusterBackendService {
     heartbeat_signal: Mutex<HeartbeatSignal>,
     heartbeat_wake: Condvar,
     topology_wake: Condvar,
+    process_epoch: watch::Sender<u64>,
     #[cfg(test)]
     _test_runtime_owner: Option<Arc<tokio::runtime::Runtime>>,
 }
@@ -311,9 +317,12 @@ impl ClusterBackendService {
             return Err("role=be must not open ClusterBackendService".to_string());
         }
         let heartbeat_runtime = data_runtime.clone();
+        let heartbeat_timeout = config.heartbeat_interval();
         let service = Arc::new(Self::new(
             &config,
-            move |endpoint, process_id| native_heartbeat(&heartbeat_runtime, process_id, endpoint),
+            move |endpoint, process_id| {
+                native_heartbeat(&heartbeat_runtime, process_id, endpoint, heartbeat_timeout)
+            },
             move |endpoint| data_runtime.invalidate_channel(endpoint),
         ));
         let _ = runtime;
@@ -328,6 +337,7 @@ impl ClusterBackendService {
         F: Fn(RuntimeEndpoint, BackendProcessId) -> HeartbeatOutcome + Send + Sync + 'static,
         I: Fn(&NativeEndpoint) + Send + Sync + 'static,
     {
+        let (process_epoch, _) = watch::channel(0);
         Self {
             state: Mutex::new(TopologyState {
                 timeout_retries: config.heartbeat_timeout_retries(),
@@ -350,6 +360,7 @@ impl ClusterBackendService {
             }),
             heartbeat_wake: Condvar::new(),
             topology_wake: Condvar::new(),
+            process_epoch,
             #[cfg(test)]
             _test_runtime_owner: None,
         }
@@ -373,9 +384,12 @@ impl ClusterBackendService {
         );
         let handle = runtime.handle().clone();
         let data_runtime = FrontendDataRuntime::new(handle);
+        let heartbeat_timeout = config.heartbeat_interval();
         let mut service = Self::new(
             &config,
-            move |endpoint, process_id| native_heartbeat(&data_runtime, process_id, endpoint),
+            move |endpoint, process_id| {
+                native_heartbeat(&data_runtime, process_id, endpoint, heartbeat_timeout)
+            },
             |_| {},
         );
         service._test_runtime_owner = Some(runtime);
@@ -404,6 +418,7 @@ impl ClusterBackendService {
                     endpoint_owned: true,
                     superseded: false,
                     num_cores: 0,
+                    admission_epoch_capability: Some(target.admission_epoch_capability()),
                     last_heartbeat_ms: 0,
                     missed_heartbeats: 0,
                     scheduled_fragments: 0,
@@ -480,6 +495,7 @@ impl ClusterBackendService {
                 endpoint_owned,
                 superseded: false,
                 num_cores: 0,
+                admission_epoch_capability: None,
                 last_heartbeat_ms: 0,
                 missed_heartbeats: 0,
                 scheduled_fragments: 0,
@@ -532,7 +548,46 @@ impl ClusterBackendService {
         Ok(())
     }
 
-    pub(crate) fn stop_heartbeat_manager(&self) -> Result<(), String> {
+    pub(crate) async fn stop_heartbeat_manager_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        self.request_heartbeat_stop_for_process_exit()?;
+        loop {
+            let finished = self
+                .heartbeat_thread
+                .lock()
+                .map_err(|_| "lock frontend topology heartbeat thread failed".to_string())?
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "frontend heartbeat manager did not stop before the shared shutdown deadline"
+                        .to_string(),
+                );
+            }
+            tokio::time::sleep(
+                Duration::from_millis(10)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            )
+            .await;
+        }
+        let join = self
+            .heartbeat_thread
+            .lock()
+            .map_err(|_| "lock frontend topology heartbeat thread failed".to_string())?
+            .take();
+        if let Some(join) = join {
+            join.join()
+                .map_err(|payload| format!("frontend heartbeat manager panicked: {payload:?}"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request_heartbeat_stop_for_process_exit(&self) -> Result<(), String> {
         {
             let mut signal = self
                 .heartbeat_signal
@@ -542,15 +597,6 @@ impl ClusterBackendService {
             signal.generation = signal.generation.wrapping_add(1);
         }
         self.heartbeat_wake.notify_all();
-        if let Some(join) = self
-            .heartbeat_thread
-            .lock()
-            .map_err(|_| "lock frontend topology heartbeat thread failed".to_string())?
-            .take()
-        {
-            join.join()
-                .map_err(|payload| format!("frontend heartbeat manager panicked: {payload:?}"))?;
-        }
         Ok(())
     }
 
@@ -572,12 +618,14 @@ impl ClusterBackendService {
                             descriptor,
                             reported_state,
                             num_cores,
+                            admission_epoch_capability,
                             now_ms,
                         } => self.record_heartbeat_success(
                             process_id,
                             descriptor,
                             reported_state,
                             num_cores,
+                            admission_epoch_capability,
                             now_ms,
                         ),
                         HeartbeatOutcome::Failed { err } => {
@@ -649,6 +697,7 @@ impl ClusterBackendService {
         descriptor: BackendProcessDescriptor,
         reported_state: BackendReportedState,
         num_cores: u32,
+        admission_epoch_capability: AdmissionEpochCapability,
         now_ms: i64,
     ) {
         self.refresh_expired_announce_leases(std::time::Instant::now());
@@ -704,6 +753,7 @@ impl ClusterBackendService {
             facts.compatibility = compatibility;
             facts.endpoint_owned = endpoint_owned;
             facts.num_cores = num_cores;
+            facts.admission_epoch_capability = Some(admission_epoch_capability);
             facts.last_heartbeat_ms = now_ms;
             facts.missed_heartbeats = 0;
             facts.last_err = None;
@@ -755,11 +805,12 @@ impl ClusterBackendService {
     }
 
     fn publish_snapshot(&self) {
-        let metrics = {
+        let (metrics, revision) = {
             let state = self.state.lock().unwrap();
-            metrics_snapshot(&state)
+            (metrics_snapshot(&state), state.revision)
         };
         publish_backend_topology_metrics(metrics);
+        self.process_epoch.send_replace(revision);
         self.topology_wake.notify_all();
     }
 
@@ -830,6 +881,10 @@ impl BackendTopologyPort for ClusterBackendService {
         self.refresh_expired_announce_leases(std::time::Instant::now());
         self.snapshot_inner()
     }
+
+    fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.process_epoch.subscribe()
+    }
     fn validate_snapshot(
         &self,
         expected: &BackendTopologySnapshot,
@@ -887,6 +942,7 @@ impl BackendTopologyPort for ClusterBackendService {
             },
         )
     }
+
     fn wait_for_eligible_after(
         &self,
         revision: u64,
@@ -1018,6 +1074,48 @@ impl BackendTopologyPort for ClusterBackendService {
     }
 }
 
+impl BackendProcessObservationPort for ClusterBackendService {
+    fn subscribe_process_changes(&self) -> watch::Receiver<u64> {
+        self.process_epoch.subscribe()
+    }
+
+    fn observe_process_at_endpoint(
+        &self,
+        expected_process: BackendProcessId,
+        expected_endpoint: &RuntimeEndpoint,
+    ) -> Result<BackendProcessObservation, BackendTopologyError> {
+        self.refresh_expired_announce_leases(std::time::Instant::now());
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| BackendTopologyError::Unavailable {
+                message: "lock frontend topology failed".to_string(),
+            })?;
+        if let Some(message) = &state.terminal_error {
+            return Err(BackendTopologyError::Unavailable {
+                message: message.clone(),
+            });
+        }
+        let Some(current_process) = state.endpoint_owners.get(expected_endpoint).copied() else {
+            return Ok(BackendProcessObservation::Unobservable);
+        };
+        if current_process != expected_process {
+            return Ok(BackendProcessObservation::Replaced { current_process });
+        }
+        Ok(
+            if state
+                .processes
+                .get(&expected_process)
+                .is_some_and(BackendFacts::eligible)
+            {
+                BackendProcessObservation::Current
+            } else {
+                BackendProcessObservation::Unobservable
+            },
+        )
+    }
+}
+
 fn latched_reported_state(
     current: BackendReportedState,
     observed: BackendReportedState,
@@ -1082,7 +1180,13 @@ fn live_targets(state: &TopologyState) -> Vec<LiveBackendTarget> {
         .filter(|facts| facts.eligible())
         .enumerate()
         .map(|(membership_ordinal, facts)| {
-            LiveBackendTarget::new(membership_ordinal, facts.descriptor.clone())
+            LiveBackendTarget::new(
+                membership_ordinal,
+                facts.descriptor.clone(),
+                facts
+                    .admission_epoch_capability
+                    .expect("eligible backend has an admission epoch capability"),
+            )
         })
         .collect()
 }
@@ -1123,7 +1227,12 @@ fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
 /// invalid deployment.
 fn advance_if_membership_changed(
     state: &mut TopologyState,
-    before: BTreeSet<(BackendProcessId, RuntimeEndpoint, u8)>,
+    before: BTreeSet<(
+        BackendProcessId,
+        RuntimeEndpoint,
+        u8,
+        Option<AdmissionEpochCapability>,
+    )>,
 ) -> Result<bool, String> {
     if before == revision_members(state) {
         return Ok(false);
@@ -1139,7 +1248,14 @@ fn advance_if_membership_changed(
     Ok(true)
 }
 
-fn revision_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, RuntimeEndpoint, u8)> {
+fn revision_members(
+    state: &TopologyState,
+) -> BTreeSet<(
+    BackendProcessId,
+    RuntimeEndpoint,
+    u8,
+    Option<AdmissionEpochCapability>,
+)> {
     state
         .processes
         .iter()
@@ -1154,7 +1270,7 @@ fn revision_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, Runtim
             };
             descriptor_runtime_endpoint(&facts.descriptor)
                 .ok()
-                .map(|endpoint| (*id, endpoint, category))
+                .map(|endpoint| (*id, endpoint, category, facts.admission_epoch_capability))
         })
         .collect()
 }
@@ -1162,7 +1278,10 @@ fn revision_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, Runtim
 #[cfg(test)]
 mod tests {
     use super::{BackendIslandSnapshotReader, ClusterBackendService};
-    use crate::common::backend_topology::BackendTopologyPort;
+    use crate::common::backend_topology::{
+        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyPort,
+    };
+    use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
     use novarocks_types::BackendProcessId;
@@ -1197,9 +1316,42 @@ mod tests {
             descriptor.clone(),
             BackendReportedState::Running,
             2,
+            AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("nonzero epoch"),
             1,
         );
     }
+
+    #[tokio::test]
+    async fn shared_deadline_retains_the_same_heartbeat_join_for_retry() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            release_rx.recv().expect("release heartbeat test worker");
+        });
+        *service.heartbeat_thread.lock().unwrap() = Some(join);
+
+        let error = service
+            .stop_heartbeat_manager_until(
+                std::time::Instant::now() + std::time::Duration::from_millis(20),
+            )
+            .await
+            .expect_err("stuck heartbeat worker must honor the shared deadline");
+        assert!(error.contains("shared shutdown deadline"));
+        assert!(service.heartbeat_thread.lock().unwrap().is_some());
+
+        release_tx.send(()).unwrap();
+        service
+            .stop_heartbeat_manager_until(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("retry joins the retained heartbeat worker");
+        assert!(service.heartbeat_thread.lock().unwrap().is_none());
+        tokio::task::spawn_blocking(move || drop(service))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn announcement_is_not_eligible_until_exact_pull() {
         let service = ClusterBackendService::new_transient_for_test(1);
@@ -1210,6 +1362,36 @@ mod tests {
         assert!(service.snapshot().unwrap().targets().is_empty());
         verify(&service, &descriptor);
         assert_eq!(service.snapshot().unwrap().targets().len(), 1);
+    }
+
+    #[test]
+    fn admission_epoch_rotation_advances_the_frozen_topology_revision() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let descriptor = descriptor("127.0.0.1:9079".parse().unwrap());
+        service
+            .record_announce(descriptor.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &descriptor);
+        let first = service.snapshot().expect("first eligible snapshot");
+        let first_revision = first.revision();
+        let first_epoch = first.targets()[0].admission_epoch_capability();
+        let next_epoch =
+            AdmissionEpochCapability::try_from_bytes([0x62; 16]).expect("nonzero next epoch");
+
+        service.record_heartbeat_success(
+            descriptor.process_id().unwrap(),
+            descriptor,
+            BackendReportedState::Running,
+            2,
+            next_epoch,
+            2,
+        );
+
+        let second = service.snapshot().expect("rotated eligible snapshot");
+        assert!(second.revision() > first_revision);
+        assert_ne!(first_epoch, next_epoch);
+        assert_eq!(second.targets()[0].admission_epoch_capability(), next_epoch);
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -1298,6 +1480,48 @@ mod tests {
                 .process_id()
                 .unwrap(),
             new.process_id().unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_process_replacement_closes_an_unobservable_endpoint_owner() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let endpoint = "127.0.0.1:9070".parse().unwrap();
+        let old = descriptor(endpoint);
+        let old_process = old.process_id().unwrap();
+        let runtime_endpoint = super::descriptor_runtime_endpoint(&old).unwrap();
+        service
+            .record_announce(old.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &old);
+        assert_eq!(
+            service
+                .observe_process_at_endpoint(old_process, &runtime_endpoint)
+                .unwrap(),
+            BackendProcessObservation::Current
+        );
+
+        assert!(service.record_heartbeat_failure(old_process));
+        assert_eq!(
+            service
+                .observe_process_at_endpoint(old_process, &runtime_endpoint)
+                .unwrap(),
+            BackendProcessObservation::Unobservable
+        );
+
+        let replacement = descriptor(endpoint);
+        let replacement_process = replacement.process_id().unwrap();
+        service
+            .record_announce(replacement.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &replacement);
+        assert_eq!(
+            service
+                .observe_process_at_endpoint(old_process, &runtime_endpoint)
+                .unwrap(),
+            BackendProcessObservation::Replaced {
+                current_process: replacement_process,
+            }
         );
     }
 
@@ -1435,6 +1659,7 @@ mod tests {
             descriptor,
             BackendReportedState::Running,
             2,
+            AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("nonzero epoch"),
             2,
         );
 

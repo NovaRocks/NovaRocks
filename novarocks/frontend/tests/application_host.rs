@@ -52,7 +52,7 @@ fn test_native_trust() -> Arc<NativeTrust> {
 }
 
 fn execution_config() -> FrontendExecutionConfig {
-    FrontendExecutionConfig::new(
+    FrontendExecutionConfig::new_for_test(
         "127.0.0.1",
         19090,
         std::num::NonZeroUsize::new(1).unwrap(),
@@ -198,7 +198,7 @@ fn sqlite_config(_temp: &TempDir) -> novarocks_frontend::StateStoreHostInput {
 
 #[tokio::test]
 async fn host_exposes_one_statistics_service_identity() {
-    let host = open_host(Some(state_store_input())).await.expect("host");
+    let mut host = open_host(Some(state_store_input())).await.expect("host");
     let first = host.statistics_application_service();
     let second = host.statistics_application_service();
     assert!(Arc::ptr_eq(&first, &second));
@@ -212,7 +212,7 @@ async fn host_exposes_one_statistics_service_identity() {
 
 #[tokio::test]
 async fn host_exposes_one_dml_service_identity() {
-    let host = open_host(Some(state_store_input())).await.expect("host");
+    let mut host = open_host(Some(state_store_input())).await.expect("host");
     let first = host.dml_service();
     let second = host.dml_service();
     assert!(Arc::ptr_eq(&first, &second));
@@ -222,11 +222,11 @@ async fn host_exposes_one_dml_service_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_host_reopens_without_a_dml_recovery_surface() {
     let config = state_store_input();
-    let host = open_host(Some(config.clone())).await.expect("first host");
+    let mut host = open_host(Some(config.clone())).await.expect("first host");
     let first = host.dml_service();
     host.shutdown().await.expect("first shutdown");
 
-    let reopened = open_host(Some(config)).await.expect("reopened host");
+    let mut reopened = open_host(Some(config)).await.expect("reopened host");
     assert!(!Arc::ptr_eq(&first, &reopened.dml_service()));
     reopened.shutdown().await.expect("reopened shutdown");
 }
@@ -243,7 +243,7 @@ async fn fe_without_state_store_fails_before_durable_services_open() {
     )
     .await
     {
-        Ok(host) => {
+        Ok(mut host) => {
             host.shutdown().await.expect("shutdown unexpected FE host");
             panic!("role=fe must not open durable services without StateStore");
         }
@@ -256,7 +256,7 @@ async fn fe_without_state_store_fails_before_durable_services_open() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_host_opens_store_with_single_fe_view() {
-    let host = open_host(Some(state_store_input()))
+    let mut host = open_host(Some(state_store_input()))
         .await
         .expect("test StateStore host must open");
 
@@ -291,7 +291,7 @@ async fn unregistered_provider_fails_before_store_open() {
     )
     .await
     {
-        Ok(host) => {
+        Ok(mut host) => {
             host.shutdown().await.expect("shutdown unexpected host");
             panic!("an unregistered test provider must fail before store I/O");
         }
@@ -303,7 +303,7 @@ async fn unregistered_provider_fails_before_store_open() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_open_releases_partial_resources() {
-    let host = open_host(Some(state_store_input()))
+    let mut host = open_host(Some(state_store_input()))
         .await
         .expect("test provider opens without retaining partial resources");
     host.shutdown()
@@ -314,14 +314,14 @@ async fn failed_open_releases_partial_resources() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_releases_sqlite_deployment_lock() {
     let config = state_store_input();
-    let host = open_host(Some(config.clone()))
+    let mut host = open_host(Some(config.clone()))
         .await
         .expect("first SQLite host must open");
 
     host.shutdown()
         .await
         .expect("host shutdown must release the SQLite deployment lock");
-    let reopened = open_host(Some(config))
+    let mut reopened = open_host(Some(config))
         .await
         .expect("SQLite deployment must reopen after shutdown");
     reopened
@@ -334,11 +334,11 @@ async fn shutdown_releases_sqlite_deployment_lock() {
 async fn shared_test_provider_allows_multiple_live_hosts() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = open_host(Some(config.clone()))
+    let mut host = open_host(Some(config.clone()))
         .await
         .expect("first SQLite host must open");
 
-    let second = open_host(Some(config.clone()))
+    let mut second = open_host(Some(config.clone()))
         .await
         .expect("shared test provider permits a second live host");
     second.shutdown().await.expect("second host shutdown");
@@ -346,7 +346,7 @@ async fn shared_test_provider_allows_multiple_live_hosts() {
     host.shutdown()
         .await
         .expect("first host shutdown must succeed");
-    let reopened = open_host(Some(config))
+    let mut reopened = open_host(Some(config))
         .await
         .expect("same test deployment reopens after explicit shutdown");
     reopened
@@ -359,7 +359,7 @@ async fn shared_test_provider_allows_multiple_live_hosts() {
 async fn configured_host_does_not_restore_local_views_after_reopen() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = open_host(Some(config.clone()))
+    let mut host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open");
     execute_view_statement(
@@ -382,7 +382,7 @@ async fn configured_host_does_not_restore_local_views_after_reopen() {
     // A local view is process runtime state even when the host has a
     // StateStore: the frontend is its only authority, so the view ends with the
     // incarnation that defined it. Durable views live in an external catalog.
-    let reopened = open_host(Some(config))
+    let mut reopened = open_host(Some(config))
         .await
         .expect("configured host must reopen");
     let mut query = parse_query("SELECT * FROM local_view");
@@ -398,7 +398,7 @@ async fn configured_host_does_not_restore_local_views_after_reopen() {
 async fn legacy_maintenance_and_gc_observation_records_do_not_block_host_open() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
-    let host = open_host(Some(config.clone()))
+    let mut host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open");
     let store = host.state_store().expect("configured host state store");
@@ -439,7 +439,7 @@ async fn legacy_maintenance_and_gc_observation_records_do_not_block_host_open() 
     host.shutdown().await.expect("seed host shutdown");
 
     for _ in 0..2 {
-        let reopened = open_host(Some(config.clone()))
+        let mut reopened = open_host(Some(config.clone()))
             .await
             .expect("legacy maintenance and corrupt GC observation data must not block host open");
         reopened.shutdown().await.expect("reopened host shutdown");

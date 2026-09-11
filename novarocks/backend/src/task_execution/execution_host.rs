@@ -26,7 +26,7 @@
 //! install_receiver          decode + prepare_fragment -> dormant handle
 //! install_inbound_capability register the descriptor for frame admission
 //! apply_task_domain         initial splits / edge opens / filters
-//! submit_runnable           start the dormant handle on its own thread
+//! submit_runnable           start and attach the dormant handle
 //! ```
 //!
 //! The dormant handle is what makes that split honest. Receiver registration
@@ -35,13 +35,13 @@
 //! [`DormantFragmentHandle`]. So `install_receiver` prepares the whole
 //! fragment and parks the handle; `remove_receiver` drops it, and the
 //! `FragmentResources` it owns roll every registration back. `submit_runnable`
-//! is the only step that can start a thread, and it runs last.
+//! is the only step that starts the prepared execution, and it runs last.
 //!
 //! This host reads nothing from the fragment-based lifecycle registry. Every
 //! query-scoped fact it needs arrives through [`TaskQueryContextFacts`], which
 //! the query context half of execution implements.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -64,15 +64,13 @@ use novarocks_execution::runtime::operator_statistics::project_operator_statisti
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_execution::task_execution::descriptor::{
-    ExchangeSource, IngressRejection, TaskDescriptor,
-};
-use novarocks_execution::task_execution::domain::{
+use novarocks_execution_contract::task_execution::descriptor::{ExchangeSource, TaskDescriptor};
+use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ContentFingerprint, DomainVersion,
 };
-use novarocks_execution::task_execution::identity::TaskIdentity;
-use novarocks_execution::task_execution::operation::TaskDomainUpdate;
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
 };
 use novarocks_proto_codec::connector_read::{
@@ -85,6 +83,7 @@ use novarocks_spi::connector::{
 use novarocks_task_codec::domain::{WireContent, stored_message};
 use novarocks_task_codec::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
 use novarocks_types::{QueryExecutionId, UniqueId};
+use novarocks_worker::{IngressRejection, authorize_inbound_frame};
 use tracing::debug;
 
 use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
@@ -97,6 +96,7 @@ use crate::fragment::ingress::{ReceivedReadSplit, TypedReadAttemptContext};
 use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 
+use super::completion::{TaskCompletionSignal, TaskCompletionSupervisor};
 use super::fault;
 use super::host::{HostRejection, RunnableTask, TaskExecutionHost};
 use super::shared_facts::fragment_plan;
@@ -230,8 +230,18 @@ pub trait TaskQueryContextFacts: Send + Sync {
 /// Installation is exclusive on that key: two live tasks sharing one kernel
 /// key would make a frame ambiguous, and no later check could disambiguate it.
 #[derive(Debug, Default)]
+struct TaskInboundCapabilityState {
+    installed: HashMap<UniqueId, Arc<TaskDescriptor>>,
+    /// A descriptor carries no frontend process identity. The registry owns
+    /// that mapping and permits only one context for a query execution, so the
+    /// execution identity is the complete key this data-plane owner can and
+    /// must fence.
+    closed_executions: HashSet<QueryExecutionId>,
+}
+
+#[derive(Debug, Default)]
 pub struct TaskInboundCapabilities {
-    installed: Mutex<HashMap<UniqueId, Arc<TaskDescriptor>>>,
+    state: Mutex<TaskInboundCapabilityState>,
 }
 
 /// The task and the frozen source one admitted frame belongs to.
@@ -271,11 +281,22 @@ impl TaskInboundCapabilities {
         sender_count: u32,
     ) -> Result<InboundFrameAdmission, IngressRejection> {
         let descriptor = {
-            let installed = self.installed.lock().expect(CAPABILITY_LOCK);
-            installed.get(&destination_kernel_key).map(Arc::clone)
+            let state = self.state.lock().expect(CAPABILITY_LOCK);
+            let descriptor = state
+                .installed
+                .get(&destination_kernel_key)
+                .map(Arc::clone)
+                .ok_or(IngressRejection::UnknownDestinationTask)?;
+            if state
+                .closed_executions
+                .contains(&descriptor.identity().query_execution_id())
+            {
+                return Err(IngressRejection::UnknownDestinationTask);
+            }
+            descriptor
         };
-        let descriptor = descriptor.ok_or(IngressRejection::UnknownDestinationTask)?;
-        let source = descriptor.authorize_inbound_frame(
+        let source = authorize_inbound_frame(
+            &descriptor,
             destination_kernel_key,
             destination_node_id,
             source_kernel_key,
@@ -300,15 +321,30 @@ impl TaskInboundCapabilities {
     pub fn claim_frame(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
         let node_id = FragmentNodeId::new(query.destination_node_id);
         let descriptor = {
-            let installed = self.installed.lock().expect(CAPABILITY_LOCK);
-            installed
+            let state = self.state.lock().expect(CAPABILITY_LOCK);
+            state
+                .installed
                 .get(&query.destination_fragment_instance_id)
-                .map(Arc::clone)
+                .map(|descriptor| {
+                    (
+                        Arc::clone(descriptor),
+                        state
+                            .closed_executions
+                            .contains(&descriptor.identity().query_execution_id()),
+                    )
+                })
         };
-        let Some(descriptor) = descriptor else {
+        let Some((descriptor, context_closed)) = descriptor else {
             return ExchangeRouteClaim::NotHeld;
         };
-        match descriptor.authorize_inbound_frame(
+        if context_closed {
+            return ExchangeRouteClaim::Refused(format!(
+                "task {} belongs to a query context whose data-plane admission is closed",
+                descriptor.identity()
+            ));
+        }
+        match authorize_inbound_frame(
+            &descriptor,
             query.destination_fragment_instance_id,
             node_id,
             query.source_fragment_instance_id,
@@ -325,7 +361,7 @@ impl TaskInboundCapabilities {
 
     /// How many tasks currently accept inbound frames.
     pub fn len(&self) -> usize {
-        self.installed.lock().expect(CAPABILITY_LOCK).len()
+        self.state.lock().expect(CAPABILITY_LOCK).installed.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -334,8 +370,17 @@ impl TaskInboundCapabilities {
 
     fn install(&self, descriptor: Arc<TaskDescriptor>) -> Result<(), HostRejection> {
         let key = descriptor.fragment_instance_id();
-        let mut installed = self.installed.lock().expect(CAPABILITY_LOCK);
-        if let Some(existing) = installed.get(&key) {
+        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+        if state
+            .closed_executions
+            .contains(&descriptor.identity().query_execution_id())
+        {
+            return Err(protocol(format!(
+                "task {} cannot install inbound capability after its query context closed",
+                descriptor.identity()
+            )));
+        }
+        if let Some(existing) = state.installed.get(&key) {
             // Replacing it would silently re-route the other task's frames,
             // so the second claimant is refused instead.
             return Err(protocol(format!(
@@ -344,8 +389,26 @@ impl TaskInboundCapabilities {
                 existing.identity()
             )));
         }
-        installed.insert(key, descriptor);
+        state.installed.insert(key, descriptor);
         Ok(())
+    }
+
+    fn close_context(&self, context: QueryContextRef) {
+        self.state
+            .lock()
+            .expect(CAPABILITY_LOCK)
+            .closed_executions
+            .insert(context.query_execution_id());
+    }
+
+    fn forget_context(&self, context: QueryContextRef) {
+        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+        debug_assert!(state.installed.values().all(|descriptor| {
+            descriptor.identity().query_execution_id() != context.query_execution_id()
+        }));
+        state
+            .closed_executions
+            .remove(&context.query_execution_id());
     }
 
     /// Withdraws exactly this task's capability.
@@ -354,13 +417,14 @@ impl TaskInboundCapabilities {
     /// the same kernel key at different times; removing another task's entry
     /// would open a hole no later step closes.
     fn remove(&self, descriptor: &TaskDescriptor) {
-        let mut installed = self.installed.lock().expect(CAPABILITY_LOCK);
+        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
         let key = descriptor.fragment_instance_id();
-        if installed
+        if state
+            .installed
             .get(&key)
             .is_some_and(|held| held.identity() == descriptor.identity())
         {
-            installed.remove(&key);
+            state.installed.remove(&key);
         }
     }
 }
@@ -375,6 +439,7 @@ pub struct NativeTaskExecutionHost {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     commit_port: Arc<dyn FragmentCommitPort>,
     execution_runtime: Arc<ExecutionRuntime>,
+    completion_supervisor: Arc<TaskCompletionSupervisor>,
     /// Split delivery, keyed by execution and kernel key so a replaced attempt
     /// gets a fresh queue set and can never inherit a sequence space.
     split_queues: Arc<SplitQueueRegistry<ReceivedReadSplit>>,
@@ -536,7 +601,7 @@ impl NativeTaskExecutionHost {
         reason = "Every execution port this host drives is injected explicitly; \
                   a bundle struct would only move the same list one level away."
     )]
-    pub fn new(
+    pub(crate) fn new(
         queries: NativeFragmentQueryRuntime,
         context_facts: Arc<dyn TaskQueryContextFacts>,
         capabilities: Arc<TaskInboundCapabilities>,
@@ -545,6 +610,7 @@ impl NativeTaskExecutionHost {
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         commit_port: Arc<dyn FragmentCommitPort>,
         execution_runtime: Arc<ExecutionRuntime>,
+        completion_supervisor: Arc<TaskCompletionSupervisor>,
     ) -> Self {
         Self {
             queries,
@@ -555,6 +621,7 @@ impl NativeTaskExecutionHost {
             exchange_receiver_port,
             commit_port,
             execution_runtime,
+            completion_supervisor,
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
         }
@@ -775,6 +842,14 @@ impl NativeTaskExecutionHost {
 }
 
 impl TaskExecutionHost for NativeTaskExecutionHost {
+    fn close_context_admission(&self, context: QueryContextRef) {
+        self.capabilities.close_context(context);
+    }
+
+    fn forget_context_admission(&self, context: QueryContextRef) {
+        self.capabilities.forget_context(context);
+    }
+
     /// Decodes the descriptor's plan and prepares the whole fragment.
     ///
     /// Receiver registration is not separable from preparation: the kernel
@@ -927,6 +1002,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .with_fragment_commit_port(Arc::clone(&self.commit_port))
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
+            .with_result_identity(identity)
             // Binding the gates here is what makes the closed-edge barrier
             // real: the sinks this fragment builds consult them before every
             // send, so a producer cannot reach a destination that has not
@@ -987,13 +1063,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         self.capabilities.remove(descriptor);
     }
 
-    /// Starts the prepared fragment on its own thread.
+    /// Starts the prepared fragment and hands its terminal work to the
+    /// process-wide completion owner.
     ///
-    /// This is the last install step and the only one that can start a
-    /// thread. Everything that could fail has already run, so a failure here
-    /// is a resource failure and leaves no worker behind: if the spawn is
-    /// refused the dormant handle and the pre-start registration lease are
-    /// dropped, which rolls both back.
+    /// This is the last install step. Everything fallible runs before the
+    /// dormant fragment starts, so a refusal leaves no running worker behind.
     fn submit_runnable(
         &self,
         descriptor: &TaskDescriptor,
@@ -1055,58 +1129,71 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
 
         let task = Arc::new(NativeRunnableTask::new(identity, kernel_key));
         let worker = Arc::clone(&task);
+        let completion_worker = Arc::clone(&task);
         let queries = self.queries.clone();
         let split_queues = Arc::clone(&self.split_queues);
         let attempt = runtime.attempt;
         let sink_kind = runtime.sink_kind;
         let operator_statistics = Arc::clone(&runtime.operator_statistics);
-        std::thread::Builder::new()
-            .name(format!(
-                "native-task-{:x}-{:x}",
-                kernel_key.high(),
-                kernel_key.low()
-            ))
-            .spawn(move || {
-                // The pre-start lease keeps the query route rollback-capable
-                // while this worker is dormant; only the thread that starts it
-                // may make it live.
-                registration.into_running();
-                // RUNNING is published before the drivers are submitted
-                // because it is the route becoming live that the status
-                // describes, and because no terminal state is reachable from
-                // PLANNED: a task that never publishes RUNNING could not
-                // publish FINISHED either.
-                reporter.running();
-                let running = if injected_execution_failure {
-                    dormant.start_failed(fault::TASK_EXECUTION_FAILURE_DETAIL)
-                } else {
-                    dormant.start()
-                };
-                // Replays a stand-down that arrived while this task was
-                // submitted but not yet started. Without it, a cancel racing
-                // the worker's first instruction would be dropped and the
-                // task would run to completion after being told to stop.
-                worker.attach(Arc::new(running.clone()));
-                let fact = running.join();
-                // The sampling tick stops firing the moment the drivers
-                // finish, so the last event-driven snapshot predates the rows
-                // the operators counted on their way out. The terminal fact
-                // carries the profile as frozen at the end, and recording it
-                // here — before the terminal state is published — is what puts
-                // final numbers in a final info rather than stale ones. A task
-                // that was asked for no profile has nothing to read here.
-                if let Some(profile) = fact.profile() {
-                    operator_statistics.record_profile(profile);
-                }
-                report_terminal(&reporter, sink_kind, &fact, worker.stand_down());
-                worker.finish();
-                split_queues.close_attempt(attempt);
-                queries.unregister_fragment_execution(execution, kernel_key);
-                queries.finish_fragment(execution);
-            })
+        let completion_reporter = reporter.clone();
+        let completion = self
+            .completion_supervisor
+            .reserve(
+                identity,
+                kernel_key,
+                Box::new(move |fact| {
+                    // The stopped observer is the positive local evidence
+                    // that pipeline work ended. A terminal status, abort
+                    // acknowledgement, or timeout cannot manufacture it.
+                    completion_reporter.note_actual_stopped();
+                    // The sampling tick stops firing the moment the drivers
+                    // finish, so the last event-driven snapshot predates the
+                    // rows the operators counted on their way out. The
+                    // terminal fact carries the final frozen profile.
+                    if let Some(profile) = fact.profile() {
+                        operator_statistics.record_profile(profile);
+                    }
+                    report_terminal(
+                        &completion_reporter,
+                        sink_kind,
+                        &fact,
+                        completion_worker.stand_down(),
+                    );
+                    completion_worker.finish();
+                    split_queues.close_attempt(attempt);
+                    queries.unregister_fragment_execution(execution, kernel_key);
+                    queries.finish_fragment(execution);
+                    // Every runtime owner named above has now returned its
+                    // local responsibility. Registry-owned ingress state is
+                    // released later, by retirement.
+                    completion_reporter.note_resources_converged();
+                }),
+            )
             .map_err(|error| {
-                resource_exhausted(format!("spawn native task worker failed: {error}"))
+                resource_exhausted(format!("reserve native task completion failed: {error}"))
             })?;
+        task.bind_completion(completion.clone());
+
+        // The pre-start lease keeps the query route rollback-capable while
+        // this worker is dormant. Submission makes it live synchronously.
+        registration.into_running();
+        // RUNNING is published before the drivers are submitted because it is
+        // the route becoming live that the status describes, and because no
+        // terminal state is reachable from PLANNED.
+        reporter.running();
+        let running = if injected_execution_failure {
+            dormant.start_failed(fault::TASK_EXECUTION_FAILURE_DETAIL)
+        } else {
+            dormant.start()
+        };
+        // Replays a stand-down that arrived while this task was submitted but
+        // not yet attached. The latch remains the first-wins cancellation
+        // authority.
+        worker.attach(Arc::new(running.clone()));
+        // Subscription after start is deliberate: the kernel retains an
+        // already-stopped fact and invokes this immediately, so neither a
+        // synchronous completion nor a stop-before-subscribe race is lost.
+        running.subscribe_stopped(move |fact| completion.publish(fact));
         Ok(task)
     }
 
@@ -1258,6 +1345,7 @@ pub struct NativeRunnableTask {
     identity: TaskIdentity,
     fragment_instance_id: UniqueId,
     state: Mutex<RunnableState>,
+    completion: OnceLock<TaskCompletionSignal>,
 }
 
 impl fmt::Debug for NativeRunnableTask {
@@ -1282,7 +1370,15 @@ impl NativeRunnableTask {
             identity,
             fragment_instance_id,
             state: Mutex::new(RunnableState::default()),
+            completion: OnceLock::new(),
         }
+    }
+
+    fn bind_completion(&self, completion: TaskCompletionSignal) {
+        assert!(
+            self.completion.set(completion).is_ok(),
+            "a native runnable task binds one completion slot"
+        );
     }
 
     /// Publishes the started fragment and replays any latched stand-down.
@@ -1303,8 +1399,8 @@ impl NativeRunnableTask {
     }
 
     /// Releases this handle's reference to the running fragment once the
-    /// worker has its terminal fact, so the kernel handle's last drop belongs
-    /// to the worker rather than to a later canceller.
+    /// completion owner has its terminal fact, so the kernel handle's last
+    /// drop belongs to that owner rather than to a later canceller.
     fn finish(&self) {
         let mut state = self.state.lock().expect(RUNNABLE_LOCK);
         state.finished = true;
@@ -1320,8 +1416,8 @@ impl NativeRunnableTask {
             state.stand_down = Some(stand_down);
             state.handle.as_ref().map(Arc::clone)
         };
-        // An absent handle means the worker has not started the fragment yet.
-        // The latch set above is what `attach` replays.
+        // An absent handle means the fragment has not been attached yet. The
+        // latch set above is what `attach` replays.
         if let Some(handle) = handle {
             handle.cancel(stand_down.reason());
         }
@@ -1329,6 +1425,13 @@ impl NativeRunnableTask {
 }
 
 impl RunnableTask for NativeRunnableTask {
+    fn commit_creation(&self) {
+        self.completion
+            .get()
+            .expect("a submitted native task has a completion slot")
+            .commit_creation();
+    }
+
     fn cancel(&self, reason: CancelReason) {
         self.request(StandDown::Cancel(reason));
     }
@@ -1359,7 +1462,18 @@ fn report_terminal(
         match stand_down {
             StandDown::Cancel(reason) => {
                 reporter.canceling(reason);
-                reporter.canceled(reason);
+                let output = if matches!(fact.outcome(), FragmentOutcome::Succeeded)
+                    && !matches!(sink_kind, FragmentSinkKind::Result)
+                {
+                    // The cancellation won the lifecycle race, but the
+                    // non-root sink still ran to success. Preserve that
+                    // independent fact so a consumer can distinguish this
+                    // race from a sink that actually stopped early.
+                    TaskOutputFacts::new(true)
+                } else {
+                    TaskOutputFacts::default()
+                };
+                reporter.canceled_with_output(reason, output);
             }
             StandDown::Abort(cause) => {
                 reporter.aborting(cause);
@@ -1459,8 +1573,8 @@ mod tests {
     use super::{
         CompositeFragmentEventSink, ExchangeRouteClaim, ExchangeRouteQuery, FragmentStandDown,
         InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, QueryContextOptions,
-        StandDown, TaskInboundCapabilities, TaskOperatorStatisticsSink, TaskQueryContextFacts,
-        query_options_fingerprint, report_terminal,
+        StandDown, TaskCompletionSupervisor, TaskInboundCapabilities, TaskOperatorStatisticsSink,
+        TaskQueryContextFacts, query_options_fingerprint, report_terminal,
     };
 
     use std::num::{NonZeroU32, NonZeroUsize};
@@ -1484,17 +1598,17 @@ mod tests {
     use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-    use novarocks_execution::task_execution::descriptor::{
+    use novarocks_execution_contract::task_execution::descriptor::{
         ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource, ExchangeTopology,
-        IngressRejection, PhysicalFragmentPlan, TaskDescriptor,
+        PhysicalFragmentPlan, TaskDescriptor,
     };
-    use novarocks_execution::task_execution::domain::{
+    use novarocks_execution_contract::task_execution::domain::{
         CodecOwnedContent, ContentFingerprint, DomainVersion, EdgeOpenVersion, ExchangeEdgeId,
         PlanNodeId, SplitOffer, SplitSequence,
     };
-    use novarocks_execution::task_execution::identity::TaskIdentity;
-    use novarocks_execution::task_execution::operation::TaskDomainUpdate;
-    use novarocks_execution::task_execution::status::{
+    use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+    use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
+    use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
     };
     use novarocks_proto_codec::FieldPath;
@@ -1508,8 +1622,9 @@ mod tests {
     use novarocks_task_codec::descriptor::WireFragmentPlan;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
-        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
+    use novarocks_worker::IngressRejection;
 
     use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
     use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
@@ -1887,15 +2002,17 @@ mod tests {
 
     fn host(facts: Arc<StubContextFacts>) -> NativeTaskExecutionHost {
         let data_runtime = crate::rpc::runtime::test_backend_data_runtime();
+        let completion_supervisor = TaskCompletionSupervisor::start(data_runtime.clone(), 64);
         NativeTaskExecutionHost::new(
             NativeFragmentQueryRuntime::global(),
             facts,
             TaskInboundCapabilities::new(),
             crate::fragment::grpc_exchange_transmitter(data_runtime),
-            crate::fragment::native_result_writer(),
+            crate::fragment::test_native_result_writer(),
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(crate::runtime::sink_commit::BackendSinkCommitPort),
             test_execution_runtime(),
+            completion_supervisor,
         )
     }
 
@@ -1912,7 +2029,7 @@ mod tests {
             consumer,
             kernel_key,
             1,
-            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
             wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
         );
         let capabilities = TaskInboundCapabilities::new();
@@ -1930,7 +2047,7 @@ mod tests {
             capabilities.authorize_frame(kernel_key, node, producer_key, 0, 1),
             Ok(InboundFrameAdmission {
                 destination: consumer,
-                source: ExchangeSource::new(producer, producer_key),
+                source: ExchangeSource::new(producer, producer_key, 0),
             })
         );
 
@@ -1956,7 +2073,7 @@ mod tests {
                 consumer,
                 kernel_key,
                 1,
-                inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+                inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
                 wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
             )))
             .expect("a legal install");
@@ -1975,6 +2092,66 @@ mod tests {
                 received: 2,
             })
         );
+    }
+
+    #[test]
+    fn closing_a_context_fences_an_installed_capability_and_any_late_install() {
+        let consumer = identity(16, 1, 1);
+        let producer = identity(16, 2, 1);
+        let producer_key = UniqueId::new(121, 122);
+        let node = FragmentNodeId::new(11);
+        let kernel_key = UniqueId::new(131, 132);
+        let descriptor = descriptor_with(
+            consumer,
+            kernel_key,
+            1,
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
+            wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
+        );
+        let context = QueryContextRef::new(
+            consumer.query_execution_id(),
+            FrontendProcessId::new_v7(),
+            consumer.backend_process_id(),
+        );
+        let capabilities = TaskInboundCapabilities::new();
+        capabilities
+            .install(Arc::new(descriptor.clone()))
+            .expect("a legal install");
+
+        capabilities.close_context(context);
+        let claim = capabilities.claim_frame(ExchangeRouteQuery {
+            destination_fragment_instance_id: kernel_key,
+            destination_node_id: node.get(),
+            source_fragment_instance_id: producer_key,
+            sender_ordinal: 0,
+            sender_count: 1,
+        });
+        let ExchangeRouteClaim::Refused(detail) = claim else {
+            panic!("a closed context must refuse its still-installed destination");
+        };
+        assert!(
+            detail.contains("data-plane admission is closed"),
+            "{detail}"
+        );
+        assert_eq!(
+            capabilities.authorize_frame(kernel_key, node, producer_key, 0, 1),
+            Err(IngressRejection::UnknownDestinationTask)
+        );
+
+        capabilities.remove(&descriptor);
+        let late = identity(16, 1, 2);
+        let late_key = UniqueId::new(141, 142);
+        let late_descriptor = descriptor_with(
+            late,
+            late_key,
+            1,
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
+            wire_plan(late.query_execution_id().query_id(), late_key, 1),
+        );
+        let rejection = capabilities
+            .install(Arc::new(late_descriptor))
+            .expect_err("a create already in flight cannot reopen a closed context");
+        assert!(rejection.detail().as_str().contains("context closed"));
     }
 
     /// The defect this catches: the exchange data plane asked only the
@@ -1996,7 +2173,7 @@ mod tests {
             consumer,
             kernel_key,
             1,
-            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
             wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
         );
         let capabilities = TaskInboundCapabilities::new();
@@ -2113,7 +2290,7 @@ mod tests {
                 consumer,
                 kernel_key,
                 1,
-                inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+                inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
                 wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
             )))
             .expect("a legal install");
@@ -2620,7 +2797,7 @@ mod tests {
             novarocks_task_codec::domain::WireContent::new(b"split", assignment),
         );
         TaskDomainUpdate::SplitAssignment(
-            novarocks_execution::task_execution::operation::SplitAssignmentIntent::new(
+            novarocks_execution_contract::task_execution::operation::SplitAssignmentIntent::new(
                 node, offer, payload,
             ),
         )
@@ -2638,7 +2815,7 @@ mod tests {
         // split batch: the queue would then accept sequence numbers that no
         // scheduler ever issued.
         let update = TaskDomainUpdate::SplitAssignment(
-            novarocks_execution::task_execution::operation::SplitAssignmentIntent::new(
+            novarocks_execution_contract::task_execution::operation::SplitAssignmentIntent::new(
                 PlanNodeId::new(10).expect("nonnegative node"),
                 SplitOffer::Seal,
                 Arc::new(novarocks_task_codec::domain::WireContent::new(
@@ -2771,9 +2948,8 @@ mod tests {
 
     /// Waits for a task to reach a terminal status, or gives up.
     ///
-    /// The worker runs on its own thread, so a poll is the only way to observe
-    /// it. The bound is generous and only exists so a hang fails the test
-    /// instead of blocking the suite forever.
+    /// Completion is published by the process owner asynchronously. The bound
+    /// only exists so a hang fails the test instead of blocking the suite.
     fn await_terminal(owner: &TaskStatusOwner) -> TaskState {
         for _ in 0..600 {
             if owner.is_terminal() {
@@ -2782,6 +2958,32 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("task did not reach a terminal state: {:?}", owner.state());
+    }
+
+    fn submit_committed(
+        host: &NativeTaskExecutionHost,
+        descriptor: &TaskDescriptor,
+        reporter: TaskStatusReporter,
+    ) -> Arc<dyn RunnableTask> {
+        let runnable = host
+            .submit_runnable(descriptor, reporter)
+            .expect("a prepared fragment starts");
+        runnable.commit_creation();
+        runnable
+    }
+
+    fn await_runtime_convergence(owner: &TaskStatusOwner) {
+        for _ in 0..600 {
+            let convergence = owner.convergence();
+            if convergence.actual_stopped() && convergence.resources_converged() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!(
+            "task runtime did not converge after its terminal: {:?}",
+            owner.convergence()
+        );
     }
 
     #[test]
@@ -2796,18 +2998,20 @@ mod tests {
         host.install_receiver(&descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
-        let runnable = host
-            .submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        let runnable = submit_committed(&host, &descriptor, reporter);
 
-        // A NOOP sink owes nothing further, so the worker itself is the only
-        // thing that may publish FINISHED. If the worker never reported, this
+        // A NOOP sink owes nothing further, so the completion owner is the
+        // only thing that may publish FINISHED. If it never reported, this
         // would hang at PLANNED and the poll would fail.
         assert_eq!(await_terminal(&owner), TaskState::Finished);
         assert!(
             owner.output_released(),
             "a finished non-root task has released its output responsibility"
         );
+        await_runtime_convergence(&owner);
+        let convergence = owner.convergence();
+        assert!(convergence.conclusion_stable());
+        assert!(convergence.retirement_ready());
         // Standing a finished task down must be inert rather than a panic on
         // an already-consumed handle.
         runnable.abort(AbortCause::QueryFailed);
@@ -2831,14 +3035,13 @@ mod tests {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
         let task = identity(26, 1, 1);
-        let descriptor = consistent_descriptor(task, UniqueId::new(211, 212));
+        let descriptor = consistent_descriptor(task, UniqueId::new(213, 214));
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
-        host.submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        submit_committed(&host, &descriptor, reporter);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         assert_eq!(
@@ -2855,16 +3058,15 @@ mod tests {
     }
 
     #[test]
-    fn submitting_a_task_that_was_never_prepared_is_refused_before_a_thread_exists() {
+    fn submitting_a_task_that_was_never_prepared_is_refused_before_execution_starts() {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
         let task = identity(25, 1, 1);
         let descriptor = consistent_descriptor(task, UniqueId::new(201, 202));
         let (_owner, reporter) = reporter_for(task);
 
-        // `submit_runnable` is the only step that can start a thread, so it
-        // must refuse an unprepared task rather than spawn a worker with
-        // nothing to run.
+        // `submit_runnable` is the only step that can start execution, so it
+        // must refuse an unprepared task rather than run nothing.
         let rejection = host
             .submit_runnable(&descriptor, reporter)
             .expect_err("no prepared fragment exists");
@@ -2946,6 +3148,30 @@ mod tests {
         );
 
         assert_eq!(owner.state(), TaskState::Canceled);
+        assert!(
+            owner.current().output().responsibility_complete(),
+            "a non-root sink that reached success preserves output completion despite the cancel race"
+        );
+        assert!(owner.output_released());
+    }
+
+    #[test]
+    fn a_stood_down_task_that_did_not_succeed_cannot_claim_output_completion() {
+        let task = identity(33, 2, 1);
+        let (owner, reporter) = reporter_for(task);
+        reporter.running();
+
+        report_terminal(
+            &reporter,
+            FragmentSinkKind::Noop,
+            &terminal_fact(FragmentOutcome::Cancelled {
+                reason: FragmentCancelReason::new("cancel reached the fragment"),
+            }),
+            Some(StandDown::Cancel(CancelReason::UpstreamNoLongerNeeded)),
+        );
+
+        assert_eq!(owner.state(), TaskState::Canceled);
+        assert!(!owner.current().output().responsibility_complete());
         assert!(owner.output_released());
     }
 
@@ -2982,15 +3208,13 @@ mod tests {
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
-        let runnable = host
-            .submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        let runnable = submit_committed(&host, &descriptor, reporter);
 
         // The owner publishes ABORTING and then asks the task to stand down,
         // which may land before or after the worker started the fragment.
         // Either way the task must terminate: a stand-down lost in that window
         // would leave the query waiting for a task nothing can stop.
-        owner.force_terminal(AbortCause::QueryFailed);
+        owner.force_conclusion(AbortCause::QueryFailed);
         runnable.abort(AbortCause::QueryFailed);
 
         assert_eq!(await_terminal(&owner), TaskState::Aborted);
@@ -3006,15 +3230,13 @@ mod tests {
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
-        let _runnable = host
-            .submit_runnable(&descriptor, reporter.clone())
-            .expect("first submit starts the fragment");
+        let _runnable = submit_committed(&host, &descriptor, reporter.clone());
 
         // The dormant handle is taken exactly once. A second submit must not
-        // start a second worker over the same pipeline.
+        // start a second execution over the same pipeline.
         let rejection = host
             .submit_runnable(&descriptor, reporter)
-            .expect_err("one fragment, one worker");
+            .expect_err("one fragment, one execution");
         assert!(
             rejection.detail().as_str().contains("submitted twice"),
             "{rejection}"
@@ -3167,9 +3389,7 @@ mod tests {
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
-        let _runnable = host
-            .submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        let _runnable = submit_committed(&host, &descriptor, reporter);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         let final_info = owner.final_info().expect("a terminal task has final info");
@@ -3201,9 +3421,7 @@ mod tests {
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
-        let _runnable = host
-            .submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        let _runnable = submit_committed(&host, &descriptor, reporter);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         let final_info = owner.final_info().expect("a terminal task has final info");

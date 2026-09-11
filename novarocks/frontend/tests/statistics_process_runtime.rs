@@ -206,7 +206,10 @@ async fn commit_unknown_is_terminal_and_never_dispatches_another_mutation() {
     assert_eq!(executor.publishes.load(Ordering::SeqCst), 1);
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(executor.publishes.load(Ordering::SeqCst), 1);
-    worker.shutdown().unwrap();
+    worker
+        .shutdown_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -241,7 +244,10 @@ async fn provider_finish_succeeds_once_and_late_cancel_cannot_rewrite_the_termin
     );
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(executor.finishes.load(Ordering::SeqCst), 1);
-    worker.shutdown().unwrap();
+    worker
+        .shutdown_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -276,7 +282,10 @@ async fn running_cancel_reaches_the_attempt_and_blocks_provider_finish() {
     let terminal = wait_terminal(&repository, job.job_id).await;
     assert_eq!(terminal.state, StatisticsJobState::Cancelled);
     assert_eq!(executor.finishes.load(Ordering::SeqCst), 0);
-    worker.shutdown().unwrap();
+    worker
+        .shutdown_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

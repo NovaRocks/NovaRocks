@@ -20,9 +20,147 @@
 use arrow::datatypes::DataType;
 
 use crate::analysis::{OutputColumn, ProjectItem, SortItem, TypedExpr};
+use crate::binding::SqlTableBindingId;
 use crate::column_id::ColumnId;
 use crate::common::{ScanVariantColumn, SqlTopNType};
 use crate::planner::table::TableDef;
+
+/// SQL-optimizer identity of one pre-rewrite scan occurrence.
+///
+/// The anchor column is allocated uniquely for that scan by one planning
+/// session, so two aliases of the same binding remain distinct.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SqlScanOccurrence {
+    binding: SqlTableBindingId,
+    anchor: ColumnId,
+}
+
+impl SqlScanOccurrence {
+    pub(crate) fn from_scan(
+        binding: SqlTableBindingId,
+        columns: &[crate::common::OutputColumn],
+    ) -> Option<Self> {
+        let anchor = columns.iter().map(|column| column.column_id).min()?;
+        (anchor != ColumnId::UNSET).then_some(Self { binding, anchor })
+    }
+
+    pub const fn binding(self) -> SqlTableBindingId {
+        self.binding
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MvRewriteInputSelection {
+    occurrence: SqlScanOccurrence,
+    publication_input_ordinal: usize,
+}
+
+impl MvRewriteInputSelection {
+    pub const fn binding(self) -> SqlTableBindingId {
+        self.occurrence.binding()
+    }
+
+    pub const fn occurrence(self) -> SqlScanOccurrence {
+        self.occurrence
+    }
+
+    pub const fn publication_input_ordinal(self) -> usize {
+        self.publication_input_ordinal
+    }
+}
+
+/// Opaque evidence emitted only when the optimizer actually selects one MV
+/// candidate. Public consumers may inspect the selected facts but cannot
+/// construct or alter this marker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRewriteSelection {
+    name: String,
+    publication_id: Option<[u8; 16]>,
+    definition_fingerprint: Option<[u8; 32]>,
+    input_mapping: Vec<MvRewriteInputSelection>,
+    publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
+    publication_target: Option<crate::compiler::SqlMvRewritePublicationRelation>,
+}
+
+impl MvRewriteSelection {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn unverified(name: String) -> Self {
+        Self {
+            name,
+            publication_id: None,
+            definition_fingerprint: None,
+            input_mapping: Vec::new(),
+            publication_inputs: Vec::new(),
+            publication_target: None,
+        }
+    }
+
+    pub(crate) fn selected(
+        name: String,
+        publication_id: [u8; 16],
+        definition_fingerprint: [u8; 32],
+        input_mapping: Vec<(SqlScanOccurrence, usize)>,
+        publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
+        publication_target: crate::compiler::SqlMvRewritePublicationRelation,
+    ) -> Self {
+        Self {
+            name,
+            publication_id: Some(publication_id),
+            definition_fingerprint: Some(definition_fingerprint),
+            input_mapping: input_mapping
+                .into_iter()
+                .map(
+                    |(occurrence, publication_input_ordinal)| MvRewriteInputSelection {
+                        occurrence,
+                        publication_input_ordinal,
+                    },
+                )
+                .collect(),
+            publication_inputs,
+            publication_target: Some(publication_target),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) const fn publication_id(&self) -> Option<[u8; 16]> {
+        self.publication_id
+    }
+
+    pub(crate) const fn definition_fingerprint(&self) -> Option<[u8; 32]> {
+        self.definition_fingerprint
+    }
+
+    pub(crate) fn input_mapping(&self) -> &[MvRewriteInputSelection] {
+        &self.input_mapping
+    }
+
+    pub(crate) fn publication_inputs(&self) -> &[crate::compiler::SqlMvRewritePublicationRelation] {
+        &self.publication_inputs
+    }
+
+    pub(crate) fn publication_target(
+        &self,
+    ) -> Option<&crate::compiler::SqlMvRewritePublicationRelation> {
+        self.publication_target.as_ref()
+    }
+}
+
+impl std::ops::Deref for MvRewriteSelection {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.name()
+    }
+}
+
+impl std::fmt::Display for MvRewriteSelection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -34,7 +172,7 @@ pub struct PlanScanNode {
     pub predicates: Vec<TypedExpr>,
     pub required_columns: Option<Vec<String>>,
     pub variant_columns: Vec<ScanVariantColumn>,
-    pub mv_rewritten_from: Option<String>,
+    pub mv_rewritten_from: Option<MvRewriteSelection>,
 }
 
 #[allow(dead_code)]

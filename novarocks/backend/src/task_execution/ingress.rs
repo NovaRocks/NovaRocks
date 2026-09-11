@@ -47,25 +47,28 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use novarocks_execution::task_execution::identity::TaskOperationId;
-use novarocks_execution::task_execution::operation::{
-    OperationOutcome, TransportBudget, UpdateQueryContext,
+use novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor;
+use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskOperationId};
+use novarocks_execution_contract::task_execution::operation::{
+    OperationOutcome, TaskDomainReceipt, UpdateQueryContext,
 };
-use novarocks_execution::task_execution::status::{SafeDetail, TaskFailureCategory};
+use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailureCategory};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
+use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::domain::{
     ConfidentialTransport, refuse_confidential_material_in_the_clear,
 };
 use novarocks_task_codec::operation::{
-    DecodedOperation, DecodedUpdateQueryContext, decode_fetch_dynamic_filters,
-    decode_get_final_task_info, decode_operation_batch, decode_subscribe_task_status,
-    encode_abort_cause_field, encode_create_task_ack, encode_operation_outcome,
-    encode_query_context_ack, encode_receipt, encode_release_ack, encode_status_event,
-    encode_task_gone_event, encode_update_task_ack,
+    DecodedOperation, DecodedUpdateQueryContext, decode_context_aware_subscribe_task_status,
+    decode_fetch_dynamic_filters, decode_get_final_task_info, decode_operation_batch,
+    encode_abort_cause_field, encode_context_convergence_event, encode_create_task_ack,
+    encode_operation_outcome, encode_query_context_ack, encode_query_context_admission_ticket_ack,
+    encode_receipt, encode_release_ack, encode_status_event, encode_task_gone_event,
+    encode_update_task_ack,
 };
 use novarocks_task_codec::status::{encode_final_task_info, encode_task_status};
 use novarocks_types::NativeCompatibilityId;
@@ -73,7 +76,10 @@ use tokio_stream::Stream;
 
 use super::fault;
 use super::host::HostRejection;
-use super::observation::{TaskStatusEvent, TaskStatusSource};
+use super::observation::{
+    ContextConvergenceCursorError, TaskStatusEvent, TaskStatusSource,
+    TaskStatusSubscriptionPosition,
+};
 use super::receipt::OperationReceipt;
 use super::registry::TaskExecutionRegistry;
 use super::shared_facts::encode_dynamic_filter_read;
@@ -109,21 +115,40 @@ impl RegistryTaskExecutionIngress {
         &self,
         operation: &DecodedOperation,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
-        if let DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::Establish(request)) =
-            operation
-            && request.native_compatibility_id() != self.native_compatibility_id
-        {
-            return encode_receipt(
+        let compatibility = match operation {
+            DecodedOperation::AcquireQueryContextAdmissionTicket(request) => Some((
                 request.envelope().operation_id(),
+                request.native_compatibility_id(),
+            )),
+            DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::Establish(request)) => {
+                Some((
+                    request.envelope().operation_id(),
+                    request.native_compatibility_id(),
+                ))
+            }
+            _ => None,
+        };
+        if let Some((operation_id, compatibility_id)) = compatibility
+            && compatibility_id != self.native_compatibility_id
+        {
+            return Ok(encode_receipt(
+                operation_id,
                 OperationOutcome::CompatibilityMismatch,
                 "native compatibility identity does not match this backend process",
                 None,
-            )
-            .ok_or_else(|| {
-                tonic::Status::internal("compatibility mismatch outcome has no wire representation")
-            });
+            ));
         }
         match operation {
+            DecodedOperation::AcquireQueryContextAdmissionTicket(request) => {
+                let receipt = self
+                    .registry
+                    .acquire_query_context_admission_ticket(*request);
+                encode_item(&receipt, |ack| {
+                    Some(ReceiptAck::QueryContextAdmissionTicket(
+                        encode_query_context_admission_ticket_ack(*ack),
+                    ))
+                })
+            }
             DecodedOperation::CreateTask(request) => {
                 let identity = request.request().identity();
                 let receipt = self.registry.create_task(request.request());
@@ -155,10 +180,12 @@ impl RegistryTaskExecutionIngress {
                 // be decoded again to learn the same thing.
                 let terminal_nonempty = receipt.acknowledgement().is_some_and(|ack| {
                     ack.domains().iter().any(|domain| match domain {
-                        novarocks_execution::task_execution::TaskDomainReceipt::SplitAssignment { nodes, .. } => nodes.iter().any(|node| {
-                            node.watermark().no_more_splits()
-                                && node.watermark().accepted_through().is_some()
-                        }),
+                        TaskDomainReceipt::SplitAssignment { nodes, .. } => {
+                            nodes.iter().any(|node| {
+                                node.watermark().no_more_splits()
+                                    && node.watermark().accepted_through().is_some()
+                            })
+                        }
                         _ => false,
                     })
                 });
@@ -276,20 +303,15 @@ fn encode_item<T>(
         })?),
         None => None,
     };
-    encode_receipt(
+    Ok(encode_receipt(
         receipt.operation_id(),
         receipt.outcome(),
         receipt.detail().map_or("", SafeDetail::as_str),
         ack,
-    )
-    .ok_or_else(|| {
-        tonic::Status::internal(format!(
-            "operation outcome {:?} has no wire representation",
-            receipt.outcome()
-        ))
-    })
+    ))
 }
 
+#[tonic::async_trait]
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
     fn apply_task_operations(
         &self,
@@ -324,9 +346,12 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         &self,
         request: proto::SubscribeTaskStatusRequest,
     ) -> Result<TaskStatusEventStream, tonic::Status> {
-        let (context, cursors) =
-            decode_subscribe_task_status(&request, FieldPath::root("subscribe_task_status"))
-                .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let (context, cursors, context_convergence_cursor) =
+            decode_context_aware_subscribe_task_status(
+                &request,
+                FieldPath::root("subscribe_task_status"),
+            )
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let source = self.registry.status_source(context).ok_or_else(|| {
             tonic::Status::failed_precondition(
                 "subscribe names a query context this backend does not hold",
@@ -334,7 +359,9 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         })?;
         // The catch-up frames are taken before the stream exists, so a cursor
         // that is behind cannot miss a version published between the two.
-        let catch_up = source.subscribe(&cursors);
+        let catch_up = source
+            .subscribe_context_aware(context, &cursors, context_convergence_cursor)
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         if fault::task_status_subscription_dropped(context)? {
             // The subscription was established and is then torn down from the
             // stream body, which is what a lost stream looks like. Cursors are
@@ -345,7 +372,13 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
                 ),
             ))));
         }
-        Ok(Box::pin(TaskStatusSubscription::new(source, catch_up)))
+        Ok(Box::pin(TaskStatusSubscription::new(
+            source,
+            catch_up,
+            context,
+            cursors,
+            context_convergence_cursor,
+        )))
     }
 
     fn fetch_task_dynamic_filters(
@@ -399,12 +432,7 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
             // Losing final info costs diagnostics only, so why it is missing
             // is reported as an outcome rather than as an error.
             None => proto::get_final_task_info_response::Result::Unavailable(
-                encode_operation_outcome(receipt.outcome()).ok_or_else(|| {
-                    tonic::Status::internal(format!(
-                        "final info outcome {:?} has no wire representation",
-                        receipt.outcome()
-                    ))
-                })?,
+                encode_operation_outcome(receipt.outcome()),
             ),
         };
         Ok(proto::GetFinalTaskInfoResponse {
@@ -412,14 +440,14 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         })
     }
 
-    fn fetch_task_result(
+    async fn fetch_task_result(
         &self,
         request: proto::FetchTaskResultRequest,
     ) -> Result<proto::FetchResultResponse, tonic::Status> {
         // The semantics live with the result plane, beside the buffer they
         // read. Two implementations of one RPC drift, and the one that drifts
         // is always the one nobody is looking at.
-        crate::rpc::data_plane::fetch_task_result(&self.registry, request)
+        crate::rpc::data_plane::fetch_task_result(&self.registry, request).await
     }
 }
 
@@ -438,18 +466,45 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
 struct TaskStatusSubscription {
     source: Arc<TaskStatusSource>,
     catch_up: VecDeque<TaskStatusEvent>,
+    context: QueryContextRef,
+    position: Arc<Mutex<TaskStatusSubscriptionPosition>>,
     /// The parked wait for the next frame. It owns its own handle to the
     /// source, so polling never borrows across the await.
-    pending: Option<Pin<Box<dyn Future<Output = Option<TaskStatusEvent>> + Send>>>,
+    pending: Option<
+        Pin<
+            Box<
+                dyn Future<Output = Result<Option<TaskStatusEvent>, ContextConvergenceCursorError>>
+                    + Send,
+            >,
+        >,
+    >,
 }
 
 impl TaskStatusSubscription {
-    fn new(source: Arc<TaskStatusSource>, catch_up: Vec<TaskStatusEvent>) -> Self {
+    fn new(
+        source: Arc<TaskStatusSource>,
+        catch_up: Vec<TaskStatusEvent>,
+        context: QueryContextRef,
+        task_cursors: Vec<novarocks_execution_contract::task_execution::status::TaskStatusCursor>,
+        context_convergence_cursor: Option<QueryContextConvergenceCursor>,
+    ) -> Self {
         Self {
             source,
             catch_up: catch_up.into(),
+            context,
+            position: Arc::new(Mutex::new(TaskStatusSubscriptionPosition::new(
+                &task_cursors,
+                context_convergence_cursor,
+            ))),
             pending: None,
         }
+    }
+
+    fn note_delivered(&mut self, event: &TaskStatusEvent) {
+        self.position
+            .lock()
+            .expect("task status subscription position")
+            .note_delivered(event);
     }
 }
 
@@ -459,27 +514,47 @@ impl Stream for TaskStatusSubscription {
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         if let Some(event) = this.catch_up.pop_front() {
+            this.note_delivered(&event);
             return Poll::Ready(Some(Ok(encode_event(&event))));
         }
         if this.pending.is_none() {
             let source = Arc::clone(&this.source);
-            this.pending = Some(Box::pin(async move { source.next_event_owned().await }));
+            let context = this.context;
+            let position = Arc::clone(&this.position);
+            this.pending = Some(Box::pin(async move {
+                source
+                    .next_subscription_event_owned(context, &position)
+                    .await
+            }));
         }
         let pending = this.pending.as_mut().expect("a wait was just installed");
         match pending.as_mut().poll(context) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(event) => {
+            Poll::Ready(Ok(event)) => {
                 this.pending = None;
-                Poll::Ready(event.map(|event| Ok(encode_event(&event))))
+                Poll::Ready(event.map(|event| {
+                    this.note_delivered(&event);
+                    Ok(encode_event(&event))
+                }))
+            }
+            Poll::Ready(Err(error)) => {
+                this.pending = None;
+                Poll::Ready(Some(Err(tonic::Status::invalid_argument(
+                    error.to_string(),
+                ))))
             }
         }
     }
 }
 
 fn encode_event(event: &TaskStatusEvent) -> proto::TaskStatusStreamEvent {
+    if let TaskStatusEvent::ContextConvergence(receipt) = event {
+        return encode_context_convergence_event(*receipt);
+    }
     let (identity, mut encoded) = match event {
         TaskStatusEvent::Status(status) => (status.identity(), encode_status_event(status)),
         TaskStatusEvent::Gone(identity) => (*identity, encode_task_gone_event(*identity)),
+        TaskStatusEvent::ContextConvergence(_) => unreachable!("handled above"),
     };
     // Claimed on the frame that is about to leave this process, which is the
     // only place the observation names a backend process the frontend will
@@ -501,19 +576,25 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use novarocks_execution::task_execution::descriptor::TaskDescriptor;
-    use novarocks_execution::task_execution::domain::{
+    use novarocks_execution_contract::task_execution::context_convergence::{
+        QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
+        QueryContextConvergenceState, QueryContextConvergenceVersion,
+    };
+    use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
+    use novarocks_execution_contract::task_execution::domain::{
         CodecOwnedContent, ContentFingerprint, DomainVersion,
     };
-    use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
-    use novarocks_execution::task_execution::operation::{
+    use novarocks_execution_contract::task_execution::identity::{
+        AdmissionTicketId, QueryContextRef, TaskIdentity,
+    };
+    use novarocks_execution_contract::task_execution::operation::{
         QueryContextDomainUpdate, TaskDomainUpdate,
     };
-    use novarocks_execution::task_execution::status::{
+    use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, TaskOutputFacts, TaskState, TaskStatus, TaskStatusCursor,
         TaskStatusVersion,
     };
-    use novarocks_execution::task_execution::transition::QueryContextState;
+    use novarocks_execution_contract::task_execution::transition::QueryContextState;
     use novarocks_proto_models::{catalog, common, plan};
     use novarocks_task_codec::identity::{
         encode_query_context_ref, encode_task_identity, encode_task_operation_id,
@@ -558,6 +639,8 @@ mod tests {
     struct InertRunnable;
 
     impl RunnableTask for InertRunnable {
+        fn commit_creation(&self) {}
+
         fn cancel(&self, _reason: CancelReason) {}
 
         fn abort(&self, _cause: AbortCause) {}
@@ -598,6 +681,10 @@ mod tests {
     }
 
     impl TaskExecutionHost for AcceptingTaskHost {
+        fn close_context_admission(&self, _context: QueryContextRef) {}
+
+        fn forget_context_admission(&self, _context: QueryContextRef) {}
+
         fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
             Ok(())
         }
@@ -718,6 +805,41 @@ mod tests {
                 .apply_task_operations(proto::ApplyTaskOperationsRequest { operations })
                 .expect("a well formed batch is answered with receipts")
         }
+
+        fn acquire_ticket(&self, context: QueryContextRef) -> AdmissionTicketId {
+            let response = self.apply(vec![acquire_ticket(
+                context,
+                TaskOperationId::new_v7(),
+                self.native_compatibility_id,
+                self.registry.admission_epoch_capability(),
+            )]);
+            let Some(ReceiptAck::QueryContextAdmissionTicket(ack)) = &response.receipts[0].ack
+            else {
+                panic!("ticket acquisition returns its grant");
+            };
+            let bytes: [u8; 16] = ack
+                .ticket_id
+                .as_ref()
+                .expect("ticket acknowledgement names the nonce")
+                .value
+                .as_slice()
+                .try_into()
+                .expect("ticket nonce is exactly 16 bytes");
+            AdmissionTicketId::try_from_bytes(bytes).expect("worker minted a nonzero nonce")
+        }
+
+        fn establish(
+            &self,
+            context: QueryContextRef,
+            operation: TaskOperationId,
+        ) -> proto::TaskOperation {
+            establish_with_compatibility(
+                context,
+                operation,
+                self.acquire_ticket(context),
+                self.native_compatibility_id,
+            )
+        }
     }
 
     fn envelope(operation: TaskOperationId) -> proto::TaskOperationEnvelope {
@@ -727,9 +849,35 @@ mod tests {
         }
     }
 
+    fn acquire_ticket(
+        context: QueryContextRef,
+        operation: TaskOperationId,
+        native_compatibility_id: NativeCompatibilityId,
+        admission_epoch_capability: novarocks_execution_contract::AdmissionEpochCapability,
+    ) -> proto::TaskOperation {
+        proto::TaskOperation {
+            envelope: Some(envelope(operation)),
+            operation: Some(
+                proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(
+                    proto::AcquireQueryContextAdmissionTicketRequest {
+                        query_context: Some(encode_query_context_ref(context)),
+                        valid_for_millis: 10_000,
+                        native_compatibility_id: Some(proto::NativeCompatibilityId {
+                            value: native_compatibility_id.as_bytes().to_vec(),
+                        }),
+                        admission_epoch_capability: Some(proto::AdmissionEpochCapability {
+                            value: admission_epoch_capability.to_bytes().to_vec(),
+                        }),
+                    },
+                ),
+            ),
+        }
+    }
+
     fn establish_with_compatibility(
         context: QueryContextRef,
         operation: TaskOperationId,
+        admission_ticket_id: AdmissionTicketId,
         native_compatibility_id: NativeCompatibilityId,
     ) -> proto::TaskOperation {
         proto::TaskOperation {
@@ -757,15 +905,14 @@ mod tests {
                             native_compatibility_id: Some(proto::NativeCompatibilityId {
                                 value: native_compatibility_id.as_bytes().to_vec(),
                             }),
+                            admission_ticket_id: Some(proto::AdmissionTicketId {
+                                value: admission_ticket_id.to_bytes().to_vec(),
+                            }),
                         },
                     )),
                 },
             )),
         }
-    }
-
-    fn establish(context: QueryContextRef, operation: TaskOperationId) -> proto::TaskOperation {
-        establish_with_compatibility(context, operation, NativeCompatibilityId::new([0x71; 32]))
     }
 
     fn renew_lease(
@@ -908,10 +1055,11 @@ mod tests {
     fn a_foreign_compatibility_identity_is_rejected_before_context_side_effects() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let response = fixture.apply(vec![establish_with_compatibility(
+        let response = fixture.apply(vec![acquire_ticket(
             context,
             TaskOperationId::new_v7(),
             NativeCompatibilityId::new([0x72; 32]),
+            fixture.registry.admission_epoch_capability(),
         )]);
 
         assert_eq!(response.receipts.len(), 1);
@@ -926,6 +1074,11 @@ mod tests {
         assert_eq!(
             fixture.registry.context_state(context),
             QueryContextState::Absent
+        );
+        assert_eq!(
+            fixture.registry.admission_reservation_count(),
+            0,
+            "compatibility must be rejected before the authority reserves capacity"
         );
 
         let response = fixture.apply(vec![renew_lease(context, TaskOperationId::new_v7(), 1)]);
@@ -944,9 +1097,11 @@ mod tests {
     fn the_exact_native_compatibility_identity_establishes_the_context() {
         let fixture = Fixture::new();
         let context = fixture.context();
+        let ticket_id = fixture.acquire_ticket(context);
         let response = fixture.apply(vec![establish_with_compatibility(
             context,
             TaskOperationId::new_v7(),
+            ticket_id,
             fixture.native_compatibility_id,
         )]);
 
@@ -970,15 +1125,18 @@ mod tests {
         let fixture = Fixture::new();
         let rejected_context = fixture.context();
         let accepted_context = fixture.other_context();
+        let accepted_ticket = fixture.acquire_ticket(accepted_context);
         let response = fixture.apply(vec![
-            establish_with_compatibility(
+            acquire_ticket(
                 rejected_context,
                 TaskOperationId::new_v7(),
                 NativeCompatibilityId::new([0x72; 32]),
+                fixture.registry.admission_epoch_capability(),
             ),
             establish_with_compatibility(
                 accepted_context,
                 TaskOperationId::new_v7(),
+                accepted_ticket,
                 fixture.native_compatibility_id,
             ),
         ]);
@@ -1017,7 +1175,7 @@ mod tests {
             TaskOperationId::new_v7(),
         ];
         let response = fixture.apply(vec![
-            establish(context, ids[0]),
+            fixture.establish(context, ids[0]),
             renew_lease(context, ids[1], 1),
             release(context, ids[2]),
         ]);
@@ -1059,7 +1217,7 @@ mod tests {
             TaskOperationId::new_v7(),
         ];
         let response = fixture.apply(vec![
-            establish(context, ids[0]),
+            fixture.establish(context, ids[0]),
             cancel(fixture.identity(9, 9), ids[1]),
             renew_lease(context, ids[2], 1),
         ]);
@@ -1200,13 +1358,17 @@ mod tests {
     async fn a_subscription_delivers_its_catch_up_frame_and_then_a_later_event() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        fixture.apply(vec![establish(context, TaskOperationId::new_v7())]);
+        fixture.apply(vec![fixture.establish(context, TaskOperationId::new_v7())]);
         let identity = fixture.identity(1, 1);
         let source = fixture
             .registry
             .status_source(context)
             .expect("an active context has an observation channel");
-
+        let convergence = QueryContextConvergenceReceipt::new(
+            context,
+            QueryContextConvergenceVersion::FIRST,
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        );
         let first = TaskStatus::try_new(
             identity,
             TaskStatusVersion::FIRST,
@@ -1221,6 +1383,7 @@ mod tests {
         // queued to bring it forward.
         assert!(source.next_event().is_some());
         assert_eq!(source.queued_frames(), 0);
+        source.publish_context_convergence(convergence);
 
         let mut stream = fixture
             .ingress
@@ -1229,6 +1392,7 @@ mod tests {
                 cursors: vec![novarocks_task_codec::status::encode_task_status_cursor(
                     TaskStatusCursor::unobserved(identity),
                 )],
+                context_convergence_cursor: None,
             })
             .expect("an active context accepts a subscription");
 
@@ -1244,6 +1408,169 @@ mod tests {
         .expect("a flushing status carries no termination");
         source.publish(second);
         assert_eq!(next_status_version(&mut stream).await, 2);
+        assert_eq!(
+            source
+                .subscribe_context_aware(
+                    context,
+                    &[],
+                    Some(QueryContextConvergenceCursor::unobserved(context)),
+                )
+                .expect("an aware subscriber can still catch up"),
+            vec![TaskStatusEvent::ContextConvergence(convergence)],
+            "a legacy cursor-free stream must not consume context convergence"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_server_streams_observe_the_same_terminal_status() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let identity = fixture.identity(1, 1);
+        fixture.apply(vec![
+            fixture.establish(context, TaskOperationId::new_v7()),
+            create_task(context, identity, TaskOperationId::new_v7()),
+        ]);
+
+        let request = || proto::SubscribeTaskStatusRequest {
+            query_context: Some(encode_query_context_ref(context)),
+            cursors: vec![novarocks_task_codec::status::encode_task_status_cursor(
+                TaskStatusCursor::unobserved(identity),
+            )],
+            context_convergence_cursor: None,
+        };
+        let mut old_stream = fixture
+            .ingress
+            .subscribe_task_status(request())
+            .expect("the old stream opens");
+        let mut replacement_stream = fixture
+            .ingress
+            .subscribe_task_status(request())
+            .expect("the replacement stream opens");
+
+        // Drain both retained catch-up frames before publishing the live
+        // terminal. This is the overlap window created while HTTP/2
+        // cancellation of the old handler is still in flight.
+        assert_eq!(next_status_version(&mut old_stream).await, 1);
+        assert_eq!(next_status_version(&mut replacement_stream).await, 1);
+
+        let terminal = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::FIRST.next().expect("version two"),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("finished status carries complete output responsibility");
+        let source = fixture
+            .registry
+            .status_source(context)
+            .expect("the context retains its observation source");
+        source.publish(terminal);
+        source.mark_gone(identity);
+
+        assert_eq!(next_status_version(&mut old_stream).await, 2);
+        assert_eq!(
+            next_status_version(&mut replacement_stream).await,
+            2,
+            "the old handler cannot consume the terminal retained for its replacement"
+        );
+        next_gone_identity(&mut old_stream, identity).await;
+        next_gone_identity(&mut replacement_stream, identity).await;
+    }
+
+    #[tokio::test]
+    async fn a_context_aware_subscription_catches_up_and_rejects_a_future_cursor() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        fixture.apply(vec![fixture.establish(context, TaskOperationId::new_v7())]);
+        let source = fixture
+            .registry
+            .status_source(context)
+            .expect("an active context has an observation channel");
+        let receipt = QueryContextConvergenceReceipt::new(
+            context,
+            QueryContextConvergenceVersion::FIRST,
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        );
+        source.publish_context_convergence(receipt);
+
+        let mut stream = fixture
+            .ingress
+            .subscribe_task_status(proto::SubscribeTaskStatusRequest {
+                query_context: Some(encode_query_context_ref(context)),
+                cursors: Vec::new(),
+                context_convergence_cursor: Some(
+                    novarocks_task_codec::context_convergence::encode_query_context_convergence_cursor(
+                        QueryContextConvergenceCursor::unobserved(context),
+                    ),
+                ),
+            })
+            .expect("an unobserved context cursor opens a subscription");
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the retained convergence frame is delivered")
+            .expect("the stream remains open")
+            .expect("the frame is valid");
+        let proto::task_status_stream_event::Event::ContextConvergence(encoded) =
+            event.event.expect("a frame carries a body")
+        else {
+            panic!("the context cursor must receive context convergence");
+        };
+        assert_eq!(
+            novarocks_task_codec::context_convergence::decode_query_context_convergence_receipt(
+                &encoded,
+                FieldPath::root("context_convergence"),
+            )
+            .expect("the backend encoded its exact receipt"),
+            receipt
+        );
+        drop(stream);
+
+        let mut replacement = fixture
+            .ingress
+            .subscribe_task_status(proto::SubscribeTaskStatusRequest {
+                query_context: Some(encode_query_context_ref(context)),
+                cursors: Vec::new(),
+                context_convergence_cursor: Some(
+                    novarocks_task_codec::context_convergence::encode_query_context_convergence_cursor(
+                        QueryContextConvergenceCursor::unobserved(context),
+                    ),
+                ),
+            })
+            .expect("a replacement stream owns an independent cursor");
+        let event = tokio::time::timeout(Duration::from_secs(5), replacement.next())
+            .await
+            .expect("the replacement stream receives the retained receipt")
+            .expect("the replacement stream remains open")
+            .expect("the replacement frame is valid");
+        assert!(matches!(
+            event.event,
+            Some(proto::task_status_stream_event::Event::ContextConvergence(
+                _
+            ))
+        ));
+        drop(replacement);
+
+        let future = QueryContextConvergenceCursor::at(
+            context,
+            QueryContextConvergenceVersion::FIRST
+                .next()
+                .expect("version two"),
+        );
+        let Err(error) = fixture
+            .ingress
+            .subscribe_task_status(proto::SubscribeTaskStatusRequest {
+            query_context: Some(encode_query_context_ref(context)),
+            cursors: Vec::new(),
+            context_convergence_cursor: Some(
+                novarocks_task_codec::context_convergence::encode_query_context_convergence_cursor(
+                    future,
+                ),
+            ),
+        }) else {
+            panic!("a future cursor must fail closed");
+        };
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -1252,7 +1579,7 @@ mod tests {
         let context = fixture.context();
         let identity = fixture.identity(1, 1);
         let response = fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
         assert_eq!(
@@ -1270,6 +1597,7 @@ mod tests {
                 cursors: vec![novarocks_task_codec::status::encode_task_status_cursor(
                     TaskStatusCursor::unobserved(identity),
                 )],
+                context_convergence_cursor: None,
             })
             .expect("an active context accepts a subscription");
         // Proves the stream was really live before it was dropped.
@@ -1294,6 +1622,7 @@ mod tests {
             .subscribe_task_status(proto::SubscribeTaskStatusRequest {
                 query_context: Some(encode_query_context_ref(fixture.context())),
                 cursors: Vec::new(),
+                context_convergence_cursor: None,
             })
         else {
             panic!("this process holds no such context");
@@ -1301,8 +1630,8 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
-    #[test]
-    fn a_result_poll_for_a_foreign_task_is_refused_before_a_buffer() {
+    #[tokio::test]
+    async fn a_result_poll_for_a_foreign_task_is_refused_before_a_buffer() {
         let fixture = Fixture::new();
         let foreign = fixture.identity_on(1, 1, BackendProcessId::new_v7());
         let response = fixture
@@ -1310,7 +1639,10 @@ mod tests {
             .fetch_task_result(proto::FetchTaskResultRequest {
                 root_task: Some(encode_task_identity(foreign)),
                 max_wait_millis: 60_000,
+                acknowledged_packet_sequence: None,
+                max_result_bytes: 16 * 1024 * 1024,
             })
+            .await
             .expect("a fenced poll is answered, not errored");
         assert_eq!(
             response.status,
@@ -1354,6 +1686,35 @@ mod tests {
             proto::task_status_stream_event::Event::TaskGone(_) => {
                 panic!("expected a status frame, not a reclamation")
             }
+            proto::task_status_stream_event::Event::ContextConvergence(_) => {
+                panic!("expected a task status frame, not context convergence")
+            }
+        }
+    }
+
+    async fn next_gone_identity(stream: &mut TaskStatusEventStream, expected: TaskIdentity) {
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a retained gone frame must wake the subscription")
+            .expect("the stream is still open")
+            .expect("an observation frame is never a status error");
+        match novarocks_task_codec::operation::decode_context_aware_status_event(
+            &event,
+            FieldPath::root("task_status_stream_event"),
+        )
+        .expect("the backend encoded a valid observation")
+        {
+            novarocks_task_codec::operation::ContextAwareStatusStreamEvent::Gone(identity) => {
+                assert_eq!(identity, expected);
+            }
+            novarocks_task_codec::operation::ContextAwareStatusStreamEvent::Status(_) => {
+                panic!("expected a reclamation frame, not a status")
+            }
+            novarocks_task_codec::operation::ContextAwareStatusStreamEvent::ContextConvergence(
+                _,
+            ) => {
+                panic!("expected a task reclamation frame, not context convergence")
+            }
         }
     }
 
@@ -1363,7 +1724,7 @@ mod tests {
         let context = fixture.context();
         let identity = fixture.identity(1, 1);
         fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
         let response = fixture
@@ -1379,8 +1740,8 @@ mod tests {
         assert!(response.domains.is_empty());
     }
 
-    #[test]
-    fn a_result_poll_aimed_at_an_exchange_producer_is_refused() {
+    #[tokio::test]
+    async fn a_result_poll_aimed_at_an_exchange_producer_is_refused() {
         // Every task owns a result buffer keyed by its kernel key, so routing
         // a poll by that key alone would hand back an exchange producer's
         // output as if it were the query's answer. Owning a buffer and owing
@@ -1389,7 +1750,7 @@ mod tests {
         let context = fixture.context();
         let producer = fixture.identity(3, 3);
         fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_producer_task(context, producer, TaskOperationId::new_v7()),
         ]);
         assert!(fixture.registry.has_live_task(producer));
@@ -1399,7 +1760,10 @@ mod tests {
             .fetch_task_result(proto::FetchTaskResultRequest {
                 root_task: Some(encode_task_identity(producer)),
                 max_wait_millis: 60_000,
+                acknowledged_packet_sequence: None,
+                max_result_bytes: 16 * 1024 * 1024,
             })
+            .await
             .expect("a fenced poll is answered, not errored");
         assert_eq!(
             response.status,
@@ -1421,7 +1785,7 @@ mod tests {
         let context = fixture.context();
         let identity = fixture.identity(1, 1);
         fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
         let envelope = novarocks_proto_models::filter::RuntimeFilterEnvelope {
@@ -1469,7 +1833,7 @@ mod tests {
         let context = fixture.context();
         let identity = fixture.identity(1, 1);
         fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
         fixture

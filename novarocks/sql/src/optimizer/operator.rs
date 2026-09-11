@@ -29,6 +29,7 @@ use crate::common::{
 };
 use crate::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
 use crate::optimizer::stats_input::StatsRef;
+use crate::planner::payload::MvRewriteSelection;
 use crate::planner::table::{BranchScope, TableDef};
 
 pub(crate) use crate::common::ScanVariantColumn;
@@ -244,7 +245,7 @@ pub(crate) struct ScanOp {
     /// When this scan was injected by the MvRewrite rule, the source MV name
     /// (shown in EXPLAIN as `rewritten with mv: <name>`). None for all
     /// user-written scans.
-    pub mv_rewritten_from: Option<String>,
+    pub mv_rewritten_from: Option<MvRewriteSelection>,
 }
 
 #[derive(Clone, Debug)]

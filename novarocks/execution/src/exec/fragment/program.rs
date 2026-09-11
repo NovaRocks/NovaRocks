@@ -25,34 +25,7 @@ use crate::exec::fragment::error::{
 };
 use crate::exec::fragment::sink::FragmentSinkProgram;
 use crate::exec::node::{ExecNodeKind, ExecPlan};
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FragmentContractVersion(u16);
-
-impl FragmentContractVersion {
-    pub const CURRENT: Self = Self(1);
-
-    pub const fn new(value: u16) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u16 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FragmentNodeId(i32);
-
-impl FragmentNodeId {
-    pub const fn new(value: i32) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> i32 {
-        self.0
-    }
-}
+pub use novarocks_execution_contract::{FragmentContractVersion, FragmentNodeId, FragmentSinkKind};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RuntimeFilterId(i32);
@@ -147,15 +120,6 @@ impl RuntimeFilterContract {
     pub fn has_bindings(&self) -> bool {
         !self.build_filters.is_empty() || !self.probe_filters.is_empty()
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FragmentSinkKind {
-    Result,
-    Noop,
-    DataStream,
-    MultiCastDataStream,
-    SplitDataStream,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

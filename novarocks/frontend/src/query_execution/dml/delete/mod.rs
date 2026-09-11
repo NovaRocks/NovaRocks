@@ -149,7 +149,9 @@ impl DeleteNativeEncoding<'_> {
                     &plan,
                 )
                 .expect("test native DELETE fixture must prepare");
-            crate::query_execution::compiler::NativeFragmentEncodingInput::new(plan, prepared)
+            crate::query_execution::compiler::NativeFragmentEncodingInput::new_for_test(
+                plan, prepared,
+            )
         });
         Ok(DeleteNativeEncoding {
             inner: DeleteNativeEncodingInner::TestFixture(input),

@@ -96,16 +96,9 @@ impl PreparedDistributedRewriteCohort {
         self,
         native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<crate::query_execution::outcome::ConnectorWriteSessionCompletion, String> {
-        if !self.encoding.matches_native_attachment(&native_bundle) {
-            return Err(
-                "native fragment bundle does not match the sealed maintenance encoding input"
-                    .into(),
-            );
-        }
-        let (_, prepared) = self.encoding.into_parts();
         let request =
             crate::query_execution::contract::build_distributed_query_request_with_execution(
-                prepared,
+                self.encoding,
                 native_bundle,
                 None,
                 crate::query_execution::contract::DistributedQueryIntent::Write,
@@ -660,7 +653,9 @@ pub trait TableMaintenanceService: Send + Sync {
         self.execute_automatic_optimize_durably(engine, target)
     }
 
-    fn shutdown(&self) -> Result<(), String>;
+    async fn shutdown_until(&self, deadline: Instant) -> Result<(), String>;
+
+    fn request_shutdown_for_process_exit(&self);
 }
 
 /// One foreground SQL maintenance command bound to the exact request admitted
@@ -1587,11 +1582,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
     crate::connector::validate_request_context(context)?;
-    let mut optimizer_settings = execution.optimizer_settings().clone();
-    if optimizer_settings.cbo_broadcast_backend_count.is_none() {
-        optimizer_settings.effective_backend_count =
-            Some(execution.topology().targets().len() as f64);
-    }
+    let optimizer_settings = execution.optimizer_settings().clone();
     let distributed_plan =
         novarocks_sql::planning::dml::build_frozen_connector_write_dataflow_plan(
             physical_plan,
@@ -1610,17 +1601,13 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         crate::query_execution::dml::write::scan_preparation_options(
             typed_connector_control,
             &optimizer_settings,
-            execution,
         )?,
     )?;
     let write_session = session
         .write_session()
         .ok_or_else(|| "distributed rewrite no-op has no write session".to_string())?;
     PreparedDistributedRewriteCohort::new(
-        crate::query_execution::compiler::NativeFragmentEncodingInput::new(
-            distributed_plan,
-            prepared,
-        ),
+        crate::query_execution::compiler::NativeFragmentEncodingInput::new(prepared),
         query_execution.clone(),
         execution.clone(),
         write_session.clone(),

@@ -22,24 +22,23 @@
 //! flight per task. Every admitted task — including one that receives no work
 //! at all — is told no-more-splits so it can finish.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks_execution::task_execution::OperationOutcome;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::UniqueId;
 
 use novarocks_spi::connector::ConnectorReadWireEncoder;
-use novarocks_spi::connector::read_stack::{
-    ConnectorReadDynamicFilterSnapshot, ConnectorReadSplitSource,
-};
 
 use super::super::connector_domain::{PlanNodeAssignmentState, Split, SplitAssignmentError};
 use super::transport::{
-    TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError, TaskUpdateTransportErrorKind,
+    TaskUpdateOutcome, TaskUpdateTicket, TaskUpdateTransport, TaskUpdateTransportError,
+    TaskUpdateTransportErrorKind,
 };
 
 // Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
@@ -100,22 +99,21 @@ impl Default for TaskUpdateRetryPolicy {
     }
 }
 
-/// The one round-owned stop authority. Its atomic makes hot checks cheap and
-/// its condition variable wakes a synchronous retry backoff immediately.
+/// The one round-owned stop authority. Its atomic keeps every event-driven
+/// owner on the same monotonic stop fact without adding a blocking waiter.
 #[derive(Clone)]
 pub(crate) struct SplitAssignmentStop {
     stopped: Arc<AtomicBool>,
+    #[cfg(test)]
     wait: Arc<(Mutex<()>, Condvar)>,
-    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 impl Default for SplitAssignmentStop {
     fn default() -> Self {
-        let (cancel, _) = tokio::sync::watch::channel(false);
         Self {
             stopped: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             wait: Arc::new((Mutex::new(()), Condvar::new())),
-            cancel,
         }
     }
 }
@@ -123,7 +121,7 @@ impl Default for SplitAssignmentStop {
 impl SplitAssignmentStop {
     pub(crate) fn stop(&self) {
         if !self.stopped.swap(true, Ordering::AcqRel) {
-            let _ = self.cancel.send(true);
+            #[cfg(test)]
             self.wait.1.notify_all();
         }
     }
@@ -132,6 +130,7 @@ impl SplitAssignmentStop {
         self.stopped.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_backoff(&self, duration: Duration) -> bool {
         if self.is_stopped() {
             return true;
@@ -143,10 +142,6 @@ impl SplitAssignmentStop {
             .wait_timeout(guard, duration)
             .expect("split assignment stop condvar");
         self.is_stopped()
-    }
-
-    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.cancel.subscribe()
     }
 }
 
@@ -161,6 +156,7 @@ pub(crate) struct AssignmentTarget {
 pub(crate) enum SplitAssignmentDriverError {
     /// The driver was closed; a caller must not keep assigning.
     Closed,
+    DeliveryInProgress,
     /// No admitted task exists for this plan node, so a split has nowhere to
     /// go. Failing closed is required: silently dropping it would produce a
     /// query that returns fewer rows than it should.
@@ -191,6 +187,9 @@ impl fmt::Display for SplitAssignmentDriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => formatter.write_str("split assignment driver is closed"),
+            Self::DeliveryInProgress => {
+                formatter.write_str("a split assignment delivery is already in progress")
+            }
             Self::NoAdmittedTask { plan_node_id } => write!(
                 formatter,
                 "plan node {plan_node_id} has no admitted task to receive splits"
@@ -222,29 +221,6 @@ impl fmt::Display for SplitAssignmentDriverError {
 }
 
 impl std::error::Error for SplitAssignmentDriverError {}
-
-impl SplitAssignmentDriverError {
-    /// This delivery failure in the neutral task-protocol vocabulary.
-    ///
-    /// The task-protocol owners consume this rather than restating which
-    /// delivery failures may be replayed, so the two owners cannot drift on
-    /// the one rule that matters: only a genuinely unknown transport outcome
-    /// is retryable, and every typed rejection fails closed however transient
-    /// its wording looks.
-    pub(crate) const fn as_operation_outcome(&self) -> OperationOutcome {
-        match self {
-            // The driver already exhausted its retry budget on an unknown
-            // outcome before surfacing this, and the identical immutable
-            // request is still the only legal resend.
-            Self::Transport { .. } => OperationOutcome::RetryableTransportUnknown,
-            Self::Closed => OperationOutcome::ContextTerminalReceipt,
-            Self::Rejected { .. } | Self::Assignment(_) | Self::NoAdmittedTask { .. } => {
-                OperationOutcome::InvalidStateOrRequest
-            }
-            Self::SplitSource { .. } => OperationOutcome::ResourceExhausted,
-        }
-    }
-}
 
 impl From<SplitAssignmentError> for SplitAssignmentDriverError {
     fn from(error: SplitAssignmentError) -> Self {
@@ -289,6 +265,25 @@ struct TaskState {
     finished: bool,
 }
 
+struct PendingTaskUpdate {
+    target: AssignmentTarget,
+    request: super::super::connector_domain::TaskUpdateRequest,
+    ticket: TaskUpdateTicket,
+    poll_deadline: Instant,
+    first_retryable_error: Option<Instant>,
+    last_retryable_error: Option<TaskUpdateTransportError>,
+    retryable_attempts: u64,
+    backoff: Duration,
+    next_attempt_at: Option<Instant>,
+}
+
+struct PendingBatchDelivery {
+    plan_node_id: i32,
+    no_more_splits: bool,
+    recipients: VecDeque<(AssignmentTarget, Vec<Split>)>,
+    current: Option<PendingTaskUpdate>,
+}
+
 /// The coordinator-side driver for one execution round.
 pub(crate) struct SplitAssignmentDriver {
     execution_id: QueryExecutionId,
@@ -310,6 +305,7 @@ pub(crate) struct SplitAssignmentDriver {
     encoders: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadWireEncoder>>,
     retry_policy: TaskUpdateRetryPolicy,
     stop: SplitAssignmentStop,
+    delivery: Option<PendingBatchDelivery>,
 }
 
 impl SplitAssignmentDriver {
@@ -352,6 +348,7 @@ impl SplitAssignmentDriver {
             encoders,
             retry_policy,
             stop,
+            delivery: None,
         }
     }
 
@@ -361,6 +358,15 @@ impl SplitAssignmentDriver {
 
     pub(crate) const fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    pub(crate) const fn delivery_in_progress(&self) -> bool {
+        self.delivery.is_some()
+    }
+
+    pub(crate) fn next_delivery_wake_at(&self) -> Option<Instant> {
+        let current = self.delivery.as_ref()?.current.as_ref()?;
+        Some(current.next_attempt_at.unwrap_or(current.poll_deadline))
     }
 
     pub(crate) fn sources(&self) -> &[SplitSourceHandle] {
@@ -459,8 +465,8 @@ impl SplitAssignmentDriver {
         Ok(placement)
     }
 
-    /// Send one plan node's batch, then wait for each acknowledgement.
-    pub(crate) fn send(
+    /// Starts one plan node's delivery without waiting for an acknowledgement.
+    pub(crate) fn start_delivery(
         &mut self,
         plan_node_id: i32,
         placement: BTreeMap<AssignmentTarget, Vec<Split>>,
@@ -468,6 +474,9 @@ impl SplitAssignmentDriver {
     ) -> Result<(), SplitAssignmentDriverError> {
         if self.closed {
             return Err(SplitAssignmentDriverError::Closed);
+        }
+        if self.delivery.is_some() {
+            return Err(SplitAssignmentDriverError::DeliveryInProgress);
         }
         // A task that received nothing still has to hear the terminal marker,
         // otherwise its scan would block forever waiting for work that will
@@ -479,11 +488,185 @@ impl SplitAssignmentDriver {
             }
         }
 
-        for (target, splits) in recipients {
+        self.delivery = Some(PendingBatchDelivery {
+            plan_node_id,
+            no_more_splits,
+            recipients: recipients.into_iter().collect(),
+            current: None,
+        });
+        Ok(())
+    }
+
+    /// Advances an outstanding batch by one nonblocking submit or observation.
+    pub(crate) fn drive_delivery(&mut self) -> Result<bool, SplitAssignmentDriverError> {
+        let Some(mut delivery) = self.delivery.take() else {
+            return Ok(false);
+        };
+        if self.closed || self.stop.is_stopped() {
+            return Err(SplitAssignmentDriverError::Closed);
+        }
+
+        if let Some(mut current) = delivery.current.take() {
+            if let Some(next_attempt_at) = current.next_attempt_at {
+                if Instant::now() < next_attempt_at {
+                    delivery.current = Some(current);
+                    self.delivery = Some(delivery);
+                    return Ok(false);
+                }
+                let remaining = current.first_retryable_error.map_or(
+                    self.retry_policy.rpc_timeout,
+                    |started| {
+                        self.retry_policy
+                            .error_duration
+                            .saturating_sub(started.elapsed())
+                            .min(self.retry_policy.rpc_timeout)
+                    },
+                );
+                if remaining.is_zero() {
+                    let last_error = current
+                        .last_retryable_error
+                        .as_ref()
+                        .expect("a retry deadline has the network error that opened its budget");
+                    return Err(SplitAssignmentDriverError::Transport {
+                        target: current.target.clone(),
+                        detail: retry_budget_exhausted(
+                            &current.target,
+                            current.retryable_attempts,
+                            current
+                                .first_retryable_error
+                                .expect("a retry has a first error")
+                                .elapsed(),
+                            last_error,
+                        )
+                        .detail()
+                        .to_owned(),
+                    });
+                }
+                current.ticket = self
+                    .transport
+                    .begin(self.execution_id, &current.target, &current.request)
+                    .map_err(|error| SplitAssignmentDriverError::Transport {
+                        target: current.target.clone(),
+                        detail: error.detail().to_owned(),
+                    })?;
+                current.poll_deadline = Instant::now() + remaining;
+                current.next_attempt_at = None;
+                delivery.current = Some(current);
+                self.delivery = Some(delivery);
+                return Ok(true);
+            }
+            let outcome = self.transport.poll(current.ticket, &self.stop);
+            let outcome = match outcome {
+                Some(outcome) => Some(outcome),
+                None if Instant::now() >= current.poll_deadline => {
+                    Some(Err(TaskUpdateTransportError::retryable_network(format!(
+                        "task update to backend {} was not acknowledged within {} ms",
+                        current.target.backend_idx,
+                        self.retry_policy.rpc_timeout.as_millis(),
+                    ))))
+                }
+                None => {
+                    delivery.current = Some(current);
+                    self.delivery = Some(delivery);
+                    return Ok(false);
+                }
+            };
+            match outcome.expect("a settled observation has an outcome") {
+                Ok(TaskUpdateOutcome::Accepted(nodes)) => {
+                    let node =
+                        validate_accepted_ack(&current.request, &nodes).map_err(|detail| {
+                            SplitAssignmentDriverError::Transport {
+                                target: current.target.clone(),
+                                detail,
+                            }
+                        })?;
+                    let state = self.task_state.entry(current.target).or_default();
+                    state.in_flight = false;
+                    state.queued_splits = node.queued_splits;
+                }
+                Ok(TaskUpdateOutcome::Rejected { reason, detail }) => {
+                    return Err(SplitAssignmentDriverError::Rejected {
+                        target: current.target,
+                        reason,
+                        detail,
+                    });
+                }
+                Ok(TaskUpdateOutcome::DestinationFinished { detail }) => {
+                    tracing::debug!(
+                        target = ?current.target,
+                        detail = %detail,
+                        "split delivery stopped for a destination that already finished"
+                    );
+                    let state = self.task_state.entry(current.target).or_default();
+                    state.in_flight = false;
+                    state.finished = true;
+                }
+                Err(error) if error.kind() == TaskUpdateTransportErrorKind::RetryableNetwork => {
+                    let now = Instant::now();
+                    let started = *current.first_retryable_error.get_or_insert(now);
+                    current.retryable_attempts = current.retryable_attempts.saturating_add(1);
+                    current.last_retryable_error = Some(error.clone());
+                    let remaining = self
+                        .retry_policy
+                        .error_duration
+                        .saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(SplitAssignmentDriverError::Transport {
+                            target: current.target.clone(),
+                            detail: retry_budget_exhausted(
+                                &current.target,
+                                current.retryable_attempts,
+                                started.elapsed(),
+                                &error,
+                            )
+                            .detail()
+                            .to_owned(),
+                        });
+                    }
+                    tracing::debug!(
+                        backend_idx = current.target.backend_idx,
+                        attempt_hi = current.request.fragment_instance_id().high(),
+                        attempt_lo = current.request.fragment_instance_id().low(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error_kind = "retryable_network",
+                        "retrying task update after unknown outcome"
+                    );
+                    if cfg!(debug_assertions)
+                        && std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER")
+                            .is_some()
+                    {
+                        eprintln!(
+                            "NOVAROCKS_TASK_UPDATE_RETRY backend={} finst={:x}:{:x} attempt={} elapsed_ms={}",
+                            current.target.backend_idx,
+                            current.request.fragment_instance_id().high(),
+                            current.request.fragment_instance_id().low(),
+                            current.retryable_attempts,
+                            started.elapsed().as_millis(),
+                        );
+                    }
+                    current.next_attempt_at = Some(now + current.backoff.min(remaining));
+                    current.backoff = current
+                        .backoff
+                        .saturating_mul(2)
+                        .min(self.retry_policy.max_backoff);
+                    delivery.current = Some(current);
+                    self.delivery = Some(delivery);
+                    return Ok(true);
+                }
+                Err(error) => {
+                    return Err(SplitAssignmentDriverError::Transport {
+                        target: current.target,
+                        detail: error.detail().to_owned(),
+                    });
+                }
+            }
+        }
+
+        while let Some((target, splits)) = delivery.recipients.pop_front() {
             if splits.len() > MAX_SPLITS_PER_UPDATE {
                 return Err(SplitAssignmentDriverError::Assignment(
                     SplitAssignmentError::BatchTooLarge {
-                        plan_node_id,
+                        plan_node_id: delivery.plan_node_id,
                         splits: splits.len(),
                     },
                 ));
@@ -506,117 +689,54 @@ impl SplitAssignmentDriver {
                 .entry(target.clone())
                 .or_insert_with(PlanNodeAssignmentState::new)
                 .assign(
-                    plan_node_id,
+                    delivery.plan_node_id,
                     splits,
-                    no_more_splits,
-                    self.encoders.get(&plan_node_id).cloned().ok_or_else(|| {
-                        SplitAssignmentDriverError::SplitSource {
-                            plan_node_id,
+                    delivery.no_more_splits,
+                    self.encoders
+                        .get(&delivery.plan_node_id)
+                        .cloned()
+                        .ok_or_else(|| SplitAssignmentDriverError::SplitSource {
+                            plan_node_id: delivery.plan_node_id,
                             detail: "missing exact connector read encoder".to_owned(),
-                        }
-                    })?,
+                        })?,
                 )?;
             let request = super::super::connector_domain::TaskUpdateRequest::new(
                 target.fragment_instance_id,
                 vec![assignment],
             );
 
-            let state = self.task_state.entry(target.clone()).or_default();
-            state.in_flight = true;
-            let outcome = self.send_until_confirmed(&target, &request);
-            let state = self.task_state.entry(target.clone()).or_default();
-            state.in_flight = false;
-
-            match outcome {
-                Ok(TaskUpdateOutcome::Accepted(nodes)) => {
-                    let node = validate_accepted_ack(&request, &nodes).map_err(|detail| {
-                        SplitAssignmentDriverError::Transport {
-                            target: target.clone(),
-                            detail,
-                        }
-                    })?;
-                    state.queued_splits = node.queued_splits;
-                }
-                Ok(TaskUpdateOutcome::Rejected { reason, detail }) => {
-                    return Err(SplitAssignmentDriverError::Rejected {
-                        target,
-                        reason,
-                        detail,
-                    });
-                }
-                Ok(TaskUpdateOutcome::DestinationFinished { detail }) => {
-                    // Not an error: the consumer stopped before this delivery
-                    // arrived, which is ordinary for an early-terminating
-                    // branch. Its queue depth is left as it was -- nothing was
-                    // enqueued -- and the loop moves on to the destinations
-                    // that are still consuming.
-                    tracing::debug!(
-                        target = ?target,
-                        detail = %detail,
-                        "split delivery stopped for a destination that already finished"
-                    );
-                    state.finished = true;
-                }
-                Err(error) => {
-                    return Err(SplitAssignmentDriverError::Transport {
-                        target,
-                        detail: error.detail().to_owned(),
-                    });
-                }
-            }
+            let ticket = self
+                .transport
+                .begin(self.execution_id, &target, &request)
+                .map_err(|error| SplitAssignmentDriverError::Transport {
+                    target: target.clone(),
+                    detail: error.detail().to_owned(),
+                })?;
+            self.task_state.entry(target.clone()).or_default().in_flight = true;
+            let sent_at = Instant::now();
+            delivery.current = Some(PendingTaskUpdate {
+                target,
+                request,
+                ticket,
+                poll_deadline: sent_at + self.retry_policy.rpc_timeout,
+                first_retryable_error: None,
+                last_retryable_error: None,
+                retryable_attempts: 0,
+                backoff: self.retry_policy.initial_backoff,
+                next_attempt_at: None,
+            });
+            self.delivery = Some(delivery);
+            return Ok(true);
         }
 
-        if no_more_splits
+        if delivery.no_more_splits
             && let Some(source) = self
                 .sources
                 .iter_mut()
-                .find(|source| source.plan_node_id == plan_node_id)
+                .find(|source| source.plan_node_id == delivery.plan_node_id)
         {
             source.finished = true;
         }
-        Ok(())
-    }
-
-    /// Pull one batch from a split source and deliver it.
-    ///
-    /// Exactly one batch per call, so a caller driving several sources can give
-    /// each a turn: draining one source to exhaustion here would let a slow
-    /// enumeration starve every other scan in the round.
-    ///
-    /// Returns `Ok(false)` when nothing was delivered — the tasks are
-    /// saturated, or the source had nothing right now. An empty batch means
-    /// "nothing right now", never the end of enumeration.
-    pub(crate) fn pump(
-        &mut self,
-        plan_node_id: i32,
-        source: &mut dyn ConnectorReadSplitSource,
-        batch_size: usize,
-        dynamic_filter: &ConnectorReadDynamicFilterSnapshot,
-    ) -> Result<bool, SplitAssignmentDriverError> {
-        if self.closed {
-            return Err(SplitAssignmentDriverError::Closed);
-        }
-        if self.is_backpressured(plan_node_id) {
-            return Ok(false);
-        }
-        let batch = source
-            .next_batch(batch_size.clamp(1, MAX_SPLITS_PER_UPDATE), dynamic_filter)
-            .map_err(|error| SplitAssignmentDriverError::SplitSource {
-                plan_node_id,
-                detail: error.to_string(),
-            })?;
-        let no_more_splits = batch.no_more_splits();
-        let splits = batch
-            .into_splits()
-            .into_iter()
-            .map(Split::new)
-            .collect::<Vec<_>>();
-        let has_work = !splits.is_empty();
-        if !has_work && !no_more_splits {
-            return Ok(false);
-        }
-        let placement = self.distribute(plan_node_id, splits)?;
-        self.send(plan_node_id, placement, no_more_splits)?;
         Ok(true)
     }
 
@@ -632,6 +752,7 @@ impl SplitAssignmentDriver {
         }
     }
 
+    #[cfg(test)]
     fn send_until_confirmed(
         &self,
         target: &AssignmentTarget,
@@ -667,10 +788,22 @@ impl SplitAssignmentDriver {
             let rpc_timeout = remaining
                 .map(|remaining| remaining.min(self.retry_policy.rpc_timeout))
                 .unwrap_or(self.retry_policy.rpc_timeout);
-            match self
-                .transport
-                .send(self.execution_id, target, request, rpc_timeout, &self.stop)
-            {
+            let ticket = self.transport.begin(self.execution_id, target, request)?;
+            let rpc_deadline = Instant::now() + rpc_timeout;
+            let outcome = loop {
+                if let Some(outcome) = self.transport.poll(ticket, &self.stop) {
+                    break outcome;
+                }
+                if Instant::now() >= rpc_deadline {
+                    break Err(TaskUpdateTransportError::retryable_network(format!(
+                        "task update to backend {} was not acknowledged within {} ms",
+                        target.backend_idx,
+                        rpc_timeout.as_millis(),
+                    )));
+                }
+                std::thread::yield_now();
+            };
+            match outcome {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) if error.kind() == TaskUpdateTransportErrorKind::RetryableNetwork => {
                     let started = *first_retryable_error.get_or_insert_with(Instant::now);
@@ -789,26 +922,34 @@ mod tests {
     }
 
     impl TaskUpdateTransport for ScriptedTransport {
-        fn send(
+        fn begin(
             &self,
             _execution_id: QueryExecutionId,
             _target: &AssignmentTarget,
             request: &TaskUpdateRequest,
-            _timeout: Duration,
-            stop: &SplitAssignmentStop,
-        ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+        ) -> Result<TaskUpdateTicket, TaskUpdateTransportError> {
             self.requests
                 .lock()
                 .expect("scripted transport requests")
                 .push(std::ptr::from_ref(request).addr());
+            Ok(TaskUpdateTicket(1))
+        }
+
+        fn poll(
+            &self,
+            _ticket: TaskUpdateTicket,
+            stop: &SplitAssignmentStop,
+        ) -> Option<Result<TaskUpdateOutcome, TaskUpdateTransportError>> {
             if self.stop_after_first_send {
                 stop.stop();
             }
-            self.outcomes
-                .lock()
-                .expect("scripted transport outcomes")
-                .pop_front()
-                .expect("scripted transport has an outcome")
+            Some(
+                self.outcomes
+                    .lock()
+                    .expect("scripted transport outcomes")
+                    .pop_front()
+                    .expect("scripted transport has an outcome"),
+            )
         }
     }
 

@@ -18,6 +18,21 @@
 //! Opaque owned handoffs and neutral scheduling projections.
 
 mod native_submission;
+#[allow(
+    dead_code,
+    reason = "The dormant-attempt binding is consumed through the Native execution adapter."
+)]
+mod task_manifest_binding;
+
+#[allow(
+    unused_imports,
+    reason = "These move-only bindings form the internal Native adapter contract."
+)]
+pub(crate) use task_manifest_binding::{
+    BoundManifestBackend, BoundManifestContext, BoundManifestEdge, BoundManifestFrozenUnits,
+    BoundManifestPartitionKind, BoundManifestProducer, BoundManifestScanAssignment,
+    BoundManifestScanWork, BoundManifestTask, FrozenAttemptTopology, TaskManifestBinding,
+};
 
 pub use native_submission::{
     NativeSubmissionAttachment, NativeSubmissionEncodingView, NativeSubmissionFragmentFacts,
@@ -32,7 +47,7 @@ use arrow::datatypes::Field;
 use novarocks_spi::connector::{CatalogHandle, CatalogProperties};
 use sha2::{Digest, Sha256};
 
-use crate::common::backend_topology::LiveBackendTarget;
+use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
 use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
 #[cfg(test)]
 use crate::query_execution::contract::QueryId;
@@ -79,7 +94,18 @@ pub struct RuntimeFilterBindingAttachment {
 /// validated schedule. Core validates only artifact/topology membership.
 pub struct RuntimeFilterDeploymentAttachment {
     artifact_id: RuntimeFilterArtifactId,
+    execution_id: QueryExecutionId,
     contributions: BTreeMap<usize, novarocks_proto_models::novarocks::RuntimeFilterContribution>,
+}
+
+impl RuntimeFilterDeploymentAttachment {
+    fn matches(
+        &self,
+        artifact_id: RuntimeFilterArtifactId,
+        execution_id: QueryExecutionId,
+    ) -> bool {
+        self.artifact_id == artifact_id && self.execution_id == execution_id
+    }
 }
 
 impl RuntimeFilterBindingAttachment {
@@ -88,27 +114,475 @@ impl RuntimeFilterBindingAttachment {
     }
 }
 
-/// The owned prepared/native pair. It has no public constructor, `Clone`, or
-/// inverse `from_parts`, so artifacts from different sealed plans cannot be
-/// recombined by a role crate.
-pub struct PreparedDistributedQuery {
-    handoff_id: u64,
-    prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentAttachment,
+/// Static Native plan/projection shared by every attempt of one logical
+/// execution. It owns no Connector access capability or planning lease.
+pub(crate) struct PreparedDistributedNativeTemplate {
+    identity: PreparedDistributedTemplateIdentity,
+    prepared: Arc<PreparedFragmentSet>,
+    native_template: Arc<NativeFragmentAttachment>,
 }
 
-impl PreparedDistributedQuery {
-    pub(super) fn new(
-        prepared: PreparedFragmentSet,
-        native_bundle: NativeFragmentAttachment,
+struct PreparedDistributedTemplateAffinity;
+
+/// Private identity shared only by the two siblings minted from one prepared
+/// logical execution. Scalar equality is insufficient: the pointer identity
+/// prevents an access factory from being spliced onto an isomorphic Native
+/// template assembled elsewhere.
+#[derive(Clone)]
+struct PreparedDistributedTemplateIdentity {
+    handoff_id: u64,
+    plan_seal: novarocks_sql::planning::query_execution::SealedPreparationPlanId,
+    affinity: Arc<PreparedDistributedTemplateAffinity>,
+}
+
+impl PreparedDistributedTemplateIdentity {
+    fn new(
+        handoff_id: u64,
+        plan_seal: novarocks_sql::planning::query_execution::SealedPreparationPlanId,
     ) -> Self {
         Self {
-            handoff_id: NEXT_HANDOFF_ID.fetch_add(1, Ordering::Relaxed),
-            prepared,
-            native_bundle,
+            handoff_id,
+            plan_seal,
+            affinity: Arc::new(PreparedDistributedTemplateAffinity),
         }
     }
 
+    fn exactly_matches(&self, other: &Self) -> bool {
+        self.handoff_id == other.handoff_id
+            && self.plan_seal == other.plan_seal
+            && Arc::ptr_eq(&self.affinity, &other.affinity)
+    }
+}
+
+fn validate_prepared_template_affinity(
+    native: &PreparedDistributedTemplateIdentity,
+    access: &PreparedDistributedTemplateIdentity,
+) -> Result<(), DistributedQueryError> {
+    if native.exactly_matches(access) {
+        Ok(())
+    } else {
+        Err(contract_error(
+            "Connector attempt access belongs to another prepared Native template",
+        ))
+    }
+}
+
+impl PreparedDistributedNativeTemplate {
+    pub(crate) const fn plan_seal(
+        &self,
+    ) -> novarocks_sql::planning::query_execution::SealedPreparationPlanId {
+        self.identity.plan_seal
+    }
+
+    /// Bind the static Native template to the exact move-only attempt request
+    /// while the request is still available. The resulting typestate is what
+    /// the dormant owner carries into activation after `request.bind` consumes
+    /// the Query Application ticket.
+    fn fork_for_attempt(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            prepared: Arc::clone(&self.prepared),
+            native_template: Arc::clone(&self.native_template),
+        }
+    }
+
+    fn bind_request(
+        self,
+        request: &novarocks_query_application::api::NativeAttemptPreparationRequest,
+        affinity: Arc<PreparedDistributedAttemptAffinity>,
+    ) -> Result<RequestBoundNativeTemplate, DistributedQueryError> {
+        validate_native_request_match(request.matches_plan_seal(self.plan_seal()))?;
+        Ok(RequestBoundNativeTemplate {
+            execution: request.execution(),
+            template: self,
+            affinity,
+        })
+    }
+}
+
+struct PreparedDistributedAttemptAffinity;
+
+/// Move-only proof that one Native template was checked against the exact
+/// Query Application attempt request before that request was consumed.
+pub(crate) struct RequestBoundNativeTemplate {
+    execution: QueryExecutionId,
+    template: PreparedDistributedNativeTemplate,
+    affinity: Arc<PreparedDistributedAttemptAffinity>,
+}
+
+/// Per-attempt Connector access owner minted beside the request-bound Native
+/// template. It is reusable within that attempt, but cannot be paired with a
+/// sibling from another attempt or logical template.
+pub(crate) struct PreparedDistributedAttemptAccessOwner {
+    execution: QueryExecutionId,
+    template_identity: PreparedDistributedTemplateIdentity,
+    affinity: Arc<PreparedDistributedAttemptAffinity>,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
+}
+
+impl PreparedDistributedAttemptAccessOwner {
+    pub(crate) fn instantiate(
+        &self,
+        manifest: &TaskManifestBinding,
+    ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
+        let native = manifest.request_bound_native();
+        validate_bound_attempt_affinity(native, self)?;
+        Ok(PreparedDistributedQuery {
+            handoff_id: native.template.identity.handoff_id,
+            prepared: Arc::clone(&native.template.prepared),
+            native_bundle: native.template.native_template.as_ref().clone(),
+            attempt_access: Arc::clone(&self.attempt_access),
+        })
+    }
+}
+
+/// One request-bound attempt handoff. Consuming it separates the dormant
+/// Native owner from the exact Connector access owner without exposing Clone
+/// on either capability.
+pub(crate) struct PreparedDistributedBoundAttempt {
+    native: RequestBoundNativeTemplate,
+    access: PreparedDistributedAttemptAccessOwner,
+}
+
+impl PreparedDistributedBoundAttempt {
+    pub(crate) fn into_native_and_access(
+        self,
+    ) -> (
+        RequestBoundNativeTemplate,
+        PreparedDistributedAttemptAccessOwner,
+    ) {
+        (self.native, self.access)
+    }
+}
+
+/// Dormant Native inputs bound to the exact topology snapshot used to expose
+/// eligible backend identities to Query Application scheduling.
+///
+/// The snapshot projection remains move-only until activation consumes it
+/// together with the request-bound Native template. A caller cannot pass a
+/// replacement snapshot to manifest binding later.
+pub(crate) struct SnapshotBoundDormantAttemptInputs {
+    native: RequestBoundNativeTemplate,
+    access: PreparedDistributedAttemptAccessOwner,
+    topology: FrozenAttemptTopology,
+}
+
+impl std::fmt::Debug for SnapshotBoundDormantAttemptInputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotBoundDormantAttemptInputs")
+            .field("execution", &self.native.execution)
+            .field("topology", &self.topology)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SnapshotBoundDormantAttemptInputs {
+    pub(crate) fn capture(
+        template: &PreparedDistributedAttemptTemplate,
+        request: &novarocks_query_application::api::NativeAttemptPreparationRequest,
+        snapshot: BackendTopologySnapshot,
+    ) -> Result<Self, DistributedQueryError> {
+        let topology = FrozenAttemptTopology::capture(snapshot)?;
+        let bound = template.bind_attempt(request)?;
+        let (native, access) = bound.into_native_and_access();
+        Ok(Self {
+            native,
+            access,
+            topology,
+        })
+    }
+
+    pub(crate) fn eligible_backends(&self) -> &[BackendProcessId] {
+        self.topology.eligible_backends()
+    }
+
+    pub(crate) const fn topology_revision(&self) -> u64 {
+        self.topology.revision()
+    }
+
+    pub(crate) fn bind_manifest(
+        self,
+        schedule: &novarocks_query_application::coordination::AttemptSchedule,
+    ) -> Result<ManifestBoundNativeAttemptInputs, DistributedQueryError> {
+        let manifest = TaskManifestBinding::bind(self.native, schedule, self.topology)?;
+        Ok(ManifestBoundNativeAttemptInputs {
+            manifest,
+            access: self.access,
+        })
+    }
+}
+
+/// Exact activation inputs after the Query Application schedule has been
+/// joined to its originating topology and Native template.
+pub(crate) struct ManifestBoundNativeAttemptInputs {
+    manifest: TaskManifestBinding,
+    access: PreparedDistributedAttemptAccessOwner,
+}
+
+impl std::fmt::Debug for ManifestBoundNativeAttemptInputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManifestBoundNativeAttemptInputs")
+            .field("manifest", &self.manifest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManifestBoundNativeAttemptInputs {
+    /// Starts a borrowed activation transaction.
+    ///
+    /// The exact manifest and Connector access capability remain in this
+    /// dormant owner while fallible Task runtime assembly runs. Only the
+    /// derived prepared view can be committed into the active behavior, so an
+    /// error, cancellation, or unwind cannot strand the sole dormant inputs.
+    pub(crate) fn begin_activation(
+        &mut self,
+    ) -> Result<ManifestBoundNativeAttemptActivation<'_>, DistributedQueryError> {
+        let prepared = self.access.instantiate(&self.manifest)?;
+        Ok(ManifestBoundNativeAttemptActivation {
+            inputs: self,
+            prepared: Some(prepared),
+        })
+    }
+}
+
+/// Borrowed activation transaction over one exact manifest-bound owner.
+///
+/// Dropping this value simply drops the derived prepared view. The manifest
+/// and access owner were never moved, which is the rollback path for every
+/// early return and panic during activation.
+pub(crate) struct ManifestBoundNativeAttemptActivation<'a> {
+    inputs: &'a mut ManifestBoundNativeAttemptInputs,
+    prepared: Option<PreparedDistributedQuery>,
+}
+
+impl std::fmt::Debug for ManifestBoundNativeAttemptActivation<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManifestBoundNativeAttemptActivation")
+            .field("manifest", &self.inputs.manifest)
+            .field("prepared_available", &self.prepared.is_some())
+            .finish()
+    }
+}
+
+impl<'a> ManifestBoundNativeAttemptActivation<'a> {
+    /// The exact immutable inputs an assembler may project. No replacement
+    /// manifest or access owner can be supplied through this API.
+    pub(crate) fn parts(&mut self) -> (&mut PreparedDistributedQuery, &TaskManifestBinding) {
+        (
+            self.prepared
+                .as_mut()
+                .expect("an uncommitted activation retains its prepared view"),
+            &self.inputs.manifest,
+        )
+    }
+
+    /// Transfers only the derived prepared view after all fallible assembly
+    /// has succeeded. The outer active owner continues to retain the exact
+    /// manifest and access owner for the attempt lifetime.
+    pub(crate) fn commit(mut self) -> PreparedDistributedQuery {
+        self.prepared
+            .take()
+            .expect("one manifest activation can commit only once")
+    }
+
+    pub(crate) fn into_prepared_and_manifest(
+        mut self,
+    ) -> (PreparedDistributedQuery, &'a TaskManifestBinding) {
+        let prepared = self
+            .prepared
+            .take()
+            .expect("one manifest activation can project only once");
+        (prepared, &self.inputs.manifest)
+    }
+}
+
+fn validate_bound_attempt_affinity(
+    native: &RequestBoundNativeTemplate,
+    access: &PreparedDistributedAttemptAccessOwner,
+) -> Result<(), DistributedQueryError> {
+    validate_bound_attempt_identity(
+        native.execution,
+        &native.template.identity,
+        &native.affinity,
+        access.execution,
+        &access.template_identity,
+        &access.affinity,
+    )
+}
+
+fn validate_bound_attempt_identity(
+    native_execution: QueryExecutionId,
+    native_template: &PreparedDistributedTemplateIdentity,
+    native_affinity: &Arc<PreparedDistributedAttemptAffinity>,
+    access_execution: QueryExecutionId,
+    access_template: &PreparedDistributedTemplateIdentity,
+    access_affinity: &Arc<PreparedDistributedAttemptAffinity>,
+) -> Result<(), DistributedQueryError> {
+    if native_execution == access_execution
+        && native_template.exactly_matches(access_template)
+        && Arc::ptr_eq(native_affinity, access_affinity)
+    {
+        Ok(())
+    } else {
+        Err(contract_error(
+            "Connector attempt access belongs to another request-bound Native attempt",
+        ))
+    }
+}
+
+fn validate_native_request_match(matches: bool) -> Result<(), DistributedQueryError> {
+    if matches {
+        Ok(())
+    } else {
+        Err(contract_error(
+            "attempt Native template belongs to another sealed preparation plan",
+        ))
+    }
+}
+
+/// Logical-execution owner that can materialize the Connector access view for
+/// an attempt. Keeping it separate prevents a pure task manifest from retaining
+/// catalog control leases or becoming a resource owner.
+pub(crate) struct PreparedDistributedAttemptAccessFactory {
+    identity: PreparedDistributedTemplateIdentity,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
+}
+
+impl PreparedDistributedAttemptAccessFactory {
+    fn fork_for_attempt(&self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            attempt_access: Arc::clone(&self.attempt_access),
+        }
+    }
+
+    fn instantiate(
+        &self,
+        native: &PreparedDistributedNativeTemplate,
+    ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
+        validate_prepared_template_affinity(&native.identity, &self.identity)?;
+        Ok(PreparedDistributedQuery {
+            handoff_id: native.identity.handoff_id,
+            prepared: Arc::clone(&native.prepared),
+            native_bundle: native.native_template.as_ref().clone(),
+            attempt_access: Arc::clone(&self.attempt_access),
+        })
+    }
+}
+
+/// Immutable logical-execution owner of both static Native facts and the
+/// separately held attempt-resource factory.
+pub(crate) struct PreparedDistributedAttemptTemplate {
+    native: PreparedDistributedNativeTemplate,
+    access: PreparedDistributedAttemptAccessFactory,
+}
+
+impl PreparedDistributedAttemptTemplate {
+    pub(super) fn new(
+        prepared: PreparedFragmentSet,
+        native_template: NativeFragmentAttachment,
+        attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
+    ) -> Self {
+        let handoff_id = NEXT_HANDOFF_ID.fetch_add(1, Ordering::Relaxed);
+        let plan_seal = prepared.plan_seal();
+        let identity = PreparedDistributedTemplateIdentity::new(handoff_id, plan_seal);
+        Self {
+            native: PreparedDistributedNativeTemplate {
+                identity: identity.clone(),
+                prepared: Arc::new(prepared),
+                native_template: Arc::new(native_template),
+            },
+            access: PreparedDistributedAttemptAccessFactory {
+                identity,
+                attempt_access: Arc::new(attempt_access),
+            },
+        }
+    }
+
+    pub(crate) const fn native_manifest_template(&self) -> &PreparedDistributedNativeTemplate {
+        &self.native
+    }
+
+    /// Project the exact static work cardinality for every sealed scan. These
+    /// facts are supplied to Query Application before placement; no backend or
+    /// endpoint fact is consulted here.
+    pub(crate) fn native_scan_work_facts(
+        &self,
+    ) -> Result<Vec<novarocks_query_application::api::NativeScanWorkFact>, DistributedQueryError>
+    {
+        use novarocks_query_application::api::{NativeScanWork, NativeScanWorkFact};
+        use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
+
+        let prepared = self.native.prepared.as_ref();
+        let view = prepared.scheduling_view();
+        prepared
+            .sealed_scan_identities()
+            .map(|(fragment_id, scan)| {
+                let work = match view.typed_connector_work_source(fragment_id, scan.node_id()) {
+                    Some(ConnectorReadWorkSource::RuntimeSplits) => NativeScanWork::RuntimeSplits,
+                    Some(ConnectorReadWorkSource::WholeRelation) => NativeScanWork::WholeRelation,
+                    None => {
+                        let count = view
+                            .scan_ranges(fragment_id, scan.node_id())
+                            .ok_or_else(|| {
+                                contract_error(format!(
+                                    "prepared Native scan node {} has no immutable work source",
+                                    scan.node_id()
+                                ))
+                            })?
+                            .len();
+                        match std::num::NonZeroUsize::new(count) {
+                            Some(count) => NativeScanWork::FrozenUnits { count },
+                            None => NativeScanWork::Empty,
+                        }
+                    }
+                };
+                Ok(NativeScanWorkFact::new(scan, work))
+            })
+            .collect()
+    }
+
+    pub(crate) fn instantiate(&self) -> PreparedDistributedQuery {
+        self.access
+            .instantiate(&self.native)
+            .expect("a prepared attempt template retains its exact sibling affinity")
+    }
+
+    /// Mint one fresh pair of request-bound attempt owners while retaining the
+    /// logical template for later recovery attempts.
+    pub(crate) fn bind_attempt(
+        &self,
+        request: &novarocks_query_application::api::NativeAttemptPreparationRequest,
+    ) -> Result<PreparedDistributedBoundAttempt, DistributedQueryError> {
+        let affinity = Arc::new(PreparedDistributedAttemptAffinity);
+        let native = self
+            .native
+            .fork_for_attempt()
+            .bind_request(request, Arc::clone(&affinity))?;
+        let access_factory = self.access.fork_for_attempt();
+        let access = PreparedDistributedAttemptAccessOwner {
+            execution: request.execution(),
+            template_identity: access_factory.identity,
+            affinity,
+            attempt_access: access_factory.attempt_access,
+        };
+        Ok(PreparedDistributedBoundAttempt { native, access })
+    }
+}
+
+/// One attempt's owned prepared/native typestate. It can only be instantiated
+/// from the logical execution's immutable attempt template.
+pub struct PreparedDistributedQuery {
+    handoff_id: u64,
+    prepared: Arc<PreparedFragmentSet>,
+    native_bundle: NativeFragmentAttachment,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
+}
+
+impl PreparedDistributedQuery {
     pub fn scheduling_view(&self) -> FragmentSchedulingView<'_> {
         FragmentSchedulingView {
             handoff_id: self.handoff_id,
@@ -143,6 +617,211 @@ impl PreparedDistributedQuery {
         self.prepared.scan_bindings().typed_scans()
     }
 
+    /// Resolve one exact scan from the immutable logical execution.
+    ///
+    /// Attempt initialization uses this borrowed view only to clone the
+    /// secret-free fields of one scan into a blocking-call recipe. The
+    /// immutable artifact itself remains owned by the actor.
+    pub(crate) fn typed_scan(
+        &self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<&crate::query_execution::preparation::scan::PreparedTypedConnectorScan> {
+        self.prepared
+            .scan_bindings()
+            .typed_scan(fragment_id, node_id)
+    }
+
+    pub(crate) fn share_connector_attempt_access(
+        &self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>> {
+        self.attempt_access.share(fragment_id, node_id)
+    }
+
+    /// Project the exact application-owned Task manifest into the existing
+    /// Native carrier encoder input. This is a one-way representation change:
+    /// every placement, scan unit and exchange route is copied from the
+    /// manifest, and no scheduler or live topology capability is consulted.
+    pub(crate) fn native_schedule_from_manifest(
+        &self,
+        manifest: &TaskManifestBinding,
+    ) -> Result<ValidatedFragmentSchedule, DistributedQueryError> {
+        if self.handoff_id != manifest.request_bound_native().template.identity.handoff_id {
+            return Err(contract_error(
+                "Task manifest belongs to another prepared Native query",
+            ));
+        }
+
+        let mut frozen_live_backends = BTreeMap::new();
+        let mut backend_by_process = BTreeMap::new();
+        for context in manifest.contexts() {
+            let backend = context.backend();
+            backend_by_process.insert(backend.process_id(), backend);
+            match frozen_live_backends.insert(backend.backend_idx(), backend.target().clone()) {
+                Some(previous) if previous != *backend.target() => {
+                    return Err(contract_error(format!(
+                        "Task manifest backend ordinal {} names conflicting frozen targets",
+                        backend.backend_idx()
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        let scheduling = self.scheduling_view();
+        let mut by_fragment = BTreeMap::<FragmentId, Vec<FragmentInstancePlacement>>::new();
+        let mut task_location = BTreeMap::new();
+        for task in manifest.tasks() {
+            let backend = backend_by_process
+                .get(&task.identity().backend_process_id())
+                .copied()
+                .ok_or_else(|| {
+                    contract_error(format!(
+                        "Task manifest task {} has no frozen backend context",
+                        task.identity()
+                    ))
+                })?;
+            let mut scan_ranges = BTreeMap::new();
+            for work in task.scan_work() {
+                let node_id = work.scan().node_id();
+                let ranges = scheduling
+                    .inner
+                    .scan_ranges(task.fragment_id(), node_id)
+                    .ok_or_else(|| {
+                        contract_error(format!(
+                            "Task manifest scan node {node_id} has no frozen scan work in fragment {}",
+                            task.fragment_id()
+                        ))
+                    })?;
+                let assigned = match work.assignment() {
+                    BoundManifestScanAssignment::RuntimeSplits
+                    | BoundManifestScanAssignment::WholeRelation => Vec::new(),
+                    BoundManifestScanAssignment::FrozenUnits(units) => {
+                        let mut selected = Vec::with_capacity(units.len().get());
+                        for offset in 0..units.len().get() {
+                            let index = units
+                                .stride()
+                                .get()
+                                .checked_mul(offset)
+                                .and_then(|delta| units.first_ordinal().checked_add(delta))
+                                .ok_or_else(|| {
+                                    contract_error(format!(
+                                        "Task manifest frozen scan assignment overflows for node {node_id}"
+                                    ))
+                                })?;
+                            selected.push(ranges.get(index).cloned().ok_or_else(|| {
+                                contract_error(format!(
+                                    "Task manifest frozen scan assignment index {index} is outside node {node_id} work"
+                                ))
+                            })?);
+                        }
+                        selected
+                    }
+                };
+                scan_ranges.insert(node_id, assigned);
+            }
+            let placements = by_fragment.entry(task.fragment_id()).or_default();
+            if placements.len() != task.instance_index() {
+                return Err(contract_error(format!(
+                    "Task manifest fragment {} instance order is not contiguous at {}",
+                    task.fragment_id(),
+                    task.instance_index()
+                )));
+            }
+            task_location.insert(task.identity(), (task.fragment_id(), task.instance_index()));
+            placements.push(FragmentInstancePlacement {
+                fragment_id: task.fragment_id(),
+                instance_index: task.instance_index(),
+                finst_id: task.fragment_instance_id(),
+                backend_idx: backend.backend_idx(),
+                endpoint: backend.endpoint().clone(),
+                scan_ranges,
+                destinations: Vec::new(),
+                per_exch_num_senders: BTreeMap::new(),
+            });
+        }
+
+        for edge in manifest.edges() {
+            let sender_count = i32::try_from(edge.sender_count().get()).map_err(|_| {
+                contract_error("Task manifest exchange sender count exceeds i32 width")
+            })?;
+            for destination in edge.destinations() {
+                let (fragment_id, instance_index) =
+                    task_location.get(destination).copied().ok_or_else(|| {
+                        contract_error(format!(
+                            "Task manifest exchange destination {destination} has no placement"
+                        ))
+                    })?;
+                let placement = by_fragment
+                    .get_mut(&fragment_id)
+                    .and_then(|placements| placements.get_mut(instance_index))
+                    .ok_or_else(|| {
+                        contract_error("Task manifest destination placement vanished")
+                    })?;
+                let entry = placement
+                    .per_exch_num_senders
+                    .entry(edge.target_exchange_node_id())
+                    .or_insert(0);
+                *entry = entry.checked_add(sender_count).ok_or_else(|| {
+                    contract_error("Task manifest exchange sender total exceeds i32 width")
+                })?;
+            }
+            for producer in edge.producers() {
+                let (fragment_id, instance_index) = task_location
+                    .get(&producer.task())
+                    .copied()
+                    .ok_or_else(|| {
+                        contract_error(format!(
+                            "Task manifest exchange producer {} has no placement",
+                            producer.task()
+                        ))
+                    })?;
+                let source_finst_id = by_fragment[&fragment_id][instance_index].finst_id;
+                let mut destinations = Vec::with_capacity(edge.destinations().len());
+                for destination in edge.destinations() {
+                    let (target_fragment, target_index) = task_location[destination];
+                    let target = &by_fragment[&target_fragment][target_index];
+                    destinations.push(
+                        FragmentDestination::new(
+                            target.finst_id,
+                            target.endpoint.clone(),
+                            source_finst_id,
+                            producer.sender_ordinal(),
+                            edge.sender_count().get(),
+                        )
+                        .map_err(contract_error)?,
+                    );
+                }
+                by_fragment
+                    .get_mut(&fragment_id)
+                    .and_then(|placements| placements.get_mut(instance_index))
+                    .expect("manifest placement was indexed above")
+                    .destinations
+                    .extend(destinations);
+            }
+        }
+
+        let (root_fragment_id, root_instance_index) = task_location
+            .get(&manifest.root())
+            .copied()
+            .ok_or_else(|| contract_error("Task manifest root has no placement"))?;
+        let root_finst_id = by_fragment[&root_fragment_id][root_instance_index].finst_id;
+        let root_backend_idx = by_fragment[&root_fragment_id][root_instance_index].backend_idx;
+        Ok(ValidatedFragmentSchedule {
+            handoff_id: self.handoff_id,
+            execution_id: manifest.execution(),
+            inner: SchedulingPlan {
+                root_fragment_id,
+                by_fragment,
+                root_finst_id,
+                root_backend_idx,
+            },
+            frozen_live_backends,
+        })
+    }
+
     /// Borrow-only identity and fragment-set view used by the Frontend RF
     /// encoder. SQL-private binding facts are intentionally added by the
     /// dedicated view in the next owner-local layer.
@@ -170,6 +849,7 @@ impl PreparedDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
             native_bundle,
+            attempt_access: self.attempt_access,
         })
     }
 }
@@ -178,8 +858,9 @@ impl PreparedDistributedQuery {
 /// distributed-query typestate and the only state that may bind a schedule.
 pub struct RuntimeFilterBoundPreparedDistributedQuery {
     handoff_id: u64,
-    prepared: PreparedFragmentSet,
+    prepared: Arc<PreparedFragmentSet>,
     native_bundle: NativeFragmentAttachment,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl RuntimeFilterBoundPreparedDistributedQuery {
@@ -197,6 +878,7 @@ impl RuntimeFilterBoundPreparedDistributedQuery {
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule,
+            attempt_access: self.attempt_access,
         })
     }
 }
@@ -291,9 +973,10 @@ impl<'a> RuntimeFilterBindingEncodingView<'a> {
 /// readiness and the connector install/ACK barrier must first complete.
 pub struct ScheduleBoundDistributedQuery {
     handoff_id: u64,
-    prepared: PreparedFragmentSet,
+    prepared: Arc<PreparedFragmentSet>,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl ScheduleBoundDistributedQuery {
@@ -353,9 +1036,12 @@ impl ScheduleBoundDistributedQuery {
         self,
         attachment: RuntimeFilterDeploymentAttachment,
     ) -> Result<RuntimeFilterDeploymentReadyDistributedQuery, DistributedQueryError> {
-        if attachment.artifact_id != RuntimeFilterArtifactId(self.schedule.handoff_id) {
+        if !attachment.matches(
+            RuntimeFilterArtifactId(self.schedule.handoff_id),
+            self.schedule.execution_id,
+        ) {
             return Err(contract_error(
-                "runtime filter deployment attachment belongs to a different prepared query handoff",
+                "runtime filter deployment attachment belongs to a different attempt schedule",
             ));
         }
         Ok(RuntimeFilterDeploymentReadyDistributedQuery {
@@ -364,6 +1050,7 @@ impl ScheduleBoundDistributedQuery {
             native_bundle: self.native_bundle,
             schedule: self.schedule,
             runtime_filter_contributions: attachment.contributions,
+            attempt_access: self.attempt_access,
         })
     }
 }
@@ -463,6 +1150,7 @@ impl<'a> RuntimeFilterScheduledView<'a> {
         }
         Ok(RuntimeFilterDeploymentAttachment {
             artifact_id: self.artifact_id,
+            execution_id: self.execution_id,
             contributions: by_backend,
         })
     }
@@ -496,11 +1184,12 @@ impl RuntimeFilterBackendTopologyEntry {
 /// transition entrypoint while owner-local deployment compilation migrates.
 pub struct RuntimeFilterDeploymentReadyDistributedQuery {
     handoff_id: u64,
-    prepared: PreparedFragmentSet,
+    prepared: Arc<PreparedFragmentSet>,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
     runtime_filter_contributions:
         BTreeMap<usize, novarocks_proto_models::novarocks::RuntimeFilterContribution>,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl RuntimeFilterDeploymentReadyDistributedQuery {
@@ -523,7 +1212,8 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
                 "task execution preparation execution id does not match validated schedule",
             ));
         }
-        let catalog_lease = freeze_query_catalog_lease(&self.prepared, options.catalog_set())?;
+        let catalog_lease =
+            freeze_query_catalog_lease(&self.attempt_access, options.catalog_set())?;
         let options = options.with_catalog_set(catalog_lease.catalog_set().clone());
         Ok(TaskExecutionPreparedQuery {
             handoff_id: self.handoff_id,
@@ -533,6 +1223,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             options,
             catalog_lease,
             runtime_filter_contributions: self.runtime_filter_contributions,
+            attempt_access: self.attempt_access,
         })
     }
 }
@@ -546,7 +1237,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
 /// barrier between the two for it to sit behind.
 pub struct TaskExecutionPreparedQuery {
     handoff_id: u64,
-    prepared: PreparedFragmentSet,
+    prepared: Arc<PreparedFragmentSet>,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
     options: QueryInitOptions,
@@ -560,6 +1251,7 @@ pub struct TaskExecutionPreparedQuery {
     )]
     catalog_lease: QueryCatalogLease,
     runtime_filter_contributions: BTreeMap<usize, novarocks::RuntimeFilterContribution>,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl TaskExecutionPreparedQuery {
@@ -680,25 +1372,24 @@ impl TaskExecutionSubmission {
 /// contributes its own catalog through the query's Init options, so only typed
 /// reads are merged here.
 fn freeze_query_catalog_lease(
-    prepared: &PreparedFragmentSet,
+    attempt_access: &crate::query_execution::preparation::ConnectorAttemptAccessPlan,
     existing: &CatalogSet,
 ) -> Result<QueryCatalogLease, DistributedQueryError> {
-    let typed_reads = prepared
-        .scan_bindings()
-        .typed_scans()
-        .map(|(_, _, scan)| (scan.catalog_properties.clone(), scan.planning_lease.clone()))
-        .collect::<Vec<_>>();
-    let catalog_set = merge_catalog_properties(
-        existing,
-        typed_reads.iter().map(|(properties, _)| properties.clone()),
-    )?;
-    Ok(QueryCatalogLease::new(
-        catalog_set,
-        typed_reads
-            .into_iter()
-            .map(|(_, planning_lease)| planning_lease)
-            .collect(),
-    ))
+    let typed_reads = attempt_access
+        .iter()
+        .map(|(_, _, access)| {
+            access
+                .catalog_properties()
+                .backend_execution_projection()
+                .map_err(|error| {
+                    contract_error(format!(
+                        "project catalog generation for backend execution: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let catalog_set = merge_catalog_properties(existing, typed_reads)?;
+    Ok(QueryCatalogLease::new(catalog_set, Vec::new()))
 }
 
 fn merge_catalog_properties(
@@ -1579,6 +2270,7 @@ fn build_expected_output_schema(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
@@ -1586,7 +2278,12 @@ mod tests {
         ConnectorProviderId, ConnectorSplit,
     };
 
-    use super::{derive_fragment_instance_id, merge_catalog_properties};
+    use super::{
+        PreparedDistributedAttemptAffinity, PreparedDistributedTemplateIdentity,
+        RuntimeFilterArtifactId, RuntimeFilterDeploymentAttachment, derive_fragment_instance_id,
+        merge_catalog_properties, validate_bound_attempt_identity, validate_native_request_match,
+        validate_prepared_template_affinity,
+    };
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
@@ -1595,6 +2292,8 @@ mod tests {
     use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
+    use novarocks_sql::planning::query_execution::SealedPreparationPlan;
+    use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
     use novarocks_types::UniqueId;
 
     fn catalog_properties(name: &str, version: u8, warehouse: &str) -> CatalogProperties {
@@ -1609,6 +2308,75 @@ mod tests {
             Vec::new(),
         )
         .expect("valid catalog properties")
+    }
+
+    #[test]
+    fn attempt_template_affinity_rejects_cross_assembly_splice() {
+        let plan_seal = SealedPreparationPlan::seal(
+            native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
+        )
+        .id();
+        let native_identity = PreparedDistributedTemplateIdentity::new(41, plan_seal);
+        let exact_access_identity = native_identity.clone();
+        let foreign_access_identity = PreparedDistributedTemplateIdentity::new(41, plan_seal);
+
+        validate_prepared_template_affinity(&native_identity, &exact_access_identity)
+            .expect("siblings minted together retain the same private token");
+        let error = validate_prepared_template_affinity(&native_identity, &foreign_access_identity)
+            .expect_err("equal scalar identities from separate assemblies must be rejected");
+        assert!(error.message().contains("another prepared Native template"));
+    }
+
+    #[test]
+    fn request_binding_rejects_a_foreign_plan_seal_match() {
+        validate_native_request_match(true).expect("an exact request seal match is accepted");
+        let error = validate_native_request_match(false)
+            .expect_err("a foreign request seal must not produce a bound typestate");
+        assert!(error.message().contains("another sealed preparation plan"));
+    }
+
+    #[test]
+    fn attempt_access_rejects_a_cross_attempt_native_splice() {
+        let query_id = QueryId::new(43, 79);
+        let first_execution =
+            QueryExecutionId::new(query_id, AttemptId::new(1).expect("valid first attempt"))
+                .expect("valid first execution");
+        let second_execution =
+            QueryExecutionId::new(query_id, AttemptId::new(2).expect("valid second attempt"))
+                .expect("valid second execution");
+        let plan_seal = SealedPreparationPlan::seal(
+            native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
+        )
+        .id();
+        let template = PreparedDistributedTemplateIdentity::new(47, plan_seal);
+        let exact_template = template.clone();
+        let affinity = Arc::new(PreparedDistributedAttemptAffinity);
+        let exact_affinity = Arc::clone(&affinity);
+        let foreign_affinity = Arc::new(PreparedDistributedAttemptAffinity);
+
+        validate_bound_attempt_identity(
+            first_execution,
+            &template,
+            &affinity,
+            first_execution,
+            &exact_template,
+            &exact_affinity,
+        )
+        .expect("siblings minted for one request bind are accepted");
+        let error = validate_bound_attempt_identity(
+            first_execution,
+            &template,
+            &affinity,
+            second_execution,
+            &exact_template,
+            &foreign_affinity,
+        )
+        .expect_err("access from another attempt must not splice onto the Native owner");
+        assert!(
+            error
+                .message()
+                .contains("another request-bound Native attempt")
+        );
     }
 
     fn placement(
@@ -1722,6 +2490,27 @@ mod tests {
             derive_fragment_instance_id(second_attempt, 9, 3).expect("second fragment instance id"),
             first
         );
+    }
+
+    #[test]
+    fn runtime_filter_deployment_attachment_is_bound_to_one_attempt() {
+        let query_id = QueryId::new(41, 74);
+        let first_attempt =
+            QueryExecutionId::new(query_id, AttemptId::new(1).expect("valid attempt"))
+                .expect("valid execution id");
+        let second_attempt =
+            QueryExecutionId::new(query_id, AttemptId::new(2).expect("valid attempt"))
+                .expect("valid execution id");
+        let artifact_id = RuntimeFilterArtifactId(17);
+        let attachment = RuntimeFilterDeploymentAttachment {
+            artifact_id,
+            execution_id: first_attempt,
+            contributions: BTreeMap::new(),
+        };
+
+        assert!(attachment.matches(artifact_id, first_attempt));
+        assert!(!attachment.matches(artifact_id, second_attempt));
+        assert!(!attachment.matches(RuntimeFilterArtifactId(18), first_attempt));
     }
 
     #[test]

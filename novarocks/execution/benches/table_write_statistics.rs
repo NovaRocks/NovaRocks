@@ -64,7 +64,9 @@ use novarocks_execution::exec::operators::{
 use novarocks_execution::exec::pipeline::operator::Operator;
 use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks_execution::runtime::exchange::{ExchangeKey, ExecutionExchangeRegistry};
+use novarocks_execution::runtime::exchange::{
+    ExchangeKey, ExchangeSenderIdentity, ExecutionExchangeRegistry,
+};
 use novarocks_execution::runtime::execution_runtime::ExecutionSpillStorageConfig;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection,
@@ -1084,8 +1086,7 @@ fn decode_exchange_into_finish(
         }
         let decoded = registry.decode_chunks_for_sender(
             key,
-            frame.sender_id,
-            frame.backend_number,
+            ExchangeSenderIdentity::native(frame.sender_fragment_instance_id, frame.sender_ordinal),
             &frame.payload,
         )?;
         if frame.eos && !decoded.is_empty() {

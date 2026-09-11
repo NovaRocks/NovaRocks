@@ -104,6 +104,12 @@ struct RescheduleState {
     deadline_index: BTreeSet<DeadlineIndexEntry>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchedulerWake {
+    Key(DriverKey),
+    Deadline(DriverKey, u64, u64),
+}
+
 impl RescheduleState {
     fn new() -> Self {
         Self {
@@ -155,6 +161,19 @@ impl RescheduleState {
             .copied()
             .map(|entry| (entry.key, entry.deadline()))
     }
+
+    fn pop_wake(&mut self, now: Instant) -> Option<SchedulerWake> {
+        if let Some((key, deadline)) = self.earliest_deadline()
+            && deadline.at <= now
+        {
+            return Some(SchedulerWake::Deadline(
+                key,
+                deadline.block_epoch,
+                deadline.operator_token,
+            ));
+        }
+        self.queue.pop_front().map(SchedulerWake::Key)
+    }
 }
 
 impl DriverKey {
@@ -163,62 +182,403 @@ impl DriverKey {
     }
 }
 
+#[derive(Clone)]
+struct DispatcherRegistration {
+    id: u64,
+    state: Weak<EventDispatcherState>,
+    scheduler: Weak<EventScheduler>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DispatcherDeadlineEntry {
+    at: Instant,
+    scheduler_id: u64,
+    generation: u64,
+}
+
+struct DispatcherDeadline {
+    entry: DispatcherDeadlineEntry,
+    scheduler: Weak<EventScheduler>,
+}
+
+struct DispatcherReady {
+    scheduler_id: u64,
+    scheduler: Weak<EventScheduler>,
+}
+
+struct EventDispatcherQueues {
+    registered: HashMap<u64, Weak<EventScheduler>>,
+    ready: VecDeque<DispatcherReady>,
+    ready_pending: HashSet<u64>,
+    deadlines: HashMap<u64, DispatcherDeadline>,
+    deadline_index: BTreeSet<DispatcherDeadlineEntry>,
+}
+
+impl EventDispatcherQueues {
+    fn new() -> Self {
+        Self {
+            registered: HashMap::new(),
+            ready: VecDeque::new(),
+            ready_pending: HashSet::new(),
+            deadlines: HashMap::new(),
+            deadline_index: BTreeSet::new(),
+        }
+    }
+
+    fn enqueue(&mut self, scheduler_id: u64, scheduler: Weak<EventScheduler>) -> bool {
+        if !self.registered.contains_key(&scheduler_id) || !self.ready_pending.insert(scheduler_id)
+        {
+            return false;
+        }
+        self.ready.push_back(DispatcherReady {
+            scheduler_id,
+            scheduler,
+        });
+        true
+    }
+
+    fn remove_deadline(&mut self, scheduler_id: u64) {
+        if let Some(previous) = self.deadlines.remove(&scheduler_id) {
+            let removed = self.deadline_index.remove(&previous.entry);
+            debug_assert!(removed, "dispatcher deadline map/index drift on removal");
+        }
+    }
+
+    fn update_deadline(
+        &mut self,
+        scheduler_id: u64,
+        scheduler: Weak<EventScheduler>,
+        generation: u64,
+        deadline: Option<Instant>,
+    ) {
+        if !self.registered.contains_key(&scheduler_id) {
+            return;
+        }
+        if self
+            .deadlines
+            .get(&scheduler_id)
+            .is_some_and(|current| current.entry.generation > generation)
+        {
+            return;
+        }
+        self.remove_deadline(scheduler_id);
+        let Some(at) = deadline else {
+            return;
+        };
+        let entry = DispatcherDeadlineEntry {
+            at,
+            scheduler_id,
+            generation,
+        };
+        let inserted = self.deadline_index.insert(entry);
+        debug_assert!(inserted, "duplicate dispatcher deadline entry");
+        self.deadlines
+            .insert(scheduler_id, DispatcherDeadline { entry, scheduler });
+    }
+
+    fn unregister(&mut self, scheduler_id: u64) {
+        self.registered.remove(&scheduler_id);
+        self.ready_pending.remove(&scheduler_id);
+        self.remove_deadline(scheduler_id);
+    }
+
+    fn pop_dispatchable(&mut self, now: Instant) -> Option<DispatcherReady> {
+        if let Some(deadline) = self.deadline_index.first().copied()
+            && deadline.at <= now
+        {
+            let scheduled = self
+                .deadlines
+                .remove(&deadline.scheduler_id)
+                .expect("deadline index must have a scheduler");
+            let removed = self.deadline_index.remove(&deadline);
+            debug_assert!(removed, "dispatcher deadline index drift on dispatch");
+            return Some(DispatcherReady {
+                scheduler_id: deadline.scheduler_id,
+                scheduler: scheduled.scheduler,
+            });
+        }
+        let ready = self.ready.pop_front()?;
+        self.ready_pending.remove(&ready.scheduler_id);
+        self.remove_deadline(ready.scheduler_id);
+        Some(ready)
+    }
+}
+
+struct EventDispatcherState {
+    queues: Mutex<EventDispatcherQueues>,
+    wake_cv: Condvar,
+    shutdown: AtomicBool,
+    next_scheduler_id: AtomicU64,
+    #[cfg(test)]
+    thread_exited: Arc<AtomicBool>,
+}
+
+impl EventDispatcherState {
+    fn register(self: &Arc<Self>, scheduler: &Arc<EventScheduler>) -> DispatcherRegistration {
+        let id = self
+            .next_scheduler_id
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let mut queues = self.queues.lock().expect("event dispatcher queue lock");
+        if !self.shutdown.load(Ordering::Acquire) {
+            queues.registered.insert(id, Arc::downgrade(scheduler));
+        }
+        DispatcherRegistration {
+            id,
+            state: Arc::downgrade(self),
+            scheduler: Arc::downgrade(scheduler),
+        }
+    }
+
+    fn notify_scheduler(&self, scheduler_id: u64, scheduler: Weak<EventScheduler>) {
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let mut queues = self.queues.lock().expect("event dispatcher queue lock");
+        if queues.enqueue(scheduler_id, scheduler) {
+            self.wake_cv.notify_one();
+        }
+    }
+
+    fn unregister(&self, scheduler_id: u64) {
+        let mut queues = self.queues.lock().expect("event dispatcher queue lock");
+        queues.unregister(scheduler_id);
+        self.wake_cv.notify_one();
+    }
+}
+
+/// One process-runtime scheduler thread for every fragment's blocked-driver
+/// events. Fragment schedulers retain their own state but never own a thread.
+pub(crate) struct EventDispatcher {
+    state: Arc<EventDispatcherState>,
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl EventDispatcher {
+    pub(crate) fn new() -> Self {
+        let state = Arc::new(EventDispatcherState {
+            queues: Mutex::new(EventDispatcherQueues::new()),
+            wake_cv: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            next_scheduler_id: AtomicU64::new(0),
+            #[cfg(test)]
+            thread_exited: Arc::new(AtomicBool::new(false)),
+        });
+        let run_state = Arc::clone(&state);
+        let thread = thread::Builder::new()
+            .name("event_dispatcher".to_string())
+            .spawn(move || run_dispatcher(run_state))
+            .expect("spawn shared event dispatcher thread");
+        Self {
+            state,
+            thread: Mutex::new(Some(thread)),
+        }
+    }
+
+    fn register(&self, scheduler: &Arc<EventScheduler>) -> DispatcherRegistration {
+        self.state.register(scheduler)
+    }
+
+    #[cfg(test)]
+    fn registered_scheduler_count(&self) -> usize {
+        self.state
+            .queues
+            .lock()
+            .expect("event dispatcher queue lock")
+            .registered
+            .len()
+    }
+
+    pub(crate) fn close_and_drain(&self) -> Vec<DriverTask> {
+        if self.state.shutdown.swap(true, Ordering::AcqRel) {
+            return Vec::new();
+        }
+        let schedulers = {
+            let mut queues = self
+                .state
+                .queues
+                .lock()
+                .expect("event dispatcher queue lock");
+            let schedulers = queues.registered.values().cloned().collect::<Vec<_>>();
+            queues.registered.clear();
+            queues.ready.clear();
+            queues.ready_pending.clear();
+            queues.deadlines.clear();
+            queues.deadline_index.clear();
+            schedulers
+        };
+        self.state.wake_cv.notify_all();
+        schedulers
+            .into_iter()
+            .filter_map(|scheduler| scheduler.upgrade())
+            .flat_map(|scheduler| scheduler.shutdown_and_take_blocked())
+            .collect()
+    }
+
+    pub(crate) fn take_thread(&self) -> Option<thread::JoinHandle<()>> {
+        self.thread
+            .lock()
+            .expect("event dispatcher thread lock")
+            .take()
+    }
+
+    pub(crate) fn shutdown_and_join(&self) {
+        let _ = self.close_and_drain();
+        if let Some(thread) = self.take_thread() {
+            let _ = thread.join();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exit_probe(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.state.thread_exited)
+    }
+}
+
+impl Drop for EventDispatcher {
+    fn drop(&mut self) {
+        self.shutdown_and_join();
+    }
+}
+
+fn run_dispatcher(state: Arc<EventDispatcherState>) {
+    #[cfg(test)]
+    let _exit_guard = ThreadExitGuard(&state.thread_exited);
+    loop {
+        let ready = {
+            let mut queues = state.queues.lock().expect("event dispatcher queue lock");
+            loop {
+                if state.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(ready) = queues.pop_dispatchable(Instant::now()) {
+                    break ready;
+                }
+                let Some(deadline) = queues.deadline_index.first().copied() else {
+                    queues = state
+                        .wake_cv
+                        .wait(queues)
+                        .unwrap_or_else(|error| error.into_inner());
+                    continue;
+                };
+                let (next, _) = state
+                    .wake_cv
+                    .wait_timeout(
+                        queues,
+                        deadline.at.saturating_duration_since(Instant::now()),
+                    )
+                    .unwrap_or_else(|error| error.into_inner());
+                queues = next;
+            }
+        };
+
+        let Some(scheduler) = ready.scheduler.upgrade() else {
+            state
+                .queues
+                .lock()
+                .expect("event dispatcher queue lock")
+                .unregister(ready.scheduler_id);
+            continue;
+        };
+        let progressed = scheduler.dispatch_one();
+        let (deadline_generation, deadline) = scheduler.deadline_snapshot();
+        let mut queues = state.queues.lock().expect("event dispatcher queue lock");
+        queues.update_deadline(
+            ready.scheduler_id,
+            Arc::downgrade(&scheduler),
+            deadline_generation,
+            deadline,
+        );
+        if progressed {
+            queues.enqueue(ready.scheduler_id, Arc::downgrade(&scheduler));
+            state.wake_cv.notify_one();
+        }
+    }
+}
+
+#[cfg(test)]
+struct ThreadExitGuard<'a>(&'a AtomicBool);
+
+#[cfg(test)]
+impl Drop for ThreadExitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// Event scheduler that returns notified blocked drivers to executor workers.
 pub(crate) struct EventScheduler {
     shared: OnceLock<Arc<ExecutorShared>>,
+    dispatcher: OnceLock<DispatcherRegistration>,
     blocked: Mutex<HashMap<DriverKey, BlockedTask>>,
     reschedule_queue: Mutex<RescheduleState>,
-    reschedule_cv: Condvar,
     shutdown: AtomicBool,
-    started: AtomicBool,
     next_block_epoch: AtomicU64,
-    thread: Mutex<Option<thread::JoinHandle<()>>>,
+    deadline_generation: AtomicU64,
+    #[cfg(test)]
+    dispatch_invocations: AtomicU64,
 }
 
 impl EventScheduler {
     pub(crate) fn new() -> Self {
         Self {
             shared: OnceLock::new(),
+            dispatcher: OnceLock::new(),
             blocked: Mutex::new(HashMap::new()),
             reschedule_queue: Mutex::new(RescheduleState::new()),
-            reschedule_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
-            started: AtomicBool::new(false),
             next_block_epoch: AtomicU64::new(0),
-            thread: Mutex::new(None),
+            deadline_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            dispatch_invocations: AtomicU64::new(0),
         }
     }
 
-    pub(crate) fn attach_executor(self: &Arc<Self>, shared: Arc<ExecutorShared>) {
+    pub(crate) fn attach_executor(
+        self: &Arc<Self>,
+        shared: Arc<ExecutorShared>,
+        dispatcher: &EventDispatcher,
+    ) {
         let _ = self.shared.set(shared);
-        self.start_if_needed();
+        if self.dispatcher.get().is_none() {
+            let registration = dispatcher.register(self);
+            if let Err(registration) = self.dispatcher.set(registration)
+                && let Some(dispatcher) = registration.state.upgrade()
+            {
+                dispatcher.unregister(registration.id);
+            }
+        }
     }
 
     pub(crate) fn shutdown(&self) {
-        // Guard the shutdown predicate with the same mutex used by the condvar wait loop,
-        // otherwise the idle scheduler thread can miss the wake-up and keep join() blocked.
+        let _ = self.shutdown_and_take_blocked();
+    }
+
+    pub(crate) fn shutdown_and_take_blocked(&self) -> Vec<DriverTask> {
+        let mut blocked_guard = self.blocked.lock().expect("event scheduler blocked lock");
         let mut queue_guard = self
             .reschedule_queue
             .lock()
             .expect("event scheduler queue lock");
         if self.shutdown.swap(true, Ordering::AcqRel) {
-            return;
+            return Vec::new();
         }
         queue_guard.clear_deadlines();
-        self.reschedule_cv.notify_all();
+        self.deadline_generation.fetch_add(1, Ordering::AcqRel);
+        queue_guard.queue.clear();
+        queue_guard.pending.clear();
         drop(queue_guard);
-        if let Some(handle) = self
-            .thread
-            .lock()
-            .expect("event scheduler thread lock")
-            .take()
+        let tasks = blocked_guard
+            .drain()
+            .map(|(_, blocked)| blocked.task)
+            .collect();
+        drop(blocked_guard);
+        if let Some(registration) = self.dispatcher.get()
+            && let Some(dispatcher) = registration.state.upgrade()
         {
-            if handle.thread().id() == thread::current().id() {
-                debug!("EventScheduler shutdown called from scheduler thread; skip self-join");
-            } else {
-                let _ = handle.join();
-            }
+            dispatcher.unregister(registration.id);
         }
+        tasks
     }
 
     pub(crate) fn enqueue(&self, key: DriverKey) {
@@ -230,7 +590,8 @@ impl EventScheduler {
             .lock()
             .expect("event scheduler queue lock");
         if state.enqueue(key) {
-            self.reschedule_cv.notify_one();
+            drop(state);
+            self.notify_dispatcher();
         }
     }
 
@@ -261,7 +622,8 @@ impl EventScheduler {
             .lock()
             .expect("event scheduler queue lock");
         if state.enqueue(key) {
-            self.reschedule_cv.notify_one();
+            drop(state);
+            self.notify_dispatcher();
         }
     }
 
@@ -277,7 +639,8 @@ impl EventScheduler {
         for key in blocked.keys().copied() {
             state.enqueue(key);
         }
-        self.reschedule_cv.notify_all();
+        drop(state);
+        self.notify_dispatcher();
     }
 
     pub(crate) fn add_blocked(
@@ -309,13 +672,9 @@ impl EventScheduler {
                         observable.num_observers()
                     );
                 }
-                self.park_blocked(task, reason, observable, generation, deadline);
-                Ok(())
+                self.park_blocked(task, reason, observable, generation, deadline)
             }
-            BlockedReason::Dependency(dep) => {
-                self.park_blocked_with_dependency(task, dep);
-                Ok(())
-            }
+            BlockedReason::Dependency(dep) => self.park_blocked_with_dependency(task, dep),
         }
     }
 
@@ -326,7 +685,7 @@ impl EventScheduler {
         observable: Arc<Observable>,
         generation: u64,
         deadline: Option<DriverBlockDeadline>,
-    ) {
+    ) -> Result<(), Box<DriverTask>> {
         let emit_exchange_marker = crate::runtime::exchange::exchange_snapshot_markers_enabled()
             && matches!(reason, BlockedReason::InputEmpty)
             && task.source_name().contains("EXCHANGE")
@@ -339,6 +698,9 @@ impl EventScheduler {
         self.register_observer(&task, &reason, Arc::clone(&observable));
         let aborted = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(Box::new(task));
+            }
             blocked.insert(
                 key,
                 BlockedTask {
@@ -363,7 +725,9 @@ impl EventScheduler {
                         block_epoch,
                     },
                 );
-                self.reschedule_cv.notify_one();
+                self.deadline_generation.fetch_add(1, Ordering::AcqRel);
+                drop(state);
+                self.notify_dispatcher();
             }
             aborted
         };
@@ -391,9 +755,14 @@ impl EventScheduler {
             let current_generation = observable.generation();
             self.enqueue_observable(key, &Arc::downgrade(&observable), current_generation);
         }
+        Ok(())
     }
 
-    fn park_blocked_with_dependency(self: &Arc<Self>, task: DriverTask, dep: DependencyHandle) {
+    fn park_blocked_with_dependency(
+        self: &Arc<Self>,
+        task: DriverTask,
+        dep: DependencyHandle,
+    ) -> Result<(), Box<DriverTask>> {
         let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
         let block_epoch = self
             .next_block_epoch
@@ -401,6 +770,9 @@ impl EventScheduler {
             .wrapping_add(1);
         let aborted = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(Box::new(task));
+            }
             blocked.insert(
                 key,
                 BlockedTask {
@@ -430,6 +802,7 @@ impl EventScheduler {
         if aborted {
             self.enqueue(key);
         }
+        Ok(())
     }
 
     fn register_observer(
@@ -480,75 +853,50 @@ impl EventScheduler {
         observable.add_observer(callback);
     }
 
-    fn start_if_needed(self: &Arc<Self>) {
-        if self.shared.get().is_none() {
-            return;
-        }
-        if self
-            .started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+    fn notify_dispatcher(&self) {
+        if let Some(registration) = self.dispatcher.get()
+            && let Some(dispatcher) = registration.state.upgrade()
         {
-            return;
+            dispatcher.notify_scheduler(registration.id, registration.scheduler.clone());
         }
-        let scheduler = Arc::clone(self);
-        let handle = thread::Builder::new()
-            .name("event_scheduler".to_string())
-            .spawn(move || scheduler.run())
-            .expect("spawn event scheduler thread");
-        *self.thread.lock().expect("event scheduler thread lock") = Some(handle);
     }
 
-    fn run(self: Arc<Self>) {
-        enum Wake {
-            Key(DriverKey),
-            Deadline(DriverKey, u64, u64),
-            Shutdown,
-        }
+    fn deadline_snapshot(&self) -> (u64, Option<Instant>) {
+        let state = self
+            .reschedule_queue
+            .lock()
+            .expect("event scheduler queue lock");
+        let generation = self.deadline_generation.load(Ordering::Acquire);
+        (
+            generation,
+            state.earliest_deadline().map(|(_, deadline)| deadline.at),
+        )
+    }
 
-        loop {
-            let wake = {
-                let mut queue = self
-                    .reschedule_queue
-                    .lock()
-                    .expect("event scheduler queue lock");
-                loop {
-                    if let Some(key) = queue.queue.pop_front() {
-                        // Keep `pending` set until `try_schedule_key` removes
-                        // the blocked task. A callback in this gap is coalesced
-                        // into the wake-up already being delivered.
-                        break Wake::Key(key);
-                    }
-                    if self.shutdown.load(Ordering::Acquire) {
-                        break Wake::Shutdown;
-                    }
-                    let earliest = queue.earliest_deadline();
-                    let Some((key, deadline)) = earliest else {
-                        queue = self
-                            .reschedule_cv
-                            .wait(queue)
-                            .expect("event scheduler condvar wait");
-                        continue;
-                    };
-                    let now = Instant::now();
-                    if deadline.at <= now {
-                        break Wake::Deadline(key, deadline.block_epoch, deadline.operator_token);
-                    }
-                    let (guard, _) = self
-                        .reschedule_cv
-                        .wait_timeout(queue, deadline.at.saturating_duration_since(now))
-                        .unwrap_or_else(|error| error.into_inner());
-                    queue = guard;
-                }
-            };
-            match wake {
-                Wake::Key(key) => self.try_schedule_key(key),
-                Wake::Deadline(key, block_epoch, operator_token) => {
-                    self.enqueue_due_deadline(key, block_epoch, operator_token)
-                }
-                Wake::Shutdown => break,
-            }
+    fn dispatch_one(self: &Arc<Self>) -> bool {
+        #[cfg(test)]
+        self.dispatch_invocations.fetch_add(1, Ordering::Relaxed);
+        if self.shutdown.load(Ordering::Acquire) {
+            return false;
         }
+        let wake = {
+            let mut queue = self
+                .reschedule_queue
+                .lock()
+                .expect("event scheduler queue lock");
+            queue.pop_wake(Instant::now())
+        };
+        match wake {
+            // Keep `pending` set until `try_schedule_key` removes the blocked
+            // task. A callback in this gap is coalesced into the wake-up being
+            // delivered.
+            Some(SchedulerWake::Key(key)) => self.try_schedule_key(key),
+            Some(SchedulerWake::Deadline(key, block_epoch, operator_token)) => {
+                self.enqueue_due_deadline(key, block_epoch, operator_token)
+            }
+            None => return false,
+        }
+        true
     }
 
     fn enqueue_due_deadline(&self, key: DriverKey, block_epoch: u64, operator_token: u64) {
@@ -573,8 +921,10 @@ impl EventScheduler {
             return;
         }
         state.remove_deadline(key);
+        self.deadline_generation.fetch_add(1, Ordering::AcqRel);
         if state.enqueue(key) {
-            self.reschedule_cv.notify_one();
+            drop(state);
+            self.notify_dispatcher();
         }
     }
 
@@ -609,7 +959,9 @@ impl EventScheduler {
                 .lock()
                 .expect("event scheduler queue lock");
             state.pending.remove(&key);
-            state.remove_deadline(key);
+            if state.remove_deadline(key).is_some() {
+                self.deadline_generation.fetch_add(1, Ordering::AcqRel);
+            }
             (entry.map(|entry| entry.task), exchange_marker)
         };
         if let Some((blocked_generation, current_generation, block_epoch)) = exchange_marker {
@@ -647,6 +999,7 @@ enum ObserverKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use crate::exec::chunk::Chunk;
@@ -951,7 +1304,9 @@ mod tests {
         let executor = Arc::new(ExecutorShared {
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
+            admission_closed: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            live_workers: AtomicUsize::new(0),
         });
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
 
@@ -1019,12 +1374,19 @@ mod tests {
             None,
         ));
         let completion = FragmentCompletion::new(1);
-        let mut task = DriverTask::new(driver, completion, fragment_ctx, Duration::from_millis(10));
+        let mut task = DriverTask::new(
+            driver,
+            Arc::clone(&completion),
+            fragment_ctx,
+            Duration::from_millis(10),
+        );
         let scheduler = Arc::new(EventScheduler::new());
         let executor = Arc::new(ExecutorShared {
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
+            admission_closed: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            live_workers: AtomicUsize::new(0),
         });
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
 
@@ -1193,7 +1555,12 @@ mod tests {
             None,
         ));
         let completion = FragmentCompletion::new(1);
-        let mut task = DriverTask::new(driver, completion, fragment_ctx, Duration::from_millis(10));
+        let mut task = DriverTask::new(
+            driver,
+            Arc::clone(&completion),
+            fragment_ctx,
+            Duration::from_millis(10),
+        );
         let reason = match task.process_for_test(Duration::from_millis(10)) {
             DriverState::Blocked(reason @ BlockedReason::InputEmpty) => reason,
             state => panic!("expected input-empty block, got {state:?}"),
@@ -1202,7 +1569,9 @@ mod tests {
         let executor = Arc::new(ExecutorShared {
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
+            admission_closed: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            live_workers: AtomicUsize::new(0),
         });
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
         assert!(scheduler.add_blocked(task, reason).is_ok());
@@ -1248,6 +1617,53 @@ mod tests {
     }
 
     #[test]
+    fn due_deadlines_preempt_a_continuously_ready_scheduler() {
+        let now = Instant::now();
+        let ready_key = DriverKey::new(Some((10, 11)), 1);
+        let deadline_key = DriverKey::new(Some((12, 13)), 2);
+        let mut scheduler_queue = RescheduleState::new();
+        assert!(scheduler_queue.enqueue(ready_key));
+        scheduler_queue.install_deadline(
+            deadline_key,
+            ScheduledDeadline {
+                at: now,
+                operator_token: 7,
+                block_epoch: 9,
+            },
+        );
+        assert_eq!(
+            scheduler_queue.pop_wake(now),
+            Some(SchedulerWake::Deadline(deadline_key, 9, 7)),
+            "a fragment-local ready backlog must not starve its due deadline"
+        );
+
+        let ready_scheduler = Arc::new(EventScheduler::new());
+        let deadline_scheduler = Arc::new(EventScheduler::new());
+        let mut dispatcher_queue = EventDispatcherQueues::new();
+        dispatcher_queue
+            .registered
+            .insert(1, Arc::downgrade(&ready_scheduler));
+        dispatcher_queue
+            .registered
+            .insert(2, Arc::downgrade(&deadline_scheduler));
+        assert!(dispatcher_queue.enqueue(1, Arc::downgrade(&ready_scheduler)));
+        dispatcher_queue.update_deadline(2, Arc::downgrade(&deadline_scheduler), 1, Some(now));
+        let selected = dispatcher_queue
+            .pop_dispatchable(now)
+            .expect("due scheduler is dispatchable");
+        assert_eq!(selected.scheduler_id, 2);
+        assert_eq!(
+            dispatcher_queue
+                .ready
+                .front()
+                .expect("ready scheduler remains queued")
+                .scheduler_id,
+            1,
+            "a process-wide ready backlog must yield to a due deadline"
+        );
+    }
+
+    #[test]
     fn shutdown_interrupts_a_far_future_deadline_wait() {
         let source_ready = Arc::new(AtomicBool::new(false));
         let runtime_state = Arc::new(RuntimeState::default());
@@ -1275,22 +1691,63 @@ mod tests {
             None,
         ));
         let completion = FragmentCompletion::new(1);
-        let mut task = DriverTask::new(driver, completion, fragment_ctx, Duration::from_millis(10));
+        let mut task = DriverTask::new(
+            driver,
+            Arc::clone(&completion),
+            fragment_ctx,
+            Duration::from_millis(10),
+        );
         let reason = match task.process_for_test(Duration::from_millis(10)) {
             DriverState::Blocked(reason @ BlockedReason::InputEmpty) => reason,
             state => panic!("expected input-empty block, got {state:?}"),
         };
         let scheduler = Arc::new(EventScheduler::new());
-        scheduler.attach_executor(Arc::new(ExecutorShared {
-            queue: Mutex::new(VecDeque::new()),
-            cv: Condvar::new(),
-            shutdown: AtomicBool::new(false),
-        }));
+        let dispatcher = EventDispatcher::new();
+        scheduler.attach_executor(
+            Arc::new(ExecutorShared {
+                queue: Mutex::new(VecDeque::new()),
+                cv: Condvar::new(),
+                admission_closed: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
+                live_workers: AtomicUsize::new(0),
+            }),
+            &dispatcher,
+        );
         assert!(scheduler.add_blocked(task, reason).is_ok());
+        let scheduler_id = scheduler
+            .dispatcher
+            .get()
+            .expect("scheduler registration")
+            .id;
+        let index_deadline = Instant::now() + Duration::from_secs(1);
+        while !dispatcher
+            .state
+            .queues
+            .lock()
+            .expect("event dispatcher queue lock")
+            .deadlines
+            .contains_key(&scheduler_id)
+            && Instant::now() < index_deadline
+        {
+            thread::yield_now();
+        }
+        let queues = dispatcher
+            .state
+            .queues
+            .lock()
+            .expect("event dispatcher queue lock");
+        assert_eq!(queues.deadlines.len(), 1);
+        assert_eq!(queues.deadline_index.len(), 1);
+        drop(queues);
 
         let start = Instant::now();
-        scheduler.shutdown();
+        let drained = dispatcher.close_and_drain();
         assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(drained.len(), 1);
+        for task in drained {
+            task.reject_due_to_executor_shutdown();
+        }
+        assert!(completion.stopped_fact().is_some());
         assert!(
             scheduler
                 .reschedule_queue
@@ -1307,5 +1764,47 @@ mod tests {
                 .deadline_index
                 .is_empty()
         );
+        assert_eq!(dispatcher.registered_scheduler_count(), 0);
+        dispatcher.shutdown_and_join();
+    }
+
+    #[test]
+    fn dispatcher_visits_only_the_scheduler_that_was_marked_ready() {
+        let dispatcher = EventDispatcher::new();
+        let executor = Arc::new(ExecutorShared {
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            admission_closed: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            live_workers: AtomicUsize::new(0),
+        });
+        let idle = (0..512)
+            .map(|_| {
+                let scheduler = Arc::new(EventScheduler::new());
+                scheduler.attach_executor(Arc::clone(&executor), &dispatcher);
+                scheduler
+            })
+            .collect::<Vec<_>>();
+        let active = Arc::new(EventScheduler::new());
+        active.attach_executor(executor, &dispatcher);
+
+        active.enqueue(DriverKey::new(Some((9_001, 9_002)), 7));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while active.dispatch_invocations.load(Ordering::Acquire) == 0 && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+
+        assert!(active.dispatch_invocations.load(Ordering::Acquire) > 0);
+        assert!(
+            idle.iter()
+                .all(|scheduler| scheduler.dispatch_invocations.load(Ordering::Acquire) == 0),
+            "idle schedulers must not be scanned when another scheduler wakes"
+        );
+        for scheduler in idle {
+            scheduler.shutdown();
+        }
+        active.shutdown();
+        dispatcher.shutdown_and_join();
     }
 }

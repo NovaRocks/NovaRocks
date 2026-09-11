@@ -15,11 +15,13 @@ mod state_family;
 mod table_maintenance;
 mod task_evidence;
 mod task_execution;
+mod uea1_performance;
 
 pub fn all() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
     scenarios.extend(backend_membership::scenarios());
     scenarios.extend(query_lifecycle::scenarios());
+    scenarios.extend(uea1_performance::scenarios());
     scenarios.extend(runtime_filter::scenarios());
     scenarios.extend(runtime_filter::native_trust_directional_scenarios());
     scenarios.extend(connector::scenarios());

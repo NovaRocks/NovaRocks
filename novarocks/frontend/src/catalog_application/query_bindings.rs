@@ -24,12 +24,18 @@
 //! against this store rather than acquiring a current connector generation.
 
 use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use arrow::datatypes::SchemaRef;
+use novarocks_query_application::api::{ExactBindingReceiptStore, SealedExactBindingReceipts};
+use novarocks_query_application::preparation::{
+    AdmittedScanSubject, SelectedMvQueryInputs, prove_selected_mv_query_inputs,
+};
+use novarocks_spi::connector::read_stack::ConnectorReadTableHandle;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
     ConnectorWritePreparation,
@@ -38,8 +44,6 @@ use novarocks_sql::binding::{SqlTableBindingAllocator, SqlTableBindingId, SqlTab
 use novarocks_sql::planning::catalog::{
     self, MetadataTableKind as SqlMetadataTableKind, ResolvedAnalyzerTable,
 };
-
-static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical request-local lookup identity.  Names are normalized before the
 /// binding is inserted, so a resolve failure is memoized just like success.
@@ -396,6 +400,7 @@ struct StoredBinding {
 /// Exact application authority paired with one compiler request.
 pub struct QueryTableBindingStore {
     allocator: Mutex<SqlTableBindingAllocator>,
+    exact_binding_receipts: ExactBindingReceiptStore,
     entries: Mutex<HashMap<QueryTableBindingKey, Result<StoredBinding, String>>>,
     by_id: Mutex<HashMap<SqlTableBindingId, Arc<QueryTableBinding>>>,
     /// Once a statement enters a topology-only replan, an unknown lookup must
@@ -408,15 +413,11 @@ impl QueryTableBindingStore {
     /// Allocate one fresh process-local scope.  Scope exhaustion is explicit
     /// rather than silently reusing a token from another query.
     pub fn try_new() -> Result<Self, String> {
-        let raw_scope = NEXT_BINDING_SCOPE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| "SQL table binding scope space is exhausted".to_string())?;
-        let scope = NonZeroU64::new(raw_scope)
-            .ok_or_else(|| "SQL table binding scope space is exhausted".to_string())?;
+        let allocator = SqlTableBindingAllocator::new_unique()?;
+        let exact_binding_receipts = ExactBindingReceiptStore::new(&allocator);
         Ok(Self {
-            allocator: Mutex::new(SqlTableBindingAllocator::try_new(scope)?),
+            allocator: Mutex::new(allocator),
+            exact_binding_receipts,
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
             sealed_for_topology_replan: AtomicBool::new(false),
@@ -429,11 +430,12 @@ impl QueryTableBindingStore {
     /// `test_sql_scan_source`, whose token has the same fixed scope.
     #[cfg(test)]
     pub fn try_new_with_scope_for_test(scope: NonZeroU64) -> Self {
+        let allocator = SqlTableBindingAllocator::try_new_for_test(scope)
+            .expect("test binding scope must construct SQL allocator");
+        let exact_binding_receipts = ExactBindingReceiptStore::new(&allocator);
         Self {
-            allocator: Mutex::new(
-                SqlTableBindingAllocator::try_new(scope)
-                    .expect("test binding scope must construct SQL allocator"),
-            ),
+            allocator: Mutex::new(allocator),
+            exact_binding_receipts,
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
             sealed_for_topology_replan: AtomicBool::new(false),
@@ -448,6 +450,7 @@ impl QueryTableBindingStore {
         // Serialize with `resolve_or_insert_with_id`, which keeps `entries`
         // locked across the one permitted first-load callback.
         let _entries = self.entries.lock().expect("query table binding lock");
+        self.exact_binding_receipts.seal();
         self.sealed_for_topology_replan
             .store(true, Ordering::Release);
     }
@@ -500,6 +503,41 @@ impl QueryTableBindingStore {
             .scope()
     }
 
+    pub(crate) fn sealed_exact_binding_receipts(
+        &self,
+    ) -> Result<SealedExactBindingReceipts, String> {
+        self.exact_binding_receipts
+            .sealed_view()
+            .ok_or_else(|| "query table binding store is not semantically sealed".to_string())
+    }
+
+    /// Resolve an optimizer-selected MV action against the exact pre-rewrite
+    /// bindings admitted by this query. The returned proof is move-only and
+    /// still requires the final target scan receipt before it can authorize
+    /// an execution description.
+    pub(crate) fn prove_selected_mv_query_inputs(
+        &self,
+        action: novarocks_sql::planning::query_execution::SealedMvRewriteAction,
+    ) -> Result<SelectedMvQueryInputs, String> {
+        let receipts = self.sealed_exact_binding_receipts()?;
+        prove_selected_mv_query_inputs(
+            novarocks_query_application::api::QueryConsistency::Strict,
+            &receipts,
+            action,
+        )
+    }
+
+    /// Sign the indivisible SQL-scan/Connector-handle pairing through this
+    /// query's exact receipt authority. The raw receipt store is never exposed.
+    pub(crate) fn admit_scan_handle(
+        &self,
+        contract: novarocks_sql::planning::query_execution::SealedScanContract,
+        handle: ConnectorReadTableHandle,
+    ) -> Result<AdmittedScanSubject, String> {
+        self.exact_binding_receipts
+            .admit_scan_handle(contract, handle)
+    }
+
     /// Memoize both success and failure.  The supplied load closure executes
     /// at most once for a canonical key in this request.
     pub fn resolve_or_insert(
@@ -535,13 +573,23 @@ impl QueryTableBindingStore {
         }
 
         let result = self.allocate_id().and_then(|id| {
-            load(id).map(|binding| {
+            load(id).and_then(|binding| {
+                if let Some(materialization) = &binding.scan_materialization {
+                    let identity = catalog::materialization_identity_facts(&binding.resolved);
+                    self.exact_binding_receipts.register_connector_binding(
+                        id,
+                        [identity.catalog(), identity.namespace(), identity.table()],
+                        &materialization.planning_lease,
+                        &materialization.table,
+                        materialization.selector,
+                    )?;
+                }
                 let binding = Arc::new(binding);
                 self.by_id
                     .lock()
                     .expect("query table binding by-id lock")
                     .insert(id, Arc::clone(&binding));
-                StoredBinding { id }
+                Ok(StoredBinding { id })
             })
         });
         let response = result
@@ -810,7 +858,7 @@ mod tests {
     }
 
     fn local_binding() -> QueryTableBinding {
-        let mut allocator = novarocks_sql::binding::SqlTableBindingAllocator::try_new(
+        let mut allocator = novarocks_sql::binding::SqlTableBindingAllocator::try_new_for_test(
             NonZeroU64::new(1).expect("test scope"),
         )
         .expect("test allocator");

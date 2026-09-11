@@ -18,8 +18,8 @@
 //! One query context's installed vended credentials.
 //!
 //! This is the backend half of the credential domain. It holds no authority
-//! over epochs: the query context owner has already classified a rotation
-//! against [`CredentialDomain`], so by the time anything here runs the only
+//! over epochs: the Worker domain owner has already classified a rotation,
+//! so by the time anything here runs the only
 //! remaining question is which scoped material a storage request may use.
 //!
 //! Two things about the shape are deliberate.
@@ -36,14 +36,12 @@
 //! division is ADR-0129's, and moving the carrier from the lifecycle stream to
 //! a query-context domain does not move the principal.
 //!
-//! [`CredentialDomain`]: novarocks_execution::task_execution::domain::CredentialDomain
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use novarocks_execution::task_execution::status::TaskFailureCategory;
+use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorStorageResolver, CredentialLeaseDescriptor,
     CredentialLeaseId, CredentialLeaseProvider, CredentialLeaseSecretEnvelope,

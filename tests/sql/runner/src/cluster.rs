@@ -29,7 +29,9 @@ pub(crate) use novarocks_cluster_harness::{
     BePorts, ClusterProcessRole, CrossProcessRuntime, QueryLifecyclePhase, ServerFailureLogSources,
     ServerHandle, build_novarocks_command, render_cross_process_config, startup_timeout_from_env,
 };
-use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHandle};
+use novarocks_cluster_harness::{
+    CrossProcessClusterOptions, CrossProcessServerHandle, LaunchProfile,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ClusterMode {
@@ -54,8 +56,7 @@ pub(crate) fn launch_server(
     cluster_size: usize,
     repo_root: &Path,
     runner_config: &RunnerConfig,
-    query_lifecycle_faults_enabled: bool,
-    cleanup_faults_enabled: bool,
+    launch_profile: LaunchProfile,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
@@ -68,8 +69,7 @@ pub(crate) fn launch_server(
                 base_config_path: resolve_base_frontend_config_path(repo_root, runner_config)?,
                 runtime_root: repo_root.join("tests/sql/.runtime/cluster"),
                 cluster_size,
-                query_lifecycle_faults_enabled,
-                cleanup_faults_enabled,
+                launch_profile,
                 startup_timeout: startup_timeout(),
                 child_environment: Default::default(),
                 config_overlay: Default::default(),

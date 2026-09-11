@@ -239,6 +239,54 @@ pub struct ConnectorRequestContext {
     resources: Option<ConnectorRequestResources>,
 }
 
+/// Connector context for metadata observation and scan negotiation.
+///
+/// Planning never owns an execution-attempt credential collector.  Providers
+/// may use the host-installed FE metadata access capability, but they cannot
+/// contribute credentials to a future BE attempt through this context.
+#[derive(Clone)]
+pub struct ConnectorPlanningContext {
+    request: ConnectorRequestContext,
+}
+
+impl ConnectorPlanningContext {
+    pub fn try_from_request(request: ConnectorRequestContext) -> Result<Self, ConnectorError> {
+        if request.storage_resolver.is_some()
+            || request.vended_credential_lease_sink.is_some()
+            || request.vended_credential_lease_collection.is_some()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Connector planning context cannot own attempt storage or credential capabilities",
+            ));
+        }
+        Ok(Self { request })
+    }
+
+    pub const fn request(&self) -> &ConnectorRequestContext {
+        &self.request
+    }
+}
+
+/// Connector context for instantiating one execution attempt from frozen scan
+/// semantics.  Attempt-only SPI accepts this type instead of a planning
+/// context, so a provider cannot use reacquisition to renegotiate metadata,
+/// projection, predicates, limits, or snapshots.
+#[derive(Clone)]
+pub struct ConnectorAttemptContext {
+    request: ConnectorRequestContext,
+}
+
+impl ConnectorAttemptContext {
+    pub fn from_admitted_request(request: ConnectorRequestContext) -> Self {
+        Self { request }
+    }
+
+    pub const fn request(&self) -> &ConnectorRequestContext {
+        &self.request
+    }
+}
+
 impl ConnectorRequestContext {
     pub fn try_new(
         deadline: Instant,
@@ -407,15 +455,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ConnectorCancellation, ConnectorRequestContext, ResolvedVendedS3Access,
-        StorageAccessRequest,
+        ConnectorCancellation, ConnectorPlanningContext, ConnectorRequestContext,
+        ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
     };
     use crate::connector::{
-        CatalogHandle, CatalogVersion, ConnectorError, ConnectorInstanceId,
+        CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorInstanceId,
         ConnectorRequestResources, ConnectorResourceCheckpoint, ConnectorResourceClass,
-        ConnectorResourceLease, ConnectorResourceLedger, CredentialLeaseId,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        StorageAccessDomainId, StorageCredentialScopePrefix,
+        ConnectorResourceLease, ConnectorResourceLedger, ConnectorVendedCredentialLeaseSink,
+        CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        StorageAccessDomainId, StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
     };
     use novarocks_secret::SecretValue;
 
@@ -428,6 +476,29 @@ mod tests {
     }
 
     struct EmptyLedger;
+
+    struct RejectingSink;
+
+    struct RejectingResolver;
+
+    impl ConnectorStorageResolver for RejectingResolver {
+        fn resolve_vended_s3(
+            &self,
+            _request: &StorageAccessRequest,
+        ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+            unreachable!("planning context construction must reject the resolver")
+        }
+    }
+
+    impl ConnectorVendedCredentialLeaseSink for RejectingSink {
+        fn offer_vended_s3_credential_lease(
+            &self,
+            _catalog_properties: &CatalogProperties,
+            _contribution: VendedS3CredentialLeaseContribution,
+        ) -> Result<(), ConnectorError> {
+            unreachable!("planning context construction must reject the sink")
+        }
+    }
 
     impl ConnectorResourceLedger for EmptyLedger {
         fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
@@ -503,5 +574,23 @@ mod tests {
                 .sequence(),
             1
         );
+    }
+
+    #[test]
+    fn planning_context_rejects_attempt_credential_collection() {
+        let base = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(Active),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        assert!(ConnectorPlanningContext::try_from_request(base.clone()).is_ok());
+        let resolver_decorated = base
+            .clone()
+            .with_storage_resolver(Arc::new(RejectingResolver));
+        assert!(ConnectorPlanningContext::try_from_request(resolver_decorated).is_err());
+        let attempt_decorated = base.with_vended_credential_lease_sink(Arc::new(RejectingSink));
+        assert!(ConnectorPlanningContext::try_from_request(attempt_decorated).is_err());
     }
 }

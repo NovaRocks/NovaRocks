@@ -496,6 +496,10 @@ fn runtime_filter_membership_contract_is_closed_and_legacy_fields_stay_reserved(
 }
 
 #[test]
+#[allow(
+    clippy::single_element_loop,
+    reason = "the table keeps the retired self-attestation field ledger appendable"
+)]
 fn retired_request_self_attestation_fields_remain_reserved() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
@@ -1054,6 +1058,7 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
                 "cancel_task",
                 "abort_query_context",
                 "release_query_context",
+                "acquire_query_context_admission_ticket",
             ][..],
         ),
         (
@@ -1079,7 +1084,7 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
         (
             "novarocks.TaskStatusStreamEvent",
             "event",
-            &["task_status", "task_gone"][..],
+            &["task_status", "task_gone", "context_convergence"][..],
         ),
         (
             "novarocks.TaskDomainReceipt",
@@ -1108,11 +1113,44 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
             "{message_name}.{oneof_name} variant set changed"
         );
     }
+
+    let edge_receipt = pool
+        .get_message_by_name("novarocks.OpenExchangeEdgesReceipt")
+        .expect("OpenExchangeEdgesReceipt descriptor");
+    let edge_receipt_fields = edge_receipt
+        .fields()
+        .map(|field| (field.number(), field.name().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        edge_receipt_fields,
+        vec![
+            (1, "opened_edge_ids".to_owned()),
+            (2, "accepted_version".to_owned()),
+        ],
+        "an edge-open receipt must identify both retained edges and their exact version"
+    );
+
+    let subscription = pool
+        .get_message_by_name("novarocks.SubscribeTaskStatusRequest")
+        .expect("SubscribeTaskStatusRequest descriptor");
+    let convergence_cursor = subscription
+        .get_field_by_name("context_convergence_cursor")
+        .expect("a status subscription must carry an optional context convergence cursor");
+    assert_eq!(convergence_cursor.number(), 3);
+    assert_eq!(
+        convergence_cursor
+            .kind()
+            .as_message()
+            .expect("context convergence cursor message")
+            .full_name(),
+        "novarocks.QueryContextConvergenceCursor"
+    );
 }
 
 /// A frozen exchange endpoint carries both addresses. The task identity is the
 /// process fence; the fragment instance id is what an actual exchange frame
-/// carries. Losing either one makes a frame uncheckable.
+/// carries. A source also freezes the sender ordinal used for receiver
+/// completion. Losing any of these facts makes a frame uncheckable.
 #[test]
 fn the_task_exchange_topology_freezes_both_addresses() {
     let pool =
@@ -1148,6 +1186,18 @@ fn the_task_exchange_topology_freezes_both_addresses() {
             "{message_name} must carry the kernel key an exchange frame uses"
         );
     }
+
+    let source = pool
+        .get_message_by_name("novarocks.TaskExchangeSource")
+        .expect("TaskExchangeSource descriptor");
+    assert_eq!(
+        source
+            .get_field_by_name("sender_ordinal")
+            .expect("the frozen sender ordinal")
+            .number(),
+        3,
+        "TaskExchangeSource.sender_ordinal must retain field number 3"
+    );
 
     // The sender count of an inbound node is its frozen source set, so there
     // is deliberately no separate count field that could disagree with it.
@@ -1271,6 +1321,16 @@ fn the_root_result_poll_is_addressed_by_task_identity() {
         request.get_field_by_name("max_wait_millis").is_some(),
         "the poll budget is a duration the backend times itself"
     );
+    assert!(
+        matches!(
+            request
+                .get_field_by_name("max_result_bytes")
+                .expect("result payload byte credit")
+                .kind(),
+            prost_reflect::Kind::Uint64
+        ),
+        "the root result poll carries a positive payload-byte credit"
+    );
 }
 
 /// A credential rotation keeps its non-secret descriptors and its confidential
@@ -1343,6 +1403,7 @@ fn the_operation_outcome_enum_reserves_the_client_only_category() {
         "TASK_OPERATION_OUTCOME_RELEASE_NOT_READY",
         "TASK_OPERATION_OUTCOME_GONE",
         "TASK_OPERATION_OUTCOME_RESOURCE_EXHAUSTED",
+        "TASK_OPERATION_OUTCOME_ADMISSION_TICKET_STILL_ACTIVE",
     ] {
         assert!(
             outcome.values().any(|value| value.name() == expected),
@@ -1418,6 +1479,7 @@ fn establish_installs_shared_facts_without_a_task_manifest_or_digest() {
         "initial_runtime_filter",
         "initial_credential",
         "initial_lease",
+        "admission_ticket_id",
     ] {
         assert!(
             establish.get_field_by_name(required).is_some(),
@@ -1450,5 +1512,97 @@ fn establish_installs_shared_facts_without_a_task_manifest_or_digest() {
         release_fields,
         vec!["query_context".to_owned()],
         "release is the frontend's closure statement, not a manifest"
+    );
+}
+
+#[test]
+fn admission_ticket_contract_is_exact_and_append_only() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    let ticket_id = pool
+        .get_message_by_name("novarocks.AdmissionTicketId")
+        .expect("admission ticket identity descriptor");
+    assert_eq!(ticket_id.fields().count(), 1);
+    let nonce = ticket_id.get_field_by_name("value").expect("nonce bytes");
+    assert_eq!(nonce.number(), 1);
+    assert!(matches!(nonce.kind(), prost_reflect::Kind::Bytes));
+
+    let request = pool
+        .get_message_by_name("novarocks.AcquireQueryContextAdmissionTicketRequest")
+        .expect("admission ticket request descriptor");
+    assert_eq!(request.fields().count(), 4);
+    assert_eq!(
+        request
+            .get_field_by_name("query_context")
+            .expect("query context")
+            .number(),
+        1
+    );
+    assert_eq!(
+        request
+            .get_field_by_name("valid_for_millis")
+            .expect("validity")
+            .number(),
+        2
+    );
+    let compatibility = request
+        .get_field_by_name("native_compatibility_id")
+        .expect("native compatibility identity");
+    assert_eq!(compatibility.number(), 3);
+    assert!(matches!(
+        compatibility.kind(),
+        prost_reflect::Kind::Message(_)
+    ));
+    let admission_epoch = request
+        .get_field_by_name("admission_epoch_capability")
+        .expect("admission epoch capability");
+    assert_eq!(admission_epoch.number(), 4);
+    assert!(matches!(
+        admission_epoch.kind(),
+        prost_reflect::Kind::Message(_)
+    ));
+
+    let ack = pool
+        .get_message_by_name("novarocks.QueryContextAdmissionTicketAck")
+        .expect("admission ticket acknowledgement descriptor");
+    for (name, number) in [
+        ("ticket_id", 1),
+        ("query_context", 2),
+        ("valid_for_millis", 3),
+    ] {
+        assert_eq!(ack.get_field_by_name(name).expect(name).number(), number);
+    }
+
+    let establish = pool
+        .get_message_by_name("novarocks.EstablishQueryContextRequest")
+        .expect("establish descriptor");
+    assert_eq!(
+        establish
+            .get_field_by_name("admission_ticket_id")
+            .expect("establish admission ticket")
+            .number(),
+        8
+    );
+
+    let operation = pool
+        .get_message_by_name("novarocks.TaskOperation")
+        .expect("task operation descriptor");
+    assert_eq!(
+        operation
+            .get_field_by_name("acquire_query_context_admission_ticket")
+            .expect("admission ticket operation")
+            .number(),
+        8
+    );
+    let receipt = pool
+        .get_message_by_name("novarocks.TaskOperationReceipt")
+        .expect("task operation receipt descriptor");
+    assert_eq!(
+        receipt
+            .get_field_by_name("query_context_admission_ticket")
+            .expect("admission ticket receipt")
+            .number(),
+        10
     );
 }

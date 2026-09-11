@@ -32,8 +32,6 @@ fn external_consumers_can_read_but_not_construct_a_sealed_plan() {
     let _ = read_sealed_plan as fn(&DistributedPlan);
 }
 
-use std::num::NonZeroUsize;
-
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::compiler::{
     SessionOptimizerSettings, SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCatalogSnapshot,
@@ -129,9 +127,7 @@ fn external_sql_contract_analyzes_freezes_and_reads_a_sealed_plan() {
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
             },
-            SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(1).expect("one is non-zero"),
-            },
+            SqlPlanningEnvironment::Distributed,
             &catalog,
             functions,
             novarocks_sql::compiler::noop_constant_evaluator(),

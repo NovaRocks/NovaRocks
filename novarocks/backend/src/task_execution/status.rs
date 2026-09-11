@@ -32,18 +32,19 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
-use novarocks_execution::task_execution::identity::TaskIdentity;
-use novarocks_execution::task_execution::lease::MonotonicInstant;
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS,
     FinalTaskInfo, OperatorStatistics, TaskFailure, TaskOutputFacts, TaskResourceFacts, TaskState,
     TaskStatus, TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
 };
-use novarocks_execution::task_execution::transition::{
-    RootDrainAction, TaskTransition, classify_root_drain, classify_task_transition,
-};
 use novarocks_types::UniqueId;
+use novarocks_worker::{
+    MonotonicInstant, RootDrainAction, TaskConvergence, TaskConvergenceAdvance,
+    TaskConvergenceRejection, TaskConvergenceSnapshot, TaskTransition, classify_root_drain,
+    classify_task_transition,
+};
 
 use super::clock::BackendMonotonicClock;
 use super::host::TaskDynamicFilterRead;
@@ -101,7 +102,7 @@ struct OwnedStatus {
     final_info: Option<FinalTaskInfo>,
     last_publication: MonotonicInstant,
     metrics_pending: bool,
-    output_released: bool,
+    convergence: TaskConvergence,
     /// Snapshots stay here until the creation transaction commits, so a
     /// creation that rolls back never leaves an observable task behind.
     released_to_observers: bool,
@@ -157,7 +158,7 @@ impl TaskStatusOwner {
                 final_info: None,
                 last_publication: now,
                 metrics_pending: false,
-                output_released: false,
+                convergence: TaskConvergence::new(),
                 released_to_observers: false,
                 buffered: Some(current),
             }),
@@ -208,7 +209,27 @@ impl TaskStatusOwner {
     /// be `ABORTED` while its buffers are still being released, and a release
     /// must not linearize until they are.
     pub fn output_released(&self) -> bool {
-        self.state.lock().expect("task status lock").output_released
+        self.convergence().output_released()
+    }
+
+    /// Returns the current Worker-local convergence facts. These facts remain
+    /// mutable after the immutable task conclusion has been published.
+    pub fn convergence(&self) -> TaskConvergenceSnapshot {
+        self.state
+            .lock()
+            .expect("task status lock")
+            .convergence
+            .snapshot()
+    }
+
+    pub fn retirement_ready(&self) -> bool {
+        self.convergence().retirement_ready()
+    }
+
+    /// Records the final Worker-owned retirement transition.
+    pub fn retire(&self) -> Result<TaskConvergenceSnapshot, TaskConvergenceRejection> {
+        let mut state = self.state.lock().expect("task status lock");
+        Ok(state.convergence.retire()?.snapshot())
     }
 
     pub fn dynamic_filters(&self) -> Option<TaskDynamicFilterRead> {
@@ -255,6 +276,10 @@ impl TaskStatusOwner {
                         state.operator_statistics_truncated,
                     )
                     .ok();
+                    state
+                        .convergence
+                        .note_conclusion_stable()
+                        .expect("a live task accepts its stable conclusion");
                 }
                 self.commit_locked(&mut state, next, now);
                 StatusAdvance::Published(version)
@@ -313,17 +338,15 @@ impl TaskStatusOwner {
         self.republish_locked(&mut state, now, true)
     }
 
-    /// Drives a task that ignored its stand-down request to a terminal
-    /// status, and releases its output responsibility.
+    /// Fixes the stable conclusion of a task that ignored stand-down.
     ///
     /// Only the query context owner calls this, and only once the termination
     /// grace has elapsed: a task is asked to stand down first and given a
-    /// bounded window to converge on its own outcome. Without this, one
-    /// uncooperative task would pin a terminating context open forever, which
-    /// is the shape of hang the whole lifecycle exists to avoid. A task that
-    /// is already converging on its own failure keeps that failure as its
-    /// cause; anything else is reported as forced.
-    pub fn force_terminal(&self, cause: AbortCause) -> bool {
+    /// bounded window to converge on its own outcome. This does not claim the
+    /// execution stopped or release output or resources. Those facts require
+    /// positive reports from the local execution owner. A task already
+    /// converging on its own failure keeps that failure as its cause.
+    pub fn force_conclusion(&self, cause: AbortCause) -> bool {
         let now = self.clock.now();
         let mut state = self.state.lock().expect("task status lock");
         if state.current.is_terminal() {
@@ -370,11 +393,13 @@ impl TaskStatusOwner {
                     state.operator_statistics_truncated,
                 )
                 .ok();
+                state
+                    .convergence
+                    .note_conclusion_stable()
+                    .expect("a live task accepts its stable conclusion");
             }
             self.commit_locked(&mut state, next, now);
         }
-        state.output_released = true;
-        self.source.note_progress();
         true
     }
 
@@ -395,7 +420,10 @@ impl TaskStatusOwner {
         let mut state = self.state.lock().expect("task status lock");
         let from = state.current.state();
         let advance = match classify_root_drain(from) {
-            RootDrainAction::AlreadyTerminal => return StatusAdvance::AlreadyTerminal(from),
+            // The stable conclusion does not close the convergence ledger.
+            // A late drain still releases output responsibility even though
+            // it cannot rewrite the terminal TaskStatus.
+            RootDrainAction::AlreadyTerminal => StatusAdvance::AlreadyTerminal(from),
             RootDrainAction::Illegal => {
                 return StatusAdvance::Illegal {
                     from,
@@ -426,14 +454,27 @@ impl TaskStatusOwner {
                     state.operator_statistics_truncated,
                 )
                 .ok();
+                state
+                    .convergence
+                    .note_conclusion_stable()
+                    .expect("a live task accepts its stable conclusion");
                 self.commit_locked(&mut state, next, now);
                 StatusAdvance::Published(version)
             }
         };
-        state.output_released = true;
+        let progressed = matches!(
+            state
+                .convergence
+                .note_output_released()
+                .expect("a live task accepts output release"),
+            TaskConvergenceAdvance::Advanced(_)
+        );
         drop(state);
-        // No snapshot carries the release fact, so the owner is told directly.
-        self.source.note_progress();
+        if progressed {
+            // No task-status snapshot carries this Worker-local convergence
+            // fact yet, so wake the registry directly.
+            self.source.note_progress();
+        }
         advance
     }
 
@@ -448,9 +489,51 @@ impl TaskStatusOwner {
     }
 
     fn release_output(&self) {
-        self.state.lock().expect("task status lock").output_released = true;
-        // No snapshot carries this fact, so the owner is told directly.
-        self.source.note_progress();
+        let progressed = {
+            let mut state = self.state.lock().expect("task status lock");
+            matches!(
+                state
+                    .convergence
+                    .note_output_released()
+                    .expect("a live task accepts output release"),
+                TaskConvergenceAdvance::Advanced(_)
+            )
+        };
+        if progressed {
+            self.source.note_progress();
+        }
+    }
+
+    fn note_actual_stopped(&self) {
+        let progressed = {
+            let mut state = self.state.lock().expect("task status lock");
+            matches!(
+                state
+                    .convergence
+                    .note_actual_stopped()
+                    .expect("a live task accepts actual-stop evidence"),
+                TaskConvergenceAdvance::Advanced(_)
+            )
+        };
+        if progressed {
+            self.source.note_progress();
+        }
+    }
+
+    fn note_resources_converged(&self) {
+        let progressed = {
+            let mut state = self.state.lock().expect("task status lock");
+            matches!(
+                state
+                    .convergence
+                    .note_resources_converged()
+                    .expect("runtime resources converge only after actual stop"),
+                TaskConvergenceAdvance::Advanced(_)
+            )
+        };
+        if progressed {
+            self.source.note_progress();
+        }
     }
 
     fn compose(
@@ -566,10 +649,26 @@ impl TaskStatusReporter {
     }
 
     pub fn canceled(&self, reason: CancelReason) -> StatusAdvance {
+        self.canceled_with_output(reason, TaskOutputFacts::default())
+    }
+
+    /// Completes a normal stand-down while preserving whether the fragment
+    /// had already satisfied its output responsibility.
+    ///
+    /// The terminal remains `CANCELED` because the stand-down won the
+    /// lifecycle race. The output fact is independent evidence used by
+    /// consumers, such as the distributed-write commit gate, that must tell a
+    /// completed sink from one that stopped before publishing all of its
+    /// output.
+    pub fn canceled_with_output(
+        &self,
+        reason: CancelReason,
+        output: TaskOutputFacts,
+    ) -> StatusAdvance {
         self.owner.advance(
             TaskState::Canceled,
             Some(TerminationDetail::Canceled(reason)),
-            TaskOutputFacts::default(),
+            output,
         )
     }
 
@@ -622,6 +721,22 @@ impl TaskStatusReporter {
     /// Reports that this task's output buffers have drained.
     pub fn release_output(&self) {
         self.owner.release_output();
+    }
+
+    /// Positive evidence that this task's executable work has physically
+    /// stopped on this Worker.
+    pub fn note_actual_stopped(&self) {
+        self.owner.note_actual_stopped();
+    }
+
+    /// Positive evidence that the stopped task's runtime-owned resources have
+    /// converged. Registry-owned ingress resources remain until retirement.
+    pub fn note_resources_converged(&self) {
+        self.owner.note_resources_converged();
+    }
+
+    pub fn convergence(&self) -> TaskConvergenceSnapshot {
+        self.owner.convergence()
     }
 
     /// The metric-only handle. It has no lifecycle method at all.
@@ -700,8 +815,11 @@ pub enum RootResultRoute {
     NotResultOwner,
     /// The creation transaction has not committed, so no buffer exists yet.
     Creating,
-    /// The task already reached its terminal; its result buffer is gone.
+    /// The task already reached its terminal and did not own a root result.
     Terminal(TaskState),
+    /// A retired result owner may still replay its exact acknowledged EOS
+    /// until the task fence or owning context is reclaimed.
+    TerminalResultOwner(TaskState),
     /// The retained terminal record was reclaimed.
     Gone,
 }
@@ -724,6 +842,9 @@ impl RootResultRoute {
             Self::Terminal(state) => {
                 Some(format!("result poll names a task that is already {state}"))
             }
+            Self::TerminalResultOwner(state) => Some(format!(
+                "result poll names a result-owning task that is already {state}"
+            )),
             Self::Gone => Some("result poll reached a reclaimed task record".to_owned()),
         }
     }

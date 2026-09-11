@@ -533,6 +533,7 @@ message HeartbeatResponse {
   uint32 num_cores = 3;    // available cores for scheduling
   BackendProcessDescriptor descriptor = 5;
   BackendReportedState reported_state = 6;
+  AdmissionEpochCapability admission_epoch_capability = 7;
 }
 
 // ============================================================================
@@ -560,6 +561,20 @@ message FrontendProcessId {
 // different content under one id is a conflict, never an update.
 message TaskOperationId {
   bytes value = 1;  // exactly 16 non-nil UUID-v7 bytes
+}
+
+// Opaque identity of one worker-local query-context admission grant. Capacity,
+// ownership, and expiry are bound by the acquisition receipt, not encoded in
+// the identity.
+message AdmissionTicketId {
+  bytes value = 1;  // exactly 16 nonzero unpredictable nonce bytes
+}
+
+// Opaque worker-local admission issuance epoch. It is published by the
+// authenticated heartbeat and rotated whenever retired acquisition history is
+// reclaimed. A sealed epoch permits retained exact replay only.
+message AdmissionEpochCapability {
+  bytes value = 1;  // exactly 16 nonzero unpredictable nonce bytes
 }
 
 // The indivisible wire identity of one task. Every component is compared
@@ -621,6 +636,7 @@ message TaskExchangeDestination {
 message TaskExchangeSource {
   TaskIdentity task = 1;
   novarocks.common.UniqueId fragment_instance_id = 2;
+  uint32 sender_ordinal = 3;  // exact ordinal frozen for this source
 }
 
 // One outbound push exchange edge. The destination set is frozen here and
@@ -699,7 +715,7 @@ message TaskDynamicFilterDomain {
 // move is closed to open; this release has no close, reconfigure, or dynamic
 // membership operation.
 message OpenExchangeEdgesDomain {
-  uint32 version = 1;             // exactly 1 in this release
+  uint32 version = 1;             // nonzero, strictly monotonic; values may skip
   repeated uint32 edge_ids = 2;   // 1..=256, all frozen by the descriptor
 }
 
@@ -758,6 +774,16 @@ message QueryExecutionLeaseGrant {
   uint64 valid_for_millis = 2;  // nonzero, <= 3600000; clamped to 1000..=30000
 }
 
+// Ask one worker to reserve the capacity needed to establish an exact query
+// context. The duration is part of the immutable request and is echoed by the
+// receipt; it is never a cross-host absolute deadline.
+message AcquireQueryContextAdmissionTicketRequest {
+  QueryContextRef query_context = 1;
+  uint64 valid_for_millis = 2;  // nonzero, <= 3600000
+  NativeCompatibilityId native_compatibility_id = 3;
+  AdmissionEpochCapability admission_epoch_capability = 4;
+}
+
 // Create one task. The descriptor is a required field of this message and of
 // no other: there is no optional descriptor anywhere in this protocol, so no
 // request can be ambiguous about whether it creates or updates.
@@ -791,6 +817,7 @@ message EstablishQueryContextRequest {
   QueryExecutionLeaseGrant initial_lease = 5;  // sequence must be 0
   QueryOptions query_options = 6;
   NativeCompatibilityId native_compatibility_id = 7;
+  AdmissionTicketId admission_ticket_id = 8;
 }
 
 // Advance one shared domain of an existing query context. It cannot create
@@ -882,6 +909,7 @@ message TaskOperation {
     CancelTaskRequest cancel_task = 5;
     AbortQueryContextRequest abort_query_context = 6;
     ReleaseQueryContextRequest release_query_context = 7;
+    AcquireQueryContextAdmissionTicketRequest acquire_query_context_admission_ticket = 8;
   }
 }
 
@@ -921,6 +949,9 @@ enum TaskOperationOutcome {
   // The backend proves it did not apply the operation and the frontend fails
   // the current attempt without retrying it on another process.
   TASK_OPERATION_OUTCOME_COMPATIBILITY_MISMATCH = 17;
+  // Admission found an older unredeemed ticket for the same context. The new
+  // operation created no grant and may retry after bounded backoff.
+  TASK_OPERATION_OUTCOME_ADMISSION_TICKET_STILL_ACTIVE = 18;
 }
 
 // Per plan node, the highest sequence this task has accepted and whether that
@@ -946,6 +977,7 @@ message ScalarDomainReceipt {
 
 message OpenExchangeEdgesReceipt {
   repeated uint32 opened_edge_ids = 1;  // <= 256
+  uint32 accepted_version = 2;  // non-zero retained EdgeOpenVersion
 }
 
 // How one accepted domain progressed.
@@ -995,6 +1027,15 @@ message QueryExecutionLeaseReceipt {
   uint64 requested_valid_for_millis = 2;
   uint64 effective_valid_for_millis = 3;  // the only duration the frontend may
                                           // schedule its next renewal from
+}
+
+// The exact admission grant produced for one acquisition request. Repeating
+// context and validity lets the receiver prove that the opaque id belongs to
+// the request it sent.
+message QueryContextAdmissionTicketAck {
+  AdmissionTicketId ticket_id = 1;
+  QueryContextRef query_context = 2;
+  uint64 valid_for_millis = 3;  // nonzero, <= 3600000
 }
 
 // Acknowledgement of a task creation. Receiving it proves the task, its
@@ -1078,6 +1119,7 @@ message TaskOperationReceipt {
     QueryContextAck query_context = 7;
     ReleaseQueryContextAck release_query_context = 8;
     TaskStatus cancel_task = 9;
+    QueryContextAdmissionTicketAck query_context_admission_ticket = 10;
   }
 }
 
@@ -1175,6 +1217,24 @@ message TaskStatusCursor {
   uint64 current_version = 2;  // 0 means never observed
 }
 
+enum QueryContextConvergenceState {
+  QUERY_CONTEXT_CONVERGENCE_STATE_UNSPECIFIED = 0;
+  QUERY_CONTEXT_CONVERGENCE_STATE_WORKER_STOPPED_AND_CONTEXT_FENCED = 1;
+}
+
+// One immutable worker-owned convergence observation for an exact context.
+message QueryContextConvergenceReceipt {
+  QueryContextRef query_context = 1;
+  uint64 version = 2;  // nonzero
+  QueryContextConvergenceState state = 3;
+}
+
+// The frontend's observation position for one exact worker context.
+message QueryContextConvergenceCursor {
+  QueryContextRef query_context = 1;
+  uint64 current_version = 2;  // 0 means never observed
+}
+
 // One logical query-by-backend subscription. It is an observation channel only:
 // it creates no task and no context, freezes no task set, and owns no
 // admission, edge-open, terminal, or cancel authority. A new task joins it
@@ -1182,6 +1242,7 @@ message TaskStatusCursor {
 message SubscribeTaskStatusRequest {
   QueryContextRef query_context = 1;
   repeated TaskStatusCursor cursors = 2;  // <= 4096
+  QueryContextConvergenceCursor context_convergence_cursor = 3;
 }
 
 // Retained state for this task was reclaimed. Inside the legal request horizon
@@ -1195,6 +1256,7 @@ message TaskStatusStreamEvent {
   oneof event {
     TaskStatus task_status = 1;
     TaskGone task_gone = 2;
+    QueryContextConvergenceReceipt context_convergence = 3;
   }
 }
 
@@ -1252,4 +1314,13 @@ message GetFinalTaskInfoResponse {
 message FetchTaskResultRequest {
   TaskIdentity root_task = 1;
   uint64 max_wait_millis = 2;  // nonzero, <= 300000
+  // Highest packet durably accepted into the frontend's bounded delivery
+  // queue. Absent means this frontend has not accepted any packet yet. The
+  // backend retains and exactly replays one unacknowledged packet; gaps and
+  // future acknowledgements fail closed.
+  optional uint64 acknowledged_packet_sequence = 3;
+  // Positive payload-byte credit for this response. The Native codec also
+  // caps this below the process-wide gRPC decode limit so the response
+  // envelope cannot make a legal payload exceed that transport limit.
+  uint64 max_result_bytes = 4;
 }

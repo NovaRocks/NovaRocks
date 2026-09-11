@@ -29,7 +29,10 @@ use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::statistics::{StatisticsExecutionMode, StatisticsExecutionPolicy};
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
+use novarocks_sql::test_support::{
+    NativePreparationFixture, NativeWriteDataflowFixture, native_preparation_plan,
+    native_write_dataflow_plan,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -44,11 +47,25 @@ fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext 
 }
 
 fn real_execution_artifacts() -> (
-    crate::query_execution::preparation::PreparedFragmentSet,
+    crate::query_execution::post_compile::NativeFragmentEncodingInput,
     crate::query_execution::native_fragment::NativeFragmentAttachment,
 ) {
     let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
         .expect("sealed result execution fixture");
+    execution_artifacts_for_plan(plan)
+}
+
+fn execution_artifacts_for_plan(
+    plan: novarocks_sql::plan_read::DistributedPlan,
+) -> (
+    crate::query_execution::post_compile::NativeFragmentEncodingInput,
+    crate::query_execution::native_fragment::NativeFragmentAttachment,
+) {
+    let fragment_ids = plan
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.fragment_id)
+        .collect::<std::collections::BTreeSet<_>>();
     let registry = crate::connector::FixtureConnectorRegistry::new();
     let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -60,24 +77,26 @@ fn real_execution_artifacts() -> (
         crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("prepare production execution artifact");
-    let native_bundle =
-        crate::query_execution::native_fragment::native_fragment_attachment_for_test(
-            [novarocks_proto_models::plan::PlanFragment {
-                fragment_id: 7,
-                ..Default::default()
-            }],
-            &std::collections::BTreeSet::from([7]),
-            None,
+    let encoding = crate::query_execution::post_compile::NativeFragmentEncodingInput::new(prepared);
+    let native_bundle = encoding
+        .native_attachment_for_test(
+            fragment_ids.iter().copied().map(|fragment_id| {
+                novarocks_proto_models::plan::PlanFragment {
+                    fragment_id,
+                    ..Default::default()
+                }
+            }),
+            &fragment_ids,
         )
         .expect("seal production execution artifact");
-    (prepared, native_bundle)
+    (encoding, native_bundle)
 }
 
 #[test]
 fn request_owns_prepared_and_native_artifacts() {
-    let (prepared, native_bundle) = real_execution_artifacts();
+    let (encoding, native_bundle) = real_execution_artifacts();
     let request = build_distributed_query_request_with_execution(
-        prepared,
+        encoding,
         native_bundle,
         Some(
             QueryOptions::parse(novarocks_proto_models::novarocks::QueryOptions {
@@ -91,9 +110,12 @@ fn request_owns_prepared_and_native_artifacts() {
     )
     .expect("valid production artifacts form an owned request");
 
+    let read_execution = request
+        .restartable_read()
+        .expect("result fixture permits replacement before visibility");
     assert_eq!(
-        request
-            .artifacts()
+        read_execution
+            .instantiate_artifacts_for_test()
             .scheduling_view()
             .fragment_ids()
             .collect::<Vec<_>>(),
@@ -103,11 +125,153 @@ fn request_owns_prepared_and_native_artifacts() {
         request.options().native_submission_options().pipeline_dop(),
         3
     );
+    let description = request.frozen_description();
+    assert_eq!(
+        description.kind(),
+        novarocks_query_application::api::QueryExecutionKind::Read
+    );
+    assert_eq!(
+        description.effect(),
+        novarocks_query_application::coordination::ExecutionEffect::None
+    );
+    assert_eq!(
+        description.recovery(),
+        novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility
+    );
+    assert_eq!(
+        description.cost().root_rows().unknown_reason(),
+        Some(novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected)
+    );
+    assert_eq!(
+        description
+            .resources()
+            .minimum_memory_bytes()
+            .unknown_reason(),
+        Some(novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected)
+    );
     let parts = request.into_parts();
     let cancellation = parts.cancellation;
     let completion = parts.completion;
     assert!(!cancellation.is_cancelled());
     assert_eq!(completion.intent(), DistributedQueryIntent::Result);
+}
+
+#[test]
+fn replacement_read_attempt_reuses_one_logical_execution_with_fresh_attempt_typestate() {
+    let cancellation = QueryCancellationSource::new();
+    let first_execution = QueryExecutionContext::new(
+        novarocks_types::ClusterRole::Fe,
+        BackendTopologySnapshot::empty(7),
+        None,
+        cancellation.view(),
+        novarocks_sql::compiler::SessionOptimizerSettings::default(),
+    );
+    let (encoding, native_bundle) = real_execution_artifacts();
+    let first = build_distributed_query_request_with_execution(
+        encoding,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Result,
+        &first_execution,
+    )
+    .expect("first read attempt");
+    let logical_execution = first
+        .restartable_read()
+        .expect("read request exposes its closed restart capability");
+
+    let first_attempt = logical_execution.instantiate_artifacts_for_test();
+    let handoff = first_attempt.runtime_filter_artifact_id();
+    let first_bindings = first_attempt
+        .runtime_filter_binding_view()
+        .seal_empty()
+        .expect("first attempt owns a writable native attachment");
+    let _first_bound = first_attempt
+        .attach_runtime_filter_bindings(first_bindings)
+        .expect("first attempt consumes only its own attachment");
+
+    let replacement_execution = QueryExecutionContext::new(
+        novarocks_types::ClusterRole::Fe,
+        BackendTopologySnapshot::empty(8),
+        None,
+        cancellation.view(),
+        novarocks_sql::compiler::SessionOptimizerSettings::default(),
+    );
+    let replacement = logical_execution.instantiate_attempt(&replacement_execution);
+    let replacement_logical_execution = replacement
+        .restartable_read()
+        .expect("replacement remains a restartable read");
+
+    assert!(std::ptr::eq(
+        first.frozen_description(),
+        replacement.frozen_description()
+    ));
+    assert_eq!(first.topology().revision(), 7);
+    assert_eq!(replacement.topology().revision(), 8);
+    assert!(std::ptr::eq(
+        first.frozen_description().plan(),
+        replacement.frozen_description().plan()
+    ));
+
+    let replacement_attempt = replacement_logical_execution.instantiate_artifacts_for_test();
+    assert_eq!(replacement_attempt.runtime_filter_artifact_id(), handoff);
+    let replacement_bindings = replacement_attempt
+        .runtime_filter_binding_view()
+        .seal_empty()
+        .expect("replacement owns an independent writable native attachment");
+    let _replacement_bound = replacement_attempt
+        .attach_runtime_filter_bindings(replacement_bindings)
+        .expect("mutating the first attempt did not consume the replacement attachment");
+}
+
+#[test]
+fn native_attachment_cannot_cross_assemblies() {
+    let (first_encoding, _) = real_execution_artifacts();
+    let (_, foreign_attachment) = real_execution_artifacts();
+    let error = match build_distributed_query_request_with_execution(
+        first_encoding,
+        foreign_attachment,
+        None,
+        DistributedQueryIntent::Result,
+        &test_execution(QueryCancellationSource::new().view()),
+    ) {
+        Ok(_) => panic!("a native attachment from another assembly must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+    assert!(error.message().contains("does not match"));
+}
+
+#[test]
+fn effectful_request_is_frozen_without_recovery() {
+    let (encoding, native_bundle) = execution_artifacts_for_plan(
+        native_write_dataflow_plan(NativeWriteDataflowFixture::SingleWriter)
+            .expect("sealed write execution fixture"),
+    );
+    let request = build_distributed_query_request_with_execution(
+        encoding,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Write,
+        &test_execution(QueryCancellationSource::new().view()),
+    )
+    .expect("effectful request should freeze");
+    let description = request.frozen_description();
+    assert_eq!(
+        description.kind(),
+        novarocks_query_application::api::QueryExecutionKind::Write
+    );
+    assert_eq!(
+        description.effect(),
+        novarocks_query_application::coordination::ExecutionEffect::External
+    );
+    assert_eq!(
+        description.recovery(),
+        novarocks_query_application::coordination::RecoveryMode::NoRecovery
+    );
+    assert!(
+        request.restartable_read().is_none(),
+        "an effectful request must retain one move-only artifact owner"
+    );
 }
 
 #[test]
@@ -248,9 +412,9 @@ fn query_execution_service_uses_explicitly_injected_coordinator() {
     let service = QueryExecutionService::new(Arc::new(RecordingCoordinator {
         calls: calls.clone(),
     }));
-    let (prepared, native_bundle) = real_execution_artifacts();
+    let (encoding, native_bundle) = real_execution_artifacts();
     let request = build_distributed_query_request_with_execution(
-        prepared,
+        encoding,
         native_bundle,
         None,
         DistributedQueryIntent::Result,
@@ -268,9 +432,9 @@ fn query_execution_service_uses_explicitly_injected_coordinator() {
 
 #[test]
 fn generic_request_builder_rejects_statistics_without_a_typed_program() {
-    let (prepared, native_bundle) = real_execution_artifacts();
+    let (encoding, native_bundle) = real_execution_artifacts();
     let result = build_distributed_query_request_with_execution(
-        prepared,
+        encoding,
         native_bundle,
         None,
         DistributedQueryIntent::Statistics,
@@ -281,4 +445,24 @@ fn generic_request_builder_rejects_statistics_without_a_typed_program() {
     };
     assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
     assert!(error.message().contains("StatisticsCollectionProgram"));
+}
+
+#[test]
+fn request_builder_rejects_a_native_attachment_from_another_encoding_input() {
+    let (encoding, _) = real_execution_artifacts();
+    let (_, foreign_attachment) = real_execution_artifacts();
+
+    let result = build_distributed_query_request_with_execution(
+        encoding,
+        foreign_attachment,
+        None,
+        DistributedQueryIntent::Result,
+        &test_execution(QueryCancellationSource::new().view()),
+    );
+    let Err(error) = result else {
+        panic!("a cross-plan native attachment must fail closed");
+    };
+
+    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+    assert!(error.message().contains("sealed query encoding input"));
 }

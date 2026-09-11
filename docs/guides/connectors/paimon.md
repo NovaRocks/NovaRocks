@@ -7,9 +7,11 @@ DDL、维护或统计信息采集权限。
 
 ## 创建 Catalog
 
-下面的例子假设 Server 已注册名为 `paimon-prod-data`、代次为 `v1` 的对象存储
-credential binding。FE 与 BE 必须解析到同一个 binding；Catalog 属性中不能放入
-访问密钥。
+下面的例子假设 FE 与 BE 的 Server 配置都注册了名为 `paimon-prod-data`、代次为
+`v1` 的对象存储 credential binding。FE 注册 `object-store-metadata` 用于读取
+schema、manifest 和统计文件，BE 注册 `object-store-data` 用于执行 attempt 的数据
+读取；两项绑定可以复用相同的名称和代次，但用途与消费角色必须分别声明。Catalog
+属性中不能放入访问密钥。
 
 ```sql
 CREATE EXTERNAL CATALOG paimon_prod
@@ -20,7 +22,11 @@ PROPERTIES (
     "aws.s3.endpoint" = "https://s3.example.com",
     "aws.s3.region" = "us-east-1",
     "aws.s3.enable_path_style_access" = "true",
-    "credential.object-store-data.consumer-role" = "frontend-and-backend",
+    "credential.object-store-metadata.consumer-role" = "frontend",
+    "credential.object-store-metadata.mode" = "static",
+    "credential.object-store-metadata.name" = "paimon-prod-data",
+    "credential.object-store-metadata.generation" = "v1",
+    "credential.object-store-data.consumer-role" = "backend",
     "credential.object-store-data.mode" = "static",
     "credential.object-store-data.name" = "paimon-prod-data",
     "credential.object-store-data.generation" = "v1"

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
 use novarocks_types::BackendProcessId;
 
@@ -32,6 +33,11 @@ use novarocks_types::BackendProcessId;
 /// backend-management implementation. Composition roots inject this port.
 pub trait BackendTopologyPort: Send + Sync + 'static {
     fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError>;
+
+    /// Subscribes to exact topology revision changes. Consumers must re-read
+    /// [`Self::snapshot`] after every notification; the revision is only a
+    /// wake-up hint and never a schedulable topology by itself.
+    fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64>;
 
     fn validate_snapshot(
         &self,
@@ -57,6 +63,37 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
 
 pub type BackendTopologyService = Arc<dyn BackendTopologyPort>;
 pub type BeId = u32;
+
+/// Narrow live process-lifecycle evidence source for residual convergence.
+/// It has no snapshot, placement, or successor-scheduling capability.
+pub trait BackendProcessObservationPort: Send + Sync + 'static {
+    fn subscribe_process_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        let (_, receiver) = tokio::sync::watch::channel(0);
+        receiver
+    }
+
+    /// Observes the lifecycle relationship between one frozen process and the
+    /// exact endpoint it owned when the attempt was prepared. A missing or
+    /// heartbeat-unobservable process is not replacement evidence.
+    fn observe_process_at_endpoint(
+        &self,
+        expected_process: BackendProcessId,
+        expected_endpoint: &RuntimeEndpoint,
+    ) -> Result<BackendProcessObservation, BackendTopologyError>;
+}
+
+pub type BackendProcessObservationService = Arc<dyn BackendProcessObservationPort>;
+
+/// Live topology evidence relevant to residual attempt convergence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendProcessObservation {
+    /// The frozen process still owns the endpoint and is currently observable.
+    Current,
+    /// No exact positive lifecycle fact is available yet.
+    Unobservable,
+    /// A different, exact process identity now owns the frozen endpoint.
+    Replaced { current_process: BackendProcessId },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackendTopologyError {
@@ -221,6 +258,7 @@ pub enum HeartbeatOutcome {
         descriptor: BackendProcessDescriptor,
         reported_state: BackendReportedState,
         num_cores: u32,
+        admission_epoch_capability: AdmissionEpochCapability,
         now_ms: i64,
     },
     Failed {
@@ -238,13 +276,19 @@ pub fn record_successful_stage(_backend_idx: usize, fragment_count: usize) {
 pub struct LiveBackendTarget {
     backend_idx: usize,
     descriptor: BackendProcessDescriptor,
+    admission_epoch_capability: AdmissionEpochCapability,
 }
 
 impl LiveBackendTarget {
-    pub fn new(backend_idx: usize, descriptor: BackendProcessDescriptor) -> Self {
+    pub fn new(
+        backend_idx: usize,
+        descriptor: BackendProcessDescriptor,
+        admission_epoch_capability: AdmissionEpochCapability,
+    ) -> Self {
         Self {
             backend_idx,
             descriptor,
+            admission_epoch_capability,
         }
     }
 
@@ -254,6 +298,10 @@ impl LiveBackendTarget {
 
     pub fn descriptor(&self) -> &BackendProcessDescriptor {
         &self.descriptor
+    }
+
+    pub const fn admission_epoch_capability(&self) -> AdmissionEpochCapability {
+        self.admission_epoch_capability
     }
 
     pub fn process_id(&self) -> Result<BackendProcessId, novarocks_proto_codec::ProtocolError> {
@@ -278,6 +326,7 @@ impl PartialEq for LiveBackendTarget {
     fn eq(&self, other: &Self) -> bool {
         self.backend_idx == other.backend_idx
             && self.descriptor.as_proto() == other.descriptor.as_proto()
+            && self.admission_epoch_capability == other.admission_epoch_capability
     }
 }
 
@@ -353,6 +402,11 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
         Ok(BackendTopologySnapshot::empty(0))
     }
 
+    fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        let (_, receiver) = tokio::sync::watch::channel(0);
+        receiver
+    }
+
     fn validate_snapshot(
         &self,
         expected: &BackendTopologySnapshot,
@@ -389,6 +443,17 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
 }
 
 #[cfg(test)]
+impl BackendProcessObservationPort for NoopBackendTopologyPort {
+    fn observe_process_at_endpoint(
+        &self,
+        _expected_process: BackendProcessId,
+        _expected_endpoint: &RuntimeEndpoint,
+    ) -> Result<BackendProcessObservation, BackendTopologyError> {
+        Ok(BackendProcessObservation::Unobservable)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -396,6 +461,11 @@ mod tests {
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_types::BackendProcessId;
+
+    fn admission_epoch() -> novarocks_execution::task_execution::AdmissionEpochCapability {
+        novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes([0x61; 16])
+            .expect("nonzero epoch")
+    }
 
     fn descriptor(endpoint: SocketAddr) -> BackendProcessDescriptor {
         BackendProcessDescriptor::new(
@@ -415,8 +485,8 @@ mod tests {
         let snapshot = BackendTopologySnapshot::try_new(
             7,
             vec![
-                LiveBackendTarget::new(9, descriptor(endpoint)),
-                LiveBackendTarget::new(2, descriptor(endpoint)),
+                LiveBackendTarget::new(9, descriptor(endpoint), admission_epoch()),
+                LiveBackendTarget::new(2, descriptor(endpoint), admission_epoch()),
             ],
         )
         .expect("distinct targets form a snapshot");
@@ -439,8 +509,8 @@ mod tests {
             BackendTopologySnapshot::try_new(
                 7,
                 vec![
-                    LiveBackendTarget::new(2, descriptor(endpoint)),
-                    LiveBackendTarget::new(2, descriptor(endpoint)),
+                    LiveBackendTarget::new(2, descriptor(endpoint), admission_epoch()),
+                    LiveBackendTarget::new(2, descriptor(endpoint), admission_epoch()),
                 ],
             ),
             Err(BackendTopologyError::DuplicateBackendId { backend_idx: 2 })

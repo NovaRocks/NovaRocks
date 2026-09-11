@@ -19,9 +19,9 @@
 
 use std::time::Duration;
 
-use novarocks_execution::task_execution::domain::DomainVersion;
-use novarocks_execution::task_execution::identity::TaskIdentity;
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::domain::DomainVersion;
+use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS,
     FinalTaskInfo, OPERATOR_COUNTER_BUDGET, OperatorCounter, OperatorStatistics,
     SAFE_DETAIL_MAX_BYTES, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,

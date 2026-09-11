@@ -23,7 +23,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks_spi::connector::{
     ConnectorCleanupCandidate, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
@@ -413,6 +413,46 @@ impl FrontendTableMaintenanceService {
         }
         Ok(())
     }
+
+    pub(crate) async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {
+        self.optimize_runtime.stop_admission();
+        let previous = {
+            let mut lifecycle = self
+                .worker
+                .lock()
+                .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
+            std::mem::replace(&mut *lifecycle, WorkerLifecycle::Stopped(Ok(())))
+        };
+        let (next, result) = match previous {
+            WorkerLifecycle::NotStarted => (WorkerLifecycle::Stopped(Ok(())), Ok(())),
+            WorkerLifecycle::Started(mut worker) => {
+                let result = worker.shutdown_until(deadline).await;
+                if result.is_err() && worker.has_join_owner() {
+                    (WorkerLifecycle::Started(worker), result)
+                } else {
+                    (WorkerLifecycle::Stopped(result.clone()), result)
+                }
+            }
+            WorkerLifecycle::Stopped(result) => (WorkerLifecycle::Stopped(result.clone()), result),
+        };
+        let mut lifecycle = self
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *lifecycle = next;
+        result
+    }
+
+    pub(crate) fn request_shutdown_for_process_exit(&self) {
+        self.optimize_runtime.stop_admission();
+        let lifecycle = self
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let WorkerLifecycle::Started(worker) = &*lifecycle {
+            worker.request_stop();
+        }
+    }
 }
 
 struct DirectOptimizeExecutor;
@@ -721,25 +761,12 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         self.submit_optimize(engine, target)
     }
 
-    fn shutdown(&self) -> Result<(), String> {
-        self.optimize_runtime.stop_admission();
-        let mut lifecycle = self
-            .worker
-            .lock()
-            .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
-        let previous = std::mem::replace(&mut *lifecycle, WorkerLifecycle::Stopped(Ok(())));
-        drop(lifecycle);
-        let result = match previous {
-            WorkerLifecycle::NotStarted => Ok(()),
-            WorkerLifecycle::Started(mut worker) => worker.shutdown(),
-            WorkerLifecycle::Stopped(result) => result,
-        };
-        let mut lifecycle = self
-            .worker
-            .lock()
-            .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
-        *lifecycle = WorkerLifecycle::Stopped(result.clone());
-        result
+    async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {
+        FrontendTableMaintenanceService::shutdown_until(self, deadline).await
+    }
+
+    fn request_shutdown_for_process_exit(&self) {
+        FrontendTableMaintenanceService::request_shutdown_for_process_exit(self);
     }
 }
 

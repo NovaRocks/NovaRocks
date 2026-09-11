@@ -1162,7 +1162,11 @@ PROPERTIES (
   "aws.s3.endpoint" = "{runtime.minio_endpoint_host}",
   "aws.s3.region" = "us-east-1",
   "aws.s3.enable_path_style_access" = "true",
-  "credential.object-store-data.consumer-role" = "frontend-and-backend",
+  "credential.object-store-metadata.consumer-role" = "frontend",
+  "credential.object-store-metadata.mode" = "static",
+  "credential.object-store-metadata.name" = "{runtime.credential_name}",
+  "credential.object-store-metadata.generation" = "{runtime.credential_generation}",
+  "credential.object-store-data.consumer-role" = "backend",
   "credential.object-store-data.mode" = "static",
   "credential.object-store-data.name" = "{runtime.credential_name}",
   "credential.object-store-data.generation" = "{runtime.credential_generation}"
@@ -1320,10 +1324,17 @@ def write_manifest(
             "endpoint": None,
             "region": "us-east-1",
             "path_style_access": True,
-            "credential_binding": {
-                "name": None,
-                "generation": None,
-                "consumer_role": "frontend-and-backend",
+            "credential_bindings": {
+                "object_store_metadata": {
+                    "name": None,
+                    "generation": None,
+                    "consumer_role": "frontend",
+                },
+                "object_store_data": {
+                    "name": None,
+                    "generation": None,
+                    "consumer_role": "backend",
+                },
             },
         },
         "object_count": len(objects),
@@ -1465,10 +1476,9 @@ def execute_prepare(args: argparse.Namespace) -> int:
                 objects,
             )
             manifest["catalog"]["endpoint"] = runtime.minio_endpoint_host
-            manifest["catalog"]["credential_binding"]["name"] = runtime.credential_name
-            manifest["catalog"]["credential_binding"]["generation"] = (
-                runtime.credential_generation
-            )
+            for binding in manifest["catalog"]["credential_bindings"].values():
+                binding["name"] = runtime.credential_name
+                binding["generation"] = runtime.credential_generation
             write_json(output_dir / "manifest.json", manifest)
             assert_artifacts_secret_free(output_dir, runtime)
             atomic_write(

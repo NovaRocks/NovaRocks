@@ -42,7 +42,7 @@
     reason = "The native task protocol is not routed into production yet; the coordinator cutover constructs this carrier."
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,22 +54,28 @@ use prometheus::{
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
-    DispatchLane, OperationKind, OperationOutcome, QueryContextRef, TaskIdentity, TaskOperationId,
-    TaskStatusCursor, TransportBudget, UpdateQueryContext,
+    AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome,
+    QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QueryContextRef, TaskIdentity,
+    TaskOperationId, TaskStatusCursor, UpdateQueryContext,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::catalog::CatalogSet;
 use novarocks_proto_models::novarocks as proto;
+use novarocks_query_application::coordination::{
+    DispatchLane, OperationDispatchResult, WorkerReceiptOutcome,
+};
+use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::descriptor::WireFragmentPlan;
 use novarocks_task_codec::domain as codec_domain;
 use novarocks_task_codec::domain::{stored_credential, stored_message};
 use novarocks_task_codec::operation as codec;
 use novarocks_task_codec::operation::{
-    ReceiptHeader, StatusStreamEvent, decode_receipt_batch, decode_status_event,
-    encode_abort_query_context, encode_advance_query_context_domain, encode_cancel_task,
-    encode_create_task, encode_establish_query_context, encode_operation_batch,
-    encode_release_query_context, encode_renew_lease, encode_subscribe_task_status,
-    encode_update_task,
+    ContextAwareStatusStreamEvent, ReceiptHeader, decode_context_aware_status_event,
+    decode_receipt_batch, encode_abort_query_context,
+    encode_acquire_query_context_admission_ticket, encode_advance_query_context_domain,
+    encode_cancel_task, encode_context_aware_subscribe_task_status, encode_create_task,
+    encode_establish_query_context, encode_operation_batch, encode_release_query_context,
+    encode_renew_lease, encode_update_task,
 };
 use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::BackendProcessId;
@@ -77,12 +83,20 @@ use novarocks_types::identity::BackendProcessId;
 use novarocks_execution::task_execution::operation::QueryContextReceipt;
 
 use crate::task_execution::intent::{
-    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationSink,
+    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
+    TaskOperationQueueAdmission, TaskOperationQueuePermit, TaskOperationSink, TaskOperationSubmit,
 };
-use crate::task_execution::status_intake::{StatusEvent, StatusIntakeHandle, StatusIntakeWake};
+use crate::task_execution::status_intake::{
+    StatusEvent, StatusIntakeAdmission, StatusIntakeHandle, StatusIntakeWake,
+};
+use crate::task_execution::{ContextConvergenceIntakeHandle, ContextConvergencePublishError};
 
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::{ChannelAcquisitionError, Client};
+use super::transport_supervisor::{
+    NativeTransportEncodingPermit, NativeTransportLane, NativeTransportReadyWake,
+    NativeTransportWaiter,
+};
 
 /// How long a lost subscription waits before its next attempt, per failure in
 /// the current run.
@@ -120,6 +134,12 @@ fn encode_operation(
     attempt: &AttemptWireFacts,
 ) -> Result<proto::TaskOperation, String> {
     match intent {
+        OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
+            Ok(encode_acquire_query_context_admission_ticket(*request))
+        }
+        OperationIntent::EstablishQueryContext(request) => {
+            encode_establish_query_context_operation(request, attempt)
+        }
         OperationIntent::CreateTask(request) => {
             let fragment = wire_fragment_plan(request.descriptor().plan())?;
             let domains = encode_task_domains(request.initial_domains())?;
@@ -217,12 +237,35 @@ fn encode_query_context_operation(
     }
 }
 
-/// Whether an applied acknowledgement of this kind carries a body its owner
-/// consumes.
-///
-/// A cancel and an abort are answered by a receipt header alone: the terminal
-/// fact still arrives as a published status, so their owners read the outcome
-/// and nothing else.
+fn encode_establish_query_context_operation(
+    establish: &novarocks_execution::task_execution::EstablishQueryContext,
+    attempt: &AttemptWireFacts,
+) -> Result<proto::TaskOperation, String> {
+    let catalog_set = stored_message::<CatalogSet>(establish.catalog_binding().as_ref())
+        .ok_or("establish catalog binding is not a codec-produced catalog set")?;
+    let filter = stored_message::<proto::RuntimeFilterContribution>(
+        establish.initial_runtime_filter().as_ref(),
+    )
+    .ok_or("establish runtime filter is not a codec-produced contribution")?;
+    let query_options = stored_message::<proto::QueryOptions>(establish.query_options().as_ref())
+        .ok_or("establish query options are not codec-produced")?;
+    let credential = stored_credential(establish.initial_credential().material().as_ref())
+        .ok_or("establish credential is not codec-produced material")?;
+    Ok(encode_establish_query_context(
+        establish,
+        catalog_set.clone(),
+        filter.clone(),
+        proto::QueryContextCredentialDomain {
+            lease_id: establish.initial_credential().lease_id().get(),
+            epoch: establish.initial_credential().epoch().get(),
+            descriptors: credential.descriptors().to_vec(),
+            envelopes: credential.envelopes().to_vec(),
+        },
+        *query_options,
+        attempt.native_compatibility_id,
+    ))
+}
+
 /// Whether an owner consumes this kind's acknowledgement body.
 ///
 /// `CancelTask` is deliberately absent even though its receipt carries a task
@@ -233,9 +276,11 @@ fn encode_query_context_operation(
 const fn consumes_ack_body(kind: OperationKind) -> bool {
     matches!(
         kind,
-        OperationKind::CreateTask
+        OperationKind::AcquireQueryContextAdmissionTicket
+            | OperationKind::CreateTask
             | OperationKind::UpdateTask
             | OperationKind::UpdateQueryContext
+            | OperationKind::AbortQueryContext
             | OperationKind::ReleaseQueryContext
     )
 }
@@ -245,6 +290,26 @@ const fn is_applied(outcome: OperationOutcome) -> bool {
         outcome,
         OperationOutcome::Accepted | OperationOutcome::Idempotent
     )
+}
+
+/// Whether this exact operation result must carry its typed acknowledgement.
+///
+/// Abort differs from the other mutations: losing to an already-closing
+/// context is a successful stand-down observation even when the operation was
+/// not newly applied. Its context state is therefore part of the mandatory
+/// receipt for every legal closing outcome.
+const fn consumes_ack_body_for_outcome(kind: OperationKind, outcome: OperationOutcome) -> bool {
+    if matches!(kind, OperationKind::AbortQueryContext) {
+        return matches!(
+            outcome,
+            OperationOutcome::Accepted
+                | OperationOutcome::Idempotent
+                | OperationOutcome::ContextTerminalReceipt
+                | OperationOutcome::LeaseExpired
+                | OperationOutcome::Gone
+        );
+    }
+    is_applied(outcome) && consumes_ack_body(kind)
 }
 
 /// Whether this intent is a lease renewal, decided from the neutral command
@@ -273,6 +338,7 @@ struct SentOperation {
 /// refused rather than read as this request's proof.
 #[derive(Clone, Copy, Debug)]
 enum AckAddress {
+    Admission(AcquireQueryContextAdmissionTicket),
     Task(TaskIdentity),
     Context(QueryContextRef),
     /// The kind carries no acknowledgement body.
@@ -282,6 +348,10 @@ enum AckAddress {
 impl AckAddress {
     fn of(intent: &OperationIntent) -> Self {
         match intent {
+            OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
+                Self::Admission(*request)
+            }
+            OperationIntent::EstablishQueryContext(request) => Self::Context(request.context()),
             OperationIntent::CreateTask(request) => Self::Task(request.identity()),
             OperationIntent::UpdateTask(request) => Self::Task(request.identity()),
             OperationIntent::CancelTask(request) => Self::Task(request.identity()),
@@ -311,8 +381,15 @@ fn decode_ack(
     let body = receipt
         .ack
         .as_ref()
-        .ok_or_else(|| format!("an applied {kind} carries no acknowledgement body"))?;
+        .ok_or_else(|| format!("{kind} requires an acknowledgement body for this outcome"))?;
     match (kind, body, address) {
+        (
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(ack),
+            AckAddress::Admission(expected),
+        ) => codec::decode_query_context_admission_ticket_ack(ack, expected, path())
+            .map(AckPayload::AdmissionTicket)
+            .map_err(|error| error.to_string()),
         (
             OperationKind::CreateTask,
             proto::task_operation_receipt::Ack::CreateTask(ack),
@@ -328,7 +405,7 @@ fn decode_ack(
             .map(AckPayload::Update)
             .map_err(|error| error.to_string()),
         (
-            OperationKind::UpdateQueryContext,
+            OperationKind::UpdateQueryContext | OperationKind::AbortQueryContext,
             proto::task_operation_receipt::Ack::QueryContext(ack),
             AckAddress::Context(context),
         ) => codec::decode_query_context_ack(ack, context, path())
@@ -418,6 +495,12 @@ impl TaskAckIntakeHandle {
     }
 }
 
+impl NativeTransportReadyWake for TaskAckIntakeHandle {
+    fn wake(&self) {
+        self.inner.wake.wake();
+    }
+}
+
 /// The runner side of the acknowledgement intake.
 #[derive(Debug)]
 pub(crate) struct TaskAckIntake {
@@ -461,21 +544,21 @@ impl TaskAckIntake {
 
 /// Classifies one unary RPC status by type.
 ///
-/// Only a status that leaves the remote outcome genuinely unknown becomes
-/// [`OperationOutcome::RetryableTransportUnknown`], the single category the
-/// protocol allows the identical immutable request to be resent under.
+/// Only a status that leaves the remote outcome genuinely unknown becomes a
+/// transport-unknown dispatch result, the single category the protocol allows
+/// the identical immutable request to be resent under.
 /// Everything else is settled and fails closed, however transient its wording
 /// looks: this never reads a status message.
-fn classify_apply_status(status: &tonic::Status) -> OperationOutcome {
+fn classify_apply_status(status: &tonic::Status) -> OperationDispatchResult {
     match status.code() {
         tonic::Code::Unavailable
         | tonic::Code::DeadlineExceeded
         | tonic::Code::Cancelled
-        | tonic::Code::Unknown => OperationOutcome::RetryableTransportUnknown,
+        | tonic::Code::Unknown => OperationDispatchResult::TransportUnknown,
         // A typed capacity rejection. The backend answered, so there is
         // nothing unknown about it and no older path to degrade onto.
-        tonic::Code::ResourceExhausted => OperationOutcome::ResourceExhausted,
-        _ => OperationOutcome::InvalidStateOrRequest,
+        tonic::Code::ResourceExhausted => worker_result(OperationOutcome::ResourceExhausted),
+        _ => worker_result(OperationOutcome::InvalidStateOrRequest),
     }
 }
 
@@ -484,11 +567,15 @@ fn classify_apply_status(status: &tonic::Status) -> OperationOutcome {
 /// URI and connector construction are deterministic local failures that
 /// resending cannot repair. A completed connector that then cannot dial or
 /// establish its HTTP/2 stream leaves the remote outcome unknown.
-fn classify_channel_error(error: &ChannelAcquisitionError) -> OperationOutcome {
+fn classify_channel_error(error: &ChannelAcquisitionError) -> OperationDispatchResult {
     match error {
-        ChannelAcquisitionError::Fatal(_) => OperationOutcome::InvalidStateOrRequest,
-        ChannelAcquisitionError::RetryableNetwork(_) => OperationOutcome::RetryableTransportUnknown,
+        ChannelAcquisitionError::Fatal(_) => worker_result(OperationOutcome::InvalidStateOrRequest),
+        ChannelAcquisitionError::RetryableNetwork(_) => OperationDispatchResult::TransportUnknown,
     }
+}
+
+const fn worker_result(outcome: OperationOutcome) -> OperationDispatchResult {
+    OperationDispatchResult::WorkerReceipt(WorkerReceiptOutcome::from_contract(outcome))
 }
 
 /// Whether a status stream rejection is fatal to the attempt.
@@ -554,6 +641,7 @@ pub(crate) struct NativeTaskOperationSink {
     attempt: AttemptWireFacts,
     acks: TaskAckIntakeHandle,
     data_runtime: FrontendDataRuntime,
+    transport_waiter: NativeTransportWaiter,
 }
 
 impl fmt::Debug for NativeTaskOperationSink {
@@ -573,12 +661,24 @@ impl NativeTaskOperationSink {
         acks: TaskAckIntakeHandle,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, String> {
+        if !data_runtime
+            .task_transport_supervisor()
+            .accepts_transport_budget(transport)
+        {
+            return Err(
+                "attempt task transport budget differs from the process supervisor".to_owned(),
+            );
+        }
+        let transport_waiter = data_runtime
+            .task_transport_supervisor()
+            .register_waiter(Arc::new(acks.clone()))?;
         Ok(Self {
             targets: freeze_targets(backends, &data_runtime)?,
             transport,
             attempt,
             acks,
             data_runtime,
+            transport_waiter,
         })
     }
 
@@ -613,17 +713,37 @@ impl NativeTaskOperationSink {
 }
 
 impl TaskOperationSink for NativeTaskOperationSink {
-    fn submit(&self, batch: &DispatchBatch) {
+    fn try_reserve_queue(
+        &self,
+        request: crate::task_execution::TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        let lane = if request.requires_control_progress() {
+            NativeTransportLane::Control
+        } else {
+            NativeTransportLane::Ordinary
+        };
+        match self
+            .data_runtime
+            .task_transport_supervisor()
+            .try_reserve_queue(&self.transport_waiter, lane, 1, request.queued_bytes())
+        {
+            Ok(permit) => TaskOperationQueueAdmission::Admitted(Box::new(permit)),
+            Err(_) => TaskOperationQueueAdmission::Backpressured,
+        }
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
         let backend = batch.backend();
         let Some(target) = self.targets.get(&backend) else {
             // The batch addresses a process this attempt never froze, so no
             // endpoint could legally answer it.
             self.settle_batch_locally(
-                batch,
+                &batch,
                 OperationOutcome::IdentityMismatch,
                 REFUSAL_UNKNOWN_BACKEND,
             );
-            return;
+            drop(batch.commit_queue_permits());
+            return TaskOperationSubmit::Accepted;
         };
         if let Some(intent) = batch
             .operations()
@@ -639,15 +759,27 @@ impl TaskOperationSink for NativeTaskOperationSink {
                 "task operation batch mixes backend processes"
             );
             self.settle_batch_locally(
-                batch,
+                &batch,
                 OperationOutcome::IdentityMismatch,
                 REFUSAL_PROCESS_MISMATCH,
             );
-            return;
+            drop(batch.commit_queue_permits());
+            return TaskOperationSubmit::Accepted;
         }
+        let target = target.clone();
+        let supervisor_lane = supervisor_lane(&batch);
+        let mut encoding_permit = match self
+            .data_runtime
+            .task_transport_supervisor()
+            .try_reserve_encoding(&self.transport_waiter, supervisor_lane)
+        {
+            Ok(permit) => permit,
+            Err(_) => return TaskOperationSubmit::Backpressured(batch),
+        };
 
         let mut operations = Vec::with_capacity(batch.operations().len());
         let mut sent = Vec::with_capacity(batch.operations().len());
+        let mut unencodable = Vec::new();
         for intent in batch.operations() {
             let encoded = encode_operation(intent, &self.attempt);
             match encoded {
@@ -661,26 +793,22 @@ impl TaskOperationSink for NativeTaskOperationSink {
                     });
                 }
                 Err(detail) => {
-                    // One item that cannot be expressed on the wire is that
-                    // item's own failure. Every other item keeps its own
-                    // receipt, which is the only property a batch has.
-                    tracing::warn!(
-                        kind = intent.kind().as_str(),
-                        detail,
-                        "task operation cannot be encoded"
-                    );
-                    observe_refusal(REFUSAL_UNENCODABLE, 1);
-                    self.settle_locally(
+                    // Do not settle this item until the sendable part of the
+                    // batch has passed process admission. On backpressure the
+                    // dispatcher must receive the whole exact batch back.
+                    unencodable.push((
                         intent.operation_id(),
                         intent.kind(),
                         is_lease_renewal(intent),
-                        OperationOutcome::InvalidStateOrRequest,
-                    );
+                        detail,
+                    ));
                 }
             }
         }
         if operations.is_empty() {
-            return;
+            settle_unencodable(self, unencodable);
+            drop(batch.commit_queue_permits());
+            return TaskOperationSubmit::Accepted;
         }
 
         let deadline = operations
@@ -711,10 +839,16 @@ impl TaskOperationSink for NativeTaskOperationSink {
                         OperationOutcome::ResourceExhausted,
                     );
                 }
-                return;
+                settle_unencodable(self, unencodable);
+                drop(batch.commit_queue_permits());
+                return TaskOperationSubmit::Accepted;
             }
         };
-        observe_batch(batch.lane(), items, prost::Message::encoded_len(&request));
+        let encoded_bytes = prost::Message::encoded_len(&request);
+        encoding_permit.shrink_to(encoded_bytes);
+        settle_unencodable(self, unencodable);
+        observe_batch(batch.lane(), items, encoded_bytes);
+        let queue_permits = batch.commit_queue_permits();
 
         let client = target.client.clone();
         let endpoint = target.endpoint.clone();
@@ -729,14 +863,56 @@ impl TaskOperationSink for NativeTaskOperationSink {
                     client,
                     endpoint,
                     data_runtime,
-                    acks,
+                    receipts: AcceptedOperationReceipts::new(acks, sent),
+                    _queue_permits: queue_permits,
+                    _encoding_permit: encoding_permit,
                 },
                 request,
-                sent,
                 deadline,
             )
             .await;
         });
+        TaskOperationSubmit::Accepted
+    }
+}
+
+fn supervisor_lane(batch: &DispatchBatch) -> NativeTransportLane {
+    if batch
+        .operations()
+        .iter()
+        .any(OperationIntent::requires_control_progress)
+    {
+        NativeTransportLane::Control
+    } else {
+        NativeTransportLane::Ordinary
+    }
+}
+
+fn supervisor_lane_for_intent(intent: &OperationIntent) -> NativeTransportLane {
+    if intent.requires_control_progress() {
+        NativeTransportLane::Control
+    } else {
+        NativeTransportLane::Ordinary
+    }
+}
+
+fn settle_unencodable(
+    sink: &NativeTaskOperationSink,
+    items: Vec<(TaskOperationId, OperationKind, bool, String)>,
+) {
+    for (operation_id, kind, lease_renewal, detail) in items {
+        tracing::warn!(
+            kind = kind.as_str(),
+            detail,
+            "task operation cannot be encoded"
+        );
+        observe_refusal(REFUSAL_UNENCODABLE, 1);
+        sink.settle_locally(
+            operation_id,
+            kind,
+            lease_renewal,
+            OperationOutcome::InvalidStateOrRequest,
+        );
     }
 }
 
@@ -745,35 +921,99 @@ struct ApplySend {
     client: Client,
     endpoint: NativeEndpoint,
     data_runtime: FrontendDataRuntime,
+    receipts: AcceptedOperationReceipts,
+    _queue_permits: Vec<Box<dyn TaskOperationQueuePermit>>,
+    _encoding_permit: NativeTransportEncodingPermit,
+}
+
+/// First-wins settlement for every operation an accepted send owns.
+///
+/// Dropping the send future is an unknown transport outcome, including runtime
+/// shutdown and task abort. The guard publishes that fact for every operation
+/// not already settled before releasing the process reservations, so an owner
+/// can never remain in flight merely because its transport future disappeared.
+struct AcceptedOperationReceipts {
     acks: TaskAckIntakeHandle,
+    pending: VecDeque<SentOperation>,
+}
+
+impl AcceptedOperationReceipts {
+    fn new(acks: TaskAckIntakeHandle, sent: Vec<SentOperation>) -> Self {
+        Self {
+            acks,
+            pending: sent.into(),
+        }
+    }
+
+    fn ids(&self) -> Vec<TaskOperationId> {
+        self.pending.iter().map(|item| item.operation_id).collect()
+    }
+
+    fn front(&self) -> Option<SentOperation> {
+        self.pending.front().copied()
+    }
+
+    fn publish_next(&mut self, ack: OperationAcknowledgement) {
+        let item = self
+            .pending
+            .pop_front()
+            .expect("an accepted response cannot outnumber its request");
+        assert_eq!(
+            item.operation_id,
+            ack.operation_id(),
+            "an accepted response must settle the request at the queue head"
+        );
+        self.acks.publish(ack);
+    }
+
+    fn publish_uniform(&mut self, result: OperationDispatchResult) {
+        while let Some(item) = self.pending.pop_front() {
+            observe_dispatch_result(item.kind, item.lease_renewal, result);
+            self.acks
+                .publish(OperationAcknowledgement::from_dispatch_result(
+                    item.operation_id,
+                    item.kind,
+                    result,
+                    AckPayload::None,
+                ));
+        }
+    }
+}
+
+impl Drop for AcceptedOperationReceipts {
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            tracing::warn!(
+                operations = self.pending.len(),
+                "accepted task operation send dropped before settlement"
+            );
+            self.publish_uniform(OperationDispatchResult::TransportUnknown);
+        }
+    }
 }
 
 /// Sends one batch and publishes one acknowledgement per request item.
 async fn apply_operations(
-    send: ApplySend,
+    mut send: ApplySend,
     request: proto::ApplyTaskOperationsRequest,
-    sent: Vec<SentOperation>,
     deadline: Duration,
 ) {
     let response = match send_operations(&send.client, request, deadline).await {
         Ok(response) => response,
-        Err(outcome) => {
-            if outcome.is_retryable() {
+        Err(result) => {
+            if matches!(result, OperationDispatchResult::TransportUnknown) {
                 // An unknown outcome may have left the shared HTTP/2 stream
                 // unusable. Drop the cached channel so the identical request
                 // is replayed on a fresh one instead of stalling on a poisoned
                 // cache.
                 send.data_runtime.invalidate_channel(&send.endpoint);
             }
-            publish_uniform(&send.acks, &sent, outcome);
+            send.receipts.publish_uniform(result);
             return;
         }
     };
 
-    let ids = sent
-        .iter()
-        .map(|item| item.operation_id)
-        .collect::<Vec<_>>();
+    let ids = send.receipts.ids();
     let headers = match decode_receipt_batch(
         &response,
         &ids,
@@ -787,29 +1027,20 @@ async fn apply_operations(
             // never applied, and resending is not allowed once an answer has
             // been received.
             tracing::warn!(detail = %error, "task operation batch response is unusable");
-            observe_refusal(REFUSAL_UNUSABLE_RESPONSE, sent.len());
-            publish_uniform(&send.acks, &sent, OperationOutcome::InvalidStateOrRequest);
+            observe_refusal(REFUSAL_UNUSABLE_RESPONSE, ids.len());
+            send.receipts
+                .publish_uniform(worker_result(OperationOutcome::InvalidStateOrRequest));
             return;
         }
     };
 
-    for (item, (header, receipt)) in sent
-        .iter()
-        .zip(headers.iter().zip(response.receipts.iter()))
-    {
-        send.acks.publish(acknowledgement(item, header, receipt));
-    }
-}
-
-fn publish_uniform(acks: &TaskAckIntakeHandle, sent: &[SentOperation], outcome: OperationOutcome) {
-    for item in sent {
-        observe_settled(item.kind, item.lease_renewal, outcome);
-        acks.publish(OperationAcknowledgement::new(
-            item.operation_id,
-            item.kind,
-            outcome,
-            AckPayload::None,
-        ));
+    for (header, receipt) in headers.iter().zip(response.receipts.iter()) {
+        let item = send
+            .receipts
+            .front()
+            .expect("validated receipt count matches the accepted request");
+        let ack = acknowledgement(&item, header, receipt);
+        send.receipts.publish_next(ack);
     }
 }
 
@@ -820,9 +1051,9 @@ fn acknowledgement(
     receipt: &proto::TaskOperationReceipt,
 ) -> OperationAcknowledgement {
     let outcome = header.outcome();
-    if !is_applied(outcome) || !consumes_ack_body(item.kind) {
+    if !consumes_ack_body_for_outcome(item.kind, outcome) {
         observe_settled(item.kind, item.lease_renewal, outcome);
-        return OperationAcknowledgement::new(
+        return OperationAcknowledgement::worker_receipt(
             item.operation_id,
             item.kind,
             outcome,
@@ -833,16 +1064,17 @@ fn acknowledgement(
     match decode_ack(item.kind, item.address, receipt) {
         Ok(payload) => {
             observe_settled(item.kind, item.lease_renewal, outcome);
-            OperationAcknowledgement::new(item.operation_id, item.kind, outcome, payload)
+            OperationAcknowledgement::worker_receipt(item.operation_id, item.kind, outcome, payload)
                 .with_detail(header.detail().cloned())
         }
         Err(detail) => {
-            // An applied operation whose acknowledgement body cannot be read
-            // is a protocol violation, not an operation that carried nothing.
+            // An operation result that requires a typed acknowledgement but
+            // whose body cannot be read is a protocol violation, not an
+            // operation that carried nothing.
             tracing::warn!(
                 kind = item.kind.as_str(),
                 detail,
-                "applied task operation receipt has an unreadable acknowledgement"
+                "task operation receipt has a required but unreadable acknowledgement"
             );
             observe_refusal(REFUSAL_UNUSABLE_ACK, 1);
             observe_settled(
@@ -850,7 +1082,7 @@ fn acknowledgement(
                 item.lease_renewal,
                 OperationOutcome::InvalidStateOrRequest,
             );
-            OperationAcknowledgement::new(
+            OperationAcknowledgement::worker_receipt(
                 item.operation_id,
                 item.kind,
                 OperationOutcome::InvalidStateOrRequest,
@@ -869,11 +1101,11 @@ async fn send_operations(
     client: &Client,
     request: proto::ApplyTaskOperationsRequest,
     deadline: Duration,
-) -> Result<proto::ApplyTaskOperationsResponse, OperationOutcome> {
+) -> Result<proto::ApplyTaskOperationsResponse, OperationDispatchResult> {
     let expires_at = tokio::time::Instant::now() + deadline;
     let mut grpc = tokio::time::timeout_at(expires_at, client.grpc_with_channel_error())
         .await
-        .map_err(|_| OperationOutcome::RetryableTransportUnknown)?
+        .map_err(|_| OperationDispatchResult::TransportUnknown)?
         .map_err(|error| {
             let outcome = classify_channel_error(&error);
             tracing::warn!(detail = %error, "apply_task_operations channel acquisition failed");
@@ -884,13 +1116,13 @@ async fn send_operations(
         // Nothing was submitted, so nothing was applied. It is still reported
         // as unknown rather than as a rejection, because a caller may only
         // conclude "not applied" from an answer it received.
-        return Err(OperationOutcome::RetryableTransportUnknown);
+        return Err(OperationDispatchResult::TransportUnknown);
     }
     let mut wire = tonic::Request::new(request);
     wire.set_timeout(remaining);
     tokio::time::timeout_at(expires_at, grpc.apply_task_operations(wire))
         .await
-        .map_err(|_| OperationOutcome::RetryableTransportUnknown)?
+        .map_err(|_| OperationDispatchResult::TransportUnknown)?
         .map(tonic::Response::into_inner)
         .map_err(|status| {
             let outcome = classify_apply_status(&status);
@@ -922,6 +1154,9 @@ pub(crate) enum SubscriptionState {
     /// An event addressed a different backend process. An exact process
     /// replacement is fatal to the attempt and is never followed.
     ProcessMismatch,
+    /// An event addressed a different query execution on the expected
+    /// backend process. It cannot contribute to this context's cursor.
+    QueryMismatch,
 }
 
 impl SubscriptionState {
@@ -933,6 +1168,7 @@ impl SubscriptionState {
             Self::BudgetExhausted => "budget_exhausted",
             Self::Rejected => "rejected",
             Self::ProcessMismatch => "process_mismatch",
+            Self::QueryMismatch => "query_mismatch",
         }
     }
 
@@ -940,7 +1176,7 @@ impl SubscriptionState {
     pub(crate) const fn is_fatal(self) -> bool {
         matches!(
             self,
-            Self::BudgetExhausted | Self::Rejected | Self::ProcessMismatch
+            Self::BudgetExhausted | Self::Rejected | Self::ProcessMismatch | Self::QueryMismatch
         )
     }
 }
@@ -948,6 +1184,7 @@ impl SubscriptionState {
 /// One running subscription. Dropping it stops the stream.
 struct Subscription {
     state: Arc<Mutex<SubscriptionState>>,
+    reconciliation: tokio::sync::watch::Sender<TaskCursorReconciliation>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -965,6 +1202,7 @@ impl Drop for Subscription {
 pub(crate) struct TaskStatusSubscriber {
     targets: BTreeMap<BackendProcessId, TaskBackendTarget>,
     intake: StatusIntakeHandle,
+    context_convergence: Option<ContextConvergenceIntakeHandle>,
     error_budget: u32,
     data_runtime: FrontendDataRuntime,
     active: Mutex<BTreeMap<QueryContextRef, Subscription>>,
@@ -981,6 +1219,11 @@ impl fmt::Debug for TaskStatusSubscriber {
 }
 
 impl TaskStatusSubscriber {
+    /// Builds the task-only transport retained until the production owner cut
+    /// installs the convergence intake in the same atomic change.
+    ///
+    /// This is a migration-only constructor. New ownership must use
+    /// [`Self::new_context_aware`].
     pub(crate) fn new(
         backends: &[(BackendProcessId, RuntimeEndpoint)],
         intake: StatusIntakeHandle,
@@ -993,6 +1236,28 @@ impl TaskStatusSubscriber {
         Ok(Self {
             targets: freeze_targets(backends, &data_runtime)?,
             intake,
+            context_convergence: None,
+            error_budget,
+            data_runtime,
+            active: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Builds the single-stream task and query-context observation transport.
+    pub(crate) fn new_context_aware(
+        backends: &[(BackendProcessId, RuntimeEndpoint)],
+        intake: StatusIntakeHandle,
+        context_convergence: ContextConvergenceIntakeHandle,
+        error_budget: u32,
+        data_runtime: FrontendDataRuntime,
+    ) -> Result<Self, String> {
+        if error_budget == 0 {
+            return Err("the status subscription error budget must be nonzero".to_owned());
+        }
+        Ok(Self {
+            targets: freeze_targets(backends, &data_runtime)?,
+            intake,
+            context_convergence: Some(context_convergence),
             error_budget,
             data_runtime,
             active: Mutex::new(BTreeMap::new()),
@@ -1017,22 +1282,34 @@ impl TaskStatusSubscriber {
         Ok(())
     }
 
-    /// Replaces this context's subscription, replaying the given cursors.
+    /// Reconciles this context's one subscription to the runner's cursors.
     ///
     /// This is the answer to observation loss the runner saw on its own side,
     /// such as a full intake queue. Loss the stream itself sees is recovered
-    /// by the subscription without anyone asking.
+    /// by the subscription without anyone asking. The bounded watch channel
+    /// coalesces repeated reconciliation requests and gives the same loop the
+    /// later one-way lifecycle control seam; it never creates a second stream.
     pub(crate) fn resubscribe(
         &self,
         context: QueryContextRef,
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String> {
-        let subscription = self.start(context, cursors)?;
+        let cursors = task_cursor_map(context, cursors)?;
         let mut active = self
             .active
             .lock()
             .map_err(|_| "task status subscription lock poisoned".to_owned())?;
-        active.insert(context, subscription);
+        if let Some(subscription) = active.get(&context) {
+            subscription.reconciliation.send_modify(|current| {
+                current.generation = current
+                    .generation
+                    .checked_add(1)
+                    .expect("task cursor reconciliation generation exhausted");
+                current.cursors.clone_from(&cursors);
+            });
+        } else {
+            active.insert(context, self.start_with_cursors(context, cursors)?);
+        }
         observe_resubscribe();
         Ok(())
     }
@@ -1056,6 +1333,14 @@ impl TaskStatusSubscriber {
         context: QueryContextRef,
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<Subscription, String> {
+        self.start_with_cursors(context, task_cursor_map(context, cursors)?)
+    }
+
+    fn start_with_cursors(
+        &self,
+        context: QueryContextRef,
+        cursors: BTreeMap<TaskIdentity, TaskStatusCursor>,
+    ) -> Result<Subscription, String> {
         let target = self
             .targets
             .get(&context.backend_process_id())
@@ -1066,16 +1351,56 @@ impl TaskStatusSubscriber {
                 )
             })?;
         let state = Arc::new(Mutex::new(SubscriptionState::Opening));
+        let (reconciliation, receiver) = tokio::sync::watch::channel(TaskCursorReconciliation {
+            generation: 0,
+            cursors,
+        });
         let task = self.data_runtime.spawn(run_subscription(
             target.client.clone(),
             context,
-            cursors,
+            receiver,
             self.intake.clone(),
+            self.context_convergence.clone(),
             self.error_budget,
             Arc::clone(&state),
         ));
-        Ok(Subscription { state, task })
+        Ok(Subscription {
+            state,
+            reconciliation,
+            task,
+        })
     }
+}
+
+#[derive(Clone, Debug)]
+struct TaskCursorReconciliation {
+    generation: u64,
+    cursors: BTreeMap<TaskIdentity, TaskStatusCursor>,
+}
+
+fn task_cursor_map(
+    context: QueryContextRef,
+    cursors: Vec<TaskStatusCursor>,
+) -> Result<BTreeMap<TaskIdentity, TaskStatusCursor>, String> {
+    let count = cursors.len();
+    let cursors = cursors
+        .into_iter()
+        .map(|cursor| {
+            let identity = cursor.identity();
+            if identity.query_execution_id() != context.query_execution_id()
+                || identity.backend_process_id() != context.backend_process_id()
+            {
+                return Err(format!(
+                    "task status cursor {identity} is outside query context {context}"
+                ));
+            }
+            Ok((identity, cursor))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if cursors.len() != count {
+        return Err("task status reconciliation contains duplicate task cursors".to_owned());
+    }
+    Ok(cursors)
 }
 
 fn set_state(state: &Mutex<SubscriptionState>, next: SubscriptionState) {
@@ -1094,26 +1419,80 @@ fn set_state(state: &Mutex<SubscriptionState>, next: SubscriptionState) {
 async fn run_subscription(
     client: Client,
     context: QueryContextRef,
-    initial: Vec<TaskStatusCursor>,
+    mut reconciliation: tokio::sync::watch::Receiver<TaskCursorReconciliation>,
     intake: StatusIntakeHandle,
+    context_convergence: Option<ContextConvergenceIntakeHandle>,
     error_budget: u32,
     state: Arc<Mutex<SubscriptionState>>,
 ) {
-    let mut cursors = initial
-        .into_iter()
-        .map(|cursor| (cursor.identity(), cursor))
-        .collect::<BTreeMap<TaskIdentity, TaskStatusCursor>>();
+    let initial = reconciliation.borrow_and_update().clone();
+    let mut reconciliation_generation = initial.generation;
+    let mut cursors = initial.cursors;
+    let mut context_cursor = context_convergence
+        .as_ref()
+        .map(|_| QueryContextConvergenceCursor::unobserved(context));
     let mut failures = 0_u32;
-    loop {
-        match open_subscription(&client, context, &cursors).await {
+    'subscription: loop {
+        let opened = tokio::select! {
+            changed = reconciliation.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                apply_task_cursor_reconciliation(
+                    &mut reconciliation,
+                    &mut reconciliation_generation,
+                    &mut cursors,
+                );
+                set_state(&state, SubscriptionState::Resubscribing);
+                continue 'subscription;
+            }
+            opened = open_subscription(&client, context, &cursors, context_cursor) => opened,
+        };
+        match opened {
             Ok(mut stream) => {
                 set_state(&state, SubscriptionState::Live);
                 let mut delivered = false;
                 loop {
-                    match stream.message().await {
+                    let message = tokio::select! {
+                        changed = reconciliation.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            apply_task_cursor_reconciliation(
+                                &mut reconciliation,
+                                &mut reconciliation_generation,
+                                &mut cursors,
+                            );
+                            set_state(&state, SubscriptionState::Resubscribing);
+                            continue 'subscription;
+                        }
+                        message = stream.message() => message,
+                    };
+                    match message {
                         Ok(Some(event)) => {
-                            match observe_event(context, &event, &mut cursors, &intake) {
-                                Ok(()) => delivered = true,
+                            match observe_stream_event(
+                                context,
+                                &event,
+                                &mut cursors,
+                                &intake,
+                                context_convergence.as_ref(),
+                                &mut context_cursor,
+                            )
+                            .await
+                            {
+                                Ok(StreamObservation::Delivered) => delivered = true,
+                                Ok(StreamObservation::AwaitTaskReconciliation) => {
+                                    set_state(&state, SubscriptionState::Resubscribing);
+                                    if reconciliation.changed().await.is_err() {
+                                        return;
+                                    }
+                                    apply_task_cursor_reconciliation(
+                                        &mut reconciliation,
+                                        &mut reconciliation_generation,
+                                        &mut cursors,
+                                    );
+                                    continue 'subscription;
+                                }
                                 Err(next) => {
                                     set_state(&state, next);
                                     return;
@@ -1169,35 +1548,106 @@ async fn run_subscription(
     }
 }
 
-/// Enqueues one observed event and advances its task's cursor.
-///
-/// This is everything the receive path may do. It classifies nothing, opens no
-/// edge, completes no stage, and settles no operation.
-fn observe_event(
+fn apply_task_cursor_reconciliation(
+    reconciliation: &mut tokio::sync::watch::Receiver<TaskCursorReconciliation>,
+    generation: &mut u64,
+    cursors: &mut BTreeMap<TaskIdentity, TaskStatusCursor>,
+) {
+    let latest = reconciliation.borrow_and_update();
+    assert!(
+        latest.generation > *generation,
+        "task cursor reconciliation generations are strictly increasing"
+    );
+    *generation = latest.generation;
+    cursors.clone_from(&latest.cursors);
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum StreamObservation {
+    Delivered,
+    AwaitTaskReconciliation,
+}
+
+async fn observe_stream_event(
     context: QueryContextRef,
     event: &proto::TaskStatusStreamEvent,
     cursors: &mut BTreeMap<TaskIdentity, TaskStatusCursor>,
     intake: &StatusIntakeHandle,
-) -> Result<(), SubscriptionState> {
-    let decoded = match decode_status_event(event, FieldPath::root("task_status_stream_event")) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            tracing::warn!(detail = %error, "SubscribeTaskStatus event is malformed");
-            return Err(SubscriptionState::Rejected);
-        }
-    };
-    let (identity, event) = match decoded {
-        StatusStreamEvent::Status(status) => {
+    context_convergence: Option<&ContextConvergenceIntakeHandle>,
+    context_cursor: &mut Option<QueryContextConvergenceCursor>,
+) -> Result<StreamObservation, SubscriptionState> {
+    let decoded =
+        decode_context_aware_status_event(event, FieldPath::root("task_status_stream_event"))
+            .map_err(|error| {
+                tracing::warn!(detail = %error, "SubscribeTaskStatus event is malformed");
+                SubscriptionState::Rejected
+            })?;
+    match decoded {
+        ContextAwareStatusStreamEvent::Status(status) => {
             let identity = status.identity();
+            let version = status.version();
             let cursor = cursors
                 .get(&identity)
                 .copied()
                 .unwrap_or_else(|| TaskStatusCursor::unobserved(identity));
-            cursors.insert(identity, cursor.advanced_to(status.version()));
-            (identity, StatusEvent::Published(status))
+            if let Some(current) = cursor.current_version() {
+                if version < current {
+                    tracing::warn!(
+                        task = %identity,
+                        current_version = current.get(),
+                        event_version = version.get(),
+                        "SubscribeTaskStatus event would move its task cursor backwards"
+                    );
+                    return Err(SubscriptionState::Rejected);
+                }
+                if version == current {
+                    return Ok(StreamObservation::Delivered);
+                }
+            }
+            observe_task_event(
+                context,
+                identity,
+                StatusEvent::Published(status),
+                Some(cursor.advanced_to(version)),
+                cursors,
+                intake,
+            )
         }
-        StatusStreamEvent::Gone(identity) => (identity, StatusEvent::Gone(identity)),
-    };
+        ContextAwareStatusStreamEvent::Gone(identity) => observe_task_event(
+            context,
+            identity,
+            StatusEvent::Gone(identity),
+            None,
+            cursors,
+            intake,
+        ),
+        ContextAwareStatusStreamEvent::ContextConvergence(receipt) => {
+            observe_context_convergence(context, receipt, context_convergence, context_cursor).await
+        }
+    }
+}
+
+/// Enqueues one observed event and advances its task's cursor only after the
+/// bounded intake retained it.
+///
+/// This is everything the receive path may do. It classifies nothing, opens no
+/// edge, completes no stage, and settles no operation.
+fn observe_task_event(
+    context: QueryContextRef,
+    identity: TaskIdentity,
+    event: StatusEvent,
+    next_cursor: Option<TaskStatusCursor>,
+    cursors: &mut BTreeMap<TaskIdentity, TaskStatusCursor>,
+    intake: &StatusIntakeHandle,
+) -> Result<StreamObservation, SubscriptionState> {
+    if identity.query_execution_id() != context.query_execution_id() {
+        tracing::warn!(
+            context_execution = ?context.query_execution_id(),
+            event_execution = ?identity.query_execution_id(),
+            "SubscribeTaskStatus event addresses a different query execution"
+        );
+        return Err(SubscriptionState::QueryMismatch);
+    }
     if identity.backend_process_id() != context.backend_process_id() {
         tracing::warn!(
             context_backend = %context.backend_process_id(),
@@ -1206,17 +1656,145 @@ fn observe_event(
         );
         return Err(SubscriptionState::ProcessMismatch);
     }
-    intake.publish(event);
-    Ok(())
+    match intake.publish(event) {
+        StatusIntakeAdmission::Enqueued => {
+            if let Some(next_cursor) = next_cursor {
+                cursors.insert(identity, next_cursor);
+            }
+            Ok(StreamObservation::Delivered)
+        }
+        // The intake has already recorded observation loss and woken the
+        // TaskRound. Stop this stream immediately so no later version can
+        // leap over the snapshot it could not retain. This is local
+        // backpressure, not a network failure, so the subscription loop must
+        // not spend its transport error budget or resubscribe from its private
+        // cursor. TaskRound will replace it from the state machine's cursor.
+        StatusIntakeAdmission::Overflowed => Ok(StreamObservation::AwaitTaskReconciliation),
+    }
+}
+
+#[cfg(test)]
+fn observe_event(
+    context: QueryContextRef,
+    event: &proto::TaskStatusStreamEvent,
+    cursors: &mut BTreeMap<TaskIdentity, TaskStatusCursor>,
+    intake: &StatusIntakeHandle,
+) -> Result<(), SubscriptionState> {
+    let decoded =
+        decode_context_aware_status_event(event, FieldPath::root("task_status_stream_event"))
+            .map_err(|_| SubscriptionState::Rejected)?;
+    let observed = match decoded {
+        ContextAwareStatusStreamEvent::Status(status) => {
+            let identity = status.identity();
+            let cursor = cursors
+                .get(&identity)
+                .copied()
+                .unwrap_or_else(|| TaskStatusCursor::unobserved(identity));
+            observe_task_event(
+                context,
+                identity,
+                StatusEvent::Published(status.clone()),
+                Some(cursor.advanced_to(status.version())),
+                cursors,
+                intake,
+            )?
+        }
+        ContextAwareStatusStreamEvent::Gone(identity) => observe_task_event(
+            context,
+            identity,
+            StatusEvent::Gone(identity),
+            None,
+            cursors,
+            intake,
+        )?,
+        ContextAwareStatusStreamEvent::ContextConvergence(_) => {
+            return Err(SubscriptionState::Rejected);
+        }
+    };
+    match observed {
+        StreamObservation::Delivered => Ok(()),
+        StreamObservation::AwaitTaskReconciliation => Err(SubscriptionState::Resubscribing),
+    }
+}
+
+async fn observe_context_convergence(
+    context: QueryContextRef,
+    receipt: QueryContextConvergenceReceipt,
+    intake: Option<&ContextConvergenceIntakeHandle>,
+    cursor: &mut Option<QueryContextConvergenceCursor>,
+) -> Result<StreamObservation, SubscriptionState> {
+    let (Some(intake), Some(current)) = (intake, cursor.as_mut()) else {
+        tracing::warn!(
+            %context,
+            "a task-only SubscribeTaskStatus stream received a context convergence event"
+        );
+        return Err(SubscriptionState::Rejected);
+    };
+    if receipt.context() != context {
+        tracing::warn!(
+            %context,
+            receipt_context = %receipt.context(),
+            "SubscribeTaskStatus convergence event addresses a different query context"
+        );
+        return Err(SubscriptionState::Rejected);
+    }
+    if let Some(version) = current.current_version() {
+        if receipt.version() < version {
+            tracing::warn!(
+                %context,
+                cursor_version = %version,
+                receipt_version = %receipt.version(),
+                "SubscribeTaskStatus convergence cursor would move backwards"
+            );
+            return Err(SubscriptionState::Rejected);
+        }
+        if receipt.version() == version {
+            return Ok(StreamObservation::Delivered);
+        }
+    }
+
+    loop {
+        // Read the epoch before publishing. A release that races with the
+        // overflow is then visible to `wait_for_capacity_change`; reading it
+        // afterwards could wait on an epoch that already incorporated the only
+        // capacity transition owed to this receipt.
+        let capacity = intake.capacity_state();
+        match intake.publish(context, receipt) {
+            Ok(admission) => {
+                assert!(admission.authorizes_cursor_advance());
+                *current = current.advanced_to(receipt.version());
+                return Ok(StreamObservation::Delivered);
+            }
+            Err(ContextConvergencePublishError::Overflow) => {
+                let changed = intake.wait_for_capacity_change(capacity.epoch()).await;
+                if changed.is_closed() {
+                    tracing::warn!(
+                        %context,
+                        "context convergence intake closed while waiting for capacity"
+                    );
+                    return Err(SubscriptionState::Rejected);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %context,
+                    detail = %error,
+                    "SubscribeTaskStatus convergence event was rejected"
+                );
+                return Err(SubscriptionState::Rejected);
+            }
+        }
+    }
 }
 
 async fn open_subscription(
     client: &Client,
     context: QueryContextRef,
     cursors: &BTreeMap<TaskIdentity, TaskStatusCursor>,
+    context_cursor: Option<QueryContextConvergenceCursor>,
 ) -> Result<tonic::Streaming<proto::TaskStatusStreamEvent>, tonic::Status> {
     let cursors = cursors.values().copied().collect::<Vec<_>>();
-    let request = encode_subscribe_task_status(context, &cursors)
+    let request = encode_context_aware_subscribe_task_status(context, &cursors, context_cursor)
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
     let mut grpc = client
         .grpc_with_channel_error()
@@ -1243,6 +1821,7 @@ const fn lane_name(lane: DispatchLane) -> &'static str {
         DispatchLane::Create => "create",
         DispatchLane::Update => "update",
         DispatchLane::Lifecycle => "lifecycle",
+        DispatchLane::Control => "control",
     }
 }
 
@@ -1255,9 +1834,7 @@ const fn outcome_name(outcome: OperationOutcome) -> &'static str {
     match outcome {
         OperationOutcome::Accepted => "accepted",
         OperationOutcome::Idempotent => "idempotent",
-        OperationOutcome::RetryableTransportUnknown => "retryable_transport_unknown",
         OperationOutcome::OperationTimedOut => "operation_timed_out",
-        OperationOutcome::RetryableObservationLoss => "retryable_observation_loss",
         OperationOutcome::IdentityMismatch => "identity_mismatch",
         OperationOutcome::CompatibilityMismatch => "compatibility_mismatch",
         OperationOutcome::CreateConflict => "create_conflict",
@@ -1267,12 +1844,11 @@ const fn outcome_name(outcome: OperationOutcome) -> &'static str {
         OperationOutcome::LeaseExpired => "lease_expired",
         OperationOutcome::ReleaseNotReady => "release_not_ready",
         OperationOutcome::ContextTerminalReceipt => "context_terminal_receipt",
-        OperationOutcome::NormalDestinationCanceled => "normal_destination_canceled",
-        OperationOutcome::DestinationFailure => "destination_failure",
         OperationOutcome::InvalidStateOrRequest => "invalid_state_or_request",
         OperationOutcome::TerminalRejected => "terminal_rejected",
         OperationOutcome::Gone => "gone",
         OperationOutcome::ResourceExhausted => "resource_exhausted",
+        OperationOutcome::AdmissionTicketStillActive => "admission_ticket_still_active",
     }
 }
 
@@ -1458,6 +2034,23 @@ fn observe_settled(kind: OperationKind, lease_renewal: bool, outcome: OperationO
     }
 }
 
+fn observe_dispatch_result(
+    kind: OperationKind,
+    lease_renewal: bool,
+    result: OperationDispatchResult,
+) {
+    let name = match result {
+        OperationDispatchResult::WorkerReceipt(receipt) => outcome_name(receipt.outcome()),
+        OperationDispatchResult::TransportUnknown => "transport_unknown",
+    };
+    TASK_OPERATION_RECEIPTS
+        .with_label_values(&[kind.as_str(), name])
+        .inc();
+    if lease_renewal {
+        TASK_LEASE_RENEWALS.with_label_values(&[name]).inc();
+    }
+}
+
 fn observe_refusal(reason: &str, operations: usize) {
     TASK_OPERATION_REFUSALS
         .with_label_values(&[reason])
@@ -1484,12 +2077,17 @@ mod tests {
     //! exercised rather than mocked.
 
     use std::collections::VecDeque;
+    use std::num::NonZeroUsize;
     use std::pin::Pin;
 
     use novarocks_execution::task_execution::{
-        CancelReason, CancelTask, CreateTaskReceipt, CredentialEpoch, CredentialLeaseId,
-        CredentialUpdate, EstablishQueryContext, FetchTaskDynamicFilters, LeaseSequence,
-        LeaseValidFor, MonotonicInstant, RenewQueryExecutionLease, TaskStatus, TaskStatusVersion,
+        AbortCause, AbortQueryContext, AdmissionTicketId, CancelReason, CancelTask,
+        CreateTaskReceipt, CredentialEpoch, CredentialLeaseId, CredentialUpdate, DomainVersion,
+        EstablishQueryContext, FetchTaskDynamicFilters, LeaseSequence, LeaseValidFor,
+        QueryContextConvergenceReceipt, QueryContextConvergenceState,
+        QueryContextConvergenceVersion, QueryContextReceipt, QueryContextState,
+        RenewQueryExecutionLease, TaskDomainUpdate, TaskOutputFacts, TaskState, TaskStatus,
+        TaskStatusVersion, UpdateTask,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter};
@@ -1499,7 +2097,9 @@ mod tests {
         ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
     };
     use novarocks_task_codec::operation::{
-        decode_subscribe_task_status, encode_operation_outcome, encode_status_event,
+        decode_context_aware_subscribe_task_status, decode_subscribe_task_status,
+        encode_context_convergence_event, encode_operation_outcome, encode_query_context_ack,
+        encode_status_event,
     };
     use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, StageId, TaskId};
     use novarocks_types::{AttemptId, QueryId};
@@ -1507,9 +2107,11 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use crate::native::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
+    use crate::native::transport_supervisor::NativeTransportSupervisor;
+    use crate::task_execution::ContextConvergenceIntake;
     use crate::task_execution::dispatch::OperationDispatcher;
     use crate::task_execution::status_intake::{CountingWake, StatusIntake};
-    use novarocks_execution::task_execution::DispatchBudget;
+    use novarocks_query_application::coordination::{DispatchBudget, MonotonicInstant};
 
     use super::*;
 
@@ -1534,6 +2136,17 @@ mod tests {
         )
     }
 
+    fn status_at(identity: TaskIdentity, version: TaskStatusVersion) -> TaskStatus {
+        TaskStatus::try_new(
+            identity,
+            version,
+            TaskState::Running,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .expect("a running task status")
+    }
+
     fn context(backend: BackendProcessId) -> QueryContextRef {
         QueryContextRef::new(execution_id(), FrontendProcessId::new_v7(), backend)
     }
@@ -1543,6 +2156,31 @@ mod tests {
             TaskOperationId::new_v7(),
             identity(task, backend),
             CancelReason::UpstreamNoLongerNeeded,
+        ))
+    }
+
+    fn abort_intent(context: QueryContextRef) -> OperationIntent {
+        OperationIntent::AbortQueryContext(AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            AbortCause::QueryFailed,
+        ))
+    }
+
+    fn update_intent(task: u32, backend: BackendProcessId, version: u64) -> OperationIntent {
+        OperationIntent::UpdateTask(Arc::new(
+            UpdateTask::try_new(
+                TaskOperationId::new_v7(),
+                identity(task, backend),
+                vec![TaskDomainUpdate::TaskDynamicFilter {
+                    version: DomainVersion::new(version).expect("a positive domain version"),
+                    payload: Arc::new(WireContent::new(
+                        b"novarocks.test.task_dynamic_filter.v1",
+                        filter::RuntimeFilterEnvelope::default(),
+                    )),
+                }],
+            )
+            .expect("one domain is an update"),
         ))
     }
 
@@ -1594,6 +2232,7 @@ mod tests {
         let request = UpdateQueryContext::Establish(EstablishQueryContext::new(
             TaskOperationId::new_v7(),
             context(backend),
+            AdmissionTicketId::try_from_bytes([0x54; 16]).expect("the ticket is nonzero"),
             Arc::new(WireContent::new(
                 ESTABLISH_CATALOG_DOMAIN_TAG,
                 catalog::CatalogSet::default(),
@@ -1700,6 +2339,16 @@ mod tests {
         fn subscribed(&self) -> Vec<proto::SubscribeTaskStatusRequest> {
             self.state.lock().expect("peer state").subscribed.clone()
         }
+
+        fn open_held_subscriptions(&self) -> usize {
+            self.state
+                .lock()
+                .expect("peer state")
+                .held
+                .iter()
+                .filter(|sender| !sender.is_closed())
+                .count()
+        }
     }
 
     type EmptyExchangeStream =
@@ -1766,8 +2415,7 @@ mod tests {
                         .envelope
                         .as_ref()
                         .and_then(|envelope| envelope.operation_id.clone()),
-                    outcome: encode_operation_outcome(outcome)
-                        .expect("every test outcome has a wire form"),
+                    outcome: encode_operation_outcome(outcome),
                     safe_detail: String::new(),
                     safe_field_path: None,
                     ack,
@@ -1973,6 +2621,13 @@ mod tests {
         );
     }
 
+    fn submit_batch(sink: &NativeTaskOperationSink, batch: DispatchBatch) {
+        assert!(matches!(
+            sink.try_submit(batch),
+            TaskOperationSubmit::Accepted
+        ));
+    }
+
     async fn subscribe_requests(
         peer: &TaskWirePeer,
         count: usize,
@@ -1993,6 +2648,139 @@ mod tests {
     // -----------------------------------------------------------------------
     // The operation sink
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_cancel_uses_the_process_control_reserve() {
+        let backend = BackendProcessId::new_v7();
+        let batch = released_batch(backend, vec![cancel_intent(1, backend)]);
+        assert_eq!(supervisor_lane(&batch), NativeTransportLane::Control);
+    }
+
+    #[test]
+    fn dropping_an_accepted_send_settles_only_its_remaining_items_as_unknown() {
+        let intake = TaskAckIntake::new(Arc::new(CountingWake::default()));
+        let backend = BackendProcessId::new_v7();
+        let intents = [update_intent(1, backend, 1), cancel_intent(2, backend)];
+        let sent = intents
+            .iter()
+            .map(|intent| SentOperation {
+                operation_id: intent.operation_id(),
+                kind: intent.kind(),
+                lease_renewal: is_lease_renewal(intent),
+                address: AckAddress::of(intent),
+            })
+            .collect::<Vec<_>>();
+        let ids = sent
+            .iter()
+            .map(|item| item.operation_id)
+            .collect::<Vec<_>>();
+        let mut receipts = AcceptedOperationReceipts::new(intake.handle(), sent);
+        receipts.publish_next(OperationAcknowledgement::transport_unknown(
+            ids[0],
+            intents[0].kind(),
+        ));
+
+        drop(receipts);
+
+        let acknowledgements = intake.drain();
+        assert_eq!(acknowledgements.len(), 2);
+        assert_eq!(
+            acknowledgements
+                .iter()
+                .map(OperationAcknowledgement::operation_id)
+                .collect::<Vec<_>>(),
+            ids,
+            "drop settlement preserves request order and never republishes a settled item"
+        );
+        assert!(acknowledgements.iter().all(|ack| matches!(
+            ack.dispatch_result(),
+            OperationDispatchResult::TransportUnknown
+        )));
+    }
+
+    #[test]
+    fn task_cancel_leaves_update_backlog_first_and_reaches_control_capacity() {
+        let backend = BackendProcessId::new_v7();
+        let transport =
+            TransportBudget::new(2, 1024, 512, 4, 4096, 4, 4096, 1, 2, Duration::from_secs(1))
+                .expect("one ordinary and one control batch fit");
+        let dispatch = DispatchBudget::new(1, 1, 1, 1).expect("nonzero lane permits");
+        let mut dispatcher = OperationDispatcher::new(dispatch, transport);
+        dispatcher
+            .register_task(backend)
+            .expect("one task fits the backend");
+        dispatcher
+            .enqueue(update_intent(1, backend, 1), MonotonicInstant::ORIGIN)
+            .expect("first ordinary update");
+        let released_update = dispatcher
+            .take_batch()
+            .expect("the first update reaches transport");
+        let update_acceptance = released_update.acceptance();
+        dispatcher
+            .accept(update_acceptance)
+            .expect("the first update saturates its only permit");
+        assert_eq!(dispatcher.lane_in_flight(backend, DispatchLane::Update), 1);
+        dispatcher
+            .enqueue(update_intent(1, backend, 2), MonotonicInstant::ORIGIN)
+            .expect("second ordinary update");
+        dispatcher
+            .enqueue(cancel_intent(1, backend), MonotonicInstant::ORIGIN)
+            .expect("task cancellation");
+
+        let cancel = dispatcher
+            .take_batch()
+            .expect("control is selected before the update backlog");
+        assert_eq!(cancel.operations().len(), 1);
+        assert_eq!(cancel.operations()[0].kind(), OperationKind::CancelTask);
+        assert_eq!(
+            cancel.lane(),
+            DispatchLane::Control,
+            "task cancellation has an independent dispatch permit"
+        );
+        assert_eq!(supervisor_lane(&cancel), NativeTransportLane::Control);
+
+        let supervisor = NativeTransportSupervisor::from_transport(transport)
+            .expect("the process windows were validated");
+        let intake = TaskAckIntake::new(Arc::new(CountingWake::default()));
+        let waiter = supervisor
+            .register_waiter(Arc::new(intake.handle()))
+            .expect("register the attempt");
+        let mut ordinary_queue = supervisor
+            .try_reserve_queue(
+                &waiter,
+                NativeTransportLane::Ordinary,
+                transport.max_batch_items(),
+                transport.max_operation_queued_bytes(),
+            )
+            .expect("fill the ordinary queue window exactly");
+        let ordinary_encoding = supervisor
+            .try_reserve_encoding(&waiter, NativeTransportLane::Ordinary)
+            .expect("ordinary head can always reserve its encoding window");
+        ordinary_queue.mark_in_flight();
+        let mut control_queue = supervisor
+            .try_reserve_queue(
+                &waiter,
+                supervisor_lane(&cancel),
+                cancel.operations().len(),
+                cancel.queued_bytes(),
+            )
+            .expect("the cancellation directly consumes the reserved control queue");
+        let mut control_encoding = supervisor
+            .try_reserve_encoding(&waiter, supervisor_lane(&cancel))
+            .expect("the cancellation can reserve encoding beside ordinary I/O");
+        control_encoding.shrink_to(1);
+        control_queue.mark_in_flight();
+        drop(control_encoding);
+        drop(control_queue);
+        drop(ordinary_encoding);
+        drop(ordinary_queue);
+
+        assert_eq!(dispatcher.lane_queued(backend, DispatchLane::Update), 1);
+        assert!(
+            dispatcher.take_batch().is_none(),
+            "the queued update remains blocked by its saturated permit"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_partial_batch_failure_is_settled_per_item_in_request_order() {
@@ -2020,7 +2808,7 @@ mod tests {
                 OperationOutcome::Idempotent,
             ]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 3).await;
 
         assert_eq!(
@@ -2032,12 +2820,12 @@ mod tests {
         );
         assert_eq!(
             acks.iter()
-                .map(OperationAcknowledgement::outcome)
+                .map(OperationAcknowledgement::worker_outcome)
                 .collect::<Vec<_>>(),
             vec![
-                OperationOutcome::Accepted,
-                OperationOutcome::TerminalRejected,
-                OperationOutcome::Idempotent,
+                Some(OperationOutcome::Accepted),
+                Some(OperationOutcome::TerminalRejected),
+                Some(OperationOutcome::Idempotent),
             ],
             "one item's failure leaves every other item exactly as its own receipt reports"
         );
@@ -2064,14 +2852,13 @@ mod tests {
                 OperationOutcome::TerminalRejected,
             ]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 2).await;
 
         for ack in &acks {
-            assert_eq!(ack.outcome(), OperationOutcome::InvalidStateOrRequest);
-            assert!(
-                !ack.outcome().is_retryable(),
-                "an answer that arrived is never resent"
+            assert_eq!(
+                ack.worker_outcome(),
+                Some(OperationOutcome::InvalidStateOrRequest)
             );
         }
     }
@@ -2092,12 +2879,12 @@ mod tests {
                 OperationOutcome::Accepted,
             ]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 2).await;
 
         assert!(
             acks.iter()
-                .all(|ack| ack.outcome() == OperationOutcome::InvalidStateOrRequest),
+                .all(|ack| ack.worker_outcome() == Some(OperationOutcome::InvalidStateOrRequest)),
             "a response with fewer receipts than items cannot be attributed"
         );
     }
@@ -2106,25 +2893,25 @@ mod tests {
     async fn an_unknown_transport_outcome_is_retryable_and_resends_the_identical_request() {
         let backend = BackendProcessId::new_v7();
         let fixture = sink_fixture(Loopback::start().await, backend);
-        let batch = released_batch(backend, vec![cancel_intent(1, backend)]);
+        let intent = cancel_intent(1, backend);
+        let batch = released_batch(backend, vec![intent.clone()]);
         fixture
             .loopback
             .peer
             .expect_apply(ApplyAnswer::Reject(tonic::Code::Unavailable));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, released_batch(backend, vec![intent]));
         let first = settled(&fixture.acks, 1).await;
         assert_eq!(
-            first[0].outcome(),
-            OperationOutcome::RetryableTransportUnknown
+            first[0].dispatch_result(),
+            OperationDispatchResult::TransportUnknown
         );
-        assert!(first[0].outcome().is_retryable());
 
         // The owner replays the same immutable intent, so the same bytes go
         // back out under the same operation id.
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let second = settled(&fixture.acks, 1).await;
-        assert_eq!(second[0].outcome(), OperationOutcome::Accepted);
+        assert_eq!(second[0].worker_outcome(), Some(OperationOutcome::Accepted));
         assert_eq!(second[0].operation_id(), first[0].operation_id());
 
         let applied = fixture.loopback.peer.applied();
@@ -2145,11 +2932,13 @@ mod tests {
             .peer
             .expect_apply(ApplyAnswer::Reject(tonic::Code::InvalidArgument));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
 
-        assert_eq!(acks[0].outcome(), OperationOutcome::InvalidStateOrRequest);
-        assert!(!acks[0].outcome().is_retryable());
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::InvalidStateOrRequest)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2159,11 +2948,13 @@ mod tests {
         let fixture = sink_fixture(Loopback::start().await, frozen);
         let batch = released_batch(replacement, vec![cancel_intent(1, replacement)]);
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
 
-        assert_eq!(acks[0].outcome(), OperationOutcome::IdentityMismatch);
-        assert!(!acks[0].outcome().is_retryable());
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::IdentityMismatch)
+        );
         assert!(
             fixture.loopback.peer.applied().is_empty(),
             "a replaced process is never retried elsewhere"
@@ -2181,11 +2972,14 @@ mod tests {
             )],
         );
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
 
         assert_eq!(acks[0].kind(), OperationKind::FetchTaskDynamicFilters);
-        assert_eq!(acks[0].outcome(), OperationOutcome::InvalidStateOrRequest);
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::InvalidStateOrRequest)
+        );
         assert!(
             fixture.loopback.peer.applied().is_empty(),
             "a read has its own RPC and never becomes a batch item"
@@ -2200,16 +2994,12 @@ mod tests {
             tonic::Code::Cancelled,
             tonic::Code::Unknown,
         ] {
-            let outcome = classify_apply_status(&Status::new(code, "unknown outcome"));
-            assert_eq!(outcome, OperationOutcome::RetryableTransportUnknown);
-            assert!(
-                outcome.is_retryable(),
-                "{code:?} keeps the request replayable"
-            );
+            let result = classify_apply_status(&Status::new(code, "unknown outcome"));
+            assert_eq!(result, OperationDispatchResult::TransportUnknown);
         }
         assert_eq!(
             classify_apply_status(&Status::new(tonic::Code::ResourceExhausted, "full")),
-            OperationOutcome::ResourceExhausted
+            worker_result(OperationOutcome::ResourceExhausted)
         );
         for code in [
             tonic::Code::InvalidArgument,
@@ -2224,16 +3014,20 @@ mod tests {
             tonic::Code::DataLoss,
             tonic::Code::Unauthenticated,
         ] {
-            let outcome = classify_apply_status(&Status::new(code, "settled"));
-            assert!(!outcome.is_retryable(), "{code:?} must not be resent");
+            let result = classify_apply_status(&Status::new(code, "settled"));
+            assert!(
+                matches!(result, OperationDispatchResult::WorkerReceipt(_)),
+                "{code:?} must not be resent"
+            );
         }
-        assert!(
-            !classify_channel_error(&ChannelAcquisitionError::fatal("bad material")).is_retryable()
-        );
-        assert!(
-            classify_channel_error(&ChannelAcquisitionError::retryable_network("dial failed"))
-                .is_retryable()
-        );
+        assert!(matches!(
+            classify_channel_error(&ChannelAcquisitionError::fatal("bad material")),
+            OperationDispatchResult::WorkerReceipt(_)
+        ));
+        assert!(matches!(
+            classify_channel_error(&ChannelAcquisitionError::retryable_network("dial failed")),
+            OperationDispatchResult::TransportUnknown
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -2246,6 +3040,13 @@ mod tests {
         intake: StatusIntake,
         wake: Arc<CountingWake>,
         acks: TaskAckIntake,
+    }
+
+    struct ContextAwareSubscriberFixture {
+        loopback: Loopback,
+        subscriber: TaskStatusSubscriber,
+        status_intake: StatusIntake,
+        convergence_intake: ContextConvergenceIntake,
     }
 
     fn subscriber_fixture(
@@ -2270,6 +3071,361 @@ mod tests {
             wake,
             acks: TaskAckIntake::new(Arc::new(CountingWake::default())),
         }
+    }
+
+    fn context_aware_subscriber_fixture(
+        loopback: Loopback,
+        backend: BackendProcessId,
+        error_budget: u32,
+        convergence_capacity: NonZeroUsize,
+    ) -> ContextAwareSubscriberFixture {
+        let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let wake = Arc::new(CountingWake::default());
+        let status_intake = StatusIntake::new(16, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+        let convergence_intake = ContextConvergenceIntake::bounded(convergence_capacity);
+        let subscriber = TaskStatusSubscriber::new_context_aware(
+            &[(backend, loopback.endpoint.clone())],
+            status_intake.handle(),
+            convergence_intake.handle(),
+            error_budget,
+            data_runtime,
+        )
+        .expect("one frozen context-aware backend target");
+        ContextAwareSubscriberFixture {
+            loopback,
+            subscriber,
+            status_intake,
+            convergence_intake,
+        }
+    }
+
+    fn convergence_receipt(context: QueryContextRef) -> QueryContextConvergenceReceipt {
+        QueryContextConvergenceReceipt::new(
+            context,
+            QueryContextConvergenceVersion::FIRST,
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_context_aware_stream_retains_convergence_and_reconnects_from_its_cursor() {
+        let backend = BackendProcessId::new_v7();
+        let mut fixture = context_aware_subscriber_fixture(
+            Loopback::start().await,
+            backend,
+            2,
+            NonZeroUsize::MIN,
+        );
+        let query_context = context(backend);
+        let receipt = convergence_receipt(query_context);
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenClose(vec![
+                encode_context_convergence_event(receipt),
+            ]));
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
+
+        fixture
+            .subscriber
+            .ensure(query_context, Vec::new())
+            .expect("the convergence-aware subscription starts");
+        let requests = subscribe_requests(&fixture.loopback.peer, 2).await;
+
+        let (first_context, first_tasks, first_context_cursor) =
+            decode_context_aware_subscribe_task_status(
+                &requests[0],
+                FieldPath::root("first_context_aware_subscription"),
+            )
+            .expect("a legal context-aware subscription");
+        assert_eq!(first_context, query_context);
+        assert!(first_tasks.is_empty());
+        let first_context_cursor = first_context_cursor.expect("convergence is always requested");
+        assert_eq!(first_context_cursor.context(), query_context);
+        assert_eq!(first_context_cursor.current_version(), None);
+
+        let (_, _, replayed_context_cursor) = decode_context_aware_subscribe_task_status(
+            &requests[1],
+            FieldPath::root("replayed_context_aware_subscription"),
+        )
+        .expect("a legal replay");
+        assert_eq!(
+            replayed_context_cursor.and_then(|cursor| cursor.current_version()),
+            Some(QueryContextConvergenceVersion::FIRST),
+            "the stream advances its context cursor only after the inbox retained the receipt"
+        );
+        assert_eq!(fixture.convergence_intake.pending(), 1);
+        assert_eq!(
+            fixture
+                .convergence_intake
+                .peek_retained()
+                .expect("the complete convergence receipt is retained")
+                .receipt(),
+            receipt
+        );
+        assert_eq!(
+            fixture.status_intake.queued(),
+            0,
+            "context convergence never enters the task status route"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_reconciliation_reopens_one_stream_and_preserves_the_context_cursor() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = context_aware_subscriber_fixture(
+            Loopback::start().await,
+            backend,
+            2,
+            NonZeroUsize::MIN,
+        );
+        let query_context = context(backend);
+        let task = identity(1, backend);
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
+                encode_context_convergence_event(convergence_receipt(query_context)),
+            ]));
+        fixture
+            .subscriber
+            .ensure(query_context, vec![TaskStatusCursor::unobserved(task)])
+            .expect("the first subscription starts");
+        for _ in 0..600 {
+            if fixture.convergence_intake.pending() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fixture.convergence_intake.pending(), 1);
+
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
+        fixture
+            .subscriber
+            .resubscribe(
+                query_context,
+                vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)],
+            )
+            .expect("TaskRound reconciles its authoritative task cursor");
+        let requests = subscribe_requests(&fixture.loopback.peer, 2).await;
+        for _ in 0..600 {
+            if fixture.loopback.peer.open_held_subscriptions() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fixture.loopback.peer.open_held_subscriptions(),
+            1,
+            "reconciliation closes the old stream before the same loop opens its replacement"
+        );
+        let (_, task_cursors, context_cursor) = decode_context_aware_subscribe_task_status(
+            &requests[1],
+            FieldPath::root("reconciled_context_aware_subscription"),
+        )
+        .expect("a legal reconciled subscription");
+        assert_eq!(
+            task_cursors[0].current_version(),
+            Some(TaskStatusVersion::FIRST)
+        );
+        assert_eq!(
+            context_cursor.and_then(|cursor| cursor.current_version()),
+            Some(QueryContextConvergenceVersion::FIRST),
+            "task reconciliation cannot reset the independently retained convergence cursor"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn convergence_overflow_waits_for_capacity_without_spending_the_network_budget() {
+        let backend = BackendProcessId::new_v7();
+        let mut fixture = context_aware_subscriber_fixture(
+            Loopback::start().await,
+            backend,
+            1,
+            NonZeroUsize::MIN,
+        );
+        let first = context(backend);
+        let second = context(backend);
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
+                encode_context_convergence_event(convergence_receipt(first)),
+            ]));
+        fixture
+            .subscriber
+            .ensure(first, Vec::new())
+            .expect("the first subscription starts");
+        for _ in 0..600 {
+            if fixture.convergence_intake.pending() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fixture.convergence_intake.pending(), 1);
+
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
+                encode_context_convergence_event(convergence_receipt(second)),
+            ]));
+        fixture
+            .subscriber
+            .ensure(second, Vec::new())
+            .expect("the second subscription starts");
+        let _ = subscribe_requests(&fixture.loopback.peer, 2).await;
+        tokio::time::sleep(RESUBSCRIBE_BACKOFF_STEP * 2).await;
+        assert_eq!(
+            fixture.loopback.peer.subscribed().len(),
+            2,
+            "local convergence backpressure does not reconnect or consume network budget"
+        );
+        assert_ne!(
+            fixture.subscriber.state(second),
+            Some(SubscriptionState::BudgetExhausted)
+        );
+
+        let first_lease = fixture
+            .convergence_intake
+            .peek_retained()
+            .expect("the first context occupies the only slot");
+        assert_eq!(first_lease.receipt(), convergence_receipt(first));
+        assert_eq!(
+            first_lease.ack(),
+            crate::task_execution::context_convergence::ContextConvergenceRetainedAck::Released
+        );
+        for _ in 0..600 {
+            let Some(lease) = fixture.convergence_intake.peek_retained() else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
+            assert_eq!(
+                lease.receipt(),
+                convergence_receipt(second),
+                "the blocked transport retries the same complete receipt after the epoch changes"
+            );
+            return;
+        }
+        panic!("the second convergence receipt was not retried after capacity became available");
+    }
+
+    #[tokio::test]
+    async fn convergence_protocol_errors_leave_the_cursor_unchanged() {
+        let backend = BackendProcessId::new_v7();
+        let exact = context(backend);
+        let stranger = context(backend);
+        let owner = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
+        let handle = owner.handle();
+        let second_version = QueryContextConvergenceVersion::FIRST
+            .next()
+            .expect("version two");
+        let mut cursor = Some(QueryContextConvergenceCursor::at(exact, second_version));
+        assert_eq!(
+            observe_context_convergence(
+                exact,
+                convergence_receipt(exact),
+                Some(&handle),
+                &mut cursor,
+            )
+            .await,
+            Err(SubscriptionState::Rejected)
+        );
+        assert_eq!(
+            cursor.and_then(|cursor| cursor.current_version()),
+            Some(second_version),
+            "an older receipt cannot move the subscriber cursor backwards"
+        );
+        assert_eq!(owner.pending(), 0);
+
+        let mut cursor = Some(QueryContextConvergenceCursor::unobserved(exact));
+        assert_eq!(
+            observe_context_convergence(
+                exact,
+                convergence_receipt(stranger),
+                Some(&handle),
+                &mut cursor,
+            )
+            .await,
+            Err(SubscriptionState::Rejected)
+        );
+        assert_eq!(cursor.and_then(|cursor| cursor.current_version()), None);
+        assert_eq!(owner.pending(), 0);
+
+        let closed_owner = ContextConvergenceIntake::bounded(NonZeroUsize::MIN);
+        let closed = closed_owner.handle();
+        drop(closed_owner);
+        assert_eq!(
+            observe_context_convergence(
+                exact,
+                convergence_receipt(exact),
+                Some(&closed),
+                &mut cursor,
+            )
+            .await,
+            Err(SubscriptionState::Rejected)
+        );
+        assert_eq!(cursor.and_then(|cursor| cursor.current_version()), None);
+    }
+
+    #[tokio::test]
+    async fn task_status_replay_cannot_move_the_transport_cursor_backwards() {
+        let backend = BackendProcessId::new_v7();
+        let query_context = context(backend);
+        let task = identity(1, backend);
+        let second_version = TaskStatusVersion::FIRST.next().expect("version two");
+        let intake = StatusIntake::new(2, Arc::new(CountingWake::default()));
+        let mut cursors = BTreeMap::from([(task, TaskStatusCursor::at(task, second_version))]);
+
+        assert_eq!(
+            observe_stream_event(
+                query_context,
+                &encode_status_event(&status_at(task, TaskStatusVersion::FIRST)),
+                &mut cursors,
+                &intake.handle(),
+                None,
+                &mut None,
+            )
+            .await,
+            Err(SubscriptionState::Rejected)
+        );
+        assert_eq!(
+            cursors
+                .get(&task)
+                .and_then(|cursor| cursor.current_version()),
+            Some(second_version)
+        );
+        assert_eq!(intake.queued(), 0);
+
+        assert_eq!(
+            observe_stream_event(
+                query_context,
+                &encode_status_event(&status_at(task, second_version)),
+                &mut cursors,
+                &intake.handle(),
+                None,
+                &mut None,
+            )
+            .await,
+            Ok(StreamObservation::Delivered)
+        );
+        assert_eq!(
+            cursors
+                .get(&task)
+                .and_then(|cursor| cursor.current_version()),
+            Some(second_version)
+        );
+        assert_eq!(
+            intake.queued(),
+            0,
+            "an exact replay is idempotent and does not consume bounded intake capacity"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2313,12 +3469,13 @@ mod tests {
 
         assert_eq!(fixture.intake.queued(), 1, "the snapshot was enqueued once");
         let mut runner = fixture.intake.try_enter().expect("the runner slot is free");
+        let (observation_loss, statuses) = runner.drain_statuses(8);
         assert!(
-            runner.take_observation_loss(),
+            observation_loss,
             "a lost stream is reported as observation loss"
         );
         assert_eq!(
-            runner.drain(8),
+            statuses,
             vec![StatusEvent::Published(status)],
             "the receive path enqueues the snapshot and nothing else"
         );
@@ -2371,12 +3528,10 @@ mod tests {
         );
         assert_eq!(fixture.acks.queued(), 0);
         let mut runner = fixture.intake.try_enter().expect("the runner slot is free");
-        assert!(
-            !runner.take_observation_loss(),
-            "a live stream reports no loss"
-        );
+        let (observation_loss, statuses) = runner.drain_statuses(8);
+        assert!(!observation_loss, "a live stream reports no loss");
         assert_eq!(
-            runner.drain(8),
+            statuses,
             vec![
                 StatusEvent::Published(TaskStatus::created(first)),
                 StatusEvent::Published(TaskStatus::created(second)),
@@ -2417,6 +3572,176 @@ mod tests {
             fixture.intake.queued(),
             0,
             "an event from a replaced process is never published"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_status_event_from_another_query_execution_is_fatal() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = subscriber_fixture(Loopback::start().await, backend, 2);
+        let query_context = context(backend);
+        let foreign_execution = QueryExecutionId::new(
+            execution_id().query_id(),
+            AttemptId::new(2).expect("attempt two is nonzero"),
+        )
+        .expect("a nonzero query id");
+        let foreign_task = TaskIdentity::new(
+            foreign_execution,
+            StageId::new(1).expect("a nonzero stage id"),
+            TaskId::new(1).expect("a nonzero task id"),
+            backend,
+        );
+        fixture
+            .loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![encode_status_event(
+                &TaskStatus::created(foreign_task),
+            )]));
+
+        fixture
+            .subscriber
+            .ensure(query_context, Vec::new())
+            .expect("the subscription starts");
+        let mut observed = None;
+        for _ in 0..600 {
+            let state = fixture.subscriber.state(query_context);
+            if state == Some(SubscriptionState::QueryMismatch) {
+                observed = state;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(observed, Some(SubscriptionState::QueryMismatch));
+        assert!(observed.expect("a settled state").is_fatal());
+        assert_eq!(
+            fixture.intake.queued(),
+            0,
+            "an event from another query execution is never published"
+        );
+    }
+
+    #[test]
+    fn intake_overflow_preserves_the_last_enqueued_status_cursor() {
+        let backend = BackendProcessId::new_v7();
+        let query_context = context(backend);
+        let task = identity(1, backend);
+        let first = TaskStatus::created(task);
+        let second_version = TaskStatusVersion::FIRST.next().expect("version two");
+        let second = status_at(task, second_version);
+        let intake = StatusIntake::new(1, Arc::new(CountingWake::default()));
+        let handle = intake.handle();
+        let mut cursors = BTreeMap::from([(task, TaskStatusCursor::unobserved(task))]);
+
+        assert_eq!(
+            observe_event(
+                query_context,
+                &encode_status_event(&first),
+                &mut cursors,
+                &handle,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            cursors
+                .get(&task)
+                .and_then(|cursor| cursor.current_version()),
+            Some(TaskStatusVersion::FIRST)
+        );
+        assert_eq!(
+            observe_event(
+                query_context,
+                &encode_status_event(&second),
+                &mut cursors,
+                &handle,
+            ),
+            Err(SubscriptionState::Resubscribing)
+        );
+        assert_eq!(
+            cursors
+                .get(&task)
+                .and_then(|cursor| cursor.current_version()),
+            Some(TaskStatusVersion::FIRST),
+            "a status the bounded intake did not retain cannot advance the stream cursor"
+        );
+        let mut runner = intake.try_enter().expect("the runner slot is free");
+        let (observation_loss, statuses) = runner.drain_statuses(2);
+        assert!(observation_loss);
+        assert_eq!(statuses, vec![StatusEvent::Published(first)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn intake_overflow_waits_for_task_round_resubscription_without_spending_error_budget() {
+        let backend = BackendProcessId::new_v7();
+        let loopback = Loopback::start().await;
+        let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let intake = StatusIntake::new(1, Arc::new(CountingWake::default()));
+        let subscriber = TaskStatusSubscriber::new(
+            &[(backend, loopback.endpoint.clone())],
+            intake.handle(),
+            1,
+            data_runtime,
+        )
+        .expect("one frozen backend target");
+        let query_context = context(backend);
+        let task = identity(1, backend);
+        let first = TaskStatus::created(task);
+        let second = status_at(task, TaskStatusVersion::FIRST.next().expect("version two"));
+        loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
+                encode_status_event(&first),
+                encode_status_event(&second),
+            ]));
+
+        subscriber
+            .ensure(query_context, vec![TaskStatusCursor::unobserved(task)])
+            .expect("the subscription starts");
+        for _ in 0..600 {
+            if subscriber.state(query_context) == Some(SubscriptionState::Resubscribing) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            subscriber.state(query_context),
+            Some(SubscriptionState::Resubscribing),
+            "local overflow waits for the serial runner instead of exhausting the network budget"
+        );
+        tokio::time::sleep(RESUBSCRIBE_BACKOFF_STEP * 2).await;
+        assert_eq!(
+            loopback.peer.subscribed().len(),
+            1,
+            "the receive task never privately resubscribes past a locally lost status"
+        );
+
+        let mut runner = intake.try_enter().expect("the runner slot is free");
+        let (observation_loss, statuses) = runner.drain_statuses(2);
+        assert!(observation_loss);
+        assert_eq!(statuses, vec![StatusEvent::Published(first)]);
+        drop(runner);
+
+        loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(Vec::new()));
+        subscriber
+            .resubscribe(
+                query_context,
+                vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)],
+            )
+            .expect("TaskRound replaces the subscription from its cursor");
+        let requests = subscribe_requests(&loopback.peer, 2).await;
+        let (_, cursors) = decode_subscribe_task_status(
+            &requests[1],
+            FieldPath::root("post_overflow_subscription"),
+        )
+        .expect("a legal subscription");
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(cursors[0].identity(), task);
+        assert_eq!(
+            cursors[0].current_version(),
+            Some(TaskStatusVersion::FIRST),
+            "TaskRound's applied cursor is the only position allowed after overflow"
         );
     }
 
@@ -2487,6 +3812,73 @@ mod tests {
     // -----------------------------------------------------------------------
     // Acknowledgement bodies
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_admission_request_and_receipt_keep_the_exact_context_validity_and_compatibility() {
+        let backend = BackendProcessId::new_v7();
+        let context = context(backend);
+        let valid_for = LeaseValidFor::new(Duration::from_secs(10)).expect("a legal validity");
+        let compatibility = novarocks_types::NativeCompatibilityId::new([0x71; 32]);
+        let admission_epoch_capability =
+            novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                [0x61; 16],
+            )
+            .expect("nonzero epoch");
+        let request = AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context,
+            valid_for,
+            compatibility,
+            admission_epoch_capability,
+        );
+        let encoded = encode_operation(
+            &OperationIntent::AcquireQueryContextAdmissionTicket(request),
+            &test_attempt_facts(),
+        )
+        .expect("the admission request is encodable");
+        let Some(proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(encoded)) =
+            encoded.operation
+        else {
+            panic!("admission uses its own batch operation");
+        };
+        assert_eq!(encoded.valid_for_millis, 10_000);
+        assert_eq!(
+            encoded
+                .native_compatibility_id
+                .expect("compatibility is required")
+                .value,
+            compatibility.as_bytes()
+        );
+
+        let ticket = AdmissionTicketId::try_from_bytes([0x57; 16]).expect("the ticket is nonzero");
+        let receipt = proto::TaskOperationReceipt {
+            operation_id: None,
+            outcome: 0,
+            safe_detail: String::new(),
+            safe_field_path: None,
+            ack: Some(
+                proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(
+                    codec::encode_query_context_admission_ticket_ack(
+                        novarocks_execution::task_execution::QueryContextAdmissionTicketReceipt::new(
+                            ticket,
+                            context,
+                            valid_for,
+                        ),
+                    ),
+                ),
+            ),
+        };
+        let payload = decode_ack(
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            AckAddress::Admission(request),
+            &receipt,
+        )
+        .expect("the exact receipt decodes");
+        assert!(matches!(
+            payload,
+            AckPayload::AdmissionTicket(receipt) if receipt.ticket_id() == ticket
+        ));
+    }
 
     /// A create acknowledgement is the frontend's only proof that a task was
     /// installed, and its status snapshot closes the window between creating a
@@ -2576,9 +3968,80 @@ mod tests {
                 )),
             )]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
-        assert_eq!(acks[0].outcome(), OperationOutcome::InvalidStateOrRequest);
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::InvalidStateOrRequest)
+        );
+        assert_eq!(*acks[0].payload(), AckPayload::None);
+    }
+
+    #[tokio::test]
+    async fn every_legal_abort_closing_outcome_keeps_its_context_receipt() {
+        for (outcome, state) in [
+            (OperationOutcome::Accepted, QueryContextState::Aborting),
+            (OperationOutcome::Idempotent, QueryContextState::Aborting),
+            (
+                OperationOutcome::ContextTerminalReceipt,
+                QueryContextState::Releasing,
+            ),
+            (
+                OperationOutcome::LeaseExpired,
+                QueryContextState::TerminalRetained,
+            ),
+            (OperationOutcome::Gone, QueryContextState::Gone),
+        ] {
+            let backend = BackendProcessId::new_v7();
+            let context = context(backend);
+            let fixture = sink_fixture(Loopback::start().await, backend);
+            fixture
+                .loopback
+                .peer
+                .expect_apply(ApplyAnswer::WithAck(vec![(
+                    outcome,
+                    Some(proto::task_operation_receipt::Ack::QueryContext(
+                        encode_query_context_ack(
+                            &QueryContextReceipt::new(context, state),
+                            Some(AbortCause::QueryFailed),
+                        )
+                        .expect("a closing context receipt encodes"),
+                    )),
+                )]));
+            submit_batch(
+                &fixture.sink,
+                released_batch(backend, vec![abort_intent(context)]),
+            );
+            let acks = settled(&fixture.acks, 1).await;
+            assert_eq!(acks[0].worker_outcome(), Some(outcome));
+            assert!(matches!(
+                acks[0].payload(),
+                AckPayload::Context(receipt)
+                    if receipt.context() == context && receipt.state() == state
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legal_abort_closing_outcome_without_its_body_fails_closed() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        fixture
+            .loopback
+            .peer
+            .expect_apply(ApplyAnswer::WithAck(vec![(
+                OperationOutcome::ContextTerminalReceipt,
+                None,
+            )]));
+        submit_batch(
+            &fixture.sink,
+            released_batch(backend, vec![abort_intent(context(backend))]),
+        );
+        let acks = settled(&fixture.acks, 1).await;
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::InvalidStateOrRequest)
+        );
         assert_eq!(*acks[0].payload(), AckPayload::None);
     }
 
@@ -2602,9 +4065,9 @@ mod tests {
                 )),
             )]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
-        assert_eq!(acks[0].outcome(), OperationOutcome::Accepted);
+        assert_eq!(acks[0].worker_outcome(), Some(OperationOutcome::Accepted));
         assert_eq!(*acks[0].payload(), AckPayload::None);
     }
 }

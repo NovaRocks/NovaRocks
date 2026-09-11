@@ -1424,6 +1424,7 @@ mod tests {
             )
             .expect("controller");
             controller.bootstrap().await.expect("bootstrap");
+            wait_for_ready(&port, &created.attachment.instance_id).await;
             controller.start().expect("start controller");
             assert!(matches!(
                 port.admit_catalog(&created.attachment.instance_id),

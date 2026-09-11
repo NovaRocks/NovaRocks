@@ -32,10 +32,14 @@
 //!
 //! Nothing in this module is routed into production yet. The existing
 //! coordinator keeps owning distributed query execution untouched.
-// Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
+// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
+pub(crate) mod abort_effect;
+pub(crate) mod actor_gate;
+pub(crate) mod blocking_io;
 pub mod clock;
 pub mod completion;
+pub mod context_convergence;
 pub mod context_owner;
 pub mod credential;
 pub(crate) mod credential_pump;
@@ -45,6 +49,7 @@ pub mod execution;
 pub(crate) mod feedback_pump;
 pub mod graph;
 pub mod intent;
+pub(crate) mod manifest_round;
 pub mod remote_task;
 pub(crate) mod round;
 pub mod sources;
@@ -56,9 +61,14 @@ pub mod status_intake;
 #[cfg(test)]
 mod tests;
 
+pub use blocking_io::ConnectorBlockingIoBudget;
 pub use clock::{ManualClock, ProcessMonotonicClock, TaskProtocolClock};
 pub use completion::{
     ReadCompletionTracker, ReadVerdict, WriteCompletionTracker, WriteVerdict, accept_final_info,
+};
+pub use context_convergence::{
+    ContextConvergenceIntake, ContextConvergenceIntakeHandle, ContextConvergencePublishAdmission,
+    ContextConvergencePublishError,
 };
 pub use context_owner::{
     ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
@@ -67,13 +77,15 @@ pub use credential::{CredentialRefreshOwner, RefreshRefusal, RefreshTiming, refr
 pub use dispatch::{ExpiredOperation, OperationDispatcher};
 pub use error::{CapacityBound, TaskExecutionError};
 pub use execution::{
-    PumpReport, QueryTaskExecution, ReleasedRuntimeFilterContributions, StatusReport,
+    AbortSubmission, PumpReport, QueryTaskExecution, ReleasedRuntimeFilterContributions,
+    StatusReport,
 };
 pub use graph::{
     FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, build_task_graph,
 };
 pub use intent::{
-    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationSink,
+    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
+    TaskOperationQueueRequest, TaskOperationSink, TaskOperationSubmit,
 };
 pub use remote_task::{
     CreateSettlement, RemoteTask, RemoteTaskState, TaskTerminalReport, UpdateAdmission,

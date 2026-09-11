@@ -23,12 +23,14 @@ use std::time::Instant;
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::common::query_cancellation::QueryCancellationView;
-use crate::query_execution::artifact::PreparedDistributedQuery;
+use crate::query_execution::artifact::{
+    PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
+};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 pub use crate::query_execution::outcome::DistributedQueryOutcome;
 pub use crate::query_execution::outcome::FragmentProfileSet;
 pub use crate::query_execution::outcome::QueryOutcomeFactory;
-use crate::query_execution::preparation::PreparedFragmentSet;
+use crate::query_execution::post_compile::NativeFragmentEncodingInput;
 pub use crate::query_execution::profile::ProfileTerminalBuilder;
 pub use crate::query_execution::statistics::StatisticsCollectionProgram;
 pub use crate::query_execution::statistics::StatisticsExecutionMode;
@@ -38,6 +40,7 @@ use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::preparation::FrozenExecutionDescription;
 use novarocks_types::BackendProcessId;
 
 #[cfg(test)]
@@ -227,8 +230,7 @@ pub enum DistributedQueryIntent {
 /// unrelated prepared/native artifacts or replace its cancellation/completion
 /// capabilities.
 pub struct DistributedQueryRequest {
-    artifacts: PreparedDistributedQuery,
-    options: ResolvedQueryOptions,
+    payload: DistributedQueryPayload,
     topology: crate::common::backend_topology::BackendTopologySnapshot,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
@@ -241,17 +243,74 @@ pub struct DistributedQueryRequest {
     statistics_program: Option<StatisticsCollectionProgram>,
 }
 
+enum DistributedQueryPayload {
+    RestartableRead(Arc<RestartableReadExecution>),
+    SingleUse {
+        description: Arc<FrozenExecutionDescription>,
+        artifacts: PreparedDistributedQuery,
+        options: Arc<ResolvedQueryOptions>,
+    },
+}
+
+/// Closed, immutable source for every legacy coordinator round of one
+/// restartable read.
+///
+/// The frozen description, static native template, Connector access recipes,
+/// resolved options and result intent are created together by the sole
+/// finalizer. This carrier deliberately does not pretend to be an executable
+/// query-application request: that move-only request can be created only when
+/// the production Native adapter also supplies its exact seed.
+pub(crate) struct RestartableReadExecution {
+    description: Arc<FrozenExecutionDescription>,
+    attempt_template: PreparedDistributedAttemptTemplate,
+    options: Arc<ResolvedQueryOptions>,
+    intent: DistributedQueryIntent,
+}
+
+impl RestartableReadExecution {
+    pub(crate) fn instantiate_attempt(
+        self: &Arc<Self>,
+        execution: &QueryExecutionContext,
+    ) -> DistributedQueryRequest {
+        DistributedQueryRequest {
+            payload: DistributedQueryPayload::RestartableRead(Arc::clone(self)),
+            topology: execution.topology().clone(),
+            deadline: execution.deadline(),
+            cancellation: execution.cancellation().clone(),
+            completion: QueryOutcomeFactory::new(self.intent),
+            write_stack_session: None,
+            write_root_decode_contract: None,
+            statistics_program: None,
+        }
+    }
+
+    pub(crate) fn shared_plan(&self) -> Arc<novarocks_sql::plan_read::DistributedPlan> {
+        self.description.shared_plan()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instantiate_artifacts_for_test(&self) -> PreparedDistributedQuery {
+        self.attempt_template.instantiate()
+    }
+}
+
 impl DistributedQueryRequest {
+    pub fn frozen_description(&self) -> &FrozenExecutionDescription {
+        match &self.payload {
+            DistributedQueryPayload::RestartableRead(read) => read.description.as_ref(),
+            DistributedQueryPayload::SingleUse { description, .. } => description.as_ref(),
+        }
+    }
+
     pub fn intent(&self) -> DistributedQueryIntent {
         self.completion.intent()
     }
 
-    pub fn artifacts(&self) -> &PreparedDistributedQuery {
-        &self.artifacts
-    }
-
     pub fn options(&self) -> &ResolvedQueryOptions {
-        &self.options
+        match &self.payload {
+            DistributedQueryPayload::RestartableRead(read) => read.options.as_ref(),
+            DistributedQueryPayload::SingleUse { options, .. } => options.as_ref(),
+        }
     }
 
     pub fn cancellation(&self) -> &QueryCancellationView {
@@ -270,10 +329,41 @@ impl DistributedQueryRequest {
         self.statistics_program.as_ref()
     }
 
+    fn write_root_targets(
+        &self,
+    ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
+        match &self.payload {
+            DistributedQueryPayload::RestartableRead(_) => None,
+            DistributedQueryPayload::SingleUse { artifacts, .. } => artifacts.write_root_targets(),
+        }
+    }
+
+    /// Return the closed capability for replacement attempts when this logical
+    /// execution's frozen recovery policy permits them.
+    pub(crate) fn restartable_read(&self) -> Option<Arc<RestartableReadExecution>> {
+        match &self.payload {
+            DistributedQueryPayload::RestartableRead(read) => Some(Arc::clone(read)),
+            DistributedQueryPayload::SingleUse { .. } => None,
+        }
+    }
+
     pub fn into_parts(self) -> DistributedQueryRequestParts {
+        let (description, artifacts, options) = match self.payload {
+            DistributedQueryPayload::RestartableRead(read) => (
+                Arc::clone(&read.description),
+                read.attempt_template.instantiate(),
+                Arc::clone(&read.options),
+            ),
+            DistributedQueryPayload::SingleUse {
+                description,
+                artifacts,
+                options,
+            } => (description, artifacts, options),
+        };
         DistributedQueryRequestParts {
-            artifacts: self.artifacts,
-            options: self.options,
+            description,
+            artifacts,
+            options,
             topology: self.topology,
             deadline: self.deadline,
             cancellation: self.cancellation,
@@ -288,8 +378,9 @@ impl DistributedQueryRequest {
 /// Consuming frontend handoff. There is deliberately no constructor,
 /// `Clone`, or inverse recombination API.
 pub struct DistributedQueryRequestParts {
+    pub description: Arc<FrozenExecutionDescription>,
     pub artifacts: PreparedDistributedQuery,
-    pub options: ResolvedQueryOptions,
+    pub options: Arc<ResolvedQueryOptions>,
     pub topology: crate::common::backend_topology::BackendTopologySnapshot,
     pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
@@ -301,32 +392,74 @@ pub struct DistributedQueryRequestParts {
     pub statistics_program: Option<StatisticsCollectionProgram>,
 }
 
-/// Request construction accepts only the execution projection captured at
-/// admission; callers cannot synthesize an empty topology or cancellation
-/// fallback at the coordinator boundary.
-pub(crate) fn build_distributed_query_request_with_execution(
-    prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentAttachment,
+pub(crate) fn build_request_from_finalized_execution(
+    finalized: crate::query_execution::post_compile::FinalizedDistributedExecution,
     options: Option<QueryOptions>,
     intent: DistributedQueryIntent,
     execution: &QueryExecutionContext,
+    statistics_program: Option<StatisticsCollectionProgram>,
 ) -> Result<DistributedQueryRequest, DistributedQueryError> {
-    if intent == DistributedQueryIntent::Statistics {
+    if (intent == DistributedQueryIntent::Statistics) != statistics_program.is_some() {
         return Err(DistributedQueryError::new(
             DistributedQueryErrorKind::ContractViolation,
-            "statistics execution requires a typed StatisticsCollectionProgram",
+            "statistics intent and typed StatisticsCollectionProgram must be present together",
         ));
     }
+    let (description, attempt_template) = finalized.into_parts();
+    let description = Arc::new(description);
+    let options = Arc::new(ResolvedQueryOptions::from_upstream(options));
+    let restartable_read = matches!(
+        intent,
+        DistributedQueryIntent::Result | DistributedQueryIntent::Profile
+    ) && description.kind()
+        == novarocks_query_application::api::QueryExecutionKind::Read
+        && description.recovery()
+            == novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility;
+    let payload = if restartable_read {
+        DistributedQueryPayload::RestartableRead(Arc::new(RestartableReadExecution {
+            description,
+            attempt_template,
+            options,
+            intent,
+        }))
+    } else {
+        DistributedQueryPayload::SingleUse {
+            description,
+            artifacts: attempt_template.instantiate(),
+            options,
+        }
+    };
     Ok(DistributedQueryRequest {
-        artifacts: PreparedDistributedQuery::new(prepared, native_bundle),
-        options: ResolvedQueryOptions::from_upstream(options),
+        payload,
         topology: execution.topology().clone(),
         deadline: execution.deadline(),
         cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(intent),
         write_stack_session: None,
         write_root_decode_contract: None,
-        statistics_program: None,
+        statistics_program,
+    })
+}
+
+/// Request construction accepts only the execution projection captured at
+/// admission; callers cannot synthesize an empty topology or cancellation
+/// fallback at the coordinator boundary.
+pub(crate) fn build_distributed_query_request_with_execution(
+    encoding: NativeFragmentEncodingInput,
+    native_bundle: NativeFragmentAttachment,
+    options: Option<QueryOptions>,
+    intent: DistributedQueryIntent,
+    execution: &QueryExecutionContext,
+) -> Result<DistributedQueryRequest, DistributedQueryError> {
+    crate::query_execution::post_compile::PreparedDistributedQueryAssembly::new(
+        encoding,
+        options,
+        intent,
+        execution.clone(),
+    )
+    .finish(native_bundle)
+    .map_err(|error| {
+        DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
     })
 }
 
@@ -335,23 +468,22 @@ pub(crate) fn build_distributed_query_request_with_execution(
 /// query options, preventing a client-result request from acquiring a
 /// statistics completion capability.
 pub(crate) fn build_statistics_query_request_with_execution(
-    prepared: PreparedFragmentSet,
+    encoding: NativeFragmentEncodingInput,
     native_bundle: NativeFragmentAttachment,
     options: Option<QueryOptions>,
     program: StatisticsCollectionProgram,
     execution: &QueryExecutionContext,
-) -> DistributedQueryRequest {
-    DistributedQueryRequest {
-        artifacts: PreparedDistributedQuery::new(prepared, native_bundle),
-        options: ResolvedQueryOptions::from_upstream(options),
-        topology: execution.topology().clone(),
-        deadline: execution.deadline(),
-        cancellation: execution.cancellation().clone(),
-        completion: QueryOutcomeFactory::new(DistributedQueryIntent::Statistics),
-        write_stack_session: None,
-        write_root_decode_contract: None,
-        statistics_program: Some(program),
-    }
+) -> Result<DistributedQueryRequest, DistributedQueryError> {
+    crate::query_execution::post_compile::PreparedDistributedQueryAssembly::new(
+        encoding,
+        options,
+        DistributedQueryIntent::Statistics,
+        execution.clone(),
+    )
+    .finish_statistics(native_bundle, program)
+    .map_err(|error| {
+        DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+    })
 }
 
 /// Attach the NCP-6 write session to a sealed distributed write request.
@@ -375,7 +507,7 @@ pub(crate) fn with_connector_write_session(
             "distributed query already has a connector write session",
         ));
     }
-    let query_targets = request.artifacts.write_root_targets().ok_or_else(|| {
+    let query_targets = request.write_root_targets().ok_or_else(|| {
         DistributedQueryError::new(
             DistributedQueryErrorKind::ContractViolation,
             "distributed write plan has no query-local TableFinish target contract",
@@ -522,6 +654,20 @@ impl std::error::Error for DistributedQueryError {}
 
 /// Frontend-owned distributed query execution port.
 pub trait DistributedQueryCoordinator: Send + Sync + 'static {
+    /// Reserve the identity of one logical query without creating an
+    /// execution attempt. SELECT preparation uses it only for diagnostics;
+    /// the coordinator mints attempt identity after the frozen operation is
+    /// submitted.
+    fn reserve_logical_query(
+        &self,
+    ) -> Result<crate::query_execution::completion::LogicalQueryReservation, DistributedQueryError>
+    {
+        Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::Rejected,
+            "distributed query coordinator does not reserve logical query identities",
+        ))
+    }
+
     /// Reserve the first attempt identity before connector metadata
     /// materialization. Production owns the query-id source; injected test
     /// coordinators fail closed unless they explicitly implement this port.
@@ -529,10 +675,8 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         &self,
     ) -> Result<crate::query_execution::completion::QueryAttemptReservation, DistributedQueryError>
     {
-        Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::Rejected,
-            "distributed query coordinator does not reserve attempt identities",
-        ))
+        let logical = self.reserve_logical_query()?;
+        crate::query_execution::completion::QueryAttemptReservation::first(logical.into_query_id())
     }
 
     fn execute(
@@ -563,17 +707,11 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
     ) -> Result<crate::runtime::statement_result::StatementResult, DistributedQueryError> {
-        let (request, completion, round_factory, reservation) = operation.into_parts();
-        if round_factory.is_some() {
+        let (request, completion, attempt_factory, _logical_reservation) = operation.into_parts();
+        if attempt_factory.is_some() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "injected coordinator does not implement statement-level pre-ready replan",
-            ));
-        }
-        if reservation.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "injected coordinator does not implement reserved distributed attempts",
             ));
         }
         let outcome = self.execute(request)?;

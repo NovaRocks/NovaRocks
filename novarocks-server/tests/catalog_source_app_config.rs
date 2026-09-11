@@ -48,12 +48,12 @@ fn frontend_static_file_preflight_resolves_relative_path_and_retains_snapshot() 
     fs::write(
         &catalogs,
         r#"
-format_version = 2
+format_version = 3
 [[catalogs]]
 instance_id = "catalog.analytics"
 provider_id = "iceberg"
 display_name = "Analytics"
-config_format_version = 2
+config_format_version = 3
 credential_bindings = []
 [catalogs.properties]
 type = "iceberg"
