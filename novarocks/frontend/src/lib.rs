@@ -56,7 +56,7 @@ pub mod workload_lifecycle;
 
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig, FrontendQueryControlTimeouts,
+    FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
 };
 pub use client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,

@@ -4061,6 +4061,7 @@ dependencies = [
  "novarocks-types",
  "novarocks-version",
  "novarocks-worker",
+ "novarocks-workload-control",
  "serde",
  "tempfile",
  "tokio",

@@ -22,10 +22,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use bytes::Bytes;
 use novarocks_spi::connector::ConnectorTableObjectId;
-use tokio::runtime::{Builder, Handle};
+use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -107,25 +108,29 @@ impl OptimizeWorker {
         self.wakeup.notify_one();
     }
 
-    pub fn shutdown(&mut self) -> Result<(), String> {
+    pub fn request_stop(&self) {
         self.runtime.stop_admission();
         self.stop.store(true, Ordering::Release);
         self.wakeup();
-        let Some(join) = self.join.take() else {
+    }
+
+    pub async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.request_stop();
+        let Some(join) = self.join.as_mut() else {
             return Ok(());
         };
-        let joined = if let Ok(runtime) = Handle::try_current() {
-            tokio::task::block_in_place(|| runtime.block_on(join))
-        } else {
-            Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| {
-                    format!("build table maintenance worker join runtime failed: {error}")
-                })?
-                .block_on(join)
-        };
+        let joined = tokio::time::timeout_at(deadline.into(), join)
+            .await
+            .map_err(|_| {
+                "table maintenance worker did not stop before the shared shutdown deadline"
+                    .to_string()
+            })?;
+        self.join.take();
         joined.map_err(|error| format!("table maintenance worker join failed: {error}"))?
+    }
+
+    pub(crate) fn has_join_owner(&self) -> bool {
+        self.join.is_some()
     }
 }
 
@@ -414,11 +419,11 @@ pub(crate) fn optimize_outcome(
 mod lifecycle_tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::ConnectorTableObjectId;
 
-    use super::{OptimizeJobExecutor, run_worker};
+    use super::{OptimizeJobExecutor, OptimizeWorker, run_worker};
     use crate::maintenance::MaintenanceTarget;
     use crate::query_execution::maintenance::{
         MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
@@ -512,6 +517,36 @@ mod lifecycle_tests {
             .expect("worker observes the terminal serving state")
             .expect("worker task joins")
             .expect("worker exits without claiming a job");
+    }
+
+    #[tokio::test]
+    async fn shared_deadline_retains_the_same_optimize_join_for_retry() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let wait = Arc::clone(&release);
+        let join = tokio::spawn(async move {
+            wait.notified().await;
+            Ok(())
+        });
+        let mut worker = OptimizeWorker {
+            runtime: Arc::new(OptimizeProcessRuntime::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            wakeup: Arc::new(tokio::sync::Notify::new()),
+            join: Some(join),
+        };
+
+        let error = worker
+            .shutdown_until(Instant::now() + Duration::from_millis(10))
+            .await
+            .expect_err("blocked optimize worker must respect the shared deadline");
+        assert!(error.contains("shared shutdown deadline"));
+        assert!(worker.has_join_owner());
+
+        release.notify_one();
+        worker
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("the retained optimize join remains retryable");
+        assert!(!worker.has_join_owner());
     }
 }
 

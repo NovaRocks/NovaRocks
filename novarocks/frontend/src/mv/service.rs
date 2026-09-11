@@ -57,7 +57,6 @@ use super::{
 };
 
 const MV_WORKER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const MV_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Frontend-owned application service for materialized-view statements.
 ///
@@ -168,18 +167,42 @@ impl FrontendMvService {
         Arc::clone(&self.readiness)
     }
 
-    pub(crate) fn shutdown_background_workers(&self) -> Result<(), String> {
+    pub(crate) async fn shutdown_background_workers_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), String> {
         self.activity_gate.begin_stopping();
-        let mut guard = self
+        let runtime = self
             .background
             .lock()
-            .map_err(|error| format!("lock frontend MV worker lifecycle: {error}"))?;
-        let Some(runtime) = guard.as_mut() else {
+            .map_err(|error| format!("lock frontend MV worker lifecycle: {error}"))?
+            .take();
+        let Some(mut runtime) = runtime else {
             return Ok(());
         };
-        runtime.stop_and_join(Instant::now() + MV_WORKER_SHUTDOWN_TIMEOUT)?;
-        guard.take();
-        Ok(())
+        let result = runtime.stop_and_join_until(deadline).await;
+        if result.is_err() {
+            let mut guard = self
+                .background
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if guard.replace(runtime).is_some() {
+                return Err("frontend MV worker owner changed during shutdown".to_string());
+            }
+        }
+        result
+    }
+
+    pub(crate) fn request_background_stop_for_process_exit(&self) {
+        self.activity_gate.begin_stopping();
+        if let Some(runtime) = self
+            .background
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            runtime.request_stop();
+        }
     }
 
     fn bind_background_engine(
@@ -429,6 +452,11 @@ struct FrontendMvBackgroundRuntime {
 }
 
 impl FrontendMvBackgroundRuntime {
+    fn request_stop(&self) {
+        let _ = self.stop_tx.send(());
+        let _ = self.maintenance_stop_tx.send(());
+    }
+
     fn start(dependencies: RefreshWorkerDependencies) -> Result<Self, MvBackgroundEngineError> {
         let (stop_tx, stop_rx) = mpsc::channel();
         let (maintenance_stop_tx, maintenance_stop_rx) = mpsc::channel();
@@ -488,39 +516,51 @@ impl FrontendMvBackgroundRuntime {
         })
     }
 
-    fn stop_and_join(&mut self, deadline: Instant) -> Result<(), String> {
-        let _ = self.stop_tx.send(());
-        let _ = self.maintenance_stop_tx.send(());
-        let Some(worker) = self.refresh_worker.as_ref() else {
-            return Ok(());
-        };
-        while !worker.is_finished() {
-            if Instant::now() >= deadline {
-                return Err("frontend MV refresh worker did not stop within 5 seconds".to_string());
+    async fn stop_and_join_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.request_stop();
+        if let Some(worker) = self.refresh_worker.as_ref() {
+            while !worker.is_finished() {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "frontend MV refresh worker did not stop before the shared shutdown deadline"
+                            .to_string(),
+                    );
+                }
+                tokio::time::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
             }
-            thread::sleep(Duration::from_millis(10));
+            self.refresh_worker
+                .take()
+                .expect("finished frontend MV refresh worker is retained")
+                .join()
+                .map_err(|_| "frontend MV refresh worker panicked during shutdown".to_string())?;
         }
-        self.refresh_worker
-            .take()
-            .expect("finished frontend MV refresh worker is retained")
-            .join()
-            .map_err(|_| "frontend MV refresh worker panicked during shutdown".to_string())?;
-        let Some(worker) = self.maintenance_worker.as_ref() else {
-            return Ok(());
-        };
-        while !worker.is_finished() {
-            if Instant::now() >= deadline {
-                return Err(
-                    "frontend MV maintenance worker did not stop within 5 seconds".to_string(),
-                );
+        if let Some(worker) = self.maintenance_worker.as_ref() {
+            while !worker.is_finished() {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "frontend MV maintenance worker did not stop before the shared shutdown deadline"
+                            .to_string(),
+                    );
+                }
+                tokio::time::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
             }
-            thread::sleep(Duration::from_millis(10));
+            self.maintenance_worker
+                .take()
+                .expect("finished frontend MV maintenance worker is retained")
+                .join()
+                .map_err(|_| {
+                    "frontend MV maintenance worker panicked during shutdown".to_string()
+                })?;
         }
-        self.maintenance_worker
-            .take()
-            .expect("finished frontend MV maintenance worker is retained")
-            .join()
-            .map_err(|_| "frontend MV maintenance worker panicked during shutdown".to_string())
+        Ok(())
     }
 }
 
@@ -839,4 +879,81 @@ fn now_unix_millis() -> i64 {
         .as_millis()
         .try_into()
         .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::FrontendMvBackgroundRuntime;
+
+    #[tokio::test]
+    async fn shared_deadline_retains_the_same_mv_worker_join_for_retry() {
+        let (stop_tx, _stop_rx) = mpsc::channel();
+        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
+        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let refresh_worker = thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let maintenance_worker = thread::spawn(|| {});
+        let mut runtime = FrontendMvBackgroundRuntime {
+            stop_tx,
+            refresh_worker: Some(refresh_worker),
+            maintenance_stop_tx,
+            maintenance_wakeup_tx,
+            maintenance_worker: Some(maintenance_worker),
+        };
+
+        let error = runtime
+            .stop_and_join_until(Instant::now() + Duration::from_millis(10))
+            .await
+            .expect_err("blocked MV worker must respect the shared deadline");
+        assert!(error.contains("shared shutdown deadline"));
+        assert!(runtime.refresh_worker.is_some());
+
+        release_tx.send(()).unwrap();
+        runtime
+            .stop_and_join_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("the retained MV worker join remains retryable");
+        assert!(runtime.refresh_worker.is_none());
+        assert!(runtime.maintenance_worker.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_still_joins_mv_maintenance_after_refresh_already_stopped() {
+        let (stop_tx, _stop_rx) = mpsc::channel();
+        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
+        let (maintenance_wakeup_tx, _maintenance_wakeup_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let refresh_worker = thread::spawn(|| {});
+        let maintenance_worker = thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let mut runtime = FrontendMvBackgroundRuntime {
+            stop_tx,
+            refresh_worker: Some(refresh_worker),
+            maintenance_stop_tx,
+            maintenance_wakeup_tx,
+            maintenance_worker: Some(maintenance_worker),
+        };
+
+        let error = runtime
+            .stop_and_join_until(Instant::now() + Duration::from_millis(10))
+            .await
+            .expect_err("blocked MV maintenance must respect the shared deadline");
+        assert!(error.contains("shared shutdown deadline"));
+        assert!(runtime.refresh_worker.is_none());
+        assert!(runtime.maintenance_worker.is_some());
+
+        release_tx.send(()).unwrap();
+        runtime
+            .stop_and_join_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("retry must join the retained MV maintenance worker");
+        assert!(runtime.maintenance_worker.is_none());
+    }
 }

@@ -116,41 +116,32 @@ impl StatisticsAnalyzeWorker {
         self.repository.notify_worker();
     }
 
-    pub fn shutdown(&mut self) -> Result<(), String> {
+    pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
+        self.wakeup();
+    }
+
+    pub async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.request_stop();
         let now = now_ms();
         let repository = self.repository.clone();
-        let cancel = async move { repository.cancel_active_for_shutdown(now).await };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                return Err("statistics worker cannot synchronously join from a current-thread Tokio runtime".into());
-            }
-            tokio::task::block_in_place(|| runtime.block_on(cancel))
-                .map_err(|error| error.to_string())?;
-        } else {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("build statistics worker join runtime failed: {error}"))?
-                .block_on(cancel)
-                .map_err(|error| error.to_string())?;
-        }
-        self.wakeup();
-        let Some(join) = self.join.take() else {
+        tokio::time::timeout_at(deadline.into(), async move {
+            repository.cancel_active_for_shutdown(now).await
+        })
+        .await
+        .map_err(|_| {
+            "statistics worker cancellation exceeded the shared shutdown deadline".to_string()
+        })?
+        .map_err(|error| error.to_string())?;
+        let Some(join) = self.join.as_mut() else {
             return Ok(());
         };
-        let joined = if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                return Err("statistics worker cannot synchronously join from a current-thread Tokio runtime".into());
-            }
-            tokio::task::block_in_place(|| runtime.block_on(join))
-        } else {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("build statistics worker join runtime failed: {error}"))?
-                .block_on(join)
-        };
+        let joined = tokio::time::timeout_at(deadline.into(), join)
+            .await
+            .map_err(|_| {
+                "statistics worker did not stop before the shared shutdown deadline".to_string()
+            })?;
+        self.join.take();
         joined.map_err(|error| format!("statistics worker join failed: {error}"))?
     }
 }
@@ -402,9 +393,11 @@ async fn finish_error(
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::{StatisticsAttemptError, StatisticsAttemptExecutor, run_worker};
+    use super::{
+        StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor, run_worker,
+    };
     use crate::statistics_jobs::model::StatisticsJob;
     use crate::statistics_jobs::repository::StatisticsJobRepository;
     use crate::workload_lifecycle::FrontendServingLifecycle;
@@ -465,6 +458,35 @@ mod tests {
             .expect("worker observes the terminal serving state")
             .expect("worker task joins")
             .expect("worker exits without claiming a job");
+    }
+
+    #[tokio::test]
+    async fn shared_deadline_retains_the_same_statistics_join_for_retry() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let wait = Arc::clone(&release);
+        let join = tokio::spawn(async move {
+            wait.notified().await;
+            Ok(())
+        });
+        let mut worker = StatisticsAnalyzeWorker {
+            repository: StatisticsJobRepository::new(),
+            stop: Arc::new(AtomicBool::new(false)),
+            join: Some(join),
+        };
+
+        let error = worker
+            .shutdown_until(Instant::now() + Duration::from_millis(10))
+            .await
+            .expect_err("blocked statistics worker must respect the shared deadline");
+        assert!(error.contains("shared shutdown deadline"));
+        assert!(worker.join.is_some());
+
+        release.notify_one();
+        worker
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("the retained statistics join remains retryable");
+        assert!(worker.join.is_none());
     }
 }
 

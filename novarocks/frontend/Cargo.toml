@@ -46,6 +46,7 @@ novarocks-task-codec.workspace = true
 novarocks-types.workspace = true
 novarocks-user-error.workspace = true
 novarocks-version.workspace = true
+novarocks-workload-control.workspace = true
 mysql_common = "0.32"
 opensrv-mysql = { version = "0.7", default-features = false }
 prost.workspace = true
@@ -66,7 +67,6 @@ novarocks-query-application = { workspace = true, features = ["test-support"] }
 novarocks-secret.workspace = true
 novarocks-state-store-testkit.workspace = true
 novarocks-sql = { workspace = true, features = ["test-support"] }
-novarocks-workload-control.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }

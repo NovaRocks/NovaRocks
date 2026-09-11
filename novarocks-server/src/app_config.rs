@@ -1052,6 +1052,74 @@ impl Default for StandaloneServerConfig {
     }
 }
 
+/// Explicit FE-local governance bounds. These are Server configuration facts,
+/// not defaults manufactured by the Frontend application host.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FrontendWorkloadRuntimeConfig {
+    pub root_limit: usize,
+    pub business_limit: usize,
+    pub preparation_limit: usize,
+    pub execution_limit: usize,
+    pub executions_per_root: usize,
+    pub waiting_limit: usize,
+    pub waiting_bytes: u64,
+    pub capacity_wait_timeout_ms: u64,
+    pub restarts_per_work: usize,
+    pub old_attempts_per_work: usize,
+    pub old_attempts_limit: usize,
+    pub unknown_creates_limit: usize,
+    pub scope_records_limit: usize,
+    pub obligation_records_limit: usize,
+    pub control_inflight_limit: usize,
+    pub control_ready_limit: usize,
+    pub control_bytes: u64,
+    pub per_scope_bytes: u64,
+    pub logical_start_capacity: usize,
+    pub logical_actor_mailbox_capacity: usize,
+    pub logical_context_admission_issue_capacity: usize,
+    pub logical_context_establish_capacity: usize,
+    pub result_decode_worker_count: usize,
+    pub result_decode_queue_capacity: usize,
+    pub logical_rows_delivery_capacity: usize,
+    pub logical_replacement_reservation_ms: u64,
+    pub logical_result_fetch_wait_ms: u64,
+}
+
+impl Default for FrontendWorkloadRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            root_limit: 256,
+            business_limit: 256,
+            preparation_limit: 16,
+            execution_limit: 64,
+            executions_per_root: 4,
+            waiting_limit: 1024,
+            waiting_bytes: 64 * 1024 * 1024,
+            capacity_wait_timeout_ms: 30_000,
+            restarts_per_work: 2,
+            old_attempts_per_work: 2,
+            old_attempts_limit: 128,
+            unknown_creates_limit: 4096,
+            scope_records_limit: 8192,
+            obligation_records_limit: 8192,
+            control_inflight_limit: 16,
+            control_ready_limit: 256,
+            control_bytes: 64 * 1024 * 1024,
+            per_scope_bytes: 2 * 1024 * 1024 * 1024,
+            logical_start_capacity: 256,
+            logical_actor_mailbox_capacity: 64,
+            logical_context_admission_issue_capacity: 16,
+            logical_context_establish_capacity: 16,
+            result_decode_worker_count: 2,
+            result_decode_queue_capacity: 32,
+            logical_rows_delivery_capacity: 32,
+            logical_replacement_reservation_ms: 30_000,
+            logical_result_fetch_wait_ms: 200,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct RuntimeConfig {
     #[serde(default = "default_exchange_wait_ms")]
@@ -1160,6 +1228,8 @@ pub struct RuntimeConfig {
     pub be_mem_limit_bytes: u64,
     #[serde(default = "default_optimizer_query_mem_limit_bytes")]
     pub optimizer_query_mem_limit_bytes: u64,
+    #[serde(default)]
+    pub frontend_workload: FrontendWorkloadRuntimeConfig,
     /// Maximum time a connector split source may wait for its first usable
     /// runtime-filter feedback domain. Zero disables this optimization wait.
     #[serde(default = "default_connector_split_initial_dynamic_filter_wait_cap_ms")]
@@ -2013,6 +2083,7 @@ impl Default for RuntimeConfig {
             mem_limit: default_mem_limit(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
+            frontend_workload: FrontendWorkloadRuntimeConfig::default(),
             connector_split_initial_dynamic_filter_wait_cap_ms:
                 default_connector_split_initial_dynamic_filter_wait_cap_ms(),
             optimizer_effective_backend_count: default_optimizer_effective_backend_count(),
@@ -2133,13 +2204,16 @@ impl ExecutionServicesConfig {
 }
 
 impl RuntimeConfig {
+    pub fn effective_process_mem_limit_bytes(&self) -> Result<u64> {
+        crate::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
+            .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
+    }
+
     pub fn effective_be_mem_limit_bytes(&self) -> Result<u64> {
         if self.be_mem_limit_bytes > 0 {
             return Ok(self.be_mem_limit_bytes);
         }
-
-        crate::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
-            .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
+        self.effective_process_mem_limit_bytes()
     }
 
     pub fn effective_be_mem_limit_bytes_for_visible_memory(

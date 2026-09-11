@@ -479,20 +479,40 @@ impl FrontendStatisticsApplicationPort {
         Ok(())
     }
 
-    pub fn shutdown_worker(&self) -> Result<(), String> {
-        if let Some(mut worker) = self
+    pub async fn shutdown_worker_until(&self, deadline: Instant) -> Result<(), String> {
+        let worker = self
             .worker
             .lock()
             .map_err(|_| "statistics worker lock poisoned".to_string())?
-            .take()
-        {
-            worker.shutdown()?;
+            .take();
+        if let Some(mut worker) = worker {
+            if let Err(error) = worker.shutdown_until(deadline).await {
+                let mut slot = self
+                    .worker
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if slot.replace(worker).is_some() {
+                    return Err("statistics worker owner changed during shutdown".to_string());
+                }
+                return Err(error);
+            }
         }
         self.attempt_executor
             .lock()
             .map_err(|_| "statistics attempt executor lock poisoned".to_string())?
             .take();
         Ok(())
+    }
+
+    pub fn request_worker_stop_for_process_exit(&self) {
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            worker.request_stop();
+        }
     }
 }
 

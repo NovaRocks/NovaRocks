@@ -43,7 +43,7 @@ fn state_store_input(temp: &TempDir) -> novarocks_frontend::StateStoreHostInput 
 }
 
 fn execution_config() -> FrontendExecutionConfig {
-    FrontendExecutionConfig::new(
+    FrontendExecutionConfig::new_for_test(
         "127.0.0.1",
         19090,
         std::num::NonZeroUsize::new(1).unwrap(),
@@ -88,7 +88,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = state_store_input(&temp);
 
-    let host = open_host(Some(config.clone()))
+    let mut host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open its MV repository");
     assert!(host.mv_repository().list_projections().await.is_ok());
@@ -98,7 +98,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
         .await
         .expect("shutdown must release MV repository first");
 
-    let reopened = open_host(Some(config))
+    let mut reopened = open_host(Some(config))
         .await
         .expect("same SQLite store must reopen its MV repository");
     assert!(reopened.mv_repository().list_projections().await.is_ok());
@@ -108,7 +108,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_state_store_rejects_mv_services_open() {
     let error = match open_host(None).await {
-        Ok(host) => {
+        Ok(mut host) => {
             host.shutdown().await.expect("shutdown unexpected host");
             panic!("role=fe requires durable StateStore before MV services open");
         }

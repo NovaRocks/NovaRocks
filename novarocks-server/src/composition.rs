@@ -45,7 +45,10 @@ use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
     TokioFileIoRuntime, TokioFileTaskSpawner,
 };
-use novarocks_query_application::coordination::{CoordinationBudgets, DispatchBudget};
+use novarocks_query_application::coordination::{
+    CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
+    LogicalExecutionSupervisorConfig,
+};
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
@@ -62,6 +65,7 @@ use novarocks_state_store_sqlite::SqliteStateStoreContribution;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::{ClusterRole, NativeCompatibilityId};
 use novarocks_worker::{LeaseBounds, OperationWaitCaps};
+use novarocks_workload_control::{ResourceConfig, WorkloadConfig};
 
 use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
@@ -485,12 +489,22 @@ pub fn compose_frontend_server_config(
             novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
         );
     }
+    let (logical_supervisor, workload, workload_resources, decode_workers, decode_queue) =
+        compose_frontend_workload_runtime(runtime_config, result_fetch_byte_limit)?;
+    let logical_runtime = novarocks_frontend::FrontendLogicalExecutionRuntimeConfig::new(
+        logical_supervisor,
+        workload,
+        workload_resources,
+        decode_workers,
+        decode_queue,
+    );
     let mut execution = FrontendExecutionConfig::new(
         native_trust.advertised_endpoint().host().to_string(),
         native_trust.advertised_endpoint().port(),
         runtime_filter_worker_count,
         native_compatibility_id,
         function_catalog,
+        logical_runtime,
     )
     .with_catalog_desired_state_source(catalog_source)
     .with_catalog_prune_config(
@@ -638,6 +652,115 @@ struct ComposedTaskExecutionBudgets {
     wait_caps: OperationWaitCaps,
     lease_bounds: LeaseBounds,
     transport: TransportBudget,
+}
+
+fn compose_frontend_workload_runtime(
+    runtime: &crate::app_config::RuntimeConfig,
+    result_fetch_byte_limit: novarocks_execution_contract::ResultByteLimit,
+) -> anyhow::Result<(
+    LogicalExecutionSupervisorConfig,
+    WorkloadConfig,
+    ResourceConfig,
+    NonZeroUsize,
+    NonZeroUsize,
+)> {
+    let input = &runtime.frontend_workload;
+    let workload = WorkloadConfig {
+        root_limit: input.root_limit,
+        business_limit: input.business_limit,
+        preparation_limit: input.preparation_limit,
+        execution_limit: input.execution_limit,
+        executions_per_root: input.executions_per_root,
+        waiting_limit: input.waiting_limit,
+        waiting_bytes: input.waiting_bytes,
+        capacity_wait_timeout: Duration::from_millis(input.capacity_wait_timeout_ms),
+        restarts_per_work: input.restarts_per_work,
+        old_attempts_per_work: input.old_attempts_per_work,
+        old_attempts_limit: input.old_attempts_limit,
+        unknown_creates_limit: input.unknown_creates_limit,
+        scope_records_limit: input.scope_records_limit,
+        obligation_records_limit: input.obligation_records_limit,
+        control_inflight_limit: input.control_inflight_limit,
+        control_ready_limit: input.control_ready_limit,
+    };
+    workload
+        .validate()
+        .map_err(|error| anyhow::anyhow!("construct frontend workload policy: {error}"))?;
+    let resources = ResourceConfig {
+        total_bytes: runtime.effective_process_mem_limit_bytes()?,
+        control_bytes: input.control_bytes,
+        per_scope_bytes: input.per_scope_bytes,
+    };
+    resources
+        .validate()
+        .map_err(|error| anyhow::anyhow!("construct frontend workload resources: {error}"))?;
+    let nonzero = |field: &'static str, value: usize| {
+        NonZeroUsize::new(value)
+            .ok_or_else(|| anyhow::anyhow!("runtime.frontend_workload.{field} must be nonzero"))
+    };
+    let max_attempts = input
+        .restarts_per_work
+        .checked_add(1)
+        .and_then(|value| u32::try_from(value).ok())
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime.frontend_workload.restarts_per_work cannot form a nonzero u32 attempt bound"
+            )
+        })?;
+    let decode_workers = nonzero(
+        "result_decode_worker_count",
+        input.result_decode_worker_count,
+    )?;
+    let decode_queue = nonzero(
+        "result_decode_queue_capacity",
+        input.result_decode_queue_capacity,
+    )?;
+    if input.logical_replacement_reservation_ms == 0 {
+        anyhow::bail!(
+            "runtime.frontend_workload.logical_replacement_reservation_ms must be nonzero"
+        );
+    }
+    let rows = LogicalExecutionRowsConfig::new(
+        nonzero(
+            "logical_rows_delivery_capacity",
+            input.logical_rows_delivery_capacity,
+        )?,
+        max_attempts,
+        Duration::from_millis(input.logical_replacement_reservation_ms),
+        novarocks_execution_contract::MaxWait::new(Duration::from_millis(
+            input.logical_result_fetch_wait_ms,
+        ))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "runtime.frontend_workload.logical_result_fetch_wait_ms is invalid: {error}"
+            )
+        })?,
+        result_fetch_byte_limit,
+    );
+    let supervisor = LogicalExecutionSupervisorConfig::new(
+        nonzero("logical_start_capacity", input.logical_start_capacity)?,
+        nonzero(
+            "logical_actor_mailbox_capacity",
+            input.logical_actor_mailbox_capacity,
+        )?,
+        nonzero(
+            "logical_context_admission_issue_capacity",
+            input.logical_context_admission_issue_capacity,
+        )?,
+        nonzero(
+            "logical_context_establish_capacity",
+            input.logical_context_establish_capacity,
+        )?,
+        rows,
+    );
+    Ok((
+        supervisor,
+        workload,
+        resources,
+        decode_workers,
+        decode_queue,
+    ))
 }
 
 fn compose_task_execution_budgets(
@@ -890,8 +1013,8 @@ pub fn state_store_provider_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        IcebergStorageLakeTargetSnapshotObservation, compose_task_execution_budgets,
-        mv_lake_target_snapshot_observation,
+        IcebergStorageLakeTargetSnapshotObservation, compose_frontend_workload_runtime,
+        compose_task_execution_budgets, mv_lake_target_snapshot_observation,
     };
     use novarocks_execution_contract::{MaxWait, OperationKind};
     use novarocks_query_application::coordination::DispatchBudget;
@@ -1031,5 +1154,69 @@ mod tests {
             MaxWait::DEFAULT_UPDATE
         );
         assert!(budgets.coordination.status_subscription_error_budget > 0);
+    }
+
+    #[test]
+    fn frontend_workload_runtime_is_built_from_validated_server_fields() {
+        let mut config = crate::app_config::NovaRocksConfig::default();
+        config.runtime.mem_limit = "1G".to_string();
+        config.runtime.frontend_workload.control_bytes = 64 * 1024 * 1024;
+        config.runtime.frontend_workload.per_scope_bytes = 512 * 1024 * 1024;
+        let byte_limit = novarocks_execution_contract::ResultByteLimit::new(1024).unwrap();
+        let (_, workload, resources, decode_workers, decode_queue) =
+            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+                .expect("explicit frontend workload fields compose");
+        assert_eq!(workload.execution_limit, 64);
+        assert_eq!(resources.total_bytes, 966_367_641);
+        assert_eq!(resources.per_scope_bytes, 512 * 1024 * 1024);
+        assert_eq!(decode_workers.get(), 2);
+        assert_eq!(decode_queue.get(), 32);
+
+        config.runtime.frontend_workload.logical_start_capacity = 0;
+        assert!(
+            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+                .expect_err("zero logical start capacity must fail preflight")
+                .to_string()
+                .contains("logical_start_capacity")
+        );
+
+        config.runtime.frontend_workload.logical_start_capacity = 256;
+        config
+            .runtime
+            .frontend_workload
+            .logical_replacement_reservation_ms = 0;
+        assert!(
+            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+                .expect_err("zero replacement reservation must fail preflight")
+                .to_string()
+                .contains("logical_replacement_reservation_ms")
+        );
+
+        config
+            .runtime
+            .frontend_workload
+            .logical_replacement_reservation_ms = 30_000;
+        config
+            .runtime
+            .frontend_workload
+            .logical_result_fetch_wait_ms = 0;
+        assert!(
+            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+                .expect_err("zero Native result wait must fail preflight")
+                .to_string()
+                .contains("logical_result_fetch_wait_ms")
+        );
+
+        config
+            .runtime
+            .frontend_workload
+            .logical_result_fetch_wait_ms = 200;
+        config.runtime.frontend_workload.per_scope_bytes = 2 * 1024 * 1024 * 1024;
+        assert!(
+            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+                .expect_err("per-scope authority cannot exceed the process budget")
+                .to_string()
+                .contains("frontend workload resources")
+        );
     }
 }

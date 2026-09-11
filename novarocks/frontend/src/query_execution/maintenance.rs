@@ -653,7 +653,9 @@ pub trait TableMaintenanceService: Send + Sync {
         self.execute_automatic_optimize_durably(engine, target)
     }
 
-    fn shutdown(&self) -> Result<(), String>;
+    async fn shutdown_until(&self, deadline: Instant) -> Result<(), String>;
+
+    fn request_shutdown_for_process_exit(&self);
 }
 
 /// One foreground SQL maintenance command bound to the exact request admitted

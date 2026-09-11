@@ -33,6 +33,7 @@ novarocks-task-codec.workspace = true
 novarocks-types.workspace = true
 novarocks-version.workspace = true
 novarocks-worker.workspace = true
+novarocks-workload-control.workspace = true
 anyhow.workspace = true
 atty = "0.2"
 chrono.workspace = true
