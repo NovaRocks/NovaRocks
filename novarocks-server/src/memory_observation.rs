@@ -71,7 +71,7 @@ use novarocks_memory::observe::{AllocatorSnapshot, CountingAllocator, CoverageDe
 /// only adds relaxed atomic arithmetic on a sharded counter array around each
 /// call, so installing it changes what the process can report about itself and
 /// not how it obtains memory.
-// Design: ADR-0143 (docs/adr/ADR-0143-process-memory-capacity-authority.md)
+// Design: ADR-0148 (docs/adr/ADR-0148-process-memory-capacity-authority.md)
 #[global_allocator]
 static GLOBAL: CountingAllocator<System> = CountingAllocator::new(System);
 

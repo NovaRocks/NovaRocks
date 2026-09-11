@@ -1,5 +1,5 @@
 ---
-id: ADR-0143
+id: ADR-0148
 title: "One non-waiting process capacity authority, with Arrow charges bound to real backings"
 domain: [memory-governance]
 status: active
@@ -27,6 +27,8 @@ code-anchors:
 **Rust 的分配失败不可恢复。** `std::alloc::alloc` 可以返回空指针，但普通不可失败分配路径与 Arrow `MutableBuffer` 的相关路径调用 `handle_alloc_error`，其默认行为终止进程。因此 ClickHouse 式「在分配点抛异常」的硬限在本生态不成立：可恢复的容量控制只能建立在比单次分配更粗的事前授权上。
 
 **Arrow 不提供分配钩子，但提供事后归属锚点。** `arrow-buffer` 的 `pool` feature 把一份 reservation 存在共享 `Bytes` 里，`Buffer::claim` 与 `ArrayData::claim` 可以为既存 backing 更换计费归属，slice、clone、导出数组共同看到同一份，`MutableBuffer` 的 freeze/into_mutable 双向携带它。同版本另有两处必须绕开的行为：`MemoryPool::reserve` 不可失败；`truncate`/`resize`/`clear` 按逻辑长度缩 reservation，而 allocation 保留完整 capacity。
+
+**UEA-1 已落地一个本机资源权威，但它自己声明不是内存治理。** `novarocks-workload-control` 的 `LocalResourceAuthority` 带 `Reservation` / `AllocationCharge` 与 move-only 单次结算，ADR-0147 裁决第 4 条把它的保证限定为「只保证它明确管理的本机 reservation/charge」，并在接受的妥协里写明「`used_bytes` 是受治理资源事实，不是操作系统总量。完整内存治理需要另行校准来源和强制接入」，其重评估条件 2 点名的正是这件事。所以本条不是反转它，而是替换它可授予余额那一半的机制、把覆盖扩到 Arrow backing 与进程观测；责任、scope、阶段准入与取消仍归 ADR-0147。
 
 **原有 `MemTracker` 是事后登记器。** 它在每层祖先增加计数后检查限额，失败时保留 charge；进程根限额恒为 -1；真正 check-then-commit 的入口只有三处。它能做局部归因，但无法表达授权、真实 owner 与共享持有，也不构成任何硬边界。
 
@@ -62,7 +64,7 @@ Arrow 适配建立在 `pool` 之上，且 feature 在 workspace 根启用——�
 
 **不完备覆盖，且这是选择而不是遗留。** 硬治理只覆盖声明的对象集合。第三方内部、原生库、allocator 保留页与碎片由观测级测量并如实报告盲区，不冒充按查询精确归属，也不承诺反应式治理可避免所有物理 OOM。
 
-**并行窗口内存在过渡态双权威。** 用户 2026-09-09 裁决 UEA-1 与 MEM-1 并行开发、之后 rebase、接受有限返工。因此生产中会短期同时存在 UEA-1 T02 的可授予余额与 MEM 账户。这是时间盒妥协，不是完成态；退出条件是 MEM-1 验收 A21：全仓不存在第二套可独立授予的 process/query 余额。
+**过渡态双权威在本条落地时真实存在，退出条件已具名。** 用户 2026-09-09 裁决 UEA-1 与 MEM-1 并行开发、MEM-1 之后 rebase，接受有限返工；UEA-1 T00–T08 已先合入。因此 `novarocks/workload-control/src/resource.rs` 的 `LocalResourceAuthority` 与本条的账户树在一段时间内同时存在可授予余额。这是时间盒妥协，不是完成态：退出条件是验收 A21，即全仓不存在第二套可独立授予的 process/query 余额，`LocalResourceAuthority` 的容量事实全部来自本条的核心。wave-2 的第一个任务就是这次替换。
 
 **`pool` 的固定成本超出了原定门限，而门限本身选错了工具。** 实测未争用 Mutex 加解锁约 3.5 ns/次：`MutableBuffer::resize` 从 0.51 升到 4.12 ns/次（+711%），`clear`+`resize` 从 1.06 升到 4.57 ns/op（+331%），二者远超原定「中位数增幅 ≤15%」。但这两个场景的基线是一次亚纳秒字段写，比值大恰恰是因为基线什么都没做。生产形态的路径全部在门内：`MutableBuffer::push`（Arrow `PrimitiveBuilder::append_value` 的实际内循环，走 `push` 而非 `resize`）无回归，`Buffer` 的 clone/slice/drop 为 +0.25 ns/次（+9%）。`resize`/`clear` 在引擎与 Arrow builder 的 append 路径上都不是逐行操作。据此保留 `pool`，并如实记下按原门限字面判定这两项未通过——门限的重新表述需要用户裁决，未获裁决前不得声称该项已过。
 
@@ -81,6 +83,6 @@ Arrow 适配建立在 `pool` 之上，且 feature 在 workspace 根启用——�
 - arrow-rs 修正 `truncate`/`resize`/`clear` 按 capacity 而非 len 缩 reservation：届时「只信交接点 claim」可以放宽，`MutableBuffer` 上的原地编辑不必回到交接点重领。
 - 引入 jemalloc 或 mimalloc：`CountingAllocator` 的分片策略、盲区列表与 `H` 的取值都需重新测量，allocator 内部统计也可以补充为独立列项。
 - aggregate/join spill 落地时在「page 化算子状态」与「算子自管 spill」之间做选择：pin、holder、额度与回收接口同时容纳两者，本 ADR 不预判该分叉。
-- UEA-1 合入并 rebase：A21 的过渡态退出条件届时成为可验证项。
+- UEA-1 已于 T00–T08 合入，本条已 rebase 其上：A21 的过渡态退出条件现在是可验证项，目标是 `novarocks/workload-control/src/resource.rs`。
 - 未争用 Mutex 的 3.5 ns 出现在某个已量化的热循环 profile 中：需要为 reservation 换一种更便宜的载体，或推动上游改用原子而非 Mutex。
 - 观测级差额在生产负载下长期偏离 `H`：说明 `B`/`H` 的划分或盲区清单需要修正，而不是把差额归罪于某个查询。

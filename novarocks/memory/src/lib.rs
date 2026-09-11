@@ -17,7 +17,7 @@
 
 //! The neutral memory core: one process-local capacity authority.
 //!
-//! Design: ADR-0143 (docs/adr/ADR-0143-process-memory-capacity-authority.md)
+//! Design: ADR-0148 (docs/adr/ADR-0148-process-memory-capacity-authority.md)
 //!
 //! # What this crate is
 //!

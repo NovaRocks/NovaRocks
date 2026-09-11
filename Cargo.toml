@@ -48,8 +48,8 @@ anyhow = "1"
 # build, so enabling it anywhere but here would leave a single-crate test or a
 # benchmark observing different buffer behaviour from the shipping binary. It
 # is what lets `novarocks-memory-arrow` bind a charge to a buffer's real
-# backing. Design: ADR-0143
-# (docs/adr/ADR-0143-process-memory-capacity-authority.md).
+# backing. Design: ADR-0148
+# (docs/adr/ADR-0148-process-memory-capacity-authority.md).
 arrow = { version = "58.2.0", features = ["pool"] }
 arrow-array = { version = "58.2.0", features = ["pool"] }
 arrow-buffer = { version = "58.2.0", features = ["pool"] }
