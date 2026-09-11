@@ -35,6 +35,7 @@
 // Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
 
 pub(crate) mod abort_effect;
+pub(crate) mod actor_gate;
 pub(crate) mod blocking_io;
 pub mod clock;
 pub mod completion;
@@ -48,6 +49,7 @@ pub mod execution;
 pub(crate) mod feedback_pump;
 pub mod graph;
 pub mod intent;
+pub(crate) mod manifest_round;
 pub mod remote_task;
 pub(crate) mod round;
 pub mod sources;

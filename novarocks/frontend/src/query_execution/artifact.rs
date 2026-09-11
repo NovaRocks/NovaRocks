@@ -30,8 +30,8 @@ mod task_manifest_binding;
 )]
 pub(crate) use task_manifest_binding::{
     BoundManifestBackend, BoundManifestContext, BoundManifestEdge, BoundManifestFrozenUnits,
-    BoundManifestProducer, BoundManifestScanAssignment, BoundManifestScanWork, BoundManifestTask,
-    FrozenAttemptTopology, TaskManifestBinding,
+    BoundManifestPartitionKind, BoundManifestProducer, BoundManifestScanAssignment,
+    BoundManifestScanWork, BoundManifestTask, FrozenAttemptTopology, TaskManifestBinding,
 };
 
 pub use native_submission::{
@@ -330,11 +330,62 @@ impl std::fmt::Debug for ManifestBoundNativeAttemptInputs {
 }
 
 impl ManifestBoundNativeAttemptInputs {
-    pub(crate) fn into_prepared_and_manifest(
-        self,
-    ) -> Result<(PreparedDistributedQuery, TaskManifestBinding), DistributedQueryError> {
+    /// Starts a borrowed activation transaction.
+    ///
+    /// The exact manifest and Connector access capability remain in this
+    /// dormant owner while fallible Task runtime assembly runs. Only the
+    /// derived prepared view can be committed into the active behavior, so an
+    /// error, cancellation, or unwind cannot strand the sole dormant inputs.
+    pub(crate) fn begin_activation(
+        &mut self,
+    ) -> Result<ManifestBoundNativeAttemptActivation<'_>, DistributedQueryError> {
         let prepared = self.access.instantiate(&self.manifest)?;
-        Ok((prepared, self.manifest))
+        Ok(ManifestBoundNativeAttemptActivation {
+            inputs: self,
+            prepared: Some(prepared),
+        })
+    }
+}
+
+/// Borrowed activation transaction over one exact manifest-bound owner.
+///
+/// Dropping this value simply drops the derived prepared view. The manifest
+/// and access owner were never moved, which is the rollback path for every
+/// early return and panic during activation.
+pub(crate) struct ManifestBoundNativeAttemptActivation<'a> {
+    inputs: &'a mut ManifestBoundNativeAttemptInputs,
+    prepared: Option<PreparedDistributedQuery>,
+}
+
+impl std::fmt::Debug for ManifestBoundNativeAttemptActivation<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManifestBoundNativeAttemptActivation")
+            .field("manifest", &self.inputs.manifest)
+            .field("prepared_available", &self.prepared.is_some())
+            .finish()
+    }
+}
+
+impl<'a> ManifestBoundNativeAttemptActivation<'a> {
+    /// The exact immutable inputs an assembler may project. No replacement
+    /// manifest or access owner can be supplied through this API.
+    pub(crate) fn parts(&mut self) -> (&mut PreparedDistributedQuery, &TaskManifestBinding) {
+        (
+            self.prepared
+                .as_mut()
+                .expect("an uncommitted activation retains its prepared view"),
+            &self.inputs.manifest,
+        )
+    }
+
+    /// Transfers only the derived prepared view after all fallible assembly
+    /// has succeeded. The outer active owner continues to retain the exact
+    /// manifest and access owner for the attempt lifetime.
+    pub(crate) fn commit(mut self) -> PreparedDistributedQuery {
+        self.prepared
+            .take()
+            .expect("one manifest activation can commit only once")
     }
 }
 

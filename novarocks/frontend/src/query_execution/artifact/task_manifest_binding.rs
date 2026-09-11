@@ -28,7 +28,7 @@ use novarocks_query_application::coordination::{
     AttemptSchedule, ScheduledFrozenUnits, ScheduledScanAssignment,
 };
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
-use novarocks_sql::plan_read::FragmentId;
+use novarocks_sql::plan_read::{FragmentId, PartitionKind};
 use novarocks_sql::planning::query_execution::{SealedPreparationPlanId, SealedScanIdentity};
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId, StageId};
 use novarocks_types::{NativeCompatibilityId, UniqueId};
@@ -181,6 +181,24 @@ pub(crate) struct BoundManifestProducer {
     sender_ordinal: u32,
 }
 
+/// Frozen transport-neutral exchange distribution carried by the manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BoundManifestPartitionKind {
+    Unpartitioned,
+    Random,
+    Hash,
+}
+
+impl BoundManifestPartitionKind {
+    const fn from_plan(kind: PartitionKind) -> Self {
+        match kind {
+            PartitionKind::Unpartitioned => Self::Unpartitioned,
+            PartitionKind::Random => Self::Random,
+            PartitionKind::Hash => Self::Hash,
+        }
+    }
+}
+
 impl BoundManifestProducer {
     pub(crate) const fn task(&self) -> TaskIdentity {
         self.task
@@ -197,6 +215,7 @@ pub(crate) struct BoundManifestEdge {
     source_fragment_id: FragmentId,
     target_fragment_id: FragmentId,
     target_exchange_node_id: i32,
+    partition_kind: BoundManifestPartitionKind,
     producers: Box<[BoundManifestProducer]>,
     destinations: Box<[TaskIdentity]>,
     sender_count: NonZeroU32,
@@ -217,6 +236,10 @@ impl BoundManifestEdge {
 
     pub(crate) const fn target_exchange_node_id(&self) -> i32 {
         self.target_exchange_node_id
+    }
+
+    pub(crate) const fn partition_kind(&self) -> BoundManifestPartitionKind {
+        self.partition_kind
     }
 
     pub(crate) fn producers(&self) -> &[BoundManifestProducer] {
@@ -671,7 +694,7 @@ struct PreparedManifestFacts {
     execution_anchor: FragmentId,
     scans: BTreeMap<(FragmentId, SealedScanIdentity), PreparedScanSource>,
     scans_by_node: BTreeMap<(FragmentId, i32), SealedScanIdentity>,
-    edges: BTreeSet<PreparedEdgeKey>,
+    edges: BTreeMap<PreparedEdgeKey, BoundManifestPartitionKind>,
 }
 
 impl PreparedManifestFacts {
@@ -725,21 +748,24 @@ impl PreparedManifestFacts {
             }
         }
 
-        let edges = view
-            .edges()
-            .iter()
-            .map(|edge| {
-                (
-                    edge.source_fragment_id,
-                    edge.target_fragment_id,
-                    edge.target_exchange_node_id,
+        let mut edges = BTreeMap::new();
+        for edge in view.edges() {
+            let key = (
+                edge.source_fragment_id,
+                edge.target_fragment_id,
+                edge.target_exchange_node_id,
+            );
+            if edges
+                .insert(
+                    key,
+                    BoundManifestPartitionKind::from_plan(edge.output_partition.kind),
                 )
-            })
-            .collect::<BTreeSet<_>>();
-        if edges.len() != view.edges().len() {
-            return Err(contract_error(
-                "prepared Native projection repeats an inter-fragment edge",
-            ));
+                .is_some()
+            {
+                return Err(contract_error(
+                    "prepared Native projection repeats an inter-fragment edge",
+                ));
+            }
         }
 
         Ok(Self {
@@ -1029,7 +1055,7 @@ fn validate_edges(
     tasks_by_fragment: &BTreeMap<FragmentId, Vec<TaskIdentity>>,
     task_identities: &BTreeSet<TaskIdentity>,
 ) -> Result<Vec<BoundManifestEdge>, DistributedQueryError> {
-    let expected = &prepared.edges;
+    let expected = prepared.edges.keys().copied().collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
     let mut edge_ids = BTreeSet::new();
     for edge in &edges {
@@ -1051,7 +1077,7 @@ fn validate_edges(
             )));
         }
     }
-    if &actual != expected {
+    if actual != expected {
         return Err(contract_error(format!(
             "attempt manifest edge set mismatch: expected={expected:?} actual={actual:?}"
         )));
@@ -1154,22 +1180,30 @@ fn validate_edges(
 
     Ok(edges
         .into_iter()
-        .map(|edge| BoundManifestEdge {
-            edge_id: edge.edge_id,
-            source_fragment_id: edge.source_fragment_id,
-            target_fragment_id: edge.target_fragment_id,
-            target_exchange_node_id: edge.target_exchange_node_id,
-            producers: edge
-                .producers
-                .into_iter()
-                .map(|(task, sender_ordinal)| BoundManifestProducer {
-                    task,
-                    sender_ordinal,
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            destinations: edge.destinations.into_boxed_slice(),
-            sender_count: edge.sender_count,
+        .map(|edge| {
+            let key = (
+                edge.source_fragment_id,
+                edge.target_fragment_id,
+                edge.target_exchange_node_id,
+            );
+            BoundManifestEdge {
+                edge_id: edge.edge_id,
+                source_fragment_id: edge.source_fragment_id,
+                target_fragment_id: edge.target_fragment_id,
+                target_exchange_node_id: edge.target_exchange_node_id,
+                partition_kind: prepared.edges[&key],
+                producers: edge
+                    .producers
+                    .into_iter()
+                    .map(|(task, sender_ordinal)| BoundManifestProducer {
+                        task,
+                        sender_ordinal,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                destinations: edge.destinations.into_boxed_slice(),
+                sender_count: edge.sender_count,
+            }
         })
         .collect())
 }
@@ -1217,11 +1251,11 @@ mod tests {
     use novarocks_types::{NativeCompatibilityId, UniqueId};
 
     use super::{
-        BoundManifestFrozenUnits, FrozenAttemptTopology, PreparedManifestFacts, PreparedScanSource,
-        ProjectedEdge, ProjectedScanAssignment, ProjectedTask,
-        derive_and_record_fragment_instance_id, validate_backend_snapshot, validate_edges,
-        validate_frozen_unit_cover, validate_native_template_plan_seal, validate_scan_assignments,
-        validate_schedule_execution, validate_task_identity,
+        BoundManifestFrozenUnits, BoundManifestPartitionKind, FrozenAttemptTopology,
+        PreparedManifestFacts, PreparedScanSource, ProjectedEdge, ProjectedScanAssignment,
+        ProjectedTask, derive_and_record_fragment_instance_id, validate_backend_snapshot,
+        validate_edges, validate_frozen_unit_cover, validate_native_template_plan_seal,
+        validate_scan_assignments, validate_schedule_execution, validate_task_identity,
     };
     use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
 
@@ -1546,7 +1580,9 @@ mod tests {
             execution_anchor: target,
             scans: Default::default(),
             scans_by_node: Default::default(),
-            edges: [(source, target, exchange)].into_iter().collect(),
+            edges: [((source, target, exchange), BoundManifestPartitionKind::Hash)]
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -1618,7 +1654,12 @@ mod tests {
             execution_anchor: 3,
             scans: Default::default(),
             scans_by_node: Default::default(),
-            edges: [(1, 3, 77), (2, 3, 77)].into_iter().collect(),
+            edges: [
+                ((1, 3, 77), BoundManifestPartitionKind::Hash),
+                ((2, 3, 77), BoundManifestPartitionKind::Hash),
+            ]
+            .into_iter()
+            .collect(),
         };
         let edge_id = ExchangeEdgeId::new(1).expect("edge id");
         let edges = vec![

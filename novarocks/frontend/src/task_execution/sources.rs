@@ -48,7 +48,7 @@ use novarocks_types::identity::BackendProcessId;
 
 use novarocks_sql::plan_read::FragmentId;
 
-use crate::query_execution::artifact::ValidatedNativeSubmission;
+use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmission};
 use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::task_execution::context_owner::{ContextEstablishFacts, ContextEstablishSource};
@@ -68,6 +68,81 @@ pub struct SubmissionFragmentPlans {
 }
 
 impl SubmissionFragmentPlans {
+    /// Indexes sealed plans against the exact Task manifest without consulting
+    /// the scheduling plan that preceded it.
+    pub(crate) fn index_manifest(
+        submissions: Vec<ValidatedNativeSubmission>,
+        manifest: &TaskManifestBinding,
+    ) -> Result<Self, TaskExecutionError> {
+        let expected = manifest
+            .tasks()
+            .iter()
+            .map(|task| {
+                (
+                    task.fragment_instance_id(),
+                    (task.fragment_id(), task.instance_index()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut plans = BTreeMap::new();
+        for submission in submissions {
+            let finst = submission.fragment_instance_id();
+            let fragment_id = submission.fragment_id();
+            let &(scheduled_fragment, instance_index) = expected.get(&finst).ok_or_else(|| {
+                TaskExecutionError::Schedule(format!(
+                    "fragment {fragment_id} submission names instance {finst} absent from the Task manifest"
+                ))
+            })?;
+            if scheduled_fragment != fragment_id {
+                return Err(TaskExecutionError::Schedule(format!(
+                    "manifest instance {finst} belongs to fragment {scheduled_fragment} but its submission names {fragment_id}"
+                )));
+            }
+            let wire = submission.into_task_fragment_plan();
+            let pipeline_dop = wire
+                .instance_params
+                .as_ref()
+                .and_then(|params| params.query_options.as_ref())
+                .map(|options| options.pipeline_dop)
+                .and_then(|dop| usize::try_from(dop).ok())
+                .and_then(NonZeroUsize::new)
+                .ok_or_else(|| {
+                    TaskExecutionError::Schedule(format!(
+                        "fragment {fragment_id} instance {finst} has no positive pipeline dop"
+                    ))
+                })?;
+            let plan = WireFragmentPlan::parse(wire, FieldPath::root("fragment_plan")).map_err(
+                |error| {
+                    TaskExecutionError::Schedule(format!(
+                        "fragment {fragment_id} instance {finst} plan is not encodable: {error}"
+                    ))
+                },
+            )?;
+            if plans
+                .insert(
+                    (fragment_id, instance_index),
+                    FragmentPlanFacts {
+                        plan: Arc::new(plan),
+                        pipeline_dop,
+                    },
+                )
+                .is_some()
+            {
+                return Err(TaskExecutionError::Schedule(format!(
+                    "manifest fragment {fragment_id} instance {instance_index} was submitted twice"
+                )));
+            }
+        }
+        if plans.len() != expected.len() {
+            return Err(TaskExecutionError::Schedule(format!(
+                "the Task manifest contains {} tasks but {} plans were submitted",
+                expected.len(),
+                plans.len()
+            )));
+        }
+        Ok(Self { plans })
+    }
+
     /// Indexes every submission against the schedule that placed it.
     ///
     /// A submission whose instance the schedule does not contain, or a

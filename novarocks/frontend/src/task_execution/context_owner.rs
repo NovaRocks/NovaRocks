@@ -91,7 +91,7 @@ impl std::fmt::Debug for ContextEstablishFacts {
 }
 
 /// Where the establish facts of one context come from.
-pub trait ContextEstablishSource {
+pub trait ContextEstablishSource: Send {
     fn facts_for(
         &self,
         context: QueryContextRef,
@@ -115,6 +115,15 @@ struct ReleasedLease {
     /// A retained request is handed out again only after a genuinely unknown
     /// outcome. While it is merely in flight it must not be queued a second
     /// time.
+    awaiting_outcome: bool,
+}
+
+/// One exact Establish allocation retained for actor authorization, Native
+/// transport, and replay after an unknown outcome.
+#[derive(Clone, Debug)]
+struct ReleasedEstablish {
+    request: Arc<EstablishQueryContext>,
+    first_sent_at: MonotonicInstant,
     awaiting_outcome: bool,
 }
 
@@ -159,7 +168,7 @@ pub struct QueryContextOwner {
     admission_qualified: bool,
     lease_sequence: LeaseSequence,
     renew_schedule: Option<RenewSchedule>,
-    establish: Option<ReleasedLease>,
+    establish: Option<ReleasedEstablish>,
     establish_acknowledged: bool,
     renewal: Option<ReleasedLease>,
     expected_creates: usize,
@@ -336,7 +345,7 @@ impl QueryContextOwner {
                 return Ok(None);
             }
             released.awaiting_outcome = true;
-            return Ok(Some(OperationIntent::UpdateQueryContext(Arc::clone(
+            return Ok(Some(OperationIntent::EstablishQueryContext(Arc::clone(
                 &released.request,
             ))));
         }
@@ -362,7 +371,7 @@ impl QueryContextOwner {
         }
         let valid_for = LeaseValidFor::new(RequestedLeaseDurations::DEFAULT.initial())
             .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
-        let request = Arc::new(UpdateQueryContext::Establish(EstablishQueryContext::new(
+        let request = Arc::new(EstablishQueryContext::new(
             TaskOperationId::new_v7(),
             self.context,
             granted.receipt.ticket_id(),
@@ -371,17 +380,16 @@ impl QueryContextOwner {
             facts.query_options,
             facts.initial_credential,
             valid_for,
-        )));
+        ));
         self.state = QueryContextState::Establishing;
         self.admission_ticket = None;
         self.admission_qualified = false;
-        self.establish = Some(ReleasedLease {
+        self.establish = Some(ReleasedEstablish {
             request: Arc::clone(&request),
-            sequence: LeaseSequence::INITIAL,
             first_sent_at: now,
             awaiting_outcome: true,
         });
-        Ok(Some(OperationIntent::UpdateQueryContext(request)))
+        Ok(Some(OperationIntent::EstablishQueryContext(request)))
     }
 
     /// The next renewal, if one is due.
@@ -490,7 +498,7 @@ impl QueryContextOwner {
             return;
         }
         if let Some(released) = &mut self.establish
-            && Self::request_id(&released.request) == operation_id
+            && released.request.envelope().operation_id() == operation_id
         {
             released.awaiting_outcome = false;
             return;
@@ -639,24 +647,24 @@ impl QueryContextOwner {
         &mut self,
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
-        let released = match (&mut self.establish, &mut self.renewal) {
-            (Some(establish), _)
-                if establish.awaiting_outcome
-                    && Self::request_id(&establish.request) == ack.operation_id() =>
-            {
-                establish.awaiting_outcome = false;
-                establish.clone()
-            }
-            (_, Some(renewal))
-                if renewal.awaiting_outcome
-                    && Self::request_id(&renewal.request) == ack.operation_id() =>
-            {
-                renewal.awaiting_outcome = false;
-                renewal.clone()
-            }
-            _ => return Err(TaskExecutionError::UnknownOperation),
-        };
-        let is_establish = matches!(released.request.as_ref(), UpdateQueryContext::Establish(_));
+        let (released_sequence, first_sent_at, is_establish) =
+            match (&mut self.establish, &mut self.renewal) {
+                (Some(establish), _)
+                    if establish.awaiting_outcome
+                        && establish.request.envelope().operation_id() == ack.operation_id() =>
+                {
+                    establish.awaiting_outcome = false;
+                    (LeaseSequence::INITIAL, establish.first_sent_at, true)
+                }
+                (_, Some(renewal))
+                    if renewal.awaiting_outcome
+                        && Self::request_id(&renewal.request) == ack.operation_id() =>
+                {
+                    renewal.awaiting_outcome = false;
+                    (renewal.sequence, renewal.first_sent_at, false)
+                }
+                _ => return Err(TaskExecutionError::UnknownOperation),
+            };
 
         if ack.is_applied() {
             let AckPayload::Context(receipt) = ack.payload() else {
@@ -668,7 +676,7 @@ impl QueryContextOwner {
             let lease = receipt.lease().ok_or(TaskExecutionError::MissingReceipt(
                 OperationKind::UpdateQueryContext,
             ))?;
-            if lease.sequence() != released.sequence {
+            if lease.sequence() != released_sequence {
                 return Err(TaskExecutionError::OperationFailed {
                     kind: OperationKind::UpdateQueryContext,
                     outcome: OperationOutcome::DomainConflict,
@@ -681,7 +689,7 @@ impl QueryContextOwner {
             // and scheduling from the request would renew too late.
             self.lease_sequence = lease.sequence();
             self.renew_schedule = Some(RenewSchedule::after(
-                released.first_sent_at,
+                first_sent_at,
                 lease.effective_valid_for(),
             ));
             if is_establish {

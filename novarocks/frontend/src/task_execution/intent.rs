@@ -27,10 +27,10 @@ use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
     AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTask,
-    CreateTaskReceipt, FetchTaskDynamicFilters, GetFinalTaskInfo, OperationKind, OperationOutcome,
-    QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate, QueryContextReceipt,
-    ReleaseOutcome, ReleaseQueryContext, TaskDomainUpdate, TaskOperationId, UpdateQueryContext,
-    UpdateTask, UpdateTaskReceipt, status::SafeDetail,
+    CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo,
+    OperationKind, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate,
+    QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext, TaskDomainUpdate, TaskOperationId,
+    UpdateQueryContext, UpdateTask, UpdateTaskReceipt, status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::{
@@ -50,6 +50,9 @@ pub const OPERATION_FIXED_BYTES: usize = 256;
 #[derive(Clone, Debug)]
 pub enum OperationIntent {
     AcquireQueryContextAdmissionTicket(AcquireQueryContextAdmissionTicket),
+    /// The exact allocation authorized by the logical-execution actor and
+    /// transferred to Native transport.
+    EstablishQueryContext(Arc<EstablishQueryContext>),
     CreateTask(Arc<CreateTask>),
     UpdateTask(Arc<UpdateTask>),
     UpdateQueryContext(Arc<UpdateQueryContext>),
@@ -64,6 +67,7 @@ impl OperationIntent {
     pub fn kind(&self) -> OperationKind {
         match self {
             Self::AcquireQueryContextAdmissionTicket(request) => request.envelope().kind(),
+            Self::EstablishQueryContext(request) => request.envelope().kind(),
             Self::CreateTask(request) => request.envelope().kind(),
             Self::UpdateTask(request) => request.envelope().kind(),
             Self::UpdateQueryContext(request) => request.envelope().kind(),
@@ -78,6 +82,7 @@ impl OperationIntent {
     pub fn operation_id(&self) -> TaskOperationId {
         match self {
             Self::AcquireQueryContextAdmissionTicket(request) => request.envelope().operation_id(),
+            Self::EstablishQueryContext(request) => request.envelope().operation_id(),
             Self::CreateTask(request) => request.envelope().operation_id(),
             Self::UpdateTask(request) => request.envelope().operation_id(),
             Self::UpdateQueryContext(request) => request.envelope().operation_id(),
@@ -102,6 +107,7 @@ impl OperationIntent {
         matches!(
             self,
             Self::AcquireQueryContextAdmissionTicket(_)
+                | Self::EstablishQueryContext(_)
                 | Self::UpdateQueryContext(_)
                 | Self::CancelTask(_)
                 | Self::AbortQueryContext(_)
@@ -115,6 +121,7 @@ impl OperationIntent {
             Self::AcquireQueryContextAdmissionTicket(request) => {
                 request.context().backend_process_id()
             }
+            Self::EstablishQueryContext(request) => request.context().backend_process_id(),
             Self::CreateTask(request) => request.identity().backend_process_id(),
             Self::UpdateTask(request) => request.identity().backend_process_id(),
             Self::UpdateQueryContext(request) => request.context().backend_process_id(),
@@ -130,6 +137,12 @@ impl OperationIntent {
     pub fn queued_bytes(&self) -> usize {
         let payload = match self {
             Self::AcquireQueryContextAdmissionTicket(_) => 0,
+            Self::EstablishQueryContext(request) => {
+                request.catalog_binding().encoded_len()
+                    + request.initial_runtime_filter().encoded_len()
+                    + request.query_options().encoded_len()
+                    + request.initial_credential().material().encoded_len()
+            }
             Self::CreateTask(request) => {
                 request.descriptor().plan().encoded_len()
                     + request
@@ -144,11 +157,8 @@ impl OperationIntent {
                 .map(task_domain_bytes)
                 .sum::<usize>(),
             Self::UpdateQueryContext(request) => match request.as_ref() {
-                UpdateQueryContext::Establish(request) => {
-                    request.catalog_binding().encoded_len()
-                        + request.initial_runtime_filter().encoded_len()
-                        + request.query_options().encoded_len()
-                        + request.initial_credential().material().encoded_len()
+                UpdateQueryContext::Establish(_) => {
+                    unreachable!("Establish must use its exact actor-owned intent variant")
                 }
                 UpdateQueryContext::AdvanceDomain(request) => {
                     context_domain_bytes(request.domain())
@@ -497,6 +507,13 @@ pub enum TaskOperationSubmit {
     /// No transport capacity was consumed; the caller still owns the exact
     /// batch and may restore it without recreating any intent.
     Backpressured(DispatchBatch),
+    /// The asynchronous actor gate permanently refused this exact batch
+    /// before Native transport ownership. The caller still owns the carrier
+    /// and must roll every operation back as definitely unsent.
+    Rejected {
+        batch: DispatchBatch,
+        reason: String,
+    },
 }
 
 /// One process-level reservation attached to an operation while it is queued.

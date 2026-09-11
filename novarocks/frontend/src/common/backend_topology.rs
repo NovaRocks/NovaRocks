@@ -59,6 +59,32 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
 pub type BackendTopologyService = Arc<dyn BackendTopologyPort>;
 pub type BeId = u32;
 
+/// Narrow live process-lifecycle evidence source for residual convergence.
+/// It has no snapshot, placement, or successor-scheduling capability.
+pub trait BackendProcessObservationPort: Send + Sync + 'static {
+    /// Observes the lifecycle relationship between one frozen process and the
+    /// exact endpoint it owned when the attempt was prepared. A missing or
+    /// heartbeat-unobservable process is not replacement evidence.
+    fn observe_process_at_endpoint(
+        &self,
+        expected_process: BackendProcessId,
+        expected_endpoint: &RuntimeEndpoint,
+    ) -> Result<BackendProcessObservation, BackendTopologyError>;
+}
+
+pub type BackendProcessObservationService = Arc<dyn BackendProcessObservationPort>;
+
+/// Live topology evidence relevant to residual attempt convergence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendProcessObservation {
+    /// The frozen process still owns the endpoint and is currently observable.
+    Current,
+    /// No exact positive lifecycle fact is available yet.
+    Unobservable,
+    /// A different, exact process identity now owns the frozen endpoint.
+    Replaced { current_process: BackendProcessId },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackendTopologyError {
     DuplicateBackendId { backend_idx: usize },
@@ -398,6 +424,17 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
 
     fn show_backends(&self) -> Result<crate::runtime::query_result::QueryResult, String> {
         Err("backend topology port is not installed".to_string())
+    }
+}
+
+#[cfg(test)]
+impl BackendProcessObservationPort for NoopBackendTopologyPort {
+    fn observe_process_at_endpoint(
+        &self,
+        _expected_process: BackendProcessId,
+        _expected_endpoint: &RuntimeEndpoint,
+    ) -> Result<BackendProcessObservation, BackendTopologyError> {
+        Ok(BackendProcessObservation::Unobservable)
     }
 }
 

@@ -21,10 +21,11 @@
 use novarocks_query_application::api::{
     ActivatedNativeAttempt, ActiveNativeAttemptOwner, CancellationView, DormantNativeAttemptOwner,
     LogicalExecutionNativePort, LogicalNativeOpenFuture, LogicalNativeOpenRequest,
-    NativeAttemptActivationFailure, NativeAttemptActivationFuture, NativeAttemptConvergenceFuture,
-    NativeAttemptPreparationError, NativeAttemptPreparationFailure, NativeAttemptPreparationFuture,
-    NativeAttemptPreparationPort, NativeAttemptPreparationRequest, NativeAttemptRunFuture,
-    QueryExecutionError, QueryExecutionErrorKind,
+    NativeActiveAttemptConvergenceFuture, NativeAttemptActivationFailure,
+    NativeAttemptActivationFuture, NativeAttemptConvergenceFuture, NativeAttemptPreparationError,
+    NativeAttemptPreparationFailure, NativeAttemptPreparationFuture, NativeAttemptPreparationPort,
+    NativeAttemptPreparationRequest, NativeAttemptRunFuture, QueryExecutionError,
+    QueryExecutionErrorKind,
 };
 use novarocks_query_application::coordination::{
     AttemptFailureClass, AttemptSchedule, NativeAttemptDrive,
@@ -32,9 +33,10 @@ use novarocks_query_application::coordination::{
 
 use crate::common::backend_topology::BackendTopologyService;
 use crate::query_execution::artifact::{
-    ManifestBoundNativeAttemptInputs, PreparedDistributedAttemptTemplate,
-    SnapshotBoundDormantAttemptInputs,
+    ManifestBoundNativeAttemptInputs, PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
+    SnapshotBoundDormantAttemptInputs, TaskManifestBinding,
 };
+use crate::task_execution::manifest_round::{ManifestAssembledRound, ManifestAttemptCompletion};
 
 /// Stateless process adapter which consumes the exact Native seed already
 /// sealed into an executable Query Application request.
@@ -72,7 +74,7 @@ pub(crate) trait FrontendActiveAttemptBehavior<M = ManifestBoundNativeAttemptInp
         &'a mut self,
         inputs: &'a mut M,
         cancellation: CancellationView,
-    ) -> NativeAttemptConvergenceFuture<'a>;
+    ) -> NativeActiveAttemptConvergenceFuture<'a>;
 }
 
 pub(crate) trait FrontendDormantAttemptBehavior<M = ManifestBoundNativeAttemptInputs>:
@@ -106,6 +108,169 @@ pub(crate) trait FrontendDormantAttemptFactory: std::fmt::Debug + Send + 'static
     type Behavior: FrontendDormantAttemptBehavior<ManifestBoundNativeAttemptInputs>;
 
     fn create(&mut self) -> Result<Self::Behavior, NativeAttemptPreparationError>;
+}
+
+/// C3's exact-manifest runtime projection consumed by the concrete Task
+/// protocol behavior.
+///
+/// Implementations may encode the already frozen fragment plans and create
+/// attempt-local split/RF/credential owners. They cannot receive a compiler,
+/// live topology service, legacy `SchedulingPlan`, or backend ordinal map.
+/// Every resource made live while this borrowed future is polled must remain
+/// owned by the projection until it is transferred into the returned round;
+/// `converge` resumes cleanup after cancellation, error, or panic.
+pub(crate) trait FrontendManifestAttemptProjection:
+    std::fmt::Debug + Send + 'static
+{
+    fn project<'a>(
+        &'a mut self,
+        prepared: &'a mut PreparedDistributedQuery,
+        manifest: &'a TaskManifestBinding,
+        cancellation: CancellationView,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ManifestAssembledRound, NativeAttemptActivationFailure>,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    fn converge<'a>(
+        &'a mut self,
+        cancellation: CancellationView,
+    ) -> NativeAttemptConvergenceFuture<'a>;
+}
+
+/// Dormant half of the concrete manifest-only Task protocol behavior.
+pub(crate) struct FrontendTaskProtocolDormantBehavior<P> {
+    projection: P,
+    completion: ManifestAttemptCompletion,
+}
+
+impl<P> std::fmt::Debug for FrontendTaskProtocolDormantBehavior<P>
+where
+    P: std::fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FrontendTaskProtocolDormantBehavior")
+            .field("projection", &self.projection)
+            .field("completion", &self.completion)
+            .finish()
+    }
+}
+
+impl<P> FrontendTaskProtocolDormantBehavior<P> {
+    pub(crate) const fn new(projection: P, completion: ManifestAttemptCompletion) -> Self {
+        Self {
+            projection,
+            completion,
+        }
+    }
+}
+
+impl<P> FrontendDormantAttemptBehavior for FrontendTaskProtocolDormantBehavior<P>
+where
+    P: FrontendManifestAttemptProjection,
+{
+    type ActiveBehavior = FrontendTaskProtocolActiveBehavior;
+
+    fn activate<'a>(
+        &'a mut self,
+        inputs: &'a mut ManifestBoundNativeAttemptInputs,
+        cancellation: CancellationView,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Self::ActiveBehavior, NativeAttemptActivationFailure>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut activation = inputs.begin_activation().map_err(|error| {
+                NativeAttemptActivationFailure::new(attempt_runtime_failure(
+                    AttemptFailureClass::ContractViolation,
+                    QueryExecutionErrorKind::InvalidRequest,
+                    error.to_string(),
+                ))
+            })?;
+            let attempt = {
+                let (prepared, manifest) = activation.parts();
+                self.projection
+                    .project(prepared, manifest, cancellation)
+                    .await?
+            };
+            // The exact manifest/access owner remains in the fixed active
+            // wrapper. The derived view is committed only after all fallible
+            // projection and TaskRound assembly has succeeded.
+            drop(activation.commit());
+            Ok(FrontendTaskProtocolActiveBehavior::new(
+                attempt,
+                self.completion,
+            ))
+        })
+    }
+
+    fn converge<'a>(
+        &'a mut self,
+        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+        cancellation: CancellationView,
+    ) -> NativeAttemptConvergenceFuture<'a> {
+        self.projection.converge(cancellation)
+    }
+}
+
+/// Concrete active behavior for the manifest-only Frontend Task protocol.
+///
+/// C3 constructs this only after it has projected and validated the exact
+/// manifest's fragment plans, establish facts and attempt-local source owners.
+/// This type receives no compiler, topology reader, scheduling plan or backend
+/// ordinal map; its only execution authority is the already assembled round.
+pub(crate) struct FrontendTaskProtocolActiveBehavior {
+    attempt: ManifestAssembledRound,
+    completion: ManifestAttemptCompletion,
+}
+
+impl std::fmt::Debug for FrontendTaskProtocolActiveBehavior {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FrontendTaskProtocolActiveBehavior")
+            .field("completion", &self.completion)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FrontendTaskProtocolActiveBehavior {
+    pub(crate) fn new(
+        attempt: ManifestAssembledRound,
+        completion: ManifestAttemptCompletion,
+    ) -> Self {
+        Self {
+            attempt,
+            completion,
+        }
+    }
+}
+
+impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
+    fn run<'a>(
+        &'a mut self,
+        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+        drive: &'a NativeAttemptDrive,
+        cancellation: CancellationView,
+    ) -> NativeAttemptRunFuture<'a> {
+        Box::pin(self.attempt.run(drive, cancellation, self.completion))
+    }
+
+    fn converge<'a>(
+        &'a mut self,
+        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+        cancellation: CancellationView,
+    ) -> NativeActiveAttemptConvergenceFuture<'a> {
+        Box::pin(self.attempt.converge(cancellation))
+    }
 }
 
 trait RetainedAttemptInputs: std::fmt::Debug + Send + 'static {
@@ -255,7 +420,7 @@ where
         B: FrontendDormantAttemptBehavior<I::Manifest>,
     {
         let activation = self.activate_fixed_retained(cancellation);
-        Box::pin(async move { activation.await.map(ActivatedNativeAttempt::new) })
+        Box::pin(async move { activation.await.map(ActivatedNativeAttempt::completion) })
     }
 
     fn converge_retained<'a>(
@@ -307,7 +472,7 @@ where
     fn converge<'a>(
         &'a mut self,
         cancellation: CancellationView,
-    ) -> NativeAttemptConvergenceFuture<'a> {
+    ) -> NativeActiveAttemptConvergenceFuture<'a> {
         self.behavior.converge(&mut self.inputs, cancellation)
     }
 }
@@ -446,9 +611,9 @@ mod tests {
 
     use futures::FutureExt;
     use novarocks_query_application::api::{
-        ActiveNativeAttemptOwner, CancellationView, NativeAttemptActivationFailure,
-        NativeAttemptConvergenceFuture, NativeAttemptPreparationError, NativeAttemptRunFuture,
-        NativeAttemptTerminal,
+        ActiveNativeAttemptOwner, CancellationView, NativeActiveAttemptConvergenceFuture,
+        NativeAttemptActivationFailure, NativeAttemptConvergence, NativeAttemptConvergenceFuture,
+        NativeAttemptPreparationError, NativeAttemptRunFuture, NativeAttemptTerminal,
     };
     use novarocks_query_application::coordination::{AttemptSchedule, NativeAttemptDrive};
     use novarocks_types::identity::BackendProcessId;
@@ -509,8 +674,8 @@ mod tests {
             &'a mut self,
             _inputs: &'a mut ManifestBoundNativeAttemptInputs,
             _cancellation: CancellationView,
-        ) -> NativeAttemptConvergenceFuture<'a> {
-            Box::pin(async {})
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            Box::pin(async { NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced() })
         }
     }
 
@@ -627,7 +792,7 @@ mod tests {
             &'a mut self,
             inputs: &'a mut TestManifest,
             _cancellation: CancellationView,
-        ) -> NativeAttemptConvergenceFuture<'a> {
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
             assert_eq!(inputs.marker, 73);
             assert_eq!(
                 inputs.identity.as_ref() as *const u8 as usize,
@@ -636,6 +801,7 @@ mod tests {
             let observed = Arc::clone(&self.convergence_observed);
             Box::pin(async move {
                 observed.store(true, Ordering::SeqCst);
+                NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
             })
         }
     }

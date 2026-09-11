@@ -47,7 +47,7 @@ use super::abort_effect::{
 use super::blocking_io::ConnectorBlockingIoSupervisor;
 use super::context_owner::{ContextEstablishSource, QueryContextOwner};
 use super::error::TaskExecutionError;
-use super::execution::{ActorAbortDispatchState, QueryTaskExecution};
+use super::execution::{ActorAbortDispatchState, QueryTaskExecution, QueuedContextAcknowledgement};
 use super::intent::{AckPayload, OperationAcknowledgement};
 use crate::native::task_transport::{SubscriptionState, TaskAckIntake, TaskStatusSubscriber};
 
@@ -257,11 +257,17 @@ impl TaskRound {
 
     /// Installs the single actor-to-Native Abort intake for this attempt.
     pub(crate) fn with_abort_effect_intake(mut self, intake: NativeAbortEffectIntake) -> Self {
+        self.install_abort_effect_intake(intake);
+        self
+    }
+
+    /// Installs the actor-owned Abort intake while an attempt is assembled
+    /// from its exact manifest.
+    pub(crate) fn install_abort_effect_intake(&mut self, intake: NativeAbortEffectIntake) {
         assert!(
             self.abort_effect_intake.replace(intake).is_none(),
             "one TaskRound may own only one Native Abort effect intake"
         );
-        self
     }
 
     /// Transfers the single accepted-root projection to the result-pump
@@ -370,6 +376,15 @@ impl TaskRound {
 
         for ack in self.acks.drain() {
             report.acknowledgements += 1;
+            let queued_context = self
+                .execution
+                .classify_queued_context_acknowledgement(&ack)?;
+            if queued_context == QueuedContextAcknowledgement::IgnoreOlderTransportUnknown {
+                // This fact belongs to an older transport generation. The
+                // unchanged replay and its actor authorization remain owned by
+                // the current queued generation.
+                continue;
+            }
             // Before the state machine settles it: settling can fail the
             // attempt, and an observer that learned nothing in that case would
             // leave a blocked owner waiting for a verdict that did arrive.
@@ -380,6 +395,10 @@ impl TaskRound {
                 }
             }
             if self.process_abort_ack(&ack)? {
+                continue;
+            }
+            if queued_context == QueuedContextAcknowledgement::ApplyDefinitive {
+                self.execution.acknowledge_queued_context_replay(&ack)?;
                 continue;
             }
             self.execution.acknowledge(&ack)?;
@@ -948,6 +967,18 @@ impl TaskRound {
     /// Whether the client may be told the read is complete.
     pub(crate) fn client_visible_completion(&self) -> bool {
         self.execution.client_visible_completion()
+    }
+
+    /// Whether the result owner and this Task owner fixed the accepted root's
+    /// successful terminal observation together.
+    ///
+    /// The sender is consumed only by `try_settle_success_seal`; transferring
+    /// the source to the result pump does not affect it. This gives the async
+    /// active owner a non-circular completion fact: it continues driving the
+    /// round until the result pump's seal request is accepted, then publishes
+    /// `NativeAttemptTerminal::Completed` back to that same pump.
+    pub(crate) fn accepted_root_success_sealed(&self) -> bool {
+        self.root_status_sender.is_none()
     }
 
     /// Whether every task terminated and every context was released.

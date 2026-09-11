@@ -38,7 +38,7 @@ use novarocks_execution::task_execution::{
     QueryContextReceipt, QueryContextRef, QueryContextState, ReleaseOutcome, SplitAssignmentIntent,
     SplitOffer, SplitSequence, SplitWatermark, TaskDomainReceipt, TaskDomainUpdate, TaskIdentity,
     TaskOperationId, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
-    UpdateQueryContext, UpdateTaskReceipt,
+    UpdateTaskReceipt,
 };
 use novarocks_query_application::coordination::{
     DispatchBudget, DispatchLane, MonotonicInstant, RenewSchedule, StageState,
@@ -727,30 +727,35 @@ impl Harness {
     /// rotation on purpose: a create may legitimately reach a backend before
     /// its establish and wait on the creation gate there.
     fn context_ack(&mut self, intent: &OperationIntent, effective: Duration) {
-        let OperationIntent::UpdateQueryContext(request) = intent else {
-            unreachable!("an update-context intent carries its request");
+        let (context, may_create) = match intent {
+            OperationIntent::EstablishQueryContext(request) => (request.context(), true),
+            OperationIntent::UpdateQueryContext(request) => {
+                (request.context(), request.may_create())
+            }
+            _ => unreachable!("a context intent carries its request"),
         };
         let sequence = self
             .execution
-            .owner(request.context())
+            .owner(context)
             .expect("the context has an owner")
             .lease_sequence();
-        let sequence = if request.may_create() {
+        let sequence = if may_create {
             LeaseSequence::INITIAL
         } else {
             sequence.next().expect("the lease sequence advances")
         };
-        let receipt = QueryContextReceipt::new(request.context(), QueryContextState::Active)
-            .with_lease(LeaseReceipt::new(
+        let receipt = QueryContextReceipt::new(context, QueryContextState::Active).with_lease(
+            LeaseReceipt::new(
                 sequence,
-                LeaseValidFor::new(if request.may_create() {
+                LeaseValidFor::new(if may_create {
                     Duration::from_secs(30)
                 } else {
                     Duration::from_secs(5)
                 })
                 .expect("a legal request"),
                 effective,
-            ));
+            ),
+        );
         self.execution
             .acknowledge(&OperationAcknowledgement::new(
                 intent.operation_id(),
@@ -1573,8 +1578,8 @@ fn renewal_is_scheduled_from_the_effective_duration_and_the_local_send_time() {
         .find(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext))
         .expect("an establish was released")
         .clone();
-    let OperationIntent::UpdateQueryContext(request) = &establish else {
-        unreachable!("an update-context intent carries its request");
+    let OperationIntent::EstablishQueryContext(request) = &establish else {
+        unreachable!("an establish intent carries its exact request");
     };
     let context = request.context();
 
@@ -1904,13 +1909,119 @@ fn an_admission_transport_unknown_replays_exactly_and_only_the_next_turn_establi
         )
         .expect("the grant is current")
         .expect("the next owner turn starts establish");
-    let OperationIntent::UpdateQueryContext(request) = establish else {
+    let OperationIntent::EstablishQueryContext(request) = establish else {
         unreachable!("the granted owner releases an establish");
     };
-    let UpdateQueryContext::Establish(request) = request.as_ref() else {
-        unreachable!("the first context update is establish");
-    };
     assert_eq!(request.admission_ticket_id(), ticket_id);
+}
+
+#[test]
+fn a_late_establish_receipt_closes_a_queued_exact_replay() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph =
+        build_graph(&schedule, &chain_edges(), &processes, 16).expect("the test graph is valid");
+    let sink = Arc::new(SwitchableQueueSink::default());
+    let clock = Arc::new(ManualClock::new());
+    let wake = Arc::new(CountingWake::default());
+    let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::DEFAULT,
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        clock as Arc<dyn TaskProtocolClock>,
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        intake,
+    )
+    .expect("the graph composes into one execution");
+    let acks = TaskAckIntake::new(Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let ack_handle = acks.handle();
+    let mut round = TaskRound::new(
+        execution,
+        acks,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()),
+    );
+    round.seal_pumps();
+
+    round.turn().expect("initial dispatch");
+    let admission = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .find(|intent| {
+            matches!(
+                intent,
+                OperationIntent::AcquireQueryContextAdmissionTicket(_)
+            )
+        })
+        .expect("the context admission was sent");
+    let OperationIntent::AcquireQueryContextAdmissionTicket(request) = admission else {
+        unreachable!()
+    };
+    let ticket = QueryContextAdmissionTicketReceipt::new(
+        AdmissionTicketId::try_from_bytes([0x55; 16]).unwrap(),
+        request.context(),
+        request.valid_for(),
+    );
+    ack_handle.publish(OperationAcknowledgement::worker_receipt(
+        request.envelope().operation_id(),
+        OperationKind::AcquireQueryContextAdmissionTicket,
+        OperationOutcome::Accepted,
+        AckPayload::AdmissionTicket(ticket),
+    ));
+
+    round
+        .turn()
+        .expect("admission settles and Establish dispatches");
+    let establish = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .find(|intent| matches!(intent, OperationIntent::EstablishQueryContext(_)))
+        .expect("the establish was sent");
+    sink.set_submit_open(false);
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        establish.operation_id(),
+        OperationKind::UpdateQueryContext,
+    ));
+    round
+        .turn()
+        .expect("the exact replay remains queued under backpressure");
+    let OperationIntent::EstablishQueryContext(establish_request) = &establish else {
+        unreachable!()
+    };
+    let receipt = OperationAcknowledgement::worker_receipt(
+        establish.operation_id(),
+        OperationKind::UpdateQueryContext,
+        OperationOutcome::Accepted,
+        AckPayload::Context(
+            QueryContextReceipt::new(establish_request.context(), QueryContextState::Active)
+                .with_lease(LeaseReceipt::new(
+                    LeaseSequence::INITIAL,
+                    LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+                    Duration::from_secs(10),
+                )),
+        ),
+    );
+    ack_handle.publish(receipt);
+    round
+        .turn()
+        .expect("the older definitive receipt closes the queued replay");
+    assert!(round.contexts_established());
+    assert!(
+        sink.take().is_empty(),
+        "the definitely-unsent replay must not cross process transport"
+    );
 }
 
 #[test]
@@ -1925,11 +2036,11 @@ fn a_round_never_emits_establish_before_each_context_grant() {
         intent,
         OperationIntent::AcquireQueryContextAdmissionTicket(_)
     )));
-    assert!(first.iter().all(|intent| !matches!(
-        intent,
-        OperationIntent::UpdateQueryContext(request)
-            if matches!(request.as_ref(), UpdateQueryContext::Establish(_))
-    )));
+    assert!(
+        first
+            .iter()
+            .all(|intent| !matches!(intent, OperationIntent::EstablishQueryContext(_)))
+    );
 
     for intent in first {
         let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent else {
@@ -1958,11 +2069,11 @@ fn a_round_never_emits_establish_before_each_context_grant() {
         .into_iter()
         .flat_map(|(_, operations)| operations)
         .collect::<Vec<_>>();
-    assert!(second.iter().any(|intent| matches!(
-        intent,
-        OperationIntent::UpdateQueryContext(request)
-            if matches!(request.as_ref(), UpdateQueryContext::Establish(_))
-    )));
+    assert!(
+        second
+            .iter()
+            .any(|intent| matches!(intent, OperationIntent::EstablishQueryContext(_)))
+    );
 }
 
 #[test]
@@ -2668,7 +2779,7 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
             .tasks()
             .find(|task| task.fragment_instance_id() == target.fragment_instance_id)
             .expect("every target addresses a graph task");
-        assert_eq!(task.backend_idx(), target.backend_idx);
+        assert_eq!(task.identity(), target.identity);
         assert_eq!(task.fragment_id(), LEAF_FRAGMENT);
     }
     assert!(
@@ -2677,16 +2788,20 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
 
     // Only a genuinely unknown transport outcome is replayable, and that
     // verdict comes from the delivery owner rather than being restated here.
+    let legacy_driver_target = crate::query_execution::split_assignment::AssignmentTarget {
+        backend_idx: 0,
+        fragment_instance_id: targets[0].fragment_instance_id,
+    };
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::Transport {
-            target: targets[0].clone(),
+            target: legacy_driver_target.clone(),
             detail: "acknowledgement lost".to_owned(),
         }),
         novarocks_query_application::coordination::FrontendAction::RetryExactRequest
     );
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::Rejected {
-            target: targets[0].clone(),
+            target: legacy_driver_target,
             reason: "watermark".to_owned(),
             detail: "gap".to_owned(),
         }),
@@ -2850,13 +2965,9 @@ fn a_create_receipt_snapshot_older_than_the_observed_one_is_ignored_not_adopted(
 /// A fresh attempt's establish creates its context, so its lease sequence is
 /// the initial one and nothing has to be read back out of the execution.
 fn establish_ack(intent: &OperationIntent) -> OperationAcknowledgement {
-    let OperationIntent::UpdateQueryContext(request) = intent else {
-        unreachable!("an update-context intent carries its request");
+    let OperationIntent::EstablishQueryContext(request) = intent else {
+        unreachable!("an establish intent carries its exact request");
     };
-    assert!(
-        request.may_create(),
-        "a fresh attempt's establish creates its context"
-    );
     let receipt = QueryContextReceipt::new(request.context(), QueryContextState::Active)
         .with_lease(LeaseReceipt::new(
             LeaseSequence::INITIAL,
@@ -2983,7 +3094,7 @@ fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
     // the other is still a context its backend does not hold.
     let establishes = released_establishes(&sink);
     assert_eq!(establishes.len(), contexts);
-    let OperationIntent::UpdateQueryContext(first_request) = &establishes[0] else {
+    let OperationIntent::EstablishQueryContext(first_request) = &establishes[0] else {
         unreachable!("an establish carries its request");
     };
     let established_context = first_request.context();

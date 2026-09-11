@@ -663,6 +663,9 @@ impl TaskOperationSink for SplitDeliverySink {
                 TaskOperationSubmit::Accepted
             }
             TaskOperationSubmit::Backpressured(batch) => TaskOperationSubmit::Backpressured(batch),
+            TaskOperationSubmit::Rejected { batch, reason } => {
+                TaskOperationSubmit::Rejected { batch, reason }
+            }
         }
     }
 }

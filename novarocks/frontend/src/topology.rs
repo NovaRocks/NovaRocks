@@ -37,8 +37,9 @@ use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, Nati
 use tokio::runtime::Handle;
 
 use crate::common::backend_topology::{
-    BackendTopologyError, BackendTopologyMetricsSnapshot, BackendTopologyPort,
-    BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
+    BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+    BackendTopologyMetricsSnapshot, BackendTopologyPort, BackendTopologySnapshot,
+    BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
     publish_backend_topology_metrics,
 };
 use crate::metrics::{record_backend_announce, record_backend_heartbeat};
@@ -537,7 +538,46 @@ impl ClusterBackendService {
         Ok(())
     }
 
-    pub(crate) fn stop_heartbeat_manager(&self) -> Result<(), String> {
+    pub(crate) async fn stop_heartbeat_manager_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        self.request_heartbeat_stop_for_process_exit()?;
+        loop {
+            let finished = self
+                .heartbeat_thread
+                .lock()
+                .map_err(|_| "lock frontend topology heartbeat thread failed".to_string())?
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "frontend heartbeat manager did not stop before the shared shutdown deadline"
+                        .to_string(),
+                );
+            }
+            tokio::time::sleep(
+                Duration::from_millis(10)
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            )
+            .await;
+        }
+        let join = self
+            .heartbeat_thread
+            .lock()
+            .map_err(|_| "lock frontend topology heartbeat thread failed".to_string())?
+            .take();
+        if let Some(join) = join {
+            join.join()
+                .map_err(|payload| format!("frontend heartbeat manager panicked: {payload:?}"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request_heartbeat_stop_for_process_exit(&self) -> Result<(), String> {
         {
             let mut signal = self
                 .heartbeat_signal
@@ -547,15 +587,6 @@ impl ClusterBackendService {
             signal.generation = signal.generation.wrapping_add(1);
         }
         self.heartbeat_wake.notify_all();
-        if let Some(join) = self
-            .heartbeat_thread
-            .lock()
-            .map_err(|_| "lock frontend topology heartbeat thread failed".to_string())?
-            .take()
-        {
-            join.join()
-                .map_err(|payload| format!("frontend heartbeat manager panicked: {payload:?}"))?;
-        }
         Ok(())
     }
 
@@ -896,6 +927,7 @@ impl BackendTopologyPort for ClusterBackendService {
             },
         )
     }
+
     fn wait_for_eligible_after(
         &self,
         revision: u64,
@@ -1024,6 +1056,44 @@ impl BackendTopologyPort for ClusterBackendService {
                 .collect(),
             chunks: vec![record_batch_to_chunk(batch)?],
         })
+    }
+}
+
+impl BackendProcessObservationPort for ClusterBackendService {
+    fn observe_process_at_endpoint(
+        &self,
+        expected_process: BackendProcessId,
+        expected_endpoint: &RuntimeEndpoint,
+    ) -> Result<BackendProcessObservation, BackendTopologyError> {
+        self.refresh_expired_announce_leases(std::time::Instant::now());
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| BackendTopologyError::Unavailable {
+                message: "lock frontend topology failed".to_string(),
+            })?;
+        if let Some(message) = &state.terminal_error {
+            return Err(BackendTopologyError::Unavailable {
+                message: message.clone(),
+            });
+        }
+        let Some(current_process) = state.endpoint_owners.get(expected_endpoint).copied() else {
+            return Ok(BackendProcessObservation::Unobservable);
+        };
+        if current_process != expected_process {
+            return Ok(BackendProcessObservation::Replaced { current_process });
+        }
+        Ok(
+            if state
+                .processes
+                .get(&expected_process)
+                .is_some_and(BackendFacts::eligible)
+            {
+                BackendProcessObservation::Current
+            } else {
+                BackendProcessObservation::Unobservable
+            },
+        )
     }
 }
 
@@ -1189,7 +1259,9 @@ fn revision_members(
 #[cfg(test)]
 mod tests {
     use super::{BackendIslandSnapshotReader, ClusterBackendService};
-    use crate::common::backend_topology::BackendTopologyPort;
+    use crate::common::backend_topology::{
+        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyPort,
+    };
     use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
@@ -1229,6 +1301,38 @@ mod tests {
             1,
         );
     }
+
+    #[tokio::test]
+    async fn shared_deadline_retains_the_same_heartbeat_join_for_retry() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            release_rx.recv().expect("release heartbeat test worker");
+        });
+        *service.heartbeat_thread.lock().unwrap() = Some(join);
+
+        let error = service
+            .stop_heartbeat_manager_until(
+                std::time::Instant::now() + std::time::Duration::from_millis(20),
+            )
+            .await
+            .expect_err("stuck heartbeat worker must honor the shared deadline");
+        assert!(error.contains("shared shutdown deadline"));
+        assert!(service.heartbeat_thread.lock().unwrap().is_some());
+
+        release_tx.send(()).unwrap();
+        service
+            .stop_heartbeat_manager_until(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect("retry joins the retained heartbeat worker");
+        assert!(service.heartbeat_thread.lock().unwrap().is_none());
+        tokio::task::spawn_blocking(move || drop(service))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn announcement_is_not_eligible_until_exact_pull() {
         let service = ClusterBackendService::new_transient_for_test(1);
@@ -1357,6 +1461,48 @@ mod tests {
                 .process_id()
                 .unwrap(),
             new.process_id().unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_process_replacement_closes_an_unobservable_endpoint_owner() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let endpoint = "127.0.0.1:9070".parse().unwrap();
+        let old = descriptor(endpoint);
+        let old_process = old.process_id().unwrap();
+        let runtime_endpoint = super::descriptor_runtime_endpoint(&old).unwrap();
+        service
+            .record_announce(old.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &old);
+        assert_eq!(
+            service
+                .observe_process_at_endpoint(old_process, &runtime_endpoint)
+                .unwrap(),
+            BackendProcessObservation::Current
+        );
+
+        assert!(service.record_heartbeat_failure(old_process));
+        assert_eq!(
+            service
+                .observe_process_at_endpoint(old_process, &runtime_endpoint)
+                .unwrap(),
+            BackendProcessObservation::Unobservable
+        );
+
+        let replacement = descriptor(endpoint);
+        let replacement_process = replacement.process_id().unwrap();
+        service
+            .record_announce(replacement.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &replacement);
+        assert_eq!(
+            service
+                .observe_process_at_endpoint(old_process, &runtime_endpoint)
+                .unwrap(),
+            BackendProcessObservation::Replaced {
+                current_process: replacement_process,
+            }
         );
     }
 

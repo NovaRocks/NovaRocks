@@ -137,6 +137,9 @@ fn encode_operation(
         OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
             Ok(encode_acquire_query_context_admission_ticket(*request))
         }
+        OperationIntent::EstablishQueryContext(request) => {
+            encode_establish_query_context_operation(request, attempt)
+        }
         OperationIntent::CreateTask(request) => {
             let fragment = wire_fragment_plan(request.descriptor().plan())?;
             let domains = encode_task_domains(request.initial_domains())?;
@@ -234,6 +237,35 @@ fn encode_query_context_operation(
     }
 }
 
+fn encode_establish_query_context_operation(
+    establish: &novarocks_execution::task_execution::EstablishQueryContext,
+    attempt: &AttemptWireFacts,
+) -> Result<proto::TaskOperation, String> {
+    let catalog_set = stored_message::<CatalogSet>(establish.catalog_binding().as_ref())
+        .ok_or("establish catalog binding is not a codec-produced catalog set")?;
+    let filter = stored_message::<proto::RuntimeFilterContribution>(
+        establish.initial_runtime_filter().as_ref(),
+    )
+    .ok_or("establish runtime filter is not a codec-produced contribution")?;
+    let query_options = stored_message::<proto::QueryOptions>(establish.query_options().as_ref())
+        .ok_or("establish query options are not codec-produced")?;
+    let credential = stored_credential(establish.initial_credential().material().as_ref())
+        .ok_or("establish credential is not codec-produced material")?;
+    Ok(encode_establish_query_context(
+        establish,
+        catalog_set.clone(),
+        filter.clone(),
+        proto::QueryContextCredentialDomain {
+            lease_id: establish.initial_credential().lease_id().get(),
+            epoch: establish.initial_credential().epoch().get(),
+            descriptors: credential.descriptors().to_vec(),
+            envelopes: credential.envelopes().to_vec(),
+        },
+        *query_options,
+        attempt.native_compatibility_id,
+    ))
+}
+
 /// Whether an owner consumes this kind's acknowledgement body.
 ///
 /// `CancelTask` is deliberately absent even though its receipt carries a task
@@ -319,6 +351,7 @@ impl AckAddress {
             OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
                 Self::Admission(*request)
             }
+            OperationIntent::EstablishQueryContext(request) => Self::Context(request.context()),
             OperationIntent::CreateTask(request) => Self::Task(request.identity()),
             OperationIntent::UpdateTask(request) => Self::Task(request.identity()),
             OperationIntent::CancelTask(request) => Self::Task(request.identity()),

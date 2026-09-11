@@ -33,7 +33,14 @@ use novarocks_types::UniqueId;
 use novarocks_types::identity::TaskId;
 
 use super::graph::TaskGraph;
-use crate::query_execution::split_assignment::{AssignmentTarget, SplitAssignmentDriverError};
+use crate::query_execution::split_assignment::SplitAssignmentDriverError;
+
+/// Stable Task-protocol address for one split-assignment destination.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct TaskAssignmentTarget {
+    pub(crate) identity: novarocks_execution::task_execution::TaskIdentity,
+    pub(crate) fragment_instance_id: UniqueId,
+}
 
 /// The driver's addresses for every task of one plan node.
 ///
@@ -44,12 +51,12 @@ use crate::query_execution::split_assignment::{AssignmentTarget, SplitAssignment
     dead_code,
     reason = "The task protocol is not routed into production yet; the adapter is exercised by this module's tests until the transport cutover lands."
 )]
-pub(crate) fn assignment_targets(graph: &TaskGraph, node: PlanNodeId) -> Vec<AssignmentTarget> {
+pub(crate) fn assignment_targets(graph: &TaskGraph, node: PlanNodeId) -> Vec<TaskAssignmentTarget> {
     graph
         .tasks()
         .filter(|task| task.split_plan_nodes().contains(&node))
-        .map(|task| AssignmentTarget {
-            backend_idx: task.backend_idx(),
+        .map(|task| TaskAssignmentTarget {
+            identity: task.identity(),
             fragment_instance_id: task.fragment_instance_id(),
         })
         .collect()

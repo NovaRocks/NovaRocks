@@ -51,7 +51,7 @@ use super::dispatch::{DispatchOperationState, OperationDispatcher};
 use super::error::{CapacityBound, TaskExecutionError};
 use super::graph::TaskGraph;
 use super::intent::{
-    OperationAcknowledgement, OperationIntent, TaskOperationQueueAdmission,
+    DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationQueueAdmission,
     TaskOperationQueuePermit, TaskOperationQueueRequest, TaskOperationSink, TaskOperationSubmit,
 };
 use super::remote_task::{
@@ -219,7 +219,85 @@ pub(crate) enum ActorAbortDispatchState {
     InFlight,
 }
 
+/// How an acknowledgement relates to an exact context operation replay which
+/// has not crossed the current generation's transport boundary yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueuedContextAcknowledgement {
+    NotQueued,
+    IgnoreOlderTransportUnknown,
+    ApplyDefinitive,
+}
+
 impl QueryTaskExecution {
+    /// Classifies a context acknowledgement against the dispatch owner before
+    /// acknowledgement observers consume it.
+    ///
+    /// After an unknown outcome, an exact replay may already be queued when an
+    /// older generation answers. Another unknown fact says nothing about the
+    /// queued generation and is ignored. A definitive Worker answer closes the
+    /// exact operation and must cancel that definitely-unsent replay before the
+    /// domain owner applies the answer.
+    pub(crate) fn classify_queued_context_acknowledgement(
+        &self,
+        acknowledgement: &OperationAcknowledgement,
+    ) -> Result<QueuedContextAcknowledgement, TaskExecutionError> {
+        if !matches!(
+            acknowledgement.kind(),
+            OperationKind::AcquireQueryContextAdmissionTicket | OperationKind::UpdateQueryContext
+        ) || !matches!(
+            self.operation_targets.get(&acknowledgement.operation_id()),
+            Some(OperationTarget::Context(_))
+        ) {
+            return Ok(QueuedContextAcknowledgement::NotQueued);
+        }
+        if self
+            .dispatcher
+            .operation_state(acknowledgement.operation_id())?
+            != DispatchOperationState::Queued
+        {
+            return Ok(QueuedContextAcknowledgement::NotQueued);
+        }
+        Ok(if acknowledgement.worker_outcome().is_some() {
+            QueuedContextAcknowledgement::ApplyDefinitive
+        } else {
+            QueuedContextAcknowledgement::IgnoreOlderTransportUnknown
+        })
+    }
+
+    /// Cancels the current definitely-unsent replay and applies the definitive
+    /// Worker acknowledgement which arrived from an older transport generation.
+    pub(crate) fn acknowledge_queued_context_replay(
+        &mut self,
+        acknowledgement: &OperationAcknowledgement,
+    ) -> Result<(), TaskExecutionError> {
+        if acknowledgement.worker_outcome().is_none() {
+            return Err(TaskExecutionError::Schedule(
+                "a queued context replay can be closed only by a definitive Worker acknowledgement"
+                    .to_owned(),
+            ));
+        }
+        let operation_id = acknowledgement.operation_id();
+        let target = *self
+            .operation_targets
+            .get(&operation_id)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let OperationTarget::Context(context) = target else {
+            return Err(TaskExecutionError::UnknownOperation);
+        };
+        let intent = self.dispatcher.cancel_queued(operation_id)?;
+        if intent.operation_id() != operation_id
+            || intent.kind() != acknowledgement.kind()
+            || intent.backend_process_id() != context.backend_process_id()
+        {
+            return Err(TaskExecutionError::Schedule(
+                "queued context replay differs from its definitive acknowledgement address"
+                    .to_owned(),
+            ));
+        }
+        self.operation_targets.remove(&operation_id);
+        self.acknowledge_context(context, acknowledgement)
+    }
+
     /// Builds the attempt's owners from its frozen graph.
     pub fn new(
         graph: TaskGraph,
@@ -493,6 +571,10 @@ impl QueryTaskExecution {
                     // only rediscover the same full hard bound and spin.
                     break;
                 }
+                TaskOperationSubmit::Rejected { batch, reason } => {
+                    self.rollback_rejected_batch(batch)?;
+                    return Err(TaskExecutionError::Schedule(reason));
+                }
             }
         }
         Ok(report)
@@ -713,6 +795,10 @@ impl QueryTaskExecution {
             TaskOperationSubmit::Backpressured(batch) => {
                 self.dispatcher.restore_backpressured(batch);
                 Ok(AbortSubmission::Backpressured)
+            }
+            TaskOperationSubmit::Rejected { batch, reason } => {
+                self.rollback_rejected_batch(batch)?;
+                Err(TaskExecutionError::Schedule(reason))
             }
         }
     }
@@ -1069,6 +1155,15 @@ impl QueryTaskExecution {
         self.attempt_drain_facts().drained()
     }
 
+    /// Whether the exact Worker context acknowledged release after all of its
+    /// local Tasks became terminal. This is a positive per-context stop fact;
+    /// absence remains unknown and must not be inferred from transport loss.
+    pub(crate) fn context_released(&self, context: QueryContextRef) -> bool {
+        self.owners
+            .get(&context)
+            .is_some_and(QueryContextOwner::is_released)
+    }
+
     /// The three facts a drain waits on, separately.
     ///
     /// A conjunction that fails has to be able to say which conjunct failed.
@@ -1155,6 +1250,25 @@ impl QueryTaskExecution {
         for candidate in candidates {
             self.rollback_unsent(candidate.target, candidate.intent.operation_id());
         }
+    }
+
+    /// Releases a batch which a pre-transport gate proved definitely unsent.
+    ///
+    /// `take_batch` already removed its queue counters. Dropping the attached
+    /// process permits releases capacity; rolling back each owner marker lets
+    /// attempt convergence mint only the cleanup work it still owes.
+    fn rollback_rejected_batch(&mut self, batch: DispatchBatch) -> Result<(), TaskExecutionError> {
+        let (operations, queue_permits) = batch.into_queue_parts();
+        drop(queue_permits);
+        for operation in operations {
+            let operation_id = operation.operation_id();
+            let target = self
+                .operation_targets
+                .remove(&operation_id)
+                .ok_or(TaskExecutionError::UnknownOperation)?;
+            self.rollback_unsent(target, operation_id);
+        }
+        Ok(())
     }
 
     fn rollback_unsent(&mut self, target: OperationTarget, operation_id: TaskOperationId) {
