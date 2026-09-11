@@ -37,7 +37,10 @@ use crate::analysis::OutputColumn;
 use crate::binding::SqlTableBindingId;
 use crate::catalog::ResolvedAnalyzerTable;
 use crate::column_id::ColumnRefFactory;
-use crate::plan_read::{BoundaryContract, DistributedPlan, FragmentId, PlanScanNode};
+use crate::plan_read::{
+    BoundaryContract, DistributedPlan, FragmentEdgeKind, FragmentId, FragmentStreamKind,
+    PartitionKind, PlanScanNode,
+};
 pub use crate::planner::payload::SqlScanOccurrence;
 use crate::planner::payload::{MvRewriteInputSelection, MvRewriteSelection};
 use novarocks_spi::connector::ConnectorReadPurpose;
@@ -98,6 +101,268 @@ pub fn project_execution_preparation_facts(plan: &DistributedPlan) -> SqlExecuti
         producer_fragment_ids: topology.producer_fragment_ids().to_vec(),
         boundary_contracts: plan.boundaries().contracts().to_vec(),
     }
+}
+
+/// One fragment's immutable scan membership in a sealed preparation plan.
+///
+/// The scan identities retain the preparation seal, so an application can
+/// join these scheduling facts to its frozen scan descriptions without using a
+/// plan-node id as an authority by itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlFragmentSchedulingFacts {
+    fragment_id: FragmentId,
+    scans: Vec<SealedScanIdentity>,
+}
+
+impl SqlFragmentSchedulingFacts {
+    pub const fn fragment_id(&self) -> FragmentId {
+        self.fragment_id
+    }
+
+    pub fn scans(&self) -> &[SealedScanIdentity] {
+        &self.scans
+    }
+}
+
+/// Runtime-neutral shape of one sealed inter-fragment edge.
+///
+/// Stream kind is normalized to the behavior scheduling consumes. In
+/// particular, a CTE multicast edge is a broadcast even though the planner
+/// retains its more specific edge category for native encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SqlSchedulingEdgeFacts {
+    source_fragment_id: FragmentId,
+    target_fragment_id: FragmentId,
+    target_exchange_node_id: i32,
+    stream_kind: FragmentStreamKind,
+    hash_partitioned: bool,
+}
+
+impl SqlSchedulingEdgeFacts {
+    pub const fn source_fragment_id(self) -> FragmentId {
+        self.source_fragment_id
+    }
+
+    pub const fn target_fragment_id(self) -> FragmentId {
+        self.target_fragment_id
+    }
+
+    pub const fn target_exchange_node_id(self) -> i32 {
+        self.target_exchange_node_id
+    }
+
+    pub const fn stream_kind(self) -> FragmentStreamKind {
+        self.stream_kind
+    }
+
+    pub const fn is_hash_partitioned(self) -> bool {
+        self.hash_partitioned
+    }
+}
+
+/// Immutable SQL-owned scheduling projection of one sealed preparation plan.
+///
+/// This is a copy-only view over already sealed topology, scan membership and
+/// edge shape. It carries no planner tree, endpoint, protocol payload or
+/// runtime capability. Construction reuses the exact scan contracts minted by
+/// [`SealedPreparationPlan`], rather than manufacturing identities from node
+/// ids after the plan has crossed into an application.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlExecutionSchedulingFacts {
+    topological_fragment_order: Vec<FragmentId>,
+    execution_anchor_fragment_id: FragmentId,
+    fragments: Vec<SqlFragmentSchedulingFacts>,
+    edges: Vec<SqlSchedulingEdgeFacts>,
+}
+
+impl SqlExecutionSchedulingFacts {
+    pub fn topological_fragment_order(&self) -> &[FragmentId] {
+        &self.topological_fragment_order
+    }
+
+    pub const fn execution_anchor_fragment_id(&self) -> FragmentId {
+        self.execution_anchor_fragment_id
+    }
+
+    pub fn fragments(&self) -> &[SqlFragmentSchedulingFacts] {
+        &self.fragments
+    }
+
+    pub fn edges(&self) -> &[SqlSchedulingEdgeFacts] {
+        &self.edges
+    }
+}
+
+/// Project the complete runtime-neutral scheduling shape of one sealed plan.
+pub fn project_execution_scheduling_facts(
+    plan: &SealedPreparationPlan,
+) -> Result<SqlExecutionSchedulingFacts, String> {
+    let scan_identities = plan
+        .scan_contracts()?
+        .into_iter()
+        .map(|contract| contract.identity())
+        .collect::<Vec<_>>();
+    project_execution_scheduling_facts_from_parts(
+        plan.plan(),
+        &scan_identities,
+        plan.id(),
+        project_execution_preparation_facts(plan.plan()),
+    )
+}
+
+fn project_execution_scheduling_facts_from_parts(
+    plan: &DistributedPlan,
+    scan_identities: &[SealedScanIdentity],
+    expected_plan_id: SealedPreparationPlanId,
+    preparation: SqlExecutionPreparationFacts,
+) -> Result<SqlExecutionSchedulingFacts, String> {
+    fn collect_scan_node_ids(node: &crate::plan_read::DistributedNode, output: &mut Vec<i32>) {
+        if matches!(node.payload, crate::plan_read::DistributedNodeKind::Scan(_)) {
+            output.push(node.node_id);
+        }
+        for child in &node.children {
+            collect_scan_node_ids(child, output);
+        }
+    }
+
+    let mut identities_by_node = std::collections::BTreeMap::new();
+    for &identity in scan_identities {
+        if identity.plan() != expected_plan_id {
+            return Err(format!(
+                "scheduling scan node {} belongs to another sealed preparation plan",
+                identity.node_id()
+            ));
+        }
+        let node_id = identity.node_id();
+        if identities_by_node.insert(node_id, identity).is_some() {
+            return Err(format!(
+                "scheduling projection repeats sealed scan identity for node {node_id}"
+            ));
+        }
+    }
+
+    let mut fragment_ids = std::collections::BTreeSet::new();
+    let mut projected_scan_nodes = std::collections::BTreeSet::new();
+    let mut fragments = Vec::with_capacity(plan.fragments().len());
+    for fragment in plan.fragments() {
+        if !fragment_ids.insert(fragment.fragment_id) {
+            return Err(format!(
+                "scheduling projection repeats fragment {}",
+                fragment.fragment_id
+            ));
+        }
+        let mut node_ids = Vec::new();
+        collect_scan_node_ids(&fragment.root, &mut node_ids);
+        node_ids.sort_unstable();
+        let scans = node_ids
+            .into_iter()
+            .map(|node_id| {
+                if !projected_scan_nodes.insert(node_id) {
+                    return Err(format!(
+                        "scheduling projection repeats scan node {node_id} across fragments"
+                    ));
+                }
+                identities_by_node.get(&node_id).copied().ok_or_else(|| {
+                    format!(
+                        "scheduling projection is missing sealed scan identity for node {node_id}"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        fragments.push(SqlFragmentSchedulingFacts {
+            fragment_id: fragment.fragment_id,
+            scans,
+        });
+    }
+
+    let identity_nodes = identities_by_node
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if projected_scan_nodes != identity_nodes {
+        let extra = identity_nodes
+            .difference(&projected_scan_nodes)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "scheduling projection has sealed scan identities absent from fragment membership: {extra:?}"
+        ));
+    }
+
+    let ordered = preparation
+        .topological_fragment_order()
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if ordered.len() != preparation.topological_fragment_order().len() || ordered != fragment_ids {
+        return Err(format!(
+            "sealed scheduling topology order {:?} is not an exact fragment permutation {:?}",
+            preparation.topological_fragment_order(),
+            fragment_ids
+        ));
+    }
+    if !fragment_ids.contains(&preparation.execution_anchor_fragment_id()) {
+        return Err(format!(
+            "sealed scheduling execution anchor {} is absent from fragment membership",
+            preparation.execution_anchor_fragment_id()
+        ));
+    }
+    let topological_position = preparation
+        .topological_fragment_order()
+        .iter()
+        .enumerate()
+        .map(|(position, fragment_id)| (*fragment_id, position))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let edges = plan
+        .edges()
+        .iter()
+        .map(|edge| {
+            let source_position = topological_position
+                .get(&edge.source_fragment_id)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "sealed scheduling edge source fragment {} is absent from topology",
+                        edge.source_fragment_id
+                    )
+                })?;
+            let target_position = topological_position
+                .get(&edge.target_fragment_id)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "sealed scheduling edge target fragment {} is absent from topology",
+                        edge.target_fragment_id
+                    )
+                })?;
+            if source_position >= target_position {
+                return Err(format!(
+                    "sealed scheduling edge {} -> {} violates topological order",
+                    edge.source_fragment_id, edge.target_fragment_id
+                ));
+            }
+            let stream_kind = match edge.edge_kind {
+                FragmentEdgeKind::CteMulticast { .. } => FragmentStreamKind::Broadcast,
+                FragmentEdgeKind::Stream | FragmentEdgeKind::ChangeStreamRouter { .. } => {
+                    edge.stream_kind
+                }
+            };
+            Ok(SqlSchedulingEdgeFacts {
+                source_fragment_id: edge.source_fragment_id,
+                target_fragment_id: edge.target_fragment_id,
+                target_exchange_node_id: edge.target_exchange_node_id,
+                stream_kind,
+                hash_partitioned: matches!(edge.output_partition.kind, PartitionKind::Hash),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(SqlExecutionSchedulingFacts {
+        topological_fragment_order: preparation.topological_fragment_order,
+        execution_anchor_fragment_id: preparation.execution_anchor_fragment_id,
+        fragments,
+        edges,
+    })
 }
 
 /// Validate a Connector negotiation result against the exact sealed scan it
@@ -1124,7 +1389,9 @@ mod tests {
     use super::{
         FrozenConnectorScanIdentity, SealedPreparationPlan, SqlScanPreparationCategory,
         build_frozen_connector_scan_plan, frozen_connector_resolved_analyzer_table,
-        matches_frozen_connector_scan, project_execution_preparation_facts, scan_preparation_facts,
+        matches_frozen_connector_scan, project_execution_preparation_facts,
+        project_execution_scheduling_facts, project_execution_scheduling_facts_from_parts,
+        scan_preparation_facts,
     };
     use crate::binding::SqlTableBindingId;
     use crate::plan_read::DistributedNodeKind;
@@ -1248,6 +1515,159 @@ mod tests {
         assert_eq!(result_facts.result_fragment_id(), Some(7));
         assert!(result_facts.producer_fragment_ids().is_empty());
         assert_eq!(result_facts.boundary_contracts().len(), 1);
+    }
+
+    #[test]
+    fn execution_scheduling_facts_preserve_exact_scan_identity_and_fragment_membership() {
+        use crate::test_support::{NativeEncoderPlanFixture, native_encoder_plan};
+
+        let sealed = SealedPreparationPlan::seal(
+            native_encoder_plan(NativeEncoderPlanFixture::PrunedConnectorScanStreamEdge)
+                .expect("sealed connector stream fixture"),
+        );
+        let contracts = sealed.scan_contracts().expect("sealed scan contracts");
+        let scheduling =
+            project_execution_scheduling_facts(&sealed).expect("sealed scheduling projection");
+        let projected = scheduling
+            .fragments()
+            .iter()
+            .flat_map(|fragment| fragment.scans().iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            projected,
+            contracts
+                .iter()
+                .map(super::SealedScanContract::identity)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            projected
+                .iter()
+                .all(|identity| identity.plan() == sealed.id())
+        );
+    }
+
+    #[test]
+    fn execution_scheduling_facts_reject_missing_scan_contract() {
+        use crate::test_support::{NativeScanFixture, native_scan_plan};
+
+        let sealed = SealedPreparationPlan::seal(
+            native_scan_plan(NativeScanFixture::ConnectorRead).expect("sealed scan fixture"),
+        );
+        let error = project_execution_scheduling_facts_from_parts(
+            sealed.plan(),
+            &[],
+            sealed.id(),
+            project_execution_preparation_facts(sealed.plan()),
+        )
+        .expect_err("scan membership without its sealed identity must fail");
+
+        assert!(error.contains("missing sealed scan identity"));
+    }
+
+    #[test]
+    fn execution_scheduling_facts_reject_duplicate_scan_contract() {
+        use crate::test_support::{NativeScanFixture, native_scan_plan};
+
+        let sealed = SealedPreparationPlan::seal(
+            native_scan_plan(NativeScanFixture::ConnectorRead).expect("sealed scan fixture"),
+        );
+        let identity = sealed
+            .scan_contracts()
+            .expect("sealed scan contracts")
+            .into_iter()
+            .next()
+            .expect("fixture scan contract")
+            .identity();
+        let error = project_execution_scheduling_facts_from_parts(
+            sealed.plan(),
+            &[identity, identity],
+            sealed.id(),
+            project_execution_preparation_facts(sealed.plan()),
+        )
+        .expect_err("duplicate sealed identity must fail");
+
+        assert!(error.contains("repeats sealed scan identity"));
+    }
+
+    #[test]
+    fn execution_scheduling_facts_reject_same_shape_identity_from_another_seal() {
+        use crate::test_support::{NativeScanFixture, native_scan_plan};
+
+        let sealed = SealedPreparationPlan::seal(
+            native_scan_plan(NativeScanFixture::ConnectorRead).expect("sealed scan fixture"),
+        );
+        let other = SealedPreparationPlan::seal(
+            native_scan_plan(NativeScanFixture::ConnectorRead).expect("second sealed scan fixture"),
+        );
+        let foreign_identity = other
+            .scan_contracts()
+            .expect("foreign scan contracts")
+            .into_iter()
+            .next()
+            .expect("foreign scan identity")
+            .identity();
+
+        let error = project_execution_scheduling_facts_from_parts(
+            sealed.plan(),
+            &[foreign_identity],
+            sealed.id(),
+            project_execution_preparation_facts(sealed.plan()),
+        )
+        .expect_err("an isomorphic plan's scan identity must not cross the seal");
+
+        assert!(error.contains("belongs to another sealed preparation plan"));
+    }
+
+    #[test]
+    fn execution_scheduling_facts_copy_sealed_edge_shape() {
+        use crate::plan_read::FragmentStreamKind;
+        use crate::test_support::{NativeBuildFixture, native_build_plan};
+
+        let sealed = SealedPreparationPlan::seal(
+            native_build_plan(NativeBuildFixture::HashPartitionedStream)
+                .expect("sealed hash stream fixture"),
+        );
+        let scheduling =
+            project_execution_scheduling_facts(&sealed).expect("sealed scheduling projection");
+
+        assert_eq!(scheduling.topological_fragment_order(), [1, 0]);
+        assert_eq!(scheduling.execution_anchor_fragment_id(), 0);
+        assert_eq!(scheduling.edges().len(), 1);
+        let edge = scheduling.edges()[0];
+        assert_eq!(edge.source_fragment_id(), 1);
+        assert_eq!(edge.target_fragment_id(), 0);
+        assert_eq!(edge.target_exchange_node_id(), 20);
+        assert_eq!(edge.stream_kind(), FragmentStreamKind::Partitioned);
+        assert!(edge.is_hash_partitioned());
+    }
+
+    #[test]
+    fn execution_scheduling_facts_reject_edge_against_topological_order() {
+        use crate::test_support::{NativeBuildFixture, native_build_plan};
+
+        let sealed = SealedPreparationPlan::seal(
+            native_build_plan(NativeBuildFixture::HashPartitionedStream)
+                .expect("sealed hash stream fixture"),
+        );
+        let mut preparation = project_execution_preparation_facts(sealed.plan());
+        preparation.topological_fragment_order.reverse();
+        let identities = sealed
+            .scan_contracts()
+            .expect("sealed scan contracts")
+            .into_iter()
+            .map(|contract| contract.identity())
+            .collect::<Vec<_>>();
+        let error = project_execution_scheduling_facts_from_parts(
+            sealed.plan(),
+            &identities,
+            sealed.id(),
+            preparation,
+        )
+        .expect_err("an edge against the supplied sealed order must fail");
+
+        assert!(error.contains("violates topological order"));
     }
 
     #[test]

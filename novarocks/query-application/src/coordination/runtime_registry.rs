@@ -47,6 +47,8 @@ static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 pub struct LogicalExecutionRuntimeRegistry {
     handle: LogicalExecutionRuntimeRegistryHandle,
     shutdown_complete: bool,
+    #[cfg(test)]
+    injected_shutdown_error: Option<LogicalExecutionRuntimeRegistryError>,
 }
 
 #[derive(Clone)]
@@ -326,6 +328,8 @@ impl LogicalExecutionRuntimeRegistry {
                 }),
             },
             shutdown_complete: false,
+            #[cfg(test)]
+            injected_shutdown_error: None,
         }
     }
 
@@ -354,6 +358,10 @@ impl LogicalExecutionRuntimeRegistry {
         // capacity, so even an already-expired deadline records shutdown on
         // every actor that was installed when shutdown began.
         self.handle.request_close_for_installed();
+        #[cfg(test)]
+        if let Some(error) = self.injected_shutdown_error.take() {
+            return Err(error.into());
+        }
         let drain = self.handle.drain_for_shutdown();
         match tokio::time::timeout_at(deadline.into(), drain).await {
             Ok(Ok(())) => {
@@ -366,6 +374,14 @@ impl LogicalExecutionRuntimeRegistry {
                 remaining_entries: self.handle.entry_count(),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_shutdown_error_once(
+        &mut self,
+        error: LogicalExecutionRuntimeRegistryError,
+    ) {
+        assert!(self.injected_shutdown_error.replace(error).is_none());
     }
 
     /// Closes reservation admission and succeeds only after every installed
@@ -719,6 +735,25 @@ impl LogicalExecutionRuntimeRegistryHandle {
             actor_id: joined.actor_id,
             outcome: joined.outcome,
         })
+    }
+
+    /// Requests actor ingress closure, waits for the exact closure fact, then
+    /// consumes the Registry-owned join and retirement receipts. Cancelling
+    /// this future leaves both the actor task and join handle in the Registry.
+    pub(crate) async fn join_and_retire(
+        &self,
+        mut registration: LogicalExecutionRegistration,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        let actor = self.actor(&registration)?;
+        let mut closed = actor.request_registry_close_for_join();
+        while !*closed.borrow_and_update() {
+            if closed.changed().await.is_err() {
+                break;
+            }
+        }
+        self.record_ingress_closed(&registration)?;
+        let receipt = self.join(&mut registration).await?;
+        self.retire(receipt).map_err(|(error, _receipt)| error)
     }
 
     pub(crate) fn retire(

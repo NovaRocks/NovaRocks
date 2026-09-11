@@ -24,7 +24,10 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_sql::{
     plan_read::{DistributedPlan, OutputColumn},
-    planning::query_execution::{SealedPreparationPlan, SealedScanContract, SealedScanIdentity},
+    planning::query_execution::{
+        SealedPreparationPlan, SealedScanContract, SealedScanIdentity, SqlExecutionSchedulingFacts,
+        project_execution_scheduling_facts,
+    },
 };
 
 use crate::api::{
@@ -797,6 +800,7 @@ impl FrozenExecutionDescriptionDraft {
 pub struct FrozenExecutionDescription {
     kind: QueryExecutionKind,
     plan: Arc<DistributedPlan>,
+    scheduling: Arc<SqlExecutionSchedulingFacts>,
     scans: Arc<[FrozenScanDescription]>,
     mv_candidate_match: Option<StrictMvCandidateMatch>,
     output: OutputContract,
@@ -982,6 +986,7 @@ impl FrozenExecutionDescription {
         if draft.effect == ExecutionEffect::External {
             residuals.insert(ResidualResponsibility::EffectCommit);
         }
+        let scheduling = Arc::new(project_execution_scheduling_facts(&draft.plan)?);
         let scans = draft
             .scan_receipts
             .into_iter()
@@ -991,6 +996,7 @@ impl FrozenExecutionDescription {
         Ok(Self {
             kind: draft.kind,
             plan,
+            scheduling,
             scans: scans.into(),
             mv_candidate_match: draft.mv_candidate_match,
             output,
@@ -1007,6 +1013,9 @@ impl FrozenExecutionDescription {
     }
     pub fn plan(&self) -> &DistributedPlan {
         self.plan.as_ref()
+    }
+    pub fn scheduling(&self) -> &SqlExecutionSchedulingFacts {
+        self.scheduling.as_ref()
     }
     /// Share the one immutable plan owned by this logical execution without
     /// rebuilding or deep-cloning it for a replacement attempt.
@@ -1051,7 +1060,7 @@ fn same_output_columns(left: &[OutputColumn], right: &[OutputColumn]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use novarocks_spi::connector::read_stack::adapter::{ProviderReadRuntime, ReadRuntimeAdapter};
@@ -1205,7 +1214,7 @@ mod tests {
         resolve_plan_scan_bindings(plan, &receipts.seal()).unwrap()
     }
 
-    fn scan_draft(
+    pub(crate) fn scan_draft(
         plan: DistributedPlan,
         effect: ExecutionEffect,
         recovery: RecoveryMode,

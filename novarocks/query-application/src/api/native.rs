@@ -26,17 +26,18 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use novarocks_execution_contract::{QueryContextRef, TaskIdentity};
-use novarocks_types::identity::QueryExecutionId;
-use novarocks_workload_control::WorkScope;
+use novarocks_sql::planning::query_execution::SealedScanIdentity;
+use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
+use novarocks_workload_control::{CancellationView, WorkId};
 
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 use crate::coordination::{
-    AbortQueryContextEffectPort, AttemptFailureClass, RecoveryMode,
-    ReplacementQualificationEffectPort,
+    AbortQueryContextEffectPort, AttemptFailureClass, AttemptSchedule, NativeAttemptDrive,
+    RecoveryMode, ReplacementQualificationEffectPort,
 };
 use crate::preparation::FrozenExecutionDescription;
 
@@ -207,13 +208,132 @@ pub trait NativeAttemptPreparationPort: fmt::Debug + Send + 'static {
     ) -> NativeAttemptPreparationFuture;
 }
 
+/// Future that activates one already ticket-bound Native attempt.
+pub type NativeAttemptActivationFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<ActivatedNativeAttempt, NativeAttemptActivationFailure>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Borrowed execution future polled while the supervisor retains the active
+/// Native owner.
+pub type NativeAttemptRunFuture<'a> =
+    Pin<Box<dyn Future<Output = NativeAttemptTerminal> + Send + 'a>>;
+
+/// Borrowed convergence future for either a dormant or active Native owner.
+/// It resolves only after every resource the owner may have made live has
+/// converged. For an active owner, resolution is positive evidence that every
+/// scheduled context has stopped accepting work for this attempt and its
+/// physical work has stopped, so the supervisor may record exact Registry
+/// convergence. Dropping the future or catching a poll panic leaves the owner
+/// with its supervisor, and a later call must resume the same idempotent
+/// convergence.
+pub type NativeAttemptConvergenceFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 /// Move-only role owner for a prepared attempt that has not started any Task.
 ///
-/// Before binding, the owner must have no asynchronous convergence
-/// responsibility. Dropping it must synchronously release every dormant
-/// resource. Activation and post-activation abandonment belong to the
-/// supervisor transition introduced by T08-C2.
-pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {}
+/// Before binding, the owner has no asynchronous convergence responsibility.
+/// The query supervisor calls `activate` only after the logical actor is
+/// atomically installed. The borrowed future leaves this owner in the
+/// supervisor even when polling panics; the supervisor then consumes it
+/// through `converge`. Success transfers all asynchronous responsibility to
+/// the returned active owner and leaves the dormant owner synchronously
+/// drop-safe.
+pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
+    fn activate<'a>(
+        &'a mut self,
+        schedule: &'a AttemptSchedule,
+        cancellation: CancellationView,
+    ) -> NativeAttemptActivationFuture<'a>;
+
+    fn converge<'a>(
+        &'a mut self,
+        cancellation: CancellationView,
+    ) -> NativeAttemptConvergenceFuture<'a>;
+}
+
+/// Opaque role owner for an attempt whose Native work may now be live.
+///
+/// Query Application retains the owner while the borrowed run future is
+/// polled. A terminal outcome or panic is followed by consuming `converge`.
+pub trait ActiveNativeAttemptOwner: fmt::Debug + Send + 'static {
+    fn run<'a>(
+        &'a mut self,
+        drive: &'a NativeAttemptDrive,
+        cancellation: CancellationView,
+    ) -> NativeAttemptRunFuture<'a>;
+
+    fn converge<'a>(
+        &'a mut self,
+        cancellation: CancellationView,
+    ) -> NativeAttemptConvergenceFuture<'a>;
+}
+
+/// Accepted active Native owner. Wrapper construction keeps role-local owner
+/// details out of coordination while preserving a single move-only owner.
+pub struct ActivatedNativeAttempt {
+    owner: Box<dyn ActiveNativeAttemptOwner>,
+}
+
+impl fmt::Debug for ActivatedNativeAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActivatedNativeAttempt")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ActivatedNativeAttempt {
+    pub fn new(owner: impl ActiveNativeAttemptOwner) -> Self {
+        Self {
+            owner: Box::new(owner),
+        }
+    }
+
+    pub(crate) fn into_owner(self) -> Box<dyn ActiveNativeAttemptOwner> {
+        self.owner
+    }
+}
+
+/// Typed activation failure. The supervisor still retains the exact dormant
+/// owner and must consume it through `converge`.
+pub struct NativeAttemptActivationFailure {
+    failure: NativeAttemptPreparationFailure,
+}
+
+impl fmt::Debug for NativeAttemptActivationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeAttemptActivationFailure")
+            .field("failure", &self.failure)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeAttemptActivationFailure {
+    pub const fn new(failure: NativeAttemptPreparationFailure) -> Self {
+        Self { failure }
+    }
+
+    pub const fn failure(&self) -> &NativeAttemptPreparationFailure {
+        &self.failure
+    }
+
+    pub(crate) fn into_failure(self) -> NativeAttemptPreparationFailure {
+        self.failure
+    }
+}
+
+/// Physical terminal observed while the supervisor still owns the active
+/// attempt. The owner must subsequently be consumed through `converge`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NativeAttemptTerminal {
+    Completed,
+    Failed(NativeAttemptPreparationFailure),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -221,13 +341,11 @@ pub enum NativeExecutionContractError {
     ForeignLogicalOpenTicket,
     ForeignAttemptTicket,
     DifferentLogicalQuery,
-    EmptyContextSet,
-    ContextExecutionMismatch,
-    DuplicateContext,
-    MultipleFrontendProcesses,
-    DuplicateBackendContext,
-    RootExecutionMismatch,
-    RootContextMissing,
+    EmptyEligibleBackends,
+    DuplicateEligibleBackend,
+    MissingScanWorkFact,
+    DuplicateScanWorkFact,
+    ForeignScanWorkFact,
     MissingReplacementPort,
     UnexpectedReplacementPort,
 }
@@ -244,21 +362,15 @@ impl fmt::Display for NativeExecutionContractError {
             Self::DifferentLogicalQuery => {
                 "Native attempt does not belong to the opened logical query"
             }
-            Self::EmptyContextSet => "Native attempt context set must not be empty",
-            Self::ContextExecutionMismatch => {
-                "Native attempt context does not match the exact execution"
+            Self::EmptyEligibleBackends => "Native attempt has no eligible backend process",
+            Self::DuplicateEligibleBackend => {
+                "Native attempt repeats an eligible backend process identity"
             }
-            Self::DuplicateContext => "Native attempt context set contains a duplicate",
-            Self::MultipleFrontendProcesses => {
-                "Native attempt contexts name multiple frontend processes"
+            Self::MissingScanWorkFact => {
+                "Native attempt scan work does not cover every sealed scan"
             }
-            Self::DuplicateBackendContext => {
-                "Native attempt contains multiple contexts for one backend process"
-            }
-            Self::RootExecutionMismatch => "Native root task does not match the exact execution",
-            Self::RootContextMissing => {
-                "Native root task backend has no context in the exact attempt"
-            }
+            Self::DuplicateScanWorkFact => "Native attempt repeats a sealed scan work fact",
+            Self::ForeignScanWorkFact => "Native attempt scan work belongs to another sealed plan",
             Self::MissingReplacementPort => {
                 "recoverable logical execution requires a replacement qualification port"
             }
@@ -275,7 +387,8 @@ impl std::error::Error for NativeExecutionContractError {}
 struct LogicalNativeTicket {
     initial_execution: QueryExecutionId,
     description: Arc<FrozenExecutionDescription>,
-    work: WorkScope,
+    work_id: WorkId,
+    cancellation: CancellationView,
 }
 
 impl fmt::Debug for LogicalNativeTicket {
@@ -283,7 +396,7 @@ impl fmt::Debug for LogicalNativeTicket {
         formatter
             .debug_struct("LogicalNativeTicket")
             .field("initial_execution", &self.initial_execution)
-            .field("work", &self.work.id())
+            .field("work", &self.work_id)
             .finish_non_exhaustive()
     }
 }
@@ -328,8 +441,12 @@ impl LogicalNativeOpenRequest {
         self.ticket.description.as_ref()
     }
 
-    pub fn work(&self) -> &WorkScope {
-        &self.ticket.work
+    pub fn work_id(&self) -> WorkId {
+        self.ticket.work_id
+    }
+
+    pub fn cancellation(&self) -> CancellationView {
+        self.ticket.cancellation.clone()
     }
 
     /// Consumes the only request ticket and binds the role-local attempt port
@@ -360,12 +477,14 @@ impl LogicalNativeOpenRequest {
     pub(crate) fn issue(
         initial_execution: QueryExecutionId,
         description: Arc<FrozenExecutionDescription>,
-        work: WorkScope,
+        work_id: WorkId,
+        cancellation: CancellationView,
     ) -> (Self, LogicalNativeOpenAcceptance) {
         let ticket = Arc::new(LogicalNativeTicket {
             initial_execution,
             description,
-            work,
+            work_id,
+            cancellation,
         });
         (
             Self {
@@ -447,6 +566,37 @@ impl LogicalNativeSession {
 #[derive(Debug)]
 struct AttemptTicket;
 
+/// Native-owned work cardinality for one exact sealed scan occurrence.
+///
+/// This is an input to Query Application scheduling, not a placement result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeScanWork {
+    RuntimeSplits,
+    WholeRelation,
+    FrozenUnits { count: NonZeroUsize },
+}
+
+/// One scan's exact Native work fact, bound to the opaque SQL plan seal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeScanWorkFact {
+    scan: SealedScanIdentity,
+    work: NativeScanWork,
+}
+
+impl NativeScanWorkFact {
+    pub const fn new(scan: SealedScanIdentity, work: NativeScanWork) -> Self {
+        Self { scan, work }
+    }
+
+    pub const fn scan(&self) -> SealedScanIdentity {
+        self.scan
+    }
+
+    pub const fn work(&self) -> NativeScanWork {
+        self.work
+    }
+}
+
 /// Move-only request for one exact physical execution attempt.
 ///
 /// ```compile_fail
@@ -479,25 +629,33 @@ impl NativeAttemptPreparationRequest {
         self.logical_ticket.description.as_ref()
     }
 
-    pub fn work(&self) -> &WorkScope {
-        &self.logical_ticket.work
+    pub fn work_id(&self) -> WorkId {
+        self.logical_ticket.work_id
     }
 
-    /// Consumes this exact prepare ticket and seals the dormant role owner to
-    /// its execution, context manifest, and root task.
+    pub fn cancellation(&self) -> CancellationView {
+        self.logical_ticket.cancellation.clone()
+    }
+
+    /// Consumes this exact prepare ticket and seals Native-owned scheduling
+    /// inputs. Query Application alone derives the context and Task manifest.
     pub fn bind(
         self,
-        contexts: Vec<QueryContextRef>,
-        root: TaskIdentity,
+        eligible_backends: Vec<BackendProcessId>,
+        scan_work: Vec<NativeScanWorkFact>,
         owner: impl DormantNativeAttemptOwner,
     ) -> Result<PreparedNativeAttempt, NativeExecutionContractError> {
-        validate_attempt_manifest(self.execution, &contexts, root)?;
+        validate_prepared_inputs(
+            self.logical_ticket.description.as_ref(),
+            &eligible_backends,
+            &scan_work,
+        )?;
         Ok(PreparedNativeAttempt {
             logical_ticket: self.logical_ticket,
             attempt_ticket: self.attempt_ticket,
             execution: self.execution,
-            contexts: contexts.into_boxed_slice(),
-            root,
+            eligible_backends: eligible_backends.into_boxed_slice(),
+            scan_work: scan_work.into_boxed_slice(),
             owner: Box::new(owner),
         })
     }
@@ -518,8 +676,8 @@ pub struct PreparedNativeAttempt {
     logical_ticket: Arc<LogicalNativeTicket>,
     attempt_ticket: Arc<AttemptTicket>,
     execution: QueryExecutionId,
-    contexts: Box<[QueryContextRef]>,
-    root: TaskIdentity,
+    eligible_backends: Box<[BackendProcessId]>,
+    scan_work: Box<[NativeScanWorkFact]>,
     owner: Box<dyn DormantNativeAttemptOwner>,
 }
 
@@ -528,8 +686,8 @@ impl fmt::Debug for PreparedNativeAttempt {
         formatter
             .debug_struct("PreparedNativeAttempt")
             .field("execution", &self.execution)
-            .field("contexts", &self.contexts)
-            .field("root", &self.root)
+            .field("eligible_backends", &self.eligible_backends)
+            .field("scan_work", &self.scan_work)
             .finish_non_exhaustive()
     }
 }
@@ -537,8 +695,8 @@ impl fmt::Debug for PreparedNativeAttempt {
 #[derive(Debug)]
 pub(crate) struct PreparedNativeAttemptParts {
     pub(crate) execution: QueryExecutionId,
-    pub(crate) contexts: Box<[QueryContextRef]>,
-    pub(crate) root: TaskIdentity,
+    pub(crate) eligible_backends: Box<[BackendProcessId]>,
+    pub(crate) scan_work: Box<[NativeScanWorkFact]>,
     pub(crate) owner: Box<dyn DormantNativeAttemptOwner>,
 }
 
@@ -574,43 +732,46 @@ impl NativeAttemptPreparationAcceptance {
         }
         Ok(PreparedNativeAttemptParts {
             execution: prepared.execution,
-            contexts: prepared.contexts,
-            root: prepared.root,
+            eligible_backends: prepared.eligible_backends,
+            scan_work: prepared.scan_work,
             owner: prepared.owner,
         })
     }
 }
 
-fn validate_attempt_manifest(
-    execution: QueryExecutionId,
-    contexts: &[QueryContextRef],
-    root: TaskIdentity,
+fn validate_prepared_inputs(
+    description: &FrozenExecutionDescription,
+    eligible_backends: &[BackendProcessId],
+    scan_work: &[NativeScanWorkFact],
 ) -> Result<(), NativeExecutionContractError> {
-    if root.query_execution_id() != execution {
-        return Err(NativeExecutionContractError::RootExecutionMismatch);
+    if eligible_backends.is_empty() {
+        return Err(NativeExecutionContractError::EmptyEligibleBackends);
     }
-    let Some(first) = contexts.first() else {
-        return Err(NativeExecutionContractError::EmptyContextSet);
-    };
-    let frontend = first.frontend_process_id();
-    let mut exact_contexts = BTreeSet::new();
-    let mut backends = BTreeSet::new();
-    for &context in contexts {
-        if context.query_execution_id() != execution {
-            return Err(NativeExecutionContractError::ContextExecutionMismatch);
+    if eligible_backends
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != eligible_backends.len()
+    {
+        return Err(NativeExecutionContractError::DuplicateEligibleBackend);
+    }
+    let expected = description
+        .scans()
+        .iter()
+        .map(|scan| scan.scan_identity())
+        .collect::<BTreeSet<_>>();
+    let mut actual = BTreeSet::new();
+    for fact in scan_work {
+        if !expected.contains(&fact.scan) {
+            return Err(NativeExecutionContractError::ForeignScanWorkFact);
         }
-        if !exact_contexts.insert(context) {
-            return Err(NativeExecutionContractError::DuplicateContext);
-        }
-        if context.frontend_process_id() != frontend {
-            return Err(NativeExecutionContractError::MultipleFrontendProcesses);
-        }
-        if !backends.insert(context.backend_process_id()) {
-            return Err(NativeExecutionContractError::DuplicateBackendContext);
+        if !actual.insert(fact.scan) {
+            return Err(NativeExecutionContractError::DuplicateScanWorkFact);
         }
     }
-    if !backends.contains(&root.backend_process_id()) {
-        return Err(NativeExecutionContractError::RootContextMissing);
+    if actual != expected {
+        return Err(NativeExecutionContractError::MissingScanWorkFact);
     }
     Ok(())
 }
@@ -628,19 +789,56 @@ mod tests {
         FrozenExecutionDescriptionDraft,
     };
     use novarocks_sql::planning::query_execution::SealedPreparationPlan;
-    use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
-    use novarocks_types::identity::{
-        AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId,
+    use novarocks_sql::test_support::{
+        NativePreparationFixture, NativeScanFixture, native_preparation_plan, native_scan_plan,
     };
+    use novarocks_types::identity::{AttemptId, BackendProcessId, QueryId};
     use novarocks_workload_control::{
-        ResourceConfig, RootWork, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        ResourceConfig, RootWork, WorkClass, WorkRequest, WorkScope, WorkloadConfig,
+        WorkloadControl,
     };
     use tokio::sync::watch;
 
     #[derive(Debug)]
     struct Dormant(u8);
 
-    impl DormantNativeAttemptOwner for Dormant {}
+    #[derive(Debug)]
+    struct ActiveDormant(u8);
+
+    impl ActiveNativeAttemptOwner for ActiveDormant {
+        fn run<'a>(
+            &'a mut self,
+            _drive: &'a NativeAttemptDrive,
+            _cancellation: CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            let _tag = self.0;
+            Box::pin(async { NativeAttemptTerminal::Completed })
+        }
+
+        fn converge<'a>(
+            &'a mut self,
+            _cancellation: CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            Box::pin(async {})
+        }
+    }
+
+    impl DormantNativeAttemptOwner for Dormant {
+        fn activate<'a>(
+            &'a mut self,
+            _schedule: &'a AttemptSchedule,
+            _cancellation: CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            Box::pin(async move { Ok(ActivatedNativeAttempt::new(ActiveDormant(self.0))) })
+        }
+
+        fn converge<'a>(
+            &'a mut self,
+            _cancellation: CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            Box::pin(async {})
+        }
+    }
 
     fn process_bytes(seed: u8) -> [u8; 16] {
         [
@@ -721,9 +919,44 @@ mod tests {
         LogicalNativeOpenAcceptance,
     ) {
         let governance = Governance::new();
-        let (request, acceptance) =
-            LogicalNativeOpenRequest::issue(execution, description(recovery), governance.scope());
+        let scope = governance.scope();
+        let (request, acceptance) = LogicalNativeOpenRequest::issue(
+            execution,
+            description(recovery),
+            scope.id(),
+            scope.cancellation().unwrap(),
+        );
         (governance, request, acceptance)
+    }
+
+    fn issue_description(
+        execution: QueryExecutionId,
+        description: Arc<FrozenExecutionDescription>,
+    ) -> (
+        Governance,
+        LogicalNativeOpenRequest,
+        LogicalNativeOpenAcceptance,
+    ) {
+        let governance = Governance::new();
+        let scope = governance.scope();
+        let (request, acceptance) = LogicalNativeOpenRequest::issue(
+            execution,
+            description,
+            scope.id(),
+            scope.cancellation().unwrap(),
+        );
+        (governance, request, acceptance)
+    }
+
+    fn scan_description() -> Arc<FrozenExecutionDescription> {
+        Arc::new(
+            FrozenExecutionDescription::try_freeze(crate::preparation::tests::scan_draft(
+                native_scan_plan(NativeScanFixture::ConnectorRead).unwrap(),
+                ExecutionEffect::None,
+                RecoveryMode::NoRecovery,
+            ))
+            .unwrap(),
+        )
     }
 
     fn bind_no_recovery(
@@ -761,24 +994,9 @@ mod tests {
         }
     }
 
-    fn manifest(
-        execution: QueryExecutionId,
-    ) -> (
-        Vec<QueryContextRef>,
-        TaskIdentity,
-        FrontendProcessId,
-        BackendProcessId,
-    ) {
-        let frontend = FrontendProcessId::try_from_bytes(process_bytes(1)).unwrap();
+    fn prepared_inputs() -> Vec<BackendProcessId> {
         let backend = BackendProcessId::try_from_bytes(process_bytes(2)).unwrap();
-        let context = QueryContextRef::new(execution, frontend, backend);
-        let root = TaskIdentity::new(
-            execution,
-            StageId::new(1).unwrap(),
-            TaskId::new(1).unwrap(),
-            backend,
-        );
-        (vec![context], root, frontend, backend)
+        vec![backend]
     }
 
     #[test]
@@ -802,8 +1020,8 @@ mod tests {
             .unwrap();
         let (first, first_acceptance) = session.issue_attempt(execution(1, 1)).unwrap();
         let (second, _) = session.issue_attempt(execution(1, 2)).unwrap();
-        let (contexts, root, _, _) = manifest(execution(1, 2));
-        let prepared = second.bind(contexts, root, Dormant(2)).unwrap();
+        let backends = prepared_inputs();
+        let prepared = second.bind(backends, Vec::new(), Dormant(2)).unwrap();
         assert!(matches!(
             first_acceptance.accept(prepared),
             Err(NativeExecutionContractError::ForeignAttemptTicket)
@@ -812,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_attempt_preserves_the_exact_manifest_and_owner() {
+    fn accepted_attempt_preserves_exact_inputs_without_accepting_a_manifest() {
         let (_governance, open, open_acceptance) = issue(execution(1, 1), RecoveryMode::NoRecovery);
         let session = open_acceptance
             .accept(bind_no_recovery(open).unwrap())
@@ -823,15 +1041,15 @@ mod tests {
             request.description(),
             session.ticket.description.as_ref()
         ));
-        assert_eq!(request.work().id(), session.ticket.work.id());
-        let (contexts, root, _, _) = manifest(exact_execution);
+        assert_eq!(request.work_id(), session.ticket.work_id);
+        let backends = prepared_inputs();
         let dormant = Dormant(7);
         assert_eq!(dormant.0, 7);
-        let prepared = request.bind(contexts.clone(), root, dormant).unwrap();
+        let prepared = request.bind(backends.clone(), Vec::new(), dormant).unwrap();
         let parts = acceptance.accept(prepared).unwrap();
         assert_eq!(parts.execution, exact_execution);
-        assert_eq!(parts.contexts.as_ref(), contexts);
-        assert_eq!(parts.root, root);
+        assert_eq!(parts.eligible_backends.as_ref(), backends);
+        assert!(parts.scan_work.is_empty());
         assert_eq!(format!("{:?}", parts.owner), "Dormant(7)");
     }
 
@@ -861,11 +1079,11 @@ mod tests {
 
         let exact_execution = execution(1, 2);
         let (request, acceptance) = session.issue_attempt(exact_execution).unwrap();
-        assert_eq!(request.work().id(), session.ticket.work.id());
+        assert_eq!(request.work_id(), session.ticket.work_id);
         let prepared = session.prepare(request).await.unwrap();
         let parts = acceptance.accept(prepared).unwrap();
         assert_eq!(parts.execution, exact_execution);
-        assert_eq!(parts.root.query_execution_id(), exact_execution);
+        assert_eq!(parts.eligible_backends.as_ref(), prepared_inputs());
     }
 
     #[test]
@@ -926,36 +1144,56 @@ mod tests {
     }
 
     #[test]
-    fn attempt_manifest_rejects_wrong_execution_duplicate_and_missing_root_context() {
+    fn prepared_attempt_rejects_empty_and_duplicate_eligible_backends() {
         let exact = execution(1, 1);
         let (_governance, open, acceptance) = issue(exact, RecoveryMode::NoRecovery);
         let session = acceptance.accept(bind_no_recovery(open).unwrap()).unwrap();
 
-        let (request, _) = session.issue_attempt(exact).unwrap();
-        let (_, wrong_root, _, _) = manifest(execution(1, 2));
-        assert!(matches!(
-            request.bind(Vec::new(), wrong_root, Dormant(1)),
-            Err(NativeExecutionContractError::RootExecutionMismatch)
-        ));
-
-        let (contexts, root, _, _) = manifest(exact);
+        let backends = prepared_inputs();
         let (request, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            request.bind(vec![contexts[0], contexts[0]], root, Dormant(1)),
-            Err(NativeExecutionContractError::DuplicateContext)
+            request.bind(Vec::new(), Vec::new(), Dormant(1)),
+            Err(NativeExecutionContractError::EmptyEligibleBackends)
         ));
 
         let (request, _) = session.issue_attempt(exact).unwrap();
-        let other_backend = BackendProcessId::try_from_bytes(process_bytes(3)).unwrap();
-        let wrong_root = TaskIdentity::new(
-            exact,
-            StageId::new(1).unwrap(),
-            TaskId::new(1).unwrap(),
-            other_backend,
+        assert!(matches!(
+            request.bind(vec![backends[0], backends[0]], Vec::new(), Dormant(1),),
+            Err(NativeExecutionContractError::DuplicateEligibleBackend)
+        ));
+    }
+
+    #[test]
+    fn prepared_attempt_requires_exact_sealed_scan_work_cover() {
+        let exact = execution(7, 1);
+        let description = scan_description();
+        let expected_scan = description.scans()[0].scan_identity();
+        let (_governance, open, acceptance) = issue_description(exact, description);
+        let session = acceptance.accept(bind_no_recovery(open).unwrap()).unwrap();
+        let backend = prepared_inputs();
+
+        let (missing, _) = session.issue_attempt(exact).unwrap();
+        assert!(matches!(
+            missing.bind(backend.clone(), Vec::new(), Dormant(1)),
+            Err(NativeExecutionContractError::MissingScanWorkFact)
+        ));
+
+        let fact = NativeScanWorkFact::new(expected_scan, NativeScanWork::RuntimeSplits);
+        let (duplicate, _) = session.issue_attempt(exact).unwrap();
+        assert!(matches!(
+            duplicate.bind(backend.clone(), vec![fact, fact], Dormant(1)),
+            Err(NativeExecutionContractError::DuplicateScanWorkFact)
+        ));
+
+        let foreign_description = scan_description();
+        let foreign = NativeScanWorkFact::new(
+            foreign_description.scans()[0].scan_identity(),
+            NativeScanWork::WholeRelation,
         );
+        let (foreign_request, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            request.bind(contexts, wrong_root, Dormant(1)),
-            Err(NativeExecutionContractError::RootContextMissing)
+            foreign_request.bind(backend, vec![foreign], Dormant(1)),
+            Err(NativeExecutionContractError::ForeignScanWorkFact)
         ));
     }
 
@@ -983,9 +1221,59 @@ mod tests {
         ) -> NativeAttemptPreparationFuture {
             self.calls += 1;
             assert_eq!(self.calls, 1);
-            let exact_execution = request.execution();
-            let (contexts, root, _, _) = manifest(exact_execution);
-            Box::pin(async move { request.bind(contexts, root, Dormant(9)).map_err(Into::into) })
+            let _exact_execution = request.execution();
+            let backends = prepared_inputs();
+            Box::pin(async move {
+                request
+                    .bind(backends, Vec::new(), Dormant(9))
+                    .map_err(Into::into)
+            })
         }
+    }
+
+    #[derive(Debug)]
+    struct RetryableBorrowedConvergence {
+        polls: usize,
+    }
+
+    impl DormantNativeAttemptOwner for RetryableBorrowedConvergence {
+        fn activate<'a>(
+            &'a mut self,
+            _schedule: &'a AttemptSchedule,
+            _cancellation: CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            Box::pin(async { panic!("test owner is never activated") })
+        }
+
+        fn converge<'a>(
+            &'a mut self,
+            _cancellation: CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            Box::pin(async move {
+                self.polls += 1;
+                if self.polls == 1 {
+                    std::future::pending::<()>().await;
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_convergence_future_retains_the_owner_for_retry() {
+        let governance = Governance::new();
+        let cancellation = governance.scope().cancellation().unwrap();
+        let mut owner = RetryableBorrowedConvergence { polls: 0 };
+        let mut first = owner.converge(cancellation.clone());
+
+        tokio::select! {
+            biased;
+            _ = &mut first => panic!("first convergence must remain pending"),
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(first);
+        assert_eq!(owner.polls, 1);
+
+        owner.converge(cancellation).await;
+        assert_eq!(owner.polls, 2);
     }
 }

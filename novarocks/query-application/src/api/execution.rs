@@ -46,6 +46,10 @@ impl QueryExecutionRequest {
     pub const fn description(&self) -> &FrozenExecutionDescription {
         &self.description
     }
+
+    pub(crate) fn into_description(self) -> FrozenExecutionDescription {
+        self.description
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,8 +105,8 @@ impl Error for QueryExecutionError {}
 pub type QueryExecutionFuture =
     Pin<Box<dyn Future<Output = Result<ExecutionHandle, QueryExecutionError>> + Send + 'static>>;
 
-/// Server-supplied query execution implementation.
-pub trait QueryExecutionDriver: Send + Sync + 'static {
+/// Crate-private process driver behind the bounded client capability.
+pub(crate) trait QueryExecutionDriver: Send + Sync + 'static {
     fn start(&self, request: QueryExecutionRequest, owner: WorkOwner) -> QueryExecutionFuture;
 }
 
@@ -126,7 +130,7 @@ pub struct QueryExecutionClient {
 }
 
 impl QueryExecutionClient {
-    pub fn new(driver: impl QueryExecutionDriver) -> Self {
+    pub(crate) fn new(driver: impl QueryExecutionDriver) -> Self {
         Self {
             driver: Arc::new(driver),
         }

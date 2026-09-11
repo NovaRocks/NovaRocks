@@ -32,8 +32,10 @@ mod result;
 mod result_decode;
 mod result_pump;
 mod runtime_registry;
+mod schedule;
 mod stand_down;
 mod status;
+mod supervisor;
 
 pub use actor::*;
 pub use actor_state::*;
@@ -51,5 +53,7 @@ pub use replacement::*;
 pub use result::*;
 pub use result_pump::*;
 pub use runtime_registry::*;
+pub use schedule::*;
 pub use stand_down::*;
 pub use status::*;
+pub use supervisor::*;
