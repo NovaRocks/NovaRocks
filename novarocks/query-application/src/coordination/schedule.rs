@@ -38,7 +38,7 @@ use crate::api::{NativeScanWork, NativeScanWorkFact};
 use super::{
     AdmissionIssueDisposition, AdmissionIssueReceipt, AdmissionIssueSettlement,
     AttemptActivationIdentity, EstablishIssuePermit, LogicalExecutionActorError,
-    RunningAttemptPermit,
+    RunningAttemptDriveAuthority, RunningAttemptPermit,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -619,37 +619,38 @@ fn take_exchange_edge_id(next: &mut Option<u32>) -> Result<ExchangeEdgeId, Attem
 
 /// Narrow Native capability for actor-owned admission and Establish effects.
 ///
-/// The running permit remains private and is returned only to the Supervisor
-/// after Native execution and convergence complete.
+/// The running permit remains private to the Supervisor. This capability has
+/// no terminal or result-delivery authority and becomes stale when that permit
+/// is consumed.
 pub struct NativeAttemptDrive {
-    permit: Option<RunningAttemptPermit>,
+    authority: RunningAttemptDriveAuthority,
 }
 
 impl fmt::Debug for NativeAttemptDrive {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NativeAttemptDrive")
-            .field("identity", &self.permit().identity())
+            .field("identity", &self.authority.identity())
             .finish_non_exhaustive()
     }
 }
 
 impl NativeAttemptDrive {
-    pub(crate) const fn new(permit: RunningAttemptPermit) -> Self {
+    pub(crate) fn new(permit: &RunningAttemptPermit) -> Self {
         Self {
-            permit: Some(permit),
+            authority: permit.native_drive_authority(),
         }
     }
 
     pub fn identity(&self) -> AttemptActivationIdentity {
-        self.permit().identity()
+        self.authority.identity()
     }
 
     pub async fn begin_admission_issue(
         &self,
         request: AcquireQueryContextAdmissionTicket,
     ) -> Result<AdmissionIssueReceipt, LogicalExecutionActorError> {
-        self.permit().begin_admission_issue(request).await
+        self.authority.begin_admission_issue(request).await
     }
 
     pub async fn settle_admission_issue(
@@ -657,7 +658,7 @@ impl NativeAttemptDrive {
         issue: AdmissionIssueReceipt,
         settlement: AdmissionIssueSettlement,
     ) -> Result<AdmissionIssueDisposition, LogicalExecutionActorError> {
-        self.permit()
+        self.authority
             .settle_admission_issue(issue, settlement)
             .await
     }
@@ -667,7 +668,7 @@ impl NativeAttemptDrive {
         request: Arc<EstablishQueryContext>,
         native_compatibility_id: NativeCompatibilityId,
     ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
-        self.permit()
+        self.authority
             .authorize_establish(request, native_compatibility_id)
             .await
     }
@@ -676,19 +677,7 @@ impl NativeAttemptDrive {
         &self,
         context: QueryContextRef,
     ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
-        self.permit().reauthorize_establish(context).await
-    }
-
-    pub(crate) fn into_permit(mut self) -> RunningAttemptPermit {
-        self.permit
-            .take()
-            .expect("live Native attempt drive retains its running permit")
-    }
-
-    fn permit(&self) -> &RunningAttemptPermit {
-        self.permit
-            .as_ref()
-            .expect("live Native attempt drive retains its running permit")
+        self.authority.reauthorize_establish(context).await
     }
 }
 

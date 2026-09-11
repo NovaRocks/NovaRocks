@@ -375,6 +375,85 @@ pub struct RunningAttemptPermit {
     mailbox_liveness: Option<mpsc::Sender<ActorCommand>>,
 }
 
+/// Non-terminal actor capability used by the Native attempt driver while the
+/// supervisor retains the sole running-attempt decision permit.
+///
+/// This value can issue only admission and Establish commands for one exact
+/// activation. It cannot complete, fail, replace, or deliver results, and a
+/// stale activation is rejected by the actor after the supervisor consumes the
+/// running permit.
+pub(crate) struct RunningAttemptDriveAuthority {
+    activation: AttemptActivationIdentity,
+    mailbox: mpsc::Sender<ActorCommand>,
+}
+
+impl fmt::Debug for RunningAttemptDriveAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunningAttemptDriveAuthority")
+            .field("activation", &self.activation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunningAttemptDriveAuthority {
+    pub(crate) const fn identity(&self) -> AttemptActivationIdentity {
+        self.activation
+    }
+
+    pub(crate) async fn begin_admission_issue(
+        &self,
+        request_to_issue: AcquireQueryContextAdmissionTicket,
+    ) -> Result<AdmissionIssueReceipt, LogicalExecutionActorError> {
+        request(&self.mailbox, |reply| ActorCommand::BeginAdmissionIssue {
+            activation: self.activation,
+            request: request_to_issue,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn settle_admission_issue(
+        &self,
+        admission_issue: AdmissionIssueReceipt,
+        settlement: AdmissionIssueSettlement,
+    ) -> Result<AdmissionIssueDisposition, LogicalExecutionActorError> {
+        request(&self.mailbox, |reply| ActorCommand::SettleAdmissionIssue {
+            activation: self.activation,
+            admission_issue,
+            settlement,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn authorize_establish(
+        &self,
+        request_to_issue: Arc<EstablishQueryContext>,
+        native_compatibility_id: NativeCompatibilityId,
+    ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
+        request(&self.mailbox, |reply| ActorCommand::AuthorizeEstablish {
+            activation: self.activation,
+            request: request_to_issue,
+            native_compatibility_id,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn reauthorize_establish(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
+        request(&self.mailbox, |reply| ActorCommand::ReauthorizeEstablish {
+            activation: self.activation,
+            context,
+            reply,
+        })
+        .await
+    }
+}
+
 impl RunningAttemptPermit {
     pub fn identity(&self) -> AttemptActivationIdentity {
         identity_of(
@@ -393,6 +472,13 @@ impl RunningAttemptPermit {
             capability: Some(capability),
             lifetime: Some(lifetime),
             mailbox_liveness: Some(mailbox_liveness),
+        }
+    }
+
+    pub(crate) fn native_drive_authority(&self) -> RunningAttemptDriveAuthority {
+        RunningAttemptDriveAuthority {
+            activation: self.identity(),
+            mailbox: self.mailbox().clone(),
         }
     }
 
@@ -498,6 +584,24 @@ impl RunningAttemptPermit {
             mailbox: self.mailbox().clone(),
             terminal_mailbox,
         })
+    }
+
+    /// Serializes a pump-owned attempt failure against the result delivery
+    /// boundary. A successful reply proves that no batch is visible or in a
+    /// protocol-owned delivery, and freezes future delivery until the permit
+    /// owner chooses replacement or logical failure.
+    pub(crate) async fn freeze_result_attempt_failure(
+        &self,
+        error: QueryExecutionError,
+    ) -> Result<(), LogicalExecutionActorError> {
+        request(self.mailbox(), |reply| {
+            ActorCommand::FreezeResultAttemptFailure {
+                activation: self.identity(),
+                error,
+                reply,
+            }
+        })
+        .await
     }
 
     /// Transfers the running authority after the coordinator has submitted
@@ -1282,6 +1386,11 @@ enum ActorCommand {
         activation: AttemptActivationIdentity,
         root: TaskIdentity,
         terminal_receiver: mpsc::Receiver<RootTerminalObservation>,
+        reply: ActorReply<()>,
+    },
+    FreezeResultAttemptFailure {
+        activation: AttemptActivationIdentity,
+        error: QueryExecutionError,
         reply: ActorReply<()>,
     },
     ObserveRootStatus {
@@ -3615,6 +3724,46 @@ fn handle_command(
                     *root_terminal_receiver = Some(terminal_receiver);
                     let _ = reply.send(Ok(()));
                 }
+            }
+        }
+        ActorCommand::FreezeResultAttemptFailure {
+            activation,
+            error,
+            reply,
+        } => {
+            let Some(runtime) = result_runtime else {
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            if let Some(conclusion) = state.conclusion() {
+                let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
+                    conclusion,
+                )));
+                return;
+            }
+            if verify_running_activation(state, activation).is_err() {
+                let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
+                return;
+            }
+            runtime.terminal_error = Some(error);
+            let protocol_may_own_rows = matches!(
+                runtime.in_flight,
+                Some(InFlightResult::Batch { .. } | InFlightResult::End { .. })
+            );
+            if state.output_visible() || protocol_may_own_rows {
+                fail_result_observation(state, runtime);
+                if state.conclusion().is_none() {
+                    conclude_failed(state);
+                }
+                let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
+                    LogicalConclusion::Failed,
+                )));
+            } else {
+                runtime.attempt_decision_pending = Some(activation);
+                if let Some(pending) = runtime.pending.take() {
+                    reject_pending_result(state, pending);
+                }
+                let _ = reply.send(Ok(()));
             }
         }
         ActorCommand::ObserveRootStatus {

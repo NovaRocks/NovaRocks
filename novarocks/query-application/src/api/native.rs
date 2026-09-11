@@ -31,6 +31,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use novarocks_execution_contract::QueryContextRef;
 use novarocks_sql::planning::query_execution::{SealedPreparationPlanId, SealedScanIdentity};
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 pub use novarocks_workload_control::CancellationView;
@@ -38,8 +39,8 @@ use novarocks_workload_control::WorkId;
 
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 use crate::coordination::{
-    AbortQueryContextEffectPort, AttemptFailureClass, AttemptSchedule, NativeAttemptDrive,
-    RecoveryMode, ReplacementQualificationEffectPort,
+    AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptFailureClass, AttemptSchedule,
+    NativeAttemptDrive, RecoveryMode, ReplacementQualificationEffectPort, RootResultPumpBinding,
 };
 use crate::preparation::FrozenExecutionDescription;
 
@@ -286,15 +287,79 @@ pub type NativeAttemptActivationFuture<'a> = Pin<
 pub type NativeAttemptRunFuture<'a> =
     Pin<Box<dyn Future<Output = NativeAttemptTerminal> + Send + 'a>>;
 
-/// Borrowed convergence future for either a dormant or active Native owner.
+/// Borrowed convergence future for a dormant Native owner.
 /// It resolves only after every resource the owner may have made live has
-/// converged. For an active owner, resolution is positive evidence that every
-/// scheduled context has stopped accepting work for this attempt and its
-/// physical work has stopped, so the supervisor may record exact Registry
-/// convergence. Dropping the future or catching a poll panic leaves the owner
+/// converged. Dropping the future or catching a poll panic leaves the owner
 /// with its supervisor, and a later call must resume the same idempotent
 /// convergence.
 pub type NativeAttemptConvergenceFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Positive evidence which closes one exact active query context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeContextConvergence {
+    context: QueryContextRef,
+    kind: NativeContextConvergenceKind,
+}
+
+impl NativeContextConvergence {
+    pub const fn worker_stopped_and_context_fenced(context: QueryContextRef) -> Self {
+        Self {
+            context,
+            kind: NativeContextConvergenceKind::WorkerStoppedAndContextFenced,
+        }
+    }
+
+    pub const fn worker_process_replaced(context: QueryContextRef) -> Self {
+        Self {
+            context,
+            kind: NativeContextConvergenceKind::WorkerProcessReplaced,
+        }
+    }
+
+    pub const fn context(self) -> QueryContextRef {
+        self.context
+    }
+
+    pub const fn kind(self) -> NativeContextConvergenceKind {
+        self.kind
+    }
+}
+
+/// Why the residual responsibility for one exact context may be retired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeContextConvergenceKind {
+    WorkerStoppedAndContextFenced,
+    WorkerProcessReplaced,
+}
+
+/// Closed convergence facts returned by an active Native owner.
+///
+/// `AllWorkersStoppedAndContextsFenced` is the compact form for owners which
+/// positively observed the whole attempt drain. The per-context form is used
+/// when an exact process replacement closes only part of an attempt. An
+/// unobservable Worker is deliberately not representable as convergence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeAttemptConvergence {
+    AllWorkersStoppedAndContextsFenced,
+    Contexts(Box<[NativeContextConvergence]>),
+}
+
+impl NativeAttemptConvergence {
+    pub const fn all_workers_stopped_and_contexts_fenced() -> Self {
+        Self::AllWorkersStoppedAndContextsFenced
+    }
+
+    pub fn contexts(contexts: impl Into<Box<[NativeContextConvergence]>>) -> Self {
+        Self::Contexts(contexts.into())
+    }
+}
+
+/// Borrowed convergence future for an active Native owner. Resolution carries
+/// positive closure evidence for every scheduled context. Dropping the future
+/// or catching a poll panic retains the exact owner for a later idempotent
+/// retry.
+pub type NativeActiveAttemptConvergenceFuture<'a> =
+    Pin<Box<dyn Future<Output = NativeAttemptConvergence> + Send + 'a>>;
 
 /// Move-only role owner for a prepared attempt that has not started any Task.
 ///
@@ -338,33 +403,60 @@ pub trait ActiveNativeAttemptOwner: fmt::Debug + Send + 'static {
     fn converge<'a>(
         &'a mut self,
         cancellation: CancellationView,
-    ) -> NativeAttemptConvergenceFuture<'a>;
+    ) -> NativeActiveAttemptConvergenceFuture<'a>;
 }
 
 /// Accepted active Native owner. Wrapper construction keeps role-local owner
 /// details out of coordination while preserving a single move-only owner.
 pub struct ActivatedNativeAttempt {
     owner: Box<dyn ActiveNativeAttemptOwner>,
+    rows: Option<NativeRowsAttemptRuntime>,
 }
 
 impl fmt::Debug for ActivatedNativeAttempt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ActivatedNativeAttempt")
+            .field("has_rows_runtime", &self.rows.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl ActivatedNativeAttempt {
-    pub fn new(owner: impl ActiveNativeAttemptOwner) -> Self {
+    pub fn completion(owner: impl ActiveNativeAttemptOwner) -> Self {
         Self {
             owner: Box::new(owner),
+            rows: None,
         }
     }
 
-    pub(crate) fn into_owner(self) -> Box<dyn ActiveNativeAttemptOwner> {
-        self.owner
+    pub fn rows(
+        owner: impl ActiveNativeAttemptOwner,
+        binding: RootResultPumpBinding,
+        statuses: AcceptedRootStatusSource,
+    ) -> Self {
+        Self {
+            owner: Box::new(owner),
+            rows: Some(NativeRowsAttemptRuntime { binding, statuses }),
+        }
     }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Box<dyn ActiveNativeAttemptOwner>,
+        Option<NativeRowsAttemptRuntime>,
+    ) {
+        (self.owner, self.rows)
+    }
+}
+
+/// Move-only role runtime for the exact root result stream of one activated
+/// attempt. Native retains transport and Task status internals; the query
+/// supervisor receives only the closed pump inputs it owns.
+pub(crate) struct NativeRowsAttemptRuntime {
+    pub(crate) binding: RootResultPumpBinding,
+    pub(crate) statuses: AcceptedRootStatusSource,
 }
 
 /// Typed activation failure. The supervisor still retains the exact dormant
@@ -918,8 +1010,8 @@ mod tests {
         fn converge<'a>(
             &'a mut self,
             _cancellation: CancellationView,
-        ) -> NativeAttemptConvergenceFuture<'a> {
-            Box::pin(async {})
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            Box::pin(async { NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced() })
         }
     }
 
@@ -933,7 +1025,7 @@ mod tests {
             _schedule: &'a AttemptSchedule,
             _cancellation: CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
-            Box::pin(async move { Ok(ActivatedNativeAttempt::new(ActiveDormant(self.tag))) })
+            Box::pin(async move { Ok(ActivatedNativeAttempt::completion(ActiveDormant(self.tag))) })
         }
 
         fn converge<'a>(

@@ -22,7 +22,7 @@
 //! delivery. It deliberately has no Native codec or execution-kernel
 //! dependency.
 
-use std::{future::Future, num::NonZeroUsize, pin::Pin, sync::Arc};
+use std::{future::Future, num::NonZeroUsize, pin::Pin, sync::Arc, time::Instant};
 
 use arrow::record_batch::RecordBatch;
 use novarocks_execution_contract::{
@@ -36,11 +36,12 @@ use novarocks_workload_control::{
 };
 use tokio::sync::{oneshot, watch};
 
+use crate::api::NativeAttemptTerminal;
 use crate::api::{QueryExecutionError, QueryExecutionErrorKind, ResultSchema};
 
 use super::result_decode::{
     BoundedResultDecodeHandle, BoundedResultDecodeOwner, ResultDecodeExecutorConfig,
-    ResultDecodeJob, ResultDecodeWorkerError,
+    ResultDecodeJob, ResultDecodeShutdownError, ResultDecodeWorkerError,
 };
 use super::{
     AttemptFailureClass, LogicalConclusion, LogicalExecutionActor, LogicalExecutionActorError,
@@ -86,12 +87,37 @@ impl RootResultDecodeRuntimeOwner {
         self.runtime.clone()
     }
 
+    /// Closes decode admission without waiting when the process owner has
+    /// committed to exit after bounded graceful shutdown failed.
+    pub fn request_shutdown_for_process_exit(&self) {
+        self.owner.request_close();
+    }
+
     pub fn shutdown_and_join_blocking(self) -> Result<(), QueryExecutionError> {
         let Self { owner, runtime } = self;
         drop(runtime);
         owner.shutdown_and_join().map_err(|error| {
             QueryExecutionError::new(
                 QueryExecutionErrorKind::Failed,
+                format!("shut down result decode runtime failed: {error}"),
+            )
+        })
+    }
+
+    /// Closes decode admission and awaits the exact worker set without moving
+    /// this process owner into a detached blocking task.
+    ///
+    /// Deadline or cancellation leaves this owner intact, so role composition
+    /// can retry the same shutdown after in-flight decode work converges.
+    pub async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), QueryExecutionError> {
+        self.owner.shutdown_until(deadline).await.map_err(|error| {
+            let kind = if matches!(error, ResultDecodeShutdownError::DeadlineExceeded { .. }) {
+                QueryExecutionErrorKind::DeadlineExceeded
+            } else {
+                QueryExecutionErrorKind::Failed
+            };
+            QueryExecutionError::new(
+                kind,
                 format!("shut down result decode runtime failed: {error}"),
             )
         })
@@ -225,6 +251,66 @@ type FetchFn = dyn Fn(RootResultFetchRequest) -> FetchFuture + Send + Sync + 'st
 pub struct RootResultPumpBinding {
     fetch: Box<FetchFn>,
     decode: RootResultDecodeRuntime,
+}
+
+pub(crate) struct NativeAttemptTerminalSender {
+    sender: Option<oneshot::Sender<NativeAttemptTerminal>>,
+}
+
+pub(crate) struct NativeAttemptTerminalSource {
+    receiver: Option<oneshot::Receiver<NativeAttemptTerminal>>,
+}
+
+pub(crate) fn native_attempt_terminal_channel()
+-> (NativeAttemptTerminalSender, NativeAttemptTerminalSource) {
+    let (sender, receiver) = oneshot::channel();
+    (
+        NativeAttemptTerminalSender {
+            sender: Some(sender),
+        },
+        NativeAttemptTerminalSource {
+            receiver: Some(receiver),
+        },
+    )
+}
+
+impl NativeAttemptTerminalSender {
+    pub(crate) fn publish(mut self, terminal: NativeAttemptTerminal) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(terminal);
+        }
+    }
+}
+
+impl NativeAttemptTerminalSource {
+    async fn next(&mut self) -> Result<NativeAttemptTerminal, QueryExecutionError> {
+        let receiver = self
+            .receiver
+            .as_mut()
+            .ok_or_else(|| contract_error("Native attempt terminal was consumed more than once"))?;
+        let terminal = receiver.await.map_err(|_| {
+            contract_error("Native attempt terminal owner dropped without a verdict")
+        })?;
+        self.receiver = None;
+        Ok(terminal)
+    }
+
+    fn try_next(&mut self) -> Result<Option<NativeAttemptTerminal>, QueryExecutionError> {
+        let receiver = self
+            .receiver
+            .as_mut()
+            .ok_or_else(|| contract_error("Native attempt terminal was consumed more than once"))?;
+        match receiver.try_recv() {
+            Ok(terminal) => {
+                self.receiver = None;
+                Ok(Some(terminal))
+            }
+            Err(oneshot::error::TryRecvError::Empty) => Ok(None),
+            Err(oneshot::error::TryRecvError::Closed) => Err(contract_error(
+                "Native attempt terminal owner dropped without a verdict",
+            )),
+        }
+    }
 }
 
 impl RootResultPumpBinding {
@@ -720,13 +806,45 @@ enum PumpInterruption {
 struct PumpRuntime {
     observer: RootResultObserver,
     statuses: AcceptedRootStatusSource,
+    native_terminal: NativeAttemptTerminalSource,
     cancellation: CancellationView,
     root_finished: bool,
     success_sealed: bool,
+    native_completed: bool,
     pending_root_failure: Option<TaskStatus>,
 }
 
 impl PumpRuntime {
+    fn observe_ready_native_terminal(&mut self) -> Result<(), PumpInterruption> {
+        if self.native_completed {
+            return Ok(());
+        }
+        if let Some(terminal) = self
+            .native_terminal
+            .try_next()
+            .map_err(|error| PumpInterruption::Decision(contract_failure(error)))?
+        {
+            self.observe_native_terminal(Ok(terminal))?;
+        }
+        Ok(())
+    }
+
+    fn observe_native_terminal(
+        &mut self,
+        terminal: Result<NativeAttemptTerminal, QueryExecutionError>,
+    ) -> Result<(), PumpInterruption> {
+        match terminal {
+            Ok(NativeAttemptTerminal::Completed) => {
+                self.native_completed = true;
+                Ok(())
+            }
+            Ok(NativeAttemptTerminal::Failed(failure)) => Err(PumpInterruption::Decision(
+                RootResultFetchFailure::new(failure.class(), failure.error().clone()),
+            )),
+            Err(error) => Err(PumpInterruption::Decision(contract_failure(error))),
+        }
+    }
+
     async fn observe_projection(
         &mut self,
         projection: AcceptedRootProjection,
@@ -872,6 +990,9 @@ impl PumpRuntime {
                     reason = self.cancellation.cancelled() => {
                         return Err(PumpInterruption::Cancellation(cancellation_failure(reason)));
                     }
+                    terminal = self.native_terminal.next(), if !self.native_completed => {
+                        self.observe_native_terminal(terminal)?;
+                    }
                     status = self.statuses.next() => {
                         let projection = status.map_err(|error| PumpInterruption::Decision(contract_failure(error)))?;
                         self.observe_projection(projection).await?;
@@ -883,7 +1004,14 @@ impl PumpRuntime {
                 return tokio::select! {
                     biased;
                     reason = self.cancellation.cancelled() => Err(PumpInterruption::Cancellation(cancellation_failure(reason))),
-                    output = &mut future => Ok(output),
+                    terminal = self.native_terminal.next(), if !self.native_completed => {
+                        self.observe_native_terminal(terminal)?;
+                        continue;
+                    }
+                    output = &mut future => {
+                        self.observe_ready_native_terminal()?;
+                        Ok(output)
+                    },
                 };
             }
             tokio::select! {
@@ -891,21 +1019,30 @@ impl PumpRuntime {
                 reason = self.cancellation.cancelled() => {
                     return Err(PumpInterruption::Cancellation(cancellation_failure(reason)));
                 }
+                terminal = self.native_terminal.next(), if !self.native_completed => {
+                    self.observe_native_terminal(terminal)?;
+                }
                 status = self.statuses.next() => {
                     let projection = status.map_err(|error| PumpInterruption::Decision(contract_failure(error)))?;
                     self.observe_projection(projection).await?;
                 }
-                output = &mut future => return Ok(output),
+                output = &mut future => {
+                    self.observe_ready_native_terminal()?;
+                    return Ok(output);
+                },
             }
         }
     }
 
     async fn await_success_seal(&mut self) -> Result<(), PumpInterruption> {
-        while !self.success_sealed {
+        while !self.success_sealed || !self.native_completed {
             tokio::select! {
                 biased;
                 reason = self.cancellation.cancelled() => {
                     return Err(PumpInterruption::Cancellation(cancellation_failure(reason)));
+                }
+                terminal = self.native_terminal.next(), if !self.native_completed => {
+                    self.observe_native_terminal(terminal)?;
                 }
                 status = self.statuses.next() => {
                     let projection = status.map_err(|error| PumpInterruption::Decision(contract_failure(error)))?;
@@ -920,7 +1057,7 @@ impl PumpRuntime {
 /// Runs the only raw-fetch/decode/delivery/ACK loop for one exact attempt.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub async fn run_root_result_pump(
+pub(crate) async fn run_root_result_pump(
     permit: RunningAttemptPermit,
     root: TaskIdentity,
     scope: WorkScope,
@@ -928,6 +1065,7 @@ pub async fn run_root_result_pump(
     schema: ResultSchema,
     binding: RootResultPumpBinding,
     statuses: AcceptedRootStatusSource,
+    native_terminal: NativeAttemptTerminalSource,
     max_wait: MaxWait,
     max_result_bytes: ResultByteLimit,
 ) -> Result<LogicalConclusion, ResultPumpFailure> {
@@ -965,9 +1103,11 @@ pub async fn run_root_result_pump(
     let mut runtime = PumpRuntime {
         observer: observer_owner.clone(),
         statuses,
+        native_terminal,
         cancellation,
         root_finished: false,
         success_sealed: false,
+        native_completed: false,
         pending_root_failure: None,
     };
     let mut expected = ResultPacketSequence::new(0);
@@ -1015,7 +1155,7 @@ pub async fn run_root_result_pump(
             Ok(Ok(outcome)) => outcome,
             Ok(Err(error)) => {
                 drop(credit);
-                return Err(bound_pump_failure(&observer_owner, permit, error));
+                return Err(bound_pump_failure(&observer_owner, permit, error).await);
             }
             Err(interruption) => {
                 drop(credit);
@@ -1037,7 +1177,8 @@ pub async fn run_root_result_pump(
                         contract_failure(contract_error(
                             "root result packet sequence is not the next expected sequence",
                         )),
-                    ));
+                    )
+                    .await);
                 }
                 let bounds = packet.bounds();
                 let payload_bytes = packet.payload_bytes();
@@ -1050,7 +1191,8 @@ pub async fn run_root_result_pump(
                         contract_failure(contract_error(
                             "root result packet exceeded the requested byte limit",
                         )),
-                    ));
+                    )
+                    .await);
                 }
                 let credit = match credit.retain_raw(payload_bytes) {
                     Ok(credit) => credit,
@@ -1104,7 +1246,8 @@ pub async fn run_root_result_pump(
                             &observer_owner,
                             permit,
                             decode_supervisor_failure(ResultDecodeWorkerError::ExecutorClosed),
-                        ));
+                        )
+                        .await);
                     }
                     Err(interruption) => {
                         return Err(
@@ -1115,14 +1258,15 @@ pub async fn run_root_result_pump(
                 let decoded = match runtime.await_step(receipt.complete()).await {
                     Ok(Ok(Ok(decoded))) => decoded,
                     Ok(Ok(Err(failure))) => {
-                        return Err(bound_pump_failure(&observer_owner, permit, failure));
+                        return Err(bound_pump_failure(&observer_owner, permit, failure).await);
                     }
                     Ok(Err(error)) => {
                         return Err(bound_pump_failure(
                             &observer_owner,
                             permit,
                             decode_supervisor_failure(error),
-                        ));
+                        )
+                        .await);
                     }
                     Err(interruption) => {
                         return Err(
@@ -1157,7 +1301,8 @@ pub async fn run_root_result_pump(
                             permit,
                             "deliver root result batch",
                             error,
-                        ));
+                        )
+                        .await);
                     }
                     Err(interruption) => {
                         return Err(
@@ -1175,7 +1320,8 @@ pub async fn run_root_result_pump(
                             contract_failure(contract_error(
                                 "root result packet sequence overflowed",
                             )),
-                        ));
+                        )
+                        .await);
                     }
                 };
             }
@@ -1188,7 +1334,8 @@ pub async fn run_root_result_pump(
                         contract_failure(contract_error(
                             "root result pending EOF does not match the next sequence",
                         )),
-                    ));
+                    )
+                    .await);
                 }
                 pending_eos = Some(sequence);
                 acknowledged = Some(sequence);
@@ -1202,7 +1349,8 @@ pub async fn run_root_result_pump(
                         contract_failure(contract_error(
                             "root result EOF acknowledgement does not match pending EOF",
                         )),
-                    ));
+                    )
+                    .await);
                 }
                 if let Err(error) = runtime
                     .observer
@@ -1214,7 +1362,8 @@ pub async fn run_root_result_pump(
                         permit,
                         "observe final Worker result ACK",
                         error,
-                    ));
+                    )
+                    .await);
                 }
                 if !runtime.success_sealed {
                     let seal_reply = match runtime.statuses.begin_success_seal_request() {
@@ -1224,7 +1373,8 @@ pub async fn run_root_result_pump(
                                 &observer_owner,
                                 permit,
                                 contract_failure(error),
-                            ));
+                            )
+                            .await);
                         }
                     };
                     let seal_result = runtime
@@ -1243,7 +1393,8 @@ pub async fn run_root_result_pump(
                                 &observer_owner,
                                 permit,
                                 contract_failure(error),
-                            ));
+                            )
+                            .await);
                         }
                         Err(interruption) => {
                             return Err(bound_pump_interruption(
@@ -1262,7 +1413,7 @@ pub async fn run_root_result_pump(
                 }
                 return match permit.finish_result_stream().await {
                     Ok(conclusion) => Ok(conclusion),
-                    Err(error) => Err(finish_handoff_failure(observer_owner, error)),
+                    Err(error) => Err(finish_handoff_failure(observer_owner, error).await),
                 };
             }
             _ => {
@@ -1273,7 +1424,8 @@ pub async fn run_root_result_pump(
                     contract_failure(contract_error(
                         "root result outcome is invalid for the current stream phase",
                     )),
-                ));
+                )
+                .await);
             }
         }
     }
@@ -1306,20 +1458,39 @@ fn pump_actor_failure(
     }
 }
 
-fn bound_pump_failure(
+async fn bound_pump_failure(
     observer: &RootResultObserver,
     permit: RunningAttemptPermit,
     failure: RootResultFetchFailure,
 ) -> ResultPumpFailure {
-    ResultPumpFailure::DecisionPending(ResultPumpDecision {
-        permit,
-        observer: Some(observer.clone()),
-        class: failure.class,
-        error: failure.error,
-    })
+    match permit
+        .freeze_result_attempt_failure(failure.error.clone())
+        .await
+    {
+        Ok(()) => ResultPumpFailure::DecisionPending(ResultPumpDecision {
+            permit,
+            observer: Some(observer.clone()),
+            class: failure.class,
+            error: failure.error,
+        }),
+        Err(LogicalExecutionActorError::ExecutionConcluded(conclusion)) => {
+            drop(permit);
+            ResultPumpFailure::Concluded(ConcludedResultPumpFailure {
+                conclusion,
+                class: failure.class,
+                error: failure.error,
+            })
+        }
+        Err(error) => {
+            drop(permit);
+            ResultPumpFailure::ActorOutcomeUnknown(ActorOutcomeUnknownResultPumpFailure {
+                error: actor_failure("freeze result attempt failure", error).error,
+            })
+        }
+    }
 }
 
-fn bound_actor_failure(
+async fn bound_actor_failure(
     observer: &RootResultObserver,
     permit: RunningAttemptPermit,
     operation: &'static str,
@@ -1331,7 +1502,7 @@ fn bound_actor_failure(
         drop(permit);
         concluded_pump_failure(conclusion, failure)
     } else {
-        bound_pump_failure(observer, permit, failure)
+        bound_pump_failure(observer, permit, failure).await
     }
 }
 
@@ -1341,7 +1512,7 @@ async fn bound_pump_interruption(
     interruption: PumpInterruption,
 ) -> ResultPumpFailure {
     match interruption {
-        PumpInterruption::Decision(failure) => bound_pump_failure(observer, permit, failure),
+        PumpInterruption::Decision(failure) => bound_pump_failure(observer, permit, failure).await,
         PumpInterruption::Cancellation(failure) => {
             conclude_cancellation(Some(observer.clone()), permit, failure).await
         }
@@ -1368,7 +1539,7 @@ async fn conclude_cancellation(
         }
         Err(RunningAttemptHandoffError::NotSubmitted { permit, .. }) => {
             if let Some(observer) = observer {
-                bound_pump_failure(&observer, permit, failure)
+                bound_pump_failure(&observer, permit, failure).await
             } else {
                 pump_failure(permit, failure)
             }
@@ -1391,7 +1562,7 @@ fn concluded_pump_failure(
     })
 }
 
-fn finish_handoff_failure(
+async fn finish_handoff_failure(
     observer: RootResultObserver,
     error: RunningAttemptHandoffError,
 ) -> ResultPumpFailure {
@@ -1407,7 +1578,7 @@ fn finish_handoff_failure(
             )
         }
         RunningAttemptHandoffError::NotSubmitted { permit, error } => {
-            bound_actor_failure(&observer, permit, "finish root result stream", error)
+            bound_actor_failure(&observer, permit, "finish root result stream", error).await
         }
         RunningAttemptHandoffError::ActorOutcomeUnknown(error) => {
             drop(observer);
@@ -1596,7 +1767,7 @@ mod tests {
     use tokio::{runtime::Handle, sync::Notify};
 
     use crate::{
-        api::{ExecutionOutput, ResultDelivery, ResultField},
+        api::{ExecutionOutput, NativeAttemptPreparationFailure, ResultDelivery, ResultField},
         coordination::{
             ExecutionEffect, LogicalExecutionActor, LogicalExecutionActorConfig,
             spawn_logical_execution_actor,
@@ -1833,6 +2004,19 @@ mod tests {
             .runtime()
     }
 
+    fn completed_native_terminal() -> NativeAttemptTerminalSource {
+        let (sender, source) = native_attempt_terminal_channel();
+        sender.publish(NativeAttemptTerminal::Completed);
+        source
+    }
+
+    fn failed_native_terminal(message: &str) -> NativeAttemptTerminal {
+        NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
+            AttemptFailureClass::RecoverableInfrastructure,
+            QueryExecutionError::new(QueryExecutionErrorKind::Failed, message),
+        ))
+    }
+
     #[test]
     fn dropping_a_query_binding_does_not_close_the_process_decode_runtime() {
         let owner = RootResultDecodeRuntimeOwner::try_new(
@@ -1982,7 +2166,9 @@ mod tests {
                 permit,
                 error: LogicalExecutionActorError::MailboxClosed,
             },
-        ) else {
+        )
+        .await
+        else {
             panic!("a finish handoff rejected before submission must retain authority");
         };
         assert_eq!(
@@ -2011,7 +2197,8 @@ mod tests {
             RunningAttemptHandoffError::ActorOutcomeUnknown(
                 LogicalExecutionActorError::MailboxClosed,
             ),
-        );
+        )
+        .await;
         let ResultPumpFailure::ActorOutcomeUnknown(failure) = failure else {
             panic!("an accepted handoff without a reply must have unknown outcome");
         };
@@ -2051,6 +2238,7 @@ mod tests {
             result_schema(),
             binding,
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         )
@@ -2150,6 +2338,7 @@ mod tests {
                 RootResultFetchOutcome::EndAcknowledged(ResultPacketSequence::new(1)),
             ]),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(128).unwrap(),
         ));
@@ -2202,6 +2391,7 @@ mod tests {
                 Arc::clone(&decode_calls),
             ))]),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         )
@@ -2256,6 +2446,7 @@ mod tests {
                 Arc::clone(&decode_calls),
             ))]),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(32).unwrap(),
         )
@@ -2316,6 +2507,7 @@ mod tests {
                 }
             }),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         )
@@ -2400,6 +2592,7 @@ mod tests {
                 }
             }),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -2486,6 +2679,7 @@ mod tests {
             result_schema(),
             scripted_binding(vec![RootResultFetchOutcome::Ready(raw)]),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(128).unwrap(),
         ));
@@ -2573,6 +2767,7 @@ mod tests {
             result_schema(),
             binding,
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -2671,6 +2866,7 @@ mod tests {
                 }
             }),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -2734,6 +2930,7 @@ mod tests {
                 Arc::clone(&decode_calls),
             ))]),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -2815,6 +3012,7 @@ mod tests {
             result_schema(),
             binding,
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -2909,6 +3107,7 @@ mod tests {
                 Arc::new(AtomicUsize::new(0)),
             ))]),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -3010,6 +3209,7 @@ mod tests {
             result_schema(),
             binding,
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -3068,9 +3268,11 @@ mod tests {
         let mut runtime = PumpRuntime {
             observer,
             statuses,
+            native_terminal: completed_native_terminal(),
             cancellation,
             root_finished: false,
             success_sealed: false,
+            native_completed: false,
             pending_root_failure: None,
         };
 
@@ -3130,6 +3332,7 @@ mod tests {
                 }
             }),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -3197,6 +3400,7 @@ mod tests {
                 panic!("a pre-existing deadline must prevent root fetch")
             }),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         )
@@ -3266,6 +3470,7 @@ mod tests {
             result_schema(),
             binding,
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -3337,6 +3542,7 @@ mod tests {
                 RootResultFetchOutcome::EndAcknowledged(ResultPacketSequence::new(1)),
             ]),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         )
@@ -3388,6 +3594,7 @@ mod tests {
                 }
             }),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -3485,6 +3692,7 @@ mod tests {
                 }
             }),
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -3606,6 +3814,7 @@ mod tests {
             result_schema(),
             binding,
             statuses,
+            completed_native_terminal(),
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         )
@@ -3626,6 +3835,194 @@ mod tests {
             LogicalConclusion::Failed
         );
         assert!(stream.next().await.is_err());
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn native_failure_without_a_root_status_returns_the_attempt_decision() {
+        let Harness {
+            control,
+            scope,
+            actor,
+            owner,
+            permit,
+            mut stream,
+            root,
+        } = harness(24).await;
+        let (_status_sender, statuses) = accepted_root_status_projection(root);
+        let (terminal_sender, terminal_source) = native_attempt_terminal_channel();
+        terminal_sender.publish(failed_native_terminal(
+            "Native run failed before root status",
+        ));
+        let ResultPumpFailure::DecisionPending(failure) = run_root_result_pump(
+            permit,
+            root,
+            scope,
+            control.resources(),
+            result_schema(),
+            RootResultPumpBinding::new(decode_runtime(), |_| async {
+                std::future::pending::<Result<RootResultFetchOutcome, RootResultFetchFailure>>()
+                    .await
+            }),
+            statuses,
+            terminal_source,
+            MaxWait::new(Duration::from_secs(1)).unwrap(),
+            ResultByteLimit::new(1 << 12).unwrap(),
+        )
+        .await
+        .unwrap_err() else {
+            panic!("Native failure must retain the pre-visibility attempt decision");
+        };
+        assert_eq!(
+            failure.class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        assert_eq!(
+            failure.error().message(),
+            "Native run failed before root status"
+        );
+        assert_eq!(
+            failure.fail_logical(&actor).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        assert!(stream.next().await.is_err());
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn native_failure_published_by_a_ready_fetch_precedes_batch_delivery() {
+        let Harness {
+            control,
+            scope,
+            actor,
+            owner,
+            permit,
+            mut stream,
+            root,
+        } = harness(25).await;
+        let (_status_sender, statuses) = accepted_root_status_projection(root);
+        let (terminal_sender, terminal_source) = native_attempt_terminal_channel();
+        let terminal_sender = Arc::new(Mutex::new(Some(terminal_sender)));
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let binding = RootResultPumpBinding::new(decode_runtime(), {
+            let terminal_sender = Arc::clone(&terminal_sender);
+            let decode_calls = Arc::clone(&decode_calls);
+            move |_| {
+                terminal_sender
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("the first fetch owns the Native terminal sender")
+                    .publish(failed_native_terminal(
+                        "Native run failed while a result packet became ready",
+                    ));
+                let packet = packet(0, Arc::clone(&decode_calls));
+                async move { Ok(RootResultFetchOutcome::Ready(packet)) }
+            }
+        });
+        let ResultPumpFailure::DecisionPending(failure) = run_root_result_pump(
+            permit,
+            root,
+            scope,
+            control.resources(),
+            result_schema(),
+            binding,
+            statuses,
+            terminal_source,
+            MaxWait::new(Duration::from_secs(1)).unwrap(),
+            ResultByteLimit::new(1 << 12).unwrap(),
+        )
+        .await
+        .unwrap_err() else {
+            panic!("Native failure must win the same-poll packet race");
+        };
+        assert_eq!(decode_calls.load(Ordering::SeqCst), 0);
+        assert!(!actor.snapshot().await.unwrap().output_visible);
+        assert_eq!(
+            failure.fail_logical(&actor).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        assert!(stream.next().await.is_err());
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn native_failure_published_by_final_ack_precedes_success() {
+        let Harness {
+            control,
+            scope,
+            actor,
+            owner,
+            permit,
+            mut stream,
+            root,
+        } = harness(26).await;
+        let seal_port = Arc::new(TestSuccessSealPort::default());
+        let (status_sender, statuses) = accepted_root_status_projection_with_seal_port(
+            root,
+            Arc::clone(&seal_port) as Arc<dyn AcceptedRootSuccessSealPort>,
+        );
+        status_sender.publish(finished(root)).unwrap();
+        let (terminal_sender, terminal_source) = native_attempt_terminal_channel();
+        let terminal_sender = Arc::new(Mutex::new(Some(terminal_sender)));
+        let fetch_index = Arc::new(AtomicUsize::new(0));
+        let binding = RootResultPumpBinding::new(decode_runtime(), {
+            let terminal_sender = Arc::clone(&terminal_sender);
+            let fetch_index = Arc::clone(&fetch_index);
+            move |_| {
+                let index = fetch_index.fetch_add(1, Ordering::SeqCst);
+                if index == 1 {
+                    terminal_sender
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("the final ACK owns the Native terminal sender")
+                        .publish(failed_native_terminal(
+                            "Native run failed while final ACK became ready",
+                        ));
+                }
+                async move {
+                    Ok(if index == 0 {
+                        RootResultFetchOutcome::EndPending(ResultPacketSequence::new(0))
+                    } else {
+                        RootResultFetchOutcome::EndAcknowledged(ResultPacketSequence::new(0))
+                    })
+                }
+            }
+        });
+        let ResultPumpFailure::DecisionPending(failure) = run_root_result_pump(
+            permit,
+            root,
+            scope,
+            control.resources(),
+            result_schema(),
+            binding,
+            statuses,
+            terminal_source,
+            MaxWait::new(Duration::from_secs(1)).unwrap(),
+            ResultByteLimit::new(1 << 12).unwrap(),
+        )
+        .await
+        .unwrap_err() else {
+            panic!("Native failure must win the same-poll success race");
+        };
+        assert_eq!(
+            failure.error().message(),
+            "Native run failed while final ACK became ready"
+        );
+        assert!(seal_port.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            failure.fail_logical(&actor).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        assert!(stream.next().await.is_err());
+        drop(status_sender);
         drop(stream);
         drop(actor);
         drop(owner);

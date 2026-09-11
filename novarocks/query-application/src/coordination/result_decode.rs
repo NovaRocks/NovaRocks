@@ -28,9 +28,10 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Condvar, Mutex, OnceLock, mpsc},
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 type DecodeCall<R> = Box<dyn FnOnce() -> R + Send + 'static>;
 
@@ -173,11 +174,13 @@ struct QueueState<R> {
     closed: bool,
     jobs: VecDeque<QueuedJob<R>>,
     running: usize,
+    live_workers: usize,
 }
 
 struct Shared<R> {
     state: Mutex<QueueState<R>>,
     ready: Condvar,
+    worker_exit: Notify,
     queue_slots: Arc<Semaphore>,
     worker_threads: usize,
     queue_capacity: usize,
@@ -230,8 +233,10 @@ impl<R: Send + 'static> BoundedResultDecodeOwner<R> {
                 closed: false,
                 jobs: VecDeque::with_capacity(queue_capacity),
                 running: 0,
+                live_workers: 0,
             }),
             ready: Condvar::new(),
+            worker_exit: Notify::new(),
             queue_slots: Arc::new(Semaphore::new(queue_capacity)),
             worker_threads,
             queue_capacity,
@@ -243,7 +248,14 @@ impl<R: Send + 'static> BoundedResultDecodeOwner<R> {
                 .name(format!("result-decode-{index}"))
                 .spawn(move || run_worker(worker_shared))
             {
-                Ok(worker) => workers.push(worker),
+                Ok(worker) => {
+                    shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .live_workers += 1;
+                    workers.push(worker);
+                }
                 Err(error) => {
                     close_queue(&shared);
                     for worker in workers {
@@ -269,6 +281,10 @@ impl<R> BoundedResultDecodeOwner<R> {
         }
     }
 
+    pub(crate) fn request_close(&self) {
+        close_queue(&self.shared);
+    }
+
     /// Closes admission and synchronously joins the fixed worker set.
     ///
     /// Process composition must call this from its blocking shutdown path, not
@@ -279,8 +295,39 @@ impl<R> BoundedResultDecodeOwner<R> {
         self.shutdown_and_join_inner()
     }
 
+    /// Closes admission and waits for the same fixed worker set under one
+    /// absolute deadline.
+    ///
+    /// The unique owner and every unjoined worker handle remain in place when
+    /// the wait is cancelled or the deadline elapses, so process composition
+    /// can resume the exact shutdown instead of detaching a blocking join.
+    pub(crate) async fn shutdown_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), ResultDecodeShutdownError> {
+        close_queue(&self.shared);
+        let wait = wait_for_worker_exit(&self.shared);
+        if tokio::time::timeout_at(deadline.into(), wait)
+            .await
+            .is_err()
+        {
+            let live_workers = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .live_workers;
+            return Err(ResultDecodeShutdownError::DeadlineExceeded { live_workers });
+        }
+        self.join_finished_workers()
+    }
+
     fn shutdown_and_join_inner(&mut self) -> Result<(), ResultDecodeShutdownError> {
         close_queue(&self.shared);
+        self.join_finished_workers()
+    }
+
+    fn join_finished_workers(&mut self) -> Result<(), ResultDecodeShutdownError> {
         let workers = self
             .workers
             .get_mut()
@@ -294,23 +341,29 @@ impl<R> BoundedResultDecodeOwner<R> {
         if panicked_workers == 0 {
             Ok(())
         } else {
-            Err(ResultDecodeShutdownError { panicked_workers })
+            Err(ResultDecodeShutdownError::WorkerPanicked { panicked_workers })
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResultDecodeShutdownError {
-    panicked_workers: usize,
+pub(crate) enum ResultDecodeShutdownError {
+    DeadlineExceeded { live_workers: usize },
+    WorkerPanicked { panicked_workers: usize },
 }
 
 impl fmt::Display for ResultDecodeShutdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} result decode worker(s) panicked during shutdown",
-            self.panicked_workers
-        )
+        match self {
+            Self::DeadlineExceeded { live_workers } => write!(
+                formatter,
+                "result decode shutdown deadline exceeded with {live_workers} live worker(s)"
+            ),
+            Self::WorkerPanicked { panicked_workers } => write!(
+                formatter,
+                "{panicked_workers} result decode worker(s) panicked during shutdown"
+            ),
+        }
     }
 }
 
@@ -365,6 +418,22 @@ impl<R: Send + 'static> BoundedResultDecodeHandle<R> {
 }
 
 fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
+    struct Exit<'a, R>(&'a Shared<R>);
+
+    impl<R> Drop for Exit<'_, R> {
+        fn drop(&mut self) {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.live_workers -= 1;
+            drop(state);
+            self.0.worker_exit.notify_waiters();
+        }
+    }
+
+    let _exit = Exit(shared.as_ref());
     loop {
         let queued = {
             let mut state = shared
@@ -405,6 +474,24 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.running -= 1;
+    }
+}
+
+async fn wait_for_worker_exit<R>(shared: &Shared<R>) {
+    loop {
+        let notified = shared.worker_exit.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .live_workers
+            == 0
+        {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -796,6 +883,38 @@ mod tests {
         }
         assert_eq!(running.complete().await.unwrap(), 1);
         releaser.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_deadline_retains_the_same_decode_workers_for_retry() {
+        let (mut owner, handle) = executor::<usize>(1, 1);
+        let (release, released) = mpsc::channel();
+        let (started, observed_start) = mpsc::channel();
+        let running = handle
+            .submit(ResultDecodeJob::new(move || {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                1
+            }))
+            .await
+            .unwrap();
+        receive(&observed_start).await;
+
+        assert_eq!(
+            owner.shutdown_until(Instant::now()).await,
+            Err(ResultDecodeShutdownError::DeadlineExceeded { live_workers: 1 })
+        );
+        match handle.submit(ResultDecodeJob::new(|| 2)).await {
+            Ok(_) => panic!("decode shutdown must keep intake closed across retry"),
+            Err(error) => drop(error.into_job()),
+        }
+
+        release.send(()).unwrap();
+        assert_eq!(running.complete().await.unwrap(), 1);
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("retry joins the original worker set");
     }
 
     #[test]

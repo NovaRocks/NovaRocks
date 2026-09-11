@@ -102,6 +102,26 @@ impl LogicalExecutionTestHarness {
         Ok(identity)
     }
 
+    /// Borrows the same narrow Native drive authority production active
+    /// attempts receive. The running permit remains owned by this harness.
+    pub fn native_attempt_drive(&self) -> crate::coordination::NativeAttemptDrive {
+        crate::coordination::NativeAttemptDrive::new(
+            self.running
+                .as_ref()
+                .expect("the test attempt must be activated before Native drive"),
+        )
+    }
+
+    /// Abandons the active attempt so tests can drive its real stand-down and
+    /// registry-shutdown path after exercising a borrowed Native drive.
+    pub fn abandon_running_attempt(&mut self) {
+        drop(
+            self.running
+                .take()
+                .expect("the test attempt must be activated before abandonment"),
+        );
+    }
+
     /// Begins the exact admission issue used by Native Abort adapter tests and
     /// abandons the running permit so the actor must supervise stand-down.
     pub async fn begin_admission_issue_and_abandon(

@@ -1280,6 +1280,12 @@ impl EstablishTransportSubmission {
         })
     }
 
+    /// Returns an accepted handoff which a layered transport still proves did
+    /// not cross its final I/O boundary.
+    pub fn definitely_unsent(mut self) -> Result<(), EstablishIssueError> {
+        self.settle(EstablishIssueEventKind::DefinitelyUnsent)
+    }
+
     pub fn worker_settled(mut self, outcome: OperationOutcome) -> Result<(), EstablishIssueError> {
         self.settle(EstablishIssueEventKind::WorkerSettled(
             EstablishWorkerSettlement::from_outcome(outcome),

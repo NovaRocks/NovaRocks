@@ -360,6 +360,9 @@ impl LogicalExecutionRuntimeRegistry {
         self.handle.request_close_for_installed();
         #[cfg(test)]
         if let Some(error) = self.injected_shutdown_error.take() {
+            if self.handle.entry_count() == 0 {
+                self.shutdown_complete = true;
+            }
             return Err(error.into());
         }
         let drain = self.handle.drain_for_shutdown();
@@ -369,11 +372,37 @@ impl LogicalExecutionRuntimeRegistry {
                 self.shutdown_complete = true;
                 Ok(())
             }
-            Ok(Err(error)) => Err(error.into()),
+            Ok(Err(error)) => {
+                // An invariant failure after the Registry has already retired
+                // every entry is a terminal cleanup diagnostic, not evidence
+                // that runtime ownership remains live. Remember convergence
+                // before returning the diagnostic so the process owner can
+                // accumulate it and continue releasing later owners. When an
+                // entry remains, retain this exact owner for a later retry.
+                if self.handle.entry_count() == 0 {
+                    self.shutdown_complete = true;
+                }
+                Err(error.into())
+            }
             Err(_) => Err(LogicalExecutionRuntimeShutdownError::DeadlineExceeded {
                 remaining_entries: self.handle.entry_count(),
             }),
         }
+    }
+
+    /// Explicitly releases process-local supervision when the owning FE
+    /// process is committed to exit after bounded graceful shutdown failed.
+    ///
+    /// This is deliberately separate from ordinary shutdown: dropping actor
+    /// joins is sound only because no process-local execution can survive the
+    /// process boundary. Callers that continue serving must retain this owner
+    /// and retry [`Self::shutdown_until`] instead.
+    pub fn abandon_for_process_exit(&mut self) {
+        self.handle.begin_shutdown();
+        self.handle.request_close_for_installed();
+        self.handle.lock().entries.clear();
+        self.handle.inner.progress.notify_waiters();
+        self.shutdown_complete = true;
     }
 
     #[cfg(test)]
@@ -1123,6 +1152,26 @@ mod tests {
         );
         drop(reservation);
         registry.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_shutdown_error_after_empty_registry_records_convergence() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        registry.inject_shutdown_error_once(LogicalExecutionRuntimeRegistryError::JoinNotReady);
+
+        assert_eq!(
+            registry
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await,
+            Err(LogicalExecutionRuntimeShutdownError::Registry(
+                LogicalExecutionRuntimeRegistryError::JoinNotReady,
+            ))
+        );
+        assert!(registry.shutdown_complete);
+        registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("the converged owner must not replay a terminal diagnostic");
     }
 
     #[tokio::test]
