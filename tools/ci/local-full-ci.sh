@@ -496,6 +496,10 @@ run_cargo_gates() {
     python3 tools/ci/check-spi-dependency-boundary.py --manifest-path Cargo.toml
   run_fail_fast_stage "SPI dependency boundary mutations" "spi-dependency-boundary-test.log" \
     tools/ci/tests/spi-dependency-boundary-test.sh
+  run_fail_fast_stage "memory dependency boundary" "memory-dependency-boundary.log" \
+    python3 tools/ci/check-memory-dependency-boundary.py --manifest-path Cargo.toml
+  run_fail_fast_stage "memory dependency boundary mutations" "memory-dependency-boundary-test.log" \
+    tools/ci/tests/memory-dependency-boundary-test.sh
   run_fail_fast_stage "NCP-8 statistics boundary" "ncp8-statistics-boundary.log" \
     tools/ci/check-ncp8-statistics-boundary.py
   run_fail_fast_stage "NCP-8 statistics boundary mutations" "ncp8-statistics-boundary-test.log" \

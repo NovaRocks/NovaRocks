@@ -25,7 +25,8 @@ use novarocks_execution::exec::expr::agg::{
 };
 use novarocks_server::app_config::NovaRocksConfig;
 use novarocks_server::{
-    composition, launch, logging, native_compatibility, provider_manifest::ServerProviderManifest,
+    composition, launch, logging, memory_observation, native_compatibility,
+    provider_manifest::ServerProviderManifest,
 };
 use novarocks_types::NativeCompatibilityId;
 
@@ -71,6 +72,7 @@ fn init_process(config: &NovaRocksConfig) -> anyhow::Result<tokio::runtime::Runt
             roll_num: config.sys_log_roll_num,
         },
     );
+    memory_observation::log_installed();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(config.runtime.actual_data_runtime_threads().max(1))
