@@ -175,6 +175,7 @@ impl RootResultObserver {
         if status.state().is_failure()
             || status.state().is_cancellation()
             || status.state().is_abort()
+            || !matches!(&terminal_failure, RootTerminalFailure::Unspecified)
         {
             let (reply, response) = oneshot::channel();
             self.terminal_mailbox
@@ -1097,6 +1098,7 @@ struct RootSuccessGate {
     activation: AttemptActivationIdentity,
     root: TaskIdentity,
     status: Option<TaskStatus>,
+    terminal_failure: RootTerminalFailure,
     final_eos_ack: Option<ResultPacketSequence>,
 }
 
@@ -1108,7 +1110,7 @@ struct RootTerminalObservation {
     reply: ActorReply<()>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RootTerminalFailure {
     Unspecified,
     Pending,
@@ -3323,6 +3325,7 @@ fn handle_command(
                         activation,
                         root,
                         status: None,
+                        terminal_failure: RootTerminalFailure::Unspecified,
                         final_eos_ack: None,
                     });
                     *root_terminal_receiver = Some(terminal_receiver);
@@ -4008,20 +4011,57 @@ fn apply_root_status_observation(
         reply_result_failure(state, reply);
         return;
     }
-    let authoritative_refinement = gate.status.as_ref() == Some(&status)
-        && runtime.attempt_decision_pending == Some(activation)
-        && matches!(&terminal_failure, RootTerminalFailure::Authoritative(_));
-    if authoritative_refinement {
-        let RootTerminalFailure::Authoritative(error) = terminal_failure else {
-            unreachable!("authoritative refinement was checked above");
-        };
-        runtime.terminal_error = Some(error);
+    if gate.status.as_ref() == Some(&status) {
+        let accepted_refinement = matches!(
+            (&gate.terminal_failure, &terminal_failure),
+            (
+                RootTerminalFailure::Unspecified,
+                RootTerminalFailure::Pending
+            ) | (
+                RootTerminalFailure::Unspecified | RootTerminalFailure::Pending,
+                RootTerminalFailure::Authoritative(_)
+            )
+        );
+        if !accepted_refinement {
+            if gate.terminal_failure == terminal_failure {
+                let response = if matches!(terminal_failure, RootTerminalFailure::Unspecified) {
+                    Ok(())
+                } else {
+                    Err(LogicalExecutionActorError::RootAttemptTerminal)
+                };
+                let _ = reply.send(response);
+                return;
+            }
+            fail_result_observation(state, runtime);
+            reply_result_failure(state, reply);
+            return;
+        }
+        gate.terminal_failure = terminal_failure.clone();
+        if matches!(terminal_failure, RootTerminalFailure::Pending) {
+            // A derived cause is not a final failure classification. Freeze
+            // delivery and ACK progression even after visibility, then let
+            // the authoritative refinement decide whether this becomes a
+            // logical stream failure or a pre-visibility attempt decision.
+            runtime.attempt_decision_pending = Some(activation);
+            if let Some(pending) = runtime.pending.take() {
+                reject_pending_result(state, pending);
+            }
+            let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
+            return;
+        }
+        if let RootTerminalFailure::Authoritative(error) = terminal_failure {
+            runtime.terminal_error = Some(error);
+        }
         if state.output_visible() {
             fail_result_observation(state, runtime);
             let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
                 LogicalConclusion::Failed,
             )));
         } else {
+            runtime.attempt_decision_pending = Some(activation);
+            if let Some(pending) = runtime.pending.take() {
+                reject_pending_result(state, pending);
+            }
             let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
         }
         return;
@@ -4057,8 +4097,10 @@ fn apply_root_status_observation(
     }
     let terminal_state = status.state().is_failure()
         || status.state().is_cancellation()
-        || status.state().is_abort();
+        || status.state().is_abort()
+        || !matches!(&terminal_failure, RootTerminalFailure::Unspecified);
     gate.status = Some(status);
+    gate.terminal_failure = terminal_failure.clone();
     if terminal_state {
         let cause_pending = matches!(&terminal_failure, RootTerminalFailure::Pending);
         if let RootTerminalFailure::Authoritative(error) = terminal_failure {

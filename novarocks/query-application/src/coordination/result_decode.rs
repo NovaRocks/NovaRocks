@@ -26,7 +26,7 @@ use std::{
     fmt,
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, OnceLock, mpsc},
     thread::{self, JoinHandle},
 };
 
@@ -272,8 +272,9 @@ impl<R> BoundedResultDecodeOwner<R> {
     /// Closes admission and synchronously joins the fixed worker set.
     ///
     /// Process composition must call this from its blocking shutdown path, not
-    /// from a Tokio coordinator worker. Drop provides the same convergence as
-    /// a last-resort process teardown fallback.
+    /// from a Tokio coordinator worker. Drop only closes admission and hands
+    /// the workers to the process reaper; it never joins on the dropping
+    /// thread.
     pub(crate) fn shutdown_and_join(mut self) -> Result<(), ResultDecodeShutdownError> {
         self.shutdown_and_join_inner()
     }
@@ -423,7 +424,55 @@ fn close_queue<R>(shared: &Shared<R>) {
 
 impl<R> Drop for BoundedResultDecodeOwner<R> {
     fn drop(&mut self) {
-        let _ = self.shutdown_and_join_inner();
+        close_queue(&self.shared);
+        let workers = self
+            .workers
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        reap_workers(std::mem::take(workers));
+    }
+}
+
+type ResultDecodeWorkerSet = Vec<JoinHandle<()>>;
+
+/// The fallback path cannot report worker panics, but it must still keep thread
+/// convergence away from arbitrary async/runtime destruction paths. A single
+/// process reaper owns every fallback join. If the reaper itself cannot be
+/// created, dropping the join handles safely detaches the already-closing
+/// workers instead of blocking the owner destructor.
+fn reap_workers(workers: ResultDecodeWorkerSet) {
+    if workers.is_empty() {
+        return;
+    }
+    static REAPER: OnceLock<Option<mpsc::Sender<ResultDecodeWorkerSet>>> = OnceLock::new();
+    let reaper = REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<ResultDecodeWorkerSet>();
+        thread::Builder::new()
+            .name("result-decode-reaper".to_string())
+            .spawn(move || {
+                while let Ok(workers) = receiver.recv() {
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                }
+            })
+            .ok()
+            .map(|reaper| {
+                // The process owns the reaper lifetime. Its channel sender is
+                // process-static, so joining it during ordinary teardown would
+                // require another blocking destructor path.
+                drop(reaper);
+                sender
+            })
+    });
+    if let Some(reaper) = reaper {
+        if let Err(mpsc::SendError(workers)) = reaper.send(workers) {
+            // Dropping JoinHandle detaches a thread. Intake is already closed,
+            // so each worker still exits after its current job finishes.
+            drop(workers);
+        }
+    } else {
+        drop(workers);
     }
 }
 
@@ -437,7 +486,7 @@ mod tests {
             mpsc,
         },
         thread::ThreadId,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use super::*;
@@ -701,6 +750,52 @@ mod tests {
         drop(handle);
         assert_eq!(receipt.complete().await.unwrap(), 7);
         owner.shutdown_and_join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fallback_owner_drop_closes_intake_without_joining_on_the_runtime_thread() {
+        let (owner, handle) = executor::<usize>(1, 1);
+        let (release, released) = mpsc::channel();
+        let (started, observed_start) = mpsc::channel();
+        let running = handle
+            .submit(ResultDecodeJob::new(move || {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                1
+            }))
+            .await
+            .unwrap();
+        receive(&observed_start).await;
+        let queued = handle.submit(ResultDecodeJob::new(|| 2)).await.unwrap();
+        wait_for(&handle, 1, 1).await;
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            release.send(()).unwrap();
+        });
+        let drop_started = Instant::now();
+        drop(owner);
+        assert!(
+            drop_started.elapsed() < Duration::from_millis(300),
+            "fallback owner Drop synchronously waited for a running decode job"
+        );
+        assert_eq!(tokio::spawn(async { 7 }).await.unwrap(), 7);
+        assert_eq!(
+            queued.complete().await,
+            Err(ResultDecodeWorkerError::ExecutorClosed)
+        );
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.submit(ResultDecodeJob::new(|| 3)),
+        )
+        .await
+        .expect("closed intake must reject without waiting")
+        {
+            Ok(_) => panic!("fallback owner Drop must close future admission"),
+            Err(error) => drop(error.into_job()),
+        }
+        assert_eq!(running.complete().await.unwrap(), 1);
+        releaser.join().unwrap();
     }
 
     #[test]

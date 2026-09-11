@@ -32,6 +32,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use novarocks_execution::task_execution::{TaskIdentity, TaskStatus};
+use novarocks_query_application::coordination::{
+    AcceptedRootSuccessSealPort, AcceptedRootSuccessSealRequest,
+};
 
 /// One immutable observation the transport published.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,11 +128,34 @@ impl StatusIntakeWake for CountingWake {
 
 #[derive(Debug)]
 struct StatusIntakeInner {
-    queue: Mutex<VecDeque<StatusEvent>>,
+    queue: Mutex<StatusIntakeQueue>,
     capacity: usize,
-    observation_loss: AtomicBool,
     runner_busy: AtomicBool,
     wake: Arc<dyn StatusIntakeWake>,
+}
+
+#[derive(Debug, Default)]
+struct StatusIntakeQueue {
+    entries: VecDeque<StatusIntakeEntry>,
+    status_count: usize,
+    observation_loss_queued: bool,
+    success_seal_queued: bool,
+}
+
+#[derive(Debug)]
+pub(super) enum StatusIntakeEntry {
+    Status(StatusEvent),
+    ObservationLoss,
+    SuccessSeal(AcceptedRootSuccessSealRequest),
+}
+
+impl StatusIntakeQueue {
+    fn enqueue_observation_loss(&mut self) {
+        if !self.observation_loss_queued {
+            self.entries.push_back(StatusIntakeEntry::ObservationLoss);
+            self.observation_loss_queued = true;
+        }
+    }
 }
 
 /// Whether a published snapshot was admitted.
@@ -155,11 +181,12 @@ impl StatusIntakeHandle {
     pub fn publish(&self, event: StatusEvent) -> StatusIntakeAdmission {
         let admission = {
             let mut queue = self.inner.queue.lock().expect("status intake queue");
-            if queue.len() >= self.inner.capacity {
-                self.inner.observation_loss.store(true, Ordering::Release);
+            if queue.status_count >= self.inner.capacity {
+                queue.enqueue_observation_loss();
                 StatusIntakeAdmission::Overflowed
             } else {
-                queue.push_back(event);
+                queue.entries.push_back(StatusIntakeEntry::Status(event));
+                queue.status_count += 1;
                 StatusIntakeAdmission::Enqueued
             }
         };
@@ -170,8 +197,35 @@ impl StatusIntakeHandle {
     /// Reports that the status transport dropped while the backend process is
     /// intact.
     pub fn note_observation_loss(&self) {
-        self.inner.observation_loss.store(true, Ordering::Release);
+        self.inner
+            .queue
+            .lock()
+            .expect("status intake queue")
+            .enqueue_observation_loss();
         self.inner.wake.wake();
+    }
+}
+
+impl AcceptedRootSuccessSealPort for StatusIntakeHandle {
+    fn enqueue_success_seal(
+        &self,
+        request: AcceptedRootSuccessSealRequest,
+    ) -> Result<(), AcceptedRootSuccessSealRequest> {
+        {
+            let mut queue = self.inner.queue.lock().expect("status intake queue");
+            if queue.success_seal_queued {
+                return Err(request);
+            }
+            // One result pump owns one move-only request. It is the queue's
+            // reserved control slot, so a full status burst cannot lose the
+            // success decision or make it wait for new capacity.
+            queue
+                .entries
+                .push_back(StatusIntakeEntry::SuccessSeal(request));
+            queue.success_seal_queued = true;
+        }
+        self.inner.wake.wake();
+        Ok(())
     }
 }
 
@@ -185,9 +239,8 @@ impl StatusIntake {
     pub fn new(capacity: usize, wake: Arc<dyn StatusIntakeWake>) -> Self {
         Self {
             inner: Arc::new(StatusIntakeInner {
-                queue: Mutex::new(VecDeque::new()),
+                queue: Mutex::new(StatusIntakeQueue::default()),
                 capacity: capacity.max(1),
-                observation_loss: AtomicBool::new(false),
                 runner_busy: AtomicBool::new(false),
                 wake,
             }),
@@ -201,7 +254,11 @@ impl StatusIntake {
     }
 
     pub fn queued(&self) -> usize {
-        self.inner.queue.lock().expect("status intake queue").len()
+        self.inner
+            .queue
+            .lock()
+            .expect("status intake queue")
+            .status_count
     }
 
     pub fn capacity(&self) -> usize {
@@ -232,19 +289,53 @@ pub struct StatusIntakeRunner<'a> {
 }
 
 impl StatusIntakeRunner<'_> {
-    /// Takes at most `max` queued snapshots.
-    pub fn drain(&mut self, max: usize) -> Vec<StatusEvent> {
+    /// Takes at most `max` queued snapshots and reports any observation-loss
+    /// marker ordered before the next success-seal request.
+    pub fn drain_statuses(&mut self, max: usize) -> (bool, Vec<StatusEvent>) {
         let mut queue = self.intake.inner.queue.lock().expect("status intake queue");
-        let take = queue.len().min(max);
-        queue.drain(..take).collect()
+        let mut statuses = Vec::new();
+        let mut observation_loss = false;
+        while statuses.len() < max {
+            match queue.entries.front() {
+                Some(StatusIntakeEntry::Status(_)) => {
+                    let Some(StatusIntakeEntry::Status(status)) = queue.entries.pop_front() else {
+                        unreachable!("the queue front was a status")
+                    };
+                    queue.status_count -= 1;
+                    statuses.push(status);
+                }
+                Some(StatusIntakeEntry::ObservationLoss) => {
+                    queue.entries.pop_front();
+                    queue.observation_loss_queued = false;
+                    observation_loss = true;
+                }
+                Some(StatusIntakeEntry::SuccessSeal(_)) | None => break,
+            }
+        }
+        (observation_loss, statuses)
     }
 
-    /// Takes and clears the observation-loss flag.
-    pub fn take_observation_loss(&mut self) -> bool {
-        self.intake
-            .inner
-            .observation_loss
-            .swap(false, Ordering::AcqRel)
+    /// Drains in publication order and stops at the first success-seal
+    /// request. Entries behind that request remain residual work.
+    pub(super) fn drain_ordered(&mut self, max: usize) -> Vec<StatusIntakeEntry> {
+        let mut queue = self.intake.inner.queue.lock().expect("status intake queue");
+        let mut entries = Vec::new();
+        while entries.len() < max {
+            let Some(entry) = queue.entries.pop_front() else {
+                break;
+            };
+            let is_seal = matches!(entry, StatusIntakeEntry::SuccessSeal(_));
+            match &entry {
+                StatusIntakeEntry::Status(_) => queue.status_count -= 1,
+                StatusIntakeEntry::ObservationLoss => queue.observation_loss_queued = false,
+                StatusIntakeEntry::SuccessSeal(_) => queue.success_seal_queued = false,
+            }
+            entries.push(entry);
+            if is_seal {
+                break;
+            }
+        }
+        entries
     }
 }
 

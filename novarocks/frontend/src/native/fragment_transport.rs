@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -44,6 +45,14 @@ use novarocks_execution::task_execution::{
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+use novarocks_query_application::{
+    api::{QueryExecutionError, QueryExecutionErrorKind},
+    coordination::{
+        AttemptFailureClass, PreflightedRootResultPacket, RootResultDecodeBounds,
+        RootResultDecodeRuntime, RootResultFetchFailure,
+        RootResultFetchOutcome as PumpRootResultFetchOutcome, RootResultPumpBinding,
+    },
+};
 use novarocks_task_codec::operation::{
     MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES, decode_operation_outcome, encode_fetch_dynamic_filters,
     encode_fetch_task_result, encode_get_final_task_info,
@@ -455,7 +464,145 @@ impl NativeTaskResultTransport {
         let address = self.endpoints[&process].to_string();
         Ok((client, address))
     }
+
+    fn fetch_root_result_for_pump(
+        &self,
+        root_task: TaskIdentity,
+        max_wait: MaxWait,
+        acknowledged: Option<ResultPacketSequence>,
+        max_result_bytes: ResultByteLimit,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<RootResultOutcome, NativeRootResultFetchError>>
+                + Send
+                + 'static,
+        >,
+    > {
+        let route = self
+            .client_of(root_task)
+            .map(|(client, address)| (client.clone(), address))
+            .map_err(NativeRootResultFetchError::contract);
+        let validation = validate_native_result_byte_limit(max_result_bytes)
+            .map_err(NativeRootResultFetchError::contract);
+        let grace = self.grace;
+        let data_runtime = self.data_runtime.clone();
+        Box::pin(async move {
+            let (client, address) = route?;
+            validation?;
+            let _fetch_permit = data_runtime
+                .acquire_result_fetch()
+                .await
+                .map_err(NativeRootResultFetchError::resource_governance)?;
+            let request =
+                encode_fetch_task_result(root_task, max_wait, acknowledged, max_result_bytes);
+            let wait = max_wait.get();
+            let deadline = grace.deadline_for(wait);
+            let mut grpc = tokio::time::timeout(deadline, client.grpc_with_channel_error())
+                .await
+                .map_err(|_| {
+                    NativeRootResultFetchError::infrastructure(format!(
+                        "{address}: root result poll for task {root_task} could not acquire a \
+                         channel within {deadline:?}"
+                    ))
+                })?
+                .map_err(|error| NativeRootResultFetchError::infrastructure(error.to_string()))?;
+            let response = tokio::time::timeout(deadline, grpc.fetch_task_result(request))
+                .await
+                .map_err(|_| {
+                    NativeRootResultFetchError::infrastructure(format!(
+                        "{address}: root result poll for task {root_task} did not answer within \
+                         {deadline:?}; it was asked to wait at most {wait:?}"
+                    ))
+                })?
+                .map(tonic::Response::into_inner)
+                .map_err(classify_fetch_task_result_rpc_status)?;
+            classify_root_result_response(&address, response, acknowledged, max_result_bytes)
+                .map_err(NativeRootResultFetchError::contract)
+        })
+    }
 }
+
+fn classify_fetch_task_result_rpc_status(error: tonic::Status) -> NativeRootResultFetchError {
+    let detail = format!("fetch_task_result rpc failed: {error}");
+    match error.code() {
+        // These two codes state that the exact backend endpoint could not
+        // complete the request in this attempt's bounded transport window.
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+            NativeRootResultFetchError::infrastructure(detail)
+        }
+        // A peer that explicitly refuses work for capacity reasons has made a
+        // resource-governance decision rather than disappearing.
+        tonic::Code::ResourceExhausted => NativeRootResultFetchError::resource_governance(detail),
+        // Every other gRPC status is an answered protocol, identity,
+        // authorization, or server-contract refusal. Retrying it as a lost
+        // endpoint can repeat an invalid request indefinitely. Attempt
+        // execution failure is learned from the accepted Task status
+        // projection, never inferred from this transport status.
+        _ => NativeRootResultFetchError::contract(detail),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeRootResultFetchErrorClass {
+    Infrastructure,
+    ResourceGovernance,
+    ContractViolation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeRootResultFetchError {
+    class: NativeRootResultFetchErrorClass,
+    detail: String,
+}
+
+impl NativeRootResultFetchError {
+    fn infrastructure(detail: impl Into<String>) -> Self {
+        Self {
+            class: NativeRootResultFetchErrorClass::Infrastructure,
+            detail: detail.into(),
+        }
+    }
+
+    fn resource_governance(detail: impl Into<String>) -> Self {
+        Self {
+            class: NativeRootResultFetchErrorClass::ResourceGovernance,
+            detail: detail.into(),
+        }
+    }
+
+    fn contract(detail: impl Into<String>) -> Self {
+        Self {
+            class: NativeRootResultFetchErrorClass::ContractViolation,
+            detail: detail.into(),
+        }
+    }
+
+    fn into_pump_failure(self) -> RootResultFetchFailure {
+        let (class, kind) = match self.class {
+            NativeRootResultFetchErrorClass::Infrastructure => (
+                AttemptFailureClass::RecoverableInfrastructure,
+                QueryExecutionErrorKind::Failed,
+            ),
+            NativeRootResultFetchErrorClass::ResourceGovernance => (
+                AttemptFailureClass::ResourceGovernance,
+                QueryExecutionErrorKind::Rejected,
+            ),
+            NativeRootResultFetchErrorClass::ContractViolation => (
+                AttemptFailureClass::ContractViolation,
+                QueryExecutionErrorKind::InvalidRequest,
+            ),
+        };
+        RootResultFetchFailure::new(class, QueryExecutionError::new(kind, self.detail))
+    }
+}
+
+impl fmt::Display for NativeRootResultFetchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for NativeRootResultFetchError {}
 
 impl TaskResultTransport for NativeTaskResultTransport {
     fn fetch_root_result(
@@ -465,47 +612,9 @@ impl TaskResultTransport for NativeTaskResultTransport {
         acknowledged: Option<ResultPacketSequence>,
         max_result_bytes: ResultByteLimit,
     ) -> Pin<Box<dyn Future<Output = Result<RootResultOutcome, String>> + Send + 'static>> {
-        let route = self
-            .client_of(root_task)
-            .map(|(client, address)| (client.clone(), address));
-        let validation = validate_native_result_byte_limit(max_result_bytes);
-        let grace = self.grace;
-        let data_runtime = self.data_runtime.clone();
-        Box::pin(async move {
-            let (client, address) = route?;
-            validation?;
-            let _fetch_permit = data_runtime.acquire_result_fetch().await?;
-            let request =
-                encode_fetch_task_result(root_task, max_wait, acknowledged, max_result_bytes);
-            let wait = max_wait.get();
-            let deadline = grace.deadline_for(wait);
-            let response = {
-                let mut grpc = tokio::time::timeout(deadline, client.grpc_with_channel_error())
-                    .await
-                    .map_err(|_| {
-                        format!(
-                            "{address}: root result poll for task {root_task} could not acquire a \
-                         channel within {deadline:?}"
-                        )
-                    })?
-                    .map_err(|error| error.to_string())?;
-                // Bounded, and the bound names the fact: a poll that outlives the
-                // wait it asked for plus the transport's own residence budget is a
-                // backend that stopped answering, and reporting that is what keeps
-                // it from stopping this attempt's only thread indefinitely.
-                tokio::time::timeout(deadline, grpc.fetch_task_result(request))
-                    .await
-                    .map_err(|_| {
-                        format!(
-                            "{address}: root result poll for task {root_task} did not answer within \
-                         {deadline:?}; it was asked to wait at most {wait:?}"
-                        )
-                    })?
-                    .map(tonic::Response::into_inner)
-                    .map_err(|error| format!("fetch_task_result rpc failed: {error}"))
-            }?;
-            classify_root_result_response(&address, response, acknowledged, max_result_bytes)
-        })
+        let fetch =
+            self.fetch_root_result_for_pump(root_task, max_wait, acknowledged, max_result_bytes);
+        Box::pin(async move { fetch.await.map_err(|error| error.to_string()) })
     }
 
     fn final_task_info(&self, identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
@@ -643,6 +752,87 @@ impl TaskResultTransport for NativeTaskResultTransport {
             );
         }
         Ok(DynamicFilterRead { version, feedback })
+    }
+}
+
+/// Binds one frozen Native result transport to the query application's sole
+/// fetch/decode/ACK pump. The binding preserves the exact request identity and
+/// bounds; it does not create a second polling or acknowledgement authority.
+#[allow(
+    dead_code,
+    reason = "The production coordinator cutover consumes this Native result-pump adapter."
+)]
+pub(crate) fn native_root_result_pump_binding(
+    decode_runtime: RootResultDecodeRuntime,
+    transport: Arc<NativeTaskResultTransport>,
+    expected_output_schema: ChunkSchemaRef,
+) -> RootResultPumpBinding {
+    RootResultPumpBinding::new(decode_runtime, move |request| {
+        let transport = Arc::clone(&transport);
+        let expected_output_schema = Arc::clone(&expected_output_schema);
+        async move {
+            let outcome = transport
+                .fetch_root_result_for_pump(
+                    request.root,
+                    request.max_wait,
+                    request.acknowledged,
+                    request.max_result_bytes,
+                )
+                .await
+                .map_err(NativeRootResultFetchError::into_pump_failure)?;
+            adapt_native_root_result_outcome(outcome, expected_output_schema)
+        }
+    })
+}
+
+fn adapt_native_root_result_outcome(
+    outcome: RootResultOutcome,
+    expected_output_schema: ChunkSchemaRef,
+) -> Result<PumpRootResultFetchOutcome, RootResultFetchFailure> {
+    match outcome {
+        RootResultOutcome::Ready(packet) => {
+            let sequence = packet.packet_sequence();
+            let payload_bytes = packet.payload_bytes();
+            let native_bounds = packet.decode_bounds();
+            let bounds = RootResultDecodeBounds::new(
+                native_bounds.decode_operation_upper_bound(),
+                native_bounds.retained_backing_upper_bound(),
+            )
+            .map_err(|error| {
+                RootResultFetchFailure::new(AttemptFailureClass::ContractViolation, error)
+            })?;
+            PreflightedRootResultPacket::new(sequence, payload_bytes, bounds, move || {
+                packet
+                    .decode(Some(ExpectedOutputSchemaView::new(&expected_output_schema)))
+                    .map(|batch| batch.into_chunk().batch)
+                    .map_err(|error| {
+                        QueryExecutionError::new(
+                            QueryExecutionErrorKind::InvalidRequest,
+                            format!("decode Native root result packet failed: {error}"),
+                        )
+                    })
+            })
+            .map(PumpRootResultFetchOutcome::Ready)
+            .map_err(|error| {
+                RootResultFetchFailure::new(AttemptFailureClass::ContractViolation, error)
+            })
+        }
+        RootResultOutcome::NotReady => Ok(PumpRootResultFetchOutcome::NotReady),
+        RootResultOutcome::EndOfStreamPending { packet_sequence } => Ok(
+            PumpRootResultFetchOutcome::EndPending(ResultPacketSequence::new(packet_sequence)),
+        ),
+        RootResultOutcome::EndOfStream { packet_sequence } => Ok(
+            PumpRootResultFetchOutcome::EndAcknowledged(ResultPacketSequence::new(packet_sequence)),
+        ),
+        // The wire ERROR variant currently has no discriminator: it can mean
+        // an exact-route refusal, a result-buffer protocol failure, or a
+        // canceled execution. The accepted Task status projection is the
+        // attempt's execution-failure authority, so guessing ExecutionFailure
+        // here could make a contract or authorization refusal retryable.
+        RootResultOutcome::Failed(detail) => Err(RootResultFetchFailure::new(
+            AttemptFailureClass::ContractViolation,
+            QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, detail),
+        )),
     }
 }
 
@@ -818,11 +1008,16 @@ mod tests {
         task_execution::ResultByteLimit,
     };
     use novarocks_proto_models::novarocks::{FetchResultResponse, fetch_result_response::Status};
+    use novarocks_query_application::coordination::{
+        AttemptFailureClass, RootResultFetchOutcome as PumpRootResultFetchOutcome,
+    };
     use novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
 
     use super::{
-        RootResultOutcome, classify_root_result_response, decode_fetched_query_batch,
-        validate_native_result_byte_limit, validate_result_payload_size,
+        NativeRootResultFetchError, RootResultOutcome, adapt_native_root_result_outcome,
+        classify_fetch_task_result_rpc_status, classify_root_result_response,
+        decode_fetched_query_batch, validate_native_result_byte_limit,
+        validate_result_payload_size,
     };
 
     fn typed_empty_result_payload() -> Vec<u8> {
@@ -893,6 +1088,117 @@ mod tests {
 
         let batch = packet.decode(None).expect("explicit packet decode");
         assert_eq!(batch.into_chunk().len(), 0);
+    }
+
+    #[test]
+    fn query_adapter_preserves_preflighted_packet_identity_and_bounds() {
+        let payload = typed_empty_result_payload();
+        let payload_bytes = u64::try_from(payload.len()).unwrap();
+        let limit = ResultByteLimit::new(payload_bytes).unwrap();
+        let RootResultOutcome::Ready(packet) =
+            classify_root_result_response("backend", ready_response(payload), None, limit)
+                .expect("current writer output passes transport preflight")
+        else {
+            panic!("READY data must remain a raw packet");
+        };
+        let native_bounds = packet.decode_bounds();
+
+        let PumpRootResultFetchOutcome::Ready(packet) = adapt_native_root_result_outcome(
+            RootResultOutcome::Ready(packet),
+            Arc::new(ChunkSchema::empty()),
+        )
+        .expect("metadata-preflighted Native packet binds to the query pump") else {
+            panic!("READY must remain READY across the application adapter");
+        };
+        assert_eq!(packet.sequence().get(), 7);
+        assert_eq!(packet.payload_bytes(), payload_bytes);
+        assert_eq!(
+            packet.bounds().decode_operation_upper_bound(),
+            native_bounds.decode_operation_upper_bound()
+        );
+        assert_eq!(
+            packet.bounds().retained_backing_upper_bound(),
+            native_bounds.retained_backing_upper_bound()
+        );
+    }
+
+    #[test]
+    fn query_adapter_preserves_terminal_sequences_and_failure_class() {
+        let schema = Arc::new(ChunkSchema::empty());
+        assert!(matches!(
+            adapt_native_root_result_outcome(
+                RootResultOutcome::EndOfStreamPending { packet_sequence: 9 },
+                Arc::clone(&schema),
+            )
+            .unwrap(),
+            PumpRootResultFetchOutcome::EndPending(sequence) if sequence.get() == 9
+        ));
+        assert!(matches!(
+            adapt_native_root_result_outcome(
+                RootResultOutcome::EndOfStream { packet_sequence: 9 },
+                schema,
+            )
+            .unwrap(),
+            PumpRootResultFetchOutcome::EndAcknowledged(sequence) if sequence.get() == 9
+        ));
+        let error = match adapt_native_root_result_outcome(
+            RootResultOutcome::Failed("root failed".to_string()),
+            Arc::new(ChunkSchema::empty()),
+        ) {
+            Ok(_) => panic!("Native root failure cannot become a pump outcome"),
+            Err(error) => error,
+        };
+        assert_eq!(error.class(), AttemptFailureClass::ContractViolation);
+        assert_eq!(error.error().message(), "root failed");
+    }
+
+    #[test]
+    fn query_adapter_classifies_native_transport_failures_without_guessing() {
+        let contract =
+            NativeRootResultFetchError::contract("malformed response").into_pump_failure();
+        assert_eq!(contract.class(), AttemptFailureClass::ContractViolation);
+        let unavailable =
+            NativeRootResultFetchError::infrastructure("backend unavailable").into_pump_failure();
+        assert_eq!(
+            unavailable.class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        let capacity = NativeRootResultFetchError::resource_governance("fetch intake closed")
+            .into_pump_failure();
+        assert_eq!(capacity.class(), AttemptFailureClass::ResourceGovernance);
+    }
+
+    #[test]
+    fn grpc_status_classification_retries_only_endpoint_unavailability() {
+        for code in [tonic::Code::Unavailable, tonic::Code::DeadlineExceeded] {
+            let failure = classify_fetch_task_result_rpc_status(tonic::Status::new(code, "lost"))
+                .into_pump_failure();
+            assert_eq!(
+                failure.class(),
+                AttemptFailureClass::RecoverableInfrastructure
+            );
+        }
+
+        let capacity = classify_fetch_task_result_rpc_status(tonic::Status::new(
+            tonic::Code::ResourceExhausted,
+            "full",
+        ))
+        .into_pump_failure();
+        assert_eq!(capacity.class(), AttemptFailureClass::ResourceGovernance);
+
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Internal,
+            tonic::Code::Cancelled,
+        ] {
+            let failure =
+                classify_fetch_task_result_rpc_status(tonic::Status::new(code, "refused"))
+                    .into_pump_failure();
+            assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+        }
     }
 
     #[test]

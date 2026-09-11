@@ -3436,12 +3436,13 @@ mod tests {
 
         assert_eq!(fixture.intake.queued(), 1, "the snapshot was enqueued once");
         let mut runner = fixture.intake.try_enter().expect("the runner slot is free");
+        let (observation_loss, statuses) = runner.drain_statuses(8);
         assert!(
-            runner.take_observation_loss(),
+            observation_loss,
             "a lost stream is reported as observation loss"
         );
         assert_eq!(
-            runner.drain(8),
+            statuses,
             vec![StatusEvent::Published(status)],
             "the receive path enqueues the snapshot and nothing else"
         );
@@ -3494,12 +3495,10 @@ mod tests {
         );
         assert_eq!(fixture.acks.queued(), 0);
         let mut runner = fixture.intake.try_enter().expect("the runner slot is free");
-        assert!(
-            !runner.take_observation_loss(),
-            "a live stream reports no loss"
-        );
+        let (observation_loss, statuses) = runner.drain_statuses(8);
+        assert!(!observation_loss, "a live stream reports no loss");
         assert_eq!(
-            runner.drain(8),
+            statuses,
             vec![
                 StatusEvent::Published(TaskStatus::created(first)),
                 StatusEvent::Published(TaskStatus::created(second)),
@@ -3633,8 +3632,9 @@ mod tests {
             "a status the bounded intake did not retain cannot advance the stream cursor"
         );
         let mut runner = intake.try_enter().expect("the runner slot is free");
-        assert!(runner.take_observation_loss());
-        assert_eq!(runner.drain(2), vec![StatusEvent::Published(first)]);
+        let (observation_loss, statuses) = runner.drain_statuses(2);
+        assert!(observation_loss);
+        assert_eq!(statuses, vec![StatusEvent::Published(first)]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3683,8 +3683,9 @@ mod tests {
         );
 
         let mut runner = intake.try_enter().expect("the runner slot is free");
-        assert!(runner.take_observation_loss());
-        assert_eq!(runner.drain(2), vec![StatusEvent::Published(first)]);
+        let (observation_loss, statuses) = runner.drain_statuses(2);
+        assert!(observation_loss);
+        assert_eq!(statuses, vec![StatusEvent::Published(first)]);
         drop(runner);
 
         loopback

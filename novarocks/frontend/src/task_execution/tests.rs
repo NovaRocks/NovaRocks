@@ -2514,11 +2514,12 @@ fn intake_overflow_is_reported_as_observation_loss_rather_than_a_silent_gap() {
     );
 
     let mut runner = intake.try_enter().expect("the runner slot is free");
+    let (observation_loss, _) = runner.drain_statuses(2);
     assert!(
-        runner.take_observation_loss(),
+        observation_loss,
         "overflow tells the runner to resubscribe with its cursors"
     );
-    assert!(!runner.take_observation_loss());
+    assert!(!runner.drain_statuses(2).0);
 }
 
 #[test]
@@ -2827,6 +2828,22 @@ fn released_establishes(sink: &RecordingSink) -> Vec<OperationIntent> {
         .flat_map(|(_, operations)| operations)
         .filter(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext))
         .collect()
+}
+
+fn accepted_create_ack(intent: &OperationIntent) -> OperationAcknowledgement {
+    let OperationIntent::CreateTask(request) = intent else {
+        unreachable!("a create intent carries its request");
+    };
+    OperationAcknowledgement::new(
+        intent.operation_id(),
+        OperationKind::CreateTask,
+        OperationOutcome::Accepted,
+        AckPayload::Create(CreateTaskReceipt::new(
+            request.identity(),
+            Vec::new(),
+            TaskStatus::created(request.identity()),
+        )),
+    )
 }
 
 /// The defect this catches: the runner subscribed to task status for every
@@ -3496,6 +3513,259 @@ fn round_of(harness: Harness) -> (TaskRoundForTest, Arc<CountingWake>) {
 }
 
 type TaskRoundForTest = crate::task_execution::round::TaskRound;
+
+fn round_waiting_on_creates(
+    harness: Harness,
+) -> (
+    TaskRoundForTest,
+    crate::task_execution::status_intake::StatusIntakeHandle,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    Vec<OperationIntent>,
+) {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    let expected_creates = harness.execution.graph().tasks().count();
+    let sink = Arc::clone(&harness.sink);
+    let status = harness.execution.intake().handle();
+    let intake = TaskAckIntake::new(Arc::clone(&harness.wake) as Arc<dyn StatusIntakeWake>);
+    let acks = intake.handle();
+    let mut round = TaskRound::new(
+        harness.execution,
+        intake,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default())
+            as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+    round.seal_pumps();
+
+    let mut creates = Vec::new();
+    for _ in 0..8 {
+        if creates.len() == expected_creates {
+            break;
+        }
+        round
+            .turn()
+            .expect("a bounded startup turn releases task work");
+        let released = sink
+            .take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+            .collect::<Vec<_>>();
+        for intent in released {
+            match intent.kind() {
+                OperationKind::AcquireQueryContextAdmissionTicket => {
+                    acks.publish(admission_ack(&intent));
+                }
+                OperationKind::UpdateQueryContext => acks.publish(establish_ack(&intent)),
+                OperationKind::CreateTask => creates.push(intent),
+                kind => panic!("attempt startup unexpectedly released {kind}"),
+            }
+        }
+    }
+    assert_eq!(
+        creates.len(),
+        expected_creates,
+        "every scheduled task must release its exact create"
+    );
+    (round, status, acks, creates)
+}
+
+#[test]
+fn result_pump_gate_remembers_create_ack_after_root_skips_created() {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let harness = Harness::from_graph(graph);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let _projection = round
+        .take_root_status_source()
+        .expect("one result owner takes the root projection");
+    assert!(round.take_root_status_source().is_none());
+
+    let root = round.root_task();
+    let finished = TaskStatus::try_new(
+        root,
+        TaskStatusVersion::new(2).expect("v2"),
+        TaskState::Finished,
+        None,
+        TaskOutputFacts::new(true),
+    )
+    .expect("a valid finished status");
+    assert_eq!(
+        status.publish(StatusEvent::Published(finished)),
+        StatusIntakeAdmission::Enqueued
+    );
+    round
+        .turn()
+        .expect("a terminal root status may race ahead of create ACK");
+    assert!(!round.result_pump_ready());
+
+    for intent in &creates {
+        acks.publish(accepted_create_ack(intent));
+    }
+    round
+        .turn()
+        .expect("the exact create ACK completes the historical gate");
+    assert!(round.result_pump_ready());
+    assert_eq!(
+        round
+            .execution()
+            .task(root.task_id())
+            .expect("the root remains owned")
+            .state(),
+        RemoteTaskState::Terminal,
+        "the gate must not require the transient Created lifecycle state"
+    );
+}
+
+#[test]
+fn root_pending_failure_refines_at_the_same_status_version() {
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let harness = Harness::from_graph(graph);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let _projection = round
+        .take_root_status_source()
+        .expect("the result owner takes one projection");
+    for intent in &creates {
+        acks.publish(accepted_create_ack(intent));
+    }
+    round.turn().expect("all create ACKs settle");
+    assert!(round.result_pump_ready());
+
+    let root = round.root_task();
+    let root_derived = TaskStatus::try_new(
+        root,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Aborted,
+        Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+        TaskOutputFacts::new(false),
+    )
+    .expect("a valid derived terminal");
+    assert_eq!(
+        status.publish(StatusEvent::Published(root_derived)),
+        StatusIntakeAdmission::Enqueued
+    );
+    round
+        .turn()
+        .expect("the root's derived failure is published as pending");
+    assert!(
+        round
+            .failure_cause()
+            .is_some_and(TerminationDetail::is_derived)
+    );
+
+    let origin = round
+        .execution()
+        .graph()
+        .tasks()
+        .map(|task| task.identity())
+        .find(|identity| *identity != root)
+        .expect("the chain has a non-root task");
+    let authoritative =
+        TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
+            novarocks_execution::task_execution::TaskFailureCategory::Execution,
+            novarocks_execution::task_execution::SafeDetail::new("originating failure")
+                .expect("safe detail"),
+        ));
+    let origin_failed = TaskStatus::try_new(
+        origin,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Failed,
+        Some(authoritative.clone()),
+        TaskOutputFacts::new(false),
+    )
+    .expect("a valid originating failure");
+    assert_eq!(
+        status.publish(StatusEvent::Published(origin_failed)),
+        StatusIntakeAdmission::Enqueued
+    );
+    round
+        .turn()
+        .expect("the same root version refines to the authoritative attempt cause");
+    assert_eq!(round.failure_cause(), Some(&authoritative));
+}
+
+#[test]
+fn finished_root_projection_is_refined_by_a_later_attempt_failure() {
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let harness = Harness::from_graph(graph);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let _projection = round
+        .take_root_status_source()
+        .expect("the result owner takes one projection");
+    for intent in &creates {
+        acks.publish(accepted_create_ack(intent));
+    }
+    round.turn().expect("all create ACKs settle");
+
+    let root = round.root_task();
+    let non_roots = round
+        .execution()
+        .graph()
+        .tasks()
+        .map(|task| task.identity())
+        .filter(|identity| *identity != root)
+        .collect::<Vec<_>>();
+    let derived_origin = non_roots[0];
+    let authoritative_origin = *non_roots
+        .get(1)
+        .expect("the chain has another upstream task");
+    let finished = TaskStatus::try_new(
+        root,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Finished,
+        None,
+        TaskOutputFacts::new(true),
+    )
+    .expect("a valid finished root");
+    status.publish(StatusEvent::Published(finished));
+    let derived = TaskStatus::try_new(
+        derived_origin,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Aborted,
+        Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+        TaskOutputFacts::new(false),
+    )
+    .expect("a valid derived upstream terminal");
+    status.publish(StatusEvent::Published(derived));
+    round
+        .turn()
+        .expect("the Finished root is atomically published with a pending attempt failure");
+    assert!(
+        round
+            .failure_cause()
+            .is_some_and(TerminationDetail::is_derived)
+    );
+    assert!(
+        !round.root_success_sealed(),
+        "an upstream derived failure must freeze success until its cause is authoritative"
+    );
+
+    let authoritative =
+        TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
+            novarocks_execution::task_execution::TaskFailureCategory::Execution,
+            novarocks_execution::task_execution::SafeDetail::new("late upstream failure")
+                .expect("safe detail"),
+        ));
+    let origin_failed = TaskStatus::try_new(
+        authoritative_origin,
+        TaskStatusVersion::new(3).expect("v3"),
+        TaskState::Failed,
+        Some(authoritative.clone()),
+        TaskOutputFacts::new(false),
+    )
+    .expect("a valid originating failure");
+    status.publish(StatusEvent::Published(origin_failed));
+    round
+        .turn()
+        .expect("the same Finished root snapshot accepts attempt-failure refinement");
+    assert_eq!(round.failure_cause(), Some(&authoritative));
+}
 
 #[test]
 fn a_runner_refuses_to_turn_until_its_per_turn_owners_are_declared() {

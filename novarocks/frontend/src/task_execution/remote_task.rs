@@ -233,6 +233,17 @@ impl RemoteTask {
         self.state
     }
 
+    /// Whether this frontend has historically accepted the exact CreateTask
+    /// receipt for this task.
+    ///
+    /// Lifecycle state is intentionally not used as a substitute: a task may
+    /// move directly from Creating to Terminal when status observation races
+    /// ahead of its create acknowledgement, while the later exact receipt
+    /// still proves that the task was admitted.
+    pub const fn create_acknowledged(&self) -> bool {
+        self.create_acknowledged
+    }
+
     /// This task's last observed lifecycle state.
     ///
     /// A task whose status has not been published yet is `PLANNED`: that is

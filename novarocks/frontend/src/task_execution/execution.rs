@@ -43,6 +43,7 @@ use novarocks_types::identity::{StageId, TaskId};
 use super::clock::TaskProtocolClock;
 use super::completion::{ReadCompletionTracker, ReadVerdict};
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
+use novarocks_query_application::coordination::AcceptedRootSuccessSealRequest;
 use novarocks_types::identity::BackendProcessId;
 
 use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
@@ -57,7 +58,7 @@ use super::remote_task::{
     CreateSettlement, RemoteTask, TaskTerminalReport, UpdateAdmission, UpdateSettlement,
 };
 use super::stage::{EdgeOpenTracker, StageExecution};
-use super::status_intake::{StatusEvent, StatusIntake};
+use super::status_intake::{StatusEvent, StatusIntake, StatusIntakeEntry};
 
 /// Which owner settles one released operation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -121,13 +122,16 @@ pub struct PumpReport {
 }
 
 /// What applying intake changed.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct StatusReport {
     pub accepted: usize,
     pub ignored: usize,
     pub terminal: Vec<TaskTerminalReport>,
     /// The status transport must be resubscribed with the per-task cursors.
     pub resubscribe: bool,
+    /// The first success-seal request in the same intake order. Entries after
+    /// it remain queued as residual status work.
+    pub success_seal: Option<AcceptedRootSuccessSealRequest>,
 }
 
 /// The release-carried runtime-filter contributions of one attempt.
@@ -742,15 +746,14 @@ impl QueryTaskExecution {
             let Some(mut runner) = self.intake.try_enter() else {
                 return Ok(report);
             };
-            report.resubscribe = runner.take_observation_loss();
-            runner.drain(max_events)
+            runner.drain_ordered(max_events)
         };
         for event in events {
             match event {
-                StatusEvent::Published(status) => {
+                StatusIntakeEntry::Status(StatusEvent::Published(status)) => {
                     self.apply_published(&status, &mut report)?;
                 }
-                StatusEvent::Gone(identity) => {
+                StatusIntakeEntry::Status(StatusEvent::Gone(identity)) => {
                     let Some(task) = self.task_by_identity(identity) else {
                         continue;
                     };
@@ -759,6 +762,13 @@ impl QueryTaskExecution {
                             StatusObservation::TerminalOverwrite,
                         ));
                     }
+                }
+                StatusIntakeEntry::ObservationLoss => {
+                    report.resubscribe = true;
+                }
+                StatusIntakeEntry::SuccessSeal(request) => {
+                    report.success_seal = Some(request);
+                    break;
                 }
             }
         }

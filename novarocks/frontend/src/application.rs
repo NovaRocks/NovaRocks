@@ -23,7 +23,9 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_execution_contract::ResultByteLimit;
-use novarocks_query_application::coordination::CoordinationBudgets;
+use novarocks_query_application::coordination::{
+    CoordinationBudgets, RootResultDecodeRuntime, RootResultDecodeRuntimeOwner,
+};
 use novarocks_task_codec::TransportBudget;
 
 use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
@@ -71,6 +73,8 @@ use crate::workload_lifecycle::{
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_RESULT_DECODE_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+const DEFAULT_RESULT_DECODE_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
 #[cfg(test)]
 fn test_native_trust() -> Arc<NativeTrust> {
@@ -102,6 +106,7 @@ pub enum FrontendApplicationErrorKind {
     ConnectorControlHost,
     ClusterBackendOpen,
     CoordinatorOpen,
+    ResultDecodeRuntimeOpen,
     Server,
     Shutdown,
 }
@@ -168,6 +173,7 @@ pub struct FrontendApplicationHost {
     query_execution: Option<QueryExecutionService>,
     query_control: crate::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
+    result_decode_runtime_owner: Option<RootResultDecodeRuntimeOwner>,
     execution_role: novarocks_types::ClusterRole,
     data_runtime: FrontendDataRuntime,
     topology: Option<Arc<ClusterBackendService>>,
@@ -227,6 +233,9 @@ pub struct FrontendExecutionConfig {
     connector_blocking_io_budget: ConnectorBlockingIoBudget,
     /// Positive root-result payload credit placed on every Native fetch.
     result_fetch_byte_limit: ResultByteLimit,
+    /// Fixed process-wide worker and waiting bounds for synchronous result decode.
+    result_decode_worker_count: NonZeroUsize,
+    result_decode_queue_capacity: NonZeroUsize,
     /// Connector split enumeration's bounded, server-owned initial feedback
     /// wait. This is frozen at startup and deliberately has no SQL override.
     connector_split_initial_dynamic_filter_wait_cap: Duration,
@@ -267,6 +276,8 @@ impl FrontendExecutionConfig {
             connector_blocking_io_budget: ConnectorBlockingIoBudget::default(),
             result_fetch_byte_limit: ResultByteLimit::new(16 * 1024 * 1024)
                 .expect("the test result fetch byte limit is nonzero"),
+            result_decode_worker_count: DEFAULT_RESULT_DECODE_WORKER_COUNT,
+            result_decode_queue_capacity: DEFAULT_RESULT_DECODE_QUEUE_CAPACITY,
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             lake_publication_runtime_policy: LakePublicationRuntimePolicy::try_new(
@@ -329,6 +340,16 @@ impl FrontendExecutionConfig {
 
     pub fn with_result_fetch_byte_limit(mut self, limit: ResultByteLimit) -> Self {
         self.result_fetch_byte_limit = limit;
+        self
+    }
+
+    pub fn with_result_decode_runtime(
+        mut self,
+        worker_count: NonZeroUsize,
+        queue_capacity: NonZeroUsize,
+    ) -> Self {
+        self.result_decode_worker_count = worker_count;
+        self.result_decode_queue_capacity = queue_capacity;
         self
     }
 
@@ -499,6 +520,16 @@ impl FrontendApplicationHost {
         .map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
         })?;
+        let result_decode_runtime_owner = RootResultDecodeRuntimeOwner::try_new(
+            execution.result_decode_worker_count,
+            execution.result_decode_queue_capacity,
+        )
+        .map_err(|error| {
+            FrontendApplicationError::new(
+                FrontendApplicationErrorKind::ResultDecodeRuntimeOpen,
+                error,
+            )
+        })?;
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
@@ -524,6 +555,7 @@ impl FrontendApplicationHost {
             query_execution: None,
             query_control: FrontendQueryControl::service(),
             coordinator: None,
+            result_decode_runtime_owner: Some(result_decode_runtime_owner),
             execution_role: backend.role(),
             data_runtime: data_runtime.clone(),
             topology: None,
@@ -1031,6 +1063,18 @@ impl FrontendApplicationHost {
             .clone()
     }
 
+    /// Cloneable query handle for the one process-owned result decode runtime.
+    #[allow(
+        dead_code,
+        reason = "The T08 coordinator cutover consumes this process-owned query handle."
+    )]
+    pub(crate) fn result_decode_runtime(&self) -> RootResultDecodeRuntime {
+        self.result_decode_runtime_owner
+            .as_ref()
+            .expect("frontend result decode runtime is installed before host open returns")
+            .runtime()
+    }
+
     pub fn query_control_service(&self) -> crate::query_execution::control::QueryControlService {
         self.query_control.clone()
     }
@@ -1202,27 +1246,72 @@ impl FrontendApplicationHost {
             .as_ref()
             .and_then(|port| port.shutdown_worker().err())
             .map(|error| format!("shutdown statistics analyze worker failed: {error}"));
+        let preserve_mv_owners = mv_worker_error.is_some();
+        self.query_execution.take();
+        self.coordinator.take();
+        let result_decode_runtime_error = match self.result_decode_runtime_owner.take() {
+            Some(owner) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let shutdown =
+                    tokio::task::spawn_blocking(move || owner.shutdown_and_join_blocking());
+                if remaining.is_zero() {
+                    drop(shutdown);
+                    Some(
+                        "frontend cleanup deadline elapsed before result decode runtime shutdown"
+                            .to_string(),
+                    )
+                } else {
+                    match tokio::time::timeout(remaining, shutdown).await {
+                        Ok(Ok(Ok(()))) => None,
+                        Ok(Ok(Err(error))) => Some(format!(
+                            "shutdown frontend result decode runtime failed: {error}"
+                        )),
+                        Ok(Err(error)) => Some(format!(
+                            "frontend result decode shutdown task failed: {error}"
+                        )),
+                        Err(_) => Some(
+                            "frontend cleanup deadline elapsed shutting down result decode runtime"
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
+            None => None,
+        };
         let mut primary_error = mv_worker_error;
-        if let Some(error) = primary_error.take() {
+        if let Some(result_decode_runtime_error) = result_decode_runtime_error {
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {result_decode_runtime_error}"));
+            } else {
+                primary_error = Some(result_decode_runtime_error);
+            }
+        }
+        if preserve_mv_owners {
             // The MV workers still own request/topology/StateStore references.
-            // Preserve them so a caller sees the explicit shutdown failure
-            // rather than pretending that teardown completed.
-            return Err(error);
+            // Preserve those owners so a caller sees the explicit shutdown
+            // failure rather than pretending teardown completed. Query intake
+            // and the process decode runtime have already been converged, so
+            // dropping the consumed host cannot join decode workers here.
+            return Err(primary_error.expect("the MV shutdown error is retained"));
         }
         let table_maintenance_error = self
             .table_maintenance_service
             .as_ref()
             .and_then(|service| service.shutdown().err())
             .map(|error| format!("shutdown frontend table-maintenance service failed: {error}"));
-        self.query_execution.take();
-        self.coordinator.take();
         let heartbeat_result = self
             .topology
             .as_ref()
             .map(|topology| topology.stop_heartbeat_manager())
             .transpose();
         self.topology.take();
-        primary_error = heartbeat_result.err();
+        if let Some(heartbeat_error) = heartbeat_result.err() {
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {heartbeat_error}"));
+            } else {
+                primary_error = Some(heartbeat_error);
+            }
+        }
         if let Some(statistics_worker_error) = statistics_worker_error {
             if let Some(primary) = primary_error.as_mut() {
                 primary.push_str(&format!("; cleanup failed: {statistics_worker_error}"));

@@ -33,13 +33,17 @@ use novarocks_execution::task_execution::status::TerminationDetail;
 
 use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::status::TaskStatusCursor;
+use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
+use novarocks_query_application::coordination::{
+    AcceptedAttemptFailure, AcceptedRootStatusSender, AcceptedRootStatusSource,
+    accepted_root_status_projection_with_seal_port,
+};
 
 use super::blocking_io::ConnectorBlockingIoSupervisor;
 use super::context_owner::{ContextEstablishSource, QueryContextOwner};
 use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
 use super::intent::OperationAcknowledgement;
-use super::remote_task::RemoteTaskState;
 use crate::native::task_transport::{SubscriptionState, TaskAckIntake, TaskStatusSubscriber};
 
 /// Something that must see every acknowledgement this runner settles.
@@ -190,6 +194,10 @@ pub(crate) struct TaskRound {
     pumps: Vec<Box<dyn TurnPump>>,
     pumps_sealed: bool,
     connector_blocking_io: Option<ConnectorBlockingIoSupervisor>,
+    root_status_sender: Option<AcceptedRootStatusSender>,
+    root_status_source: Option<AcceptedRootStatusSource>,
+    pending_success_seal:
+        Option<novarocks_query_application::coordination::AcceptedRootSuccessSealRequest>,
 }
 
 impl TaskRound {
@@ -199,6 +207,11 @@ impl TaskRound {
         establish: Box<dyn ContextEstablishSource>,
         subscriber: Arc<dyn StatusSubscriptions>,
     ) -> Self {
+        let (root_status_sender, root_status_source) =
+            accepted_root_status_projection_with_seal_port(
+                execution.graph().root_identity(),
+                Arc::new(execution.intake().handle()),
+            );
         Self {
             execution,
             acks,
@@ -208,7 +221,16 @@ impl TaskRound {
             pumps: Vec::new(),
             pumps_sealed: false,
             connector_blocking_io: None,
+            root_status_sender: Some(root_status_sender),
+            root_status_source: Some(root_status_source),
+            pending_success_seal: None,
         }
+    }
+
+    /// Transfers the single accepted-root projection to the result-pump
+    /// owner. The round retains only its sender and remains the sole publisher.
+    pub(crate) fn take_root_status_source(&mut self) -> Option<AcceptedRootStatusSource> {
+        self.root_status_source.take()
     }
 
     /// Installs the process owner used by blocking Connector calls.
@@ -322,8 +344,32 @@ impl TaskRound {
             report.resubscriptions += 1;
         }
 
-        let status = self.execution.apply_status(STATUS_EVENTS_PER_TURN)?;
+        let status_budget = if self.pending_success_seal.is_some() {
+            1
+        } else {
+            STATUS_EVENTS_PER_TURN
+        };
+        let status = self.execution.apply_status(status_budget)?;
         report.status_events = status.accepted + status.ignored;
+        if let Some(request) = status.success_seal {
+            if self.pending_success_seal.replace(request).is_some() {
+                return Err(TaskExecutionError::Schedule(
+                    "more than one result success-seal request reached one TaskRound".to_owned(),
+                ));
+            }
+        }
+        if status.resubscribe
+            && let Some(request) = self.pending_success_seal.take()
+        {
+            request.reject(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "success seal refused because Task status observation was incomplete before its linearization point",
+            ));
+        }
+        self.publish_root_status()?;
+        if !status.resubscribe {
+            self.try_settle_success_seal()?;
+        }
         if status.resubscribe {
             for &context in self.execution.graph().contexts() {
                 if self
@@ -387,6 +433,98 @@ impl TaskRound {
         Ok(report)
     }
 
+    /// Publishes the root snapshot only after the whole bounded status fold
+    /// has updated the attempt failure latch. Re-reading the held root on every
+    /// turn is intentional: a derived root failure may first be published as
+    /// pending, then be refined at the same status version when another task
+    /// supplies the authoritative non-derived cause on a later turn.
+    fn publish_root_status(&mut self) -> Result<(), TaskExecutionError> {
+        let Some(sender) = self.root_status_sender.as_ref() else {
+            // Status ordered after the consumed seal is residual convergence
+            // information. It cannot revise the already fixed business result.
+            return Ok(());
+        };
+        let root = self.execution.graph().root_identity();
+        let Some(task) = self.execution.task(root.task_id()) else {
+            return Err(TaskExecutionError::Schedule(
+                "the frozen root Task is absent from its TaskRound".to_owned(),
+            ));
+        };
+        if !task.create_acknowledged() {
+            return Ok(());
+        }
+        let Some(status) = task.status().cloned() else {
+            return Ok(());
+        };
+        let attempt_failure = match self.execution.failure_cause() {
+            Some(cause) if cause.is_derived() => AcceptedAttemptFailure::DerivedPending,
+            Some(authoritative) => AcceptedAttemptFailure::Authoritative(authoritative.clone()),
+            None => AcceptedAttemptFailure::None,
+        };
+        sender
+            .publish_attempt_observation(status, attempt_failure)
+            .map_err(|error| {
+                TaskExecutionError::Schedule(format!(
+                    "publish accepted root Task status projection failed: {error}"
+                ))
+            })
+    }
+
+    fn try_settle_success_seal(&mut self) -> Result<(), TaskExecutionError> {
+        if self.pending_success_seal.is_none() {
+            return Ok(());
+        }
+        let root = self.execution.graph().root_identity();
+        let root_status = self
+            .execution
+            .task(root.task_id())
+            .and_then(|task| task.status());
+        let root_finished = root_status.is_some_and(|status| {
+            status.identity() == root
+                && status.state() == novarocks_execution::task_execution::TaskState::Finished
+        });
+        if root_finished && self.execution.failure_cause().is_none() && self.tasks_created() {
+            let sender = self.root_status_sender.take().ok_or_else(|| {
+                TaskExecutionError::Schedule(
+                    "success seal reached TaskRound after its publisher was consumed".to_owned(),
+                )
+            })?;
+            return self
+                .pending_success_seal
+                .take()
+                .expect("the success request was checked before settlement")
+                .accept(sender)
+                .map_err(|error| {
+                    TaskExecutionError::Schedule(format!(
+                        "seal accepted root Task success projection failed: {error}"
+                    ))
+                });
+        }
+        let terminal_without_success = match self.execution.failure_cause() {
+            // A derived cause deliberately freezes the decision until the
+            // same attempt owner learns the originating cause. Rejecting the
+            // seal here would turn an incomplete failure fact into a final
+            // classification.
+            Some(cause) if cause.is_derived() => false,
+            Some(_) => true,
+            None => root_status.is_some_and(|status| {
+                status.is_terminal()
+                    && status.state() != novarocks_execution::task_execution::TaskState::Finished
+            }),
+        };
+        if terminal_without_success {
+            let error = QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "success seal reached TaskRound without exact root Finished and an empty attempt failure latch",
+            );
+            self.pending_success_seal
+                .take()
+                .expect("the success request was checked before rejection")
+                .reject(error);
+        }
+        Ok(())
+    }
+
     /// Whether every query context of this attempt has been established.
     ///
     /// This is the task protocol's ControlReady: past it, every backend that
@@ -401,18 +539,29 @@ impl TaskRound {
         })
     }
 
-    /// Whether every task of this attempt has been created.
+    /// Whether every task of this attempt has acknowledged its exact create.
     ///
     /// This is the task protocol's Stage and Start: past it, every backend
-    /// holds the exact task the schedule placed on it. A task that already
-    /// went terminal does not count as created -- the question is whether the
-    /// attempt finished starting, and one that lost a task did not.
+    /// holds or historically held the exact task the schedule placed on it.
+    /// Lifecycle status cannot answer this: a task may skip the locally
+    /// visible Created state and reach Terminal before its create receipt is
+    /// settled, while the later receipt still proves admission.
     pub(crate) fn tasks_created(&self) -> bool {
         self.execution.graph().tasks().all(|task| {
             self.execution
                 .task(task.task_id())
-                .is_some_and(|task| matches!(task.state(), RemoteTaskState::Created))
+                .is_some_and(|task| task.create_acknowledged())
         })
+    }
+
+    /// The historical create-receipt barrier for starting result fetches.
+    pub(crate) fn result_pump_ready(&self) -> bool {
+        self.tasks_created()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_success_sealed(&self) -> bool {
+        self.root_status_sender.is_none()
     }
 
     /// The root task the client's result comes from.
