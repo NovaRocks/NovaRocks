@@ -113,6 +113,87 @@ pub struct WorkloadSnapshot {
     pub scopes: Vec<ScopeSnapshot>,
 }
 
+/// Cloneable, read-only view of one process-local workload authority.
+///
+/// This handle cannot admit work, progress control, recover obligations, or
+/// reserve resources.
+#[derive(Clone)]
+pub struct WorkloadObservationHandle {
+    inner: Arc<crate::scope::Inner>,
+}
+
+impl WorkloadObservationHandle {
+    pub(crate) fn new(inner: Arc<crate::scope::Inner>) -> Self {
+        Self { inner }
+    }
+
+    pub fn snapshot(&self) -> WorkloadSnapshot {
+        snapshot(&self.inner)
+    }
+}
+
+fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
+    let state = inner.state.lock().unwrap();
+    WorkloadSnapshot {
+        serving: if state.closed {
+            crate::ServingState::Closed
+        } else if state.ready {
+            crate::ServingState::Ready
+        } else {
+            crate::ServingState::Initializing
+        },
+        admission_closed: state.closed,
+        root_responsibilities: state.roots,
+        businesses: state.businesses,
+        preparation: state.preparation,
+        execution: state.execution,
+        admission_records: state.requests.len(),
+        resource_waiters: state.resource_waiters.len(),
+        waiting_records: state.waiting_records(),
+        peak_waiting_records: state.peak_waiting_records,
+        waiting_bytes: state.waiting_bytes,
+        peak_admission_records: state.peak_waiting,
+        peak_waiting_bytes: state.peak_waiting_bytes,
+        old_attempts: state.old_attempts,
+        unknown_creates: state.unknown_creates,
+        control_ready: state.control_ready.len(),
+        control_inflight: state.control_inflight,
+        scopes: state
+            .nodes
+            .iter()
+            .map(|(&id, node)| ScopeSnapshot {
+                id,
+                parent: node.parent,
+                root: node.root,
+                class: node.class,
+                owner: node.owner,
+                handoffs: node.handoffs,
+                own_completed: node.completed,
+                children: node.children,
+                business_admitted: node.business,
+                occupied_stages: node.stages.iter().copied().collect(),
+                restarts: node.restarts,
+                reserved_bytes: node.reserved_bytes,
+                used_bytes: node.used_bytes,
+                result_credit: node.result_credit,
+                resource_holders: node.resource_holders,
+                resource_waiters: node.resource_waiters,
+                obligations: node
+                    .obligations
+                    .iter()
+                    .map(|(&key, record)| ObligationSnapshot {
+                        key,
+                        kind: record.kind,
+                        usage: record.usage.clone(),
+                    })
+                    .collect(),
+                control_pending: node.control_pending,
+                control_inflight: node.control_inflight,
+            })
+            .collect(),
+    }
+}
+
 impl WorkloadControl {
     /// Recover a fact reporter for an existing obligation after a product
     /// owner/dispatcher was lost. This grants no new scheduling authority.
@@ -138,65 +219,7 @@ impl WorkloadControl {
     }
 
     pub fn snapshot(&self) -> WorkloadSnapshot {
-        let state = self.inner.state.lock().unwrap();
-        WorkloadSnapshot {
-            serving: if state.closed {
-                crate::ServingState::Closed
-            } else if state.ready {
-                crate::ServingState::Ready
-            } else {
-                crate::ServingState::Initializing
-            },
-            admission_closed: state.closed,
-            root_responsibilities: state.roots,
-            businesses: state.businesses,
-            preparation: state.preparation,
-            execution: state.execution,
-            admission_records: state.requests.len(),
-            resource_waiters: state.resource_waiters.len(),
-            waiting_records: state.waiting_records(),
-            peak_waiting_records: state.peak_waiting_records,
-            waiting_bytes: state.waiting_bytes,
-            peak_admission_records: state.peak_waiting,
-            peak_waiting_bytes: state.peak_waiting_bytes,
-            old_attempts: state.old_attempts,
-            unknown_creates: state.unknown_creates,
-            control_ready: state.control_ready.len(),
-            control_inflight: state.control_inflight,
-            scopes: state
-                .nodes
-                .iter()
-                .map(|(&id, node)| ScopeSnapshot {
-                    id,
-                    parent: node.parent,
-                    root: node.root,
-                    class: node.class,
-                    owner: node.owner,
-                    handoffs: node.handoffs,
-                    own_completed: node.completed,
-                    children: node.children,
-                    business_admitted: node.business,
-                    occupied_stages: node.stages.iter().copied().collect(),
-                    restarts: node.restarts,
-                    reserved_bytes: node.reserved_bytes,
-                    used_bytes: node.used_bytes,
-                    result_credit: node.result_credit,
-                    resource_holders: node.resource_holders,
-                    resource_waiters: node.resource_waiters,
-                    obligations: node
-                        .obligations
-                        .iter()
-                        .map(|(&key, record)| ObligationSnapshot {
-                            key,
-                            kind: record.kind,
-                            usage: record.usage.clone(),
-                        })
-                        .collect(),
-                    control_pending: node.control_pending,
-                    control_inflight: node.control_inflight,
-                })
-                .collect(),
-        }
+        snapshot(&self.inner)
     }
 }
 

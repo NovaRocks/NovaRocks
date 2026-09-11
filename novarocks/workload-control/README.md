@@ -3,16 +3,34 @@
 This crate owns one role's process-local work admission and responsibility.
 It does not own SQL, MV, statistics, maintenance, Task, or provider state machines.
 Construct it in role composition with validated policy and actual local memory
-configuration. Inject scopes into work entry points, not the root-issuing
-`WorkloadControl` capability.
+configuration. `WorkloadControl::try_new_split` returns one non-cloneable
+process owner plus three narrow capabilities: cloneable root admission,
+read-only observation, and the process-local resource authority. Inject only
+the capability a service needs; never inject or wrap the process owner in a
+cloneable service container.
 
 Construction starts in Initializing. Role composition calls `mark_ready` after
 required bootstrap services are ready. Closing admission is irreversible and
 preserves existing work/control; drain policy remains outside this crate.
+Only the process owner can mark ready, close admission, adopt orphaned work,
+recover obligation reporters, expire deadlines, dispatch control, or complete
+shutdown. `shutdown` consumes that owner only after admission is closed and all
+responsibilities, waiters, control intents, and local allocations have drained;
+failure returns the owner so convergence can continue.
+Dropping the unique owner, including by dropping an unrecovered shutdown
+failure, irreversibly closes every previously issued root-admission handle.
+Existing scopes and cleanup capabilities keep their real responsibilities and
+accounting until they converge.
+
+The owner-only `try_new` constructor remains temporarily available to existing
+tests and call sites while the Frontend host switches atomically to the split
+bundle. It is not a service-injection API and will retire with that host
+cutover; it no longer implements `Clone`.
 
 ## Integration contract
 
-- `try_begin_root` creates one `WorkOwner` and one `BusinessPermit`. Derive child
+- `RootAdmissionHandle::try_begin_root` creates one `WorkOwner` and one
+  `BusinessPermit`. Derive child
   scopes for synchronous cross-domain work. Scope clones acquire no additional
   business or execution capacity. Preparation and execution use independent
   `StagePermit` values; validate the permit against the exact scope at the entry
@@ -44,21 +62,29 @@ preserves existing work/control; drain policy remains outside this crate.
   fail before subscribing. The RAII registration retains scope responsibility
   and is removed on success, timeout, cancellation, or future drop. Requested
   bytes are demand, never a physical reservation or retained queue payload.
-- Control dispatch uses `next_control` / `wait_control_ready` independently of
+- Process-owner control dispatch uses `next_control` / `wait_control_ready`
+  independently of
   data queues. Full ready queues retain coalesced intent in bounded owner records.
   Drop of an unacknowledged control permit retries its intent. Acknowledgement is
   control progress, not an allocation release or physical-stop fact. The control
   resource class is for trusted role cleanup adapters; data work must use Data.
-- Role supervision calls `expire_deadlines` at `next_deadline`. Cancellation
+- Role supervision calls owner-only `expire_deadlines` at `next_deadline`. Cancellation
   subscribers and queued admissions also observe inherited deadlines directly.
   The crate creates no supervision tasks, OS threads, or polling loops that spin.
+- Role shutdown uses owner-only `progress_revision` / `wait_progress` after a
+  failed drain check. The revision closes the subscribe/check race, and the
+  future reports control readiness, any later authority event, or complete
+  drain. Closing an already empty authority and the last node, resource, or
+  control release all wake it without a timer.
 
 ## Resource accounting coverage
 
 `ResourceConfig` has no default: Server must supply the resolved local total,
-control partition, and per-scope bound. `resources()` returns the same authority
-for that controller. A foreign controller's scope is rejected. Remote samples
-are observations and never reserve bytes in this authority.
+control partition, and per-scope bound. Split construction returns exactly one
+resource authority backed by the same process ledger; its clones remain that
+same authority. A foreign controller's scope is rejected. Remote samples are
+observations and never reserve bytes in this authority. Workload snapshots come
+from the separate read-only observation handle.
 
 Reservation converts unused bytes into actual allocation charges without double
 charging. A shared backing allocation uses one `AllocationCharge`; Arrow slices

@@ -17,7 +17,7 @@
 
 use crate::{
     CancellationReason, CancellationView, LocalResourceAuthority, ResourceClass, ResourceConfig,
-    WorkError,
+    WorkError, WorkloadObservationHandle,
     admission::{PendingAdmission, Stage},
     cancellation::Cancellation,
     observation::{ControlIntents, ObligationKey, ObligationRecord, OwnerState},
@@ -266,6 +266,7 @@ pub(crate) struct State {
     pub peak_waiting: usize,
     pub peak_waiting_records: usize,
     pub peak_waiting_bytes: u64,
+    pub progress_revision: u64,
 }
 
 impl State {
@@ -275,6 +276,36 @@ impl State {
 
     pub(crate) fn record_waiting_peak(&mut self) {
         self.peak_waiting_records = self.peak_waiting_records.max(self.waiting_records());
+    }
+
+    pub(crate) fn advance_progress_revision(&mut self) {
+        self.progress_revision = self.progress_revision.wrapping_add(1);
+    }
+
+    pub(crate) fn is_drained(&self) -> bool {
+        self.closed
+            && self.nodes.is_empty()
+            && self.roots == 0
+            && self.businesses == 0
+            && self.preparation == 0
+            && self.execution == 0
+            && self.requests.is_empty()
+            && self.resource_waiters.generic.is_empty()
+            && self.resource_waiters.result_fetch.is_empty()
+            && self.resource_waiters.decode.is_empty()
+            && self.resource_waiters.protocol.is_empty()
+            && self.waiting_bytes == 0
+            && self.old_attempts == 0
+            && self.unknown_creates == 0
+            && self.obligations == 0
+            && self.control_ready.is_empty()
+            && self.control_waiting.is_empty()
+            && self.control_inflight == 0
+            && self.data_reserved == 0
+            && self.data_used == 0
+            && self.control_reserved == 0
+            && self.control_used == 0
+            && self.result_credit.held_bytes() == 0
     }
 
     pub(crate) fn next_id(&mut self) -> Result<u64, WorkError> {
@@ -373,7 +404,12 @@ impl Inner {
     /// Allocation and observation facts do not drive policy queues. Keep their
     /// hot path independent of the number of scopes and admission requests.
     pub(crate) fn update_facts<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        let result = f(&mut self.state.lock().unwrap());
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            let result = f(&mut state);
+            state.advance_progress_revision();
+            result
+        };
         self.changed.notify_waiters();
         result
     }
@@ -382,7 +418,10 @@ impl Inner {
     /// Result packet state transitions use this path while capacity is held or
     /// reduced, avoiding a process-wide waiter wakeup for every packet step.
     pub(crate) fn update_facts_silent<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        f(&mut self.state.lock().unwrap())
+        let mut state = self.state.lock().unwrap();
+        let result = f(&mut state);
+        state.advance_progress_revision();
+        result
     }
 
     pub(crate) fn notify_capacity_available(&self) {
@@ -395,6 +434,7 @@ impl Inner {
             let result = f(&mut state);
             let wakers = crate::admission::dispatch(&mut state, &self.config);
             crate::observation::fill_control(&mut state, &self.config);
+            state.advance_progress_revision();
             (result, wakers)
         };
         // Never invoke arbitrary wake implementations while holding the owner lock.
@@ -406,14 +446,152 @@ impl Inner {
     }
 }
 
-/// Role-owned constructor and supervisor. Inject scopes into product work,
-/// not this root-issuing capability.
-#[derive(Clone)]
+/// Role-owned policy and control-progression authority.
+///
+/// This type is deliberately not cloneable. Role composition keeps it in the
+/// process owner and injects only the narrower handles returned by
+/// [`Self::try_new_split`] into long-lived services.
 pub struct WorkloadControl {
     pub(crate) inner: Arc<Inner>,
 }
 
+/// Cloneable capability that can only begin a root business responsibility.
+///
+/// Holding this handle grants no readiness, drain, control-progression,
+/// observation, recovery, or local-resource authority.
+#[derive(Clone)]
+pub struct RootAdmissionHandle {
+    inner: Arc<Inner>,
+}
+
+/// Complete process-composition result for one workload authority.
+///
+/// The owner is unique. Each handle is intentionally a separate capability so
+/// a business service cannot obtain process lifecycle authority by cloning the
+/// object it was injected.
+pub struct WorkloadControlParts {
+    pub owner: WorkloadControl,
+    pub root_admission: RootAdmissionHandle,
+    pub observation: WorkloadObservationHandle,
+    pub resources: LocalResourceAuthority,
+}
+
+/// Proof that the unique workload owner closed admission and observed a fully
+/// drained local authority before relinquishing process ownership.
+#[derive(Debug)]
+pub struct WorkloadShutdown {
+    _private: (),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkloadShutdownError {
+    AdmissionOpen,
+    NotDrained,
+}
+
+impl std::fmt::Display for WorkloadShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AdmissionOpen => f.write_str("New work admission is still open"),
+            Self::NotDrained => f.write_str("Workload authority has not fully drained"),
+        }
+    }
+}
+
+impl std::error::Error for WorkloadShutdownError {}
+
+/// A failed shutdown returns the unique owner so role composition can continue
+/// driving control and convergence.
+pub struct WorkloadShutdownFailure {
+    error: WorkloadShutdownError,
+    owner: WorkloadControl,
+}
+
+/// Monotonic process-local token used to await a later governance event.
+///
+/// Equality is the only supported interpretation. The counter may wrap after
+/// `u64::MAX` authority transactions; callers must never derive elapsed work
+/// or ordering distances from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkloadProgressRevision(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkloadProgress {
+    ControlReady(WorkloadProgressRevision),
+    StateChanged(WorkloadProgressRevision),
+    Drained(WorkloadProgressRevision),
+}
+
+impl WorkloadProgress {
+    pub fn revision(self) -> WorkloadProgressRevision {
+        match self {
+            Self::ControlReady(revision)
+            | Self::StateChanged(revision)
+            | Self::Drained(revision) => revision,
+        }
+    }
+}
+
+impl WorkloadShutdownFailure {
+    pub fn error(&self) -> WorkloadShutdownError {
+        self.error
+    }
+
+    pub fn into_parts(self) -> (WorkloadShutdownError, WorkloadControl) {
+        (self.error, self.owner)
+    }
+}
+
+fn try_begin_root(inner: &Arc<Inner>, request: WorkRequest) -> Result<RootWork, WorkError> {
+    inner.update(|state| {
+        if state.closed {
+            return Err(WorkError::Closed);
+        }
+        if !state.ready {
+            return Err(WorkError::NotReady);
+        }
+        if state.roots >= inner.config.root_limit {
+            return Err(WorkError::Capacity("root responsibilities"));
+        }
+        if state.businesses >= inner.config.business_limit {
+            return Err(WorkError::Capacity("business admission"));
+        }
+        if state.nodes.len() >= inner.config.scope_records_limit {
+            return Err(WorkError::Capacity("scope records"));
+        }
+        let cancellation = Cancellation::root(request.deadline);
+        if let Some(reason) = cancellation.reason() {
+            return Err(WorkError::Cancelled(reason));
+        }
+        let id = WorkId(state.next_id()?);
+        let mut node = Node::new(None, id, request.class, cancellation);
+        node.business = true;
+        state.nodes.insert(id, node);
+        state.roots += 1;
+        state.businesses += 1;
+        let scope = WorkScope {
+            inner: Arc::clone(inner),
+            id,
+        };
+        Ok(RootWork {
+            owner: WorkOwner {
+                scope: Some(scope.clone()),
+            },
+            business: BusinessPermit { scope: Some(scope) },
+        })
+    })
+}
+
+impl RootAdmissionHandle {
+    pub fn try_begin_root(&self, request: WorkRequest) -> Result<RootWork, WorkError> {
+        try_begin_root(&self.inner, request)
+    }
+}
+
 impl WorkloadControl {
+    /// Transitional owner-only constructor retained until the Frontend host
+    /// atomically switches to [`Self::try_new_split`]. Do not inject this owner
+    /// into product-lived services.
     pub fn try_new(config: WorkloadConfig, resources: ResourceConfig) -> Result<Self, WorkError> {
         config.validate()?;
         resources.validate()?;
@@ -427,44 +605,33 @@ impl WorkloadControl {
         })
     }
 
-    pub fn try_begin_root(&self, request: WorkRequest) -> Result<RootWork, WorkError> {
-        self.inner.update(|state| {
-            if state.closed {
-                return Err(WorkError::Closed);
-            }
-            if !state.ready {
-                return Err(WorkError::NotReady);
-            }
-            if state.roots >= self.inner.config.root_limit {
-                return Err(WorkError::Capacity("root responsibilities"));
-            }
-            if state.businesses >= self.inner.config.business_limit {
-                return Err(WorkError::Capacity("business admission"));
-            }
-            if state.nodes.len() >= self.inner.config.scope_records_limit {
-                return Err(WorkError::Capacity("scope records"));
-            }
-            let cancellation = Cancellation::root(request.deadline);
-            if let Some(reason) = cancellation.reason() {
-                return Err(WorkError::Cancelled(reason));
-            }
-            let id = WorkId(state.next_id()?);
-            let mut node = Node::new(None, id, request.class, cancellation);
-            node.business = true;
-            state.nodes.insert(id, node);
-            state.roots += 1;
-            state.businesses += 1;
-            let scope = WorkScope {
-                inner: Arc::clone(&self.inner),
-                id,
-            };
-            Ok(RootWork {
-                owner: WorkOwner {
-                    scope: Some(scope.clone()),
-                },
-                business: BusinessPermit { scope: Some(scope) },
-            })
+    /// Construct one unique process owner and the complete set of narrow,
+    /// cloneable service capabilities backed by that same local authority.
+    pub fn try_new_split(
+        config: WorkloadConfig,
+        resources: ResourceConfig,
+    ) -> Result<WorkloadControlParts, WorkError> {
+        let owner = Self::try_new(config, resources)?;
+        Ok(WorkloadControlParts {
+            root_admission: owner.root_admission(),
+            observation: owner.observation(),
+            resources: owner.resources(),
+            owner,
         })
+    }
+
+    pub fn root_admission(&self) -> RootAdmissionHandle {
+        RootAdmissionHandle {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    pub fn observation(&self) -> WorkloadObservationHandle {
+        WorkloadObservationHandle::new(Arc::clone(&self.inner))
+    }
+
+    pub fn try_begin_root(&self, request: WorkRequest) -> Result<RootWork, WorkError> {
+        try_begin_root(&self.inner, request)
     }
 
     /// Close new roots; existing work and control retain their authority.
@@ -551,6 +718,73 @@ impl WorkloadControl {
                     .map(|request| request.wait_deadline),
             )
             .min()
+    }
+
+    /// Capture the current event revision before attempting a state-dependent
+    /// owner operation such as shutdown.
+    pub fn progress_revision(&self) -> WorkloadProgressRevision {
+        WorkloadProgressRevision(self.inner.state.lock().unwrap().progress_revision)
+    }
+
+    /// Await a later authority event without dedicating a thread or polling.
+    ///
+    /// The subscription is armed before state inspection, so convergence
+    /// between the caller's failed shutdown attempt and this future cannot be
+    /// lost. A drained authority is returned immediately even when its revision
+    /// equals `after`.
+    pub async fn wait_progress(&self, after: WorkloadProgressRevision) -> WorkloadProgress {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let progress = {
+                let state = self.inner.state.lock().unwrap();
+                let revision = WorkloadProgressRevision(state.progress_revision);
+                if state.is_drained() {
+                    Some(WorkloadProgress::Drained(revision))
+                } else if !state.control_ready.is_empty()
+                    && state.control_inflight < self.inner.config.control_inflight_limit
+                {
+                    Some(WorkloadProgress::ControlReady(revision))
+                } else if revision != after {
+                    Some(WorkloadProgress::StateChanged(revision))
+                } else {
+                    None
+                }
+            };
+            if let Some(progress) = progress {
+                return progress;
+            }
+            changed.await;
+        }
+    }
+
+    /// Consume the unique owner after admission has closed and every local
+    /// responsibility, waiter, control intent, and allocation has converged.
+    ///
+    /// On failure the owner is returned so the caller can continue driving
+    /// convergence. This method never fabricates cancellation, stop, or
+    /// release facts.
+    pub fn shutdown(self) -> Result<WorkloadShutdown, WorkloadShutdownFailure> {
+        let result = {
+            let state = self.inner.state.lock().unwrap();
+            if !state.closed {
+                Err(WorkloadShutdownError::AdmissionOpen)
+            } else if !state.is_drained() {
+                Err(WorkloadShutdownError::NotDrained)
+            } else {
+                Ok(WorkloadShutdown { _private: () })
+            }
+        };
+        result.map_err(|error| WorkloadShutdownFailure { error, owner: self })
+    }
+}
+
+impl Drop for WorkloadControl {
+    fn drop(&mut self) {
+        // Losing the unique process owner must fail closed. Existing work and
+        // cleanup capabilities remain valid and retain their real accounting.
+        self.close_admission();
     }
 }
 
@@ -799,7 +1033,7 @@ mod tests {
     }
 
     fn controller() -> WorkloadControl {
-        let control = WorkloadControl::try_new(
+        let control = WorkloadControl::try_new_split(
             WorkloadConfig::default(),
             ResourceConfig {
                 total_bytes: 128,
@@ -807,7 +1041,8 @@ mod tests {
                 per_scope_bytes: 112,
             },
         )
-        .unwrap();
+        .unwrap()
+        .owner;
         control.mark_ready().unwrap();
         control
     }

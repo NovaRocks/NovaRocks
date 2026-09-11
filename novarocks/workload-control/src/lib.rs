@@ -32,6 +32,39 @@
 //! use novarocks_workload_control::WorkScope;
 //! let scope = WorkScope {};
 //! ```
+//!
+//! Process lifecycle authority is unique, while injected handles are narrow:
+//! ```compile_fail
+//! use novarocks_workload_control::WorkloadControl;
+//! fn process_owner() -> WorkloadControl { unimplemented!() }
+//! let second_owner = process_owner().clone();
+//! ```
+//! ```compile_fail
+//! use novarocks_workload_control::RootAdmissionHandle;
+//! fn admission() -> RootAdmissionHandle { unimplemented!() }
+//! admission().mark_ready();
+//! ```
+//! ```compile_fail
+//! use novarocks_workload_control::RootAdmissionHandle;
+//! fn admission() -> RootAdmissionHandle { unimplemented!() }
+//! let _ = admission().next_control();
+//! ```
+//! ```compile_fail
+//! use novarocks_workload_control::{RootAdmissionHandle, WorkloadProgressRevision};
+//! fn admission() -> RootAdmissionHandle { unimplemented!() }
+//! fn revision() -> WorkloadProgressRevision { unimplemented!() }
+//! let _ = admission().wait_progress(revision());
+//! ```
+//! ```compile_fail
+//! use novarocks_workload_control::{WorkClass, WorkRequest, WorkloadObservationHandle};
+//! fn observation() -> WorkloadObservationHandle { unimplemented!() }
+//! let _ = observation().try_begin_root(WorkRequest::new(WorkClass::Query));
+//! ```
+//! ```compile_fail
+//! use novarocks_workload_control::LocalResourceAuthority;
+//! fn resources() -> LocalResourceAuthority { unimplemented!() }
+//! resources().close_admission();
+//! ```
 
 mod admission;
 mod cancellation;
@@ -44,7 +77,8 @@ pub use admission::{Stage, StageAdmission, StagePermit, StageRequest};
 pub use cancellation::{CancellationReason, CancellationView};
 pub use observation::{
     ControlIntent, ControlIntents, ControlPermit, Obligation, ObligationKey, ObligationKind,
-    ObligationSnapshot, OwnerState, ScopeSnapshot, UsageObservation, WorkloadSnapshot,
+    ObligationSnapshot, OwnerState, ScopeSnapshot, UsageObservation, WorkloadObservationHandle,
+    WorkloadSnapshot,
 };
 pub use resource::{
     AllocationCharge, LocalResourceAuthority, Reservation, ResourceClass, ResourceConfig,
@@ -52,8 +86,10 @@ pub use resource::{
     ResultCreditStage,
 };
 pub use scope::{
-    BusinessPermit, RootWork, ServingState, WorkCancellationRequester, WorkClass, WorkId,
-    WorkOwner, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
+    BusinessPermit, RootAdmissionHandle, RootWork, ServingState, WorkCancellationRequester,
+    WorkClass, WorkId, WorkOwner, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
+    WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision, WorkloadShutdown,
+    WorkloadShutdownError, WorkloadShutdownFailure,
 };
 
 /// Admission failures never imply cancellation, physical stop, or release.

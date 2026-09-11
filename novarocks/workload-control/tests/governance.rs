@@ -54,7 +54,9 @@ fn resources() -> ResourceConfig {
     }
 }
 fn control() -> WorkloadControl {
-    let control = WorkloadControl::try_new(config(), resources()).unwrap();
+    let control = WorkloadControl::try_new_split(config(), resources())
+        .unwrap()
+        .owner;
     control.mark_ready().unwrap();
     control
 }
@@ -86,11 +88,229 @@ fn drain_control(control: &WorkloadControl) {
 }
 
 #[test]
+fn split_construction_keeps_process_progression_unique_and_service_handles_narrow() {
+    let WorkloadControlParts {
+        owner,
+        root_admission,
+        observation,
+        resources,
+    } = WorkloadControl::try_new_split(config(), resources()).unwrap();
+    let second_admission = root_admission.clone();
+    let second_observation = observation.clone();
+
+    assert_eq!(observation.snapshot().serving, ServingState::Initializing);
+    assert!(matches!(
+        root_admission.try_begin_root(WorkRequest::new(WorkClass::Query)),
+        Err(WorkError::NotReady)
+    ));
+    owner.mark_ready().unwrap();
+
+    let work = second_admission
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    assert_eq!(second_observation.snapshot().root_responsibilities, 1);
+    assert_eq!(resources.snapshot().held_bytes(), 0);
+
+    owner.close_admission();
+    assert!(matches!(
+        root_admission.try_begin_root(WorkRequest::new(WorkClass::Query)),
+        Err(WorkError::Closed)
+    ));
+    let (error, owner) = owner.shutdown().unwrap_err().into_parts();
+    assert_eq!(error, WorkloadShutdownError::NotDrained);
+
+    work.business.release();
+    work.owner.complete();
+    assert_eq!(observation.snapshot().root_responsibilities, 0);
+    assert!(owner.shutdown().is_ok());
+}
+
+#[test]
+fn shutdown_returns_the_unique_owner_when_admission_is_open() {
+    let WorkloadControlParts {
+        owner,
+        root_admission,
+        observation,
+        ..
+    } = WorkloadControl::try_new_split(config(), resources()).unwrap();
+    owner.mark_ready().unwrap();
+    let (error, owner) = owner.shutdown().unwrap_err().into_parts();
+    assert_eq!(error, WorkloadShutdownError::AdmissionOpen);
+    let work = root_admission
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .expect("recovering the unique owner must not close admission");
+    work.business.release();
+    work.owner.complete();
+    owner.close_admission();
+    assert!(owner.shutdown().is_ok());
+    assert_eq!(observation.snapshot().serving, ServingState::Closed);
+    assert!(matches!(
+        root_admission.try_begin_root(WorkRequest::new(WorkClass::Query)),
+        Err(WorkError::Closed)
+    ));
+}
+
+#[test]
+fn dropping_the_unique_owner_closes_every_existing_root_admission_handle() {
+    let WorkloadControlParts {
+        owner,
+        root_admission,
+        observation,
+        ..
+    } = WorkloadControl::try_new_split(config(), resources()).unwrap();
+    owner.mark_ready().unwrap();
+    drop(owner);
+
+    assert_eq!(observation.snapshot().serving, ServingState::Closed);
+    assert!(matches!(
+        root_admission.try_begin_root(WorkRequest::new(WorkClass::Query)),
+        Err(WorkError::Closed)
+    ));
+}
+
+#[test]
+fn dropping_an_unrecovered_shutdown_failure_closes_root_admission() {
+    let WorkloadControlParts {
+        owner,
+        root_admission,
+        observation,
+        ..
+    } = WorkloadControl::try_new_split(config(), resources()).unwrap();
+    owner.mark_ready().unwrap();
+    let failure = owner.shutdown().unwrap_err();
+    assert_eq!(failure.error(), WorkloadShutdownError::AdmissionOpen);
+    drop(failure);
+
+    assert_eq!(observation.snapshot().serving, ServingState::Closed);
+    assert!(matches!(
+        root_admission.try_begin_root(WorkRequest::new(WorkClass::Query)),
+        Err(WorkError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn progress_wait_wakes_when_close_immediately_drains_the_authority() {
+    let WorkloadControlParts {
+        owner, observation, ..
+    } = WorkloadControl::try_new_split(config(), resources()).unwrap();
+    let after = owner.progress_revision();
+    let mut progress = Box::pin(owner.wait_progress(after));
+    assert!(poll(&mut progress).is_pending());
+
+    owner.close_admission();
+    assert!(matches!(
+        progress.await,
+        WorkloadProgress::Drained(revision) if revision != after
+    ));
+    assert_eq!(observation.snapshot().serving, ServingState::Closed);
+}
+
+#[tokio::test]
+async fn progress_wait_wakes_for_each_step_until_the_last_node_is_drained() {
+    let WorkloadControlParts {
+        owner,
+        root_admission,
+        ..
+    } = WorkloadControl::try_new_split(config(), resources()).unwrap();
+    owner.mark_ready().unwrap();
+    let work = root_admission
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    owner.close_admission();
+
+    let revision = owner.progress_revision();
+    let mut progress = Box::pin(owner.wait_progress(revision));
+    assert!(poll(&mut progress).is_pending());
+    work.business.release();
+    let progress = progress.await;
+    assert!(matches!(progress, WorkloadProgress::StateChanged(_)));
+
+    let mut drained = Box::pin(owner.wait_progress(progress.revision()));
+    assert!(poll(&mut drained).is_pending());
+    work.owner.complete();
+    assert!(matches!(drained.await, WorkloadProgress::Drained(_)));
+}
+
+#[tokio::test]
+async fn progress_wait_wakes_when_the_last_local_resource_is_released() {
+    let WorkloadControlParts {
+        owner,
+        root_admission,
+        resources,
+        ..
+    } = WorkloadControl::try_new_split(config(), resources()).unwrap();
+    owner.mark_ready().unwrap();
+    let work = root_admission
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = work.owner.scope();
+    let reservation = resources.reserve(&scope, 16, ResourceClass::Data).unwrap();
+    owner.close_admission();
+    work.business.release();
+    work.owner.complete();
+
+    let revision = owner.progress_revision();
+    let mut drained = Box::pin(owner.wait_progress(revision));
+    assert!(poll(&mut drained).is_pending());
+    drop(reservation);
+    assert!(matches!(drained.await, WorkloadProgress::Drained(_)));
+}
+
+#[tokio::test]
+async fn progress_wait_wakes_when_the_last_control_permit_converges() {
+    let WorkloadControlParts {
+        owner,
+        root_admission,
+        ..
+    } = WorkloadControl::try_new_split(config(), resources()).unwrap();
+    owner.mark_ready().unwrap();
+    let work = root_admission
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    work.owner.cancel(CancellationReason::Requested);
+    let control = owner.next_control().unwrap();
+    owner.close_admission();
+    work.business.release();
+    work.owner.complete();
+
+    let revision = owner.progress_revision();
+    let mut drained = Box::pin(owner.wait_progress(revision));
+    assert!(poll(&mut drained).is_pending());
+    control.acknowledge();
+    assert!(matches!(drained.await, WorkloadProgress::Drained(_)));
+}
+
+#[tokio::test]
+async fn progress_wait_prioritizes_ready_control_work() {
+    let WorkloadControlParts {
+        owner,
+        root_admission,
+        ..
+    } = WorkloadControl::try_new_split(config(), resources()).unwrap();
+    owner.mark_ready().unwrap();
+    let work = root_admission
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let revision = owner.progress_revision();
+    work.owner.cancel(CancellationReason::Requested);
+
+    assert!(matches!(
+        owner.wait_progress(revision).await,
+        WorkloadProgress::ControlReady(_)
+    ));
+    owner.next_control().unwrap().acknowledge();
+    owner.close_admission();
+    work.business.release();
+    work.owner.complete();
+    assert!(owner.shutdown().is_ok());
+}
+
+#[test]
 fn invalid_and_excessive_configuration_is_rejected() {
     let mut invalid = config();
     invalid.root_limit = 0;
     assert!(matches!(
-        WorkloadControl::try_new(invalid, resources()),
+        WorkloadControl::try_new_split(invalid, resources()),
         Err(WorkError::InvalidConfig(_))
     ));
     let mut invalid = config();
@@ -145,7 +365,9 @@ fn invalid_and_excessive_configuration_is_rejected() {
 
 #[test]
 fn construction_does_not_admit_work_and_closed_roles_never_reopen() {
-    let control = WorkloadControl::try_new(config(), resources()).unwrap();
+    let control = WorkloadControl::try_new_split(config(), resources())
+        .unwrap()
+        .owner;
     assert_eq!(control.snapshot().serving, ServingState::Initializing);
     assert!(matches!(
         control.try_begin_root(WorkRequest::new(WorkClass::Query)),
@@ -232,7 +454,9 @@ async fn parent_waiting_for_children_holds_no_idle_stage_capacity() {
 async fn round_robin_keeps_root_fifo_without_starving_other_businesses() {
     let mut limits = config();
     limits.execution_limit = 1;
-    let control = WorkloadControl::try_new(limits, resources()).unwrap();
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
     let a = root(&control, WorkClass::MaterializedView);
     let b = root(&control, WorkClass::Query);
     let a1 = child(&a.owner.scope());
@@ -260,7 +484,9 @@ async fn round_robin_keeps_root_fifo_without_starving_other_businesses() {
 async fn an_exhausted_root_does_not_block_another_runnable_root() {
     let mut limits = config();
     limits.executions_per_root = 1;
-    let control = WorkloadControl::try_new(limits, resources()).unwrap();
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
     let a = root(&control, WorkClass::MaterializedView);
     let a1 = child(&a.owner.scope());
     let b = root(&control, WorkClass::Query);
@@ -278,7 +504,9 @@ async fn an_exhausted_root_does_not_block_another_runnable_root() {
 async fn object_lock_contention_returns_stage_before_requeue() {
     let mut limits = config();
     limits.execution_limit = 1;
-    let control = WorkloadControl::try_new(limits, resources()).unwrap();
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
     let a = root(&control, WorkClass::TableMaintenance);
     let b = root(&control, WorkClass::Query);
     let object_lock = tokio::sync::Mutex::new(());
@@ -528,7 +756,9 @@ async fn grant_receipt_racing_cancellation_returns_capacity_exactly_once() {
 #[test]
 fn stage_capability_and_resource_authority_are_bound_to_the_exact_scope() {
     let control = control();
-    let foreign = WorkloadControl::try_new(config(), resources()).unwrap();
+    let foreign = WorkloadControl::try_new_split(config(), resources())
+        .unwrap()
+        .owner;
     let a = root(&control, WorkClass::Query);
     let b = root(&control, WorkClass::Query);
     let c = root(&foreign, WorkClass::Query);
@@ -619,7 +849,9 @@ fn commit_wait_releases_execution_but_keeps_output_and_business_responsibility()
 #[test]
 fn allocation_handoff_is_atomic_and_foreign_processes_cannot_receive_it() {
     let control = control();
-    let other_control = WorkloadControl::try_new(config(), resources()).unwrap();
+    let other_control = WorkloadControl::try_new_split(config(), resources())
+        .unwrap()
+        .owner;
     let a = root(&control, WorkClass::Query);
     let b = root(&control, WorkClass::Query);
     let foreign = root(&other_control, WorkClass::Query);
@@ -1626,7 +1858,9 @@ fn closing_admission_and_releasing_business_do_not_free_root_responsibility() {
     let mut limits = config();
     limits.root_limit = 1;
     limits.business_limit = 1;
-    let control = WorkloadControl::try_new(limits, resources()).unwrap();
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
     let work = root(&control, WorkClass::Query);
     work.business.release();
     assert_eq!(control.snapshot().businesses, 0);
@@ -1695,7 +1929,9 @@ fn supervisor_recovers_an_existing_obligation_without_reopening_work() {
 fn scope_and_obligation_metadata_stay_bounded() {
     let mut limits = config();
     limits.scope_records_limit = 8;
-    let control = WorkloadControl::try_new(limits, resources()).unwrap();
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
     let work = root(&control, WorkClass::MaterializedView);
     let children = (0..7)
         .map(|_| child(&work.owner.scope()))
@@ -1764,7 +2000,9 @@ async fn stage_capacity_timeout_does_not_cancel_unlimited_logical_work() {
 async fn stage_dispatch_does_not_grant_an_expired_unpolled_request() {
     let mut limits = config();
     limits.capacity_wait_timeout = Duration::from_secs(2);
-    let control = WorkloadControl::try_new(limits, resources()).unwrap();
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
     let blocker = root(&control, WorkClass::Query);
     let other = child(&blocker.owner.scope());
     let work = root(&control, WorkClass::Query);
@@ -2035,7 +2273,9 @@ async fn cleanup_capacity_can_become_available_after_inherited_deadline_expires(
 async fn cleanup_capacity_uses_its_full_independent_timeout_after_parent_deadline() {
     let mut limits = config();
     limits.capacity_wait_timeout = Duration::from_secs(2);
-    let control = WorkloadControl::try_new(limits, resources()).unwrap();
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
     let blocker = root(&control, WorkClass::Query);
     let work = control
         .try_begin_root(WorkRequest {
