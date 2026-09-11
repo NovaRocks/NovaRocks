@@ -143,6 +143,14 @@ struct InFlightSlot {
     lane: DispatchLane,
 }
 
+/// Exact carrier ownership for one operation inside the attempt dispatcher.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum DispatchOperationState {
+    Queued,
+    InFlight,
+    Absent,
+}
+
 /// The per-attempt dispatcher.
 ///
 /// It is scoped to one query execution, so its per-backend queues are exactly
@@ -316,6 +324,105 @@ impl OperationDispatcher {
             .into());
         }
         Ok(())
+    }
+
+    /// Whether one exact urgent operation can enter and immediately use its
+    /// lane on this serial turn.
+    ///
+    /// This is checked before an external owner hands its payload to the task
+    /// substrate. The caller separately obtains the process transport's queue
+    /// permit; this predicate is only the attempt-local dispatcher authority.
+    /// Because one TaskRound is the dispatcher's sole mutator, the capacity
+    /// cannot change between this check and the matching enqueue.
+    pub(super) fn priority_capacity_available(
+        &self,
+        intent: &OperationIntent,
+    ) -> Result<bool, TaskExecutionError> {
+        self.validate_operation_carrier(intent)?;
+        let queued_bytes = intent.queued_bytes();
+        if self.queued_items + 1 > self.transport.max_backend_queued_operations()
+            || self.queued_bytes + queued_bytes > self.transport.max_backend_queued_bytes()
+        {
+            return Ok(false);
+        }
+        let backend = intent.backend_process_id();
+        let lane = lane_index(intent.lane());
+        let Some(queues) = self.backends.get(&backend) else {
+            return Ok(false);
+        };
+        if queues.queued_items + 1 > self.transport.max_query_backend_queued_operations()
+            || queues.queued_bytes + queued_bytes > self.transport.max_query_backend_queued_bytes()
+        {
+            return Ok(false);
+        }
+        if queues.in_flight[lane] >= self.budget.permits_for(intent.lane()) {
+            return Ok(false);
+        }
+        Ok(queued_bytes <= self.transport.max_batch_encoded_bytes())
+    }
+
+    /// Reports whether an exact operation is still locally queued or has
+    /// crossed the process-transport acceptance boundary.
+    pub(super) fn operation_state(
+        &self,
+        operation_id: TaskOperationId,
+    ) -> Result<DispatchOperationState, TaskExecutionError> {
+        let queued = self
+            .backends
+            .values()
+            .flat_map(|queues| queues.lanes.iter())
+            .flat_map(|lane| lane.iter())
+            .filter(|entry| entry.intent.operation_id() == operation_id)
+            .count();
+        let in_flight = usize::from(self.in_flight.contains_key(&operation_id));
+        match queued + in_flight {
+            0 => Ok(DispatchOperationState::Absent),
+            1 if queued == 1 => Ok(DispatchOperationState::Queued),
+            1 => Ok(DispatchOperationState::InFlight),
+            _ => Err(TaskExecutionError::Schedule(
+                "one operation identity has multiple dispatcher owners".to_owned(),
+            )),
+        }
+    }
+
+    /// Removes one exact operation that has not crossed process transport.
+    /// Dropping its queue permit here returns process capacity before the
+    /// application effect is resolved by an older generation's receipt.
+    pub(super) fn cancel_queued(
+        &mut self,
+        operation_id: TaskOperationId,
+    ) -> Result<OperationIntent, TaskExecutionError> {
+        if self.operation_state(operation_id)? != DispatchOperationState::Queued {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        let mut removed = None;
+        'backend: for queues in self.backends.values_mut() {
+            for lane in &mut queues.lanes {
+                let Some(index) = lane
+                    .iter()
+                    .position(|entry| entry.intent.operation_id() == operation_id)
+                else {
+                    continue;
+                };
+                let entry = lane
+                    .remove(index)
+                    .expect("queued operation index came from the same lane");
+                queues.queued_items -= 1;
+                queues.queued_bytes -= entry.queued_bytes;
+                removed = Some(entry);
+                break 'backend;
+            }
+        }
+        let QueuedOperation {
+            intent,
+            queue_permit,
+            queued_bytes,
+            ..
+        } = removed.ok_or(TaskExecutionError::UnknownOperation)?;
+        self.queued_items -= 1;
+        self.queued_bytes -= queued_bytes;
+        drop(queue_permit);
+        Ok(intent)
     }
 
     fn backend_entry(&mut self, backend: BackendProcessId) -> &mut BackendQueues {

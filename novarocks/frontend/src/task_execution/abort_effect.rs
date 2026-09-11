@@ -27,12 +27,14 @@
 //! This module neither owns a wire nor creates a second context-lifecycle
 //! state machine.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use novarocks_execution::task_execution::{
-    AbortCause, AbortQueryContext, OperationKind, OperationOutcome, QueryContextState,
+    AbortCause, AbortQueryContext, OperationKind, OperationOutcome, QueryContextReceipt,
+    QueryContextState,
 };
 use novarocks_query_application::coordination::{
     AbortQueryContextEffectAdmission, AbortQueryContextEffectPort,
@@ -43,32 +45,45 @@ use novarocks_query_application::coordination::{
 use tokio::sync::{mpsc, watch};
 
 use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
+use super::status_intake::StatusIntakeWake;
 
 /// Bounded application-to-Native Abort projection.
 pub(crate) struct NativeAbortEffectAdapter {
-    effects: mpsc::Sender<NativeAbortEffect>,
+    effects: Option<mpsc::Sender<NativeAbortEffect>>,
+    submission_order: Arc<Mutex<VecDeque<OperationIntent>>>,
     capacity_epoch: watch::Sender<u64>,
+    wake: Arc<dyn StatusIntakeWake>,
 }
 
 impl fmt::Debug for NativeAbortEffectAdapter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NativeAbortEffectAdapter")
-            .field("remaining_capacity", &self.effects.capacity())
+            .field(
+                "remaining_capacity",
+                &self.effects.as_ref().map(mpsc::Sender::capacity),
+            )
             .finish()
     }
 }
 
 impl NativeAbortEffectAdapter {
-    pub(crate) fn bounded(capacity: NonZeroUsize) -> (Arc<Self>, NativeAbortEffectIntake) {
+    pub(crate) fn bounded(
+        capacity: NonZeroUsize,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> (Arc<Self>, NativeAbortEffectIntake) {
         let (effects, receiver) = mpsc::channel(capacity.get());
         let (capacity_epoch, _) = watch::channel(0);
+        let submission_order = Arc::new(Mutex::new(VecDeque::with_capacity(capacity.get())));
         let adapter = Arc::new(Self {
-            effects,
+            effects: Some(effects),
+            submission_order: Arc::clone(&submission_order),
             capacity_epoch: capacity_epoch.clone(),
+            wake,
         });
         let intake = NativeAbortEffectIntake {
             receiver,
+            submission_order,
             capacity_epoch,
         };
         (adapter, intake)
@@ -84,12 +99,17 @@ impl AbortQueryContextEffectPort for NativeAbortEffectAdapter {
         &self,
         identity: AbortQueryContextIssueIdentity,
     ) -> AbortQueryContextEffectAdmission {
-        match self.effects.clone().try_reserve_owned() {
+        let Some(effects) = self.effects.as_ref() else {
+            return AbortQueryContextEffectAdmission::Closed;
+        };
+        match effects.clone().try_reserve_owned() {
             Ok(permit) => {
                 AbortQueryContextEffectAdmission::Admitted(Box::new(NativeAbortEffectReservation {
                     identity,
                     permit: Some(permit),
+                    submission_order: Arc::clone(&self.submission_order),
                     capacity_epoch: self.capacity_epoch.clone(),
+                    wake: Arc::clone(&self.wake),
                 }))
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -97,6 +117,16 @@ impl AbortQueryContextEffectPort for NativeAbortEffectAdapter {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => AbortQueryContextEffectAdmission::Closed,
         }
+    }
+}
+
+impl Drop for NativeAbortEffectAdapter {
+    fn drop(&mut self) {
+        // Closing the final sender is the state transition the serial runner
+        // must observe. Publish the wake only after that transition so a
+        // runner cannot wake, still see an open empty intake, and park forever.
+        drop(self.effects.take());
+        self.wake.wake();
     }
 }
 
@@ -108,19 +138,72 @@ impl AbortQueryContextEffectPort for NativeAbortEffectAdapter {
 #[derive(Debug)]
 pub(crate) struct NativeAbortEffectIntake {
     receiver: mpsc::Receiver<NativeAbortEffect>,
+    submission_order: Arc<Mutex<VecDeque<OperationIntent>>>,
     capacity_epoch: watch::Sender<u64>,
 }
 
 impl NativeAbortEffectIntake {
+    /// Copies the exact front intent without releasing the adapter slot.
+    ///
+    /// The serial runner uses this description to obtain both dispatcher and
+    /// process-transport capacity before it takes ownership of the effect.
+    /// A producer serializes the carrier send and this preview under the same
+    /// lock, so the preview cannot name a different channel entry.
+    pub(crate) fn front_intent(&self) -> Result<OperationIntent, mpsc::error::TryRecvError> {
+        let order = self
+            .submission_order
+            .lock()
+            .expect("Native Abort effect submission order");
+        if let Some(intent) = order.front() {
+            return Ok(intent.clone());
+        }
+        if self.receiver.is_closed() {
+            Err(mpsc::error::TryRecvError::Disconnected)
+        } else {
+            Err(mpsc::error::TryRecvError::Empty)
+        }
+    }
+
     pub(crate) fn try_recv(&mut self) -> Result<NativeAbortEffect, mpsc::error::TryRecvError> {
+        let mut order = self
+            .submission_order
+            .lock()
+            .expect("Native Abort effect submission order");
         let effect = self.receiver.try_recv()?;
+        let preview = order
+            .pop_front()
+            .expect("every Native Abort carrier has one ordered preview");
+        assert_eq!(
+            preview.operation_id(),
+            effect.intent().operation_id(),
+            "Native Abort preview and carrier order diverged"
+        );
         publish_capacity(&self.capacity_epoch);
         Ok(effect)
     }
 
     #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.submission_order
+            .lock()
+            .expect("Native Abort effect submission order")
+            .len()
+    }
+
+    #[cfg(test)]
     async fn recv(&mut self) -> Option<NativeAbortEffect> {
         let effect = self.receiver.recv().await?;
+        let preview = self
+            .submission_order
+            .lock()
+            .expect("Native Abort effect submission order")
+            .pop_front()
+            .expect("every Native Abort carrier has one ordered preview");
+        assert_eq!(
+            preview.operation_id(),
+            effect.intent().operation_id(),
+            "Native Abort preview and carrier order diverged"
+        );
         publish_capacity(&self.capacity_epoch);
         Some(effect)
     }
@@ -130,7 +213,9 @@ impl NativeAbortEffectIntake {
 struct NativeAbortEffectReservation {
     identity: AbortQueryContextIssueIdentity,
     permit: Option<mpsc::OwnedPermit<NativeAbortEffect>>,
+    submission_order: Arc<Mutex<VecDeque<OperationIntent>>>,
     capacity_epoch: watch::Sender<u64>,
+    wake: Arc<dyn StatusIntakeWake>,
 }
 
 impl AbortQueryContextEffectReservation for NativeAbortEffectReservation {
@@ -150,18 +235,39 @@ impl AbortQueryContextEffectReservation for NativeAbortEffectReservation {
             intent: OperationIntent::AbortQueryContext(request),
             submission: Some(submission),
         };
+        let mut order = self
+            .submission_order
+            .lock()
+            .expect("Native Abort effect submission order");
         self.permit
             .take()
             .expect("a live Abort reservation retains its bounded slot")
             .send(effect);
+        order.push_back(OperationIntent::AbortQueryContext(request));
+        drop(order);
+        self.wake.wake();
     }
 }
 
 impl Drop for NativeAbortEffectReservation {
     fn drop(&mut self) {
         if self.permit.is_some() {
-            publish_capacity(&self.capacity_epoch);
+            release_permit_then_publish_capacity(&mut self.permit, &self.capacity_epoch);
+            self.wake.wake();
         }
+    }
+}
+
+fn release_permit_then_publish_capacity(
+    permit: &mut Option<mpsc::OwnedPermit<NativeAbortEffect>>,
+    capacity_epoch: &watch::Sender<u64>,
+) {
+    if let Some(permit) = permit.take() {
+        // Releasing capacity must happen before publishing its epoch; a
+        // waiter that wakes first could otherwise observe the old full
+        // channel and sleep without another notification.
+        drop(permit);
+        publish_capacity(capacity_epoch);
     }
 }
 
@@ -188,26 +294,79 @@ pub(crate) struct NativeAbortEffect {
     submission: Option<AbortQueryContextEffectSubmission>,
 }
 
+impl Drop for NativeAbortEffect {
+    fn drop(&mut self) {
+        if let Some(submission) = self.submission.take() {
+            // Losing the frontend owner is a local protocol failure, not
+            // evidence that a transport call had an unknown remote outcome.
+            // Stop replay and leave residual convergence to the supervisor.
+            let _ = submission.fail_closed();
+        }
+    }
+}
+
 impl NativeAbortEffect {
     pub(crate) fn intent(&self) -> &OperationIntent {
         &self.intent
+    }
+
+    /// Validates the acknowledgement without consuming actor authority.
+    /// TaskRound uses this before it releases dispatcher ownership so a bad
+    /// receipt cannot partially settle either side of the transaction.
+    pub(crate) fn validate_acknowledgement(
+        &self,
+        acknowledgement: &OperationAcknowledgement,
+    ) -> Result<(), NativeAbortEffectAckError> {
+        if acknowledgement.operation_id() != self.intent.operation_id() {
+            return Err(NativeAbortEffectAckError::OperationIdentityMismatch);
+        }
+        if acknowledgement.kind() != OperationKind::AbortQueryContext {
+            return Err(NativeAbortEffectAckError::OperationKindMismatch);
+        }
+        if acknowledgement.dispatch_result() == OperationDispatchResult::TransportUnknown {
+            return Ok(());
+        }
+        let expected_context = match &self.intent {
+            OperationIntent::AbortQueryContext(request) => request.context(),
+            _ => unreachable!("a Native Abort effect always retains an Abort intent"),
+        };
+        closing_receipt(expected_context, acknowledgement).map(drop)
+    }
+
+    /// Stops replay after a local protocol or dispatcher violation while the
+    /// actor's residual supervisor retains the exact context responsibility.
+    pub(crate) fn fail_closed(mut self) -> Result<(), ContextStandDownError> {
+        self.submission
+            .take()
+            .expect("a live Native Abort retains actor settlement authority")
+            .fail_closed()
+    }
+
+    /// Returns an Abort that expired while still dispatcher-queued to the
+    /// actor as definitely unsent. The actor may spend its next bounded
+    /// authorization generation on the same immutable operation.
+    pub(crate) fn definitely_unsent(mut self) -> Result<(), ContextStandDownError> {
+        self.submission
+            .take()
+            .expect("a live Native Abort retains actor settlement authority")
+            .definitely_unsent()
+    }
+
+    /// Another exact generation supplied the definitive Worker receipt while
+    /// this carrier was still definitely unsent in the dispatcher.
+    pub(crate) fn resolved_by_other_generation(mut self) {
+        self.submission
+            .take()
+            .expect("a live Native Abort retains actor settlement authority")
+            .resolved_by_other_generation();
     }
 
     pub(crate) fn settle(
         mut self,
         acknowledgement: &OperationAcknowledgement,
     ) -> Result<NativeAbortEffectSettlement, NativeAbortEffectSettleError> {
-        if acknowledgement.operation_id() != self.intent.operation_id() {
-            return Err(NativeAbortEffectSettleError::rejected(
-                NativeAbortEffectAckError::OperationIdentityMismatch,
-                self,
-            ));
-        }
-        if acknowledgement.kind() != OperationKind::AbortQueryContext {
-            return Err(NativeAbortEffectSettleError::rejected(
-                NativeAbortEffectAckError::OperationKindMismatch,
-                self,
-            ));
+        if let Err(reason) = self.validate_acknowledgement(acknowledgement) {
+            return Err(NativeAbortEffectSettleError::rejected(reason, self));
         }
 
         match acknowledgement.dispatch_result() {
@@ -218,55 +377,145 @@ impl NativeAbortEffect {
                     .expect("a live Native Abort retains actor settlement authority")
                     .transport_unknown()
                     .map_err(NativeAbortEffectSettleError::Application)?;
-                Ok(NativeAbortEffectSettlement::TransportUnknown(late))
+                Ok(NativeAbortEffectSettlement::TransportUnknown(
+                    NativeLateAbortEffect::new(late),
+                ))
             }
             OperationDispatchResult::WorkerReceipt(_) => {
-                let Some(outcome) = acknowledgement.worker_outcome() else {
-                    unreachable!("a Worker receipt carries its outcome");
-                };
-                if !legal_abort_closing_outcome(outcome) {
-                    return Err(NativeAbortEffectSettleError::rejected(
-                        NativeAbortEffectAckError::NonClosingWorkerOutcome(outcome),
-                        self,
-                    ));
-                }
-                let AckPayload::Context(receipt) = acknowledgement.payload() else {
-                    return Err(NativeAbortEffectSettleError::rejected(
-                        NativeAbortEffectAckError::MissingContextReceipt,
-                        self,
-                    ));
-                };
                 let expected_context = match &self.intent {
                     OperationIntent::AbortQueryContext(request) => request.context(),
                     _ => unreachable!("a Native Abort effect always retains an Abort intent"),
                 };
-                if receipt.context() != expected_context {
-                    return Err(NativeAbortEffectSettleError::rejected(
-                        NativeAbortEffectAckError::ContextReceiptIdentityMismatch,
-                        self,
-                    ));
-                }
-                if !matches!(
-                    receipt.state(),
-                    QueryContextState::Aborting
-                        | QueryContextState::Releasing
-                        | QueryContextState::TerminalRetained
-                        | QueryContextState::Gone
-                ) {
-                    return Err(NativeAbortEffectSettleError::rejected(
-                        NativeAbortEffectAckError::NonClosingContextReceipt,
-                        self,
-                    ));
-                }
+                let receipt = closing_receipt(expected_context, acknowledgement)
+                    .expect("Native Abort acknowledgement was validated before settlement");
                 self.submission
                     .take()
                     .expect("a live Native Abort retains actor settlement authority")
-                    .worker_settled(receipt.clone())
+                    .worker_settled(receipt)
                     .map_err(NativeAbortEffectSettleError::Application)?;
                 Ok(NativeAbortEffectSettlement::WorkerSettled)
             }
         }
     }
+}
+
+/// Applies a definitive Worker receipt to an earlier transport-unknown issue.
+///
+/// This path deliberately bypasses `QueryTaskExecution::acknowledge`: that
+/// dispatcher generation was already released by the unknown transport
+/// outcome. The retained application authority is exact in both operation and
+/// context, so only its matching closing receipt may resolve it.
+pub(crate) fn settle_late_abort_receipt(
+    settlement: NativeLateAbortEffect,
+    acknowledgement: &OperationAcknowledgement,
+) -> Result<(), NativeLateAbortEffectSettleError> {
+    let identity = settlement.identity();
+    if acknowledgement.operation_id() != identity.operation_id() {
+        return Err(NativeLateAbortEffectSettleError::rejected(
+            NativeAbortEffectAckError::OperationIdentityMismatch,
+            settlement,
+        ));
+    }
+    if acknowledgement.kind() != OperationKind::AbortQueryContext {
+        return Err(NativeLateAbortEffectSettleError::rejected(
+            NativeAbortEffectAckError::OperationKindMismatch,
+            settlement,
+        ));
+    }
+    if acknowledgement.dispatch_result() == OperationDispatchResult::TransportUnknown {
+        return Err(NativeLateAbortEffectSettleError::rejected(
+            NativeAbortEffectAckError::MissingWorkerReceipt,
+            settlement,
+        ));
+    }
+    let receipt = match closing_receipt(identity.context(), acknowledgement) {
+        Ok(receipt) => receipt,
+        Err(reason) => {
+            return Err(NativeLateAbortEffectSettleError::rejected(
+                reason, settlement,
+            ));
+        }
+    };
+    settlement
+        .worker_settled(receipt)
+        .map_err(NativeLateAbortEffectSettleError::Application)
+}
+
+/// Frontend ownership of a transport-unknown generation's late settlement.
+/// Dropping it is an explicit local failure, never another unknown outcome.
+#[derive(Debug)]
+pub(crate) struct NativeLateAbortEffect {
+    settlement: Option<LateAbortQueryContextWorkerSettlement>,
+}
+
+impl NativeLateAbortEffect {
+    fn new(settlement: LateAbortQueryContextWorkerSettlement) -> Self {
+        Self {
+            settlement: Some(settlement),
+        }
+    }
+
+    pub(crate) fn identity(&self) -> AbortQueryContextIssueIdentity {
+        self.settlement
+            .as_ref()
+            .expect("a live late Abort owner retains its settlement")
+            .identity()
+    }
+
+    fn worker_settled(mut self, receipt: QueryContextReceipt) -> Result<(), ContextStandDownError> {
+        self.settlement
+            .take()
+            .expect("a live late Abort owner retains its settlement")
+            .worker_settled(receipt)
+    }
+
+    pub(crate) fn fail_closed(mut self) -> Result<(), ContextStandDownError> {
+        self.settlement
+            .take()
+            .expect("a live late Abort owner retains its settlement")
+            .fail_closed()
+    }
+
+    /// Another exact generation published the definitive Worker fact.
+    pub(crate) fn resolved_by_other_generation(mut self) {
+        drop(self.settlement.take());
+    }
+}
+
+impl Drop for NativeLateAbortEffect {
+    fn drop(&mut self) {
+        if let Some(settlement) = self.settlement.take() {
+            let _ = settlement.fail_closed();
+        }
+    }
+}
+
+pub(crate) fn closing_receipt(
+    expected_context: novarocks_execution::task_execution::QueryContextRef,
+    acknowledgement: &OperationAcknowledgement,
+) -> Result<QueryContextReceipt, NativeAbortEffectAckError> {
+    let Some(outcome) = acknowledgement.worker_outcome() else {
+        return Err(NativeAbortEffectAckError::MissingWorkerReceipt);
+    };
+    if !legal_abort_closing_outcome(outcome) {
+        return Err(NativeAbortEffectAckError::NonClosingWorkerOutcome(outcome));
+    }
+    let AckPayload::Context(receipt) = acknowledgement.payload() else {
+        return Err(NativeAbortEffectAckError::MissingContextReceipt);
+    };
+    if receipt.context() != expected_context {
+        return Err(NativeAbortEffectAckError::ContextReceiptIdentityMismatch);
+    }
+    if !matches!(
+        receipt.state(),
+        QueryContextState::Aborting
+            | QueryContextState::Releasing
+            | QueryContextState::TerminalRetained
+            | QueryContextState::Gone
+    ) {
+        return Err(NativeAbortEffectAckError::NonClosingContextReceipt);
+    }
+    Ok(receipt.clone())
 }
 
 fn legal_abort_closing_outcome(outcome: OperationOutcome) -> bool {
@@ -284,17 +533,55 @@ fn legal_abort_closing_outcome(outcome: OperationOutcome) -> bool {
 #[must_use = "the late settlement authority must be retained or explicitly resolved"]
 pub(crate) enum NativeAbortEffectSettlement {
     WorkerSettled,
-    TransportUnknown(LateAbortQueryContextWorkerSettlement),
+    TransportUnknown(NativeLateAbortEffect),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativeAbortEffectAckError {
     OperationIdentityMismatch,
     OperationKindMismatch,
+    MissingWorkerReceipt,
     NonClosingWorkerOutcome(OperationOutcome),
     MissingContextReceipt,
     ContextReceiptIdentityMismatch,
     NonClosingContextReceipt,
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeLateAbortEffectSettleError {
+    /// The receipt does not resolve this exact late issue. The authority is
+    /// returned so callers cannot accidentally discard it as a normal miss.
+    Rejected {
+        reason: NativeAbortEffectAckError,
+        settlement: NativeLateAbortEffect,
+    },
+    Application(ContextStandDownError),
+}
+
+impl NativeLateAbortEffectSettleError {
+    fn rejected(reason: NativeAbortEffectAckError, settlement: NativeLateAbortEffect) -> Self {
+        Self::Rejected { reason, settlement }
+    }
+
+    pub(crate) fn fail_closed(self) -> Result<(), ContextStandDownError> {
+        match self {
+            Self::Rejected { settlement, .. } => settlement.fail_closed(),
+            Self::Application(error) => Err(error),
+        }
+    }
+}
+
+impl fmt::Display for NativeLateAbortEffectSettleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected { reason, settlement } => write!(
+                formatter,
+                "receipt rejected as {reason:?} for {:?}",
+                settlement.identity()
+            ),
+            Self::Application(error) => write!(formatter, "application settlement failed: {error}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -325,6 +612,26 @@ impl NativeAbortEffectSettleError {
         match self {
             Self::Rejected { effect, .. } => Some(effect),
             Self::Application(_) => None,
+        }
+    }
+
+    pub(crate) fn fail_closed(self) -> Result<(), ContextStandDownError> {
+        match self {
+            Self::Rejected { effect, .. } => effect.fail_closed(),
+            Self::Application(error) => Err(error),
+        }
+    }
+}
+
+impl fmt::Display for NativeAbortEffectSettleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected { reason, effect } => write!(
+                formatter,
+                "receipt rejected as {reason:?} for {:?}",
+                effect.intent().operation_id()
+            ),
+            Self::Application(error) => write!(formatter, "application settlement failed: {error}"),
         }
     }
 }
@@ -391,10 +698,43 @@ mod tests {
             .expect("the adapter intake remains connected")
     }
 
+    #[test]
+    fn cancelled_reservation_releases_capacity_before_publishing_its_epoch() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut permit = Some(sender.clone().try_reserve_owned().unwrap());
+        assert_eq!(sender.capacity(), 0);
+        let (capacity_epoch, receiver) = watch::channel(0);
+
+        release_permit_then_publish_capacity(&mut permit, &capacity_epoch);
+
+        assert_eq!(sender.capacity(), 1);
+        assert!(receiver.has_changed().unwrap());
+    }
+
+    #[test]
+    fn final_adapter_owner_closes_the_sender_before_waking_the_runner() {
+        let wake = Arc::new(super::super::status_intake::CountingWake::default());
+        let (adapter, intake) = NativeAbortEffectAdapter::bounded(
+            NonZeroUsize::MIN,
+            Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+        );
+
+        drop(adapter);
+
+        assert_eq!(wake.count(), 1);
+        assert!(matches!(
+            intake.front_intent(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
     #[tokio::test]
     async fn projects_actor_identity_and_replays_the_exact_native_abort() {
         let exact_context = context(BackendProcessId::new_v7());
-        let (adapter, mut intake) = NativeAbortEffectAdapter::bounded(NonZeroUsize::MIN);
+        let (adapter, mut intake) = NativeAbortEffectAdapter::bounded(
+            NonZeroUsize::MIN,
+            Arc::new(super::super::status_intake::CountingWake::default()),
+        );
         let (work_owner, execution_stage) = governed_execution();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             execution(),
@@ -453,15 +793,18 @@ mod tests {
         assert_eq!(first_request.context(), exact_context);
         assert_eq!(first_request.cause(), AbortCause::QueryFailed);
         let operation_id = first_request.envelope().operation_id();
-        assert!(matches!(
-            first
-                .settle(&OperationAcknowledgement::transport_unknown(
-                    operation_id,
-                    OperationKind::AbortQueryContext,
-                ))
-                .unwrap(),
-            NativeAbortEffectSettlement::TransportUnknown(_)
-        ));
+        let late = match first
+            .settle(&OperationAcknowledgement::transport_unknown(
+                operation_id,
+                OperationKind::AbortQueryContext,
+            ))
+            .unwrap()
+        {
+            NativeAbortEffectSettlement::TransportUnknown(late) => late,
+            NativeAbortEffectSettlement::WorkerSettled => {
+                panic!("a transport-unknown acknowledgement retains late authority")
+            }
+        };
 
         let second = next_effect(&mut intake).await;
         let OperationIntent::AbortQueryContext(second_request) = second.intent() else {
@@ -485,6 +828,7 @@ mod tests {
                 .unwrap(),
             NativeAbortEffectSettlement::WorkerSettled
         ));
+        late.resolved_by_other_generation();
 
         loop {
             if actor
@@ -520,7 +864,10 @@ mod tests {
     #[tokio::test]
     async fn invalid_context_receipts_are_rejected_without_losing_the_effect() {
         let exact_context = context(BackendProcessId::new_v7());
-        let (adapter, mut intake) = NativeAbortEffectAdapter::bounded(NonZeroUsize::MIN);
+        let (adapter, mut intake) = NativeAbortEffectAdapter::bounded(
+            NonZeroUsize::MIN,
+            Arc::new(super::super::status_intake::CountingWake::default()),
+        );
         let (work_owner, execution_stage) = governed_execution();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             execution(),
@@ -620,38 +967,37 @@ mod tests {
         );
         let effect = error.into_effect().expect("the exact effect is retained");
 
-        // The test owns the retained effect and resolves it explicitly so the
-        // actor can converge; rejection itself never classified it as unknown.
-        assert!(matches!(
-            effect
-                .settle(&OperationAcknowledgement::worker_receipt(
-                    operation_id,
-                    OperationKind::AbortQueryContext,
-                    OperationOutcome::Accepted,
-                    AckPayload::Context(QueryContextReceipt::new(
-                        exact_context,
-                        QueryContextState::Aborting,
-                    )),
-                ))
-                .unwrap(),
-            NativeAbortEffectSettlement::WorkerSettled
-        ));
+        effect
+            .fail_closed()
+            .expect("a rejected protocol receipt explicitly fails the effect closed");
         loop {
             if actor
                 .stand_down_snapshot(exact_context)
                 .await
                 .unwrap()
-                .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::Aborting)
+                .is_some_and(|snapshot| {
+                    snapshot.closure() == ContextClosureState::AbortIssueExhausted
+                        && snapshot.issue_state()
+                            == Some(
+                                novarocks_query_application::coordination::AbortQueryContextIssueState::FailedClosed,
+                            )
+                })
             {
                 break;
             }
             tokio::task::yield_now().await;
         }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), intake.recv())
+                .await
+                .is_err(),
+            "a typed protocol failure must not become an unknown-outcome replay"
+        );
         let supervisor = owner.into_residual_stand_down_supervisor();
         drop(actor);
         assert!(
             !supervisor.is_finished(),
-            "a valid Abort acknowledgement does not settle residual Worker responsibility"
+            "a failed-closed Abort retains residual Worker responsibility"
         );
         supervisor
             .observe_worker_process_replaced(exact_context)

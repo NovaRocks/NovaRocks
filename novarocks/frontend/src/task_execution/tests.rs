@@ -65,8 +65,8 @@ use super::graph::{
 };
 use super::intent::{
     AckPayload, DispatchBatch, OPERATION_FIXED_BYTES, OperationAcknowledgement, OperationIntent,
-    TaskOperationQueueAdmission, TaskOperationQueueRequest, TaskOperationSink, TaskOperationSubmit,
-    test_queue_permit,
+    TaskOperationQueueAdmission, TaskOperationQueuePermit, TaskOperationQueueRequest,
+    TaskOperationSink, TaskOperationSubmit, test_queue_permit,
 };
 use super::remote_task::{RemoteTaskState, UpdateAdmission};
 use super::split_domain::{assignment_targets, delivery_action};
@@ -291,6 +291,87 @@ struct BackpressureOnceSink {
 struct QueueBackpressureOnceSink {
     reserve_attempts: AtomicUsize,
     submitted_operations: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct SwitchableQueueSink {
+    queue_open: std::sync::atomic::AtomicBool,
+    submit_open: std::sync::atomic::AtomicBool,
+    batches: Mutex<Vec<(DispatchLane, Vec<OperationIntent>)>>,
+    live_queue_permits: Arc<AtomicUsize>,
+}
+
+impl Default for SwitchableQueueSink {
+    fn default() -> Self {
+        Self {
+            queue_open: std::sync::atomic::AtomicBool::new(true),
+            submit_open: std::sync::atomic::AtomicBool::new(true),
+            batches: Mutex::new(Vec::new()),
+            live_queue_permits: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SwitchableQueuePermit {
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for SwitchableQueuePermit {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl TaskOperationQueuePermit for SwitchableQueuePermit {
+    fn mark_in_flight(&mut self) {}
+}
+
+impl SwitchableQueueSink {
+    fn set_queue_open(&self, open: bool) {
+        self.queue_open.store(open, Ordering::SeqCst);
+    }
+
+    fn set_submit_open(&self, open: bool) {
+        self.submit_open.store(open, Ordering::SeqCst);
+    }
+
+    fn take(&self) -> Vec<(DispatchLane, Vec<OperationIntent>)> {
+        std::mem::take(&mut *self.batches.lock().expect("switchable sink"))
+    }
+
+    fn live_queue_permits(&self) -> usize {
+        self.live_queue_permits.load(Ordering::SeqCst)
+    }
+}
+
+impl TaskOperationSink for SwitchableQueueSink {
+    fn try_reserve_queue(
+        &self,
+        _request: TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        if self.queue_open.load(Ordering::SeqCst) {
+            self.live_queue_permits.fetch_add(1, Ordering::SeqCst);
+            TaskOperationQueueAdmission::Admitted(Box::new(SwitchableQueuePermit {
+                live: Arc::clone(&self.live_queue_permits),
+            }))
+        } else {
+            TaskOperationQueueAdmission::Backpressured
+        }
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+        if !self.submit_open.load(Ordering::SeqCst) {
+            return TaskOperationSubmit::Backpressured(batch);
+        }
+        let lane = batch.lane();
+        let operations = batch.into_operations();
+        self.batches
+            .lock()
+            .expect("switchable sink")
+            .push((lane, operations));
+        TaskOperationSubmit::Accepted
+    }
 }
 
 impl TaskOperationSink for QueueBackpressureOnceSink {
@@ -3510,6 +3591,732 @@ fn round_of(harness: Harness) -> (TaskRoundForTest, Arc<CountingWake>) {
     )
     .with_connector_blocking_io(test_connector_blocking_io());
     (round, wake)
+}
+
+async fn actor_abort_round_at_first_dispatch() -> (
+    crate::task_execution::round::TaskRound,
+    Arc<SwitchableQueueSink>,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    novarocks_query_application::coordination::LogicalExecutionActorOwner,
+    novarocks_query_application::coordination::LogicalExecutionActor,
+    QueryContextRef,
+    OperationIntent,
+    Arc<ManualClock>,
+) {
+    use novarocks_execution::task_execution::{
+        AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor,
+        QueryContextAdmissionTicketReceipt,
+    };
+    use novarocks_query_application::coordination::{
+        AbortQueryContextEffectPort, AdmissionIssueSettlement, ExecutionEffect,
+        LogicalExecutionActorConfig, spawn_logical_execution_actor,
+    };
+    use novarocks_workload_control::{
+        ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::abort_effect::NativeAbortEffectAdapter;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let exact_context = *graph.contexts().next().expect("one attempt context");
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(SwitchableQueueSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let clock = Arc::new(ManualClock::new());
+    let status = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::new(16, 12, 1, 4).expect("nonzero dispatch budget"),
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::clone(&clock) as Arc<dyn TaskProtocolClock>,
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        status,
+    )
+    .expect("compose execution");
+    let acks = TaskAckIntake::new(Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let ack_handle = acks.handle();
+    let (adapter, abort_intake) = NativeAbortEffectAdapter::bounded(
+        NonZeroUsize::new(2).unwrap(),
+        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+    );
+    let mut round = TaskRound::new(
+        execution,
+        acks,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()),
+    )
+    .with_abort_effect_intake(abort_intake);
+    round.seal_pumps();
+    round.turn().expect("startup releases admission");
+    let admission = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .find(|intent| {
+            matches!(
+                intent.kind(),
+                OperationKind::AcquireQueryContextAdmissionTicket
+            )
+        })
+        .expect("startup releases admission");
+
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1 << 30,
+            control_bytes: 1 << 20,
+            per_scope_bytes: 1 << 28,
+        },
+    )
+    .expect("valid workload control");
+    control.mark_ready().expect("workload control ready");
+    let governed = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .expect("query work admitted");
+    let execution_stage = governed
+        .owner
+        .scope()
+        .try_acquire(Stage::Execution)
+        .expect("execution stage admitted");
+    let config = LogicalExecutionActorConfig::single_attempt_completion(
+        execution_id(),
+        ExecutionEffect::None,
+        NonZeroUsize::new(2).unwrap(),
+        vec![exact_context],
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        governed.owner,
+        execution_stage,
+    )
+    .expect("valid actor configuration")
+    .with_abort_query_context_effect_port(
+        Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
+        NonZeroUsize::new(3).unwrap(),
+    );
+    let (owner, initial) =
+        spawn_logical_execution_actor(&tokio::runtime::Handle::current(), config)
+            .expect("spawn actor");
+    let actor = owner.actor().clone();
+    let running = actor.activate(initial.ready()).await.expect("activate");
+    let actor_admission = AcquireQueryContextAdmissionTicket::new(
+        TaskOperationId::new_v7(),
+        exact_context,
+        LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+        NativeCompatibilityId::new([7; 32]),
+        AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
+    );
+    let activation = running.identity();
+    let pending = running
+        .begin_admission_issue(actor_admission)
+        .await
+        .expect("begin actor admission");
+    drop(running);
+    actor
+        .settle_late_admission_issue(
+            activation,
+            pending,
+            AdmissionIssueSettlement::applied(
+                pending.operation_id(),
+                OperationOutcome::Accepted,
+                QueryContextAdmissionTicketReceipt::new(
+                    AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+                    exact_context,
+                    LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+                ),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("settle actor admission");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    ack_handle.publish(admission_ack(&admission));
+    round
+        .turn()
+        .expect("admission ACK frees lifecycle capacity");
+    let first_abort = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .find(|intent| matches!(intent.kind(), OperationKind::AbortQueryContext))
+        .expect("first actor Abort reaches transport");
+    (
+        round,
+        sink,
+        ack_handle,
+        owner,
+        actor,
+        exact_context,
+        first_abort,
+        clock,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
+    use novarocks_execution::task_execution::{
+        AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor,
+        QueryContextAdmissionTicketReceipt,
+    };
+    use novarocks_query_application::coordination::{
+        AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState,
+        ExecutionEffect, LogicalExecutionActorConfig, spawn_logical_execution_actor,
+    };
+    use novarocks_workload_control::{
+        ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::abort_effect::NativeAbortEffectAdapter;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let exact_context = *graph.contexts().next().expect("one attempt context");
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(SwitchableQueueSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let status = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::new(16, 12, 1, 4).expect("nonzero dispatch budget"),
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::new(ManualClock::new()),
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        status,
+    )
+    .expect("compose execution");
+    let acks = TaskAckIntake::new(Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let ack_handle = acks.handle();
+    let (adapter, abort_intake) = NativeAbortEffectAdapter::bounded(
+        NonZeroUsize::new(2).unwrap(),
+        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+    );
+    let mut round = TaskRound::new(
+        execution,
+        acks,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()),
+    )
+    .with_abort_effect_intake(abort_intake);
+    round.seal_pumps();
+
+    // Occupy the only real lifecycle permit with TaskRound's admission. An
+    // adapter slot exists independently and must not be mistaken for it.
+    round.turn().expect("startup releases one admission");
+    let mut startup = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .collect::<Vec<_>>();
+    let admission = startup
+        .iter()
+        .find(|intent| {
+            matches!(
+                intent.kind(),
+                OperationKind::AcquireQueryContextAdmissionTicket
+            )
+        })
+        .cloned()
+        .expect("startup releases admission");
+
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1 << 30,
+            control_bytes: 1 << 20,
+            per_scope_bytes: 1 << 28,
+        },
+    )
+    .expect("valid workload control");
+    control.mark_ready().expect("workload control ready");
+    let governed = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .expect("query work admitted");
+    let execution_stage = governed
+        .owner
+        .scope()
+        .try_acquire(Stage::Execution)
+        .expect("execution stage admitted");
+    let config = LogicalExecutionActorConfig::single_attempt_completion(
+        execution_id(),
+        ExecutionEffect::None,
+        NonZeroUsize::new(2).unwrap(),
+        vec![exact_context],
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        governed.owner,
+        execution_stage,
+    )
+    .expect("valid actor configuration")
+    .with_abort_query_context_effect_port(
+        Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
+        NonZeroUsize::new(2).unwrap(),
+    );
+    let (owner, initial) =
+        spawn_logical_execution_actor(&tokio::runtime::Handle::current(), config)
+            .expect("spawn actor");
+    let actor = owner.actor().clone();
+    let running = actor.activate(initial.ready()).await.expect("activate");
+    let actor_admission = AcquireQueryContextAdmissionTicket::new(
+        TaskOperationId::new_v7(),
+        exact_context,
+        LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+        NativeCompatibilityId::new([7; 32]),
+        AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
+    );
+    let activation = running.identity();
+    let pending = running
+        .begin_admission_issue(actor_admission)
+        .await
+        .expect("begin actor admission");
+    drop(running);
+    actor
+        .settle_late_admission_issue(
+            activation,
+            pending,
+            AdmissionIssueSettlement::applied(
+                pending.operation_id(),
+                OperationOutcome::Accepted,
+                QueryContextAdmissionTicketReceipt::new(
+                    AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+                    exact_context,
+                    LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+                ),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("settle actor admission");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(round.queued_abort_effects(), 1, "actor publishes one Abort");
+
+    let blocked = round
+        .turn()
+        .expect("full lifecycle lane leaves the adapter untouched");
+    assert_eq!(blocked.abort_effects, 0);
+    assert_eq!(round.queued_abort_effects(), 1);
+
+    sink.set_queue_open(false);
+    ack_handle.publish(admission_ack(&admission));
+    let process_blocked = round
+        .turn()
+        .expect("process backpressure leaves the adapter untouched");
+    assert_eq!(process_blocked.abort_effects, 0);
+    assert_eq!(round.queued_abort_effects(), 1);
+
+    sink.set_queue_open(true);
+    let admitted = round
+        .turn()
+        .expect("the freed lifecycle permit admits the actor Abort");
+    assert_eq!(admitted.abort_effects, 1);
+    assert_eq!(round.queued_abort_effects(), 0);
+    startup = sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .collect();
+    let first_abort = startup
+        .iter()
+        .find(|intent| matches!(intent.kind(), OperationKind::AbortQueryContext))
+        .cloned()
+        .expect("priority lifecycle dispatch releases the actor Abort");
+    assert_eq!(startup[0].operation_id(), first_abort.operation_id());
+    let operation_id = first_abort.operation_id();
+
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    round
+        .turn()
+        .expect("unknown outcome is published to the actor");
+
+    let mut replay = None;
+    for _ in 0..100 {
+        for intent in sink
+            .take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+        {
+            match intent.kind() {
+                OperationKind::AbortQueryContext => replay = Some(intent),
+                OperationKind::UpdateQueryContext => {
+                    ack_handle.publish(establish_ack(&intent));
+                }
+                _ => {}
+            }
+        }
+        if replay.is_some() {
+            break;
+        }
+        round.turn().expect("bounded retry turn");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let replay = replay.expect("the actor replays after unknown outcome");
+    assert_eq!(replay.operation_id(), operation_id);
+    let OperationIntent::AbortQueryContext(first_request) = first_abort else {
+        unreachable!()
+    };
+    let OperationIntent::AbortQueryContext(replay_request) = replay else {
+        unreachable!()
+    };
+    assert_eq!(
+        replay_request.envelope().operation_id(),
+        first_request.envelope().operation_id()
+    );
+    assert_eq!(replay_request.context(), first_request.context());
+    assert_eq!(replay_request.cause(), first_request.cause());
+
+    // A definitive receipt from the original send races with replay gen2
+    // already in flight. It may settle the same exact logical operation; the
+    // later gen2 transport callback must then hit the closing tombstone rather
+    // than fail as UnknownOperation.
+    ack_handle.publish(OperationAcknowledgement::worker_receipt(
+        operation_id,
+        OperationKind::AbortQueryContext,
+        OperationOutcome::ContextTerminalReceipt,
+        AckPayload::Context(QueryContextReceipt::new(
+            exact_context,
+            QueryContextState::TerminalRetained,
+        )),
+    ));
+    let closed = round
+        .turn()
+        .expect("the original receipt closes the in-flight exact replay");
+    assert_eq!(closed.acknowledgements, 1);
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    let tombstoned = round
+        .turn()
+        .expect("replay gen2's later callback is absorbed by the exact closing tombstone");
+    assert_eq!(tombstoned.acknowledgements, 1);
+    for _ in 0..100 {
+        if actor
+            .stand_down_snapshot(exact_context)
+            .await
+            .expect("stand-down snapshot")
+            .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        actor
+            .stand_down_snapshot(exact_context)
+            .await
+            .unwrap()
+            .unwrap()
+            .closure(),
+        ContextClosureState::TerminalRetained
+    );
+    assert_eq!(
+        round.queued_abort_effects(),
+        0,
+        "the late receipt settles before another replay enters the adapter"
+    );
+    assert!(
+        sink.take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+            .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
+        "the settled actor must not leave another Abort in process dispatch"
+    );
+    let supervisor = owner.into_residual_stand_down_supervisor();
+    drop(actor);
+    supervisor
+        .observe_worker_stopped_and_context_fenced(exact_context)
+        .await
+        .unwrap();
+    supervisor.join().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn definitive_late_receipt_consumes_an_adapter_queued_replay() {
+    use novarocks_query_application::coordination::ContextClosureState;
+
+    let (mut round, sink, ack_handle, owner, actor, exact_context, first_abort, _clock) =
+        actor_abort_round_at_first_dispatch().await;
+    let operation_id = first_abort.operation_id();
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    round.turn().expect("first Abort becomes transport-unknown");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(round.queued_abort_effects(), 1, "replay waits in adapter");
+
+    ack_handle.publish(OperationAcknowledgement::worker_receipt(
+        operation_id,
+        OperationKind::AbortQueryContext,
+        OperationOutcome::ContextTerminalReceipt,
+        AckPayload::Context(QueryContextReceipt::new(
+            exact_context,
+            QueryContextState::TerminalRetained,
+        )),
+    ));
+    let settled = round
+        .turn()
+        .expect("late receipt settles and consumes the adapter replay");
+    assert_eq!(settled.acknowledgements, 1);
+    assert_eq!(settled.abort_effects, 1);
+    assert_eq!(round.queued_abort_effects(), 0);
+    assert!(
+        sink.take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+            .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
+        "a replay closed in the adapter must never reach process transport"
+    );
+    for _ in 0..100 {
+        if actor
+            .stand_down_snapshot(exact_context)
+            .await
+            .unwrap()
+            .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let supervisor = owner.into_residual_stand_down_supervisor();
+    drop(actor);
+    supervisor
+        .observe_worker_stopped_and_context_fenced(exact_context)
+        .await
+        .unwrap();
+    supervisor.join().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn definitive_late_receipt_cancels_a_dispatcher_queued_replay() {
+    use novarocks_query_application::coordination::ContextClosureState;
+
+    let (mut round, sink, ack_handle, owner, actor, exact_context, first_abort, _clock) =
+        actor_abort_round_at_first_dispatch().await;
+    let operation_id = first_abort.operation_id();
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    round.turn().expect("first Abort becomes transport-unknown");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(round.queued_abort_effects(), 1, "actor authorizes replay");
+
+    // Release the real lifecycle lane, then make process submission refuse
+    // the replay after TaskRound has moved it out of the adapter.
+    for intent in sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+    {
+        if intent.kind() == OperationKind::UpdateQueryContext {
+            ack_handle.publish(establish_ack(&intent));
+        }
+    }
+    sink.set_submit_open(false);
+    let queued = round
+        .turn()
+        .expect("process backpressure restores replay to dispatcher");
+    assert_eq!(queued.abort_effects, 1);
+    assert_eq!(round.queued_abort_effects(), 0);
+    assert_eq!(
+        sink.live_queue_permits(),
+        1,
+        "dispatcher-queued replay retains its process reservation"
+    );
+
+    ack_handle.publish(OperationAcknowledgement::worker_receipt(
+        operation_id,
+        OperationKind::AbortQueryContext,
+        OperationOutcome::ContextTerminalReceipt,
+        AckPayload::Context(QueryContextReceipt::new(
+            exact_context,
+            QueryContextState::TerminalRetained,
+        )),
+    ));
+    let settled = round
+        .turn()
+        .expect("late receipt cancels the definitely-unsent queued replay");
+    assert_eq!(settled.acknowledgements, 1);
+    assert_eq!(
+        sink.live_queue_permits(),
+        0,
+        "cancelling the queued carrier returns process capacity"
+    );
+
+    sink.set_submit_open(true);
+    round
+        .turn()
+        .expect("a later turn has no closed replay to send");
+    assert!(
+        sink.take()
+            .into_iter()
+            .flat_map(|(_, operations)| operations)
+            .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
+        "the cancelled dispatcher replay must never reach process transport"
+    );
+    for _ in 0..100 {
+        if actor
+            .stand_down_snapshot(exact_context)
+            .await
+            .unwrap()
+            .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let supervisor = owner.into_residual_stand_down_supervisor();
+    drop(actor);
+    supervisor
+        .observe_worker_stopped_and_context_fenced(exact_context)
+        .await
+        .unwrap();
+    supervisor.join().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_actor_abort_expiry_returns_definitely_unsent_for_bounded_replay() {
+    use novarocks_query_application::coordination::{
+        AbortQueryContextIssueState, ContextClosureState,
+    };
+
+    let (mut round, sink, ack_handle, owner, actor, exact_context, first_abort, clock) =
+        actor_abort_round_at_first_dispatch().await;
+    let operation_id = first_abort.operation_id();
+    ack_handle.publish(OperationAcknowledgement::transport_unknown(
+        operation_id,
+        OperationKind::AbortQueryContext,
+    ));
+    round.turn().expect("first Abort becomes transport-unknown");
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(round.queued_abort_effects(), 1, "actor authorizes replay");
+
+    for intent in sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+    {
+        if intent.kind() == OperationKind::UpdateQueryContext {
+            ack_handle.publish(establish_ack(&intent));
+        }
+    }
+    sink.set_submit_open(false);
+    let queued = round
+        .turn()
+        .expect("process backpressure retains replay in dispatcher");
+    assert_eq!(queued.abort_effects, 1);
+    assert_eq!(round.queued_abort_effects(), 0);
+    clock.advance(TransportBudget::DEFAULT.frontend_queue_residence());
+    let error = round
+        .turn()
+        .expect_err("expired actor Abort is a typed local failure");
+    assert!(matches!(
+        error,
+        TaskExecutionError::QueueResidenceExpired {
+            kind: OperationKind::AbortQueryContext,
+            ..
+        }
+    ));
+    for _ in 0..100 {
+        if round.queued_abort_effects() == 1
+            && actor
+                .stand_down_snapshot(exact_context)
+                .await
+                .unwrap()
+                .is_some_and(|snapshot| {
+                    snapshot.closure() == ContextClosureState::AbortPending
+                        && snapshot.issue_state()
+                            == Some(AbortQueryContextIssueState::TransportOwned)
+                })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        round.queued_abort_effects(),
+        1,
+        "definitely-unsent returns the exact Abort to bounded actor replay"
+    );
+    let supervisor = owner.into_residual_stand_down_supervisor();
+    drop(actor);
+    supervisor
+        .observe_worker_process_replaced(exact_context)
+        .await
+        .unwrap();
+    supervisor.join().await.unwrap();
+}
+
+#[test]
+fn closed_actor_abort_intake_fails_the_active_round() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::abort_effect::NativeAbortEffectAdapter;
+    use crate::task_execution::round::TaskRound;
+
+    let harness = Harness::new(&[0], &[0], 64);
+    let wake = Arc::clone(&harness.wake);
+    let (adapter, abort_intake) = NativeAbortEffectAdapter::bounded(
+        NonZeroUsize::MIN,
+        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+    );
+    drop(adapter);
+    let mut round = TaskRound::new(
+        harness.execution,
+        TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>),
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()),
+    )
+    .with_abort_effect_intake(abort_intake);
+    round.seal_pumps();
+
+    let error = round
+        .turn()
+        .expect_err("a disconnected effect owner cannot be treated as no work");
+    assert!(error.to_string().contains("Abort effect intake closed"));
 }
 
 type TaskRoundForTest = crate::task_execution::round::TaskRound;

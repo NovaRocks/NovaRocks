@@ -47,7 +47,7 @@ use novarocks_query_application::coordination::AcceptedRootSuccessSealRequest;
 use novarocks_types::identity::BackendProcessId;
 
 use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
-use super::dispatch::OperationDispatcher;
+use super::dispatch::{DispatchOperationState, OperationDispatcher};
 use super::error::{CapacityBound, TaskExecutionError};
 use super::graph::TaskGraph;
 use super::intent::{
@@ -78,6 +78,10 @@ enum OperationTarget {
     /// the runner's acknowledgement-observer seam, which sees every
     /// acknowledgement before it is settled.
     ContextDomain(QueryContextRef),
+    /// An actor-owned Abort projected into this attempt's Native lifecycle
+    /// lane. The dispatcher owns only carrier capacity; TaskRound settles the
+    /// actor's exact effect from the same acknowledgement intake.
+    ActorAbort,
 }
 
 /// One owner transition waiting to become a dispatcher entry.
@@ -178,6 +182,7 @@ pub struct QueryTaskExecution {
     sink: Arc<dyn TaskOperationSink>,
     intake: StatusIntake,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
+    expired_actor_aborts: Vec<TaskOperationId>,
     status_reconciliations: BTreeSet<QueryContextRef>,
     failure: TerminationLatch,
     read: ReadCompletionTracker,
@@ -197,6 +202,21 @@ pub enum AbortSubmission {
     /// process-level transport supervisor owns the capacity-change wake that
     /// will schedule its next turn.
     Backpressured,
+}
+
+/// Real dispatcher and process-transport capacity reserved for one exact
+/// actor-owned Abort preview.
+#[derive(Debug)]
+pub(crate) struct ActorAbortReservation {
+    operation_id: TaskOperationId,
+    context: QueryContextRef,
+    queue_permit: Box<dyn TaskOperationQueuePermit>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ActorAbortDispatchState {
+    Queued,
+    InFlight,
 }
 
 impl QueryTaskExecution {
@@ -279,6 +299,7 @@ impl QueryTaskExecution {
             sink,
             intake,
             operation_targets: BTreeMap::new(),
+            expired_actor_aborts: Vec::new(),
             status_reconciliations: BTreeSet::new(),
             failure: TerminationLatch::open(),
             read,
@@ -312,6 +333,10 @@ impl QueryTaskExecution {
     /// immediate status resubscription from the frontend's held cursors.
     pub fn take_status_reconciliations(&mut self) -> BTreeSet<QueryContextRef> {
         std::mem::take(&mut self.status_reconciliations)
+    }
+
+    pub(crate) fn take_expired_actor_aborts(&mut self) -> Vec<TaskOperationId> {
+        std::mem::take(&mut self.expired_actor_aborts)
     }
 
     /// Every backend's sealed runtime-filter observation, as its release
@@ -379,7 +404,11 @@ impl QueryTaskExecution {
             // The dispatcher never accepted this operation, so no remote
             // effect is possible. Roll back its owner marker before failing
             // the attempt; cleanup can then mint the cancellation it owes.
-            self.rollback_unsent(target, operation_id);
+            if target == OperationTarget::ActorAbort {
+                self.expired_actor_aborts.push(operation_id);
+            } else {
+                self.rollback_unsent(target, operation_id);
+            }
             first_expiry.get_or_insert(TaskExecutionError::QueueResidenceExpired {
                 operation_id,
                 kind,
@@ -534,6 +563,113 @@ impl QueryTaskExecution {
         Ok(operation_id)
     }
 
+    /// Reserves the two capacities an actor-owned Abort needs before its
+    /// bounded adapter slot is released.
+    ///
+    /// The preview remains in the adapter while this runs. A successful
+    /// result owns a real process queue permit, and the serial dispatcher has
+    /// proved that the exact backend's lifecycle lane can advance now. The
+    /// adapter slot is never treated as either authority.
+    pub(crate) fn try_reserve_actor_abort(
+        &self,
+        intent: &OperationIntent,
+    ) -> Result<Option<ActorAbortReservation>, TaskExecutionError> {
+        let OperationIntent::AbortQueryContext(request) = intent else {
+            return Err(TaskExecutionError::Schedule(
+                "actor Abort intake preview is not an AbortQueryContext intent".to_owned(),
+            ));
+        };
+        if !self.owners.contains_key(&request.context()) {
+            return Err(TaskExecutionError::Schedule(format!(
+                "actor Abort names context {} outside this attempt",
+                request.context()
+            )));
+        }
+        if self.operation_targets.contains_key(&intent.operation_id()) {
+            return Err(TaskExecutionError::Schedule(format!(
+                "actor Abort operation {} is already owned by this attempt",
+                intent.operation_id()
+            )));
+        }
+        if !self.dispatcher.priority_capacity_available(intent)? {
+            return Ok(None);
+        }
+        let Some(queue_permit) = self.reserve_process_queue(intent)? else {
+            return Ok(None);
+        };
+        Ok(Some(ActorAbortReservation {
+            operation_id: intent.operation_id(),
+            context: request.context(),
+            queue_permit,
+        }))
+    }
+
+    /// Commits one actor-owned Abort after its exact adapter effect is taken.
+    pub(crate) fn enqueue_actor_abort(
+        &mut self,
+        intent: OperationIntent,
+        reservation: ActorAbortReservation,
+    ) -> Result<(), TaskExecutionError> {
+        let OperationIntent::AbortQueryContext(request) = &intent else {
+            return Err(TaskExecutionError::Schedule(
+                "actor Abort carrier is not an AbortQueryContext intent".to_owned(),
+            ));
+        };
+        if intent.operation_id() != reservation.operation_id
+            || request.context() != reservation.context
+        {
+            return Err(TaskExecutionError::Schedule(
+                "actor Abort carrier differs from its reserved preview".to_owned(),
+            ));
+        }
+        let now = self.clock.now();
+        self.dispatcher
+            .enqueue_priority_reserved(intent, now, reservation.queue_permit)?;
+        if self
+            .operation_targets
+            .insert(reservation.operation_id, OperationTarget::ActorAbort)
+            .is_some()
+        {
+            return Err(TaskExecutionError::Schedule(
+                "actor Abort operation ownership was replaced".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn actor_abort_dispatch_state(
+        &self,
+        operation_id: TaskOperationId,
+    ) -> Result<ActorAbortDispatchState, TaskExecutionError> {
+        if self.operation_targets.get(&operation_id) != Some(&OperationTarget::ActorAbort) {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        match self.dispatcher.operation_state(operation_id)? {
+            DispatchOperationState::Queued => Ok(ActorAbortDispatchState::Queued),
+            DispatchOperationState::InFlight => Ok(ActorAbortDispatchState::InFlight),
+            DispatchOperationState::Absent => Err(TaskExecutionError::UnknownOperation),
+        }
+    }
+
+    /// Cancels a definitely-unsent actor Abort after another generation's
+    /// definitive receipt closed the exact operation.
+    pub(crate) fn cancel_queued_actor_abort(
+        &mut self,
+        operation_id: TaskOperationId,
+    ) -> Result<(), TaskExecutionError> {
+        if self.actor_abort_dispatch_state(operation_id)? != ActorAbortDispatchState::Queued {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        let intent = self.dispatcher.cancel_queued(operation_id)?;
+        if intent.kind() != OperationKind::AbortQueryContext {
+            return Err(TaskExecutionError::Schedule(
+                "actor Abort dispatcher target retained a non-Abort carrier".to_owned(),
+            ));
+        }
+        self.operation_targets.remove(&operation_id);
+        Ok(())
+    }
+
     /// Forces one context down, ahead of everything queued for it.
     pub fn abort_context(
         &mut self,
@@ -586,11 +722,12 @@ impl QueryTaskExecution {
         &mut self,
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
-        let target = self
+        let target = *self
             .operation_targets
-            .remove(&ack.operation_id())
+            .get(&ack.operation_id())
             .ok_or(TaskExecutionError::UnknownOperation)?;
         self.dispatcher.settle(ack.operation_id())?;
+        self.operation_targets.remove(&ack.operation_id());
         match target {
             OperationTarget::Task { stage, task } => self.acknowledge_task(stage, task, ack),
             OperationTarget::Context(context) => self.acknowledge_context(context, ack),
@@ -599,6 +736,7 @@ impl QueryTaskExecution {
             // seam before the runner got here, so applying it a second time
             // would be a second authority over the same progression.
             OperationTarget::ContextDomain(_) => Ok(()),
+            OperationTarget::ActorAbort => Ok(()),
         }
     }
 
@@ -1036,6 +1174,7 @@ impl QueryTaskExecution {
                 }
             }
             OperationTarget::ContextDomain(_) => {}
+            OperationTarget::ActorAbort => {}
         }
     }
 

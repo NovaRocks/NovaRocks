@@ -195,6 +195,10 @@ pub enum AbortQueryContextIssueState {
     DefinitelyUnsent,
     TransportUnknown,
     WorkerSettled,
+    /// The effect owner observed a local protocol or dispatcher violation.
+    /// Replaying cannot repair such a violation, so the context remains a
+    /// residual responsibility until Worker-stop or process-fence evidence.
+    FailedClosed,
     AuthorizationExhausted,
 }
 
@@ -337,6 +341,7 @@ enum AbortIssueEventKind {
     DefinitelyUnsent,
     TransportUnknown,
     WorkerSettled(AbortQueryContextWorkerSettlement),
+    FailedClosed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -703,6 +708,7 @@ impl ContextStandDownLedger {
             return match event.kind {
                 AbortIssueEventKind::WorkerSettled(_) if record.registry_fenced => Ok(()),
                 AbortIssueEventKind::WorkerSettled(settlement) => settle_worker(record, settlement),
+                AbortIssueEventKind::FailedClosed => fail_closed(record),
                 _ => Ok(()),
             };
         }
@@ -741,6 +747,7 @@ impl ContextStandDownLedger {
                 Some(AbortQueryContextIssueState::TransportUnknown) => Ok(()),
                 _ => Err(ContextStandDownError::WrongState),
             },
+            AbortIssueEventKind::FailedClosed => fail_closed(record),
         }
     }
 }
@@ -763,6 +770,17 @@ fn settle_worker(
     advance_closure(record, closure)?;
     record.worker_settled = true;
     record.issue_state = Some(AbortQueryContextIssueState::WorkerSettled);
+    record.request = None;
+    Ok(())
+}
+
+fn fail_closed(record: &mut ContextStandDownRecord) -> Result<(), ContextStandDownError> {
+    if record.registry_fenced || record.worker_settled {
+        return Ok(());
+    }
+    record.issue_state = Some(AbortQueryContextIssueState::FailedClosed);
+    record.closure = ContextClosureState::AbortIssueExhausted;
+    record.retry_not_before = None;
     record.request = None;
     Ok(())
 }
@@ -1003,14 +1021,40 @@ impl AbortQueryContextEffectSubmission {
         })
     }
 
+    /// The frontend dispatcher proved that this port-owned effect expired
+    /// before it was released to process transport. This preserves the exact
+    /// request in the actor ledger and permits the next bounded replay.
+    pub fn definitely_unsent(mut self) -> Result<(), ContextStandDownError> {
+        let result = self.publish(AbortIssueEventKind::DefinitelyUnsent);
+        self.request.take();
+        result
+    }
+
     pub fn worker_settled(
         mut self,
         receipt: QueryContextReceipt,
     ) -> Result<(), ContextStandDownError> {
         let settlement = AbortQueryContextWorkerSettlement::try_new(self.identity, receipt)?;
-        self.publish(AbortIssueEventKind::WorkerSettled(settlement))?;
+        let result = self.publish(AbortIssueEventKind::WorkerSettled(settlement));
         self.request.take();
-        Ok(())
+        result
+    }
+
+    /// A local protocol or dispatcher violation makes replay unsafe.
+    ///
+    /// The actor stops authorizing this issue while its residual supervisor
+    /// retains the context responsibility until exact convergence evidence.
+    pub fn fail_closed(mut self) -> Result<(), ContextStandDownError> {
+        let result = self.publish(AbortIssueEventKind::FailedClosed);
+        self.request.take();
+        result
+    }
+
+    /// Another generation of this exact operation observed the definitive
+    /// Worker receipt. The actor ledger has already consumed that fact, so
+    /// this transport owner can relinquish its duplicate request silently.
+    pub fn resolved_by_other_generation(mut self) {
+        self.request.take();
     }
 
     fn publish(&self, kind: AbortIssueEventKind) -> Result<(), ContextStandDownError> {
@@ -1053,6 +1097,19 @@ impl LateAbortQueryContextWorkerSettlement {
                 identity: self.identity,
                 authorization_generation: self.authorization_generation,
                 kind: AbortIssueEventKind::WorkerSettled(settlement),
+            },
+        )
+    }
+
+    /// A late receipt violated the exact operation/context contract.
+    /// Replaying the same request cannot repair that local protocol failure.
+    pub fn fail_closed(self) -> Result<(), ContextStandDownError> {
+        publish_event(
+            &self.events,
+            AbortIssueEvent {
+                identity: self.identity,
+                authorization_generation: self.authorization_generation,
+                kind: AbortIssueEventKind::FailedClosed,
             },
         )
     }
