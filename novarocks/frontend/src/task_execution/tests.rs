@@ -3597,7 +3597,9 @@ async fn actor_abort_round_at_first_dispatch() -> (
     crate::task_execution::round::TaskRound,
     Arc<SwitchableQueueSink>,
     crate::native::task_transport::TaskAckIntakeHandle,
-    novarocks_query_application::coordination::LogicalExecutionActorOwner,
+    novarocks_query_application::coordination::LogicalExecutionRuntimeRegistry,
+    novarocks_query_application::coordination::LogicalExecutionRuntimeRegistryHandle,
+    novarocks_query_application::coordination::LogicalExecutionRegistration,
     novarocks_query_application::coordination::LogicalExecutionActor,
     QueryContextRef,
     OperationIntent,
@@ -3609,7 +3611,7 @@ async fn actor_abort_round_at_first_dispatch() -> (
     };
     use novarocks_query_application::coordination::{
         AbortQueryContextEffectPort, AdmissionIssueSettlement, ExecutionEffect,
-        LogicalExecutionActorConfig, spawn_logical_execution_actor,
+        LogicalExecutionActorConfig, LogicalExecutionRuntimeRegistry,
     };
     use novarocks_workload_control::{
         ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
@@ -3702,10 +3704,15 @@ async fn actor_abort_round_at_first_dispatch() -> (
         Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
         NonZeroUsize::new(3).unwrap(),
     );
-    let (owner, initial) =
-        spawn_logical_execution_actor(&tokio::runtime::Handle::current(), config)
-            .expect("spawn actor");
-    let actor = owner.actor().clone();
+    let registry_owner = LogicalExecutionRuntimeRegistry::new(tokio::runtime::Handle::current());
+    let registry = registry_owner.handle();
+    let (registration, initial, _output) = registry
+        .reserve(execution_id(), vec![exact_context])
+        .expect("reserve logical execution")
+        .spawn_and_install(config)
+        .expect("spawn and install actor")
+        .into_parts();
+    let actor = registry.actor(&registration).expect("registered actor");
     let running = actor.activate(initial.ready()).await.expect("activate");
     let actor_admission = AcquireQueryContextAdmissionTicket::new(
         TaskOperationId::new_v7(),
@@ -3757,7 +3764,9 @@ async fn actor_abort_round_at_first_dispatch() -> (
         round,
         sink,
         ack_handle,
-        owner,
+        registry_owner,
+        registry,
+        registration,
         actor,
         exact_context,
         first_abort,
@@ -3773,7 +3782,7 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
     };
     use novarocks_query_application::coordination::{
         AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState,
-        ExecutionEffect, LogicalExecutionActorConfig, spawn_logical_execution_actor,
+        ExecutionEffect, LogicalExecutionActorConfig, LogicalExecutionRuntimeRegistry,
     };
     use novarocks_workload_control::{
         ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
@@ -3872,10 +3881,15 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
         NonZeroUsize::new(2).unwrap(),
     );
-    let (owner, initial) =
-        spawn_logical_execution_actor(&tokio::runtime::Handle::current(), config)
-            .expect("spawn actor");
-    let actor = owner.actor().clone();
+    let registry_owner = LogicalExecutionRuntimeRegistry::new(tokio::runtime::Handle::current());
+    let registry = registry_owner.handle();
+    let (mut registration, initial, _output) = registry
+        .reserve(execution_id(), vec![exact_context])
+        .expect("reserve logical execution")
+        .spawn_and_install(config)
+        .expect("spawn and install actor")
+        .into_parts();
+    let actor = registry.actor(&registration).expect("registered actor");
     let running = actor.activate(initial.ready()).await.expect("activate");
     let actor_admission = AcquireQueryContextAdmissionTicket::new(
         TaskOperationId::new_v7(),
@@ -4049,21 +4063,32 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
             .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
         "the settled actor must not leave another Abort in process dispatch"
     );
-    let supervisor = owner.into_residual_stand_down_supervisor();
     drop(actor);
-    supervisor
-        .observe_worker_stopped_and_context_fenced(exact_context)
+    registry
+        .observe_worker_stopped_and_context_fenced(&registration, exact_context)
         .await
         .unwrap();
-    supervisor.join().await.unwrap();
+    let receipt = registry.join(&mut registration).await.unwrap();
+    registry.retire(receipt).unwrap();
+    registry_owner.shutdown().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn definitive_late_receipt_consumes_an_adapter_queued_replay() {
     use novarocks_query_application::coordination::ContextClosureState;
 
-    let (mut round, sink, ack_handle, owner, actor, exact_context, first_abort, _clock) =
-        actor_abort_round_at_first_dispatch().await;
+    let (
+        mut round,
+        sink,
+        ack_handle,
+        registry_owner,
+        registry,
+        mut registration,
+        actor,
+        exact_context,
+        first_abort,
+        _clock,
+    ) = actor_abort_round_at_first_dispatch().await;
     let operation_id = first_abort.operation_id();
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
@@ -4111,21 +4136,32 @@ async fn definitive_late_receipt_consumes_an_adapter_queued_replay() {
         }
         tokio::task::yield_now().await;
     }
-    let supervisor = owner.into_residual_stand_down_supervisor();
     drop(actor);
-    supervisor
-        .observe_worker_stopped_and_context_fenced(exact_context)
+    registry
+        .observe_worker_stopped_and_context_fenced(&registration, exact_context)
         .await
         .unwrap();
-    supervisor.join().await.unwrap();
+    let receipt = registry.join(&mut registration).await.unwrap();
+    registry.retire(receipt).unwrap();
+    registry_owner.shutdown().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn definitive_late_receipt_cancels_a_dispatcher_queued_replay() {
     use novarocks_query_application::coordination::ContextClosureState;
 
-    let (mut round, sink, ack_handle, owner, actor, exact_context, first_abort, _clock) =
-        actor_abort_round_at_first_dispatch().await;
+    let (
+        mut round,
+        sink,
+        ack_handle,
+        registry_owner,
+        registry,
+        mut registration,
+        actor,
+        exact_context,
+        first_abort,
+        _clock,
+    ) = actor_abort_round_at_first_dispatch().await;
     let operation_id = first_abort.operation_id();
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
@@ -4204,13 +4240,14 @@ async fn definitive_late_receipt_cancels_a_dispatcher_queued_replay() {
         }
         tokio::task::yield_now().await;
     }
-    let supervisor = owner.into_residual_stand_down_supervisor();
     drop(actor);
-    supervisor
-        .observe_worker_stopped_and_context_fenced(exact_context)
+    registry
+        .observe_worker_stopped_and_context_fenced(&registration, exact_context)
         .await
         .unwrap();
-    supervisor.join().await.unwrap();
+    let receipt = registry.join(&mut registration).await.unwrap();
+    registry.retire(receipt).unwrap();
+    registry_owner.shutdown().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4219,8 +4256,18 @@ async fn queued_actor_abort_expiry_returns_definitely_unsent_for_bounded_replay(
         AbortQueryContextIssueState, ContextClosureState,
     };
 
-    let (mut round, sink, ack_handle, owner, actor, exact_context, first_abort, clock) =
-        actor_abort_round_at_first_dispatch().await;
+    let (
+        mut round,
+        sink,
+        ack_handle,
+        registry_owner,
+        registry,
+        mut registration,
+        actor,
+        exact_context,
+        first_abort,
+        clock,
+    ) = actor_abort_round_at_first_dispatch().await;
     let operation_id = first_abort.operation_id();
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
@@ -4282,13 +4329,14 @@ async fn queued_actor_abort_expiry_returns_definitely_unsent_for_bounded_replay(
         1,
         "definitely-unsent returns the exact Abort to bounded actor replay"
     );
-    let supervisor = owner.into_residual_stand_down_supervisor();
     drop(actor);
-    supervisor
-        .observe_worker_process_replaced(exact_context)
+    registry
+        .observe_worker_process_replaced(&registration, exact_context)
         .await
         .unwrap();
-    supervisor.join().await.unwrap();
+    let receipt = registry.join(&mut registration).await.unwrap();
+    registry.retire(receipt).unwrap();
+    registry_owner.shutdown().unwrap();
 }
 
 #[test]

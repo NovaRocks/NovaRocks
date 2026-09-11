@@ -1499,7 +1499,9 @@ mod tests {
             stage,
         )
         .unwrap();
-        let (_owner, permit) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
+        let (_owner, permit, _output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
         permit.identity()
     }
 
@@ -2227,7 +2229,9 @@ mod tests {
         let expected_expiry = MonotonicInstant::from_origin(Duration::from_secs(13));
         let clock = Arc::new(ManualActorClock::new(sent_at));
         let config = actor_config(execution, vec![context]).with_clock(clock.clone());
-        let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let issue = running
@@ -2252,7 +2256,9 @@ mod tests {
         let execution = execution(10);
         let context = context(execution);
         let config = actor_config(execution, vec![context]);
-        let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         assert_eq!(
@@ -2272,7 +2278,9 @@ mod tests {
         let execution = execution(11);
         let context = context(execution);
         let config = actor_config(execution, vec![context]);
-        let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let ticket = ticket(context, 11);
@@ -2327,7 +2335,9 @@ mod tests {
         let execution = execution(12);
         let context = context(execution);
         let config = actor_config(execution, vec![context]);
-        let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let ticket = ticket(context, 12);
@@ -2377,7 +2387,9 @@ mod tests {
         let first_context = context(execution);
         let second_context = context(execution);
         let config = actor_config(execution, vec![first_context, second_context]);
-        let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let first_ticket = ticket(first_context, 13);

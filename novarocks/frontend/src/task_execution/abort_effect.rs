@@ -648,7 +648,7 @@ mod tests {
     use novarocks_query_application::coordination::{
         AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState, DispatchLane,
         ExecutionEffect, LogicalConclusion, LogicalExecutionActorConfig,
-        spawn_logical_execution_actor,
+        LogicalExecutionRuntimeRegistry,
     };
     use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{
@@ -751,9 +751,16 @@ mod tests {
             Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
             NonZeroUsize::new(2).unwrap(),
         );
-        let (owner, initial) =
-            spawn_logical_execution_actor(&tokio::runtime::Handle::current(), config).unwrap();
-        let actor = owner.actor().clone();
+        let registry_owner =
+            LogicalExecutionRuntimeRegistry::new(tokio::runtime::Handle::current());
+        let registry = registry_owner.handle();
+        let (mut registration, initial, _output) = registry
+            .reserve(execution(), vec![exact_context])
+            .unwrap()
+            .spawn_and_install(config)
+            .unwrap()
+            .into_parts();
+        let actor = registry.actor(&registration).unwrap();
         let running = actor.activate(initial.ready()).await.unwrap();
         let admission = AcquireQueryContextAdmissionTicket::new(
             TaskOperationId::new_v7(),
@@ -845,20 +852,25 @@ mod tests {
             actor.snapshot().await.unwrap().conclusion,
             Some(LogicalConclusion::Cancelled)
         );
-        let supervisor = owner.into_residual_stand_down_supervisor();
         drop(actor);
         assert!(
-            !supervisor.is_finished(),
+            !matches!(
+                registry.join_readiness(&registration).await.unwrap(),
+                novarocks_query_application::coordination::LogicalExecutionJoinReadiness::Ready
+            ),
             "a terminal Abort receipt does not prove actual Worker stop or process replacement"
         );
-        supervisor
-            .observe_worker_stopped_and_context_fenced(exact_context)
+        registry
+            .observe_worker_stopped_and_context_fenced(&registration, exact_context)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), supervisor.join())
-            .await
-            .expect("exact Worker stop and context fencing lets the owner finish")
-            .unwrap();
+        let receipt =
+            tokio::time::timeout(Duration::from_secs(1), registry.join(&mut registration))
+                .await
+                .expect("exact Worker stop and context fencing lets the owner finish")
+                .unwrap();
+        registry.retire(receipt).unwrap();
+        registry_owner.shutdown().unwrap();
     }
 
     #[tokio::test]
@@ -884,9 +896,16 @@ mod tests {
             Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
             NonZeroUsize::MIN,
         );
-        let (owner, initial) =
-            spawn_logical_execution_actor(&tokio::runtime::Handle::current(), config).unwrap();
-        let actor = owner.actor().clone();
+        let registry_owner =
+            LogicalExecutionRuntimeRegistry::new(tokio::runtime::Handle::current());
+        let registry = registry_owner.handle();
+        let (mut registration, initial, _output) = registry
+            .reserve(execution(), vec![exact_context])
+            .unwrap()
+            .spawn_and_install(config)
+            .unwrap()
+            .into_parts();
+        let actor = registry.actor(&registration).unwrap();
         let running = actor.activate(initial.ready()).await.unwrap();
         let admission = AcquireQueryContextAdmissionTicket::new(
             TaskOperationId::new_v7(),
@@ -993,20 +1012,25 @@ mod tests {
                 .is_err(),
             "a typed protocol failure must not become an unknown-outcome replay"
         );
-        let supervisor = owner.into_residual_stand_down_supervisor();
         drop(actor);
         assert!(
-            !supervisor.is_finished(),
+            !matches!(
+                registry.join_readiness(&registration).await.unwrap(),
+                novarocks_query_application::coordination::LogicalExecutionJoinReadiness::Ready
+            ),
             "a failed-closed Abort retains residual Worker responsibility"
         );
-        supervisor
-            .observe_worker_process_replaced(exact_context)
+        registry
+            .observe_worker_process_replaced(&registration, exact_context)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), supervisor.join())
-            .await
-            .expect("the retained effect plus exact process replacement can settle")
-            .unwrap();
+        let receipt =
+            tokio::time::timeout(Duration::from_secs(1), registry.join(&mut registration))
+                .await
+                .expect("the retained effect plus exact process replacement can settle")
+                .unwrap();
+        registry.retire(receipt).unwrap();
+        registry_owner.shutdown().unwrap();
     }
 
     #[test]

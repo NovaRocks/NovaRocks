@@ -31,6 +31,7 @@ mod replacement;
 mod result;
 mod result_decode;
 mod result_pump;
+mod runtime_registry;
 mod stand_down;
 mod status;
 
@@ -49,5 +50,6 @@ pub use recovery::*;
 pub use replacement::*;
 pub use result::*;
 pub use result_pump::*;
+pub use runtime_registry::*;
 pub use stand_down::*;
 pub use status::*;

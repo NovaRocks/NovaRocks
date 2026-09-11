@@ -1743,9 +1743,10 @@ mod tests {
         )
         .unwrap()
         .with_result_stream(schema, NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) =
-            spawn_logical_execution_actor(&Handle::current(), config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result actor must expose a stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -1796,9 +1797,10 @@ mod tests {
         )
         .unwrap()
         .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) =
-            spawn_logical_execution_actor(&Handle::current(), config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&Handle::current(), config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result actor must expose a stream");
         };
         stream.begin_schema().unwrap().complete();

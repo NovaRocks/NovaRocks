@@ -1947,8 +1947,10 @@ mod tests {
             Arc::clone(&port) as Arc<dyn AbortQueryContextEffectPort>,
             NonZeroUsize::new(2).unwrap(),
         );
-        let (owner, initial) =
-            crate::coordination::spawn_logical_execution_actor(&Handle::current(), config).unwrap();
+        let (owner, initial, _output) =
+            crate::coordination::spawn_logical_execution_actor(&Handle::current(), config)
+                .unwrap()
+                .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
         let admission = AcquireQueryContextAdmissionTicket::new(

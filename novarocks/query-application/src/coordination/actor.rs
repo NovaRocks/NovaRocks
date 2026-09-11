@@ -717,6 +717,14 @@ fn close_unstarted_governance(work_owner: WorkOwner, execution_stage: StagePermi
 }
 
 impl LogicalExecutionActorConfig {
+    pub(crate) const fn initial_execution(&self) -> QueryExecutionId {
+        self.initial_execution
+    }
+
+    pub(crate) fn required_establish_contexts(&self) -> &[QueryContextRef] {
+        &self.required_establish_contexts
+    }
+
     /// Constructs an execution whose business contract permits no attempt
     /// replacement. External-effect executions can only use this constructor.
     pub fn no_recovery_completion(
@@ -781,6 +789,46 @@ impl LogicalExecutionActorConfig {
         )
     }
 
+    /// Constructs one effect-free read attempt with a bounded row stream.
+    ///
+    /// The effect and recovery policy are fixed by this constructor. External
+    /// callers cannot attach a row stream to an effectful completion config.
+    ///
+    /// ```compile_fail
+    /// use std::num::NonZeroUsize;
+    /// use novarocks_query_application::{api::ResultSchema, coordination::LogicalExecutionActorConfig};
+    /// fn attach_arbitrary_rows(config: LogicalExecutionActorConfig) {
+    ///     let _ = config.with_result_stream(
+    ///         ResultSchema::new(Vec::new()),
+    ///         NonZeroUsize::new(1).unwrap(),
+    ///     );
+    /// }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn single_attempt_read_rows(
+        initial_execution: QueryExecutionId,
+        mailbox_capacity: NonZeroUsize,
+        required_establish_contexts: Vec<QueryContextRef>,
+        max_admission_issues_per_context: NonZeroUsize,
+        max_establish_authorizations_per_context: NonZeroUsize,
+        work_owner: WorkOwner,
+        initial_execution_stage: StagePermit,
+        schema: ResultSchema,
+        delivery_capacity: NonZeroUsize,
+    ) -> Result<Self, LogicalExecutionActorError> {
+        Ok(Self::single_attempt_completion(
+            initial_execution,
+            ExecutionEffect::None,
+            mailbox_capacity,
+            required_establish_contexts,
+            max_admission_issues_per_context,
+            max_establish_authorizations_per_context,
+            work_owner,
+            initial_execution_stage,
+        )?
+        .with_result_stream(schema, delivery_capacity))
+    }
+
     /// Constructs effect-free read execution recovery before any data packet
     /// becomes visible. The budget must authorize at least one successor.
     pub(crate) fn read_only_pre_visibility_recovery(
@@ -833,6 +881,38 @@ impl LogicalExecutionActorConfig {
             result_schema: None,
             result_delivery_capacity: None,
         })
+    }
+
+    /// Constructs an effect-free read whose whole attempt may restart only
+    /// before any result packet becomes visible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_only_pre_visibility_recovery_rows(
+        initial_execution: QueryExecutionId,
+        mailbox_capacity: NonZeroUsize,
+        required_establish_contexts: Vec<QueryContextRef>,
+        max_admission_issues_per_context: NonZeroUsize,
+        max_establish_authorizations_per_context: NonZeroUsize,
+        max_attempts: NonZeroU32,
+        replacement_effect_port: Arc<dyn ReplacementQualificationEffectPort>,
+        work_owner: WorkOwner,
+        initial_execution_stage: StagePermit,
+        replacement_reservation_valid_for: Duration,
+        schema: ResultSchema,
+        delivery_capacity: NonZeroUsize,
+    ) -> Result<Self, LogicalExecutionActorError> {
+        Ok(Self::read_only_pre_visibility_recovery(
+            initial_execution,
+            mailbox_capacity,
+            required_establish_contexts,
+            max_admission_issues_per_context,
+            max_establish_authorizations_per_context,
+            max_attempts,
+            replacement_effect_port,
+            work_owner,
+            initial_execution_stage,
+            replacement_reservation_valid_for,
+        )?
+        .with_result_stream(schema, delivery_capacity))
     }
 
     /// Attaches the fixed logical schema and bounded protocol queue used by
@@ -1272,6 +1352,10 @@ enum ActorCommand {
         convergence: RegistryContextConvergence,
         reply: ActorReply<()>,
     },
+    RegistryJoinReadiness {
+        close_ingress: bool,
+        reply: ActorReply<bool>,
+    },
     Snapshot {
         reply: ActorReply<LogicalExecutionActorSnapshot>,
     },
@@ -1289,6 +1373,32 @@ pub struct LogicalExecutionActor {
 impl LogicalExecutionActor {
     pub const fn id(&self) -> LogicalExecutionActorId {
         self.id
+    }
+
+    pub(crate) async fn observe_registry_context_convergence(
+        &self,
+        context: QueryContextRef,
+        convergence: RegistryContextConvergence,
+    ) -> Result<(), LogicalExecutionActorError> {
+        request(&self.sender, |reply| {
+            ActorCommand::RegistryContextConverged {
+                context,
+                convergence,
+                reply,
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn registry_join_readiness(
+        &self,
+        close_ingress: bool,
+    ) -> Result<bool, LogicalExecutionActorError> {
+        request(&self.sender, |reply| ActorCommand::RegistryJoinReadiness {
+            close_ingress,
+            reply,
+        })
+        .await
     }
 
     pub async fn activate(
@@ -1503,7 +1613,6 @@ async fn request<T>(
 pub struct LogicalExecutionActorOwner {
     actor: LogicalExecutionActor,
     join: JoinHandle<()>,
-    output: Option<ExecutionOutput>,
 }
 
 impl fmt::Debug for LogicalExecutionActorOwner {
@@ -1512,7 +1621,6 @@ impl fmt::Debug for LogicalExecutionActorOwner {
             .debug_struct("LogicalExecutionActorOwner")
             .field("actor", &self.actor)
             .field("join_finished", &self.join.is_finished())
-            .field("output_attached", &self.output.is_some())
             .finish()
     }
 }
@@ -1526,20 +1634,123 @@ impl LogicalExecutionActorOwner {
         self.join.is_finished()
     }
 
-    pub fn take_output(&mut self) -> Option<ExecutionOutput> {
-        self.output.take()
-    }
-
     /// Transfers ownership of an unfinished cancellation tail to an explicit
     /// residual supervisor without detaching its join handle.
     pub fn into_residual_stand_down_supervisor(self) -> ResidualStandDownSupervisor {
+        let Self { actor, join } = self;
+        ResidualStandDownSupervisor { actor, join }
+    }
+
+    #[cfg(test)]
+    fn into_test_parts(self) -> (LogicalExecutionActor, JoinHandle<()>) {
+        let Self { actor, join } = self;
+        (actor, join)
+    }
+
+    pub(crate) fn into_registry_parts(self) -> (LogicalExecutionActor, JoinHandle<()>) {
+        let Self { actor, join } = self;
+        (actor, join)
+    }
+}
+
+/// Move-only transfer of the logical execution's single output consumer.
+///
+/// Output belongs to the logical execution spawn result rather than to an
+/// attempt or runtime supervisor. Consuming this transfer is the only way to
+/// obtain that output.
+///
+/// ```compile_fail
+/// use novarocks_query_application::coordination::LogicalExecutionOutputTransfer;
+/// fn consume_twice(transfer: LogicalExecutionOutputTransfer) {
+///     let _first = transfer.into_output();
+///     let _second = transfer.into_output();
+/// }
+/// ```
+#[must_use = "the logical execution output must be handed to its application consumer"]
+pub struct LogicalExecutionOutputTransfer {
+    output: ExecutionOutput,
+}
+
+impl fmt::Debug for LogicalExecutionOutputTransfer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LogicalExecutionOutputTransfer")
+            .finish_non_exhaustive()
+    }
+}
+
+impl LogicalExecutionOutputTransfer {
+    pub fn into_output(self) -> ExecutionOutput {
+        self.output
+    }
+}
+
+/// Indivisible result of creating one logical execution runtime.
+///
+/// The private fields prevent callers from minting a runtime owner, initial
+/// attempt authority, or output transfer independently. The query application
+/// may split this bundle only while atomically installing all three owners in
+/// its runtime registry.
+///
+/// ```compile_fail
+/// use novarocks_query_application::coordination::SpawnedLogicalExecution;
+/// fn split_before_registry_install(spawned: SpawnedLogicalExecution) {
+///     let _ = spawned.into_parts();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use novarocks_query_application::coordination::AttemptInstantiationPermit;
+/// fn attempt_cannot_take_output(attempt: AttemptInstantiationPermit) {
+///     let _ = attempt.into_output();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use novarocks_query_application::coordination::ResidualStandDownSupervisor;
+/// fn residual_cannot_take_output(residual: ResidualStandDownSupervisor) {
+///     let _ = residual.into_output();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use novarocks_query_application::coordination::LogicalExecutionActorOwner;
+/// fn runtime_owner_cannot_take_output(owner: LogicalExecutionActorOwner) {
+///     let _ = owner.take_output();
+/// }
+/// ```
+#[must_use = "the spawned logical execution must remain supervised"]
+pub(crate) struct SpawnedLogicalExecution {
+    runtime_owner: LogicalExecutionActorOwner,
+    initial_attempt: AttemptInstantiationPermit,
+    output: LogicalExecutionOutputTransfer,
+}
+
+impl fmt::Debug for SpawnedLogicalExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpawnedLogicalExecution")
+            .field("runtime_owner", &self.runtime_owner)
+            .field("initial_attempt", &self.initial_attempt.identity())
+            .field("output", &self.output)
+            .finish()
+    }
+}
+
+impl SpawnedLogicalExecution {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        LogicalExecutionActorOwner,
+        AttemptInstantiationPermit,
+        LogicalExecutionOutputTransfer,
+    ) {
         let Self {
-            actor,
-            join,
+            runtime_owner,
+            initial_attempt,
             output,
         } = self;
-        drop(output);
-        ResidualStandDownSupervisor { actor, join }
+        (runtime_owner, initial_attempt, output)
     }
 }
 
@@ -1603,10 +1814,15 @@ impl ResidualStandDownSupervisor {
 
 /// Starts one event-driven logical execution actor on an explicit process
 /// runtime and mints the initial exact instantiation authority.
-pub fn spawn_logical_execution_actor(
+pub(crate) fn spawn_logical_execution_actor(
     runtime: &Handle,
     mut config: LogicalExecutionActorConfig,
-) -> Result<(LogicalExecutionActorOwner, AttemptInstantiationPermit), LogicalExecutionActorError> {
+) -> Result<SpawnedLogicalExecution, LogicalExecutionActorError> {
+    if matches!(config.output_mode, LogicalOutputMode::ResultStream)
+        && !matches!(config.effect, ExecutionEffect::None)
+    {
+        return Err(LogicalExecutionActorError::InvariantViolation);
+    }
     let mut state = LogicalExecutionState::new(
         config.initial_execution,
         config.recovery_mode,
@@ -1689,7 +1905,7 @@ pub fn spawn_logical_execution_actor(
     let abort_effect_port = config.abort_effect_port.take();
     let replacement_effect_port = config.replacement_effect_port.take();
     let (result_runtime, output) = match config.output_mode {
-        LogicalOutputMode::CompletionOnly => (None, Some(ExecutionOutput::Completion)),
+        LogicalOutputMode::CompletionOnly => (None, ExecutionOutput::Completion),
         LogicalOutputMode::ResultStream => {
             let schema = config
                 .result_schema
@@ -1719,7 +1935,7 @@ pub fn spawn_logical_execution_actor(
                     pending: None,
                     in_flight: None,
                 }),
-                Some(ExecutionOutput::Rows(stream)),
+                ExecutionOutput::Rows(stream),
             )
         }
     };
@@ -1748,21 +1964,21 @@ pub fn spawn_logical_execution_actor(
         )
         .await;
     });
-    Ok((
-        LogicalExecutionActorOwner {
+    Ok(SpawnedLogicalExecution {
+        runtime_owner: LogicalExecutionActorOwner {
             actor: LogicalExecutionActor {
                 id: actor_id,
                 sender: sender.clone(),
             },
             join,
-            output,
         },
-        AttemptInstantiationPermit {
+        initial_attempt: AttemptInstantiationPermit {
             capability: Some(capability),
             lifetime: Some(lifetime),
             mailbox_liveness: Some(sender),
         },
-    ))
+        output: LogicalExecutionOutputTransfer { output },
+    })
 }
 
 async fn run_actor(
@@ -1971,6 +2187,20 @@ async fn run_actor(
                     receiver_open = false;
                     continue;
                 };
+                if let ActorCommand::RegistryJoinReadiness {
+                    close_ingress,
+                    reply,
+                } = command
+                {
+                    let ready = actor_cleanup_complete(state, &attempts, replacement.as_ref())
+                        && result_runtime.as_ref().is_none_or(ResultRuntime::idle);
+                    if ready && close_ingress {
+                        receiver.close();
+                        receiver_open = false;
+                    }
+                    let _ = reply.send(Ok(ready));
+                    continue;
+                }
                 handle_command(
                     state,
                     &mut attempts,
@@ -3759,6 +3989,9 @@ fn handle_command(
             }
             let _ = reply.send(result);
         }
+        ActorCommand::RegistryJoinReadiness { .. } => {
+            unreachable!("registry join readiness is handled by the actor loop")
+        }
         ActorCommand::Snapshot { reply } => {
             let _ = reply.send(Ok(LogicalExecutionActorSnapshot {
                 phase: state.phase(),
@@ -4713,6 +4946,20 @@ mod tests {
         (root.owner, stage)
     }
 
+    fn isolated_workload_control() -> WorkloadControl {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 12,
+                per_scope_bytes: (1 << 20) - (1 << 12),
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        control
+    }
+
     fn test_governed_child_work(
         parent_deadline: Option<tokio::time::Instant>,
     ) -> (WorkOwner, WorkOwner, StagePermit) {
@@ -5058,7 +5305,7 @@ mod tests {
         max_attempts: u32,
     ) -> LogicalExecutionActorConfig {
         let (work_owner, stage) = test_governed_work();
-        LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+        LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
             initial_execution,
             NonZeroUsize::new(4).unwrap(),
             Vec::new(),
@@ -5069,12 +5316,10 @@ mod tests {
             work_owner,
             stage,
             Duration::from_secs(30),
-        )
-        .unwrap()
-        .with_result_stream(
             ResultSchema::new(Vec::<crate::api::ResultField>::new()),
             NonZeroUsize::new(1).unwrap(),
         )
+        .unwrap()
     }
 
     fn recovery_config_with_contexts(
@@ -5084,7 +5329,7 @@ mod tests {
         max_attempts: u32,
     ) -> LogicalExecutionActorConfig {
         let (work_owner, stage) = test_governed_work();
-        LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+        LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
             initial_execution,
             NonZeroUsize::new(4).unwrap(),
             contexts,
@@ -5095,12 +5340,10 @@ mod tests {
             work_owner,
             stage,
             Duration::from_secs(30),
-        )
-        .unwrap()
-        .with_result_stream(
             ResultSchema::new(Vec::<crate::api::ResultField>::new()),
             NonZeroUsize::new(1).unwrap(),
         )
+        .unwrap()
     }
 
     fn config(initial_execution: QueryExecutionId) -> LogicalExecutionActorConfig {
@@ -5197,7 +5440,9 @@ mod tests {
     async fn exact_readiness_activates_and_completes_once() {
         let runtime = Handle::current();
         let execution = execution(1);
-        let (owner, permit) = spawn_logical_execution_actor(&runtime, config(execution)).unwrap();
+        let (owner, permit, _output) = spawn_logical_execution_actor(&runtime, config(execution))
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let identity = permit.identity();
         assert_eq!(actor.id(), identity.actor());
@@ -5207,6 +5452,88 @@ mod tests {
             actor.complete_attempt(running).await.unwrap(),
             LogicalConclusion::Succeeded
         );
+    }
+
+    #[tokio::test]
+    async fn spawned_bundle_explicitly_holds_untransferred_output() {
+        let runtime = Handle::current();
+        let execution = execution(10_001);
+        let spawned = spawn_logical_execution_actor(&runtime, config(execution)).unwrap();
+
+        let (owner, permit, output) = spawned.into_parts();
+        assert!(matches!(output.into_output(), ExecutionOutput::Completion));
+        let actor = owner.actor();
+        let running = actor.activate(permit.ready()).await.unwrap();
+        assert_eq!(
+            actor.complete_attempt(running).await.unwrap(),
+            LogicalConclusion::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn residual_transfer_does_not_close_separately_handed_result_stream() {
+        let runtime = Handle::current();
+        let execution = execution(10_002);
+        let (work_owner, stage) = test_governed_work();
+        let actor_config = LogicalExecutionActorConfig::single_attempt_read_rows(
+            execution,
+            NonZeroUsize::new(1).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            work_owner,
+            stage,
+            result_schema(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        let spawned = spawn_logical_execution_actor(&runtime, actor_config).unwrap();
+        let (owner, initial, output) = spawned.into_parts();
+        let actor = owner.actor().clone();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+            panic!("result execution must expose its row stream");
+        };
+
+        let residual = owner.into_residual_stand_down_supervisor();
+        stream.begin_schema().unwrap().complete();
+
+        drop(initial);
+        wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
+        assert!(stream.next().await.is_err());
+        drop(stream);
+        drop(actor);
+        residual.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn effectful_result_stream_configuration_fails_closed() {
+        let control = isolated_workload_control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let stage = root.owner.scope().try_acquire(Stage::Execution).unwrap();
+        let work_owner = root.owner;
+        drop(root.business);
+        let mut config = LogicalExecutionActorConfig::single_attempt_completion(
+            execution(10_005),
+            ExecutionEffect::External,
+            NonZeroUsize::new(1).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            work_owner,
+            stage,
+        )
+        .unwrap();
+        config.output_mode = LogicalOutputMode::ResultStream;
+        config.result_schema = Some(result_schema());
+        config.result_delivery_capacity = NonZeroUsize::new(1);
+
+        assert!(matches!(
+            spawn_logical_execution_actor(&Handle::current(), config),
+            Err(LogicalExecutionActorError::InvariantViolation)
+        ));
+        assert_eq!(control.snapshot().root_responsibilities, 0);
     }
 
     #[tokio::test]
@@ -5231,7 +5558,9 @@ mod tests {
         )
         .unwrap()
         .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
         let ticket = admission_ticket(context, 71);
@@ -5298,8 +5627,10 @@ mod tests {
     #[tokio::test]
     async fn dropping_initial_permit_concludes_cancelled() {
         let runtime = Handle::current();
-        let (owner, permit) =
-            spawn_logical_execution_actor(&runtime, config(execution(2))).unwrap();
+        let (owner, permit, _output) =
+            spawn_logical_execution_actor(&runtime, config(execution(2)))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         drop(permit);
         let snapshot = wait_for_conclusion(actor, LogicalConclusion::Cancelled).await;
@@ -5309,8 +5640,10 @@ mod tests {
     #[tokio::test]
     async fn cancelling_activation_before_enqueue_does_not_strand_instantiating() {
         let runtime = Handle::current();
-        let (owner, permit) =
-            spawn_logical_execution_actor(&runtime, config(execution(3))).unwrap();
+        let (owner, permit, _output) =
+            spawn_logical_execution_actor(&runtime, config(execution(3)))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let activation = actor.activate(permit.ready());
         drop(activation);
@@ -5320,8 +5653,10 @@ mod tests {
     #[tokio::test]
     async fn cancelling_activation_after_enqueue_does_not_strand_running() {
         let runtime = Handle::current();
-        let (owner, permit) =
-            spawn_logical_execution_actor(&runtime, config(execution(4))).unwrap();
+        let (owner, permit, _output) =
+            spawn_logical_execution_actor(&runtime, config(execution(4)))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let mut activation = Box::pin(actor.activate(permit.ready()));
         assert!(matches!(
@@ -5335,8 +5670,10 @@ mod tests {
     #[tokio::test]
     async fn dropping_delivered_running_permit_concludes_cancelled() {
         let runtime = Handle::current();
-        let (owner, permit) =
-            spawn_logical_execution_actor(&runtime, config(execution(5))).unwrap();
+        let (owner, permit, _output) =
+            spawn_logical_execution_actor(&runtime, config(execution(5)))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let (reply, response) = oneshot::channel();
         actor
@@ -5354,8 +5691,10 @@ mod tests {
     #[tokio::test]
     async fn initialization_can_fail_or_cancel_before_readiness() {
         let runtime = Handle::current();
-        let (failed_owner, failed) =
-            spawn_logical_execution_actor(&runtime, config(execution(6))).unwrap();
+        let (failed_owner, failed, _failed_output) =
+            spawn_logical_execution_actor(&runtime, config(execution(6)))
+                .unwrap()
+                .into_parts();
         assert_eq!(
             failed_owner
                 .actor()
@@ -5365,8 +5704,10 @@ mod tests {
             LogicalConclusion::Failed
         );
 
-        let (cancelled_owner, cancelled) =
-            spawn_logical_execution_actor(&runtime, config(execution(7))).unwrap();
+        let (cancelled_owner, cancelled, _cancelled_output) =
+            spawn_logical_execution_actor(&runtime, config(execution(7)))
+                .unwrap()
+                .into_parts();
         assert_eq!(
             cancelled_owner
                 .actor()
@@ -5380,8 +5721,10 @@ mod tests {
     #[tokio::test]
     async fn running_attempt_can_fail() {
         let runtime = Handle::current();
-        let (owner, permit) =
-            spawn_logical_execution_actor(&runtime, config(execution(8))).unwrap();
+        let (owner, permit, _output) =
+            spawn_logical_execution_actor(&runtime, config(execution(8)))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(permit.ready()).await.unwrap();
         assert_eq!(
@@ -5397,8 +5740,10 @@ mod tests {
         let second = replacement(first, 2);
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let (owner, permit) =
-            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let (owner, permit, _output) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(permit.ready()).await.unwrap();
         let qualification = actor
@@ -5450,7 +5795,9 @@ mod tests {
         let submissions = Arc::clone(&port.submissions);
         let config = recovery_config_with_contexts(first, vec![old_context], port, 2)
             .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let ticket = admission_ticket(old_context, 21);
@@ -5551,7 +5898,9 @@ mod tests {
         // completion-only test mode reaches the same actor cleanup loop after
         // exercising the real replacement and residual ledgers.
         config.output_mode = LogicalOutputMode::CompletionOnly;
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
         let ticket = admission_ticket(old_context, 22);
@@ -5673,7 +6022,9 @@ mod tests {
         )
         .unwrap()
         .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
         let ticket = admission_ticket(context, 51);
@@ -5767,7 +6118,9 @@ mod tests {
                 super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
                 NonZeroUsize::new(2).unwrap(),
             );
-        let (owner, permit) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, permit, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(permit.ready()).await.unwrap();
         let qualification = actor
@@ -5819,7 +6172,9 @@ mod tests {
                 super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
                 NonZeroUsize::new(2).unwrap(),
             );
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let ticket = admission_ticket(old_context, 22);
@@ -5905,7 +6260,9 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(83);
         let second = replacement(first, 2);
-        let (owner, permit) = spawn_logical_execution_actor(&runtime, config(first)).unwrap();
+        let (owner, permit, _output) = spawn_logical_execution_actor(&runtime, config(first))
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(permit.ready()).await.unwrap();
         assert_eq!(
@@ -5923,9 +6280,10 @@ mod tests {
         wait_for_conclusion(actor, LogicalConclusion::Failed).await;
 
         let port = Arc::new(DelayedQualificationPort::default());
-        let (owner, permit) =
+        let (owner, permit, _output) =
             spawn_logical_execution_actor(&runtime, recovery_config(execution(84), port, 2))
-                .unwrap();
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(permit.ready()).await.unwrap();
         assert_eq!(
@@ -5944,8 +6302,10 @@ mod tests {
 
         let first = execution(842);
         let port = Arc::new(DelayedQualificationPort::default());
-        let (owner, permit) =
-            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let (owner, permit, _output) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(permit.ready()).await.unwrap();
         assert_eq!(
@@ -5998,7 +6358,9 @@ mod tests {
             stage,
         )
         .unwrap();
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
 
@@ -6033,8 +6395,10 @@ mod tests {
         )
         .unwrap()
         .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -6081,8 +6445,10 @@ mod tests {
         )
         .unwrap()
         .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -6127,8 +6493,10 @@ mod tests {
         )
         .unwrap()
         .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -6179,7 +6547,9 @@ mod tests {
             ResultSchema::new(Vec::<crate::api::ResultField>::new()),
             NonZeroUsize::new(1).unwrap(),
         );
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -6239,7 +6609,9 @@ mod tests {
             super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
         );
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -6292,11 +6664,12 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(85);
         let port = Arc::new(DelayedQualificationPort::default());
-        let (owner, permit) = spawn_logical_execution_actor(
+        let (owner, permit, _output) = spawn_logical_execution_actor(
             &runtime,
             recovery_config(first, Arc::clone(&port) as Arc<_>, 2),
         )
-        .unwrap();
+        .unwrap()
+        .into_parts();
         let actor = owner.actor();
         let running = actor.activate(permit.ready()).await.unwrap();
         let qualification = actor
@@ -6314,8 +6687,10 @@ mod tests {
         let first = execution(86);
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let (owner, permit) =
-            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let (owner, permit, _output) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(permit.ready()).await.unwrap();
         let _qualification = actor
@@ -6341,9 +6716,11 @@ mod tests {
         let first = execution(861);
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let (owner, initial) =
-            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
-        let LogicalExecutionActorOwner { actor, join, .. } = owner;
+        let (owner, initial, _output) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
+                .unwrap()
+                .into_parts();
+        let (actor, join) = owner.into_test_parts();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
             .begin_replacement(
@@ -6385,7 +6762,9 @@ mod tests {
         let abort_submissions = Arc::clone(&abort_port.submissions);
         let config = recovery_config_with_contexts(first, vec![old_context], port, 2)
             .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
         let ticket = admission_ticket(old_context, 61);
@@ -6506,7 +6885,9 @@ mod tests {
         let submissions = Arc::clone(&port.submissions);
         let clock = Arc::new(ManualActorClock::new(MonotonicInstant::ORIGIN));
         let config = recovery_config(first, port, 2).with_clock(clock.clone());
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -6557,7 +6938,9 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
         )
         .with_clock(clock.clone());
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -6614,7 +6997,9 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
         )
         .with_clock(clock.clone());
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -6653,7 +7038,9 @@ mod tests {
                 super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
                 NonZeroUsize::new(2).unwrap(),
             );
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let _qualification = actor
@@ -6692,8 +7079,10 @@ mod tests {
         let frontend = FrontendProcessId::new_v7();
         let duplicate = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
         let port = Arc::new(DelayedQualificationPort::default());
-        let (owner, initial) =
-            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let (owner, initial, _output) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         assert_eq!(
@@ -6719,8 +7108,10 @@ mod tests {
         let second = replacement(first, 2);
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let (owner, initial) =
-            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let (owner, initial, _output) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let _qualification = actor
@@ -6764,8 +7155,10 @@ mod tests {
         let first = execution(868);
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let (owner, initial) =
-            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let (owner, initial, _output) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -6818,8 +7211,10 @@ mod tests {
         let second = replacement(first, 2);
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let (owner, initial) =
-            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let (owner, initial, _output) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -6864,8 +7259,10 @@ mod tests {
         let new_context = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let (owner, initial) =
-            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let (owner, initial, _output) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
+                .unwrap()
+                .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -6917,7 +7314,9 @@ mod tests {
             NonZeroUsize::new(2).unwrap(),
         );
         config.output_mode = LogicalOutputMode::CompletionOnly;
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -7012,11 +7411,12 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(862);
         let port = Arc::new(ClosingBackpressureQualificationPort::default());
-        let (owner, initial) = spawn_logical_execution_actor(
+        let (owner, initial, _output) = spawn_logical_execution_actor(
             &runtime,
             recovery_config(first, Arc::clone(&port) as Arc<_>, 2),
         )
-        .unwrap();
+        .unwrap()
+        .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let _qualification = actor
@@ -7061,11 +7461,12 @@ mod tests {
         let first = execution(863);
         let port = Arc::new(RecoverableBackpressureQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let (owner, initial) = spawn_logical_execution_actor(
+        let (owner, initial, _output) = spawn_logical_execution_actor(
             &runtime,
             recovery_config(first, Arc::clone(&port) as Arc<_>, 2),
         )
-        .unwrap();
+        .unwrap()
+        .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let qualification = actor
@@ -7105,9 +7506,11 @@ mod tests {
     #[tokio::test]
     async fn permit_keeps_actor_alive_after_owner_is_dropped() {
         let runtime = Handle::current();
-        let (owner, permit) =
-            spawn_logical_execution_actor(&runtime, config(execution(9))).unwrap();
-        let LogicalExecutionActorOwner { actor, join, .. } = owner;
+        let (owner, permit, _output) =
+            spawn_logical_execution_actor(&runtime, config(execution(9)))
+                .unwrap()
+                .into_parts();
+        let (actor, join) = owner.into_test_parts();
         drop(actor);
         tokio::task::yield_now().await;
         assert!(!join.is_finished());
@@ -7128,8 +7531,10 @@ mod tests {
         let first = execution(103);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7197,8 +7602,10 @@ mod tests {
         let first = execution(109);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7257,8 +7664,10 @@ mod tests {
         let first = execution(110);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7301,8 +7710,10 @@ mod tests {
         )
         .unwrap()
         .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7372,8 +7783,10 @@ mod tests {
         )
         .unwrap()
         .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         let mut failure = stream.failure_view().unwrap();
@@ -7420,8 +7833,10 @@ mod tests {
         let first = execution(104);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7462,8 +7877,10 @@ mod tests {
         let first = execution(105);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         drop(stream);
@@ -7480,8 +7897,10 @@ mod tests {
         let first = execution(108);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7501,8 +7920,10 @@ mod tests {
         let first = execution(106);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7560,8 +7981,10 @@ mod tests {
         let first = execution(111);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7593,8 +8016,10 @@ mod tests {
         let second = execution(112);
         let config = recovery_config(second, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7625,8 +8050,10 @@ mod tests {
         let submissions = Arc::clone(&port.submissions);
         let config = recovery_config(first, port, 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7695,8 +8122,10 @@ mod tests {
         let first = execution(113);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7763,8 +8192,10 @@ mod tests {
         let first = execution(114);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7825,8 +8256,10 @@ mod tests {
         let first = execution(1141);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7864,8 +8297,10 @@ mod tests {
         let first = execution(115);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7893,8 +8328,10 @@ mod tests {
         let first = execution(122);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7938,8 +8375,10 @@ mod tests {
         let first = execution(116);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -7971,8 +8410,10 @@ mod tests {
         let first = execution(117);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -8026,8 +8467,10 @@ mod tests {
         let first = execution(118);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -8081,8 +8524,10 @@ mod tests {
         )
         .unwrap()
         .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -8123,8 +8568,10 @@ mod tests {
         let first = execution(120);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -8155,8 +8602,10 @@ mod tests {
         let first = execution(121);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
             .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
-        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
-        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
             panic!("result execution must expose its row stream");
         };
         stream.begin_schema().unwrap().complete();
@@ -8344,7 +8793,9 @@ mod tests {
         .unwrap()
         .with_abort_query_context_effect_port(port.clone(), NonZeroUsize::new(2).unwrap())
         .with_clock(clock.clone());
-        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         for (context, tag) in [(unknown, 31), (blocked, 32)] {
