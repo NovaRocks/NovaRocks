@@ -18,9 +18,11 @@
 mod candidate;
 mod command;
 mod execution;
+mod native;
 mod result;
 
 pub use candidate::*;
 pub use command::*;
 pub use execution::*;
+pub use native::*;
 pub use result::*;

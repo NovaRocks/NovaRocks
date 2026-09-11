@@ -648,8 +648,8 @@ mod tests {
     use novarocks_query_application::coordination::{
         AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState, DispatchLane,
         ExecutionEffect, LogicalConclusion, LogicalExecutionActorConfig,
-        LogicalExecutionRuntimeRegistry,
     };
+    use novarocks_query_application::test_support::LogicalExecutionTestHarness;
     use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
@@ -751,17 +751,14 @@ mod tests {
             Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
             NonZeroUsize::new(2).unwrap(),
         );
-        let registry_owner =
-            LogicalExecutionRuntimeRegistry::new(tokio::runtime::Handle::current());
-        let registry = registry_owner.handle();
-        let (mut registration, initial, _output) = registry
-            .reserve(execution(), vec![exact_context])
-            .unwrap()
-            .spawn_and_install(config)
-            .unwrap()
-            .into_parts();
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
+        let mut logical = LogicalExecutionTestHarness::install(
+            tokio::runtime::Handle::current(),
+            config,
+            execution(),
+            vec![exact_context],
+        )
+        .unwrap();
+        logical.activate_initial().await.unwrap();
         let admission = AcquireQueryContextAdmissionTicket::new(
             TaskOperationId::new_v7(),
             exact_context,
@@ -769,10 +766,11 @@ mod tests {
             NativeCompatibilityId::new([7; 32]),
             AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
         );
-        let activation = running.identity();
-        let pending = running.begin_admission_issue(admission).await.unwrap();
-        drop(running);
-        actor
+        let (activation, pending) = logical
+            .begin_admission_issue_and_abandon(admission)
+            .await
+            .unwrap();
+        logical
             .settle_late_admission_issue(
                 activation,
                 pending,
@@ -838,7 +836,7 @@ mod tests {
         late.resolved_by_other_generation();
 
         loop {
-            if actor
+            if logical
                 .stand_down_snapshot(exact_context)
                 .await
                 .unwrap()
@@ -849,28 +847,24 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            actor.snapshot().await.unwrap().conclusion,
+            logical.actor_snapshot().await.unwrap().conclusion,
             Some(LogicalConclusion::Cancelled)
         );
-        drop(actor);
         assert!(
             !matches!(
-                registry.join_readiness(&registration).await.unwrap(),
+                logical.join_readiness().await.unwrap(),
                 novarocks_query_application::coordination::LogicalExecutionJoinReadiness::Ready
             ),
             "a terminal Abort receipt does not prove actual Worker stop or process replacement"
         );
-        registry
-            .observe_worker_stopped_and_context_fenced(&registration, exact_context)
+        logical
+            .observe_worker_stopped_and_context_fenced(exact_context)
             .await
             .unwrap();
-        let receipt =
-            tokio::time::timeout(Duration::from_secs(1), registry.join(&mut registration))
-                .await
-                .expect("exact Worker stop and context fencing lets the owner finish")
-                .unwrap();
-        registry.retire(receipt).unwrap();
-        registry_owner.shutdown().unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("exact Worker stop and context fencing lets the owner finish");
     }
 
     #[tokio::test]
@@ -896,17 +890,14 @@ mod tests {
             Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
             NonZeroUsize::MIN,
         );
-        let registry_owner =
-            LogicalExecutionRuntimeRegistry::new(tokio::runtime::Handle::current());
-        let registry = registry_owner.handle();
-        let (mut registration, initial, _output) = registry
-            .reserve(execution(), vec![exact_context])
-            .unwrap()
-            .spawn_and_install(config)
-            .unwrap()
-            .into_parts();
-        let actor = registry.actor(&registration).unwrap();
-        let running = actor.activate(initial.ready()).await.unwrap();
+        let mut logical = LogicalExecutionTestHarness::install(
+            tokio::runtime::Handle::current(),
+            config,
+            execution(),
+            vec![exact_context],
+        )
+        .unwrap();
+        logical.activate_initial().await.unwrap();
         let admission = AcquireQueryContextAdmissionTicket::new(
             TaskOperationId::new_v7(),
             exact_context,
@@ -914,10 +905,11 @@ mod tests {
             NativeCompatibilityId::new([7; 32]),
             AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
         );
-        let activation = running.identity();
-        let pending = running.begin_admission_issue(admission).await.unwrap();
-        drop(running);
-        actor
+        let (activation, pending) = logical
+            .begin_admission_issue_and_abandon(admission)
+            .await
+            .unwrap();
+        logical
             .settle_late_admission_issue(
                 activation,
                 pending,
@@ -990,7 +982,7 @@ mod tests {
             .fail_closed()
             .expect("a rejected protocol receipt explicitly fails the effect closed");
         loop {
-            if actor
+            if logical
                 .stand_down_snapshot(exact_context)
                 .await
                 .unwrap()
@@ -1012,25 +1004,21 @@ mod tests {
                 .is_err(),
             "a typed protocol failure must not become an unknown-outcome replay"
         );
-        drop(actor);
         assert!(
             !matches!(
-                registry.join_readiness(&registration).await.unwrap(),
+                logical.join_readiness().await.unwrap(),
                 novarocks_query_application::coordination::LogicalExecutionJoinReadiness::Ready
             ),
             "a failed-closed Abort retains residual Worker responsibility"
         );
-        registry
-            .observe_worker_process_replaced(&registration, exact_context)
+        logical
+            .observe_worker_process_replaced(exact_context)
             .await
             .unwrap();
-        let receipt =
-            tokio::time::timeout(Duration::from_secs(1), registry.join(&mut registration))
-                .await
-                .expect("the retained effect plus exact process replacement can settle")
-                .unwrap();
-        registry.retire(receipt).unwrap();
-        registry_owner.shutdown().unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("the retained effect plus exact process replacement can settle");
     }
 
     #[test]

@@ -1368,6 +1368,8 @@ enum ActorCommand {
 pub struct LogicalExecutionActor {
     id: LogicalExecutionActorId,
     sender: mpsc::Sender<ActorCommand>,
+    registry_close_requested: watch::Sender<bool>,
+    registry_ingress_closed: watch::Receiver<bool>,
 }
 
 impl LogicalExecutionActor {
@@ -1399,6 +1401,28 @@ impl LogicalExecutionActor {
             reply,
         })
         .await
+    }
+
+    pub(crate) fn request_registry_close_for_join(&self) -> watch::Receiver<bool> {
+        // This signal is independent of ordinary mailbox capacity. Once set,
+        // dropping the returned waiter never retracts cancellation or ingress
+        // closure.
+        let closed = self.registry_ingress_closed.clone();
+        if *closed.borrow() {
+            return closed;
+        }
+        self.registry_close_requested.send_replace(true);
+        closed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registry_ingress_closed(&self) -> watch::Receiver<bool> {
+        self.registry_ingress_closed.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registry_close_was_requested(&self) -> bool {
+        *self.registry_close_requested.borrow()
     }
 
     pub async fn activate(
@@ -1667,7 +1691,7 @@ impl LogicalExecutionActorOwner {
 /// }
 /// ```
 #[must_use = "the logical execution output must be handed to its application consumer"]
-pub struct LogicalExecutionOutputTransfer {
+pub(crate) struct LogicalExecutionOutputTransfer {
     output: ExecutionOutput,
 }
 
@@ -1680,7 +1704,7 @@ impl fmt::Debug for LogicalExecutionOutputTransfer {
 }
 
 impl LogicalExecutionOutputTransfer {
-    pub fn into_output(self) -> ExecutionOutput {
+    pub(crate) fn into_output(self) -> ExecutionOutput {
         self.output
     }
 }
@@ -1839,6 +1863,8 @@ pub(crate) fn spawn_logical_execution_actor(
         settled: AtomicBool::new(false),
     });
     let (sender, receiver) = mpsc::channel(config.mailbox_capacity.get());
+    let (registry_close_requested, registry_close_requested_rx) = watch::channel(false);
+    let (registry_ingress_closed, registry_ingress_closed_rx) = watch::channel(false);
     let required_contexts: BTreeSet<_> =
         config.required_establish_contexts.iter().copied().collect();
     if required_contexts.len() != config.required_establish_contexts.len() {
@@ -1961,6 +1987,8 @@ pub(crate) fn spawn_logical_execution_actor(
             config.max_abort_authorizations_per_context,
             result_runtime,
             clock,
+            registry_close_requested_rx,
+            registry_ingress_closed,
         )
         .await;
     });
@@ -1969,6 +1997,8 @@ pub(crate) fn spawn_logical_execution_actor(
             actor: LogicalExecutionActor {
                 id: actor_id,
                 sender: sender.clone(),
+                registry_close_requested,
+                registry_ingress_closed: registry_ingress_closed_rx,
             },
             join,
         },
@@ -2002,6 +2032,8 @@ async fn run_actor(
     max_abort_authorizations_per_context: NonZeroUsize,
     mut result_runtime: Option<ResultRuntime>,
     clock: Arc<dyn LogicalExecutionClock>,
+    mut registry_close_requested_rx: watch::Receiver<bool>,
+    registry_ingress_closed: watch::Sender<bool>,
 ) {
     let mut establish_error = None;
     let mut stand_down_error = None;
@@ -2009,6 +2041,8 @@ async fn run_actor(
     let mut replacement = None;
     let mut execution_stage = Some(execution_stage);
     let mut receiver_open = true;
+    let mut registry_close_requested = false;
+    let mut registry_close_signal_open = true;
     let mut root_terminal_receiver = None;
     loop {
         let now = clock.now();
@@ -2023,6 +2057,10 @@ async fn run_actor(
                 &reason,
             );
             lifetime.settle();
+        }
+        if !registry_close_requested && *registry_close_requested_rx.borrow() {
+            registry_close_requested = true;
+            work_owner.cancel(CancellationReason::ServerShutdown);
         }
         expire_replacement_reservation(state, replacement.as_mut(), &mut replacement_error, now);
         if *abandoned.borrow() {
@@ -2073,6 +2111,14 @@ async fn run_actor(
             conclude_failed(state);
             fail_result_runtime(state, result_runtime.as_mut());
         }
+        if registry_close_requested
+            && actor_cleanup_complete(state, &attempts, replacement.as_ref())
+            && result_runtime.as_ref().is_none_or(ResultRuntime::idle)
+        {
+            receiver.close();
+            receiver_open = false;
+            registry_ingress_closed.send_replace(true);
+        }
         if !receiver_open
             && actor_cleanup_complete(state, &attempts, replacement.as_ref())
             && result_runtime.as_ref().is_none_or(ResultRuntime::idle)
@@ -2113,6 +2159,14 @@ async fn run_actor(
         let root_terminal_pending = root_terminal_receiver.is_some();
         tokio::select! {
             biased;
+            changed = registry_close_requested_rx.changed(), if !registry_close_requested && registry_close_signal_open => {
+                if changed.is_ok() && *registry_close_requested_rx.borrow() {
+                    registry_close_requested = true;
+                    work_owner.cancel(CancellationReason::ServerShutdown);
+                } else if changed.is_err() {
+                    registry_close_signal_open = false;
+                }
+            }
             reason = work_cancellation.cancelled(), if state.conclusion().is_none() => {
                 revoke_all_establish_authority(&mut attempts);
                 conclude_for_work_cancellation(

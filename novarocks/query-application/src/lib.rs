@@ -32,3 +32,7 @@ pub mod preparation;
 // wires them into the coordinator before this migration-only allowance goes.
 #[doc(hidden)]
 pub mod coordination;
+
+/// High-level lifecycle harness for role-adapter integration tests.
+#[cfg(feature = "test-support")]
+pub mod test_support;

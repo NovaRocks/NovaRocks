@@ -62,6 +62,7 @@ uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
 novarocks-connector-starrocks.workspace = true
+novarocks-query-application = { workspace = true, features = ["test-support"] }
 novarocks-secret.workspace = true
 novarocks-state-store-testkit.workspace = true
 novarocks-sql = { workspace = true, features = ["test-support"] }

@@ -176,7 +176,7 @@ pub struct ExecutionHandle {
 }
 
 impl ExecutionHandle {
-    pub fn new(control: impl ExecutionControl, output: crate::api::ExecutionOutput) -> Self {
+    pub(crate) fn new(control: impl ExecutionControl, output: crate::api::ExecutionOutput) -> Self {
         Self {
             control: Box::new(control),
             output: Some(output),
