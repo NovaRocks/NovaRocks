@@ -655,18 +655,21 @@ impl WorkOwner {
         self.scope.as_ref().unwrap().clone()
     }
 
-    pub fn cancel(&self, reason: CancellationReason) {
+    /// Derive a cloneable capability that may only request cancellation for
+    /// this responsibility and its descendants. The requester does not retain
+    /// ownership, keep the scope alive, or acquire completion/release rights.
+    pub fn cancellation_requester(&self) -> WorkCancellationRequester {
         let scope = self.scope.as_ref().unwrap();
-        let cancellation =
-            Arc::clone(&scope.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
-        cancellation.request(reason);
-        scope.inner.update(|state| {
-            if let Some(node) = state.nodes.get_mut(&scope.id) {
-                node.cancellation_signalled = true;
-                crate::observation::queue_control(state, scope.id, crate::ControlIntent::Cancel)
-                    .unwrap();
-            }
-        });
+        WorkCancellationRequester {
+            inner: Arc::clone(&scope.inner),
+            id: scope.id,
+        }
+    }
+
+    pub fn cancel(&self, reason: CancellationReason) {
+        self.cancellation_requester()
+            .request(reason)
+            .expect("an active work owner must retain its responsibility");
     }
 
     /// Record a responsibility transfer before moving this owner to the
@@ -692,6 +695,41 @@ impl WorkOwner {
             node.owner = OwnerState::Completed;
             state.collect(scope.id);
         });
+    }
+}
+
+/// Cloneable authority to request first-wins downward cancellation.
+///
+/// This capability cannot complete or hand off its owner responsibility and
+/// cannot release business, stage, allocation, or obligation resources.
+#[derive(Clone)]
+pub struct WorkCancellationRequester {
+    inner: Arc<Inner>,
+    id: WorkId,
+}
+
+impl WorkCancellationRequester {
+    /// Request cancellation for this work and its descendants. Repeated or
+    /// competing requests preserve the cancellation tree's first reason.
+    /// Cancellation is intent only and never releases governed resources.
+    pub fn request(&self, reason: CancellationReason) -> Result<(), WorkError> {
+        let cancellation = {
+            let state = self.inner.state.lock().unwrap();
+            Arc::clone(
+                &state
+                    .nodes
+                    .get(&self.id)
+                    .ok_or(WorkError::Released)?
+                    .cancellation,
+            )
+        };
+        cancellation.request(reason);
+        self.inner.update(|state| {
+            let node = state.nodes.get_mut(&self.id).ok_or(WorkError::Released)?;
+            node.cancellation_signalled = true;
+            crate::observation::queue_control(state, self.id, crate::ControlIntent::Cancel)?;
+            Ok(())
+        })
     }
 }
 

@@ -52,8 +52,8 @@ pub use resource::{
     ResultCreditStage,
 };
 pub use scope::{
-    BusinessPermit, RootWork, ServingState, WorkClass, WorkId, WorkOwner, WorkRequest, WorkScope,
-    WorkloadConfig, WorkloadControl,
+    BusinessPermit, RootWork, ServingState, WorkCancellationRequester, WorkClass, WorkId,
+    WorkOwner, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
 };
 
 /// Admission failures never imply cancellation, physical stop, or release.

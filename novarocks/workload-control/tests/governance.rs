@@ -380,6 +380,82 @@ async fn cancellation_is_first_wins_downward_and_has_no_lost_subscription() {
 }
 
 #[tokio::test]
+async fn cloned_cancellation_requester_is_first_wins_and_downward_only() {
+    let control = control();
+    let parent = root(&control, WorkClass::MaterializedView);
+    let target = child(&parent.owner.scope());
+    let descendant = child(&target.scope());
+    let sibling = child(&parent.owner.scope());
+    let requester = target.cancellation_requester();
+
+    requester
+        .request(CancellationReason::ExplicitKill {
+            requester_connection_id: 41,
+        })
+        .unwrap();
+    requester
+        .clone()
+        .request(CancellationReason::ServerShutdown)
+        .unwrap();
+
+    let expected = CancellationReason::ExplicitKill {
+        requester_connection_id: 41,
+    };
+    assert_eq!(
+        target.scope().cancellation().unwrap().reason(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        descendant.scope().cancellation().unwrap().reason(),
+        Some(expected)
+    );
+    assert_eq!(parent.owner.scope().cancellation().unwrap().reason(), None);
+    assert_eq!(sibling.scope().cancellation().unwrap().reason(), None);
+
+    let permit = control.next_control().unwrap();
+    assert_eq!(permit.scope().id(), target.scope().id());
+    assert!(permit.intents().contains(ControlIntent::Cancel));
+}
+
+#[test]
+fn cancellation_requester_neither_releases_nor_retains_responsibility() {
+    let control = control();
+    let work = root(&control, WorkClass::Query);
+    let requester = work.owner.cancellation_requester();
+    let execution = work.owner.scope().try_acquire(Stage::Execution).unwrap();
+    let obligation = work
+        .owner
+        .scope()
+        .register_obligation(key(90), ObligationKind::RunningWork)
+        .unwrap();
+
+    requester
+        .request(CancellationReason::ClientDisconnected)
+        .unwrap();
+    let snapshot = control.snapshot();
+    let scope = snapshot
+        .scopes
+        .iter()
+        .find(|scope| scope.id == work.owner.scope().id())
+        .unwrap();
+    assert_eq!(snapshot.execution, 1);
+    assert_eq!(scope.owner, OwnerState::Active);
+    assert!(scope.business_admitted);
+    assert_eq!(scope.obligations.len(), 1);
+
+    drop(execution);
+    assert!(obligation.resolve());
+    work.owner.complete();
+    work.business.release();
+    drain_control(&control);
+    assert_eq!(control.snapshot().root_responsibilities, 0);
+    assert_eq!(
+        requester.request(CancellationReason::Requested),
+        Err(WorkError::Released)
+    );
+}
+
+#[tokio::test]
 async fn waiting_entries_and_bytes_are_bounded_and_drop_returns_unreceived_grants() {
     let control = control();
     let mv = root(&control, WorkClass::MaterializedView);

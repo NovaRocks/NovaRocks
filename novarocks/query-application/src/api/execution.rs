@@ -17,7 +17,9 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
-use novarocks_workload_control::WorkOwner;
+use novarocks_workload_control::{
+    CancellationReason, WorkCancellationRequester, WorkError, WorkOwner,
+};
 
 use crate::preparation::FrozenExecutionDescription;
 
@@ -140,6 +142,23 @@ pub trait ExecutionControl: Send + 'static {
     fn request_cancel(&self) -> Result<(), QueryExecutionError>;
 }
 
+impl ExecutionControl for WorkCancellationRequester {
+    fn request_cancel(&self) -> Result<(), QueryExecutionError> {
+        self.request(CancellationReason::Requested)
+            .map_err(|error| {
+                let kind = if matches!(error, WorkError::Released) {
+                    QueryExecutionErrorKind::Rejected
+                } else {
+                    QueryExecutionErrorKind::Failed
+                };
+                QueryExecutionError::new(
+                    kind,
+                    format!("request governed logical execution cancellation: {error}"),
+                )
+            })
+    }
+}
+
 /// Move-only logical execution handle.
 ///
 /// Dropping a handle is not a stop or resource-release fact. T08 attaches
@@ -185,6 +204,9 @@ mod tests {
 
     use super::*;
     use crate::api::ExecutionOutput;
+    use novarocks_workload_control::{
+        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
 
     struct RecordingControl(Arc<AtomicBool>);
 
@@ -209,5 +231,38 @@ mod tests {
         assert!(handle.take_output().is_none());
         handle.request_cancel().unwrap();
         assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn execution_handle_requests_cancellation_without_owning_work() {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = work.owner.scope();
+        let handle = ExecutionHandle::new(
+            work.owner.cancellation_requester(),
+            ExecutionOutput::Completion,
+        );
+
+        handle.request_cancel().unwrap();
+        assert_eq!(
+            scope.cancellation().unwrap().reason(),
+            Some(CancellationReason::Requested)
+        );
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+
+        drop(handle);
+        work.owner.complete();
+        work.business.release();
     }
 }
