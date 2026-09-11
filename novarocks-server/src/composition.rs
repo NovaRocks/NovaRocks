@@ -35,8 +35,8 @@ use novarocks_execution::runtime::execution_runtime::{
 };
 use novarocks_frontend::{
     CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
-    FrontendQueryControlTimeouts, FrontendServerConfig, LakePublicationRuntimePolicy,
-    TaskUpdateRetryPolicy,
+    FrontendQueryControlTimeouts, FrontendServerConfig, FrontendTaskTransportBudget,
+    LakePublicationRuntimePolicy, TaskUpdateRetryPolicy,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
@@ -62,7 +62,6 @@ use novarocks_spi::connector::{
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
-use novarocks_task_codec::TransportBudget;
 use novarocks_types::{ClusterRole, NativeCompatibilityId};
 use novarocks_worker::{LeaseBounds, OperationWaitCaps};
 use novarocks_workload_control::{ResourceConfig, WorkloadConfig};
@@ -481,22 +480,29 @@ pub fn compose_frontend_server_config(
     )
     .map_err(|error| anyhow::anyhow!("construct result fetch byte limit: {error}"))?;
     if result_fetch_byte_limit.get()
-        > novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
+        > novarocks_frontend::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
     {
         anyhow::bail!(
             "runtime.result_retained_bytes_per_root {} exceeds the Native root-result payload limit {}",
             result_fetch_byte_limit.get(),
-            novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
+            novarocks_frontend::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
         );
     }
-    let (logical_supervisor, workload, workload_resources, decode_workers, decode_queue) =
-        compose_frontend_workload_runtime(runtime_config, result_fetch_byte_limit)?;
+    let (
+        logical_supervisor,
+        workload,
+        workload_resources,
+        decode_workers,
+        decode_queue,
+        abort_capacity,
+    ) = compose_frontend_workload_runtime(runtime_config, result_fetch_byte_limit)?;
     let logical_runtime = novarocks_frontend::FrontendLogicalExecutionRuntimeConfig::new(
         logical_supervisor,
         workload,
         workload_resources,
         decode_workers,
         decode_queue,
+        abort_capacity,
     );
     let mut execution = FrontendExecutionConfig::new(
         native_trust.advertised_endpoint().host().to_string(),
@@ -651,7 +657,7 @@ struct ComposedTaskExecutionBudgets {
     coordination: CoordinationBudgets,
     wait_caps: OperationWaitCaps,
     lease_bounds: LeaseBounds,
-    transport: TransportBudget,
+    transport: FrontendTaskTransportBudget,
 }
 
 fn compose_frontend_workload_runtime(
@@ -661,6 +667,7 @@ fn compose_frontend_workload_runtime(
     LogicalExecutionSupervisorConfig,
     WorkloadConfig,
     ResourceConfig,
+    NonZeroUsize,
     NonZeroUsize,
     NonZeroUsize,
 )> {
@@ -716,6 +723,10 @@ fn compose_frontend_workload_runtime(
         "result_decode_queue_capacity",
         input.result_decode_queue_capacity,
     )?;
+    let abort_capacity = nonzero(
+        "logical_abort_effect_capacity",
+        input.logical_abort_effect_capacity,
+    )?;
     if input.logical_replacement_reservation_ms == 0 {
         anyhow::bail!(
             "runtime.frontend_workload.logical_replacement_reservation_ms must be nonzero"
@@ -760,6 +771,7 @@ fn compose_frontend_workload_runtime(
         resources,
         decode_workers,
         decode_queue,
+        abort_capacity,
     ))
 }
 
@@ -788,7 +800,7 @@ fn compose_task_execution_budgets(
     .ok_or_else(|| {
         anyhow::anyhow!("construct task lease bounds: the accepted range must not be inverted")
     })?;
-    let transport = TransportBudget::new(
+    let transport = FrontendTaskTransportBudget::try_new(
         runtime.task_operation_max_batch_items,
         runtime.task_operation_max_batch_encoded_bytes,
         runtime.task_descriptor_max_encoded_bytes,
@@ -1017,8 +1029,8 @@ mod tests {
         compose_task_execution_budgets, mv_lake_target_snapshot_observation,
     };
     use novarocks_execution_contract::{MaxWait, OperationKind};
+    use novarocks_frontend::FrontendTaskTransportBudget;
     use novarocks_query_application::coordination::DispatchBudget;
-    use novarocks_task_codec::TransportBudget;
     use novarocks_worker::LeaseBounds;
     use std::time::Duration;
 
@@ -1096,7 +1108,7 @@ mod tests {
 
         assert_eq!(budgets.coordination.dispatch, DispatchBudget::DEFAULT);
         assert_eq!(budgets.lease_bounds, LeaseBounds::DEFAULT);
-        let frozen = TransportBudget::DEFAULT;
+        let frozen = FrontendTaskTransportBudget::DEFAULT;
         assert_eq!(
             budgets.transport.max_batch_items(),
             frozen.max_batch_items()
@@ -1163,7 +1175,7 @@ mod tests {
         config.runtime.frontend_workload.control_bytes = 64 * 1024 * 1024;
         config.runtime.frontend_workload.per_scope_bytes = 512 * 1024 * 1024;
         let byte_limit = novarocks_execution_contract::ResultByteLimit::new(1024).unwrap();
-        let (_, workload, resources, decode_workers, decode_queue) =
+        let (_, workload, resources, decode_workers, decode_queue, abort_capacity) =
             compose_frontend_workload_runtime(&config.runtime, byte_limit)
                 .expect("explicit frontend workload fields compose");
         assert_eq!(workload.execution_limit, 64);
@@ -1171,6 +1183,7 @@ mod tests {
         assert_eq!(resources.per_scope_bytes, 512 * 1024 * 1024);
         assert_eq!(decode_workers.get(), 2);
         assert_eq!(decode_queue.get(), 32);
+        assert_eq!(abort_capacity.get(), 16);
 
         config.runtime.frontend_workload.logical_start_capacity = 0;
         assert!(
@@ -1211,6 +1224,21 @@ mod tests {
             .runtime
             .frontend_workload
             .logical_result_fetch_wait_ms = 200;
+        config
+            .runtime
+            .frontend_workload
+            .logical_abort_effect_capacity = 0;
+        assert!(
+            compose_frontend_workload_runtime(&config.runtime, byte_limit)
+                .expect_err("zero logical Abort effect capacity must fail preflight")
+                .to_string()
+                .contains("logical_abort_effect_capacity")
+        );
+
+        config
+            .runtime
+            .frontend_workload
+            .logical_abort_effect_capacity = 16;
         config.runtime.frontend_workload.per_scope_bytes = 2 * 1024 * 1024 * 1024;
         assert!(
             compose_frontend_workload_runtime(&config.runtime, byte_limit)

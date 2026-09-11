@@ -410,7 +410,7 @@ impl DispatchBatch {
         )
     }
 
-    pub(super) fn with_queued_at(
+    pub(crate) fn with_queued_at(
         backend: BackendProcessId,
         lane: DispatchLane,
         operations: Vec<OperationIntent>,

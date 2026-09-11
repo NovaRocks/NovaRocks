@@ -174,7 +174,7 @@ struct NativeFinalizerInputs {
 /// private to this module, so sibling modules cannot pair a frozen description
 /// with native projection or attempt access from another assembly.
 pub(crate) struct FinalizedDistributedExecution {
-    description: Arc<novarocks_query_application::preparation::FrozenExecutionDescription>,
+    description: novarocks_query_application::preparation::FrozenExecutionDescription,
     attempt_template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
 }
 
@@ -186,7 +186,7 @@ impl FinalizedDistributedExecution {
         attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
     ) -> Self {
         Self {
-            description: Arc::new(description),
+            description,
             attempt_template:
                 crate::query_execution::artifact::PreparedDistributedAttemptTemplate::new(
                     prepared,
@@ -199,7 +199,7 @@ impl FinalizedDistributedExecution {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        Arc<novarocks_query_application::preparation::FrozenExecutionDescription>,
+        novarocks_query_application::preparation::FrozenExecutionDescription,
         crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
     ) {
         (self.description, self.attempt_template)
@@ -265,6 +265,57 @@ impl PreparedDistributedQueryAssembly {
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
         statistics_program: Option<crate::query_execution::statistics::StatisticsCollectionProgram>,
     ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
+        let (finalized, query_options, intent, execution) =
+            self.finalize_execution(native_attachment)?;
+        crate::query_execution::contract::build_request_from_finalized_execution(
+            finalized,
+            query_options,
+            intent,
+            &execution,
+            statistics_program,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Finalize a plain read into the move-only Query Application handoff.
+    ///
+    /// This route deliberately bypasses `DistributedQueryRequest`: that
+    /// request owns one legacy coordinator round and would either erase the
+    /// reusable attempt template or expose the old retry authority.
+    pub(crate) fn finish_logical_read(
+        self,
+        native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
+    ) -> Result<crate::query_execution::PreparedLogicalRead, String> {
+        let (finalized, query_options, intent, _execution) =
+            self.finalize_execution(native_attachment)?;
+        if intent != crate::query_execution::contract::DistributedQueryIntent::Result {
+            return Err(
+                "Query Application logical-read finalization requires result intent".to_string(),
+            );
+        }
+        let (description, attempt_template) = finalized.into_parts();
+        let options = Arc::new(
+            crate::query_execution::contract::ResolvedQueryOptions::from_upstream(query_options),
+        );
+        Ok(crate::query_execution::PreparedLogicalRead::new(
+            description,
+            attempt_template,
+            options,
+        ))
+    }
+
+    fn finalize_execution(
+        self,
+        native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
+    ) -> Result<
+        (
+            FinalizedDistributedExecution,
+            Option<QueryOptions>,
+            crate::query_execution::contract::DistributedQueryIntent,
+            QueryExecutionContext,
+        ),
+        String,
+    > {
         let finalized = self.encoding.into_finalizer_inputs(&native_attachment)?;
         let NativeFinalizerInputs {
             sealed_plan,
@@ -339,14 +390,7 @@ impl PreparedDistributedQueryAssembly {
             native_attachment,
             attempt_access,
         );
-        crate::query_execution::contract::build_request_from_finalized_execution(
-            finalized,
-            self.query_options,
-            self.intent,
-            &self.execution,
-            statistics_program,
-        )
-        .map_err(|error| error.to_string())
+        Ok((finalized, self.query_options, self.intent, self.execution))
     }
 
     pub fn into_operation(

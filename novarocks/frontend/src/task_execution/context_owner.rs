@@ -60,7 +60,7 @@ const RELEASE_RETRY_MAX: Duration = Duration::from_secs(1);
 ///
 /// This is a query-side policy. Worker retention limits remain Worker-owned
 /// and are not imported into the frontend.
-const ADMISSION_TICKET_VALID_FOR: Duration = Duration::from_secs(10);
+pub(crate) const ADMISSION_TICKET_VALID_FOR: Duration = Duration::from_secs(10);
 
 /// The shared facts an establish installs atomically.
 ///
@@ -140,6 +140,12 @@ struct ReleasedAdmission {
 struct GrantedAdmission {
     receipt: QueryContextAdmissionTicketReceipt,
     conservative_expiry: MonotonicInstant,
+    /// A frontend-local upper bound on the Worker's ticket expiry.
+    ///
+    /// The Worker issued the ticket no later than the receipt reached this
+    /// owner. Waiting one full validity window from that observation therefore
+    /// prevents a replacement request from racing a still-active old ticket.
+    reissue_not_before: MonotonicInstant,
 }
 
 /// What a release answer did to this owner.
@@ -165,6 +171,7 @@ pub struct QueryContextOwner {
     state: QueryContextState,
     admission: Option<ReleasedAdmission>,
     admission_ticket: Option<GrantedAdmission>,
+    admission_reissue_at: Option<MonotonicInstant>,
     admission_qualified: bool,
     lease_sequence: LeaseSequence,
     renew_schedule: Option<RenewSchedule>,
@@ -210,6 +217,7 @@ impl QueryContextOwner {
             state: QueryContextState::Absent,
             admission: None,
             admission_ticket: None,
+            admission_reissue_at: None,
             admission_qualified: true,
             lease_sequence: LeaseSequence::INITIAL,
             renew_schedule: None,
@@ -231,6 +239,39 @@ impl QueryContextOwner {
             progress: 0,
             runtime_filter_contribution: None,
         }
+    }
+
+    /// Adopts the exact Worker grant already acquired by the logical
+    /// replacement owner. The Task protocol must consume this receipt before
+    /// its first turn so it cannot issue a second admission request for the
+    /// same successor context.
+    pub(crate) fn adopt_replacement_admission(
+        &mut self,
+        receipt: QueryContextAdmissionTicketReceipt,
+        now: MonotonicInstant,
+    ) -> Result<(), TaskExecutionError> {
+        if receipt.context() != self.context
+            || self.admission.is_some()
+            || self.admission_ticket.is_some()
+            || self.establish.is_some()
+            || self.establish_acknowledged
+            || !matches!(self.state, QueryContextState::Absent)
+        {
+            return Err(TaskExecutionError::Schedule(format!(
+                "replacement admission does not belong to pristine context {}",
+                self.context
+            )));
+        }
+        self.admission_ticket = Some(GrantedAdmission {
+            receipt,
+            conservative_expiry: now.saturating_add(receipt.valid_for().get()),
+            reissue_not_before: now.saturating_add(receipt.valid_for().get()),
+        });
+        // The replacement remains authorized. Holding a ticket already makes
+        // `needs_admission_ticket` false; preserving qualification lets an
+        // unconsumed expired ticket be replaced instead of failing the query.
+        self.admission_qualified = true;
+        Ok(())
     }
 
     pub const fn context(&self) -> QueryContextRef {
@@ -300,6 +341,13 @@ impl QueryContextOwner {
         if !self.needs_admission_ticket() {
             return Ok(None);
         }
+        if self
+            .admission_reissue_at
+            .is_some_and(|reissue_at| !now.has_reached(reissue_at))
+        {
+            return Ok(None);
+        }
+        self.admission_reissue_at = None;
         if let Some(released) = &mut self.admission {
             if released.awaiting_outcome {
                 return Ok(None);
@@ -359,15 +407,8 @@ impl QueryContextOwner {
             return Ok(None);
         };
         if now.has_reached(granted.conservative_expiry) {
-            self.admission_ticket = None;
-            self.admission_qualified = false;
-            self.state = QueryContextState::TerminalRetained;
-            self.released = true;
-            return Err(TaskExecutionError::OperationFailed {
-                kind: OperationKind::AcquireQueryContextAdmissionTicket,
-                outcome: OperationOutcome::LeaseExpired,
-                detail: Some("the admission ticket expired before establish was sent".to_owned()),
-            });
+            self.defer_admission_reissue(granted.reissue_not_before);
+            return Ok(None);
         }
         let valid_for = LeaseValidFor::new(RequestedLeaseDurations::DEFAULT.initial())
             .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
@@ -383,6 +424,7 @@ impl QueryContextOwner {
         ));
         self.state = QueryContextState::Establishing;
         self.admission_ticket = None;
+        self.admission_reissue_at = None;
         self.admission_qualified = false;
         self.establish = Some(ReleasedEstablish {
             request: Arc::clone(&request),
@@ -480,6 +522,7 @@ impl QueryContextOwner {
         });
         self.admission_qualified = false;
         self.admission_ticket = None;
+        self.admission_reissue_at = None;
         Some(OperationIntent::AbortQueryContext(request))
     }
 
@@ -619,24 +662,29 @@ impl QueryContextOwner {
             .first_sent_at
             .saturating_add(receipt.valid_for().get());
         if now.has_reached(conservative_expiry) {
-            self.fail_admission();
-            return Err(TaskExecutionError::OperationFailed {
-                kind: OperationKind::AcquireQueryContextAdmissionTicket,
-                outcome: OperationOutcome::LeaseExpired,
-                detail: Some("the admission ticket expired before its receipt arrived".to_owned()),
-            });
+            self.defer_admission_reissue(now.saturating_add(receipt.valid_for().get()));
+            return Ok(());
         }
         self.admission = None;
+        self.admission_reissue_at = None;
         self.admission_ticket = Some(GrantedAdmission {
             receipt: *receipt,
             conservative_expiry,
+            reissue_not_before: now.saturating_add(receipt.valid_for().get()),
         });
         Ok(())
+    }
+
+    fn defer_admission_reissue(&mut self, reissue_not_before: MonotonicInstant) {
+        self.admission = None;
+        self.admission_ticket = None;
+        self.admission_reissue_at = Some(reissue_not_before);
     }
 
     fn fail_admission(&mut self) {
         self.admission = None;
         self.admission_ticket = None;
+        self.admission_reissue_at = None;
         self.admission_qualified = false;
         self.state = QueryContextState::TerminalRetained;
         self.released = true;

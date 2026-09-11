@@ -1916,6 +1916,96 @@ fn an_admission_transport_unknown_replays_exactly_and_only_the_next_turn_establi
 }
 
 #[test]
+fn an_unconsumed_expired_admission_is_reissued_after_the_worker_ticket_must_be_gone() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x42; 32]),
+        admission_epoch(),
+    );
+    let first = owner
+        .admission_intent(MonotonicInstant::ORIGIN)
+        .expect("the request is legal")
+        .expect("admission is required");
+    let first_operation = first.operation_id();
+    owner
+        .on_admission_ack(
+            &admission_ack(&first),
+            MonotonicInstant::from_origin(Duration::from_secs(1)),
+        )
+        .expect("the admission grant settles");
+
+    assert!(
+        owner
+            .establish_intent(
+                FakeEstablish.facts_for(context).expect("frozen facts"),
+                MonotonicInstant::from_origin(Duration::from_secs(10)),
+            )
+            .expect("expiry schedules a replacement grant")
+            .is_none()
+    );
+    assert_eq!(owner.state(), QueryContextState::Absent);
+    assert!(!owner.is_released());
+    assert!(
+        owner
+            .admission_intent(MonotonicInstant::from_origin(Duration::from_millis(10_999)))
+            .expect("the wait remains valid")
+            .is_none(),
+        "the Worker may still hold the old ticket"
+    );
+    let replacement = owner
+        .admission_intent(MonotonicInstant::from_origin(Duration::from_secs(11)))
+        .expect("the reissue is legal")
+        .expect("a fresh grant is requested after the safe bound");
+    assert_ne!(replacement.operation_id(), first_operation);
+}
+
+#[test]
+fn a_grant_received_after_its_conservative_expiry_waits_before_reissue() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x42; 32]),
+        admission_epoch(),
+    );
+    let first = owner
+        .admission_intent(MonotonicInstant::ORIGIN)
+        .expect("the request is legal")
+        .expect("admission is required");
+    let first_operation = first.operation_id();
+    owner
+        .on_admission_ack(
+            &admission_ack(&first),
+            MonotonicInstant::from_origin(Duration::from_secs(11)),
+        )
+        .expect("a late definitive grant keeps the attempt authorized");
+
+    assert_eq!(owner.state(), QueryContextState::Absent);
+    assert!(!owner.is_released());
+    assert!(
+        owner
+            .admission_intent(MonotonicInstant::from_origin(Duration::from_millis(20_999)))
+            .expect("the wait remains valid")
+            .is_none()
+    );
+    let replacement = owner
+        .admission_intent(MonotonicInstant::from_origin(Duration::from_secs(21)))
+        .expect("the reissue is legal")
+        .expect("a fresh grant is requested after the late receipt's safe bound");
+    assert_ne!(replacement.operation_id(), first_operation);
+}
+
+#[test]
 fn a_late_establish_receipt_closes_a_queued_exact_replay() {
     use crate::native::task_transport::TaskAckIntake;
     use crate::task_execution::round::TaskRound;

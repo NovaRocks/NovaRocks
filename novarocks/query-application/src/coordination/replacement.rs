@@ -75,6 +75,7 @@ pub struct ReplacementQualificationRequest {
     replacement_contexts: Arc<[QueryContextRef]>,
     issued_at: MonotonicInstant,
     conservative_expiry: MonotonicInstant,
+    absolute_expiry: std::time::Instant,
 }
 
 impl ReplacementQualificationRequest {
@@ -85,6 +86,9 @@ impl ReplacementQualificationRequest {
         issued_at: MonotonicInstant,
         conservative_expiry: MonotonicInstant,
     ) -> Self {
+        let absolute_expiry = std::time::Instant::now()
+            .checked_add(conservative_expiry.saturating_duration_since(issued_at))
+            .unwrap_or_else(std::time::Instant::now);
         Self {
             operation_id: TaskOperationId::new_v7(),
             identity,
@@ -92,6 +96,7 @@ impl ReplacementQualificationRequest {
             replacement_contexts,
             issued_at,
             conservative_expiry,
+            absolute_expiry,
         }
     }
 
@@ -115,6 +120,10 @@ impl ReplacementQualificationRequest {
     /// the submission when this deadline or its cancellation signal fires.
     pub const fn conservative_expiry(&self) -> MonotonicInstant {
         self.conservative_expiry
+    }
+
+    pub const fn absolute_expiry(&self) -> std::time::Instant {
+        self.absolute_expiry
     }
 }
 

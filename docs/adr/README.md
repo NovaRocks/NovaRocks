@@ -119,7 +119,6 @@ code-anchors:
 - ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
-- ADR-0129 — vended credential 为何必须在 metadata materialization 前按 attempt 收集（active）
 - ADR-0130 — Connector role binding 为何每个进程角色只发布一个 complete generation（active）
 - ADR-0139 — Server 为何以唯一封闭 manifest 定义 active provider 并拒绝退役配置（active）
 - ADR-0137 — 多 provider 的私有 Connector wire 为何归 provider 自有、Native 只承载 opaque envelope（active）
@@ -143,11 +142,12 @@ code-anchors:
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
-- ADR-0141 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
+- ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
 
 #### 历史
 
 - ADR-0132 — provider 为何拥有 role-binding factory、而 Server 只组装 role-local resource（superseded → ADR-0139）
+- ADR-0129 — vended credential 为何必须在 metadata materialization 前按 attempt 收集（superseded → ADR-0145）
 - ADR-0022 — Connector statistics capability 为何保持 FE-only、generation-fenced 且不进入 BE binding（superseded → ADR-0136）
 - ADR-0082 — 同一快照上的统计发布为何以覆盖度排序、且冲突重试必须重新判定（superseded → ADR-0136）
 
@@ -187,7 +187,7 @@ code-anchors:
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
 - ADR-0124 — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active）
-- ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（active）
+- ADR-0146 — 逻辑执行为何拥有 attempts、结果可见性与残余收敛，并在其下保留 Task 唯一生命周期权威（active）
 
 #### 历史
 
@@ -205,6 +205,7 @@ code-anchors:
 - ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（superseded → ADR-0128）
 - ADR-0008 — 分布式查询为何使用 Init/Stage/Start 三阶段启动（superseded → ADR-0135）
 - ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（superseded → ADR-0135）
+- ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 
 ### sql-compiler
 
@@ -214,6 +215,7 @@ code-anchors:
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
 - ADR-0050 — sealed DistributedPlan 为何以 logical mutation effect 与 opaque provider route 服务跨 owner encoder（active）
 - ADR-0100 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active）
+- ADR-0145 — 查询语义为何先于 per-attempt execution access 冻结，重试为何不得重新规划或携带秘密（active）
 
 #### 历史
 
@@ -242,6 +244,7 @@ StarRocks 已废弃且没有 active read capability。
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0121 — FE serving lifecycle 为何用单向 admission drain、而不是 connection shutdown 或远程 management mutation（active）
 - ADR-0124 — Native compatibility island 与 ingress admission 为何保持 role-local、无 all-in-one 旁路（active）
+- ADR-0147 — 进程本地工作治理为何分离责任、准入、资源与结果信用，并由 Application Host 持有唯一 owner（active）
 
 #### 历史
 
@@ -295,8 +298,8 @@ generation；`Absent`（未知）与 `Unavailable`（本机未物化）永远分
 admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。跨 family 的同事务约束不可用：被读的一侧若是
 可清除的加速态，那个「保证」会在缓存被清空时静默消失。
 
-- ADR-0115 — catalog 期望态为何收敛为单一 typed 快照 + 三个互斥 source mode（active；其继承自 ADR-0066 的 durable change-hint 机制已由 ADR-0141 换成进程内唤醒 + 周期 sweep，快照与重读裁决不变）
-- ADR-0116 — `DROP CATALOG` 的 MV 引用检查为何降级为 best-effort 运维保护（active；裁决第 4 条点名的 `resolve_commit` 已由 ADR-0141 换成 attempt 观察，未知即三态的语义不变）
+- ADR-0115 — catalog 期望态为何收敛为单一 typed 快照 + 三个互斥 source mode（active；其继承自 ADR-0066 的 durable change-hint 机制已由 ADR-0143 换成进程内唤醒 + 周期 sweep，快照与重读裁决不变）
+- ADR-0116 — `DROP CATALOG` 的 MV 引用检查为何降级为 best-effort 运维保护（active；裁决第 4 条点名的 `resolve_commit` 已由 ADR-0143 换成 attempt 观察，未知即三态的语义不变）
 
 历史：
 
@@ -319,7 +322,7 @@ admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。跨 
 StateStore 的全局单值限制保持公共契约，record owner 负责自己的 schema、状态机与错误映射，索引和控制值保持独立小值路径。
 
 - ADR-0074 — Frontend durable record 为何统一采用有界 canonical 编码与整记录预算（active）
-- ADR-0141 — StateStore 为何只回答自己签发过的 attempt，并把提交结果收敛为不可翻转的三态（active）
+- ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并把提交结果收敛为不可翻转的三态（active）
 
 ### frontend-dml
 
@@ -398,8 +401,9 @@ fallback 模糊 owner 和故障语义。
 - ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
+- ADR-0144 — 应用领域为何沿稳定 owner 接缝物理化，依赖为何指向政策而移动接缝留在模块内（active）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
-- ADR-0122 — SQLite 为何是唯一 production StateStore、远程 provider 仅保留实验 leaf crate（active；其中 schema 版本、history 保留与 commit-resolution 三项承诺已由 ADR-0141 替换，产品裁决仍有效）
+- ADR-0122 — SQLite 为何是唯一 production StateStore、远程 provider 仅保留实验 leaf crate（active；其中 schema 版本、history 保留与 commit-resolution 三项承诺已由 ADR-0143 替换，产品裁决仍有效）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active）
 - ADR-0142 — NovaRocks 自有 packages 为何共享一个 Cargo workspace、resolver 与 lock authority（active）
 

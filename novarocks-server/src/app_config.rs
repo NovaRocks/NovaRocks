@@ -29,14 +29,16 @@ use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_execution_contract::{LeaseValidFor, MaxWait};
-use novarocks_frontend::StateStoreRunPolicy;
+use novarocks_frontend::{
+    FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
+    StateStoreRunPolicy,
+};
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_query_application::coordination::{
     DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
 };
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
-use novarocks_task_codec::TransportBudget;
 use novarocks_types::{ClusterRole, NativeEndpoint};
 use novarocks_worker::LeaseBounds;
 
@@ -1079,6 +1081,7 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub logical_actor_mailbox_capacity: usize,
     pub logical_context_admission_issue_capacity: usize,
     pub logical_context_establish_capacity: usize,
+    pub logical_abort_effect_capacity: usize,
     pub result_decode_worker_count: usize,
     pub result_decode_queue_capacity: usize,
     pub logical_rows_delivery_capacity: usize,
@@ -1111,6 +1114,7 @@ impl Default for FrontendWorkloadRuntimeConfig {
             logical_actor_mailbox_capacity: 64,
             logical_context_admission_issue_capacity: 16,
             logical_context_establish_capacity: 16,
+            logical_abort_effect_capacity: 16,
             result_decode_worker_count: 2,
             result_decode_queue_capacity: 32,
             logical_rows_delivery_capacity: 32,
@@ -1464,43 +1468,43 @@ fn default_task_dispatch_control_permits() -> usize {
 }
 
 fn default_task_operation_max_batch_items() -> usize {
-    TransportBudget::DEFAULT.max_batch_items()
+    FrontendTaskTransportBudget::DEFAULT.max_batch_items()
 }
 
 fn default_task_operation_max_batch_encoded_bytes() -> usize {
-    TransportBudget::DEFAULT.max_batch_encoded_bytes()
+    FrontendTaskTransportBudget::DEFAULT.max_batch_encoded_bytes()
 }
 
 fn default_task_descriptor_max_encoded_bytes() -> usize {
-    TransportBudget::DEFAULT.max_descriptor_encoded_bytes()
+    FrontendTaskTransportBudget::DEFAULT.max_descriptor_encoded_bytes()
 }
 
 fn default_task_query_backend_max_queued_operations() -> usize {
-    TransportBudget::DEFAULT.max_query_backend_queued_operations()
+    FrontendTaskTransportBudget::DEFAULT.max_query_backend_queued_operations()
 }
 
 fn default_task_query_backend_max_queued_bytes() -> usize {
-    TransportBudget::DEFAULT.max_query_backend_queued_bytes()
+    FrontendTaskTransportBudget::DEFAULT.max_query_backend_queued_bytes()
 }
 
 fn default_task_backend_max_queued_operations() -> usize {
-    TransportBudget::DEFAULT.max_backend_queued_operations()
+    FrontendTaskTransportBudget::DEFAULT.max_backend_queued_operations()
 }
 
 fn default_task_backend_max_queued_bytes() -> usize {
-    TransportBudget::DEFAULT.max_backend_queued_bytes()
+    FrontendTaskTransportBudget::DEFAULT.max_backend_queued_bytes()
 }
 
 fn default_task_max_tasks_per_context() -> usize {
-    TransportBudget::DEFAULT.max_tasks_per_context()
+    FrontendTaskTransportBudget::DEFAULT.max_tasks_per_context()
 }
 
 fn default_task_max_active_tasks_per_backend() -> usize {
-    TransportBudget::DEFAULT.max_active_tasks_per_backend()
+    FrontendTaskTransportBudget::DEFAULT.max_active_tasks_per_backend()
 }
 
 fn default_task_operation_queue_residence_ms() -> u64 {
-    duration_millis(TransportBudget::DEFAULT.frontend_queue_residence())
+    duration_millis(FrontendTaskTransportBudget::DEFAULT.frontend_queue_residence())
 }
 
 /// `OperationWaitCaps` exposes no accessor for either cap, so both defaults
@@ -1707,10 +1711,10 @@ fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
     .context("validate native result retained-byte limits")?;
     let per_root = u64::try_from(runtime.result_retained_bytes_per_root)
         .context("runtime.result_retained_bytes_per_root exceeds u64")?;
-    if per_root > novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES {
+    if per_root > FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES {
         bail!(
             "runtime.result_retained_bytes_per_root {per_root} exceeds the Native root-result payload limit {}",
-            novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
+            FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
         );
     }
     Ok(())
@@ -2402,9 +2406,10 @@ impl Default for CacheConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait,
-        NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
-        TransportBudget, validate_connector_blocking_io_config, validate_query_control_config,
+        DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES,
+        FrontendTaskTransportBudget, LeaseBounds, LeaseValidFor, MaxWait, NovaRocksConfig,
+        RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
+        validate_connector_blocking_io_config, validate_query_control_config,
         validate_result_retained_config, validate_task_execution_config,
     };
     use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
@@ -2775,7 +2780,7 @@ access_key_secret = ""
     #[test]
     fn task_execution_config_defaults_to_the_frozen_contract_values() {
         let runtime = RuntimeConfig::default();
-        let frozen = TransportBudget::DEFAULT;
+        let frozen = FrontendTaskTransportBudget::DEFAULT;
 
         assert_eq!(
             runtime.task_dispatch_create_permits,
@@ -2882,10 +2887,8 @@ access_key_secret = ""
             .expect_err("a per-root cap above the process cap must fail");
         assert!(format!("{error:#}").contains("must not exceed"));
 
-        let above_wire = usize::try_from(
-            novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES + 1,
-        )
-        .expect("the Native wire bound fits usize");
+        let above_wire = usize::try_from(FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES + 1)
+            .expect("the Native wire bound fits usize");
         runtime = RuntimeConfig {
             result_retained_bytes_per_root: above_wire,
             result_retained_bytes_per_process: above_wire,

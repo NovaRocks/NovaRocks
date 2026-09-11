@@ -40,7 +40,8 @@ use novarocks_workload_control::WorkId;
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 use crate::coordination::{
     AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptFailureClass, AttemptSchedule,
-    NativeAttemptDrive, RecoveryMode, ReplacementQualificationEffectPort, RootResultPumpBinding,
+    NativeAttemptDrive, RecoveryMode, ReplacementQualificationEffectPort,
+    ReplacementWorkerAdmissionEvidence, RootResultPumpBinding,
 };
 use crate::preparation::FrozenExecutionDescription;
 
@@ -380,6 +381,7 @@ pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
     fn activate<'a>(
         &'a mut self,
         schedule: &'a AttemptSchedule,
+        replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
         cancellation: CancellationView,
     ) -> NativeAttemptActivationFuture<'a>;
 
@@ -1023,6 +1025,7 @@ mod tests {
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,
+            _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             Box::pin(async move { Ok(ActivatedNativeAttempt::completion(ActiveDormant(self.tag))) })
@@ -1573,6 +1576,7 @@ mod tests {
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,
+            _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             Box::pin(async { panic!("test owner is never activated") })

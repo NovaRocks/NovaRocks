@@ -2,9 +2,9 @@
 id: ADR-0135
 title: "Native distributed work is created, driven and retired as tasks"
 domain: [distributed-execution]
-status: active
+status: superseded
 supersedes: [ADR-0008, ADR-0114]
-superseded-by: null
+superseded-by: ADR-0146
 date: 2026-09-03
 provenance:
   - "PR: <backfill after merge>"

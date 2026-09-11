@@ -22,10 +22,23 @@
 //! application crate. Production adapters cannot use this module because the
 //! production dependency does not enable `test-support`.
 
-use novarocks_execution_contract::{AcquireQueryContextAdmissionTicket, QueryContextRef};
+use arrow::record_batch::RecordBatch;
+use novarocks_execution_contract::{
+    AcquireQueryContextAdmissionTicket, QueryContextRef, ResultPacketSequence,
+};
+use novarocks_types::QueryExecutionId;
+use novarocks_workload_control::{
+    CancellationReason, LocalResourceAuthority, ResourceConfig, RootWork, WorkClass, WorkRequest,
+    WorkloadConfig, WorkloadControl,
+};
 use std::time::Instant;
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 
+use crate::api::{
+    ExecutionHandle, ExecutionOutput, QueryExecutionError, QueryResultStream, ResultField,
+    ResultSchema,
+};
 use crate::coordination::{
     AdmissionIssueReceipt, AdmissionIssueSettlement, AttemptActivationIdentity,
     ContextStandDownSnapshot, LogicalExecutionActor, LogicalExecutionActorConfig,
@@ -34,6 +47,162 @@ use crate::coordination::{
     LogicalExecutionRuntimeRegistryError, LogicalExecutionRuntimeRegistryHandle,
     LogicalExecutionRuntimeShutdownError, RunningAttemptPermit,
 };
+
+use crate::api::result::{
+    BatchDelivery, DecodedResultBatch, EndDelivery, QueryResultTransport, ResultDelivery,
+    ResultDeliveryDisposition, ResultDeliveryReceipt,
+};
+
+/// Test-only observation of one move-only protocol delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TestResultDeliveryDisposition {
+    Completed,
+    Failed(QueryExecutionError),
+    Dropped,
+}
+
+/// Test-only receipt for the actor side of one protocol delivery.
+pub struct TestResultDeliveryReceipt(ResultDeliveryReceipt);
+
+impl TestResultDeliveryReceipt {
+    pub async fn wait(self) -> TestResultDeliveryDisposition {
+        match self
+            .0
+            .await
+            .expect("test result delivery owner remains alive")
+        {
+            ResultDeliveryDisposition::Completed => TestResultDeliveryDisposition::Completed,
+            ResultDeliveryDisposition::Failed(error) => {
+                TestResultDeliveryDisposition::Failed(error)
+            }
+            ResultDeliveryDisposition::Dropped => TestResultDeliveryDisposition::Dropped,
+        }
+    }
+}
+
+/// Feature-gated producer for exercising a real [`QueryResultStream`] from a
+/// role adapter without exposing production construction authority.
+pub struct ResultStreamTestProducer {
+    execution_id: QueryExecutionId,
+    transport: QueryResultTransport,
+    failure: watch::Sender<Option<QueryExecutionError>>,
+    workload: WorkloadControl,
+    root: Option<RootWork>,
+}
+
+impl ResultStreamTestProducer {
+    pub fn open(
+        execution_id: QueryExecutionId,
+        fields: Vec<ResultField>,
+        delivery_capacity: usize,
+        resource_config: ResourceConfig,
+    ) -> Result<
+        (
+            Self,
+            ExecutionHandle,
+            LocalResourceAuthority,
+            TestResultDeliveryReceipt,
+        ),
+        QueryExecutionError,
+    > {
+        let workload = WorkloadControl::try_new(WorkloadConfig::default(), resource_config)
+            .expect("test result workload config must be valid");
+        workload
+            .mark_ready()
+            .expect("test result workload becomes ready");
+        let root = workload
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("test result root work is admitted");
+        let schema = ResultSchema::new(fields);
+        let (transport, schema_receipt, failure, stream) =
+            QueryResultStream::try_channel(execution_id.query_id(), schema, delivery_capacity)?;
+        let handle = ExecutionHandle::new(
+            root.owner.cancellation_requester(),
+            ExecutionOutput::Rows(stream),
+        );
+        let resources = workload.resources();
+        Ok((
+            Self {
+                execution_id,
+                transport,
+                failure,
+                workload,
+                root: Some(root),
+            },
+            handle,
+            resources,
+            TestResultDeliveryReceipt(schema_receipt),
+        ))
+    }
+
+    pub async fn enqueue_batch(
+        &self,
+        sequence: u64,
+        batch: RecordBatch,
+    ) -> Result<TestResultDeliveryReceipt, QueryExecutionError> {
+        let decoded = DecodedResultBatch::try_new(batch)?;
+        let bytes = decoded.governance_charge_bytes();
+        let root = self.root.as_ref().expect("test result root remains active");
+        let authority = self.workload.resources();
+        let credit = authority
+            .reserve_result_credit(&root.owner.scope(), bytes)
+            .expect("test result fetch credit is representable")
+            .begin_fetch()
+            .expect("test result fetch begins")
+            .retain_raw(bytes)
+            .expect("test result raw payload is retained")
+            .reserve_decode(&authority, bytes)
+            .expect("test result decode capacity is reserved")
+            .queue_decoded(bytes)
+            .expect("test result decoded payload is queued");
+        let (delivery, receipt) = BatchDelivery::try_new(
+            self.execution_id,
+            ResultPacketSequence::new(sequence),
+            decoded,
+            credit,
+        )?;
+        let permit = self.transport.reserve_owned().await?;
+        self.transport
+            .enqueue(permit, ResultDelivery::Batch(delivery));
+        Ok(TestResultDeliveryReceipt(receipt))
+    }
+
+    pub async fn enqueue_end(&self, sequence: u64) -> TestResultDeliveryReceipt {
+        let (delivery, receipt) =
+            EndDelivery::success_eof(self.execution_id, ResultPacketSequence::new(sequence));
+        let permit = self
+            .transport
+            .reserve_owned()
+            .await
+            .expect("test result stream remains connected");
+        self.transport
+            .enqueue(permit, ResultDelivery::End(delivery));
+        TestResultDeliveryReceipt(receipt)
+    }
+
+    pub fn fail(&self, error: QueryExecutionError) {
+        self.failure.send_replace(Some(error));
+    }
+
+    pub fn cancellation_reason(&self) -> Option<CancellationReason> {
+        self.root
+            .as_ref()
+            .expect("test result root remains active")
+            .owner
+            .scope()
+            .cancellation()
+            .expect("test result scope remains observable")
+            .reason()
+    }
+
+    pub fn finish(mut self) {
+        drop(self.transport);
+        drop(self.failure);
+        let root = self.root.take().expect("test result root finishes once");
+        root.owner.complete();
+        root.business.release();
+    }
+}
 
 /// Complete Query Application ownership for one actor-driven integration test.
 #[must_use = "the test logical execution must converge and call finish"]

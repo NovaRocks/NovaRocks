@@ -2,9 +2,9 @@
 id: ADR-0129
 title: "Attempt-scoped collection of vended credentials before metadata materialization"
 domain: [provider-spi, distributed-query-lifecycle, native-transport-security]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0145
 date: 2026-08-30
 provenance:
   - "discussion: 2026-08-30 CCA-1 vended credential ownership and timing"

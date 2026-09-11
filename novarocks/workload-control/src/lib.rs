@@ -86,8 +86,9 @@ pub use resource::{
     ResultCreditStage,
 };
 pub use scope::{
-    BusinessPermit, RootAdmissionHandle, RootWork, ServingState, WorkCancellationRequester,
-    WorkClass, WorkId, WorkOwner, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
+    BusinessPermit, RootAdmissionHandle, RootWork, ServingState, WorkCancellationRequestOutcome,
+    WorkCancellationRequester, WorkClass, WorkId, WorkOwner, WorkRequest, WorkScope,
+    WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig, WorkloadControl,
     WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision, WorkloadShutdown,
     WorkloadShutdownError, WorkloadShutdownFailure,
 };

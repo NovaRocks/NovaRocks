@@ -53,6 +53,7 @@ pub(crate) struct NativeAbortEffectAdapter {
     submission_order: Arc<Mutex<VecDeque<OperationIntent>>>,
     capacity_epoch: watch::Sender<u64>,
     wake: Arc<dyn StatusIntakeWake>,
+    worker_closed: Option<Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>>,
 }
 
 impl fmt::Debug for NativeAbortEffectAdapter {
@@ -72,14 +73,36 @@ impl NativeAbortEffectAdapter {
         capacity: NonZeroUsize,
         wake: Arc<dyn StatusIntakeWake>,
     ) -> (Arc<Self>, NativeAbortEffectIntake) {
-        let (effects, receiver) = mpsc::channel(capacity.get());
         let (capacity_epoch, _) = watch::channel(0);
+        Self::bounded_with_capacity_epoch(capacity, wake, capacity_epoch)
+    }
+
+    /// Builds one attempt-local intake while publishing capacity changes on
+    /// its logical execution's shared Abort port.
+    pub(crate) fn bounded_with_capacity_epoch(
+        capacity: NonZeroUsize,
+        wake: Arc<dyn StatusIntakeWake>,
+        capacity_epoch: watch::Sender<u64>,
+    ) -> (Arc<Self>, NativeAbortEffectIntake) {
+        Self::bounded_with_observer(capacity, wake, capacity_epoch, None)
+    }
+
+    pub(crate) fn bounded_with_observer(
+        capacity: NonZeroUsize,
+        wake: Arc<dyn StatusIntakeWake>,
+        capacity_epoch: watch::Sender<u64>,
+        worker_closed: Option<
+            Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>,
+        >,
+    ) -> (Arc<Self>, NativeAbortEffectIntake) {
+        let (effects, receiver) = mpsc::channel(capacity.get());
         let submission_order = Arc::new(Mutex::new(VecDeque::with_capacity(capacity.get())));
         let adapter = Arc::new(Self {
             effects: Some(effects),
             submission_order: Arc::clone(&submission_order),
             capacity_epoch: capacity_epoch.clone(),
             wake,
+            worker_closed,
         });
         let intake = NativeAbortEffectIntake {
             receiver,
@@ -110,6 +133,7 @@ impl AbortQueryContextEffectPort for NativeAbortEffectAdapter {
                     submission_order: Arc::clone(&self.submission_order),
                     capacity_epoch: self.capacity_epoch.clone(),
                     wake: Arc::clone(&self.wake),
+                    worker_closed: self.worker_closed.clone(),
                 }))
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -209,13 +233,22 @@ impl NativeAbortEffectIntake {
     }
 }
 
-#[derive(Debug)]
 struct NativeAbortEffectReservation {
     identity: AbortQueryContextIssueIdentity,
     permit: Option<mpsc::OwnedPermit<NativeAbortEffect>>,
     submission_order: Arc<Mutex<VecDeque<OperationIntent>>>,
     capacity_epoch: watch::Sender<u64>,
     wake: Arc<dyn StatusIntakeWake>,
+    worker_closed: Option<Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>>,
+}
+
+impl fmt::Debug for NativeAbortEffectReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeAbortEffectReservation")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AbortQueryContextEffectReservation for NativeAbortEffectReservation {
@@ -234,6 +267,7 @@ impl AbortQueryContextEffectReservation for NativeAbortEffectReservation {
         let effect = NativeAbortEffect {
             intent: OperationIntent::AbortQueryContext(request),
             submission: Some(submission),
+            worker_closed: self.worker_closed.clone(),
         };
         let mut order = self
             .submission_order
@@ -287,11 +321,20 @@ fn publish_capacity(capacity_epoch: &watch::Sender<u64>) {
 }
 
 /// One exact Native Abort intent bound to its actor settlement authority.
-#[derive(Debug)]
 #[must_use = "a Native Abort effect must enter lifecycle dispatch or retain its settlement"]
 pub(crate) struct NativeAbortEffect {
     intent: OperationIntent,
     submission: Option<AbortQueryContextEffectSubmission>,
+    worker_closed: Option<Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>>,
+}
+
+impl fmt::Debug for NativeAbortEffect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeAbortEffect")
+            .field("intent", &self.intent)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for NativeAbortEffect {
@@ -378,7 +421,7 @@ impl NativeAbortEffect {
                     .transport_unknown()
                     .map_err(NativeAbortEffectSettleError::Application)?;
                 Ok(NativeAbortEffectSettlement::TransportUnknown(
-                    NativeLateAbortEffect::new(late),
+                    NativeLateAbortEffect::new(late, self.worker_closed.clone()),
                 ))
             }
             OperationDispatchResult::WorkerReceipt(_) => {
@@ -393,6 +436,9 @@ impl NativeAbortEffect {
                     .expect("a live Native Abort retains actor settlement authority")
                     .worker_settled(receipt)
                     .map_err(NativeAbortEffectSettleError::Application)?;
+                if let Some(observer) = &self.worker_closed {
+                    observer(expected_context);
+                }
                 Ok(NativeAbortEffectSettlement::WorkerSettled)
             }
         }
@@ -443,15 +489,30 @@ pub(crate) fn settle_late_abort_receipt(
 
 /// Frontend ownership of a transport-unknown generation's late settlement.
 /// Dropping it is an explicit local failure, never another unknown outcome.
-#[derive(Debug)]
 pub(crate) struct NativeLateAbortEffect {
     settlement: Option<LateAbortQueryContextWorkerSettlement>,
+    worker_closed: Option<Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>>,
+}
+
+impl fmt::Debug for NativeLateAbortEffect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeLateAbortEffect")
+            .field("identity", &self.identity())
+            .finish_non_exhaustive()
+    }
 }
 
 impl NativeLateAbortEffect {
-    fn new(settlement: LateAbortQueryContextWorkerSettlement) -> Self {
+    fn new(
+        settlement: LateAbortQueryContextWorkerSettlement,
+        worker_closed: Option<
+            Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>,
+        >,
+    ) -> Self {
         Self {
             settlement: Some(settlement),
+            worker_closed,
         }
     }
 
@@ -463,10 +524,15 @@ impl NativeLateAbortEffect {
     }
 
     fn worker_settled(mut self, receipt: QueryContextReceipt) -> Result<(), ContextStandDownError> {
+        let context = self.identity().context();
         self.settlement
             .take()
             .expect("a live late Abort owner retains its settlement")
-            .worker_settled(receipt)
+            .worker_settled(receipt)?;
+        if let Some(observer) = &self.worker_closed {
+            observer(context);
+        }
+        Ok(())
     }
 
     pub(crate) fn fail_closed(mut self) -> Result<(), ContextStandDownError> {

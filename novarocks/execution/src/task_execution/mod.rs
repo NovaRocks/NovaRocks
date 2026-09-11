@@ -29,7 +29,7 @@
 //! their own runtime state machines built on top of them; only immutable
 //! values, this module's pure validation, and the central codec are shared
 //! across the process boundary.
-// Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
+// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
 pub mod descriptor {
     pub use novarocks_execution_contract::descriptor::*;

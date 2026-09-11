@@ -58,8 +58,7 @@ use super::{
     ReplacementQualificationFailure, ReplacementQualificationIdentity,
     ReplacementQualificationRequest, ReplacementQualificationSettlement,
     ReplacementWorkerAdmissionEvidence, ResultPacket, SchemaDeliveryPermit, StatusObservation,
-    SuccessEndOfStreamPermit, classify_observation, classify_observed_task_transition,
-    receipt_channel,
+    classify_observation, classify_observed_task_transition, receipt_channel,
 };
 
 /// Immutable identity of one actor-owned attempt activation generation.
@@ -765,9 +764,8 @@ fn retired_obligation_key(identity: ReplacementQualificationIdentity) -> Obligat
 
 /// Honest construction inputs for the currently connected actor slice.
 ///
-/// T08 first connects a single, completion-only attempt. Recovery and result
-/// delivery remain reducer capabilities until their actor-owned effect gates
-/// are connected; callers cannot select those modes prematurely.
+/// Recovery, result delivery, and attempt effects are selected together so
+/// callers cannot assemble a mode that lacks its actor-owned effect gates.
 pub struct LogicalExecutionActorConfig {
     initial_execution: QueryExecutionId,
     recovery_mode: RecoveryMode,
@@ -1317,10 +1315,7 @@ enum InFlightResult {
         reply: ActorReply<()>,
     },
     End {
-        permit: SuccessEndOfStreamPermit,
         receipt: ResultDeliveryReceipt,
-        lifetime: Arc<PermitLifetime>,
-        reply: ActorReply<LogicalConclusion>,
     },
 }
 
@@ -2214,7 +2209,12 @@ async fn run_actor(
             clock.as_ref(),
         );
         release_concluded_actor_resources(state, &mut execution_stage, replacement.as_mut());
-        if state.conclusion().is_some() {
+        let committed_end_awaiting_transport = state.conclusion()
+            == Some(LogicalConclusion::Succeeded)
+            && result_runtime.as_ref().is_some_and(|runtime| {
+                matches!(runtime.in_flight, Some(InFlightResult::End { .. }))
+            });
+        if state.conclusion().is_some() && !committed_end_awaiting_transport {
             fail_result_runtime(state, result_runtime.as_mut());
         } else if drive_root_success(state, result_runtime.as_mut()).is_err() {
             conclude_failed(state);
@@ -3237,6 +3237,15 @@ fn apply_result_capacity(
                     return;
                 }
             };
+            // Commit logical success before the End token becomes observable.
+            // Once a protocol/application consumer can see this token, a
+            // later root or cancellation observation cannot safely revoke
+            // success. The token disposition settles only result transport.
+            if state.complete_success_end_of_stream(permit).is_err() {
+                drop(slot);
+                conclude_consumed_handoff_as_failed(state, pending.permit, pending.reply);
+                return;
+            }
             let (delivery, receipt) =
                 EndDelivery::success_eof(activation.execution(), pending.sequence);
             runtime
@@ -3244,12 +3253,9 @@ fn apply_result_capacity(
                 .enqueue(slot, ResultDelivery::End(delivery));
             let (_capability, lifetime, mailbox_liveness) = pending.permit.into_parts();
             drop(mailbox_liveness);
-            runtime.in_flight = Some(InFlightResult::End {
-                permit,
-                receipt,
-                lifetime,
-                reply: pending.reply,
-            });
+            lifetime.settle();
+            let _ = pending.reply.send(Ok(LogicalConclusion::Succeeded));
+            runtime.in_flight = Some(InFlightResult::End { receipt });
         }
     }
 }
@@ -3307,28 +3313,11 @@ fn apply_result_receipt(
                 reply_result_failure(state, reply);
             }
         }
-        InFlightResult::End {
-            permit,
-            lifetime,
-            reply,
-            ..
-        } => {
-            if completed {
-                match state.complete_success_end_of_stream(permit) {
-                    Ok(_) => {
-                        lifetime.settle();
-                        let _ = reply.send(Ok(LogicalConclusion::Succeeded));
-                    }
-                    Err(_) => {
-                        conclude_failed(state);
-                        reply_fixed_handoff_conclusion(state, &lifetime, reply);
-                    }
-                }
-            } else {
-                let _ = state.fail_success_end_of_stream(permit);
-                conclude_failed(state);
-                reply_fixed_handoff_conclusion(state, &lifetime, reply);
-            }
+        InFlightResult::End { .. } => {
+            // The actor authorized and committed logical success before this
+            // End token entered the consumer queue. Completion or failure here
+            // belongs to the transport/protocol owner and cannot revoke it.
+            let _ = completed;
         }
     }
 }
@@ -3400,11 +3389,7 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
         InFlightResult::Batch { reply, .. } => {
             reply_result_failure(state, reply);
         }
-        InFlightResult::End {
-            lifetime, reply, ..
-        } => {
-            reply_fixed_handoff_conclusion(state, &lifetime, reply);
-        }
+        InFlightResult::End { .. } => {}
     }
 }
 
@@ -3452,23 +3437,7 @@ fn conclude_or_interrupt_success(
     runtime: Option<&mut ResultRuntime>,
     conclusion: LogicalConclusion,
 ) {
-    if matches!(state.phase(), ExecutionPhase::FinishingSuccess { .. }) {
-        let Some(runtime) = runtime else {
-            return;
-        };
-        let Some(InFlightResult::End {
-            permit,
-            lifetime,
-            reply,
-            ..
-        }) = runtime.in_flight.take()
-        else {
-            return;
-        };
-        let _ = state.conclude_success_end_of_stream(permit, conclusion);
-        reply_fixed_handoff_conclusion(state, &lifetime, reply);
-        return;
-    }
+    let _ = runtime;
     conclude_with(state, replacement, conclusion);
 }
 
@@ -4592,21 +4561,10 @@ fn verify_result_observation_activation(
 }
 
 fn fail_result_observation(state: &mut LogicalExecutionState, runtime: &mut ResultRuntime) {
-    if !matches!(state.phase(), ExecutionPhase::FinishingSuccess { .. }) {
+    let _ = runtime;
+    if state.conclusion().is_none() {
         conclude_failed(state);
-        return;
     }
-    let Some(InFlightResult::End {
-        permit,
-        lifetime,
-        reply,
-        ..
-    }) = runtime.in_flight.take()
-    else {
-        return;
-    };
-    let _ = state.fail_success_end_of_stream(permit);
-    reply_fixed_handoff_conclusion(state, &lifetime, reply);
 }
 
 fn settle_terminal(
@@ -4692,22 +4650,6 @@ fn reply_consumed_handoff_actual(
         Ok(conclusion)
     };
     let _ = reply.send(response);
-}
-
-fn reply_fixed_handoff_conclusion(
-    state: &LogicalExecutionState,
-    lifetime: &Arc<PermitLifetime>,
-    reply: ActorReply<LogicalConclusion>,
-) {
-    let Some(conclusion) = state.conclusion() else {
-        lifetime.abandon();
-        let _ = reply.send(Err(LogicalExecutionActorError::InvariantViolation));
-        return;
-    };
-    lifetime.settle();
-    let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
-        conclusion,
-    )));
 }
 
 fn reply_result_failure(state: &LogicalExecutionState, reply: ActorReply<()>) {
@@ -7729,7 +7671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_holds_batch_ack_and_logical_success_until_writer_receipts() {
+    async fn actor_commits_logical_success_before_end_transport_receipt() {
         let runtime = Handle::current();
         let first = execution(103);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
@@ -7784,13 +7726,15 @@ mod tests {
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
             panic!("actor must enqueue success EOF");
         };
-        assert!(!finish_task.is_finished());
-        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
-        end.complete();
         assert_eq!(
             finish_task.await.unwrap().unwrap(),
             LogicalConclusion::Succeeded
         );
+        assert_eq!(
+            actor.snapshot().await.unwrap().conclusion,
+            Some(LogicalConclusion::Succeeded)
+        );
+        end.complete();
         wait_for_conclusion(&actor, LogicalConclusion::Succeeded).await;
         credit_owner.complete();
         drop(control);
@@ -8306,12 +8250,15 @@ mod tests {
         };
         assert_eq!(end.execution_id(), second);
         assert_eq!(end.sequence(), ResultPacketSequence::new(0));
-        assert!(!finish_task.is_finished());
-        end.complete();
         assert_eq!(
             finish_task.await.unwrap().unwrap(),
             LogicalConclusion::Succeeded
         );
+        assert_eq!(
+            actor.snapshot().await.unwrap().conclusion,
+            Some(LogicalConclusion::Succeeded)
+        );
+        end.complete();
         assert!(stream.begin_schema().is_none());
         wait_for_conclusion(&actor, LogicalConclusion::Succeeded).await;
         drop(stream);
@@ -8608,7 +8555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_failure_command_beats_ready_eof_receipt_in_the_same_tick() {
+    async fn committed_end_authorization_beats_a_late_root_failure_in_the_same_tick() {
         let runtime = Handle::current();
         let first = execution(117);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
@@ -8652,20 +8599,20 @@ mod tests {
 
         assert_eq!(
             response.await.unwrap().unwrap_err(),
-            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Succeeded)
         );
-        assert!(matches!(
-            finish_task.await.unwrap().unwrap_err(),
-            RunningAttemptHandoffError::ExecutionConcluded(LogicalConclusion::Failed)
-        ));
-        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        assert_eq!(
+            finish_task.await.unwrap().unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        wait_for_conclusion(&actor, LogicalConclusion::Succeeded).await;
         drop(stream);
         drop(actor);
         drop(owner);
     }
 
     #[tokio::test]
-    async fn eof_writer_failure_fails_the_logical_execution() {
+    async fn eof_writer_failure_cannot_revoke_committed_logical_success() {
         let runtime = Handle::current();
         let first = execution(118);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
@@ -8698,18 +8645,18 @@ mod tests {
             "protocol writer failed to encode EOF",
         ));
 
-        assert!(matches!(
-            finish_task.await.unwrap().unwrap_err(),
-            RunningAttemptHandoffError::ExecutionConcluded(LogicalConclusion::Failed)
-        ));
-        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        assert_eq!(
+            finish_task.await.unwrap().unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        wait_for_conclusion(&actor, LogicalConclusion::Succeeded).await;
         drop(stream);
         drop(actor);
         drop(owner);
     }
 
     #[tokio::test]
-    async fn cancellation_before_eof_acceptance_consumes_provisional_success() {
+    async fn cancellation_after_end_authorization_cannot_revoke_logical_success() {
         let runtime = Handle::current();
         let first = execution(119);
         let (parent, work_owner, stage) = test_governed_child_work(None);
@@ -8748,21 +8695,79 @@ mod tests {
             .unwrap();
         let finish_task = tokio::spawn(async move { running.finish_result_stream().await });
         let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
-            panic!("actor must enqueue provisional success EOF");
+            panic!("actor must enqueue committed success EOF");
         };
 
         parent.cancel(CancellationReason::Requested);
-        assert!(matches!(
-            finish_task.await.unwrap().unwrap_err(),
-            RunningAttemptHandoffError::ExecutionConcluded(LogicalConclusion::Cancelled)
-        ));
-        wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
+        assert_eq!(
+            finish_task.await.unwrap().unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        wait_for_conclusion(&actor, LogicalConclusion::Succeeded).await;
         drop(end);
         drop(observer);
         drop(stream);
         drop(actor);
         drop(owner);
         drop(parent);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_end_authorization_prevents_success_visibility() {
+        let runtime = Handle::current();
+        let first = execution(1191);
+        let (parent, work_owner, stage) = test_governed_child_work(None);
+        let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            first,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            Arc::new(DelayedQualificationPort::default()),
+            work_owner,
+            stage,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let root = root_task(first, 121);
+        let observer = running.bind_root_result(root).await.unwrap();
+        observer
+            .observe_status(root_status(root, 1, TaskState::Finished))
+            .await
+            .unwrap();
+        observer
+            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .await
+            .unwrap();
+        let finish_task = tokio::spawn(async move { running.finish_result_stream().await });
+
+        parent.cancel(CancellationReason::Requested);
+        let error = match stream.next().await {
+            Err(error) => error,
+            Ok(_) => panic!("prior cancellation must prevent success EOF visibility"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+        assert!(matches!(
+            finish_task.await.unwrap().unwrap_err(),
+            RunningAttemptHandoffError::ExecutionConcluded(LogicalConclusion::Cancelled)
+        ));
+        wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
+        drop(observer);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+        parent.complete();
     }
 
     #[tokio::test]

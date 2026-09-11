@@ -17,7 +17,7 @@
 
 #![allow(
     dead_code,
-    reason = "T08 keeps delivery permits private until the production actor cutover"
+    reason = "delivery phase helpers remain private to the actor-owned result path"
 )]
 
 use novarocks_types::identity::QueryExecutionId;

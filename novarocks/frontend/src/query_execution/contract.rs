@@ -406,6 +406,7 @@ pub(crate) fn build_request_from_finalized_execution(
         ));
     }
     let (description, attempt_template) = finalized.into_parts();
+    let description = Arc::new(description);
     let options = Arc::new(ResolvedQueryOptions::from_upstream(options));
     let restartable_read = matches!(
         intent,

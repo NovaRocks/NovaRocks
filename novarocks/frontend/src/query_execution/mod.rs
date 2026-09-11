@@ -19,6 +19,7 @@ pub mod artifact;
 /// Carrier-neutral payload validation and patch helpers consumed by the
 /// Frontend-owned native submission mapper.
 pub mod assembly;
+pub(crate) mod attempt_initialization;
 pub mod backend_command;
 pub mod completion;
 // MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
@@ -36,6 +37,7 @@ pub mod distributed_rewrite;
 pub mod dml;
 pub mod kernels;
 pub mod lifecycle_plan;
+pub(crate) mod logical_read;
 pub mod maintenance;
 pub mod mv_assembly;
 pub mod mv_native_write;
@@ -48,7 +50,7 @@ pub(crate) mod rewrite_group_read;
 pub use crate::runtime::statement_result::StatementResult;
 pub use completion::{
     PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,
-    PreparedQueryCompletion, PreparedQueryOperation,
+    PreparedLogicalRead, PreparedQueryCompletion, PreparedQueryOperation,
 };
 pub use outcome::WriteExecutionOutcome;
 /// Sealed preparation carriers consumed by the native Frontend encoder.
@@ -82,6 +84,7 @@ pub mod service;
     reason = "Consumed by the frontend typed-scan lowering in the same PR."
 )]
 pub(crate) mod split_assignment;
+pub(crate) mod split_assignment_round;
 pub mod statistics;
 pub(crate) mod write_barrier;
 pub(crate) mod write_result;

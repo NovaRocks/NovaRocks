@@ -616,15 +616,23 @@ async fn cloned_cancellation_requester_is_first_wins_and_downward_only() {
     let sibling = child(&parent.owner.scope());
     let requester = target.cancellation_requester();
 
-    requester
-        .request(CancellationReason::ExplicitKill {
+    assert_eq!(
+        requester
+            .request_with_outcome(CancellationReason::ExplicitKill {
+                requester_connection_id: 41,
+            })
+            .unwrap(),
+        WorkCancellationRequestOutcome::Requested
+    );
+    assert_eq!(
+        requester
+            .clone()
+            .request_with_outcome(CancellationReason::ServerShutdown)
+            .unwrap(),
+        WorkCancellationRequestOutcome::AlreadyRequested(CancellationReason::ExplicitKill {
             requester_connection_id: 41,
         })
-        .unwrap();
-    requester
-        .clone()
-        .request(CancellationReason::ServerShutdown)
-        .unwrap();
+    );
 
     let expected = CancellationReason::ExplicitKill {
         requester_connection_id: 41,
@@ -643,6 +651,100 @@ async fn cloned_cancellation_requester_is_first_wins_and_downward_only() {
     let permit = control.next_control().unwrap();
     assert_eq!(permit.scope().id(), target.scope().id());
     assert!(permit.intents().contains(ControlIntent::Cancel));
+}
+
+#[test]
+fn success_seal_and_cancellation_share_one_first_wins_authority() {
+    let control = control();
+    let sealed = root(&control, WorkClass::Query);
+    let sealer = sealed.owner.success_sealer();
+    let requester = sealed.owner.cancellation_requester();
+
+    assert_eq!(sealer.seal().unwrap(), WorkSuccessSealOutcome::Sealed);
+    assert_eq!(
+        requester
+            .request_with_outcome(CancellationReason::ServerShutdown)
+            .unwrap(),
+        WorkCancellationRequestOutcome::SuccessSealed
+    );
+    assert_eq!(sealed.owner.scope().cancellation().unwrap().reason(), None);
+
+    let cancelled = root(&control, WorkClass::Query);
+    let sealer = cancelled.owner.success_sealer();
+    assert_eq!(
+        cancelled
+            .owner
+            .cancellation_requester()
+            .request_with_outcome(CancellationReason::ExplicitKill {
+                requester_connection_id: 9,
+            })
+            .unwrap(),
+        WorkCancellationRequestOutcome::Requested
+    );
+    assert_eq!(
+        sealer.seal().unwrap(),
+        WorkSuccessSealOutcome::Cancelled(CancellationReason::ExplicitKill {
+            requester_connection_id: 9,
+        })
+    );
+}
+
+#[test]
+fn success_seal_and_direct_request_are_linearizable_under_race() {
+    for _ in 0..64 {
+        let control = control();
+        let work = root(&control, WorkClass::Query);
+        let sealer = work.owner.success_sealer();
+        let requester = work.owner.cancellation_requester();
+        let barrier = Barrier::new(3);
+        let (seal, cancel) = std::thread::scope(|threads| {
+            let seal = threads.spawn(|| {
+                barrier.wait();
+                sealer.seal().unwrap()
+            });
+            let cancel = threads.spawn(|| {
+                barrier.wait();
+                requester
+                    .request_with_outcome(CancellationReason::ServerShutdown)
+                    .unwrap()
+            });
+            barrier.wait();
+            (seal.join().unwrap(), cancel.join().unwrap())
+        });
+        match (seal, cancel) {
+            (WorkSuccessSealOutcome::Sealed, WorkCancellationRequestOutcome::SuccessSealed) => {
+                assert_eq!(work.owner.scope().cancellation().unwrap().reason(), None);
+            }
+            (
+                WorkSuccessSealOutcome::Cancelled(CancellationReason::ServerShutdown),
+                WorkCancellationRequestOutcome::Requested,
+            ) => {
+                assert_eq!(
+                    work.owner.scope().cancellation().unwrap().reason(),
+                    Some(CancellationReason::ServerShutdown)
+                );
+            }
+            other => panic!("non-linearizable seal/request outcome: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn expired_deadline_wins_before_success_seal() {
+    let control = control();
+    let mut request = WorkRequest::new(WorkClass::Query);
+    request.deadline = Some(Instant::now() + Duration::from_millis(1));
+    let work = control.try_begin_root(request).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+
+    assert_eq!(
+        work.owner.success_sealer().seal().unwrap(),
+        WorkSuccessSealOutcome::Cancelled(CancellationReason::DeadlineExceeded)
+    );
+    assert_eq!(
+        work.owner.scope().cancellation().unwrap().reason(),
+        Some(CancellationReason::DeadlineExceeded)
+    );
 }
 
 #[test]

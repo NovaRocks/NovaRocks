@@ -28,6 +28,8 @@ struct QueryCancellationState {
 /// The actor that first requested cancellation for a statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryCancellationReason {
+    ExecutionCancellationRequested,
+    ExecutionOwnerDropped,
     ExplicitKill {
         requester_connection_id: u32,
     },
@@ -66,7 +68,7 @@ impl QueryCancellationSource {
 
     pub fn view(&self) -> QueryCancellationView {
         QueryCancellationView {
-            state: Arc::clone(&self.state),
+            inner: QueryCancellationViewInner::Legacy(Arc::clone(&self.state)),
         }
     }
 
@@ -95,29 +97,97 @@ impl QueryCancellationSource {
 /// it. Those consumers leave with CLS-R5 and CLS-R4 respectively.
 #[derive(Clone)]
 pub struct QueryCancellationView {
-    state: Arc<QueryCancellationState>,
+    inner: QueryCancellationViewInner,
+}
+
+#[derive(Clone)]
+enum QueryCancellationViewInner {
+    Legacy(Arc<QueryCancellationState>),
+    Governed {
+        view: novarocks_workload_control::CancellationView,
+        timeout_ms: Option<u64>,
+    },
 }
 
 impl QueryCancellationView {
+    pub(crate) fn governed(
+        view: novarocks_workload_control::CancellationView,
+        timeout_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            inner: QueryCancellationViewInner::Governed { view, timeout_ms },
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
-        self.state.reason.get().is_some()
+        self.reason().is_some()
     }
 
     pub fn reason(&self) -> Option<QueryCancellationReason> {
-        self.state.reason.get().cloned()
+        match &self.inner {
+            QueryCancellationViewInner::Legacy(state) => state.reason.get().cloned(),
+            QueryCancellationViewInner::Governed { view, timeout_ms } => view
+                .reason()
+                .map(|reason| governed_reason(reason, *timeout_ms)),
+        }
     }
 
     /// Wait for the first cancellation without losing a transition that races
     /// subscription setup.
     pub async fn cancelled(&self) -> QueryCancellationReason {
-        loop {
-            let changed = self.state.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if let Some(reason) = self.reason() {
-                return reason;
+        match &self.inner {
+            QueryCancellationViewInner::Legacy(state) => loop {
+                let changed = state.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if let Some(reason) = state.reason.get().cloned() {
+                    return reason;
+                }
+                changed.await;
+            },
+            QueryCancellationViewInner::Governed { view, timeout_ms } => {
+                governed_reason(view.cancelled().await, *timeout_ms)
             }
-            changed.await;
+        }
+    }
+}
+
+fn governed_reason(
+    reason: novarocks_workload_control::CancellationReason,
+    timeout_ms: Option<u64>,
+) -> QueryCancellationReason {
+    match reason {
+        novarocks_workload_control::CancellationReason::ExplicitKill {
+            requester_connection_id,
+        } => QueryCancellationReason::ExplicitKill {
+            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
+        },
+        novarocks_workload_control::CancellationReason::ExplicitKillConnection {
+            requester_connection_id,
+        } => QueryCancellationReason::ExplicitKillConnection {
+            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
+        },
+        novarocks_workload_control::CancellationReason::ClientDisconnected => {
+            QueryCancellationReason::ClientDisconnected
+        }
+        novarocks_workload_control::CancellationReason::DeadlineExceeded => {
+            QueryCancellationReason::DeadlineExceeded {
+                timeout_ms: timeout_ms.unwrap_or(0),
+            }
+        }
+        novarocks_workload_control::CancellationReason::FrontendDrainDeadlineExceeded => {
+            QueryCancellationReason::FrontendDrainDeadlineExceeded {
+                timeout_ms: timeout_ms.unwrap_or(0),
+            }
+        }
+        novarocks_workload_control::CancellationReason::ServerShutdown => {
+            QueryCancellationReason::ServerShutdown
+        }
+        novarocks_workload_control::CancellationReason::Requested => {
+            QueryCancellationReason::ExecutionCancellationRequested
+        }
+        novarocks_workload_control::CancellationReason::OwnerDropped => {
+            QueryCancellationReason::ExecutionOwnerDropped
         }
     }
 }

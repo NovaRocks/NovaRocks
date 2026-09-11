@@ -1,5 +1,5 @@
 ---
-id: ADR-0141
+id: ADR-0143
 title: "StateStore answers only about attempts its own instance issued"
 domain: [provider-spi, frontend-durable-records]
 status: active

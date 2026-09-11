@@ -27,6 +27,7 @@ use novarocks_query_application::api::{
 use novarocks_query_application::coordination::DispatchBudget;
 use novarocks_query_application::coordination::{
     AcceptedRootStatusSource, AttemptFailureClass, NativeAttemptDrive,
+    ReplacementWorkerAdmissionEvidence,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_workload_control::{CancellationReason, CancellationView};
@@ -50,6 +51,10 @@ use crate::native::task_transport::{
     AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskStatusSubscriber,
 };
 use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmission};
+use crate::query_execution::split_assignment::TaskUpdateTransport;
+use crate::query_execution::split_assignment_round::{
+    RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
+};
 
 const STATUS_INTAKE_CAPACITY: usize = 4096;
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
@@ -102,6 +107,7 @@ pub(crate) fn assemble_manifest_round(
     manifest: &TaskManifestBinding,
     submissions: Vec<ValidatedNativeSubmission>,
     establish: AttemptEstablishFacts,
+    replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
     transport: ManifestAttemptTransport,
 ) -> Result<ManifestAssembledRound, TaskExecutionError> {
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -168,7 +174,7 @@ pub(crate) fn assemble_manifest_round(
         )
         .map_err(TaskExecutionError::Schedule)?,
     );
-    let execution = QueryTaskExecution::new(
+    let mut execution = QueryTaskExecution::new(
         graph,
         transport.dispatch_budget,
         transport.transport_budget,
@@ -178,6 +184,9 @@ pub(crate) fn assemble_manifest_round(
         sink,
         intake,
     )?;
+    if let Some(admissions) = replacement_admissions {
+        execution.adopt_replacement_admissions(admissions)?;
+    }
     let round = TaskRound::new(
         execution,
         acks,
@@ -201,6 +210,26 @@ pub(crate) fn assemble_manifest_round(
 }
 
 impl ManifestAssembledRound {
+    pub(crate) fn install_split_assignment(
+        &mut self,
+        execution: novarocks_types::QueryExecutionId,
+        plan: RoundSplitAssignmentPlan,
+        data_runtime: FrontendDataRuntime,
+    ) -> Option<SplitAssignmentRoundGuard> {
+        SplitAssignmentRoundGuard::install(
+            &mut self.round,
+            execution,
+            plan,
+            Arc::clone(&self.split_delivery) as Arc<dyn TaskUpdateTransport>,
+            data_runtime,
+            Arc::new(NotifyWake::new(Arc::clone(&self.notify))) as Arc<dyn StatusIntakeWake>,
+        )
+    }
+
+    pub(crate) fn abort_wake(&self) -> Arc<dyn StatusIntakeWake> {
+        Arc::new(NotifyWake::new(Arc::clone(&self.notify)))
+    }
+
     /// Installs the actor's one bounded Abort-effect intake before the attempt
     /// starts. The intake is part of C3's manifest-validated runtime resource
     /// projection; this owner never constructs a second actor port.

@@ -32,7 +32,7 @@
 //!
 //! Nothing in this module is routed into production yet. The existing
 //! coordinator keeps owning distributed query execution untouched.
-// Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
+// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
 pub(crate) mod abort_effect;
 pub(crate) mod actor_gate;

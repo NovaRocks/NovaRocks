@@ -284,6 +284,10 @@ impl PreparedRetriableDistributedRequest {
 )]
 pub enum PreparedQueryOperation {
     Immediate(PreparedImmediateQuery),
+    /// Plain read query owned by Query Application. The carrier retains the
+    /// frozen logical description and the reusable Native attempt template;
+    /// it cannot be downgraded to one legacy coordinator round.
+    LogicalRead(PreparedLogicalRead),
     Distributed(PreparedDistributedQuery),
 }
 
@@ -299,6 +303,41 @@ impl PreparedQueryOperation {
         Ok(Self::immediate(StatementResult::Query(
             build_string_query_result("Explain String", lines)?,
         )))
+    }
+}
+
+/// Move-only plain SELECT handoff into the Query Application runtime.
+///
+/// The three fields originate in one semantic/native finalization. Keeping
+/// them private prevents callers from pairing an immutable description with a
+/// different attempt template or resolved option set.
+pub struct PreparedLogicalRead {
+    description: novarocks_query_application::preparation::FrozenExecutionDescription,
+    attempt_template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
+    options: Arc<crate::query_execution::contract::ResolvedQueryOptions>,
+}
+
+impl PreparedLogicalRead {
+    pub(super) fn new(
+        description: novarocks_query_application::preparation::FrozenExecutionDescription,
+        attempt_template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
+        options: Arc<crate::query_execution::contract::ResolvedQueryOptions>,
+    ) -> Self {
+        Self {
+            description,
+            attempt_template,
+            options,
+        }
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        novarocks_query_application::preparation::FrozenExecutionDescription,
+        crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
+        Arc<crate::query_execution::contract::ResolvedQueryOptions>,
+    ) {
+        (self.description, self.attempt_template, self.options)
     }
 }
 

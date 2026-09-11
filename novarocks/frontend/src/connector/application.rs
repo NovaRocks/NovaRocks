@@ -155,7 +155,7 @@ impl ConnectorResourceLedger for FrontendConnectorResourceLedger {
     }
 }
 
-fn install_frontend_connector_resources(
+pub(crate) fn install_frontend_connector_resources(
     context: ConnectorRequestContext,
 ) -> ConnectorRequestContext {
     context.with_resources(ConnectorRequestResources::new(Arc::new(

@@ -65,8 +65,12 @@ use crate::mv::{
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::FrontendNativeTransport;
 use crate::query_control::FrontendQueryControl;
+use crate::query_execution::logical_read::LogicalReadLauncher;
 use crate::query_execution::maintenance::TableMaintenanceService;
-use crate::query_execution::native_execution_adapter::FrontendLogicalExecutionNativePort;
+use crate::query_execution::native_execution_adapter::{
+    FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionRuntime,
+    FrontendNativeLogicalReadLauncher,
+};
 use crate::statistics::FrontendStatisticsService;
 use crate::statistics_jobs::service::{
     FrontendStatisticsApplicationPort, StatisticsApplicationService,
@@ -91,9 +95,101 @@ const DEFAULT_LOGICAL_EXECUTION_START_CAPACITY: NonZeroUsize = NonZeroUsize::new
 const DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(16).unwrap();
+const DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 const TEST_WORKLOAD_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const TEST_WORKLOAD_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
 const TEST_WORKLOAD_PER_SCOPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Frontend-owned startup configuration for the Native Task transport.
+///
+/// Server composition supplies primitive deployment limits through this
+/// application boundary. The Frontend alone materializes the private wire
+/// codec budget consumed by its Native adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontendTaskTransportBudget(TransportBudget);
+
+impl FrontendTaskTransportBudget {
+    pub const DEFAULT: Self = Self(TransportBudget::DEFAULT);
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each deployment limit is independently configurable"
+    )]
+    pub fn try_new(
+        max_batch_items: usize,
+        max_batch_encoded_bytes: usize,
+        max_descriptor_encoded_bytes: usize,
+        max_query_backend_queued_operations: usize,
+        max_query_backend_queued_bytes: usize,
+        max_backend_queued_operations: usize,
+        max_backend_queued_bytes: usize,
+        max_tasks_per_context: usize,
+        max_active_tasks_per_backend: usize,
+        frontend_queue_residence: Duration,
+    ) -> Option<Self> {
+        TransportBudget::new(
+            max_batch_items,
+            max_batch_encoded_bytes,
+            max_descriptor_encoded_bytes,
+            max_query_backend_queued_operations,
+            max_query_backend_queued_bytes,
+            max_backend_queued_operations,
+            max_backend_queued_bytes,
+            max_tasks_per_context,
+            max_active_tasks_per_backend,
+            frontend_queue_residence,
+        )
+        .map(Self)
+    }
+
+    pub const fn max_batch_items(self) -> usize {
+        self.0.max_batch_items()
+    }
+
+    pub const fn max_batch_encoded_bytes(self) -> usize {
+        self.0.max_batch_encoded_bytes()
+    }
+
+    pub const fn max_descriptor_encoded_bytes(self) -> usize {
+        self.0.max_descriptor_encoded_bytes()
+    }
+
+    pub const fn max_query_backend_queued_operations(self) -> usize {
+        self.0.max_query_backend_queued_operations()
+    }
+
+    pub const fn max_query_backend_queued_bytes(self) -> usize {
+        self.0.max_query_backend_queued_bytes()
+    }
+
+    pub const fn max_backend_queued_operations(self) -> usize {
+        self.0.max_backend_queued_operations()
+    }
+
+    pub const fn max_backend_queued_bytes(self) -> usize {
+        self.0.max_backend_queued_bytes()
+    }
+
+    pub const fn max_tasks_per_context(self) -> usize {
+        self.0.max_tasks_per_context()
+    }
+
+    pub const fn max_active_tasks_per_backend(self) -> usize {
+        self.0.max_active_tasks_per_backend()
+    }
+
+    pub const fn frontend_queue_residence(self) -> Duration {
+        self.0.frontend_queue_residence()
+    }
+
+    const fn into_codec(self) -> TransportBudget {
+        self.0
+    }
+}
+
+/// Largest root-result payload accepted by the Frontend Native adapter.
+pub const FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES: u64 =
+    novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
 
 #[cfg(test)]
 fn test_native_trust() -> Arc<NativeTrust> {
@@ -168,12 +264,12 @@ impl fmt::Display for FrontendApplicationError {
 
 impl std::error::Error for FrontendApplicationError {}
 
-/// Unique owner aggregate for the new query-application runtime.
+/// Unique owner aggregate for the query-application runtime.
 ///
-/// The legacy SQL entrypoint is intentionally not wired to these handles until
-/// T08-C3. Keeping all process owners here still makes startup and shutdown
-/// ownership concrete: services may clone only the narrow capabilities below,
-/// never the supervisor, Registry, workload control, or decode join handles.
+/// Keeping all process owners here makes startup and shutdown ownership
+/// concrete: services may clone only the narrow capabilities below, never the
+/// supervisor, Registry, workload control, or decode join handles.
+// Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
 struct FrontendExecutionRuntimeOwner {
     supervisor: LogicalExecutionSupervisor,
     logical_execution_client: QueryExecutionClient,
@@ -417,6 +513,7 @@ pub struct FrontendApplicationHost {
     mv_background_engine_sink: Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
+    logical_read_launcher: Option<Arc<FrontendNativeLogicalReadLauncher>>,
     query_control: crate::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
@@ -457,6 +554,7 @@ pub struct FrontendLogicalExecutionRuntimeConfig {
     resources: ResourceConfig,
     decode_worker_count: NonZeroUsize,
     decode_queue_capacity: NonZeroUsize,
+    abort_effect_capacity: NonZeroUsize,
 }
 
 impl FrontendLogicalExecutionRuntimeConfig {
@@ -466,6 +564,7 @@ impl FrontendLogicalExecutionRuntimeConfig {
         resources: ResourceConfig,
         decode_worker_count: NonZeroUsize,
         decode_queue_capacity: NonZeroUsize,
+        abort_effect_capacity: NonZeroUsize,
     ) -> Self {
         Self {
             supervisor,
@@ -473,6 +572,7 @@ impl FrontendLogicalExecutionRuntimeConfig {
             resources,
             decode_worker_count,
             decode_queue_capacity,
+            abort_effect_capacity,
         }
     }
 
@@ -501,6 +601,7 @@ impl FrontendLogicalExecutionRuntimeConfig {
             },
             DEFAULT_RESULT_DECODE_WORKER_COUNT,
             DEFAULT_RESULT_DECODE_QUEUE_CAPACITY,
+            DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY,
         )
     }
 }
@@ -530,7 +631,7 @@ pub struct FrontendExecutionConfig {
     /// change while the process runs, and so an attempt never has to invent
     /// one that configuration failed to supply.
     coordination_budgets: CoordinationBudgets,
-    transport_budget: TransportBudget,
+    transport_budget: FrontendTaskTransportBudget,
     connector_blocking_io_budget: ConnectorBlockingIoBudget,
     /// Positive root-result payload credit placed on every Native fetch.
     result_fetch_byte_limit: ResultByteLimit,
@@ -540,6 +641,7 @@ pub struct FrontendExecutionConfig {
     logical_execution_supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
     workload_resources: ResourceConfig,
+    logical_abort_effect_capacity: NonZeroUsize,
     /// Connector split enumeration's bounded, server-owned initial feedback
     /// wait. This is frozen at startup and deliberately has no SQL override.
     connector_split_initial_dynamic_filter_wait_cap: Duration,
@@ -577,7 +679,7 @@ impl FrontendExecutionConfig {
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
             coordination_budgets: CoordinationBudgets::DEFAULT,
-            transport_budget: TransportBudget::DEFAULT,
+            transport_budget: FrontendTaskTransportBudget::DEFAULT,
             connector_blocking_io_budget: ConnectorBlockingIoBudget::default(),
             result_fetch_byte_limit: ResultByteLimit::new(16 * 1024 * 1024)
                 .expect("the test result fetch byte limit is nonzero"),
@@ -586,6 +688,7 @@ impl FrontendExecutionConfig {
             logical_execution_supervisor: logical_runtime.supervisor,
             workload: logical_runtime.workload,
             workload_resources: logical_runtime.resources,
+            logical_abort_effect_capacity: logical_runtime.abort_effect_capacity,
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             lake_publication_runtime_policy: LakePublicationRuntimePolicy::try_new(
@@ -653,7 +756,7 @@ impl FrontendExecutionConfig {
     pub fn with_task_execution_budgets(
         mut self,
         coordination: CoordinationBudgets,
-        transport: TransportBudget,
+        transport: FrontendTaskTransportBudget,
     ) -> Self {
         self.coordination_budgets = coordination;
         self.transport_budget = transport;
@@ -832,7 +935,7 @@ impl FrontendApplicationHost {
             data_runtime,
             native_trust,
             native_transport,
-            execution.transport_budget,
+            execution.transport_budget.into_codec(),
             execution.connector_blocking_io_budget,
         )
         .map_err(|error| {
@@ -869,6 +972,7 @@ impl FrontendApplicationHost {
             mv_background_engine_sink: None,
             state_store_host: None,
             query_execution: None,
+            logical_read_launcher: None,
             query_control: FrontendQueryControl::service(),
             coordinator: None,
             execution_runtime_owner,
@@ -1044,6 +1148,24 @@ impl FrontendApplicationHost {
                     .await);
             }
         }
+        let topology = Arc::clone(host.topology());
+        let native_runtime = FrontendNativeLogicalExecutionRuntime::new(
+            Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+            topology as crate::common::backend_topology::BackendProcessObservationService,
+            host.data_runtime.clone(),
+            host.result_decode_runtime(),
+            execution.native_compatibility_id,
+            execution.runtime_filter_worker_count,
+            execution.task_update_retry_policy,
+            execution.connector_split_initial_dynamic_filter_wait_cap,
+            execution.coordination_budgets,
+            execution.transport_budget.into_codec(),
+            execution.logical_abort_effect_capacity,
+        );
+        host.logical_read_launcher = Some(Arc::new(FrontendNativeLogicalReadLauncher::new(
+            host.logical_execution_client(),
+            native_runtime,
+        )));
         let catalog_prune = FrontendCatalogPruneService::new(
             Arc::clone(
                 host.catalog_application_port
@@ -1399,7 +1521,7 @@ impl FrontendApplicationHost {
     /// Cloneable query handle for the one process-owned result decode runtime.
     #[allow(
         dead_code,
-        reason = "The T08 coordinator cutover consumes this process-owned query handle."
+        reason = "The application host retains this narrow handle for role integration."
     )]
     pub(crate) fn result_decode_runtime(&self) -> RootResultDecodeRuntime {
         self.execution_runtime_owner.decode_runtime()
@@ -1407,15 +1529,23 @@ impl FrontendApplicationHost {
 
     #[allow(
         dead_code,
-        reason = "The T08-C3 SQL cutover consumes this bounded start handle."
+        reason = "The application host retains this bounded start handle for role integration."
     )]
     pub(crate) fn logical_execution_client(&self) -> QueryExecutionClient {
         self.execution_runtime_owner.logical_execution_client()
     }
 
+    pub(crate) fn logical_read_launcher(&self) -> Arc<dyn LogicalReadLauncher> {
+        Arc::clone(
+            self.logical_read_launcher
+                .as_ref()
+                .expect("frontend logical read launcher is installed before host open returns"),
+        ) as Arc<dyn LogicalReadLauncher>
+    }
+
     #[allow(
         dead_code,
-        reason = "The T08-C3 SQL cutover consumes this governed root admission handle."
+        reason = "Product integrations consume this governed root admission handle."
     )]
     pub(crate) fn workload_root_admission(&self) -> RootAdmissionHandle {
         self.execution_runtime_owner.root_admission()
@@ -1423,7 +1553,7 @@ impl FrontendApplicationHost {
 
     #[allow(
         dead_code,
-        reason = "Management observation is wired after the T08-C3 execution cutover."
+        reason = "Management integrations consume this read-only observation handle."
     )]
     pub(crate) fn workload_observation(&self) -> WorkloadObservationHandle {
         self.execution_runtime_owner.workload_observation()
@@ -1431,7 +1561,7 @@ impl FrontendApplicationHost {
 
     #[allow(
         dead_code,
-        reason = "The T08-C3 result path consumes this local resource authority."
+        reason = "Product integrations consume this local resource authority."
     )]
     pub(crate) fn workload_resources(&self) -> LocalResourceAuthority {
         self.execution_runtime_owner.resources()
@@ -1596,7 +1726,7 @@ impl FrontendApplicationHost {
                 execution.task_update_retry_policy,
                 execution.connector_split_initial_dynamic_filter_wait_cap,
                 execution.coordination_budgets,
-                execution.transport_budget,
+                execution.transport_budget.into_codec(),
                 execution.result_fetch_byte_limit,
                 self.backend_topology_port(),
                 self.data_runtime.clone(),

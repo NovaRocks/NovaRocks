@@ -20,13 +20,13 @@
 mod native_submission;
 #[allow(
     dead_code,
-    reason = "T08 builds the pure dormant-attempt binding before its activation adapter lands."
+    reason = "The dormant-attempt binding is consumed through the Native execution adapter."
 )]
 mod task_manifest_binding;
 
 #[allow(
     unused_imports,
-    reason = "T08 activation consumes these move-only bindings in the next owner cut."
+    reason = "These move-only bindings form the internal Native adapter contract."
 )]
 pub(crate) use task_manifest_binding::{
     BoundManifestBackend, BoundManifestContext, BoundManifestEdge, BoundManifestFrozenUnits,
@@ -387,6 +387,16 @@ impl<'a> ManifestBoundNativeAttemptActivation<'a> {
             .take()
             .expect("one manifest activation can commit only once")
     }
+
+    pub(crate) fn into_prepared_and_manifest(
+        mut self,
+    ) -> (PreparedDistributedQuery, &'a TaskManifestBinding) {
+        let prepared = self
+            .prepared
+            .take()
+            .expect("one manifest activation can project only once");
+        (prepared, &self.inputs.manifest)
+    }
 }
 
 fn validate_bound_attempt_affinity(
@@ -628,6 +638,188 @@ impl PreparedDistributedQuery {
         node_id: i32,
     ) -> Option<Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>> {
         self.attempt_access.share(fragment_id, node_id)
+    }
+
+    /// Project the exact application-owned Task manifest into the existing
+    /// Native carrier encoder input. This is a one-way representation change:
+    /// every placement, scan unit and exchange route is copied from the
+    /// manifest, and no scheduler or live topology capability is consulted.
+    pub(crate) fn native_schedule_from_manifest(
+        &self,
+        manifest: &TaskManifestBinding,
+    ) -> Result<ValidatedFragmentSchedule, DistributedQueryError> {
+        if self.handoff_id != manifest.request_bound_native().template.identity.handoff_id {
+            return Err(contract_error(
+                "Task manifest belongs to another prepared Native query",
+            ));
+        }
+
+        let mut frozen_live_backends = BTreeMap::new();
+        let mut backend_by_process = BTreeMap::new();
+        for context in manifest.contexts() {
+            let backend = context.backend();
+            backend_by_process.insert(backend.process_id(), backend);
+            match frozen_live_backends.insert(backend.backend_idx(), backend.target().clone()) {
+                Some(previous) if previous != *backend.target() => {
+                    return Err(contract_error(format!(
+                        "Task manifest backend ordinal {} names conflicting frozen targets",
+                        backend.backend_idx()
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        let scheduling = self.scheduling_view();
+        let mut by_fragment = BTreeMap::<FragmentId, Vec<FragmentInstancePlacement>>::new();
+        let mut task_location = BTreeMap::new();
+        for task in manifest.tasks() {
+            let backend = backend_by_process
+                .get(&task.identity().backend_process_id())
+                .copied()
+                .ok_or_else(|| {
+                    contract_error(format!(
+                        "Task manifest task {} has no frozen backend context",
+                        task.identity()
+                    ))
+                })?;
+            let mut scan_ranges = BTreeMap::new();
+            for work in task.scan_work() {
+                let node_id = work.scan().node_id();
+                let ranges = scheduling
+                    .inner
+                    .scan_ranges(task.fragment_id(), node_id)
+                    .ok_or_else(|| {
+                        contract_error(format!(
+                            "Task manifest scan node {node_id} has no frozen scan work in fragment {}",
+                            task.fragment_id()
+                        ))
+                    })?;
+                let assigned = match work.assignment() {
+                    BoundManifestScanAssignment::RuntimeSplits
+                    | BoundManifestScanAssignment::WholeRelation => Vec::new(),
+                    BoundManifestScanAssignment::FrozenUnits(units) => {
+                        let mut selected = Vec::with_capacity(units.len().get());
+                        for offset in 0..units.len().get() {
+                            let index = units
+                                .stride()
+                                .get()
+                                .checked_mul(offset)
+                                .and_then(|delta| units.first_ordinal().checked_add(delta))
+                                .ok_or_else(|| {
+                                    contract_error(format!(
+                                        "Task manifest frozen scan assignment overflows for node {node_id}"
+                                    ))
+                                })?;
+                            selected.push(ranges.get(index).cloned().ok_or_else(|| {
+                                contract_error(format!(
+                                    "Task manifest frozen scan assignment index {index} is outside node {node_id} work"
+                                ))
+                            })?);
+                        }
+                        selected
+                    }
+                };
+                scan_ranges.insert(node_id, assigned);
+            }
+            let placements = by_fragment.entry(task.fragment_id()).or_default();
+            if placements.len() != task.instance_index() {
+                return Err(contract_error(format!(
+                    "Task manifest fragment {} instance order is not contiguous at {}",
+                    task.fragment_id(),
+                    task.instance_index()
+                )));
+            }
+            task_location.insert(task.identity(), (task.fragment_id(), task.instance_index()));
+            placements.push(FragmentInstancePlacement {
+                fragment_id: task.fragment_id(),
+                instance_index: task.instance_index(),
+                finst_id: task.fragment_instance_id(),
+                backend_idx: backend.backend_idx(),
+                endpoint: backend.endpoint().clone(),
+                scan_ranges,
+                destinations: Vec::new(),
+                per_exch_num_senders: BTreeMap::new(),
+            });
+        }
+
+        for edge in manifest.edges() {
+            let sender_count = i32::try_from(edge.sender_count().get()).map_err(|_| {
+                contract_error("Task manifest exchange sender count exceeds i32 width")
+            })?;
+            for destination in edge.destinations() {
+                let (fragment_id, instance_index) =
+                    task_location.get(destination).copied().ok_or_else(|| {
+                        contract_error(format!(
+                            "Task manifest exchange destination {destination} has no placement"
+                        ))
+                    })?;
+                let placement = by_fragment
+                    .get_mut(&fragment_id)
+                    .and_then(|placements| placements.get_mut(instance_index))
+                    .ok_or_else(|| {
+                        contract_error("Task manifest destination placement vanished")
+                    })?;
+                let entry = placement
+                    .per_exch_num_senders
+                    .entry(edge.target_exchange_node_id())
+                    .or_insert(0);
+                *entry = entry.checked_add(sender_count).ok_or_else(|| {
+                    contract_error("Task manifest exchange sender total exceeds i32 width")
+                })?;
+            }
+            for producer in edge.producers() {
+                let (fragment_id, instance_index) = task_location
+                    .get(&producer.task())
+                    .copied()
+                    .ok_or_else(|| {
+                        contract_error(format!(
+                            "Task manifest exchange producer {} has no placement",
+                            producer.task()
+                        ))
+                    })?;
+                let source_finst_id = by_fragment[&fragment_id][instance_index].finst_id;
+                let mut destinations = Vec::with_capacity(edge.destinations().len());
+                for destination in edge.destinations() {
+                    let (target_fragment, target_index) = task_location[destination];
+                    let target = &by_fragment[&target_fragment][target_index];
+                    destinations.push(
+                        FragmentDestination::new(
+                            target.finst_id,
+                            target.endpoint.clone(),
+                            source_finst_id,
+                            producer.sender_ordinal(),
+                            edge.sender_count().get(),
+                        )
+                        .map_err(contract_error)?,
+                    );
+                }
+                by_fragment
+                    .get_mut(&fragment_id)
+                    .and_then(|placements| placements.get_mut(instance_index))
+                    .expect("manifest placement was indexed above")
+                    .destinations
+                    .extend(destinations);
+            }
+        }
+
+        let (root_fragment_id, root_instance_index) = task_location
+            .get(&manifest.root())
+            .copied()
+            .ok_or_else(|| contract_error("Task manifest root has no placement"))?;
+        let root_finst_id = by_fragment[&root_fragment_id][root_instance_index].finst_id;
+        let root_backend_idx = by_fragment[&root_fragment_id][root_instance_index].backend_idx;
+        Ok(ValidatedFragmentSchedule {
+            handoff_id: self.handoff_id,
+            execution_id: manifest.execution(),
+            inner: SchedulingPlan {
+                root_fragment_id,
+                by_fragment,
+                root_finst_id,
+                root_backend_idx,
+            },
+            frozen_live_backends,
+        })
     }
 
     /// Borrow-only identity and fragment-set view used by the Frontend RF

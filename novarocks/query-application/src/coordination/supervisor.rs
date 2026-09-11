@@ -124,6 +124,10 @@ impl LogicalExecutionSupervisorConfig {
             rows,
         }
     }
+
+    pub const fn replacement_reservation_valid_for(self) -> Duration {
+        self.rows.replacement_reservation_valid_for
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,6 +165,7 @@ impl std::error::Error for LogicalExecutionSupervisorShutdownError {}
 /// Shutdown borrows this owner. A timed-out or cancelled wait leaves the exact
 /// join handle and Registry owner here so a later call resumes the same
 /// convergence.
+// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 pub struct LogicalExecutionSupervisor {
     shutdown: watch::Sender<bool>,
     join: Option<JoinHandle<Result<(), QueryExecutionError>>>,
@@ -675,7 +680,7 @@ async fn run_logical_execution(
     };
     let mut dormant = prepared.owner;
     let activation = await_with_shutdown(
-        catch_future_panic(dormant.activate(&schedule, cancellation.clone())),
+        catch_future_panic(dormant.activate(&schedule, None, cancellation.clone())),
         &mut shutdown,
         &requester,
     )
@@ -972,13 +977,25 @@ async fn converge_rows_attempts(
     requester: &novarocks_workload_control::WorkCancellationRequester,
 ) -> Result<(), QueryExecutionError> {
     let active_convergence = converge_active(active, cancellation, shutdown, requester).await;
-    let mut result = record_reported_active_convergence(
+    let result = record_reported_active_convergence(
         registry,
         registration,
         active_contexts,
         active_convergence,
     )
     .await;
+    first_supervision_error(
+        result,
+        converge_residual_rows_attempts(residuals, registry, registration).await,
+    )
+}
+
+async fn converge_residual_rows_attempts(
+    residuals: &mut ResidualRowsConvergence,
+    registry: &LogicalExecutionRuntimeRegistryHandle,
+    registration: &super::LogicalExecutionRegistration,
+) -> Result<(), QueryExecutionError> {
+    let mut result = Ok(());
     while let Some(joined) = residuals.join_next().await {
         let convergence = match joined {
             Ok((contexts, convergence)) => {
@@ -1287,6 +1304,14 @@ async fn supervise_rows(
                     }
                 };
 
+                supervise_residual_rows_attempt(
+                    &mut residuals,
+                    attempt.active,
+                    attempt.schedule.contexts().to_vec().into_boxed_slice(),
+                    cancellation.clone(),
+                    shutdown.clone(),
+                    requester.clone(),
+                );
                 let instantiation = match await_with_shutdown(
                     actor.activate_replacement(qualification),
                     shutdown,
@@ -1303,17 +1328,34 @@ async fn supervise_rows(
                             replacement_schedule.contexts(),
                         )
                         .await;
-                        let old_convergence = converge_rows_attempts(
-                            attempt.active.as_mut(),
-                            attempt.schedule.contexts(),
-                            &mut residuals,
-                            scope.cancellation().map_err(work_error)?,
+                        let old_convergence =
+                            converge_residual_rows_attempts(&mut residuals, registry, registration)
+                                .await;
+                        return first_supervision_error(
+                            Err(actor_error(error)),
+                            first_supervision_error(replacement_convergence, old_convergence),
+                        );
+                    }
+                };
+                let replacement_admissions = match await_with_shutdown(
+                    instantiation.take_replacement_admission_evidence(),
+                    shutdown,
+                    requester,
+                )
+                .await
+                {
+                    Ok(admissions) => admissions,
+                    Err(error) => {
+                        converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
+                        let replacement_convergence = record_active_convergence(
                             registry,
                             registration,
-                            shutdown,
-                            requester,
+                            replacement_schedule.contexts(),
                         )
                         .await;
+                        let old_convergence =
+                            converge_residual_rows_attempts(&mut residuals, registry, registration)
+                                .await;
                         return first_supervision_error(
                             Err(actor_error(error)),
                             first_supervision_error(replacement_convergence, old_convergence),
@@ -1321,9 +1363,11 @@ async fn supervise_rows(
                     }
                 };
                 let activated = await_with_shutdown(
-                    catch_future_panic(
-                        dormant.activate(&replacement_schedule, cancellation.clone()),
-                    ),
+                    catch_future_panic(dormant.activate(
+                        &replacement_schedule,
+                        replacement_admissions,
+                        cancellation.clone(),
+                    )),
                     shutdown,
                     requester,
                 )
@@ -1344,17 +1388,9 @@ async fn supervise_rows(
                             replacement_schedule.contexts(),
                         )
                         .await;
-                        let old_convergence = converge_rows_attempts(
-                            attempt.active.as_mut(),
-                            attempt.schedule.contexts(),
-                            &mut residuals,
-                            scope.cancellation().map_err(work_error)?,
-                            registry,
-                            registration,
-                            shutdown,
-                            requester,
-                        )
-                        .await;
+                        let old_convergence =
+                            converge_residual_rows_attempts(&mut residuals, registry, registration)
+                                .await;
                         return first_supervision_error(
                             Err(error),
                             first_supervision_error(
@@ -1379,17 +1415,9 @@ async fn supervise_rows(
                             replacement_schedule.contexts(),
                         )
                         .await;
-                        let old_convergence = converge_rows_attempts(
-                            attempt.active.as_mut(),
-                            attempt.schedule.contexts(),
-                            &mut residuals,
-                            scope.cancellation().map_err(work_error)?,
-                            registry,
-                            registration,
-                            shutdown,
-                            requester,
-                        )
-                        .await;
+                        let old_convergence =
+                            converge_residual_rows_attempts(&mut residuals, registry, registration)
+                                .await;
                         return first_supervision_error(
                             Err(error),
                             first_supervision_error(
@@ -1422,17 +1450,9 @@ async fn supervise_rows(
                         convergence,
                     )
                     .await;
-                    let old_convergence = converge_rows_attempts(
-                        attempt.active.as_mut(),
-                        attempt.schedule.contexts(),
-                        &mut residuals,
-                        scope.cancellation().map_err(work_error)?,
-                        registry,
-                        registration,
-                        shutdown,
-                        requester,
-                    )
-                    .await;
+                    let old_convergence =
+                        converge_residual_rows_attempts(&mut residuals, registry, registration)
+                            .await;
                     return first_supervision_error(
                         Err(error),
                         first_supervision_error(
@@ -1455,31 +1475,15 @@ async fn supervise_rows(
                             convergence,
                         )
                         .await;
-                        let old_convergence = converge_rows_attempts(
-                            attempt.active.as_mut(),
-                            attempt.schedule.contexts(),
-                            &mut residuals,
-                            scope.cancellation().map_err(work_error)?,
-                            registry,
-                            registration,
-                            shutdown,
-                            requester,
-                        )
-                        .await;
+                        let old_convergence =
+                            converge_residual_rows_attempts(&mut residuals, registry, registration)
+                                .await;
                         return first_supervision_error(
                             Err(actor_error(error)),
                             first_supervision_error(replacement_convergence, old_convergence),
                         );
                     }
                 };
-                supervise_residual_rows_attempt(
-                    &mut residuals,
-                    attempt.active,
-                    attempt.schedule.contexts().to_vec().into_boxed_slice(),
-                    cancellation,
-                    shutdown.clone(),
-                    requester.clone(),
-                );
                 attempt = RowsAttempt {
                     schedule: replacement_schedule,
                     active,
@@ -1781,7 +1785,8 @@ mod tests {
         AdmissionEpochCapability, AdmissionTicketId, CodecOwnedContent, ConfidentialContent,
         ContentFingerprint, CredentialEpoch, CredentialLeaseId, CredentialUpdate,
         EstablishQueryContext, LeaseValidFor, OperationOutcome, QueryContextAdmissionTicketReceipt,
-        QueryContextRef, TaskOperationId,
+        QueryContextRef, TaskOperationId, TaskOutputFacts, TaskState, TaskStatus,
+        TaskStatusVersion,
     };
     use novarocks_sql::planning::query_execution::SealedPreparationPlan;
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
@@ -1800,6 +1805,7 @@ mod tests {
         NativeAttemptPreparationRequest, NativeAttemptRunFuture,
     };
     use crate::coordination::AttemptSchedule;
+    use crate::coordination::ReplacementWorkerAdmissionEvidence;
     use crate::coordination::{
         AdmissionIssueSettlement, EstablishIssueIdentity, EstablishIssueSubmit,
         EstablishTransportAdmission, EstablishTransportReservation, EstablishTransportSink,
@@ -1903,6 +1909,17 @@ mod tests {
                 .unwrap()
             })
             .runtime()
+    }
+
+    fn running_status(root: novarocks_execution_contract::TaskIdentity) -> TaskStatus {
+        TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(1).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::new(false),
+        )
+        .unwrap()
     }
 
     #[derive(Debug)]
@@ -2017,6 +2034,7 @@ mod tests {
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,
+            _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             self.activated.store(true, Ordering::SeqCst);
@@ -2196,6 +2214,7 @@ mod tests {
         fn activate<'a>(
             &'a mut self,
             schedule: &'a AttemptSchedule,
+            _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             let root = schedule.root();
@@ -2206,6 +2225,12 @@ mod tests {
                         root,
                         Arc::new(ClosedSuccessSealPort),
                     );
+                status_sender
+                    .publish_attempt_observation(
+                        running_status(root),
+                        super::super::AcceptedAttemptFailure::None,
+                    )
+                    .unwrap();
                 let binding =
                     super::super::RootResultPumpBinding::new(rows_decode_runtime(), |_| async {
                         std::future::pending::<
@@ -2524,6 +2549,7 @@ mod tests {
         fn activate<'a>(
             &'a mut self,
             schedule: &'a AttemptSchedule,
+            _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             let root = schedule.root();
@@ -2546,6 +2572,12 @@ mod tests {
                         root,
                         Arc::new(ClosedSuccessSealPort),
                     );
+                status_sender
+                    .publish_attempt_observation(
+                        running_status(root),
+                        super::super::AcceptedAttemptFailure::None,
+                    )
+                    .unwrap();
                 let fetches = Arc::new(AtomicU64::new(0));
                 let binding =
                     super::super::RootResultPumpBinding::new(rows_decode_runtime(), move |_| {
@@ -2976,6 +3008,7 @@ mod tests {
         fn activate<'a>(
             &'a mut self,
             schedule: &'a AttemptSchedule,
+            _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             let root = schedule.root();
@@ -2986,6 +3019,12 @@ mod tests {
                         root,
                         Arc::new(ClosedSuccessSealPort),
                     );
+                status_sender
+                    .publish_attempt_observation(
+                        running_status(root),
+                        super::super::AcceptedAttemptFailure::None,
+                    )
+                    .unwrap();
                 let fetches = Arc::new(AtomicU64::new(0));
                 let binding =
                     super::super::RootResultPumpBinding::new(rows_decode_runtime(), move |_| {
@@ -3202,6 +3241,7 @@ mod tests {
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,
+            _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             match self.phase {
@@ -3496,6 +3536,7 @@ mod tests {
         fn activate<'a>(
             &'a mut self,
             schedule: &'a AttemptSchedule,
+            _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             assert!(
@@ -3670,6 +3711,7 @@ mod tests {
         fn activate<'a>(
             &'a mut self,
             _schedule: &'a AttemptSchedule,
+            _replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             Box::pin(async {

@@ -16,7 +16,6 @@
 // under the License.
 
 // MIGRATION: wired into the round once the typed producer lands.
-mod attempt_initialization;
 mod execution;
 mod query_registry;
 mod scheduler;
@@ -24,7 +23,6 @@ mod scheduler;
     dead_code,
     reason = "Wired into execute_round by the typed producer cut in the same PR."
 )]
-pub(crate) mod split_assignment_round;
 pub(crate) mod task_round;
 
 pub use execution::FrontendDistributedQueryCoordinator;

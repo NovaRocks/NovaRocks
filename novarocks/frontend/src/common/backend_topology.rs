@@ -34,6 +34,11 @@ use novarocks_types::BackendProcessId;
 pub trait BackendTopologyPort: Send + Sync + 'static {
     fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError>;
 
+    /// Subscribes to exact topology revision changes. Consumers must re-read
+    /// [`Self::snapshot`] after every notification; the revision is only a
+    /// wake-up hint and never a schedulable topology by itself.
+    fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64>;
+
     fn validate_snapshot(
         &self,
         expected: &BackendTopologySnapshot,
@@ -62,6 +67,11 @@ pub type BeId = u32;
 /// Narrow live process-lifecycle evidence source for residual convergence.
 /// It has no snapshot, placement, or successor-scheduling capability.
 pub trait BackendProcessObservationPort: Send + Sync + 'static {
+    fn subscribe_process_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        let (_, receiver) = tokio::sync::watch::channel(0);
+        receiver
+    }
+
     /// Observes the lifecycle relationship between one frozen process and the
     /// exact endpoint it owned when the attempt was prepared. A missing or
     /// heartbeat-unobservable process is not replacement evidence.
@@ -390,6 +400,11 @@ pub(crate) struct NoopBackendTopologyPort;
 impl BackendTopologyPort for NoopBackendTopologyPort {
     fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
         Ok(BackendTopologySnapshot::empty(0))
+    }
+
+    fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        let (_, receiver) = tokio::sync::watch::channel(0);
+        receiver
     }
 
     fn validate_snapshot(

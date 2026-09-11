@@ -209,8 +209,8 @@ impl ExecutionControl for WorkCancellationRequester {
 
 /// Move-only logical execution handle.
 ///
-/// Dropping a handle is not a stop or resource-release fact. T08 attaches
-/// bounded result delivery and convergence observation to this abstraction.
+/// Dropping a handle is not a stop or resource-release fact. Bounded result
+/// delivery and convergence remain owned by the supervised logical execution.
 ///
 /// ```compile_fail
 /// use novarocks_query_application::api::ExecutionHandle;

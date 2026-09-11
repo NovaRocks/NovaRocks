@@ -393,11 +393,17 @@ impl FrontendQueryCompiler {
         completion_intent: PostCompileIntent,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
         let connector_context = connector_planning_context.request();
-        let logical_reservation = self
-            .query
-            .query_execution()
-            .reserve_logical_query()
-            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
+        let query_application_read = matches!(&completion_intent, PostCompileIntent::Result);
+        let logical_reservation = if query_application_read {
+            None
+        } else {
+            Some(
+                self.query
+                    .query_execution()
+                    .reserve_logical_query()
+                    .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
+            )
+        };
         let catalog_service = query_catalog_service_snapshot(&self.query);
         let bindings = Arc::new(
             QueryTableBindingStore::try_new()
@@ -491,9 +497,16 @@ impl FrontendQueryCompiler {
         // Every round of this statement reuses these exact bindings; they are
         // sealed here and a retry rebinds them rather than re-materializing.
         let native_bundle = encode_native_fragment_bundle(assembly.encoding().encoding_view())?;
+        if query_application_read {
+            let logical_read = assembly.finish_logical_read(native_bundle)?;
+            drop(materializer);
+            return Ok(PreparedQueryOperation::LogicalRead(logical_read));
+        }
         let request = assembly.finish(native_bundle)?;
         let logical_execution = request.restartable_read();
         drop(materializer);
+        let logical_reservation = logical_reservation
+            .expect("legacy distributed completion must reserve its old coordinator logical query");
         let mut operation =
             PreparedQueryDistributedOperation::new(request, completion, logical_reservation);
         if let Some(logical_execution) = logical_execution {

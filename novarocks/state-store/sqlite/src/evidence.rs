@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Design: ADR-0141 (docs/adr/ADR-0141-state-store-answers-only-issued-attempts.md)
+// Design: ADR-0143 (docs/adr/ADR-0143-state-store-answers-only-issued-attempts.md)
 
 //! In-doubt adjudication from this provider's own commit evidence.
 //!

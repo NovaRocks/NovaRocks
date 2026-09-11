@@ -978,6 +978,29 @@ impl PumpRuntime {
         }
     }
 
+    /// Waits until the serialized Task owner has accepted at least one status
+    /// for the exact root. The Frontend publishes this projection only after
+    /// the root CreateTask acknowledgement, so crossing this gate proves that
+    /// a result fetch cannot overtake root-task creation on its owning Worker.
+    async fn await_initial_root_status(&mut self) -> Result<(), PumpInterruption> {
+        loop {
+            tokio::select! {
+                biased;
+                reason = self.cancellation.cancelled() => {
+                    return Err(PumpInterruption::Cancellation(cancellation_failure(reason)));
+                }
+                terminal = self.native_terminal.next(), if !self.native_completed => {
+                    self.observe_native_terminal(terminal)?;
+                }
+                status = self.statuses.next() => {
+                    let projection = status.map_err(|error| PumpInterruption::Decision(contract_failure(error)))?;
+                    self.observe_projection(projection).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     async fn await_step<F, T>(&mut self, future: F) -> Result<T, PumpInterruption>
     where
         F: Future<Output = T>,
@@ -1035,7 +1058,13 @@ impl PumpRuntime {
     }
 
     async fn await_success_seal(&mut self) -> Result<(), PumpInterruption> {
-        while !self.success_sealed || !self.native_completed {
+        // The serialized Task owner publishes SuccessSealed only after the
+        // exact root is Finished, no authoritative attempt failure exists,
+        // and every required Task creation was accepted. That is the logical
+        // result boundary. Native terminal convergence may still be waiting
+        // for transport ownership or residual Worker cleanup and must remain
+        // observable without delaying the actor-owned success EOF.
+        while !self.success_sealed {
             tokio::select! {
                 biased;
                 reason = self.cancellation.cancelled() => {
@@ -1113,6 +1142,10 @@ pub(crate) async fn run_root_result_pump(
     let mut expected = ResultPacketSequence::new(0);
     let mut acknowledged = None;
     let mut pending_eos = None;
+
+    if let Err(interruption) = runtime.await_initial_root_status().await {
+        return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
+    }
 
     loop {
         let credit = match runtime
@@ -1857,10 +1890,21 @@ mod tests {
         .unwrap()
     }
 
+    fn running(root: TaskIdentity) -> TaskStatus {
+        TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(1).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::new(false),
+        )
+        .unwrap()
+    }
+
     fn failed(root: TaskIdentity, detail: &str) -> TaskStatus {
         TaskStatus::try_new(
             root,
-            TaskStatusVersion::new(2).unwrap(),
+            TaskStatusVersion::new(3).unwrap(),
             TaskState::Failed,
             Some(TerminationDetail::Failed(TaskFailure::new(
                 TaskFailureCategory::Execution,
@@ -2220,7 +2264,8 @@ mod tests {
             mut stream,
             root,
         } = harness(13).await;
-        let (_status_sender, statuses) = accepted_root_status_projection(root);
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let binding = RootResultPumpBinding::new(decode_runtime(), |_| async {
             Err(RootResultFetchFailure::new(
                 AttemptFailureClass::DeadlineExceeded,
@@ -2249,6 +2294,74 @@ mod tests {
         assert_eq!(failure.class(), AttemptFailureClass::DeadlineExceeded);
         failure.fail_logical(&actor).await.unwrap();
         assert!(stream.next().await.is_err());
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn root_fetch_waits_for_the_first_accepted_root_status() {
+        let Harness {
+            control,
+            scope,
+            actor,
+            owner,
+            permit,
+            mut stream,
+            root,
+        } = harness(143).await;
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls_for_binding = Arc::clone(&fetch_calls);
+        let pump = tokio::spawn(run_root_result_pump(
+            permit,
+            root,
+            scope,
+            control.resources(),
+            result_schema(),
+            RootResultPumpBinding::new(decode_runtime(), move |_| {
+                fetch_calls_for_binding.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(RootResultFetchFailure::new(
+                        AttemptFailureClass::ContractViolation,
+                        contract_error("scripted fetch after root admission"),
+                    ))
+                }
+            }),
+            statuses,
+            completed_native_terminal(),
+            MaxWait::new(Duration::from_secs(1)).unwrap(),
+            ResultByteLimit::new(1 << 12).unwrap(),
+        ));
+
+        let premature_fetch = tokio::time::timeout(Duration::from_millis(20), async {
+            while fetch_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            premature_fetch.is_err(),
+            "root fetch must not start before an accepted root status"
+        );
+
+        status_sender.publish(running(root)).unwrap();
+        let ResultPumpFailure::DecisionPending(failure) =
+            tokio::time::timeout(Duration::from_secs(1), pump)
+                .await
+                .expect("accepted root status must release the first fetch")
+                .unwrap()
+                .unwrap_err()
+        else {
+            panic!("the scripted fetch failure must retain attempt authority");
+        };
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            failure.fail_logical(&actor).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        assert!(stream.next().await.is_err());
+        drop(status_sender);
         drop(stream);
         drop(actor);
         drop(owner);
@@ -2433,7 +2546,8 @@ mod tests {
             mut stream,
             root,
         } = harness(3).await;
-        let (_status_sender, statuses) = accepted_root_status_projection(root);
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let decode_calls = Arc::new(AtomicUsize::new(0));
         let ResultPumpFailure::DecisionPending(failure) = run_root_result_pump(
             permit,
@@ -2490,7 +2604,8 @@ mod tests {
             )
             .unwrap(),
         )));
-        let (_status_sender, statuses) = accepted_root_status_projection(root);
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let authority = control.resources();
         let ResultPumpFailure::DecisionPending(failure) = run_root_result_pump(
             permit,
@@ -2575,7 +2690,8 @@ mod tests {
         drop(blocker);
 
         let packet = Arc::new(Mutex::new(Some(packet(0, Arc::new(AtomicUsize::new(0))))));
-        let (_status_sender, statuses) = accepted_root_status_projection(root);
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let authority = control.resources();
         let pump = tokio::spawn(run_root_result_pump(
             permit,
@@ -2670,7 +2786,8 @@ mod tests {
             },
         )
         .unwrap();
-        let (_status_sender, statuses) = accepted_root_status_projection(root);
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let pump = tokio::spawn(run_root_result_pump(
             permit,
             root,
@@ -2758,6 +2875,7 @@ mod tests {
             async move { Ok(outcome) }
         });
         let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let authority = control.resources();
         let pump = tokio::spawn(run_root_result_pump(
             permit,
@@ -2849,7 +2967,8 @@ mod tests {
         )
         .unwrap();
         let packet = Arc::new(Mutex::new(Some(raw)));
-        let (_status_sender, statuses) = accepted_root_status_projection(root);
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let authority = control.resources();
         let pump = tokio::spawn(run_root_result_pump(
             permit,
@@ -2918,6 +3037,7 @@ mod tests {
             root,
         } = harness(4).await;
         let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let decode_calls = Arc::new(AtomicUsize::new(0));
         let pump = tokio::spawn(run_root_result_pump(
             permit,
@@ -2988,6 +3108,7 @@ mod tests {
             root,
         } = harness(9).await;
         let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let observed_requests = Arc::new(Mutex::new(Vec::new()));
         let binding = RootResultPumpBinding::new(decode_runtime(), {
             let observed_requests = Arc::clone(&observed_requests);
@@ -3021,7 +3142,7 @@ mod tests {
         };
         let derived = TaskStatus::try_new(
             root,
-            TaskStatusVersion::new(2).unwrap(),
+            TaskStatusVersion::new(3).unwrap(),
             TaskState::Aborted,
             Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
             TaskOutputFacts::new(false),
@@ -3095,6 +3216,7 @@ mod tests {
             root,
         } = harness(11).await;
         let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let authority = control.resources();
         let pump = tokio::spawn(run_root_result_pump(
             permit,
@@ -3116,7 +3238,7 @@ mod tests {
         };
         let derived = TaskStatus::try_new(
             root,
-            TaskStatusVersion::new(2).unwrap(),
+            TaskStatusVersion::new(3).unwrap(),
             TaskState::Aborted,
             Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
             TaskOutputFacts::new(false),
@@ -3175,6 +3297,7 @@ mod tests {
             root,
         } = harness(12).await;
         let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let second_fetch_started = Arc::new(AtomicUsize::new(0));
         let release_second_fetch = Arc::new(Notify::new());
         let fetch_index = Arc::new(AtomicUsize::new(0));
@@ -3315,6 +3438,7 @@ mod tests {
             parent,
         ) = cancellable_harness(10).await;
         let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let fetch_started = Arc::new(AtomicUsize::new(0));
         let fetch_started_for_binding = Arc::clone(&fetch_started);
         let pump = tokio::spawn(run_root_result_pump(
@@ -3429,7 +3553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_completion_precedes_ack_and_stable_eof() {
+    async fn accepted_success_seal_publishes_eof_before_native_convergence() {
         let Harness {
             control,
             scope,
@@ -3462,6 +3586,7 @@ mod tests {
         });
         let authority = control.resources();
         let pump_authority = authority.clone();
+        let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
         let pump = tokio::spawn(run_root_result_pump(
             permit,
             root,
@@ -3470,7 +3595,7 @@ mod tests {
             result_schema(),
             binding,
             statuses,
-            completed_native_terminal(),
+            terminal_source,
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
@@ -3501,7 +3626,14 @@ mod tests {
             panic!("stable Worker success must produce actor-owned EOF");
         };
         end.complete();
-        assert_eq!(pump.await.unwrap().unwrap(), LogicalConclusion::Succeeded);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), pump)
+                .await
+                .expect("logical EOF must not wait for Native convergence")
+                .unwrap()
+                .unwrap(),
+            LogicalConclusion::Succeeded
+        );
         assert_eq!(decode_calls.load(Ordering::SeqCst), 1);
         let requests = observed_requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
@@ -3904,7 +4036,8 @@ mod tests {
             mut stream,
             root,
         } = harness(25).await;
-        let (_status_sender, statuses) = accepted_root_status_projection(root);
+        let (status_sender, statuses) = accepted_root_status_projection(root);
+        status_sender.publish(running(root)).unwrap();
         let (terminal_sender, terminal_source) = native_attempt_terminal_channel();
         let terminal_sender = Arc::new(Mutex::new(Some(terminal_sender)));
         let decode_calls = Arc::new(AtomicUsize::new(0));

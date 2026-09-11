@@ -796,6 +796,7 @@ impl FrozenExecutionDescriptionDraft {
 }
 
 /// Immutable semantic input for all attempts of one logical execution.
+// Design: ADR-0145 (docs/adr/ADR-0145-freeze-query-semantics-before-attempt-access.md)
 #[derive(Clone, Debug)]
 pub struct FrozenExecutionDescription {
     plan_seal: SealedPreparationPlanId,
@@ -1016,6 +1017,13 @@ impl FrozenExecutionDescription {
     }
     pub(crate) const fn plan_seal(&self) -> SealedPreparationPlanId {
         self.plan_seal
+    }
+
+    /// Borrowed affinity check for a role adapter that must atomically bind
+    /// the description to its opaque Native template without exposing the
+    /// seal as a reconstructible application value.
+    pub fn matches_plan_seal(&self, seal: SealedPreparationPlanId) -> bool {
+        self.plan_seal == seal
     }
     pub fn plan(&self) -> &DistributedPlan {
         self.plan.as_ref()

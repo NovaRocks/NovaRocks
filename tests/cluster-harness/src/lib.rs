@@ -2517,7 +2517,40 @@ pub fn render_cross_process_config(
         root.remove("catalog_source");
     }
 
+    project_connector_credentials_for_role(root, role);
+
     toml::to_string(&value).context("serialize cross-process standalone config")
+}
+
+/// Project shared fixture credentials onto the process role authorized to own
+/// them. Malformed or unknown entries remain visible so normal Server config
+/// validation still rejects them.
+fn project_connector_credentials_for_role(
+    root: &mut toml::map::Map<String, Value>,
+    role: ClusterProcessRole,
+) {
+    let Some(credentials) = root
+        .get_mut("connector")
+        .and_then(Value::as_table_mut)
+        .and_then(|connector| connector.get_mut("credentials"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    credentials.retain(|credential| {
+        let Some(purpose) = credential
+            .as_table()
+            .and_then(|entry| entry.get("purpose"))
+            .and_then(Value::as_str)
+        else {
+            return true;
+        };
+        !matches!(
+            (role, purpose),
+            (ClusterProcessRole::Fe, "object-store-data")
+                | (ClusterProcessRole::Be, "object-store-metadata")
+        )
+    });
 }
 
 struct CrossProcessLaunchConfig<'a> {
@@ -6275,6 +6308,14 @@ generation = "v1"
 kind = "s3"
 access_key_id = "admin"
 access_key_secret = "admin123"
+
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "test-metadata"
+generation = "v1"
+kind = "s3"
+access_key_id = "admin"
+access_key_secret = "admin123"
 "#;
 
     #[test]
@@ -6299,11 +6340,18 @@ access_key_secret = "admin123"
         );
         assert_eq!(
             fe_value["connector"]["credentials"][0]["purpose"].as_str(),
-            Some("object-store-data")
+            Some("object-store-metadata")
         );
         assert_eq!(
             fe_value["connector"]["credentials"][0]["name"].as_str(),
-            Some("test-data")
+            Some("test-metadata")
+        );
+        assert_eq!(
+            fe_value["connector"]["credentials"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
         assert_eq!(fe_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(fe_value["server"]["http_port"].as_integer(), Some(28080));
@@ -6343,6 +6391,13 @@ access_key_secret = "admin123"
         assert_eq!(
             be_value["connector"]["credentials"][0]["generation"].as_str(),
             Some("v1")
+        );
+        assert_eq!(
+            be_value["connector"]["credentials"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
         assert_eq!(be_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(be_value["server"]["http_port"].as_integer(), Some(18080));

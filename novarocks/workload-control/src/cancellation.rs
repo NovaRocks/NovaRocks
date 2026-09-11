@@ -33,7 +33,22 @@ pub enum CancellationReason {
 #[derive(Default)]
 struct State {
     reason: Option<CancellationReason>,
+    success_sealed: bool,
     children: Vec<Weak<Cancellation>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CancellationRequestOutcome {
+    Requested,
+    AlreadyRequested(CancellationReason),
+    SuccessSealed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CancellationSuccessSealOutcome {
+    Sealed,
+    AlreadySealed,
+    Cancelled(CancellationReason),
 }
 
 pub(crate) struct Cancellation {
@@ -76,24 +91,30 @@ impl Cancellation {
         child
     }
 
-    pub(crate) fn request(&self, reason: CancellationReason) -> bool {
+    pub(crate) fn request(&self, reason: CancellationReason) -> CancellationRequestOutcome {
         let inherited = self.ancestor_reason();
-        let (changed, mut children) = {
+        let (outcome, mut children) = {
             let mut state = self.state.lock().unwrap();
-            let changed = state.reason.is_none();
-            let effective_reason = state
-                .reason
-                .get_or_insert_with(|| inherited.unwrap_or(reason))
-                .clone();
+            if state.success_sealed {
+                return CancellationRequestOutcome::SuccessSealed;
+            }
+            let outcome = match state.reason.as_ref() {
+                Some(existing) => CancellationRequestOutcome::AlreadyRequested(existing.clone()),
+                None => {
+                    state.reason = Some(inherited.unwrap_or(reason));
+                    CancellationRequestOutcome::Requested
+                }
+            };
+            let effective_reason = state.reason.as_ref().unwrap().clone();
             let children = state
                 .children
                 .iter()
                 .filter_map(Weak::upgrade)
                 .map(|child| (child, effective_reason.clone()))
                 .collect::<Vec<_>>();
-            (changed, children)
+            (outcome, children)
         };
-        if changed {
+        if outcome == CancellationRequestOutcome::Requested {
             self.changed.notify_waiters();
         }
         // Deep responsibility trees must not recurse on the cancellation stack.
@@ -102,6 +123,9 @@ impl Cancellation {
         while let Some((child, inherited_reason)) = children.pop() {
             let (changed, descendants) = {
                 let mut state = child.state.lock().unwrap();
+                if state.success_sealed {
+                    continue;
+                }
                 let changed = state.reason.is_none();
                 let effective_reason = state.reason.get_or_insert(inherited_reason).clone();
                 let descendants = state
@@ -118,7 +142,39 @@ impl Cancellation {
             children.extend(descendants);
         }
         // Keep the return value about this node's first-wins decision only.
-        changed
+        outcome
+    }
+
+    pub(crate) fn seal_success(&self) -> CancellationSuccessSealOutcome {
+        let inherited = self.ancestor_reason();
+        let cancelled = {
+            let mut state = self.state.lock().unwrap();
+            if state.success_sealed {
+                return CancellationSuccessSealOutcome::AlreadySealed;
+            }
+            if let Some(reason) = state.reason.clone() {
+                return CancellationSuccessSealOutcome::Cancelled(reason);
+            }
+            let deadline_reason = self
+                .deadline
+                .filter(|deadline| Instant::now() >= *deadline)
+                .map(|_| CancellationReason::DeadlineExceeded);
+            if let Some(reason) = inherited.or(deadline_reason) {
+                state.reason = Some(reason.clone());
+                Some(reason)
+            } else {
+                state.success_sealed = true;
+                None
+            }
+        };
+        if let Some(reason) = cancelled {
+            // Propagate the reason installed while winning the seal/request race.
+            let _ = self.request(reason.clone());
+            self.changed.notify_waiters();
+            CancellationSuccessSealOutcome::Cancelled(reason)
+        } else {
+            CancellationSuccessSealOutcome::Sealed
+        }
     }
 
     pub(crate) fn detach(self: &Arc<Self>) {
@@ -138,7 +194,7 @@ impl Cancellation {
             return Some(reason);
         }
         let reason = self.check_reason()?;
-        self.request(reason);
+        let _ = self.request(reason);
         self.state.lock().unwrap().reason.clone()
     }
 
@@ -258,12 +314,22 @@ mod tests {
             let installed_after_help = grandchild.state.lock().unwrap().reason.clone();
             // Resume before assertions so a failing oracle cannot strand a thread.
             resume.wait();
-            assert!(first_request.join().unwrap());
+            assert_eq!(
+                first_request.join().unwrap(),
+                CancellationRequestOutcome::Requested
+            );
             (visible_before_help, installed_after_help, changed)
         });
         assert_eq!(visible_before_help, Some(CancellationReason::Requested));
         assert_eq!(installed_after_help, Some(CancellationReason::Requested));
-        assert_eq!(changed, help_from_ancestor);
+        assert_eq!(
+            changed,
+            if help_from_ancestor {
+                CancellationRequestOutcome::Requested
+            } else {
+                CancellationRequestOutcome::AlreadyRequested(CancellationReason::Requested)
+            }
+        );
     }
 
     #[test]

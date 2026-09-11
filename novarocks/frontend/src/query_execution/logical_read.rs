@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod candidate;
-mod command;
-mod execution;
-mod native;
-pub(crate) mod result;
+//! Narrow Frontend launch boundary for one prepared logical read.
 
-pub use candidate::*;
-pub use command::*;
-pub use execution::*;
-pub use native::*;
-pub use result::*;
+use novarocks_query_application::api::QueryExecutionFuture;
+use novarocks_workload_control::WorkOwner;
+
+use crate::query_execution::PreparedLogicalRead;
+
+/// Production composition injects one implementation backed by the process
+/// Query Application runtime. The SQL session transfers the complete prepared
+/// carrier and the unique governed owner without learning Native adapter parts.
+pub(crate) trait LogicalReadLauncher: Send + Sync + 'static {
+    fn start(&self, read: PreparedLogicalRead, owner: WorkOwner) -> QueryExecutionFuture;
+}

@@ -19,7 +19,7 @@ use crate::{
     CancellationReason, CancellationView, LocalResourceAuthority, ResourceClass, ResourceConfig,
     WorkError, WorkloadObservationHandle,
     admission::{PendingAdmission, Stage},
-    cancellation::Cancellation,
+    cancellation::{Cancellation, CancellationRequestOutcome, CancellationSuccessSealOutcome},
     observation::{ControlIntents, ObligationKey, ObligationRecord, OwnerState},
     queue::FairQueue,
 };
@@ -451,6 +451,7 @@ impl Inner {
 /// This type is deliberately not cloneable. Role composition keeps it in the
 /// process owner and injects only the narrower handles returned by
 /// [`Self::try_new_split`] into long-lived services.
+// Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
 pub struct WorkloadControl {
     pub(crate) inner: Arc<Inner>,
 }
@@ -900,6 +901,14 @@ impl WorkOwner {
         }
     }
 
+    pub fn success_sealer(&self) -> WorkSuccessSealer {
+        let scope = self.scope.as_ref().unwrap();
+        WorkSuccessSealer {
+            inner: Arc::clone(&scope.inner),
+            id: scope.id,
+        }
+    }
+
     pub fn cancel(&self, reason: CancellationReason) {
         self.cancellation_requester()
             .request(reason)
@@ -942,11 +951,60 @@ pub struct WorkCancellationRequester {
     id: WorkId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkCancellationRequestOutcome {
+    Requested,
+    AlreadyRequested(CancellationReason),
+    SuccessSealed,
+}
+
+#[derive(Clone)]
+pub struct WorkSuccessSealer {
+    inner: Arc<Inner>,
+    id: WorkId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkSuccessSealOutcome {
+    Sealed,
+    AlreadySealed,
+    Cancelled(CancellationReason),
+}
+
+impl WorkSuccessSealer {
+    pub fn seal(&self) -> Result<WorkSuccessSealOutcome, WorkError> {
+        let cancellation = {
+            let state = self.inner.state.lock().unwrap();
+            let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
+            if node.parent.is_some() {
+                return Err(WorkError::Conflict);
+            }
+            Arc::clone(&node.cancellation)
+        };
+        Ok(match cancellation.seal_success() {
+            CancellationSuccessSealOutcome::Sealed => WorkSuccessSealOutcome::Sealed,
+            CancellationSuccessSealOutcome::AlreadySealed => WorkSuccessSealOutcome::AlreadySealed,
+            CancellationSuccessSealOutcome::Cancelled(reason) => {
+                WorkSuccessSealOutcome::Cancelled(reason)
+            }
+        })
+    }
+}
+
 impl WorkCancellationRequester {
     /// Request cancellation for this work and its descendants. Repeated or
     /// competing requests preserve the cancellation tree's first reason.
     /// Cancellation is intent only and never releases governed resources.
     pub fn request(&self, reason: CancellationReason) -> Result<(), WorkError> {
+        self.request_with_outcome(reason).map(|_| ())
+    }
+
+    /// Request cancellation and report the exact first-wins decision made by
+    /// this workload authority.
+    pub fn request_with_outcome(
+        &self,
+        reason: CancellationReason,
+    ) -> Result<WorkCancellationRequestOutcome, WorkError> {
         let cancellation = {
             let state = self.inner.state.lock().unwrap();
             Arc::clone(
@@ -957,12 +1015,23 @@ impl WorkCancellationRequester {
                     .cancellation,
             )
         };
-        cancellation.request(reason);
-        self.inner.update(|state| {
-            let node = state.nodes.get_mut(&self.id).ok_or(WorkError::Released)?;
-            node.cancellation_signalled = true;
-            crate::observation::queue_control(state, self.id, crate::ControlIntent::Cancel)?;
-            Ok(())
+        let outcome = cancellation.request(reason);
+        if outcome != CancellationRequestOutcome::SuccessSealed {
+            self.inner.update(|state| {
+                let node = state.nodes.get_mut(&self.id).ok_or(WorkError::Released)?;
+                node.cancellation_signalled = true;
+                crate::observation::queue_control(state, self.id, crate::ControlIntent::Cancel)?;
+                Ok(())
+            })?;
+        }
+        Ok(match outcome {
+            CancellationRequestOutcome::Requested => WorkCancellationRequestOutcome::Requested,
+            CancellationRequestOutcome::AlreadyRequested(reason) => {
+                WorkCancellationRequestOutcome::AlreadyRequested(reason)
+            }
+            CancellationRequestOutcome::SuccessSealed => {
+                WorkCancellationRequestOutcome::SuccessSealed
+            }
         })
     }
 }
@@ -972,17 +1041,19 @@ impl Drop for WorkOwner {
         if let Some(scope) = self.scope.take() {
             let cancellation =
                 Arc::clone(&scope.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
-            cancellation.request(CancellationReason::OwnerDropped);
+            let cancellation_outcome = cancellation.request(CancellationReason::OwnerDropped);
             scope.inner.update(|state| {
                 if let Some(node) = state.nodes.get_mut(&scope.id) {
                     node.owner = OwnerState::Orphaned;
-                    node.cancellation_signalled = true;
-                    crate::observation::queue_control(
-                        state,
-                        scope.id,
-                        crate::ControlIntent::Cancel,
-                    )
-                    .unwrap();
+                    if cancellation_outcome != CancellationRequestOutcome::SuccessSealed {
+                        node.cancellation_signalled = true;
+                        crate::observation::queue_control(
+                            state,
+                            scope.id,
+                            crate::ControlIntent::Cancel,
+                        )
+                        .unwrap();
+                    }
                 }
             });
         }

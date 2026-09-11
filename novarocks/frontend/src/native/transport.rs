@@ -337,24 +337,29 @@ pub(crate) fn heartbeat(
     data_runtime: &FrontendDataRuntime,
     process_id: BackendProcessId,
     endpoint: RuntimeEndpoint,
+    timeout: Duration,
 ) -> HeartbeatOutcome {
     let started = Instant::now();
     let outcome = (|| -> Result<_, String> {
         let client = Client::new(endpoint.native_endpoint().clone(), data_runtime.clone());
         data_runtime.block_on(async {
-            let mut grpc = client.grpc().await?;
-            grpc.heartbeat(Request::new(
-                novarocks_proto_models::novarocks::HeartbeatRequest {
-                    expected_process_id: Some(
-                        ProtocolBackendProcessId::from_domain(process_id)
-                            .as_proto()
-                            .clone(),
-                    ),
-                },
-            ))
+            tokio::time::timeout(timeout, async {
+                let mut grpc = client.grpc().await?;
+                grpc.heartbeat(Request::new(
+                    novarocks_proto_models::novarocks::HeartbeatRequest {
+                        expected_process_id: Some(
+                            ProtocolBackendProcessId::from_domain(process_id)
+                                .as_proto()
+                                .clone(),
+                        ),
+                    },
+                ))
+                .await
+                .map(|value| value.into_inner())
+                .map_err(|error| format!("heartbeat rpc failed: {error}"))
+            })
             .await
-            .map(|value| value.into_inner())
-            .map_err(|error| format!("heartbeat rpc failed: {error}"))
+            .map_err(|_| format!("heartbeat did not complete within {timeout:?}"))?
         })?
     })();
     observe_backend_heartbeat_rtt(started.elapsed());

@@ -19,6 +19,7 @@
 //!
 //! Product services depend on this crate. The query application never depends
 //! on their implementations; role composition supplies the consumer ports.
+// Design: ADR-0144 (docs/adr/ADR-0144-application-domains-follow-stable-ownership-seams.md)
 
 pub mod api;
 
@@ -28,8 +29,9 @@ pub mod observation;
 /// Pure, topology-free preparation and its immutable execution handoff.
 pub mod preparation;
 
-// These policies are query-coordination decisions, not worker protocol. T08
-// wires them into the coordinator before this migration-only allowance goes.
+// These policies are query-coordination decisions, not worker protocol. The
+// hidden visibility supports role-adapter integration while keeping them out
+// of the consumer-facing contract.
 #[doc(hidden)]
 pub mod coordination;
 

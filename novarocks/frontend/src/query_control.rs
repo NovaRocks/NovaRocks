@@ -23,9 +23,13 @@ use std::sync::{Arc, Mutex};
 use crate::ClientConnectionToken;
 use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
 use crate::query_execution::control::{
-    ConnectionKillAuthorization, QueryCancelOutcome, QueryControlError, QueryControlPort,
-    QueryControlService, SessionIdentity, SessionToken, StatementFinishOutcome,
-    StatementRegistration, StatementToken,
+    ConnectionKillAuthorization, GovernedStatementCancellation, GovernedStatementFinishOutcome,
+    GovernedStatementRegistration, GovernedStatementVisibilitySealOutcome, QueryCancelOutcome,
+    QueryControlError, QueryControlPort, QueryControlService, SessionIdentity, SessionToken,
+    StatementFinishOutcome, StatementRegistration, StatementToken,
+};
+use novarocks_workload_control::{
+    CancellationReason, WorkCancellationRequestOutcome, WorkError, WorkSuccessSealOutcome,
 };
 
 // Design: ADR-0102 (docs/adr/ADR-0102-mysql-kill-connection-lifecycle-ownership.md)
@@ -46,11 +50,114 @@ struct SessionEntry {
     principal: Arc<str>,
     next_statement_generation: u64,
     active: Option<ActiveStatement>,
+    unregister_pending: bool,
 }
 
 struct ActiveStatement {
     generation: u64,
-    cancellation: QueryCancellationSource,
+    cancellation: ActiveStatementCancellation,
+    success_visibility_sealed: bool,
+}
+
+enum ActiveStatementCancellation {
+    Legacy(QueryCancellationSource),
+    Governed(GovernedStatementCancellation),
+}
+
+impl ActiveStatementCancellation {
+    fn request(&self, reason: QueryCancellationReason) -> QueryCancelOutcome {
+        match self {
+            Self::Legacy(cancellation) => match cancellation.request(reason) {
+                crate::common::query_cancellation::QueryCancellationRequestResult::Requested => {
+                    QueryCancelOutcome::Requested
+                }
+                crate::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
+                    reason,
+                ) => QueryCancelOutcome::AlreadyRequested(reason),
+            },
+            Self::Governed(cancellation) => {
+                let workload_reason = workload_cancellation_reason(&reason);
+                match cancellation.requester().request_with_outcome(workload_reason) {
+                    Ok(WorkCancellationRequestOutcome::Requested) => {
+                        cancellation.remember_query_reason(reason);
+                        QueryCancelOutcome::Requested
+                    }
+                    Ok(WorkCancellationRequestOutcome::AlreadyRequested(existing)) => {
+                        let first = cancellation.first_query_reason();
+                        QueryCancelOutcome::AlreadyRequested(query_cancellation_reason(
+                            existing,
+                            first.as_ref().unwrap_or(&reason),
+                        ))
+                    }
+                    Ok(WorkCancellationRequestOutcome::SuccessSealed) => {
+                        QueryCancelOutcome::NoActiveStatement
+                    }
+                    Err(error) => QueryCancelOutcome::Failed(error),
+                }
+            }
+        }
+    }
+}
+
+fn workload_cancellation_reason(reason: &QueryCancellationReason) -> CancellationReason {
+    match reason {
+        QueryCancellationReason::ExecutionCancellationRequested => CancellationReason::Requested,
+        QueryCancellationReason::ExecutionOwnerDropped => CancellationReason::OwnerDropped,
+        QueryCancellationReason::ExplicitKill {
+            requester_connection_id,
+        } => CancellationReason::ExplicitKill {
+            requester_connection_id: u64::from(*requester_connection_id),
+        },
+        QueryCancellationReason::ExplicitKillConnection {
+            requester_connection_id,
+        } => CancellationReason::ExplicitKillConnection {
+            requester_connection_id: u64::from(*requester_connection_id),
+        },
+        QueryCancellationReason::ClientDisconnected => CancellationReason::ClientDisconnected,
+        QueryCancellationReason::DeadlineExceeded { .. } => CancellationReason::DeadlineExceeded,
+        QueryCancellationReason::FrontendDrainDeadlineExceeded { .. } => {
+            CancellationReason::FrontendDrainDeadlineExceeded
+        }
+        QueryCancellationReason::ServerShutdown => CancellationReason::ServerShutdown,
+    }
+}
+
+fn query_cancellation_reason(
+    reason: CancellationReason,
+    requested: &QueryCancellationReason,
+) -> QueryCancellationReason {
+    match reason {
+        CancellationReason::ExplicitKill {
+            requester_connection_id,
+        } => QueryCancellationReason::ExplicitKill {
+            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
+        },
+        CancellationReason::ExplicitKillConnection {
+            requester_connection_id,
+        } => QueryCancellationReason::ExplicitKillConnection {
+            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
+        },
+        CancellationReason::ClientDisconnected => QueryCancellationReason::ClientDisconnected,
+        CancellationReason::DeadlineExceeded => match requested {
+            QueryCancellationReason::DeadlineExceeded { timeout_ms } => {
+                QueryCancellationReason::DeadlineExceeded {
+                    timeout_ms: *timeout_ms,
+                }
+            }
+            _ => QueryCancellationReason::DeadlineExceeded { timeout_ms: 0 },
+        },
+        CancellationReason::FrontendDrainDeadlineExceeded => match requested {
+            QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms } => {
+                QueryCancellationReason::FrontendDrainDeadlineExceeded {
+                    timeout_ms: *timeout_ms,
+                }
+            }
+            _ => QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms: 0 },
+        },
+        CancellationReason::ServerShutdown => QueryCancellationReason::ServerShutdown,
+        CancellationReason::Requested => QueryCancellationReason::ExecutionCancellationRequested,
+        CancellationReason::OwnerDropped => QueryCancellationReason::ExecutionOwnerDropped,
+    }
 }
 
 impl FrontendQueryControl {
@@ -87,6 +194,7 @@ impl QueryControlPort for FrontendQueryControl {
                 principal: Arc::from(identity.principal()),
                 next_statement_generation: 0,
                 active: None,
+                unregister_pending: false,
             },
         );
         Ok(token)
@@ -99,6 +207,23 @@ impl QueryControlPort for FrontendQueryControl {
             .get(&token.connection_id())
             .is_some_and(|entry| entry.session_epoch == token.session_epoch())
         {
+            let entry = state.sessions.get_mut(&token.connection_id()).unwrap();
+            if let Some(active) = entry.active.as_ref() {
+                entry.unregister_pending = true;
+                if !active.success_visibility_sealed
+                    && let QueryCancelOutcome::Failed(error) = active
+                        .cancellation
+                        .request(QueryCancellationReason::ClientDisconnected)
+                {
+                    tracing::error!(
+                        connection_id = token.connection_id(),
+                        session_epoch = token.session_epoch(),
+                        error = %error,
+                        "retain query-control session after workload cancellation failed"
+                    );
+                }
+                return;
+            }
             state.sessions.remove(&token.connection_id());
         }
     }
@@ -123,6 +248,9 @@ impl QueryControlPort for FrontendQueryControl {
         if entry.session_epoch != session.session_epoch() {
             return Err(QueryControlError::StaleSession);
         }
+        if entry.unregister_pending {
+            return Err(QueryControlError::UnknownSession);
+        }
         if entry.active.is_some() {
             return Err(QueryControlError::StatementBusy);
         }
@@ -136,7 +264,43 @@ impl QueryControlPort for FrontendQueryControl {
         );
         entry.active = Some(ActiveStatement {
             generation: entry.next_statement_generation,
-            cancellation,
+            cancellation: ActiveStatementCancellation::Legacy(cancellation),
+            success_visibility_sealed: false,
+        });
+        Ok(registration)
+    }
+
+    fn begin_statement_with_governed_cancellation(
+        &self,
+        session: SessionToken,
+        cancellation: GovernedStatementCancellation,
+    ) -> Result<GovernedStatementRegistration, QueryControlError> {
+        let mut state = self.lock();
+        let entry = state
+            .sessions
+            .get_mut(&session.connection_id())
+            .ok_or(QueryControlError::UnknownSession)?;
+        if entry.session_epoch != session.session_epoch() {
+            return Err(QueryControlError::StaleSession);
+        }
+        if entry.unregister_pending {
+            return Err(QueryControlError::UnknownSession);
+        }
+        if entry.active.is_some() {
+            return Err(QueryControlError::StatementBusy);
+        }
+        entry.next_statement_generation = entry.next_statement_generation.wrapping_add(1);
+        if entry.next_statement_generation == 0 {
+            entry.next_statement_generation = 1;
+        }
+        let registration = GovernedStatementRegistration::new(
+            StatementToken::new(session, entry.next_statement_generation),
+            cancellation.view().clone(),
+        );
+        entry.active = Some(ActiveStatement {
+            generation: entry.next_statement_generation,
+            cancellation: ActiveStatementCancellation::Governed(cancellation),
+            success_visibility_sealed: false,
         });
         Ok(registration)
     }
@@ -155,12 +319,153 @@ impl QueryControlPort for FrontendQueryControl {
         if active.generation != statement.generation() {
             return StatementFinishOutcome::Stale;
         }
-        let reason = active.cancellation.view().reason();
+        let ActiveStatementCancellation::Legacy(cancellation) = &active.cancellation else {
+            return StatementFinishOutcome::Stale;
+        };
+        let reason = if active.success_visibility_sealed {
+            None
+        } else {
+            cancellation.view().reason()
+        };
+        let unregister_pending = entry.unregister_pending;
         entry.active = None;
-        match reason {
+        let outcome = match reason {
             Some(reason) => StatementFinishOutcome::Cancelled(reason),
             None => StatementFinishOutcome::Completed,
+        };
+        if unregister_pending {
+            state.sessions.remove(&statement.session().connection_id());
         }
+        outcome
+    }
+
+    fn seal_governed_statement_visibility(
+        &self,
+        statement: StatementToken,
+    ) -> GovernedStatementVisibilitySealOutcome {
+        let mut state = self.lock();
+        let Some(entry) = state.sessions.get_mut(&statement.session().connection_id()) else {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        };
+        if entry.session_epoch != statement.session().session_epoch() {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        }
+        let Some(active) = entry.active.as_mut() else {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        };
+        if active.generation != statement.generation() {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        }
+        let ActiveStatementCancellation::Governed(cancellation) = &active.cancellation else {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        };
+        if active.success_visibility_sealed {
+            return GovernedStatementVisibilitySealOutcome::Sealed;
+        }
+        match cancellation.success_sealer().seal() {
+            Ok(WorkSuccessSealOutcome::Sealed | WorkSuccessSealOutcome::AlreadySealed) => {
+                active.success_visibility_sealed = true;
+                GovernedStatementVisibilitySealOutcome::Sealed
+            }
+            Ok(WorkSuccessSealOutcome::Cancelled(reason)) => {
+                GovernedStatementVisibilitySealOutcome::Cancelled(reason)
+            }
+            Err(_) => GovernedStatementVisibilitySealOutcome::Stale,
+        }
+    }
+
+    fn finish_governed_statement(
+        &self,
+        statement: StatementToken,
+    ) -> GovernedStatementFinishOutcome {
+        let mut state = self.lock();
+        let Some(entry) = state.sessions.get_mut(&statement.session().connection_id()) else {
+            return GovernedStatementFinishOutcome::Stale;
+        };
+        if entry.session_epoch != statement.session().session_epoch() {
+            return GovernedStatementFinishOutcome::Stale;
+        }
+        let Some(active) = entry.active.as_ref() else {
+            return GovernedStatementFinishOutcome::Stale;
+        };
+        if active.generation != statement.generation() {
+            return GovernedStatementFinishOutcome::Stale;
+        }
+        let ActiveStatementCancellation::Governed(cancellation) = &active.cancellation else {
+            return GovernedStatementFinishOutcome::Stale;
+        };
+        let reason = if active.success_visibility_sealed {
+            None
+        } else {
+            cancellation.view().reason()
+        };
+        let unregister_pending = entry.unregister_pending;
+        entry.active = None;
+        let outcome = match reason {
+            Some(reason) => GovernedStatementFinishOutcome::Cancelled(reason),
+            None => GovernedStatementFinishOutcome::Completed,
+        };
+        if unregister_pending {
+            state.sessions.remove(&statement.session().connection_id());
+        }
+        outcome
+    }
+
+    fn fail_governed_statement(&self, statement: StatementToken) -> GovernedStatementFinishOutcome {
+        let mut state = self.lock();
+        let Some(entry) = state.sessions.get_mut(&statement.session().connection_id()) else {
+            return GovernedStatementFinishOutcome::Stale;
+        };
+        if entry.session_epoch != statement.session().session_epoch() {
+            return GovernedStatementFinishOutcome::Stale;
+        }
+        let Some(active) = entry.active.as_ref() else {
+            return GovernedStatementFinishOutcome::Stale;
+        };
+        if active.generation != statement.generation()
+            || !matches!(
+                active.cancellation,
+                ActiveStatementCancellation::Governed(_)
+            )
+        {
+            return GovernedStatementFinishOutcome::Stale;
+        }
+        let unregister_pending = entry.unregister_pending;
+        entry.active = None;
+        if unregister_pending {
+            state.sessions.remove(&statement.session().connection_id());
+        }
+        GovernedStatementFinishOutcome::ProtocolFailed
+    }
+
+    fn cancel_governed_statement(
+        &self,
+        statement: StatementToken,
+        reason: CancellationReason,
+    ) -> Result<Option<WorkCancellationRequestOutcome>, WorkError> {
+        let state = self.lock();
+        let Some(entry) = state.sessions.get(&statement.session().connection_id()) else {
+            return Ok(None);
+        };
+        if entry.session_epoch != statement.session().session_epoch() {
+            return Ok(None);
+        }
+        let Some(active) = entry.active.as_ref() else {
+            return Ok(None);
+        };
+        if active.generation != statement.generation() {
+            return Ok(None);
+        }
+        if active.success_visibility_sealed {
+            return Ok(None);
+        }
+        let ActiveStatementCancellation::Governed(cancellation) = &active.cancellation else {
+            return Ok(None);
+        };
+        cancellation
+            .requester()
+            .request_with_outcome(reason)
+            .map(Some)
     }
 
     fn cancel_session_statement(
@@ -178,14 +483,10 @@ impl QueryControlPort for FrontendQueryControl {
         let Some(active) = entry.active.as_ref() else {
             return QueryCancelOutcome::NoActiveStatement;
         };
-        match active.cancellation.request(reason) {
-            crate::common::query_cancellation::QueryCancellationRequestResult::Requested => {
-                QueryCancelOutcome::Requested
-            }
-            crate::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
-                reason,
-            ) => QueryCancelOutcome::AlreadyRequested(reason),
+        if active.success_visibility_sealed {
+            return QueryCancelOutcome::NoActiveStatement;
         }
+        active.cancellation.request(reason)
     }
 
     fn kill_query(&self, requester: SessionToken, target_connection_id: u32) -> QueryCancelOutcome {
@@ -206,18 +507,14 @@ impl QueryControlPort for FrontendQueryControl {
         let Some(active) = target_entry.active.as_ref() else {
             return QueryCancelOutcome::NoActiveStatement;
         };
-        match active
+        if active.success_visibility_sealed {
+            return QueryCancelOutcome::NoActiveStatement;
+        }
+        active
             .cancellation
             .request(QueryCancellationReason::ExplicitKill {
                 requester_connection_id: requester.connection_id(),
-            }) {
-            crate::common::query_cancellation::QueryCancellationRequestResult::Requested => {
-                QueryCancelOutcome::Requested
-            }
-            crate::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
-                reason,
-            ) => QueryCancelOutcome::AlreadyRequested(reason),
-        }
+            })
     }
 
     fn authorize_connection_kill(
@@ -245,7 +542,17 @@ impl QueryControlPort for FrontendQueryControl {
         let state = self.lock();
         for entry in state.sessions.values() {
             if let Some(active) = entry.active.as_ref() {
-                let _ = active.cancellation.request(reason.clone());
+                if active.success_visibility_sealed {
+                    continue;
+                }
+                if let QueryCancelOutcome::Failed(error) =
+                    active.cancellation.request(reason.clone())
+                {
+                    tracing::error!(
+                        error = %error,
+                        "failed to request governed statement cancellation during cancel-all"
+                    );
+                }
             }
         }
     }
@@ -254,7 +561,8 @@ impl QueryControlPort for FrontendQueryControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_execution::control::QueryControlPort;
+    use crate::query_execution::control::{GovernedQueryStatementBeginError, QueryControlPort};
+    use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     fn register(
         control: &FrontendQueryControl,
@@ -276,6 +584,17 @@ mod tests {
         let first = register(&control, 7, 1, "root");
         let old = control.begin_statement(first).expect("begin old");
         control.unregister_session(first);
+        assert!(matches!(
+            control.register_session(SessionIdentity::new(
+                ClientConnectionToken::new(7, 2).expect("valid connection token"),
+                "root",
+            )),
+            Err(QueryControlError::ConnectionIdInUse)
+        ));
+        assert_eq!(
+            control.finish_statement(old.token()),
+            StatementFinishOutcome::Cancelled(QueryCancellationReason::ClientDisconnected)
+        );
         let second = register(&control, 7, 2, "root");
         let current = control.begin_statement(second).expect("begin current");
         assert_eq!(
@@ -423,5 +742,324 @@ mod tests {
             )
         );
         control.unregister_session(successor);
+    }
+
+    fn governed_control() -> (
+        Arc<FrontendQueryControl>,
+        QueryControlService,
+        WorkloadControl,
+    ) {
+        let control = Arc::new(FrontendQueryControl::default());
+        let service = QueryControlService::new(control.clone());
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .expect("workload authority");
+        workload.mark_ready().expect("workload authority ready");
+        (control, service, workload)
+    }
+
+    #[test]
+    fn governed_kill_requests_the_registered_work_scope() {
+        let (control, service, workload) = governed_control();
+        let target = register(&control, 7, 1, "root");
+        let requester = register(&control, 8, 1, "root");
+        let mut statement = service
+            .begin_governed_query_statement(target, &workload.root_admission(), None, None)
+            .expect("governed query statement");
+        let owner = statement
+            .take_execution_owner()
+            .expect("root owner transfers once");
+
+        assert_eq!(
+            control.kill_query(requester, target.connection_id()),
+            QueryCancelOutcome::Requested
+        );
+        assert_eq!(
+            statement.cancellation().reason(),
+            Some(CancellationReason::ExplicitKill {
+                requester_connection_id: u64::from(requester.connection_id()),
+            })
+        );
+        owner.complete();
+        assert_eq!(
+            statement.finish(),
+            GovernedStatementFinishOutcome::Cancelled(CancellationReason::ExplicitKill {
+                requester_connection_id: u64::from(requester.connection_id()),
+            })
+        );
+        assert_eq!(workload.snapshot().businesses, 0);
+    }
+
+    #[test]
+    fn governed_late_kill_reports_the_existing_owner_drop_reason() {
+        let (control, service, workload) = governed_control();
+        let target = register(&control, 7, 1, "root");
+        let requester = register(&control, 8, 1, "root");
+        let statement = service
+            .begin_governed_query_statement(target, &workload.root_admission(), None, None)
+            .expect("governed query statement");
+
+        assert_eq!(
+            control
+                .cancel_session_statement(target, QueryCancellationReason::ExecutionOwnerDropped,),
+            QueryCancelOutcome::Requested
+        );
+        assert_eq!(
+            control.kill_query(requester, target.connection_id()),
+            QueryCancelOutcome::AlreadyRequested(QueryCancellationReason::ExecutionOwnerDropped,)
+        );
+        assert_eq!(
+            statement.finish(),
+            GovernedStatementFinishOutcome::Cancelled(CancellationReason::OwnerDropped)
+        );
+    }
+
+    #[test]
+    fn governed_disconnect_and_timeout_use_the_same_workload_authority() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .expect("governed query statement");
+        let owner = statement
+            .take_execution_owner()
+            .expect("root owner transfers once");
+
+        assert_eq!(
+            control.cancel_session_statement(
+                session,
+                QueryCancellationReason::DeadlineExceeded { timeout_ms: 50 },
+            ),
+            QueryCancelOutcome::Requested
+        );
+        assert_eq!(
+            control.cancel_session_statement(session, QueryCancellationReason::ClientDisconnected,),
+            QueryCancelOutcome::AlreadyRequested(QueryCancellationReason::DeadlineExceeded {
+                timeout_ms: 50,
+            })
+        );
+        assert_eq!(
+            statement.cancellation().reason(),
+            Some(CancellationReason::DeadlineExceeded)
+        );
+        owner.complete();
+        assert_eq!(
+            statement.finish(),
+            GovernedStatementFinishOutcome::Cancelled(CancellationReason::DeadlineExceeded)
+        );
+
+        let session_lease = service
+            .register_session(SessionIdentity::new(
+                ClientConnectionToken::new(9, 1).expect("valid connection token"),
+                "root",
+            ))
+            .expect("register second session");
+        let session = session_lease.token();
+        let statement = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .expect("second governed query statement");
+        drop(session_lease);
+        assert_eq!(
+            statement.cancellation().reason(),
+            Some(CancellationReason::ClientDisconnected)
+        );
+    }
+
+    #[test]
+    fn governed_generation_and_business_permit_span_execution_start_to_protocol_finish() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let mut first = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .expect("first governed query statement");
+        let first_generation = first.token().generation();
+        let owner = first
+            .take_execution_owner()
+            .expect("execution start consumes the root owner");
+        owner.complete();
+
+        assert_eq!(workload.snapshot().businesses, 1);
+        assert!(matches!(
+            service.begin_governed_query_statement(session, &workload.root_admission(), None, None),
+            Err(GovernedQueryStatementBeginError::QueryControl(
+                QueryControlError::StatementBusy
+            ))
+        ));
+        assert_eq!(
+            workload.snapshot().businesses,
+            1,
+            "rejected successor admission rolls back its root and business permit"
+        );
+
+        assert_eq!(first.finish(), GovernedStatementFinishOutcome::Completed);
+        assert_eq!(workload.snapshot().businesses, 0);
+        let second = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .expect("protocol completion releases the next generation");
+        assert!(second.token().generation() > first_generation);
+    }
+
+    #[test]
+    fn governed_success_seal_wins_against_late_kill_until_protocol_finish() {
+        let (control, service, workload) = governed_control();
+        let target = register(&control, 7, 1, "root");
+        let requester = register(&control, 8, 1, "root");
+        let mut statement = service
+            .begin_governed_query_statement(target, &workload.root_admission(), None, None)
+            .expect("governed query statement");
+        statement
+            .take_execution_owner()
+            .expect("execution owner")
+            .complete();
+
+        assert_eq!(
+            statement.seal_success_visibility(),
+            GovernedStatementVisibilitySealOutcome::Sealed
+        );
+        assert_eq!(workload.snapshot().businesses, 1);
+        assert_eq!(
+            control.kill_query(requester, target.connection_id()),
+            QueryCancelOutcome::NoActiveStatement
+        );
+        assert_eq!(statement.cancellation().reason(), None);
+        assert_eq!(
+            statement.finish(),
+            GovernedStatementFinishOutcome::Completed
+        );
+        assert_eq!(workload.snapshot().businesses, 0);
+    }
+
+    #[test]
+    fn governed_eof_failure_after_success_seal_is_protocol_failed() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .expect("governed query statement");
+        statement
+            .take_execution_owner()
+            .expect("execution owner")
+            .complete();
+
+        assert_eq!(
+            statement.seal_success_visibility(),
+            GovernedStatementVisibilitySealOutcome::Sealed
+        );
+        assert_eq!(
+            statement.protocol_fail(),
+            GovernedStatementFinishOutcome::ProtocolFailed
+        );
+        assert_eq!(workload.snapshot().businesses, 0);
+    }
+
+    #[test]
+    fn governed_internal_protocol_failure_does_not_fabricate_cancellation() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .expect("governed query statement");
+        let cancellation = statement.cancellation().clone();
+        statement
+            .take_execution_owner()
+            .expect("execution owner")
+            .complete();
+
+        assert_eq!(
+            statement.protocol_fail(),
+            GovernedStatementFinishOutcome::ProtocolFailed
+        );
+        assert_eq!(cancellation.reason(), None);
+        assert_eq!(workload.snapshot().businesses, 0);
+    }
+
+    #[test]
+    fn unregister_is_deferred_until_the_active_generation_settles() {
+        let (control, service, workload) = governed_control();
+        let connection = ClientConnectionToken::new(17, 1).expect("connection token");
+        let session = service
+            .register_session(SessionIdentity::new(connection, "root"))
+            .expect("register session");
+        let token = session.token();
+        let statement = service
+            .begin_governed_query_statement(token, &workload.root_admission(), None, None)
+            .expect("begin governed statement");
+
+        drop(session);
+        assert!(
+            matches!(
+                service.register_session(SessionIdentity::new(connection, "root")),
+                Err(QueryControlError::ConnectionIdInUse)
+            ),
+            "the registry retains the deferred unregister owner"
+        );
+        assert_eq!(
+            statement.protocol_fail(),
+            GovernedStatementFinishOutcome::ProtocolFailed
+        );
+        let successor = service
+            .register_session(SessionIdentity::new(connection, "root"))
+            .expect("settlement completes deferred unregister");
+        assert_ne!(successor.token().session_epoch(), token.session_epoch());
+        drop(successor);
+        assert!(
+            !control
+                .lock()
+                .sessions
+                .contains_key(&connection.connection_id())
+        );
+    }
+
+    #[tokio::test]
+    async fn governed_root_deadline_is_observed_without_a_legacy_cancellation_source() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+        let statement = service
+            .begin_governed_query_statement(
+                session,
+                &workload.root_admission(),
+                Some(deadline),
+                Some(1),
+            )
+            .expect("deadline-bound governed query statement");
+
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                statement.cancellation().cancelled(),
+            )
+            .await
+            .expect("deadline cancellation arrives"),
+            CancellationReason::DeadlineExceeded
+        );
+    }
+
+    #[test]
+    fn dropping_protocol_owner_after_execution_handoff_cancels_the_same_root() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .expect("governed query statement");
+        let scope = statement.scope().clone();
+        let owner = statement
+            .take_execution_owner()
+            .expect("execution owner transfers once");
+
+        drop(statement);
+
+        assert_eq!(
+            scope.cancellation().expect("root remains owned").reason(),
+            Some(CancellationReason::OwnerDropped)
+        );
+        assert_eq!(workload.snapshot().businesses, 0);
+        owner.complete();
     }
 }

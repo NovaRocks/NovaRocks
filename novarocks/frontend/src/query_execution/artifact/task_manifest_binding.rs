@@ -45,6 +45,8 @@ use super::{
 /// membership or reconstructing a compatibility decision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundManifestBackend {
+    target: LiveBackendTarget,
+    backend_idx: usize,
     process_id: BackendProcessId,
     endpoint: RuntimeEndpoint,
     admission_epoch_capability: AdmissionEpochCapability,
@@ -52,6 +54,14 @@ pub(crate) struct BoundManifestBackend {
 }
 
 impl BoundManifestBackend {
+    pub(crate) const fn target(&self) -> &LiveBackendTarget {
+        &self.target
+    }
+
+    pub(crate) const fn backend_idx(&self) -> usize {
+        self.backend_idx
+    }
+
     pub(crate) const fn process_id(&self) -> BackendProcessId {
         self.process_id
     }
@@ -872,6 +882,8 @@ fn validate_backend_snapshot(
                 ))
             })?;
         let backend = BoundManifestBackend {
+            target: target.clone(),
+            backend_idx: target.backend_idx(),
             process_id: process,
             endpoint: endpoint.clone(),
             admission_epoch_capability: target.admission_epoch_capability(),

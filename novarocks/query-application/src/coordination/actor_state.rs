@@ -17,7 +17,7 @@
 
 #![allow(
     dead_code,
-    reason = "T08 keeps unconnected replacement and delivery transitions private during actor cutover"
+    reason = "the actor reducer keeps transition helpers private until each state is reachable"
 )]
 
 use std::collections::BTreeMap;

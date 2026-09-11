@@ -83,7 +83,7 @@ pub fn prove_selected_mv_query_inputs(
 ) -> Result<SelectedMvQueryInputs, String> {
     if consistency != QueryConsistency::Strict {
         return Err(
-            "UEA-1 currently validates MV candidate matches only at strict consistency".to_string(),
+            "MV candidate matching currently supports only strict query consistency".to_string(),
         );
     }
     let publication_inputs = rewrite_action.publication_inputs();

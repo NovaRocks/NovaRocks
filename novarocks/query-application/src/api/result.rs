@@ -487,6 +487,31 @@ impl BatchDelivery {
         }
     }
 
+    /// Release decoded-result credit after an in-process application sink has
+    /// accepted this batch. This is distinct from protocol completion: no
+    /// protocol reservation or write exists for scalar/session consumers.
+    pub fn complete_decoded(mut self) -> Result<(), QueryExecutionError> {
+        let stage = self
+            .credit
+            .as_ref()
+            .expect("batch delivery owns credit before completion")
+            .stage();
+        if stage != ResultCreditStage::DecodedQueued {
+            let error = invalid_result_delivery(format!(
+                "decoded application sink requires DecodedQueued credit, got {stage:?}"
+            ));
+            drop(self.decoded.take());
+            drop(self.credit.take());
+            self.signal
+                .finish(ResultDeliveryDisposition::Failed(error.clone()));
+            return Err(error);
+        }
+        drop(self.decoded.take());
+        drop(self.credit.take());
+        self.signal.finish(ResultDeliveryDisposition::Completed);
+        Ok(())
+    }
+
     pub fn fail(mut self, error: QueryExecutionError) {
         drop(self.decoded.take());
         drop(self.credit.take());
@@ -504,8 +529,10 @@ impl Drop for BatchDelivery {
     }
 }
 
-/// Successful EOF for one exact execution. Only the logical execution owner
-/// may construct this after the attempt has reached stable success.
+/// Successful EOF for one exact execution. Only the logical execution actor
+/// may construct this after it has irreversibly committed logical success.
+/// The consumer disposition settles visible transport only; it cannot revoke
+/// or replace that logical conclusion.
 pub struct EndDelivery {
     execution_id: QueryExecutionId,
     sequence: ResultPacketSequence,
@@ -536,10 +563,13 @@ impl EndDelivery {
         self.sequence
     }
 
+    /// Records successful transport of the actor-authorized EOF.
     pub fn complete(mut self) {
         self.signal.finish(ResultDeliveryDisposition::Completed);
     }
 
+    /// Records failed transport of the actor-authorized EOF. The protocol or
+    /// application owner decides its externally visible outcome separately.
     pub fn fail(mut self, error: QueryExecutionError) {
         self.signal.finish(ResultDeliveryDisposition::Failed(error));
     }

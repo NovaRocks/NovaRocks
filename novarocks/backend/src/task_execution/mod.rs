@@ -39,7 +39,7 @@
 //! fragment-based lifecycle stack still owns every query, and binding this
 //! owner to execution, then retiring the stack it replaces, are separate
 //! steps.
-// Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
+// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
 mod clock;
 mod completion;

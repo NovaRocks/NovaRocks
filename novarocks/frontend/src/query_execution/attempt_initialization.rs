@@ -33,17 +33,19 @@ use novarocks_spi::connector::read_stack::ConnectorReadBinding;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
 use novarocks_sql::plan_read::FragmentId;
 
-use super::split_assignment_round::{
-    OpenRoundSplitSources, OpenedRoundSplitSource, RoundSplitAssignmentPlan,
-    RoundSplitSourceRecipe, assignment_endpoints, assignment_targets, open_round_split_source,
-};
 use crate::common::query_cancellation::QueryCancellationView;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::artifact::{PreparedDistributedQuery, ValidatedFragmentSchedule};
 use crate::query_execution::completion::QueryAttemptReservation;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
+use crate::query_execution::lifecycle_plan::{
+    AttemptCredentialLeaseCollector, QueryCredentialLeases,
+};
 use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
+use crate::query_execution::split_assignment_round::{
+    OpenRoundSplitSources, OpenedRoundSplitSource, RoundSplitAssignmentPlan,
+    RoundSplitSourceRecipe, assignment_endpoints, assignment_targets, open_round_split_source,
+};
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::blocking_io::{
     ConnectorBlockingIoAdmission, ConnectorBlockingIoJob, ConnectorBlockingIoSupervisor,
@@ -61,8 +63,12 @@ fn connector_context_for_single_scan(context: &ConnectorRequestContext) -> Conne
 
 /// Credential material stays under its planning collector until every split
 /// source of this exact attempt is open.
-pub(super) enum RoundCredentialLeaseSource {
+pub(crate) enum RoundCredentialLeaseSource {
     Frozen(QueryCredentialLeases),
+    Fresh {
+        collector: Arc<AttemptCredentialLeaseCollector>,
+        request_scope: ConnectorRequestScope,
+    },
     Reservation {
         reservation: Option<QueryAttemptReservation>,
         observed_collected: Option<Arc<AtomicBool>>,
@@ -70,12 +76,26 @@ pub(super) enum RoundCredentialLeaseSource {
 }
 
 impl RoundCredentialLeaseSource {
-    pub(super) fn connector_request_context(
+    pub(crate) fn fresh(execution: QueryExecutionId) -> Self {
+        Self::Fresh {
+            collector: AttemptCredentialLeaseCollector::new(execution),
+            request_scope: ConnectorRequestScope::new(),
+        }
+    }
+
+    pub(crate) fn connector_request_context(
         &self,
         context: ConnectorRequestContext,
     ) -> ConnectorRequestContext {
         match self {
             Self::Frozen(_) => context,
+            Self::Fresh {
+                collector,
+                request_scope,
+            } => context
+                .with_request_scope(request_scope.clone())
+                .with_storage_resolver(collector.storage_resolver())
+                .with_vended_credential_lease_sink(collector.sink()),
             Self::Reservation { reservation, .. } => reservation
                 .as_ref()
                 .expect("attempt reservation exists before credential sealing")
@@ -99,6 +119,7 @@ impl RoundCredentialLeaseSource {
         self.publish_observed();
         match &mut self {
             Self::Frozen(leases) => Ok(std::mem::replace(leases, QueryCredentialLeases::empty())),
+            Self::Fresh { collector, .. } => collector.into_credential_leases(),
             Self::Reservation { reservation, .. } => reservation
                 .take()
                 .expect("attempt reservation is consumed exactly once")
@@ -154,14 +175,50 @@ trait SerialAttemptInitialization: Send + Sized + 'static {
 #[derive(Clone)]
 struct AttemptInitializationLifecycle {
     deadline: Instant,
-    cancellation: QueryCancellationView,
+    cancellation: AttemptInitializationCancellation,
+}
+
+#[derive(Clone)]
+enum AttemptInitializationCancellation {
+    Legacy(QueryCancellationView),
+    Governed(novarocks_workload_control::CancellationView),
+}
+
+impl AttemptInitializationCancellation {
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Legacy(cancellation) => cancellation.is_cancelled(),
+            Self::Governed(cancellation) => cancellation.reason().is_some(),
+        }
+    }
+
+    async fn cancelled(&self) {
+        match self {
+            Self::Legacy(cancellation) => {
+                cancellation.cancelled().await;
+            }
+            Self::Governed(cancellation) => {
+                cancellation.cancelled().await;
+            }
+        }
+    }
 }
 
 impl AttemptInitializationLifecycle {
     fn new(deadline: Instant, cancellation: QueryCancellationView) -> Self {
         Self {
             deadline,
-            cancellation,
+            cancellation: AttemptInitializationCancellation::Legacy(cancellation),
+        }
+    }
+
+    fn governed(
+        deadline: Instant,
+        cancellation: novarocks_workload_control::CancellationView,
+    ) -> Self {
+        Self {
+            deadline,
+            cancellation: AttemptInitializationCancellation::Governed(cancellation),
         }
     }
 
@@ -385,7 +442,7 @@ impl SerialAttemptInitialization for ProductionInitializationState {
 
 /// The only pre-round state. It owns source recipes and attempt credentials,
 /// but exposes neither until every source has opened under this attempt.
-pub(super) struct AttemptInitializing {
+pub(crate) struct AttemptInitializing {
     runtime: FrontendDataRuntime,
     lifecycle: AttemptInitializationLifecycle,
     state: ProductionInitializationState,
@@ -396,7 +453,7 @@ impl AttemptInitializing {
         clippy::too_many_arguments,
         reason = "Each input is an independently frozen fact needed before an attempt may become ready."
     )]
-    pub(super) fn new(
+    pub(crate) fn new(
         execution_id: QueryExecutionId,
         artifacts: PreparedDistributedQuery,
         schedule: ValidatedFragmentSchedule,
@@ -407,6 +464,38 @@ impl AttemptInitializing {
         cancellation: QueryCancellationView,
         runtime: FrontendDataRuntime,
         credential_lease_source: RoundCredentialLeaseSource,
+    ) -> Result<Self, DistributedQueryError> {
+        let lifecycle =
+            AttemptInitializationLifecycle::new(connector_context.deadline(), cancellation);
+        Self::from_lifecycle(
+            execution_id,
+            artifacts,
+            schedule,
+            retry_policy,
+            feedback,
+            initial_dynamic_filter_wait_cap,
+            connector_context,
+            runtime,
+            credential_lease_source,
+            lifecycle,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Each input is an independently frozen fact needed before an attempt may become ready."
+    )]
+    fn from_lifecycle(
+        execution_id: QueryExecutionId,
+        artifacts: PreparedDistributedQuery,
+        schedule: ValidatedFragmentSchedule,
+        retry_policy: TaskUpdateRetryPolicy,
+        feedback: Arc<RuntimeFilterFeedbackState>,
+        initial_dynamic_filter_wait_cap: Duration,
+        connector_context: ConnectorRequestContext,
+        runtime: FrontendDataRuntime,
+        credential_lease_source: RoundCredentialLeaseSource,
+        lifecycle: AttemptInitializationLifecycle,
     ) -> Result<Self, DistributedQueryError> {
         if schedule.execution_id() != execution_id {
             return Err(DistributedQueryError::new(
@@ -421,8 +510,6 @@ impl AttemptInitializing {
         let session =
             crate::query_execution::compiler::typed_connector_session().map_err(failed)?;
         let blocking_io = runtime.connector_blocking_io().clone();
-        let lifecycle =
-            AttemptInitializationLifecycle::new(connector_context.deadline(), cancellation);
         let permits_confidential_credential_leases = runtime
             .native_transport()
             .permits_confidential_credential_leases();
@@ -448,7 +535,43 @@ impl AttemptInitializing {
         })
     }
 
-    pub(super) async fn initialize(self) -> Result<AttemptReady, DistributedQueryError> {
+    /// Build the same attempt-local source owner for the query application's
+    /// governed cancellation lifetime. The schedule supplied here is already
+    /// a one-way projection of the exact Task manifest; this constructor does
+    /// not read topology or invoke placement policy.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Each input is an independently frozen fact needed before an attempt may become ready."
+    )]
+    pub(crate) fn new_governed(
+        execution_id: QueryExecutionId,
+        artifacts: PreparedDistributedQuery,
+        schedule: ValidatedFragmentSchedule,
+        retry_policy: TaskUpdateRetryPolicy,
+        feedback: Arc<RuntimeFilterFeedbackState>,
+        initial_dynamic_filter_wait_cap: Duration,
+        connector_context: ConnectorRequestContext,
+        cancellation: novarocks_workload_control::CancellationView,
+        runtime: FrontendDataRuntime,
+        credential_lease_source: RoundCredentialLeaseSource,
+    ) -> Result<Self, DistributedQueryError> {
+        let lifecycle =
+            AttemptInitializationLifecycle::governed(connector_context.deadline(), cancellation);
+        Self::from_lifecycle(
+            execution_id,
+            artifacts,
+            schedule,
+            retry_policy,
+            feedback,
+            initial_dynamic_filter_wait_cap,
+            connector_context,
+            runtime,
+            credential_lease_source,
+            lifecycle,
+        )
+    }
+
+    pub(crate) async fn initialize(self) -> Result<AttemptReady, DistributedQueryError> {
         drive_attempt_initialization(
             self.runtime.connector_blocking_io().clone(),
             self.lifecycle,
@@ -460,7 +583,7 @@ impl AttemptInitializing {
 
 /// Move-only proof that source-open, exact generation checks, and credential
 /// sealing all completed before task-round construction.
-pub(super) struct AttemptReady {
+pub(crate) struct AttemptReady {
     execution_id: QueryExecutionId,
     artifacts: PreparedDistributedQuery,
     schedule: ValidatedFragmentSchedule,
@@ -470,7 +593,7 @@ pub(super) struct AttemptReady {
 }
 
 impl AttemptReady {
-    pub(super) fn into_parts(
+    pub(crate) fn into_parts(
         self,
     ) -> (
         QueryExecutionId,

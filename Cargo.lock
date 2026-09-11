@@ -4056,7 +4056,6 @@ dependencies = [
  "novarocks-sql",
  "novarocks-state-store-api",
  "novarocks-state-store-sqlite",
- "novarocks-task-codec",
  "novarocks-test-support",
  "novarocks-types",
  "novarocks-version",

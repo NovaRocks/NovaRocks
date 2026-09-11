@@ -6364,6 +6364,14 @@ generation = "v1"
 kind = "s3"
 access_key_id = "admin"
 access_key_secret = "admin123"
+
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "test-metadata"
+generation = "v1"
+kind = "s3"
+access_key_id = "admin"
+access_key_secret = "admin123"
 "#;
 
         let fe = render_cross_process_config(base, ClusterProcessRole::Fe, 0, &runtime)
@@ -6378,11 +6386,18 @@ access_key_secret = "admin123"
         assert!(be_value.get("metadata").is_none());
         assert_eq!(
             fe_value["connector"]["credentials"][0]["purpose"].as_str(),
-            Some("object-store-data")
+            Some("object-store-metadata")
         );
         assert_eq!(
             fe_value["connector"]["credentials"][0]["name"].as_str(),
-            Some("test-data")
+            Some("test-metadata")
+        );
+        assert_eq!(
+            fe_value["connector"]["credentials"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
         assert_eq!(
             fe_value["standalone_server"]["mysql_port"].as_integer(),
@@ -6398,6 +6413,13 @@ access_key_secret = "admin123"
                 .get("connector")
                 .and_then(|value| value.get("credentials"))
                 .is_some()
+        );
+        assert_eq!(
+            be_value["connector"]["credentials"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
     }
 

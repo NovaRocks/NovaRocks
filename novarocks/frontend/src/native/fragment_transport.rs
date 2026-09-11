@@ -497,7 +497,8 @@ impl NativeTaskResultTransport {
                 encode_fetch_task_result(root_task, max_wait, acknowledged, max_result_bytes);
             let wait = max_wait.get();
             let deadline = grace.deadline_for(wait);
-            let mut grpc = tokio::time::timeout(deadline, client.grpc_with_channel_error())
+            let expires_at = tokio::time::Instant::now() + deadline;
+            let mut grpc = tokio::time::timeout_at(expires_at, client.grpc_with_channel_error())
                 .await
                 .map_err(|_| {
                     NativeRootResultFetchError::infrastructure(format!(
@@ -506,7 +507,7 @@ impl NativeTaskResultTransport {
                     ))
                 })?
                 .map_err(|error| NativeRootResultFetchError::infrastructure(error.to_string()))?;
-            let response = tokio::time::timeout(deadline, grpc.fetch_task_result(request))
+            let response = tokio::time::timeout_at(expires_at, grpc.fetch_task_result(request))
                 .await
                 .map_err(|_| {
                     NativeRootResultFetchError::infrastructure(format!(
@@ -523,21 +524,31 @@ impl NativeTaskResultTransport {
 }
 
 fn classify_fetch_task_result_rpc_status(error: tonic::Status) -> NativeRootResultFetchError {
+    let unknown_is_transport = error.code() == tonic::Code::Unknown
+        && (std::error::Error::source(&error).is_some()
+            || error.message().starts_with("Service was not ready: "));
     let detail = format!("fetch_task_result rpc failed: {error}");
     match error.code() {
-        // These two codes state that the exact backend endpoint could not
-        // complete the request in this attempt's bounded transport window.
+        // These statuses state that the exact backend endpoint or its HTTP/2
+        // transport could not complete the request in this attempt's bounded
+        // transport window.
         tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+            NativeRootResultFetchError::infrastructure(detail)
+        }
+        tonic::Code::Unknown if unknown_is_transport => {
             NativeRootResultFetchError::infrastructure(detail)
         }
         // A peer that explicitly refuses work for capacity reasons has made a
         // resource-governance decision rather than disappearing.
         tonic::Code::ResourceExhausted => NativeRootResultFetchError::resource_governance(detail),
-        // Every other gRPC status is an answered protocol, identity,
-        // authorization, or server-contract refusal. Retrying it as a lost
-        // endpoint can repeat an invalid request indefinitely. Attempt
-        // execution failure is learned from the accepted Task status
-        // projection, never inferred from this transport status.
+        // The FetchResult response carries every application-owned refusal in
+        // band. Tonic's generated client maps service-readiness failures to a
+        // source-less Unknown with a fixed generated prefix; HTTP/2 failures
+        // retain an error source. A source-less remote Unknown is ambiguous and
+        // therefore remains a contract failure. Every other gRPC status is an
+        // answered protocol, identity, authorization, or server-contract
+        // refusal. Attempt execution failure is learned from the accepted Task
+        // status projection, never inferred from this transport status.
         _ => NativeRootResultFetchError::contract(detail),
     }
 }
@@ -627,7 +638,8 @@ impl TaskResultTransport for NativeTaskResultTransport {
         // whose whole point is not to hold a client-visible completion.
         let deadline = self.grace.deadline_for(std::time::Duration::ZERO);
         let response = self.data_runtime.block_on(async {
-            let mut grpc = tokio::time::timeout(deadline, client.grpc_with_channel_error())
+            let expires_at = tokio::time::Instant::now() + deadline;
+            let mut grpc = tokio::time::timeout_at(expires_at, client.grpc_with_channel_error())
                 .await
                 .map_err(|_| {
                     format!(
@@ -636,7 +648,7 @@ impl TaskResultTransport for NativeTaskResultTransport {
                     )
                 })?
                 .map_err(|error| error.to_string())?;
-            tokio::time::timeout(deadline, grpc.get_final_task_info(request))
+            tokio::time::timeout_at(expires_at, grpc.get_final_task_info(request))
                 .await
                 .map_err(|_| {
                     format!(
@@ -683,29 +695,25 @@ impl TaskResultTransport for NativeTaskResultTransport {
         let response = self
             .data_runtime
             .block_on(async {
-                let mut grpc = tokio::time::timeout(
-                    DYNAMIC_FILTER_READ_TIMEOUT,
-                    client.grpc_with_channel_error(),
-                )
-                .await
-                .map_err(|_| {
-                    DynamicFilterReadError::Unavailable(format!(
-                        "{address}: dynamic filter read could not acquire a channel in time"
-                    ))
-                })?
-                .map_err(|error| DynamicFilterReadError::Unavailable(error.to_string()))?;
-                tokio::time::timeout(
-                    DYNAMIC_FILTER_READ_TIMEOUT,
-                    grpc.fetch_task_dynamic_filters(request),
-                )
-                .await
-                .map_err(|_| {
-                    DynamicFilterReadError::Unavailable(format!(
-                        "{address}: dynamic filter read did not answer in time"
-                    ))
-                })?
-                .map(tonic::Response::into_inner)
-                .map_err(|error| classify_dynamic_filter_status(&address, &error))
+                let expires_at = tokio::time::Instant::now() + DYNAMIC_FILTER_READ_TIMEOUT;
+                let mut grpc =
+                    tokio::time::timeout_at(expires_at, client.grpc_with_channel_error())
+                        .await
+                        .map_err(|_| {
+                            DynamicFilterReadError::Unavailable(format!(
+                                "{address}: dynamic filter read could not acquire a channel in time"
+                            ))
+                        })?
+                        .map_err(|error| DynamicFilterReadError::Unavailable(error.to_string()))?;
+                tokio::time::timeout_at(expires_at, grpc.fetch_task_dynamic_filters(request))
+                    .await
+                    .map_err(|_| {
+                        DynamicFilterReadError::Unavailable(format!(
+                            "{address}: dynamic filter read did not answer in time"
+                        ))
+                    })?
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| classify_dynamic_filter_status(&address, &error))
             })
             .map_err(DynamicFilterReadError::Unavailable)??;
         let answered = response
@@ -1178,6 +1186,32 @@ mod tests {
                 AttemptFailureClass::RecoverableInfrastructure
             );
         }
+
+        let generated_readiness = classify_fetch_task_result_rpc_status(tonic::Status::unknown(
+            "Service was not ready: transport error",
+        ))
+        .into_pump_failure();
+        assert_eq!(
+            generated_readiness.class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        let sourced_transport =
+            classify_fetch_task_result_rpc_status(tonic::Status::from_error(Box::new(
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset"),
+            )))
+            .into_pump_failure();
+        assert_eq!(
+            sourced_transport.class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        let remote_unknown = classify_fetch_task_result_rpc_status(tonic::Status::unknown(
+            "remote application returned an unknown status",
+        ))
+        .into_pump_failure();
+        assert_eq!(
+            remote_unknown.class(),
+            AttemptFailureClass::ContractViolation
+        );
 
         let capacity = classify_fetch_task_result_rpc_status(tonic::Status::new(
             tonic::Code::ResourceExhausted,

@@ -53,14 +53,12 @@ use novarocks_types::{
     QueryIdAttribution, QueryProcessNamespace,
 };
 
-use super::attempt_initialization::{AttemptInitializing, RoundCredentialLeaseSource};
 use super::query_registry::{
     FrontendQueryRegistry, QueryFailureCause, QueryLifecycleConvergenceReader,
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
 };
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
-use super::split_assignment_round::{RoundSplitAssignmentPlan, SplitAssignmentRoundGuard};
 use super::task_round::{
     AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
 };
@@ -73,7 +71,13 @@ use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::task_transport::AttemptWireFacts;
 use crate::native::transport::new_fragment_dispatcher;
+use crate::query_execution::attempt_initialization::{
+    AttemptInitializing, RoundCredentialLeaseSource,
+};
 use crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions;
+use crate::query_execution::split_assignment_round::{
+    RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
+};
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };

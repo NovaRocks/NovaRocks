@@ -33,8 +33,9 @@ use novarocks_execution::task_execution::{
     UpdateQueryContext,
 };
 use novarocks_query_application::coordination::{
-    AttemptDrainFacts, DispatchBudget, DispatchLane, GoneObservation, LatchOutcome, StageState,
-    StatusObservation, TerminationLatch, parent_released_children,
+    AttemptDrainFacts, DispatchBudget, DispatchLane, GoneObservation, LatchOutcome,
+    ReplacementWorkerAdmissionEvidence, StageState, StatusObservation, TerminationLatch,
+    parent_released_children,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::NativeCompatibilityId;
@@ -385,6 +386,34 @@ impl QueryTaskExecution {
             released_outputs: BTreeSet::new(),
             released_children_of: BTreeSet::new(),
         })
+    }
+
+    /// Installs the complete admission set acquired by a qualified
+    /// replacement. Missing, duplicate, or foreign evidence is rejected
+    /// before the first Task-protocol turn.
+    pub(crate) fn adopt_replacement_admissions(
+        &mut self,
+        admissions: Box<[ReplacementWorkerAdmissionEvidence]>,
+    ) -> Result<(), TaskExecutionError> {
+        let expected = self.owners.keys().copied().collect::<BTreeSet<_>>();
+        let actual = admissions
+            .iter()
+            .map(ReplacementWorkerAdmissionEvidence::context)
+            .collect::<BTreeSet<_>>();
+        if admissions.len() != actual.len() || actual != expected {
+            return Err(TaskExecutionError::Schedule(
+                "qualified replacement admission set differs from the Task manifest contexts"
+                    .to_owned(),
+            ));
+        }
+        let now = self.clock.now();
+        for admission in admissions.iter() {
+            self.owners
+                .get_mut(&admission.context())
+                .expect("the complete replacement admission set was validated")
+                .adopt_replacement_admission(admission.receipt(), now)?;
+        }
+        Ok(())
     }
 
     pub const fn graph(&self) -> &TaskGraph {

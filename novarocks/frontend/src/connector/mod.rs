@@ -46,7 +46,7 @@ pub use application::{
 };
 pub(crate) use application::{
     connector_planning_context_for_query, context_for_planning_lease,
-    context_for_planning_lease_typed, metadata_binding_typed,
+    context_for_planning_lease_typed, install_frontend_connector_resources, metadata_binding_typed,
     metadata_load_connector_table_with_planning_lease_typed,
 };
 pub use control_host::ConnectorControlHost;

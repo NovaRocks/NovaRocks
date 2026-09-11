@@ -35,6 +35,7 @@ use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
 use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, NativeEndpoint};
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 
 use crate::common::backend_topology::{
     BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
@@ -294,6 +295,7 @@ pub(crate) struct ClusterBackendService {
     heartbeat_signal: Mutex<HeartbeatSignal>,
     heartbeat_wake: Condvar,
     topology_wake: Condvar,
+    process_epoch: watch::Sender<u64>,
     #[cfg(test)]
     _test_runtime_owner: Option<Arc<tokio::runtime::Runtime>>,
 }
@@ -315,9 +317,12 @@ impl ClusterBackendService {
             return Err("role=be must not open ClusterBackendService".to_string());
         }
         let heartbeat_runtime = data_runtime.clone();
+        let heartbeat_timeout = config.heartbeat_interval();
         let service = Arc::new(Self::new(
             &config,
-            move |endpoint, process_id| native_heartbeat(&heartbeat_runtime, process_id, endpoint),
+            move |endpoint, process_id| {
+                native_heartbeat(&heartbeat_runtime, process_id, endpoint, heartbeat_timeout)
+            },
             move |endpoint| data_runtime.invalidate_channel(endpoint),
         ));
         let _ = runtime;
@@ -332,6 +337,7 @@ impl ClusterBackendService {
         F: Fn(RuntimeEndpoint, BackendProcessId) -> HeartbeatOutcome + Send + Sync + 'static,
         I: Fn(&NativeEndpoint) + Send + Sync + 'static,
     {
+        let (process_epoch, _) = watch::channel(0);
         Self {
             state: Mutex::new(TopologyState {
                 timeout_retries: config.heartbeat_timeout_retries(),
@@ -354,6 +360,7 @@ impl ClusterBackendService {
             }),
             heartbeat_wake: Condvar::new(),
             topology_wake: Condvar::new(),
+            process_epoch,
             #[cfg(test)]
             _test_runtime_owner: None,
         }
@@ -377,9 +384,12 @@ impl ClusterBackendService {
         );
         let handle = runtime.handle().clone();
         let data_runtime = FrontendDataRuntime::new(handle);
+        let heartbeat_timeout = config.heartbeat_interval();
         let mut service = Self::new(
             &config,
-            move |endpoint, process_id| native_heartbeat(&data_runtime, process_id, endpoint),
+            move |endpoint, process_id| {
+                native_heartbeat(&data_runtime, process_id, endpoint, heartbeat_timeout)
+            },
             |_| {},
         );
         service._test_runtime_owner = Some(runtime);
@@ -795,11 +805,12 @@ impl ClusterBackendService {
     }
 
     fn publish_snapshot(&self) {
-        let metrics = {
+        let (metrics, revision) = {
             let state = self.state.lock().unwrap();
-            metrics_snapshot(&state)
+            (metrics_snapshot(&state), state.revision)
         };
         publish_backend_topology_metrics(metrics);
+        self.process_epoch.send_replace(revision);
         self.topology_wake.notify_all();
     }
 
@@ -869,6 +880,10 @@ impl BackendTopologyPort for ClusterBackendService {
     fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
         self.refresh_expired_announce_leases(std::time::Instant::now());
         self.snapshot_inner()
+    }
+
+    fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.process_epoch.subscribe()
     }
     fn validate_snapshot(
         &self,
@@ -1060,6 +1075,10 @@ impl BackendTopologyPort for ClusterBackendService {
 }
 
 impl BackendProcessObservationPort for ClusterBackendService {
+    fn subscribe_process_changes(&self) -> watch::Receiver<u64> {
+        self.process_epoch.subscribe()
+    }
+
     fn observe_process_at_endpoint(
         &self,
         expected_process: BackendProcessId,
