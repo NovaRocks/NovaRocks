@@ -38,7 +38,8 @@ mod table_write;
 mod topn;
 #[cfg(test)]
 mod unpivot;
-mod window;
+#[cfg(test)]
+mod window_tests;
 
 use novarocks_execution::runtime_filter as execution;
 use std::collections::BTreeMap;
@@ -1423,16 +1424,18 @@ fn lower_physical_node(
             children,
             arena,
         ),
-        plan::plan_node::Kind::Window(window) => window::lower_window_node(
-            node,
-            physical,
-            window,
-            path.clone().field("window"),
-            physical_output_path.clone(),
-            children,
-            arena,
-            ctx,
-        ),
+        plan::plan_node::Kind::Window(window) => {
+            novarocks_native_adapter::fragment_window::lower_window_node(
+                node,
+                physical,
+                window,
+                path.clone().field("window"),
+                physical_output_path.clone(),
+                children,
+                arena,
+                ctx,
+            )
+        }
         plan::plan_node::Kind::Repeat(repeat) => {
             lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
         }
