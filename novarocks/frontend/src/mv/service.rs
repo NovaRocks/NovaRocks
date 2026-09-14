@@ -124,14 +124,12 @@ impl FrontendMvProductAdapter {
         &self,
         deadline: Instant,
     ) -> Result<(), String> {
-        self.product_service.begin_stopping();
         self.product_service
             .shutdown_background_workers_until(deadline)
             .await
     }
 
     pub(crate) fn request_background_stop_for_process_exit(&self) {
-        self.product_service.begin_stopping();
         self.product_service
             .request_background_stop_for_process_exit();
     }

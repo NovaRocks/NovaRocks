@@ -152,6 +152,9 @@ struct FrontendRoleProducts {
     maintenance_engine: Arc<dyn crate::query_execution::maintenance::TableMaintenanceEngine>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_candidate_reader: crate::mv::domain::readiness::MvCandidateReader,
+    /// The role graph owns the sole MV process product. The frontend adapter
+    /// receives only a clone of this exact product for port translation.
+    mv_product_service: Arc<MvProductService>,
     mv_service: Arc<crate::mv::FrontendMvProductAdapter>,
     maintenance_ports: core_capabilities::MaintenanceCommandPorts,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -195,6 +198,7 @@ impl FrontendRoleProducts {
         deadline: Instant,
     ) -> Result<(), FrontendApplicationError> {
         let mut first_error = None;
+        self.mv_product_service.begin_stopping();
         if let Err(error) = self
             .statistics_application
             .shutdown_worker_until(deadline)
@@ -235,6 +239,7 @@ impl FrontendRoleProducts {
     fn request_background_stop_for_process_exit(&self) {
         self.statistics_application
             .request_worker_stop_for_process_exit();
+        self.mv_product_service.begin_stopping();
         self.mv_service.request_background_stop_for_process_exit();
         self.maintenance_service.request_shutdown_for_process_exit();
         self.catalog_runtime.request_stop_for_process_exit();
@@ -348,7 +353,7 @@ async fn build_frontend_role_products(
             mv_activation,
             role,
             topology.clone(),
-            mv_product_service,
+            Arc::clone(&mv_product_service),
             host.mv_maintenance_config(),
             Arc::clone(&maintenance_service),
             host.optimizer_query_mem_limit_bytes(),
@@ -446,6 +451,7 @@ async fn build_frontend_role_products(
         maintenance_engine,
         mv_readiness,
         mv_candidate_reader,
+        mv_product_service,
         mv_service,
         maintenance_ports,
         mv_storage_observation,
@@ -1553,6 +1559,54 @@ mod tests {
 
         session.close();
         drop(session);
+        drop(session_factory);
+        shutdown_frontend_role_products_to_convergence(&mut products, Duration::from_secs(1))
+            .await
+            .expect("shutdown frontend role products");
+        host.shutdown()
+            .await
+            .expect("shutdown frontend application host");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn role_products_inject_their_unique_mv_product_into_the_frontend_adapter() {
+        let state_store = test_state_store_input("mv-product-role-composition");
+        let registry = test_state_store_registry();
+        let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            Some(state_store),
+            &registry,
+            FrontendExecutionConfig::new_for_test(
+                "127.0.0.1",
+                0,
+                std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
+            ),
+            frontend_backend_open_config(),
+            Vec::new(),
+            tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
+        )
+        .await
+        .expect("open frontend application host");
+        let (session_factory, mut products) = build_frontend_query_session_factory(
+            &mut host,
+            Arc::new(
+                novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+            ),
+            0,
+            Arc::new(UnavailableMvStorageObservationPort),
+            Arc::new(MysqlClientConnectionRegistry::new()),
+        )
+        .await
+        .expect("build ready frontend session factory");
+
+        assert!(std::ptr::eq(
+            products.mv_product_service.as_ref(),
+            products.mv_service.product_service(),
+        ));
+
         drop(session_factory);
         shutdown_frontend_role_products_to_convergence(&mut products, Duration::from_secs(1))
             .await
