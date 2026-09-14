@@ -275,7 +275,7 @@ impl Scenario for DistributedReaderCancel {
         )?;
 
         context.action("start a public-MySQL distributed read that retains connector readers");
-        let target = start_connector_read(
+        let target = start_held_connector_read(
             &user,
             port,
             "connector_cancel_catalog",
@@ -371,7 +371,7 @@ impl Scenario for DistributedReaderKillConnection {
         )?;
 
         context.action("start a public-MySQL distributed read that retains connector readers");
-        let target = start_connector_read(
+        let target = start_held_connector_read(
             &user,
             port,
             "connector_kill_connection_catalog",
