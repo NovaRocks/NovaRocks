@@ -1674,7 +1674,11 @@ mod tests {
     fn scheduled_split(sequence_id: u64) -> crate::fragment::ingress::ReceivedReadSplit {
         let (evidence, split) =
             test_support::decoded_scheduled_split(NODE, sequence_id).into_parts();
-        crate::fragment::ingress::ReceivedReadSplit::new(evidence, split)
+        crate::fragment::ingress::ReceivedReadSplit::new(
+            evidence.sequence_id(),
+            evidence.plan_node_id(),
+            split,
+        )
     }
 
     fn attempt_queues() -> Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>

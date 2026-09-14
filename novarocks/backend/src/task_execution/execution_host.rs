@@ -537,7 +537,11 @@ impl NativeTaskExecutionHost {
                 .map(|split| {
                     decoder.decode_scheduled_split(split).map(|decoded| {
                         let (evidence, split) = decoded.into_parts();
-                        ReceivedReadSplit::new(evidence, split)
+                        ReceivedReadSplit::new(
+                            evidence.sequence_id(),
+                            evidence.plan_node_id(),
+                            split,
+                        )
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()

@@ -42,6 +42,7 @@ mod lifecycle;
 mod observation;
 mod operation;
 pub mod query_context;
+pub mod read_attempt;
 mod receipt;
 mod reliable_transport;
 pub mod result_batch;
