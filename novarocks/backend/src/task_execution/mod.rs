@@ -43,7 +43,6 @@
 
 mod context_host;
 mod execution_host;
-mod feedback;
 pub(crate) mod ingress;
 
 #[cfg(test)]

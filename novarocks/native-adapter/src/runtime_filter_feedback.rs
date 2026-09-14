@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The backend end of the dynamic filter feedback loop.
+//! Native encoding of the Worker dynamic-filter feedback loop.
 //!
 //! A runtime-filter channel that reduces to a terminal logical domain has one
 //! thing left to do with it: tell the frontend, so the frontend's connector
@@ -56,11 +56,10 @@ use novarocks_worker::runtime_filter::domain::{
     BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication, BackendFrontendFeedbackSink,
 };
 
-use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_worker::TaskStatusReporter;
 
 /// Publishes one query context's terminal logical feedback through one task.
-pub(crate) struct TaskRuntimeFilterFeedbackEgress {
+pub struct TaskRuntimeFilterFeedbackEgress {
     carrier: TaskIdentity,
     reporter: TaskStatusReporter,
     /// The next domain version this carrier will advertise.
@@ -73,7 +72,7 @@ pub(crate) struct TaskRuntimeFilterFeedbackEgress {
 }
 
 impl TaskRuntimeFilterFeedbackEgress {
-    pub(crate) fn new(carrier: TaskIdentity, reporter: TaskStatusReporter) -> Self {
+    pub fn new(carrier: TaskIdentity, reporter: TaskStatusReporter) -> Self {
         Self {
             carrier,
             reporter,
@@ -81,7 +80,7 @@ impl TaskRuntimeFilterFeedbackEgress {
         }
     }
 
-    pub(crate) const fn carrier(&self) -> TaskIdentity {
+    pub const fn carrier(&self) -> TaskIdentity {
         self.carrier
     }
 }
@@ -99,19 +98,20 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
         // stream's feedback sink used to claim it. A claim left behind on the
         // retired carrier is armed and unconsumed: the query succeeds
         // untouched and the case waits out its budget.
-        let outcome = if fault::force_feedback_unavailable(self.carrier) {
+        let outcome = if crate::task_protocol_fault::force_feedback_unavailable(self.carrier) {
             BackendFrontendFeedbackOutcome::ProducerUnavailable
         } else {
             outcome
         };
-        let deployment_epoch = if fault::forge_feedback_foreign_attempt(self.carrier) {
-            // Any epoch but this attempt's. Wrapping keeps it a legal u64
-            // rather than saturating onto a value the frontend could still
-            // read as the active attempt.
-            deployment_epoch.wrapping_add(1)
-        } else {
-            deployment_epoch
-        };
+        let deployment_epoch =
+            if crate::task_protocol_fault::forge_feedback_foreign_attempt(self.carrier) {
+                // Any epoch but this attempt's. Wrapping keeps it a legal u64
+                // rather than saturating onto a value the frontend could still
+                // read as the active attempt.
+                deployment_epoch.wrapping_add(1)
+            } else {
+                deployment_epoch
+            };
         let (kind, payload) = match &outcome {
             BackendFrontendFeedbackOutcome::CanonicalDomain(domain) => (
                 filter::RuntimeFilterEnvelopeKind::DegradedLogical,
@@ -138,7 +138,7 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
         };
         let query_id = self.carrier.query_execution_id().query_id();
         let mut schema_digest = publication.contract_digest().to_vec();
-        if fault::corrupt_feedback_contract_digest(self.carrier) {
+        if crate::task_protocol_fault::corrupt_feedback_contract_digest(self.carrier) {
             // One bit, not a truncation: the frontend refuses a digest of the
             // wrong width before it ever compares one, so a shortened digest
             // would exercise the decoder instead of the contract fence.
@@ -203,7 +203,7 @@ fn emit_advertised_marker(
     channel_id: RuntimeFilterChannelId,
     version: DomainVersion,
 ) {
-    if !novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker() {
+    if !crate::debug_environment::debug_emit_connector_reader_marker() {
         return;
     }
     let execution = carrier.query_execution_id();
@@ -233,7 +233,7 @@ mod tests {
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    use novarocks_native_adapter::task_protocol::encode_dynamic_filter_read;
+    use crate::task_protocol::encode_dynamic_filter_read;
     use novarocks_worker::ProcessMonotonicClock;
     use novarocks_worker::runtime_filter::domain::{
         BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication,

@@ -69,10 +69,10 @@ use novarocks_types::QueryExecutionId;
 use tracing::error;
 
 use super::execution_host::QueryContextOptions;
-use super::feedback::TaskRuntimeFilterFeedbackEgress;
 use crate::runtime_filter::participant::RuntimeFilterParticipantFactory;
 use novarocks_native_adapter::{
     BackendDataRuntime,
+    runtime_filter_feedback::TaskRuntimeFilterFeedbackEgress,
     runtime_filter_install::{
         DecodedRuntimeFilterContribution, decode_runtime_filter_contribution,
     },
