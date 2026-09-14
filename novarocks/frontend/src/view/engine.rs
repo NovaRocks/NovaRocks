@@ -22,7 +22,6 @@
 //! view DDL and rewrite, without leaking the retired Core application facade, connector
 //! backends, or parser-internal column definitions.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
@@ -33,10 +32,15 @@ use novarocks_parser::{
         Ident, Literal, LiteralKind, ObjectName, Query, StructField, TypeName, TypeNameArgument,
     },
 };
-use novarocks_query_application::api::QueryResult;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
+use novarocks_query_application::view::{
+    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
+    ViewEngine, ViewTarget,
+};
+#[cfg(test)]
+use novarocks_query_application::view::{ViewRequestContext, ViewService, ViewStatementResult};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
@@ -44,118 +48,6 @@ use novarocks_spi::connector::{
 };
 use novarocks_sql::literal::arrow_data_type_to_sql_type;
 use novarocks_sql::semantic::TableColumnDef;
-
-#[derive(Clone, Copy)]
-pub struct ViewRequestContext<'a> {
-    pub current_catalog: Option<&'a str>,
-    pub current_database: &'a str,
-    /// Query-owned context used by connector reads and external view mutations.
-    pub connector_context: Option<&'a ConnectorRequestContext>,
-}
-
-#[derive(Clone, Debug)]
-pub enum ViewStatementResult {
-    Ok,
-    Query(QueryResult),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ViewTarget {
-    pub catalog: String,
-    pub database: String,
-    pub view: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ViewColumnDefinition {
-    pub name: String,
-    pub data_type: TypeName,
-    pub nullable: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CreateExternalViewRequest {
-    pub target: ViewTarget,
-    pub columns: Vec<ViewColumnDefinition>,
-    pub definition: PersistedQueryDefinition,
-    pub comment: Option<String>,
-    pub or_replace: bool,
-    pub if_not_exists: bool,
-    pub properties: Vec<(String, String)>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedExternalView {
-    pub definition: PersistedQueryDefinition,
-    pub column_names: Vec<String>,
-    pub comment: Option<String>,
-    pub properties: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ExternalViewResolution {
-    Table,
-    View(ResolvedExternalView),
-    Missing,
-}
-
-pub trait ViewService: Send + Sync {
-    fn execute_statement(
-        &self,
-        engine: &dyn ViewEngine,
-        statement: &novarocks_parser::ast::ViewStatement,
-        context: ViewRequestContext<'_>,
-    ) -> Result<ViewStatementResult, String>;
-
-    fn rewrite_query(
-        &self,
-        engine: &dyn ViewEngine,
-        query: &mut Query,
-        context: ViewRequestContext<'_>,
-    ) -> Result<(), String>;
-
-    fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String>;
-}
-
-pub trait ViewEngine: Send + Sync {
-    /// Resolve a table-or-view name through exactly one connector control
-    /// generation.  Missing view metadata is not equivalent to an undeclared
-    /// view capability; the latter remains a typed Unsupported error.
-    fn resolve_external_view(
-        &self,
-        target: &ViewTarget,
-        context: &ConnectorRequestContext,
-    ) -> Result<ExternalViewResolution, String>;
-    fn create_external_view(
-        &self,
-        request: CreateExternalViewRequest,
-        context: &ConnectorRequestContext,
-    ) -> Result<(), String>;
-    fn drop_external_view(
-        &self,
-        target: &ViewTarget,
-        context: &ConnectorRequestContext,
-        policy: DropPolicy,
-    ) -> Result<(), String>;
-    fn load_external_view(
-        &self,
-        target: &ViewTarget,
-        context: &ConnectorRequestContext,
-    ) -> Result<Option<ResolvedExternalView>, String>;
-    fn list_external_views(
-        &self,
-        catalog: &str,
-        database: &str,
-        context: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, String>;
-    fn analyze_external_view(
-        &self,
-        catalog: &str,
-        database: &str,
-        query: &Query,
-        context: &ConnectorRequestContext,
-    ) -> Result<Vec<ViewColumnDefinition>, String>;
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg(test)]
@@ -197,26 +89,45 @@ trait ViewExecutionContext: CatalogServiceSource + Send + Sync {
     ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort>;
 }
 
-impl ViewExecutionContext for ViewExecutionKernel {
+/// Frontend's connector/Catalog implementation of the query-application
+/// external-view port. It is deliberately a narrow adapter, not a view
+/// service or a Frontend application aggregate.
+#[derive(Clone)]
+pub(crate) struct FrontendViewEngine {
+    kernel: ViewExecutionKernel,
+}
+
+impl FrontendViewEngine {
+    pub(crate) fn new(kernel: ViewExecutionKernel) -> Self {
+        Self { kernel }
+    }
+}
+
+impl CatalogServiceSource for FrontendViewEngine {
+    fn catalog_service(
+        &self,
+    ) -> &Arc<crate::catalog_application::query_catalog::QueryCatalogService> {
+        self.kernel.catalog_service()
+    }
+}
+
+impl ViewExecutionContext for FrontendViewEngine {
     fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
-        self.function_catalog().as_ref()
+        self.kernel.function_catalog().as_ref()
     }
 
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry {
-        self.connector_control().as_ref()
+        self.kernel.connector_control().as_ref()
     }
 
     fn catalog_application(
         &self,
     ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
-        self.catalog_application().map(Arc::as_ref)
+        self.kernel.catalog_application().map(Arc::as_ref)
     }
 }
 
-impl<T> ViewEngine for T
-where
-    T: ViewExecutionContext,
-{
+impl ViewEngine for FrontendViewEngine {
     fn resolve_external_view(
         &self,
         target: &ViewTarget,

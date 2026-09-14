@@ -37,7 +37,7 @@ mod rewrite;
 #[cfg(test)]
 mod tests;
 
-pub use engine::{
+pub use novarocks_query_application::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
     ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };

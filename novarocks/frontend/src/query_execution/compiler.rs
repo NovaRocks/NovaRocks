@@ -1114,7 +1114,7 @@ impl TestQueryCompiler {
                 }
                 let mut prepared = query;
                 self.view.view_service().rewrite_query(
-                    &self.view,
+                    &crate::view::engine::FrontendViewEngine::new(self.view.clone()),
                     &mut prepared,
                     crate::view::ViewRequestContext {
                         current_catalog,
@@ -1425,7 +1425,7 @@ fn prepare_explain_query_with_ports(
 ) -> Result<Query, String> {
     let mut prepared = query.clone();
     view_kernel.view_service().rewrite_query(
-        view_kernel,
+        &crate::view::engine::FrontendViewEngine::new(view_kernel.clone()),
         &mut prepared,
         crate::view::ViewRequestContext {
             current_catalog,

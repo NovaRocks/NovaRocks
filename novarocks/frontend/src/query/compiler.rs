@@ -593,7 +593,7 @@ impl FrontendQueryCompiler {
     ) -> Result<Query, FrontendQueryCompilerError> {
         let mut prepared = query.clone();
         self.view.view_service().rewrite_query(
-            &self.view,
+            &crate::view::engine::FrontendViewEngine::new(self.view.clone()),
             &mut prepared,
             ViewRequestContext {
                 current_catalog,

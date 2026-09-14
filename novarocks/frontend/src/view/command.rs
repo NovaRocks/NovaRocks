@@ -43,7 +43,7 @@ impl ViewCommandExecutor {
         self.kernel
             .view_service()
             .execute_statement(
-                &self.kernel,
+                &crate::view::engine::FrontendViewEngine::new(self.kernel.clone()),
                 statement,
                 ViewRequestContext {
                     current_catalog,
