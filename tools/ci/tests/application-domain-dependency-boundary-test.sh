@@ -75,7 +75,7 @@ assert_edge_rejected novarocks-worker novarocks-proto-models \
   "novarocks-worker normal dependency closure contains forbidden domains:"
 assert_edge_rejected novarocks-mysql-adapter novarocks-frontend \
   "novarocks-mysql-adapter normal dependency closure contains forbidden owners:"
-assert_edge_rejected novarocks-native-adapter novarocks-backend \
+assert_edge_rejected novarocks-native-adapter novarocks-query-application \
   "novarocks-native-adapter normal dependency closure contains forbidden owners:"
 assert_edge_rejected novarocks-statistics-application novarocks-task-codec \
   "novarocks-statistics-application normal dependency closure contains forbidden owners:"

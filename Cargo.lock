@@ -3588,45 +3588,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-backend"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "arrow-buffer",
- "async-trait",
- "axum 0.7.9",
- "bytes",
- "hex",
- "hyper",
- "hyper-util",
- "novarocks-execution",
- "novarocks-execution-contract",
- "novarocks-failpoint",
- "novarocks-functions",
- "novarocks-memory",
- "novarocks-native-adapter",
- "novarocks-native-trust",
- "novarocks-plan-codec",
- "novarocks-proto-codec",
- "novarocks-proto-models",
- "novarocks-secret",
- "novarocks-spi",
- "novarocks-sql",
- "novarocks-task-codec",
- "novarocks-types",
- "novarocks-version",
- "novarocks-worker",
- "parquet",
- "prost 0.13.5",
- "sha2",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower 0.5.2",
- "tracing",
-]
-
-[[package]]
 name = "novarocks-catalog-application"
 version = "0.1.0"
 dependencies = [
@@ -4040,6 +4001,7 @@ dependencies = [
  "novarocks-sql",
  "novarocks-task-codec",
  "novarocks-types",
+ "novarocks-version",
  "novarocks-worker",
  "once_cell",
  "prometheus",
@@ -4168,7 +4130,6 @@ dependencies = [
  "hex",
  "libc",
  "mysql",
- "novarocks-backend",
  "novarocks-catalog-application",
  "novarocks-connector-iceberg",
  "novarocks-connector-iceberg-functions",

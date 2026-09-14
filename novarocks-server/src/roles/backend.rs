@@ -20,10 +20,10 @@
 use std::future::Future;
 use std::time::Duration;
 
-use novarocks_backend::application::{
+use novarocks_native_adapter::BackendDataRuntime;
+use novarocks_native_adapter::backend_application::{
     BackendApplicationError, BackendApplicationHost, BackendServerConfig,
 };
-use novarocks_native_adapter::BackendDataRuntime;
 
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 

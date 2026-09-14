@@ -59,26 +59,14 @@ jq '
 assert_rejected "$retired_binding" \
   "retired package must be absent: novarocks-connector-binding"
 
-backend_missing="$tmpdir/backend-missing-spi.json"
+native_adapter_missing="$tmpdir/native-adapter-missing-spi.json"
 jq '
-  (.packages[] | select(.name == "novarocks-backend") | .dependencies) |= map(
+  (.packages[] | select(.name == "novarocks-native-adapter") | .dependencies) |= map(
     select(.name != "novarocks-spi")
   )
-' "$metadata" >"$backend_missing"
-assert_rejected "$backend_missing" \
-  "novarocks-backend must directly declare a normal dependency on novarocks-spi"
-
-touch "$source_root/novarocks/backend/src/connector/typed_registry.rs"
-if "$CHECKER" --metadata-path "$metadata" --source-root "$source_root" \
-  >"$tmpdir/source.stdout" 2>"$tmpdir/source.stderr"; then
-  echo "connector role binding source mutation was accepted" >&2
-  exit 1
-fi
-grep -Fq "legacy parallel registry must be removed" "$tmpdir/source.stderr"
-
-# Keep the source mutation fixtures independent so the next check reaches its
-# intended server-adapter validation instead of failing on this legacy marker.
-rm "$source_root/novarocks/backend/src/connector/typed_registry.rs"
+' "$metadata" >"$native_adapter_missing"
+assert_rejected "$native_adapter_missing" \
+  "novarocks-native-adapter must directly declare a normal dependency on novarocks-spi"
 
 touch "$source_root/novarocks-server/src/connector_role_binding.rs"
 if "$CHECKER" --metadata-path "$metadata" --source-root "$source_root" \

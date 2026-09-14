@@ -101,7 +101,7 @@ jq '
 assert_rejected "$task_codec_execution" \
   "novarocks-task-codec internal normal dependencies must be exactly"
 
-for role in novarocks-frontend novarocks-backend; do
+for role in novarocks-frontend novarocks-native-adapter; do
   role_missing_models="$tmpdir/${role}-missing-models.json"
   jq --arg role "$role" '
     (.packages[] | select(.name == $role) | .dependencies) |= map(
@@ -122,7 +122,6 @@ assert_rejected "$models_tonic" \
 
 for forbidden in \
   tonic \
-  novarocks-backend \
   novarocks-connector-starrocks \
   novarocks-execution \
   novarocks-frontend \

@@ -12,7 +12,6 @@ name = "novarocks"
 path = "src/main.rs"
 
 [dependencies]
-novarocks-backend.workspace = true
 novarocks-connector-iceberg.workspace = true
 novarocks-connector-paimon.workspace = true
 novarocks-connector-iceberg-functions.workspace = true

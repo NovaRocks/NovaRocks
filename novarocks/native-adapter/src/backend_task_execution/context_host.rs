@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The production query-context side of execution.
+//! The native backend query-context side of execution.
 //!
 //! One establish installs four shared facts on this backend — query options,
 //! catalog runtimes, a runtime-filter participant, and the query's vended
@@ -69,7 +69,8 @@ use novarocks_types::QueryExecutionId;
 use tracing::error;
 
 use super::execution_host::QueryContextOptions;
-use novarocks_native_adapter::{
+use crate::runtime_filter_ingress::BackendRuntimeFilterParticipantAuthority;
+use crate::{
     BackendDataRuntime,
     runtime_filter_feedback::TaskRuntimeFilterFeedbackEgress,
     runtime_filter_install::{
@@ -85,6 +86,7 @@ use novarocks_native_adapter::{
     },
 };
 use novarocks_worker::runtime_filter::domain::BackendFrontendFeedbackSink;
+use novarocks_worker::runtime_filter::domain::BackendParticipantIdentity;
 use novarocks_worker::{
     CatalogManager, CatalogManagerError, CatalogPruneResult,
     ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextCredentialSlot,
@@ -226,6 +228,19 @@ pub struct NativeQueryContextHost {
     runtime_filter_installer: Arc<RuntimeFilterParticipantInstaller>,
     catalog_install_runtime: BackendDataRuntime,
     contexts: Mutex<HostContexts>,
+}
+
+impl BackendRuntimeFilterParticipantAuthority for NativeQueryContextHost {
+    fn authority_name(&self) -> &'static str {
+        "the task query-context host"
+    }
+
+    fn claim_participant(
+        &self,
+        participant: BackendParticipantIdentity,
+    ) -> Option<Arc<RuntimeFilterParticipant>> {
+        self.claim_runtime_filter_participant(participant)
+    }
 }
 
 impl fmt::Debug for NativeQueryContextHost {
@@ -1223,7 +1238,7 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
 
-    use crate::task_execution::execution_host::TaskQueryContextFacts;
+    use super::super::execution_host::TaskQueryContextFacts;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_native_adapter::backend_test_support::test_backend_data_runtime;
     use novarocks_native_adapter::runtime_filter_install::DecodedRuntimeFilterContribution;
@@ -1837,7 +1852,7 @@ mod tests {
     /// facts nothing will take back.
     #[test]
     fn a_task_that_binds_a_filter_is_refused_when_its_context_installed_none() {
-        use crate::task_execution::execution_host::TaskQueryContextFacts;
+        use super::super::execution_host::TaskQueryContextFacts;
 
         // Answering `None` here would let the scan run unfiltered and call the
         // result correct. A query that installs no filter on this backend is
@@ -1871,7 +1886,7 @@ mod tests {
 
     #[test]
     fn storage_credentials_are_refused_rather_than_defaulted() {
-        use crate::task_execution::execution_host::TaskQueryContextFacts;
+        use super::super::execution_host::TaskQueryContextFacts;
 
         // There is no process-level credential a scan could legitimately fall
         // back to, so an unestablished or released context must fail the
@@ -2535,7 +2550,7 @@ use novarocks_proto_models::filter;
 use novarocks_task_codec::domain::stored_message;
 use novarocks_types::UniqueId;
 
-use crate::task_execution::execution_host::TaskQueryContextFacts;
+use crate::backend_task_execution::execution_host::TaskQueryContextFacts;
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
 };

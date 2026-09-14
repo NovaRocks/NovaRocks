@@ -81,7 +81,7 @@ STORAGE_CONTRACT = Capability(
 APPLICATION_OWNER = Capability(
     "application/execution owner",
     exact={
-        "novarocks-backend",
+        "novarocks-native-adapter",
         "novarocks-core",
         "novarocks-execution",
         "novarocks-frontend",

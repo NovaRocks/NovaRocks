@@ -33,10 +33,9 @@ from pathlib import Path
 RETIRED_BINDING = "novarocks-connector-binding"
 SPI = "novarocks-spi"
 FRONTEND = "novarocks-frontend"
-BACKEND = "novarocks-backend"
+NATIVE_ADAPTER = "novarocks-native-adapter"
 LEGACY_PATHS = (
     "novarocks/frontend/src/connector/typed_control_registry.rs",
-    "novarocks/backend/src/connector/typed_registry.rs",
 )
 STARROCKS_PROVIDER_FACTORY = "novarocks/connector/starrocks/src/role_binding.rs"
 SERVER_STARROCKS_FACTORY_ADAPTER = "novarocks-server/src/connector_role_binding.rs"
@@ -121,7 +120,7 @@ def normal_closure(metadata, root_name):
 def verify_metadata(metadata):
     if any(entry["name"] == RETIRED_BINDING for entry in metadata["packages"]):
         fail(f"retired package must be absent: {RETIRED_BINDING}")
-    for role in (FRONTEND, BACKEND):
+    for role in (FRONTEND, NATIVE_ADAPTER):
         if SPI not in normal_direct_dependencies(package(metadata, role)):
             fail(f"{role} must directly declare a normal dependency on {SPI}")
 

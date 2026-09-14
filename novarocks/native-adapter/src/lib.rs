@@ -17,11 +17,15 @@
 
 //! Server-resolved Native transport capabilities and protocol adapters.
 
+extern crate self as novarocks_native_adapter;
+
 pub mod backend_announce;
+pub mod backend_application;
 pub mod backend_heartbeat;
 pub mod backend_metrics;
 pub mod backend_readiness;
 pub mod backend_rpc_service;
+pub mod backend_task_execution;
 #[cfg(any(test, feature = "test-support"))]
 pub mod backend_test_support;
 pub mod catalog_prune_rpc;

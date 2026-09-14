@@ -17,7 +17,23 @@ use novarocks_worker::{
     WorkerResultRetainedLimits,
 };
 
-use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress_for_context_host;
+// Native backend application composition and lifecycle owner.
+
+use crate::backend_metrics::BackendMetricsRegistry;
+use crate::backend_rpc_service::BackendRpcService;
+use crate::fragment_result_writer::native_result_writer;
+use crate::management_http::MetricsHttpServer;
+use crate::runtime_filter_ingress::native_runtime_filter_envelope_ingress;
+use crate::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
+use crate::task_execution_observation::backend_task_execution_ports;
+use crate::task_protocol_ingress::RegistryTaskExecutionIngress;
+use crate::{
+    BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
+    backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
+    backend_readiness::wait_for_backend_native_endpoint_ready,
+    runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress, task_protocol::TaskExecutionIngress,
+    task_protocol_fault::RestartAfterEstablishTaskCreationGate,
+};
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
@@ -32,20 +48,6 @@ use novarocks_execution_contract::task_execution::operation::{
 };
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
-use novarocks_native_adapter::backend_metrics::BackendMetricsRegistry;
-use novarocks_native_adapter::backend_rpc_service::BackendRpcService;
-use novarocks_native_adapter::fragment_result_writer::native_result_writer;
-use novarocks_native_adapter::management_http::MetricsHttpServer;
-use novarocks_native_adapter::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
-use novarocks_native_adapter::task_execution_observation::backend_task_execution_ports;
-use novarocks_native_adapter::task_protocol_ingress::RegistryTaskExecutionIngress;
-use novarocks_native_adapter::{
-    BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
-    backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
-    backend_readiness::wait_for_backend_native_endpoint_ready,
-    runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress, task_protocol::TaskExecutionIngress,
-    task_protocol_fault::RestartAfterEstablishTaskCreationGate,
-};
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 #[cfg(test)]
 use novarocks_worker::ReleasedContextEvidence;
@@ -189,7 +191,7 @@ struct BackendApplicationServices {
     /// The task substrate's runtime-filter participant owner. The RPC ingress
     /// needs it directly, for the same reason: an `EstablishQueryContext`
     /// install is the only place a task-protocol query's participant exists.
-    query_context_host: Arc<crate::task_execution::NativeQueryContextHost>,
+    query_context_host: Arc<crate::backend_task_execution::NativeQueryContextHost>,
 }
 
 /// What the two unrouted hosts below report.
@@ -372,7 +374,7 @@ fn compose_backend_application_services(
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
     let runtime_filter_factory = NativeRuntimeFilterParticipantFactory::new(data_runtime.clone());
-    let context_host = Arc::new(crate::task_execution::NativeQueryContextHost::new(
+    let context_host = Arc::new(crate::backend_task_execution::NativeQueryContextHost::new(
         Arc::clone(&catalog_manager),
         Arc::clone(&execution_role_binding_factories),
         Arc::new(move |execution_id, contribution| {
@@ -393,11 +395,11 @@ fn compose_backend_application_services(
         data_runtime.handle().clone(),
         task_execution_registry_config.max_active_tasks_per_backend,
     );
-    let execution_host = Arc::new(crate::task_execution::NativeTaskExecutionHost::new(
+    let execution_host = Arc::new(crate::backend_task_execution::NativeTaskExecutionHost::new(
         novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime::global(
             Arc::clone(&memory_authority),
         ),
-        Arc::clone(&context_host) as Arc<dyn crate::task_execution::TaskQueryContextFacts>,
+        Arc::clone(&context_host) as Arc<dyn crate::backend_task_execution::TaskQueryContextFacts>,
         Arc::clone(&inbound_capabilities),
         novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
             data_runtime.clone(),
@@ -616,10 +618,11 @@ impl BackendApplicationHost {
         // The participant owner, because an attempt is reachable only
         // through the one that installed it, and every intent's participant is
         // installed by the query-context host.
+        let runtime_filter_authority: Arc<
+            dyn crate::runtime_filter_ingress::BackendRuntimeFilterParticipantAuthority,
+        > = services.query_context_host.clone();
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
-            native_runtime_filter_envelope_ingress_for_context_host(Arc::clone(
-                &services.query_context_host,
-            ));
+            native_runtime_filter_envelope_ingress(runtime_filter_authority);
         let admission_epoch: Arc<dyn WorkerAdmissionEpochAuthority> =
             services.task_execution_registry.clone();
         let mut grpc_server = match NativeRpcServerHandle::start(
@@ -741,7 +744,7 @@ fn combine_shutdown_results(
 }
 
 #[cfg(test)]
-#[path = "application_host_tests.rs"]
+#[path = "backend_application_host_tests.rs"]
 mod application_host_tests;
 
 #[cfg(test)]
@@ -964,7 +967,7 @@ mod tests {
     /// simply waits out its whole wait cap and then scans unfiltered.
     #[test]
     fn the_composed_runtime_filter_ingress_reaches_a_task_protocol_participant() {
-        use super::native_runtime_filter_envelope_ingress_for_context_host;
+        use crate::runtime_filter_ingress::native_runtime_filter_envelope_ingress;
         use novarocks_execution_contract::CredentialUpdate;
         use novarocks_execution_contract::task_execution::domain::{
             CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
@@ -1052,9 +1055,10 @@ mod tests {
             ))
             .expect("establishing a query context with a participant is legal");
 
-        let ingress = native_runtime_filter_envelope_ingress_for_context_host(Arc::clone(
-            &services.query_context_host,
-        ));
+        let authority: Arc<
+            dyn crate::runtime_filter_ingress::BackendRuntimeFilterParticipantAuthority,
+        > = services.query_context_host.clone();
+        let ingress = native_runtime_filter_envelope_ingress(authority);
         let reason = ingress
             .accept(envelope)
             .rejection_reason()

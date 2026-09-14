@@ -38,7 +38,7 @@ PRODUCTS = {
     "novarocks-statistics-application",
     "novarocks-table-maintenance",
 }
-ROLE_IMPLEMENTATIONS = {"novarocks-frontend", "novarocks-backend"}
+ROLE_IMPLEMENTATIONS = {"novarocks-frontend"}
 ADAPTERS = {"novarocks-native-adapter", "novarocks-mysql-adapter"}
 WIRE = {
     "novarocks-proto-models",

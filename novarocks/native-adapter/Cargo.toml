@@ -25,6 +25,7 @@ novarocks-spi.workspace = true
 novarocks-secret = { workspace = true, optional = true }
 novarocks-task-codec.workspace = true
 novarocks-types.workspace = true
+novarocks-version.workspace = true
 novarocks-worker.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true
@@ -37,7 +38,7 @@ prost.workspace = true
 once_cell.workspace = true
 prometheus.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util"] }
@@ -50,4 +51,5 @@ tonic-build.workspace = true
 [dev-dependencies]
 novarocks-sql.workspace = true
 novarocks-worker = { workspace = true, features = ["test-support"] }
+novarocks-secret.workspace = true
 sha2.workspace = true

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend role adapters for the Worker-owned native task protocol.
+//! Native backend adapters for the Worker-owned task protocol.
 //!
 //! Worker owns query context lifecycle, the task registry and its creation
 //! transaction, per-task status, the observation channel, and terminal
@@ -34,11 +34,8 @@
 //!        `-- TaskStatusSource (one per context: the observation channel)
 //! ```
 //!
-//! [`ingress`] puts this owner behind the backend's RPC boundary, which makes
-//! the protocol reachable over the wire. It routes no traffic: the
-//! fragment-based lifecycle stack still owns every query, and binding this
-//! owner to execution, then retiring the stack it replaces, are separate
-//! steps.
+//! The transport ingress is a sibling adapter. It routes no traffic: the
+//! task protocol owner is bound directly to these execution hosts.
 // Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
 mod context_host;
@@ -47,5 +44,5 @@ mod execution_host;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use context_host::NativeQueryContextHost;
-pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
+pub use context_host::NativeQueryContextHost;
+pub use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};

@@ -99,7 +99,7 @@ CONNECTOR_CONTRACT = Capability("connector contract", exact={"novarocks-spi"})
 APPLICATION_OWNER = Capability(
     "application/execution owner",
     exact={
-        "novarocks-backend",
+        "novarocks-native-adapter",
         "novarocks-core",
         "novarocks-execution",
         "novarocks-frontend",

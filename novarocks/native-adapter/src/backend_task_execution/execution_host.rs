@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The production task side of execution: one frozen descriptor becomes one
+//! The native backend task side of execution: one frozen descriptor becomes one
 //! prepared, then running, fragment on this backend process.
 //!
 //! The owner in [`super::registry`] calls the four install steps in commit
@@ -83,10 +83,10 @@ use novarocks_types::{QueryExecutionId, UniqueId};
 use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInboundCapabilities};
 use tracing::debug;
 
-use novarocks_native_adapter::fragment_request::NativeFragmentRequest;
-use novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime;
-use novarocks_native_adapter::task_protocol_fault as fault;
-use novarocks_native_adapter::task_shared_facts::fragment_plan;
+use crate::fragment_request::NativeFragmentRequest;
+use crate::native_fragment_query::NativeFragmentQueryRuntime;
+use crate::task_protocol_fault as fault;
+use crate::task_shared_facts::fragment_plan;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
 use novarocks_worker::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, HostRejection, RunnableTask,
@@ -101,9 +101,7 @@ use novarocks_worker::{
 /// depend on the lifecycle owner's admission permit. Here they are one
 /// injected port, implemented by the query-context half of execution, so the
 /// task side holds no query-wide authority of its own.
-pub use novarocks_native_adapter::task_query_context_options::{
-    QueryContextOptions, query_options_fingerprint,
-};
+pub use crate::task_query_context_options::{QueryContextOptions, query_options_fingerprint};
 
 pub trait TaskQueryContextFacts: Send + Sync {
     /// The immutable execution options installed by this query context.

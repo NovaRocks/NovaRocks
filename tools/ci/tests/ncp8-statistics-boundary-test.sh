@@ -42,7 +42,7 @@ write_fixture() {
   write_package "$root" "novarocks/connector/iceberg-functions" "novarocks-connector-iceberg-functions"
   write_package "$root" "novarocks/connector/iceberg" "novarocks-connector-iceberg"
   write_package "$root" "novarocks/frontend" "novarocks-frontend"
-  write_package "$root" "novarocks/backend" "novarocks-backend"
+  write_package "$root" "novarocks/native-adapter" "novarocks-native-adapter"
   write_package "$root" "novarocks/proto-models" "novarocks-proto-models"
   write_package "$root" "novarocks-server" "novarocks-server"
   write_package "$root" "datasketches" "datasketches"
@@ -57,7 +57,7 @@ members = [
   "novarocks/connector/iceberg-functions",
   "novarocks/connector/iceberg",
   "novarocks/frontend",
-  "novarocks/backend",
+  "novarocks/native-adapter",
   "novarocks/proto-models",
   "novarocks-server",
   "datasketches",
@@ -90,7 +90,7 @@ EOF
 [dependencies]
 novarocks-execution = { path = "../execution" }
 EOF
-  cat >>"$root/novarocks/backend/Cargo.toml" <<'EOF'
+  cat >>"$root/novarocks/native-adapter/Cargo.toml" <<'EOF'
 
 [dependencies]
 novarocks-execution = { path = "../execution" }
