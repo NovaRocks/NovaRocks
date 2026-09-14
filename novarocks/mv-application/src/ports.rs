@@ -23,6 +23,7 @@ use crate::product::{
     MvCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition, MvProductError,
     MvProductErrorKind, MvRefreshAttemptIdentity, MvTarget,
 };
+use crate::publication::MvRefreshPublicationFinalizationFacts;
 use crate::readiness::MvDropReadiness;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,7 +195,7 @@ pub trait MvRefreshProjectionPort: Send + Sync {
     fn project_known_committed(
         &self,
         target: &MvTarget,
-        attempt: &MvRefreshAttemptIdentity,
+        published: &MvRefreshPublicationFinalizationFacts,
     ) -> Result<(), MvProviderFailure>;
 }
 

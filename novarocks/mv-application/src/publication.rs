@@ -293,6 +293,36 @@ impl MvRefreshPublishedFacts {
     }
 }
 
+/// Facts shared by data-producing and metadata-only refreshes once their
+/// publication is known committed. Metadata-only refreshes have no write
+/// receipt, so this value deliberately records the common publication proof
+/// rather than fabricating write-committed facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshPublicationFinalizationFacts {
+    intent: MvRefreshPublicationIntent,
+    publication_version: ConnectorCommittedVersion,
+}
+
+impl MvRefreshPublicationFinalizationFacts {
+    pub fn try_new(
+        intent: MvRefreshPublicationIntent,
+        publication_version: ConnectorCommittedVersion,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            intent,
+            publication_version,
+        })
+    }
+
+    pub fn intent(&self) -> &MvRefreshPublicationIntent {
+        &self.intent
+    }
+
+    pub fn publication_version(&self) -> &ConnectorCommittedVersion {
+        &self.publication_version
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

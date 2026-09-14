@@ -37,7 +37,9 @@ use novarocks_mv_application::ports::{
 use novarocks_mv_application::product::{
     MvProductError, MvProductErrorKind, MvProductResult, MvTarget as ProductMvTarget,
 };
-use novarocks_mv_application::publication::{MvRefreshCommittedFacts, MvRefreshPublicationIntent};
+use novarocks_mv_application::publication::{
+    MvRefreshCommittedFacts, MvRefreshPublicationFinalizationFacts, MvRefreshPublicationIntent,
+};
 use novarocks_mv_application::service::MvProductService;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
@@ -192,13 +194,21 @@ fn execute_data(
     } else {
         publish_data_staging_branch(planning, &attempt, &finalize, &committed, context.clone())?
     };
+    let published = MvRefreshPublicationFinalizationFacts::try_new(
+        committed.intent().clone(),
+        publication_version,
+    )
+    .map_err(invalid)?;
     wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
-    let snapshot = publication_version.snapshot_id().ok_or_else(|| {
-        MvApplicationError::new(
-            MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-            "MV publication completed without a snapshot ID",
-        )
-    })?;
+    let snapshot = published
+        .publication_version()
+        .snapshot_id()
+        .ok_or_else(|| {
+            MvApplicationError::new(
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                "MV publication completed without a snapshot ID",
+            )
+        })?;
     let table = ConnectorTableIdentity {
         instance_id: planning.binding().descriptor().instance_id.clone(),
         namespace: finalize.target.database.into(),
@@ -215,7 +225,14 @@ fn execute_data(
         .map_err(|error| {
             MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
         })?;
-    finalize_known_committed_refresh(product, dependencies, product_target, &attempt, &package)
+    finalize_known_committed_refresh(
+        product,
+        dependencies,
+        product_target,
+        &attempt,
+        &published,
+        &package,
+    )
 }
 
 /// The one commit authority of one MV data write.
@@ -480,11 +497,19 @@ fn execute_metadata_only(
         ),
         "publish metadata-only MV snapshot",
     )?;
+    let published = MvRefreshPublicationFinalizationFacts::try_new(
+        intent,
+        published
+            .receipt
+            .committed_version()
+            .cloned()
+            .ok_or_else(|| invalid("metadata-only MV publication committed without a version"))?,
+    )
+    .map_err(invalid)?;
     wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
     let snapshot = published
-        .receipt
-        .committed_version()
-        .and_then(novarocks_spi::connector::ConnectorCommittedVersion::snapshot_id)
+        .publication_version()
+        .snapshot_id()
         .ok_or_else(|| invalid("metadata-only MV publication committed without a snapshot ID"))?;
     let package = dependencies
         .provider_activation
@@ -497,7 +522,14 @@ fn execute_metadata_only(
         .map_err(|error| {
             MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
         })?;
-    finalize_known_committed_refresh(product, dependencies, product_target, &attempt, &package)
+    finalize_known_committed_refresh(
+        product,
+        dependencies,
+        product_target,
+        &attempt,
+        &published,
+        &package,
+    )
 }
 
 /// Provider observation and StateStore I/O remain outer effects. The product
@@ -512,13 +544,14 @@ impl MvRefreshProjectionPort for FrontendKnownCommittedProjection<'_> {
     fn project_known_committed(
         &self,
         _target: &ProductMvTarget,
-        attempt: &MvRefreshAttemptIdentity,
+        published: &MvRefreshPublicationFinalizationFacts,
     ) -> Result<(), MvProviderFailure> {
-        wait_for_known_committed_before_projector_cas(&attempt.publication_id).map_err(
-            |error| MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string()),
-        )?;
+        let attempt = published.intent().publication_id();
+        wait_for_known_committed_before_projector_cas(&attempt).map_err(|error| {
+            MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
+        })?;
         self.readiness
-            .project_observed(*attempt.publication_id.as_uuid(), self.package)
+            .project_observed(*attempt.as_uuid(), self.package)
             .map_err(|error| {
                 MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
             })
@@ -530,6 +563,7 @@ fn finalize_known_committed_refresh(
     dependencies: &FrontendMvRefreshDependencies,
     target: ProductMvTarget,
     attempt: &MvRefreshAttemptIdentity,
+    published: &MvRefreshPublicationFinalizationFacts,
     package: &crate::mv::domain::storage_observation::MvLakePackageObservation,
 ) -> Result<MvStatementResult, MvApplicationError> {
     let projection = FrontendKnownCommittedProjection {
@@ -537,7 +571,7 @@ fn finalize_known_committed_refresh(
         package,
     };
     match product
-        .finalize_known_committed_refresh(&target, attempt, &projection)
+        .finalize_known_committed_refresh(&target, attempt, published, &projection)
         .map_err(product_error)?
     {
         MvProductResult::Acknowledged => Ok(MvStatementResult::Ok),

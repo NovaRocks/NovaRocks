@@ -34,6 +34,7 @@ use crate::product::{
     MvCommand, MvCreateCommand, MvOperationContext, MvProductError, MvProductErrorKind,
     MvProductResult, MvRefreshAttemptIdentity, MvTarget,
 };
+use crate::publication::MvRefreshPublicationFinalizationFacts;
 use crate::readiness::{MvDropReadiness, MvReadinessService, MvRuntimePublicationLease};
 use crate::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use crate::scheduler::{MvRefreshScheduler, MvSchedulerConfig};
@@ -134,10 +135,12 @@ impl MvProductService {
         &self,
         target: &MvTarget,
         attempt: &MvRefreshAttemptIdentity,
+        published: &MvRefreshPublicationFinalizationFacts,
         projection: &dyn MvRefreshProjectionPort,
     ) -> Result<MvProductResult, MvProductError> {
+        validate_published_refresh(target, attempt, published)?;
         projection
-            .project_known_committed(target, attempt)
+            .project_known_committed(target, published)
             .map_err(known_committed_finalize_failure)?;
         Ok(MvProductResult::Acknowledged)
     }
@@ -278,6 +281,30 @@ fn known_committed_finalize_failure(failure: MvProviderFailure) -> MvProductErro
     )
 }
 
+fn validate_published_refresh(
+    target: &MvTarget,
+    attempt: &MvRefreshAttemptIdentity,
+    published: &MvRefreshPublicationFinalizationFacts,
+) -> Result<(), MvProductError> {
+    let intent = published.intent();
+    if intent.publication_id() != attempt.publication_id {
+        return Err(MvProductError::new(
+            MvProductErrorKind::Corruption,
+            "MV known-committed refresh facts do not match the reserved publication identity",
+        ));
+    }
+    if target.catalog() != Some(intent.target_catalog())
+        || target.namespace() != intent.target_namespace()
+        || target.name() != intent.target_name()
+    {
+        return Err(MvProductError::new(
+            MvProductErrorKind::Corruption,
+            "MV known-committed refresh facts do not match the product target",
+        ));
+    }
+    Ok(())
+}
+
 fn readiness_error(error: MvRepositoryError) -> MvProductError {
     let kind = match error.kind() {
         MvRepositoryErrorKind::InvalidRequest => MvProductErrorKind::InvalidRequest,
@@ -315,6 +342,10 @@ mod tests {
         MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition,
         MvProductErrorKind, MvProductResult, MvTarget,
     };
+    use crate::publication::{
+        MvRefreshPublicationBase, MvRefreshPublicationFinalizationFacts,
+        MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
+    };
     use crate::readiness::{MvDropReadiness, MvReadinessService};
     use crate::repository::InitialMvRefreshConfiguration;
     use crate::scheduler::MvSchedulerConfig;
@@ -323,7 +354,10 @@ mod tests {
     use novarocks_query_application::persisted_query_definition::{
         PersistedQueryDefinition, PersistedQueryDialect,
     };
-    use novarocks_spi::connector::{ConnectorTableObjectId, LakePublicationId};
+    use novarocks_spi::connector::{
+        ConnectorCommittedVersion, ConnectorManagedDescriptorProperties, ConnectorTableObjectId,
+        LakePublicationId,
+    };
     use novarocks_sql::planning::mv::ApplyKeySource;
     use uuid::Uuid;
 
@@ -454,7 +488,7 @@ mod tests {
         fn project_known_committed(
             &self,
             _target: &MvTarget,
-            _attempt: &crate::product::MvRefreshAttemptIdentity,
+            _published: &MvRefreshPublicationFinalizationFacts,
         ) -> Result<(), MvProviderFailure> {
             self.record("project_known_committed");
             if self.fail_known_committed_projection {
@@ -465,6 +499,48 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    fn finalization_facts(
+        target: &MvTarget,
+        attempt: &crate::product::MvRefreshAttemptIdentity,
+    ) -> MvRefreshPublicationFinalizationFacts {
+        let intent = MvRefreshPublicationIntent::try_new(
+            attempt.publication_id,
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"mv-target-object"))
+                .expect("target object ID"),
+            Some(7),
+            ConnectorManagedDescriptorProperties::try_new(vec![(
+                Arc::from("novarocks.mv.descriptor.hash"),
+                Arc::from("descriptor-hash"),
+            )])
+            .expect("descriptor properties"),
+            MvRefreshPublicationTechnique::Full,
+            vec![
+                MvRefreshPublicationBase::try_new(
+                    "ice.db.base".to_string(),
+                    ConnectorTableObjectId::try_new(Bytes::from_static(b"base-object"))
+                        .expect("base object ID"),
+                    None,
+                    7,
+                )
+                .expect("base fact"),
+            ],
+            "definition-fingerprint".to_string(),
+            target.catalog().expect("test target catalog").to_string(),
+            target.namespace().to_string(),
+            target.name().to_string(),
+        )
+        .expect("publication intent");
+        MvRefreshPublicationFinalizationFacts::try_new(
+            intent,
+            ConnectorCommittedVersion::try_new(
+                Bytes::from_static(b"mv-publication-version"),
+                Some(42),
+            )
+            .expect("publication version"),
+        )
+        .expect("published facts")
     }
 
     impl MvDropProjectionPort for CreateEffects {
@@ -626,13 +702,31 @@ mod tests {
         let effects = CreateEffects::default();
         let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
         let attempt = service.reserve_refresh_attempt();
+        let published = finalization_facts(&target, &attempt);
 
         let result = service
-            .finalize_known_committed_refresh(&target, &attempt, &effects)
+            .finalize_known_committed_refresh(&target, &attempt, &published, &effects)
             .expect("projection succeeds");
 
         assert!(matches!(result, MvProductResult::Acknowledged));
         assert_eq!(effects.events(), ["project_known_committed"]);
+    }
+
+    #[test]
+    fn known_committed_refresh_rejects_a_different_publication_before_projection() {
+        let service = MvProductService::default();
+        let effects = CreateEffects::default();
+        let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
+        let attempt = service.reserve_refresh_attempt();
+        let other_attempt = service.reserve_refresh_attempt();
+        let published = finalization_facts(&target, &other_attempt);
+
+        let error = service
+            .finalize_known_committed_refresh(&target, &attempt, &published, &effects)
+            .expect_err("different publication identity must be rejected");
+
+        assert_eq!(error.kind(), MvProductErrorKind::Corruption);
+        assert!(effects.events().is_empty());
     }
 
     #[test]
@@ -669,9 +763,10 @@ mod tests {
         };
         let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
         let attempt = service.reserve_refresh_attempt();
+        let published = finalization_facts(&target, &attempt);
 
         let error = service
-            .finalize_known_committed_refresh(&target, &attempt, &effects)
+            .finalize_known_committed_refresh(&target, &attempt, &published, &effects)
             .expect_err("projection finalization fails");
 
         assert_eq!(
