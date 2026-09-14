@@ -447,8 +447,10 @@ impl std::error::Error for ContractSelfCheckError {}
 // The two keys a provider also reads come from the neutral contract, so the
 // spelling this owner writes and the spelling the provider hides by cannot
 // drift. The other two stay owner-private: no provider reads them.
-pub use novarocks_spi::connector::CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY as APPLY_KEY_COLUMN_PROPERTY;
-pub use novarocks_spi::connector::CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY as HIDDEN_COLUMNS_PROPERTY;
+#[cfg(test)]
+use novarocks_spi::connector::CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY as APPLY_KEY_COLUMN_PROPERTY;
+#[cfg(test)]
+use novarocks_spi::connector::CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY as HIDDEN_COLUMNS_PROPERTY;
 pub const APPLY_KEY_SOURCE_PROPERTY: &str = "novarocks.mv.apply-key.source";
 pub const APPLY_KEY_FIELD_ID_PROPERTY: &str = "novarocks.mv.apply-key.field-id";
 

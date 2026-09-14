@@ -55,8 +55,7 @@ use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
 use crate::mv::domain::persistence::schema as mv_schema;
 use crate::mv::domain::persistence::schema::{
-    APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
-    HIDDEN_COLUMNS_PROPERTY,
+    APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
 };
 use crate::mv::domain::persistence::semantic::{MvDesiredSemantics, MvRefreshDesiredConfiguration};
 use crate::mv::domain::readiness::MvReadinessPort;
@@ -115,7 +114,9 @@ use novarocks_query_application::engine_error::EngineError;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
-    ConnectorControlRegistry, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY as APPLY_KEY_COLUMN_PROPERTY,
+    CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY as HIDDEN_COLUMNS_PROPERTY, ConnectorControlRegistry,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
 };
 use novarocks_sql::planning::mv::FULL_REFRESH_DISABLED_MESSAGE;
 #[cfg(test)]
