@@ -560,6 +560,7 @@ impl SessionCatalogPort for SessionCatalogResolver {
         let namespace_name = namespace_name.to_owned();
         self.connector_blocking_io
             .spawn_ordinary(move || {
+                crate::connector::validate_request_context(&request)?;
                 crate::connector::metadata_namespace_exists(
                     connector_control.as_ref(),
                     request,
