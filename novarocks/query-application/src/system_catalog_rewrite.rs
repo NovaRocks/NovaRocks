@@ -522,6 +522,7 @@ mod tests {
 
     struct Facts {
         external_requests: Mutex<Vec<(String, bool)>>,
+        external_request_cancelled: Mutex<Vec<bool>>,
         external: Option<SystemCatalogFacts>,
     }
 
@@ -529,6 +530,7 @@ mod tests {
         fn local() -> Self {
             Self {
                 external_requests: Mutex::new(Vec::new()),
+                external_request_cancelled: Mutex::new(Vec::new()),
                 external: None,
             }
         }
@@ -536,6 +538,7 @@ mod tests {
         fn external() -> Self {
             Self {
                 external_requests: Mutex::new(Vec::new()),
+                external_request_cancelled: Mutex::new(Vec::new()),
                 external: Some(SystemCatalogFacts {
                     catalog_name: "ice".to_string(),
                     schema_names: vec!["warehouse".to_string()],
@@ -556,7 +559,7 @@ mod tests {
 
         fn external_system_catalog_facts(
             &self,
-            _request: &ConnectorRequestContext,
+            request: &ConnectorRequestContext,
             catalog_name: &str,
             include_table_names: bool,
         ) -> Result<Option<SystemCatalogFacts>, String> {
@@ -564,6 +567,10 @@ mod tests {
                 .lock()
                 .expect("external requests lock")
                 .push((catalog_name.to_string(), include_table_names));
+            self.external_request_cancelled
+                .lock()
+                .expect("external request cancellation lock")
+                .push(request.cancellation().is_cancelled());
             Ok(self.external.clone())
         }
     }
@@ -622,6 +629,13 @@ mod tests {
                 .lock()
                 .expect("external requests lock"),
             vec![("ice".to_string(), true)]
+        );
+        assert_eq!(
+            *facts
+                .external_request_cancelled
+                .lock()
+                .expect("external request cancellation lock"),
+            vec![false]
         );
     }
 
