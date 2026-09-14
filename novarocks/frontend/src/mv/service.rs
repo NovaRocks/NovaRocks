@@ -120,6 +120,10 @@ impl FrontendMvService {
         Arc::clone(&self.readiness)
     }
 
+    pub(crate) fn product_service(&self) -> &MvProductService {
+        &self.product_service
+    }
+
     pub(crate) async fn shutdown_background_workers_until(
         &self,
         deadline: Instant,

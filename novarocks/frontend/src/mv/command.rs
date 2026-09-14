@@ -126,8 +126,8 @@ impl MvCommandExecutor {
                     execution,
                     || {
                         drop_mv_with_ports(
-                            self.ports.readiness().as_ref(),
-                            self.mv_backend.as_ref(),
+                            self.refresh_service.product_service(),
+                            &self.ports,
                             current_catalog,
                             current_database,
                             &statement,

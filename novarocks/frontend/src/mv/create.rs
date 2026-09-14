@@ -67,10 +67,12 @@ pub(super) fn handle_create(
         .map_err(product_error)?
     {
         MvProductResult::Created(_) => Ok(MvStatementResult::Ok),
-        MvProductResult::Acknowledged | MvProductResult::Listed(_) => Err(MvApplicationError::new(
-            MvApplicationErrorKind::Engine,
-            "MV CREATE product returned a non-CREATE result",
-        )),
+        MvProductResult::Acknowledged | MvProductResult::Dropped | MvProductResult::Listed(_) => {
+            Err(MvApplicationError::new(
+                MvApplicationErrorKind::Engine,
+                "MV CREATE product returned a non-CREATE result",
+            ))
+        }
     }
 }
 

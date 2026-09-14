@@ -22,7 +22,9 @@ use std::time::Instant;
 use crate::activity::{
     MvActivityAdmissionError, MvActivityGate, MvActivityLease, MvActivityOwner, MvActivityTicket,
 };
-use crate::ports::{MvCatalogRegistrationPort, MvProviderFailure, MvProviderPort};
+use crate::ports::{
+    MvCatalogRegistrationPort, MvDropProjectionPort, MvProviderFailure, MvProviderPort,
+};
 use crate::process_runtime::{
     MvBackgroundRuntimeLifecycleError, MvBackgroundRuntimeOwner, MvBackgroundRuntimeStart,
 };
@@ -30,6 +32,7 @@ use crate::product::{
     MvCommand, MvCreateCommand, MvOperationContext, MvProductError, MvProductErrorKind,
     MvProductResult, MvTarget,
 };
+use crate::readiness::MvDropReadiness;
 
 /// The one process-local MV owner for activity admission and background-worker
 /// lifecycle. Hosts may inject effect callbacks, but cannot own a parallel
@@ -80,6 +83,38 @@ impl MvProductService {
             .register_target(operation, &created)
             .map_err(known_committed_finalize_failure)?;
         Ok(MvProductResult::Created(created))
+    }
+
+    /// Execute the product-owned DROP state machine. The projection port
+    /// supplies only exact durable facts; provider and catalog ports carry the
+    /// outer effects without owning their order or terminal interpretation.
+    pub fn drop(
+        &self,
+        operation: MvOperationContext,
+        target: MvTarget,
+        if_exists: bool,
+        projection: &dyn MvDropProjectionPort,
+        provider: &dyn MvProviderPort,
+        catalog_registration: &dyn MvCatalogRegistrationPort,
+    ) -> Result<MvProductResult, MvProductError> {
+        match projection
+            .prepare_drop(operation, &target, if_exists)
+            .map_err(MvProviderFailure::into_product_error)?
+        {
+            MvDropReadiness::AlreadyAbsent => Ok(MvProductResult::Acknowledged),
+            MvDropReadiness::ReadyToDrop => {
+                provider
+                    .drop_target(operation, &target)
+                    .map_err(MvProviderFailure::into_product_error)?;
+                projection
+                    .delete_after_provider_drop(operation, &target)
+                    .map_err(known_committed_finalize_failure)?;
+                catalog_registration
+                    .unregister_target(operation, &target)
+                    .map_err(known_committed_finalize_failure)?;
+                Ok(MvProductResult::Dropped)
+            }
+        }
     }
 
     pub fn acquire_foreground(
@@ -167,12 +202,14 @@ mod tests {
         semantic::MvRefreshDesiredConfiguration,
     };
     use crate::ports::{
-        MvCatalogRegistrationPort, MvProviderFailure, MvProviderFailureKind, MvProviderPort,
+        MvCatalogRegistrationPort, MvDropProjectionPort, MvProviderFailure, MvProviderFailureKind,
+        MvProviderPort,
     };
     use crate::product::{
         MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition,
         MvProductErrorKind, MvProductResult, MvTarget,
     };
+    use crate::readiness::MvDropReadiness;
     use crate::repository::InitialMvRefreshConfiguration;
     use bytes::Bytes;
     use novarocks_query_application::persisted_query_definition::{
@@ -187,6 +224,7 @@ mod tests {
         events: Mutex<Vec<&'static str>>,
         fail_inspection: bool,
         fail_projection: bool,
+        drop_absent: bool,
     }
 
     impl CreateEffects {
@@ -285,6 +323,32 @@ mod tests {
             _operation: MvOperationContext,
             _target: &MvTarget,
         ) -> Result<(), MvProviderFailure> {
+            self.record("unregister");
+            Ok(())
+        }
+    }
+
+    impl MvDropProjectionPort for CreateEffects {
+        fn prepare_drop(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvTarget,
+            _if_exists: bool,
+        ) -> Result<MvDropReadiness, MvProviderFailure> {
+            self.record("prepare_drop");
+            Ok(if self.drop_absent {
+                MvDropReadiness::AlreadyAbsent
+            } else {
+                MvDropReadiness::ReadyToDrop
+            })
+        }
+
+        fn delete_after_provider_drop(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvTarget,
+        ) -> Result<(), MvProviderFailure> {
+            self.record("delete_projection");
             Ok(())
         }
     }
@@ -442,5 +506,39 @@ mod tests {
             MvProductErrorKind::KnownCommittedFinalizeFailed
         );
         assert_eq!(effects.events(), ["create", "inspect", "sync", "project"]);
+    }
+
+    #[test]
+    fn drop_orders_provider_projection_and_catalog_effects() {
+        let service = MvProductService::default();
+        let effects = CreateEffects::default();
+        let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
+
+        let result = service
+            .drop(operation(), target, false, &effects, &effects, &effects)
+            .expect("drop succeeds");
+
+        assert!(matches!(result, MvProductResult::Dropped));
+        assert_eq!(
+            effects.events(),
+            ["prepare_drop", "drop", "delete_projection", "unregister"]
+        );
+    }
+
+    #[test]
+    fn drop_if_exists_absence_emits_no_external_effect() {
+        let service = MvProductService::default();
+        let effects = CreateEffects {
+            drop_absent: true,
+            ..Default::default()
+        };
+        let target = MvTarget::from_parts(Some("iceberg"), "db", "missing_mv");
+
+        let result = service
+            .drop(operation(), target, true, &effects, &effects, &effects)
+            .expect("missing IF EXISTS target is acknowledged");
+
+        assert!(matches!(result, MvProductResult::Acknowledged));
+        assert_eq!(effects.events(), ["prepare_drop"]);
     }
 }

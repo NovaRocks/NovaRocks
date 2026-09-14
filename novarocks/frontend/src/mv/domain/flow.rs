@@ -26,7 +26,7 @@ use crate::mv::domain::application::{
 };
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::domain::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
+use crate::mv::domain::lifecycle::{CreateMvRequest, ListMvsRequest};
 use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
@@ -189,30 +189,22 @@ pub fn create_mv_with_ports(
 /// Drop an MV through the readiness-aware Accelerator view and the injected
 /// MV backend.
 pub fn drop_mv_with_ports(
-    readiness: &MvReadinessPort,
-    mv_backend: &IcebergMvBackend,
+    product: &novarocks_mv_application::service::MvProductService,
+    ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     db: &str,
     stmt: &MvDropStatement,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
-    let target = resolve_refresh_target(current_catalog, db, &stmt.name_parts)?;
-    if let Some(engine) = existing_mv_storage_engine_by_target(readiness, &target)?
-        && engine != MvStorageEngine::Iceberg
-    {
-        return Err(
-            "DROP MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
-                .to_string(),
-        );
-    }
-    mv_backend.drop_mv(DropMvRequest {
-        stmt: stmt.clone(),
-        current_catalog: current_catalog.map(str::to_string),
-        current_database: db.to_string(),
-        connector_context: connector_context.clone(),
-    })?;
-    Ok(StatementResult::Ok)
+    crate::mv::domain::iceberg_refresh::drop_iceberg_mv_with_product(
+        product,
+        ports,
+        current_catalog,
+        db,
+        stmt,
+        connector_context,
+    )
 }
 
 /// Alter Iceberg MV metadata through the explicit frontend-composed MV ports.

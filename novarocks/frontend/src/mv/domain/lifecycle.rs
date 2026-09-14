@@ -21,23 +21,13 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::mv::domain::application::{
-    MvCreateStatement, MvDropStatement, MvRefreshRequest, MvShowStatement,
-};
+use crate::mv::domain::application::{MvCreateStatement, MvRefreshRequest, MvShowStatement};
 use crate::mv::domain::refresh::planning::RefreshPlanContract;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 #[derive(Clone)]
 pub struct CreateMvRequest {
     pub stmt: MvCreateStatement,
-    pub current_catalog: Option<String>,
-    pub current_database: String,
-    pub connector_context: novarocks_spi::connector::ConnectorRequestContext,
-}
-
-#[derive(Clone)]
-pub struct DropMvRequest {
-    pub stmt: MvDropStatement,
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub connector_context: novarocks_spi::connector::ConnectorRequestContext,

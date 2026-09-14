@@ -122,6 +122,7 @@ pub struct MvCreatedTarget {
 pub enum MvProductResult {
     Acknowledged,
     Created(MvCreatedTarget),
+    Dropped,
     Listed(Vec<MvTarget>),
 }
 

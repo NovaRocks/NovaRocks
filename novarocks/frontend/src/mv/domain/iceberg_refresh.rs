@@ -5894,7 +5894,11 @@ struct RewriteMergeRefreshOptions {
     apply_key: ApplyKeyContract,
 }
 
-pub(crate) fn drop_iceberg_mv_with_ports(
+/// Run the provider-specific effects for a product-owned DROP state machine.
+/// SQL target resolution and Connector mutation remain outside the product;
+/// the product fixes their admissible order and terminal meaning.
+pub(crate) fn drop_iceberg_mv_with_product(
+    product: &novarocks_mv_application::service::MvProductService,
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -5902,7 +5906,6 @@ pub(crate) fn drop_iceberg_mv_with_ports(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
-    let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_drop_target(
         current_catalog,
         current_database,
@@ -5910,76 +5913,268 @@ pub(crate) fn drop_iceberg_mv_with_ports(
             parts: stmt.name_parts.clone(),
         },
     )?;
-    let readiness_target = novarocks_sql::planning::mv::SqlMvTarget {
-        catalog: Some(target.catalog.clone()),
-        database: target.namespace.clone(),
-        name: target.table.clone(),
+    let product_target = novarocks_mv_application::product::MvTarget::try_new(
+        Some(target.catalog.clone()),
+        target.namespace.clone(),
+        target.table.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    // This lock is an outer Iceberg effect capability. It remains held across
+    // the complete product transition, exactly as the former direct route.
+    let _refresh_guard = acquire_mv_refresh_lock()?;
+    let projection = IcebergDropProjection {
+        readiness: ports.readiness.as_ref(),
     };
-    let upstream = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    );
-    if matches!(
-        ports
-            .readiness
-            .prepare_drop(&readiness_target, &upstream, stmt.if_exists)
-            .map_err(|error| {
-                if error.kind()
-                    == novarocks_mv_application::repository::MvRepositoryErrorKind::Conflict
-                {
-                    error.to_string()
-                } else {
-                    format!("load iceberg mv definition for drop failed: {error}")
-                }
-            })?,
-        novarocks_mv_application::readiness::MvDropReadiness::AlreadyAbsent
-    ) {
-        return Ok(StatementResult::Ok);
+    let effects = IcebergDropEffects {
+        ports,
+        connector_context,
+    };
+    match product
+        .drop(
+            novarocks_mv_application::product::MvOperationContext {
+                operation_id: uuid::Uuid::now_v7(),
+            },
+            product_target,
+            stmt.if_exists,
+            &projection,
+            &effects,
+            &effects,
+        )
+        .map_err(|error| error.to_string())?
+    {
+        novarocks_mv_application::product::MvProductResult::Acknowledged => Ok(StatementResult::Ok),
+        novarocks_mv_application::product::MvProductResult::Dropped => {
+            tracing::info!(
+                "iceberg mv {}.{}.{}: dropped successfully",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            Ok(StatementResult::Ok)
+        }
+        novarocks_mv_application::product::MvProductResult::Created(_)
+        | novarocks_mv_application::product::MvProductResult::Listed(_) => {
+            Err("MV DROP product returned a non-DROP result".to_string())
+        }
+    }
+}
+
+struct IcebergDropProjection<'a> {
+    readiness: &'a MvReadinessPort,
+}
+
+impl novarocks_mv_application::ports::MvDropProjectionPort for IcebergDropProjection<'_> {
+    fn prepare_drop(
+        &self,
+        _operation: novarocks_mv_application::product::MvOperationContext,
+        target: &novarocks_mv_application::product::MvTarget,
+        if_exists: bool,
+    ) -> Result<
+        novarocks_mv_application::readiness::MvDropReadiness,
+        novarocks_mv_application::ports::MvProviderFailure,
+    > {
+        let target = sql_target_from_product(target);
+        let upstream = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
+            target.catalog.as_deref().unwrap_or_default(),
+            &target.database,
+            &target.name,
+        );
+        self.readiness
+            .prepare_drop(&target, &upstream, if_exists)
+            .map_err(drop_preflight_repository_failure)
     }
 
-    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-        .map_err(|error| error.to_string())?;
-    crate::connector::mutation::execute_catalog_mutation(
-        ports.connector_control.as_ref(),
-        &instance_id,
-        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
-            table: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: Arc::from(target.namespace.as_str()),
-                table: Arc::from(target.table.as_str()),
-            },
-            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
-            data_disposition: novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
-        },
-        connector_context.clone(),
-    )?;
-    ports
-        .readiness
-        .delete_after_provider_drop(uuid::Uuid::now_v7(), &readiness_target)
-        .map_err(|error| {
-            if error.kind()
-                == novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption
-                && error.message().contains("metadata disappeared during drop")
-            {
-                error.to_string()
-            } else {
-                format!("drop iceberg MV accelerator projection failed: {error}")
-            }
-        })?;
-    crate::catalog_application::query_catalog::drop_local_table_registration_if_exists(
-        ports,
-        &target.namespace,
-        &target.table,
-    )?;
+    fn delete_after_provider_drop(
+        &self,
+        operation: novarocks_mv_application::product::MvOperationContext,
+        target: &novarocks_mv_application::product::MvTarget,
+    ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
+        self.readiness
+            .delete_after_provider_drop(operation.operation_id, &sql_target_from_product(target))
+            .map_err(drop_delete_repository_failure)
+    }
+}
 
-    tracing::info!(
-        "iceberg mv {}.{}.{}: dropped successfully",
-        target.catalog,
-        target.namespace,
-        target.table
-    );
-    Ok(StatementResult::Ok)
+struct IcebergDropEffects<'a> {
+    ports: &'a IcebergMvCorePorts,
+    connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+}
+
+impl IcebergDropEffects<'_> {
+    fn unsupported() -> novarocks_mv_application::ports::MvProviderFailure {
+        novarocks_mv_application::ports::MvProviderFailure::new(
+            novarocks_mv_application::ports::MvProviderFailureKind::InvalidRequest,
+            "Iceberg DROP adapter received an unsupported MV product operation",
+        )
+    }
+}
+
+impl novarocks_mv_application::ports::MvProviderPort for IcebergDropEffects<'_> {
+    fn create_target(
+        &self,
+        _operation: novarocks_mv_application::product::MvOperationContext,
+        _command: &novarocks_mv_application::product::MvCommand,
+    ) -> Result<
+        novarocks_mv_application::product::MvCreatedTarget,
+        novarocks_mv_application::ports::MvProviderFailure,
+    > {
+        Err(Self::unsupported())
+    }
+
+    fn inspect_created_target(
+        &self,
+        _operation: novarocks_mv_application::product::MvOperationContext,
+        _target: &novarocks_mv_application::product::MvCreatedTarget,
+    ) -> Result<
+        novarocks_mv_application::product::MvPreparedDefinition,
+        novarocks_mv_application::ports::MvProviderFailure,
+    > {
+        Err(Self::unsupported())
+    }
+
+    fn sync_target_descriptor(
+        &self,
+        _operation: novarocks_mv_application::product::MvOperationContext,
+        _target: &novarocks_mv_application::product::MvCreatedTarget,
+        _definition: &novarocks_mv_application::product::MvPreparedDefinition,
+    ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
+        Err(Self::unsupported())
+    }
+
+    fn project_created_target(
+        &self,
+        _operation: novarocks_mv_application::product::MvOperationContext,
+        _target: &novarocks_mv_application::product::MvCreatedTarget,
+    ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
+        Err(Self::unsupported())
+    }
+
+    fn drop_target(
+        &self,
+        _operation: novarocks_mv_application::product::MvOperationContext,
+        target: &novarocks_mv_application::product::MvTarget,
+    ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
+        let catalog = target.catalog().ok_or_else(|| {
+            novarocks_mv_application::ports::MvProviderFailure::new(
+                novarocks_mv_application::ports::MvProviderFailureKind::InvalidRequest,
+                "Iceberg MV DROP target has no catalog",
+            )
+        })?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
+            .map_err(|error| drop_provider_failure(error.to_string()))?;
+        crate::connector::mutation::execute_catalog_mutation(
+            self.ports.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(target.namespace()),
+                    table: Arc::from(target.name()),
+                },
+                policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+                data_disposition:
+                    novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+            },
+            self.connector_context.clone(),
+        )
+        .map(|_| ())
+        .map_err(drop_provider_failure)
+    }
+}
+
+impl novarocks_mv_application::ports::MvCatalogRegistrationPort for IcebergDropEffects<'_> {
+    fn register_target(
+        &self,
+        _operation: novarocks_mv_application::product::MvOperationContext,
+        _target: &novarocks_mv_application::product::MvCreatedTarget,
+    ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
+        Err(Self::unsupported())
+    }
+
+    fn unregister_target(
+        &self,
+        _operation: novarocks_mv_application::product::MvOperationContext,
+        target: &novarocks_mv_application::product::MvTarget,
+    ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
+        crate::catalog_application::query_catalog::drop_local_table_registration_if_exists(
+            self.ports,
+            target.namespace(),
+            target.name(),
+        )
+        .map_err(drop_provider_failure)
+    }
+}
+
+fn sql_target_from_product(target: &novarocks_mv_application::product::MvTarget) -> MvTarget {
+    MvTarget {
+        catalog: target.catalog().map(str::to_owned),
+        database: target.namespace().to_owned(),
+        name: target.name().to_owned(),
+    }
+}
+
+fn drop_preflight_repository_failure(
+    error: novarocks_mv_application::repository::MvRepositoryError,
+) -> novarocks_mv_application::ports::MvProviderFailure {
+    let message = if error.kind()
+        == novarocks_mv_application::repository::MvRepositoryErrorKind::Conflict
+        || (error.kind()
+            == novarocks_mv_application::repository::MvRepositoryErrorKind::InvalidRequest
+            && error.message().contains("materialized view does not exist"))
+    {
+        error.to_string()
+    } else {
+        format!("load iceberg mv definition for drop failed: {error}")
+    };
+    repository_failure(error, message)
+}
+
+fn drop_delete_repository_failure(
+    error: novarocks_mv_application::repository::MvRepositoryError,
+) -> novarocks_mv_application::ports::MvProviderFailure {
+    let message = if error.kind()
+        == novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption
+        && error.message().contains("metadata disappeared during drop")
+    {
+        error.to_string()
+    } else {
+        format!("drop iceberg MV accelerator projection failed: {error}")
+    };
+    repository_failure(error, message)
+}
+
+fn repository_failure(
+    error: novarocks_mv_application::repository::MvRepositoryError,
+    message: String,
+) -> novarocks_mv_application::ports::MvProviderFailure {
+    let kind = match error.kind() {
+        novarocks_mv_application::repository::MvRepositoryErrorKind::InvalidRequest => {
+            novarocks_mv_application::ports::MvProviderFailureKind::InvalidRequest
+        }
+        novarocks_mv_application::repository::MvRepositoryErrorKind::Conflict => {
+            novarocks_mv_application::ports::MvProviderFailureKind::TargetReplaced
+        }
+        novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption => {
+            novarocks_mv_application::ports::MvProviderFailureKind::Corruption
+        }
+        novarocks_mv_application::repository::MvRepositoryErrorKind::CommitUnknown => {
+            novarocks_mv_application::ports::MvProviderFailureKind::CommitUnknown
+        }
+        novarocks_mv_application::repository::MvRepositoryErrorKind::NotFound
+        | novarocks_mv_application::repository::MvRepositoryErrorKind::Unavailable => {
+            novarocks_mv_application::ports::MvProviderFailureKind::Unavailable
+        }
+    };
+    novarocks_mv_application::ports::MvProviderFailure::new(kind, message)
+}
+
+fn drop_provider_failure(
+    error: impl ToString,
+) -> novarocks_mv_application::ports::MvProviderFailure {
+    novarocks_mv_application::ports::MvProviderFailure::new(
+        novarocks_mv_application::ports::MvProviderFailureKind::Unavailable,
+        error.to_string(),
+    )
 }
 
 fn resolve_drop_target(

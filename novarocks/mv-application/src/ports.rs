@@ -23,6 +23,7 @@ use crate::product::{
     MvCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition, MvProductError,
     MvProductErrorKind, MvTarget,
 };
+use crate::readiness::MvDropReadiness;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvProviderFailureKind {
@@ -146,6 +147,24 @@ pub trait MvCatalogRegistrationPort: Send + Sync {
     ) -> Result<(), MvProviderFailure>;
 
     fn unregister_target(
+        &self,
+        operation: MvOperationContext,
+        target: &MvTarget,
+    ) -> Result<(), MvProviderFailure>;
+}
+
+/// The product-owned durable side of DROP. An outer adapter may bridge sync
+/// execution, but cannot reinterpret missing-target policy, dependency safety,
+/// or the exact post-provider-delete CAS.
+pub trait MvDropProjectionPort: Send + Sync {
+    fn prepare_drop(
+        &self,
+        operation: MvOperationContext,
+        target: &MvTarget,
+        if_exists: bool,
+    ) -> Result<MvDropReadiness, MvProviderFailure>;
+
+    fn delete_after_provider_drop(
         &self,
         operation: MvOperationContext,
         target: &MvTarget,
