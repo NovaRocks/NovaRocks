@@ -579,7 +579,8 @@ impl SessionCatalogPort for SessionCatalogResolver {
 
 #[cfg(test)]
 mod session_catalog_tests {
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
 
     use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
     use novarocks_query_application::session_error::QueryServiceErrorKind;
@@ -619,5 +620,49 @@ mod session_catalog_tests {
             .require_external_catalog_ready("warehouse")
             .expect_err("external catalog cannot bypass frontend catalog admission");
         assert_eq!(error.kind(), QueryServiceErrorKind::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn queued_external_namespace_lookup_rechecks_cancellation_before_provider_call() {
+        let supervisor = crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
+            tokio::runtime::Handle::current(),
+            ConnectorBlockingIoBudget::try_new(2, 1).expect("test budget"),
+        );
+        let (started, started_at_provider) = tokio::sync::oneshot::channel();
+        let (release, released) = mpsc::channel();
+        let held = supervisor.spawn_ordinary(move || {
+            started.send(()).expect("publish held call start");
+            released.recv().expect("release held call");
+        });
+        started_at_provider
+            .await
+            .expect("held call did not occupy ordinary capacity");
+
+        let resolver = SessionCatalogResolver::new(
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+            None,
+            Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
+            supervisor,
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let request = crate::connector::connector_request_context(None, Arc::clone(&cancellation))
+            .expect("connector request context");
+        let lookup = resolver.external_namespace_exists(request, "warehouse", "analytics");
+        tokio::pin!(lookup);
+        tokio::select! {
+            biased;
+            result = &mut lookup => panic!("queued lookup completed before capacity released: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+
+        cancellation.store(true, Ordering::Release);
+        release.send(()).expect("release held call");
+        held.finish().await.expect("held call completes");
+
+        let error = lookup
+            .await
+            .expect_err("cancelled request must not reach the provider");
+        assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
+        assert!(error.message().contains("connector request was cancelled"));
     }
 }
