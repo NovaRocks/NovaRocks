@@ -25,13 +25,11 @@ use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
-use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_catalog_application::ConnectorControlHost;
-use novarocks_mv_application::repository::MvRepository;
 use novarocks_query_application::api::BackendTopologyService;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::sql::catalog::SessionCatalogPort;
@@ -339,87 +337,6 @@ impl CatalogCommandKernel {
     }
 }
 
-/// MV metadata and refresh execution dependencies.
-///
-/// The backend is injected directly; the obsolete string-keyed
-/// `ConnectorRegistry` is intentionally not represented here.
-#[derive(Clone)]
-#[allow(
-    dead_code,
-    reason = "The MV kernel keeps all owned ports explicit for refresh and activation paths compiled in other targets."
-)]
-pub struct MvExecutionKernel {
-    catalog_service: Arc<QueryCatalogService>,
-    catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-    unified_statistics: Arc<UnifiedStatisticsResolver>,
-    mv_backend: Arc<IcebergMvBackend>,
-    repository: Arc<dyn MvRepository>,
-    storage_observation: Arc<dyn MvStorageObservationPort>,
-    query_execution: QueryExecutionService,
-}
-
-#[allow(
-    dead_code,
-    reason = "MV kernel accessors are retained as narrow ports for refresh and activation paths compiled in other targets."
-)]
-impl MvExecutionKernel {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        catalog_service: Arc<QueryCatalogService>,
-        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
-        unified_statistics: Arc<UnifiedStatisticsResolver>,
-        mv_backend: Arc<IcebergMvBackend>,
-        repository: Arc<dyn MvRepository>,
-        storage_observation: Arc<dyn MvStorageObservationPort>,
-        query_execution: QueryExecutionService,
-    ) -> Self {
-        Self {
-            catalog_service,
-            catalog_application,
-            connector_control,
-            unified_statistics,
-            mv_backend,
-            repository,
-            storage_observation,
-            query_execution,
-        }
-    }
-
-    pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {
-        &self.catalog_service
-    }
-
-    pub(crate) fn catalog_application(&self) -> Option<&Arc<dyn CatalogApplicationPort>> {
-        self.catalog_application.as_ref()
-    }
-
-    pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
-        &self.connector_control
-    }
-
-    pub(crate) fn unified_statistics(&self) -> &Arc<UnifiedStatisticsResolver> {
-        &self.unified_statistics
-    }
-
-    pub(crate) fn mv_backend(&self) -> &Arc<IcebergMvBackend> {
-        &self.mv_backend
-    }
-
-    pub(crate) fn repository(&self) -> &Arc<dyn MvRepository> {
-        &self.repository
-    }
-
-    pub(crate) fn storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {
-        &self.storage_observation
-    }
-
-    pub(crate) fn query_execution(&self) -> &QueryExecutionService {
-        &self.query_execution
-    }
-}
-
 /// View command dependencies.
 #[derive(Clone)]
 pub struct ViewExecutionKernel {
@@ -555,7 +472,6 @@ macro_rules! impl_kernel_catalog_admission {
 impl_kernel_catalog_admission!(QueryPreparationKernel);
 impl_kernel_catalog_admission!(CatalogCommandKernel);
 impl_kernel_catalog_admission!(DmlExecutionKernel);
-impl_kernel_catalog_admission!(MvExecutionKernel);
 impl_kernel_catalog_admission!(ViewExecutionKernel);
 impl_kernel_catalog_admission!(MaintenanceExecutionKernel);
 

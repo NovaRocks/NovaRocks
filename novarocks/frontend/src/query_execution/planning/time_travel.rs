@@ -20,9 +20,7 @@
 //! Ordinary SELECT external tables resolve through the query catalog materializer.
 
 use crate::catalog_application::resolver::{CatalogAdmission, resolve_table_target};
-use crate::query_execution::kernels::{
-    DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
-};
+use crate::query_execution::kernels::{DmlExecutionKernel, QueryPreparationKernel};
 use novarocks_parser::ast::{
     Ident, ObjectName as ParserObjectName, Query, SetExpr, TableAlias, TableFactor, TableWithJoins,
 };
@@ -228,7 +226,6 @@ macro_rules! impl_kernel_time_travel_resolver {
 
 impl_kernel_time_travel_resolver!(QueryPreparationKernel);
 impl_kernel_time_travel_resolver!(DmlExecutionKernel);
-impl_kernel_time_travel_resolver!(MvExecutionKernel);
 
 /// Walk the query AST in-place and rewrite each `TableFactor::Table` that has
 /// a `version: Some(...)` clause:

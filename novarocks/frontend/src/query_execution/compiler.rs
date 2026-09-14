@@ -36,8 +36,6 @@ use novarocks_sql::planning::catalog::TableLookupMode;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
-#[cfg(test)]
-use novarocks_mv_application::repository::MvRepository;
 use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
@@ -61,7 +59,6 @@ macro_rules! impl_kernel_catalog_service_source {
 impl_kernel_catalog_service_source!(domain::QueryPreparationKernel);
 impl_kernel_catalog_service_source!(domain::DmlExecutionKernel);
 impl_kernel_catalog_service_source!(domain::CatalogCommandKernel);
-impl_kernel_catalog_service_source!(domain::MvExecutionKernel);
 impl_kernel_catalog_service_source!(domain::ViewExecutionKernel);
 impl_kernel_catalog_service_source!(domain::MaintenanceExecutionKernel);
 
@@ -927,15 +924,6 @@ pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
 }
 
 #[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Shared test fixture provides the in-memory MV repository to external frontend tests."
-)]
-pub(crate) fn test_mv_repository() -> Arc<dyn MvRepository> {
-    Arc::new(novarocks_mv_application::test_repository::InMemoryMvRepository::default())
-}
-
-#[cfg(test)]
 #[expect(
     clippy::large_enum_variant,
     reason = "The distributed fixture retains both its sealed assembly and completion contract for integration tests."
@@ -994,7 +982,6 @@ pub struct TestQueryCompiler {
     query: domain::QueryPreparationKernel,
     view: domain::ViewExecutionKernel,
     system_tables: domain::SystemTableQueryKernel,
-    mv_repository: Arc<dyn MvRepository>,
     mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
 }
 
@@ -1004,14 +991,12 @@ impl TestQueryCompiler {
         query: domain::QueryPreparationKernel,
         view: domain::ViewExecutionKernel,
         system_tables: domain::SystemTableQueryKernel,
-        mv_repository: Arc<dyn MvRepository>,
         mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
     ) -> Self {
         Self {
             query,
             view,
             system_tables,
-            mv_repository,
             mv_storage_observation,
         }
     }

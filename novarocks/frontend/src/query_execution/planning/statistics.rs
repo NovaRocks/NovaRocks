@@ -25,9 +25,7 @@ use crate::catalog_application::query_bindings::{
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
-use crate::query_execution::kernels::{
-    DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
-};
+use crate::query_execution::kernels::{DmlExecutionKernel, QueryPreparationKernel};
 use arrow::datatypes::DataType;
 use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 use novarocks_sql::planning::catalog::materialization_statistics_facts;
@@ -115,7 +113,6 @@ macro_rules! impl_kernel_statistics_resolver {
 
 impl_kernel_statistics_resolver!(QueryPreparationKernel);
 impl_kernel_statistics_resolver!(DmlExecutionKernel);
-impl_kernel_statistics_resolver!(MvExecutionKernel);
 
 /// Project every admission-frozen connector observation into SQL values before
 /// optimization begins.  This is the one application boundary that may touch
