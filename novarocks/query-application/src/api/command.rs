@@ -72,51 +72,6 @@ impl CommandContext {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum CommandOutput {
-    Acknowledged,
-    Rows(CommandRows),
-}
-
-/// Bounded administrative rows. Distributed query rows use ExecutionHandle.
-pub type CommandCell = Option<Arc<str>>;
-pub type CommandRow = Arc<[CommandCell]>;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandRows {
-    columns: Arc<[Arc<str>]>,
-    rows: Arc<[CommandRow]>,
-}
-
-impl CommandRows {
-    pub fn try_new(columns: Vec<Arc<str>>, rows: Vec<Vec<Option<Arc<str>>>>) -> Option<Self> {
-        if columns.is_empty()
-            || columns.iter().any(|column| column.is_empty())
-            || rows.len() > 100_000
-            || rows.iter().any(|row| row.len() != columns.len())
-        {
-            return None;
-        }
-        Some(Self {
-            columns: columns.into(),
-            rows: rows
-                .into_iter()
-                .map(Arc::<[Option<Arc<str>>]>::from)
-                .collect::<Vec<_>>()
-                .into(),
-        })
-    }
-
-    pub fn columns(&self) -> &[Arc<str>] {
-        &self.columns
-    }
-
-    pub fn rows(&self) -> &[CommandRow] {
-        &self.rows
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CommandErrorKind {
@@ -213,10 +168,7 @@ pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{ConnectorCancellation, ConnectorRequestContext};
     use novarocks_workload_control::{
@@ -232,13 +184,6 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             false
         }
-    }
-
-    #[test]
-    fn administrative_rows_require_one_value_per_column() {
-        let columns = vec![Arc::<str>::from("job"), Arc::<str>::from("state")];
-        let rows = vec![vec![Some(Arc::<str>::from("one"))]];
-        assert!(CommandRows::try_new(columns, rows).is_none());
     }
 
     #[test]
