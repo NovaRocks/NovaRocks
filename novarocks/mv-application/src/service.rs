@@ -139,12 +139,6 @@ impl MvProductService {
         self.activity_gate.request(target, owner)
     }
 
-    /// A host callback may use this capability only to register or complete
-    /// product work; the gate state remains owned by this service.
-    pub fn activity_gate(&self) -> MvActivityGate {
-        self.activity_gate.clone()
-    }
-
     pub fn begin_background_start(
         &self,
     ) -> Result<MvBackgroundRuntimeStart<'_>, MvBackgroundRuntimeLifecycleError> {

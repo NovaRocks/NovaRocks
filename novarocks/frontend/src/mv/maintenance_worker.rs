@@ -43,12 +43,13 @@ use crate::query_execution::maintenance::{
 use novarocks_mv_application::persistence::definition::StoredMvDefinition;
 use novarocks_mv_application::repository::MvRepositoryError;
 use novarocks_mv_application::{
-    activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner},
+    activity::{CanonicalMvTarget, MvActivityGateError, MvActivityOwner},
     maintenance::{
         AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceCoordinator,
         MaintenanceCoordinatorConfig, MaintenanceExecutionReport, MvBackgroundEngineError,
         MvBackgroundEngineErrorKind, MvMaintenanceRuntime,
     },
+    service::MvProductService,
 };
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
@@ -62,7 +63,7 @@ pub(crate) struct FrontendMaintenanceWorkerDependencies {
     pub(crate) background_engine: Arc<dyn MvBackgroundEngine>,
     pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     pub(crate) table_maintenance_service: Arc<dyn TableMaintenanceService>,
-    pub(crate) activity_gate: MvActivityGate,
+    pub(crate) product_service: Arc<MvProductService>,
     pub(crate) root_admission: RootAdmissionHandle,
     pub(crate) coordinator_config: MaintenanceCoordinatorConfig,
     pub(crate) attempt_timeout: Duration,
@@ -224,7 +225,7 @@ impl FrontendMaintenanceWorker {
                 return;
             }
         };
-        let mut ticket = match self.dependencies.activity_gate.request(
+        let mut ticket = match self.dependencies.product_service.request_activity(
             CanonicalMvTarget::from_parts(Some(&target.catalog), &target.namespace, &target.table),
             MvActivityOwner::AutomaticMaintenance,
         ) {

@@ -34,7 +34,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_mv_application::{
-    activity::{MvActivityAdmissionError, MvActivityGate, MvActivityLease, MvActivityOwner},
+    activity::{MvActivityAdmissionError, MvActivityLease, MvActivityOwner},
     maintenance::{
         MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     },
@@ -62,7 +62,7 @@ use super::{
 pub struct FrontendMvService {
     readiness: Arc<MvReadinessPort>,
     refresh: refresh::FrontendMvRefreshDependencies,
-    product_service: MvProductService,
+    product_service: Arc<MvProductService>,
     scheduler_config: MvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
@@ -104,7 +104,7 @@ impl FrontendMvService {
                 readiness: Arc::clone(&readiness),
             },
             readiness,
-            product_service: MvProductService::default(),
+            product_service: Arc::new(MvProductService::default()),
             scheduler_config,
             maintenance_config,
             table_maintenance_service,
@@ -121,7 +121,7 @@ impl FrontendMvService {
     }
 
     pub(crate) fn product_service(&self) -> &MvProductService {
-        &self.product_service
+        self.product_service.as_ref()
     }
 
     pub(crate) async fn shutdown_background_workers_until(
@@ -161,7 +161,7 @@ impl FrontendMvService {
             maintenance_config: self.maintenance_config.clone(),
             table_maintenance_engine: bindings.table_maintenance_engine,
             table_maintenance_service,
-            activity_gate: self.product_service.activity_gate(),
+            product_service: Arc::clone(&self.product_service),
             root_admission: self.root_admission.clone(),
             optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
             attempt_timeout: self.attempt_timeout,
@@ -302,7 +302,7 @@ struct RefreshWorkerDependencies {
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
-    activity_gate: MvActivityGate,
+    product_service: Arc<MvProductService>,
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
@@ -320,7 +320,7 @@ fn start_background_workers(
             background_engine: Arc::clone(&dependencies.background_engine),
             table_maintenance_engine: Arc::clone(&dependencies.table_maintenance_engine),
             table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
-            activity_gate: dependencies.activity_gate.clone(),
+            product_service: Arc::clone(&dependencies.product_service),
             root_admission: dependencies.root_admission.clone(),
             coordinator_config: dependencies.maintenance_config.clone(),
             attempt_timeout: dependencies.attempt_timeout,
@@ -420,7 +420,7 @@ fn run_scheduled_refreshes(
                 break;
             }
         };
-        let mut ticket = match dependencies.activity_gate.request(
+        let mut ticket = match dependencies.product_service.request_activity(
             canonical_mv_target(&request.target),
             MvActivityOwner::ScheduledRefresh,
         ) {
