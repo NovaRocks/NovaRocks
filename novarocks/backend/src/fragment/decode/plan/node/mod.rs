@@ -22,7 +22,8 @@ mod aggregate;
 mod change_event_expand;
 #[cfg(test)]
 mod filter;
-mod hash_join;
+#[cfg(test)]
+mod hash_join_tests;
 #[cfg(test)]
 mod nestloop_join;
 #[cfg(test)]
@@ -1397,16 +1398,18 @@ fn lower_physical_node(
             arena,
             ctx,
         ),
-        plan::plan_node::Kind::HashJoin(join) => hash_join::lower_hash_join_node(
-            node,
-            physical,
-            join,
-            path.clone().field("hash_join"),
-            node_path.clone(),
-            physical_output_path.clone(),
-            children,
-            arena,
-        ),
+        plan::plan_node::Kind::HashJoin(join) => {
+            novarocks_native_adapter::fragment_hash_join::lower_hash_join_node(
+                node,
+                physical,
+                join,
+                path.clone().field("hash_join"),
+                node_path.clone(),
+                physical_output_path.clone(),
+                children,
+                arena,
+            )
+        }
         plan::plan_node::Kind::NestLoopJoin(join) => lower_nest_loop_join_node(
             node,
             physical,

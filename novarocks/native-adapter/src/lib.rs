@@ -37,6 +37,7 @@ pub mod fragment_decode_context;
 pub mod fragment_error;
 pub mod fragment_exchange_receiver;
 pub mod fragment_expression;
+pub mod fragment_hash_join;
 pub mod fragment_ingress_error;
 pub mod fragment_instance;
 pub mod fragment_layout;
