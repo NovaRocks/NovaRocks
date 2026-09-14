@@ -24,7 +24,6 @@
 use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
-use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::common::backend_topology::BackendTopologyService;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
@@ -38,6 +37,7 @@ use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::sql::catalog::SessionCatalogPort;
+use novarocks_query_application::system_catalog::SystemCatalog;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
 

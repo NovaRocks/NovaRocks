@@ -453,7 +453,7 @@ async fn build_frontend_role_products(
 fn build_frontend_query_session_factory_from_role_products(
     host: &FrontendApplicationHost,
     products: &FrontendRoleProducts,
-    system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
+    system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog>,
     client_connection_control: Arc<dyn ClientConnectionControlPort>,
 ) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
     let catalog_service = Arc::clone(&products.catalog_service);
@@ -597,7 +597,7 @@ fn build_frontend_query_session_factory_from_role_products(
 #[cfg(test)]
 async fn build_frontend_query_session_factory(
     host: &mut FrontendApplicationHost,
-    system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
+    system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     client_connection_control: Arc<dyn ClientConnectionControlPort>,
@@ -788,8 +788,10 @@ where
         config.native_transport.clone(),
     )?;
     let exchange_port = report_server.bound_addr().port();
-    let system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog> =
-        Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
+    let system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog> =
+        Arc::new(
+            novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+        );
     let client_connections = Arc::new(MysqlClientConnectionRegistry::new());
     let client_connection_control: Arc<dyn ClientConnectionControlPort> =
         client_connections.clone();
@@ -1364,7 +1366,9 @@ mod tests {
 
         let (session_factory, mut products) = build_frontend_query_session_factory(
             &mut host,
-            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+            Arc::new(
+                novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+            ),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
             Arc::new(MysqlClientConnectionRegistry::new()),
@@ -1518,7 +1522,9 @@ mod tests {
         .expect("open frontend application host");
         let (session_factory, mut products) = build_frontend_query_session_factory(
             &mut host,
-            Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+            Arc::new(
+                novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+            ),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
             Arc::new(MysqlClientConnectionRegistry::new()),

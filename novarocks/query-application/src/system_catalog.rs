@@ -15,22 +15,65 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned system catalog: the information_schema virtual-table registry
-//! and providers. Implements core's `SystemCatalog` port; core resolves through
-//! the port and never names these types (FEH-3).
+//! Query-application-owned `information_schema` virtual-table registry.
+//!
+//! The query application owns both the narrow materialization contract and the
+//! built-in providers. Role-local catalog readers supply only the immutable
+//! names needed for a scan, so neither a provider nor a caller can obtain a
+//! Frontend application aggregate through this boundary.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::catalog_application::system_catalog::{
-    SystemCatalog, SystemCatalogInputs, SystemTableData,
-};
+use crate::api::{build_utf8_query_result, build_utf8_table_query_result};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use novarocks_query_application::api::{build_utf8_query_result, build_utf8_table_query_result};
 use novarocks_types::schema::ColumnDef;
 
 const INFORMATION_SCHEMA_DB: &str = "information_schema";
+
+/// Minimal facts a system-table rewriter gathers from role-local catalog
+/// readers. Providers receive no engine state or catalog-control capability.
+pub struct SystemCatalogInputs<'a> {
+    /// Value for the `catalog_name` column.
+    pub catalog_name: &'a str,
+    /// Sorted, deduplicated namespace names for the selected catalog.
+    pub schema_names: &'a [String],
+    /// Enumerated `(schema, table)` pairs only when the selected provider
+    /// requires table facts.
+    pub table_names: &'a [(String, String)],
+}
+
+/// Columns and materialized batches for one resolved system table.
+pub struct SystemTableData {
+    pub columns: Vec<ColumnDef>,
+    pub batches: Vec<RecordBatch>,
+}
+
+/// Resolves a system-table reference from caller-supplied, read-only facts.
+pub trait SystemCatalog: Send + Sync {
+    /// `Ok(None)` leaves an unregistered reference for downstream resolution.
+    fn resolve(
+        &self,
+        db: &str,
+        tbl: &str,
+        inputs: &SystemCatalogInputs<'_>,
+    ) -> Result<Option<SystemTableData>, String>;
+}
+
+/// No-op catalog for query paths that deliberately do not install providers.
+pub struct EmptySystemCatalog;
+
+impl SystemCatalog for EmptySystemCatalog {
+    fn resolve(
+        &self,
+        _db: &str,
+        _tbl: &str,
+        _inputs: &SystemCatalogInputs<'_>,
+    ) -> Result<Option<SystemTableData>, String> {
+        Ok(None)
+    }
+}
 
 /// Contract for a single information_schema virtual table. Unlike the former
 /// core trait, `scan` receives only the narrow inputs it needs — never engine
@@ -248,6 +291,23 @@ impl SystemCatalog for SystemCatalogService {
 mod tests {
     use super::*;
     use arrow::array::{Array, StringArray};
+
+    #[test]
+    fn empty_system_catalog_returns_none() {
+        let names = vec!["a".to_string()];
+        let inputs = SystemCatalogInputs {
+            catalog_name: "default_catalog",
+            schema_names: &names,
+            table_names: &[],
+        };
+
+        assert!(
+            EmptySystemCatalog
+                .resolve("information_schema", "schemata", &inputs)
+                .expect("empty catalog resolution must succeed")
+                .is_none()
+        );
+    }
 
     fn inputs<'a>(catalog_name: &'a str, schema_names: &'a [String]) -> SystemCatalogInputs<'a> {
         SystemCatalogInputs {

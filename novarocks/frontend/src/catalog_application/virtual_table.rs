@@ -36,7 +36,7 @@ use arrow::record_batch::RecordBatch;
 use novarocks_parser::{Span, ast};
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
-use crate::catalog_application::system_catalog::SystemCatalog;
+use novarocks_query_application::system_catalog::{SystemCatalog, SystemCatalogInputs};
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_types::schema::ColumnDef;
 
@@ -227,12 +227,11 @@ fn rewrite_table_factor(
                                     );
                                 }
                             }
-                            let inputs =
-                                crate::catalog_application::system_catalog::SystemCatalogInputs {
-                                    catalog_name: cat,
-                                    schema_names: &databases,
-                                    table_names: &table_names,
-                                };
+                            let inputs = SystemCatalogInputs {
+                                catalog_name: cat,
+                                schema_names: &databases,
+                                table_names: &table_names,
+                            };
                             let Some(data) =
                                 system_catalog.resolve(INFORMATION_SCHEMA_DB, tbl, &inputs)?
                             else {
@@ -269,7 +268,7 @@ fn rewrite_table_factor(
             };
             schema_names.sort();
             schema_names.dedup();
-            let inputs = crate::catalog_application::system_catalog::SystemCatalogInputs {
+            let inputs = SystemCatalogInputs {
                 catalog_name: "default_catalog",
                 schema_names: &schema_names,
                 // The local catalog's table listing is not wired here yet; the
