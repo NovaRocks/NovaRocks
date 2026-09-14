@@ -87,15 +87,6 @@ pub trait CoreCommandRoute: Send + Sync {
     ) -> Result<Option<QuerySessionOutput>, String> {
         Ok(None)
     }
-
-    fn execute_typed(
-        &self,
-        _statement: &Statement,
-        _context: &RequestContext,
-        _command_context: &CommandContext,
-    ) -> Result<QuerySessionOutput, String> {
-        Err("typed command route is unavailable".to_string())
-    }
 }
 
 /// A fully lowered product command selected by SQL admission.
