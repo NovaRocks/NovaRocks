@@ -52,3 +52,22 @@ mode = "dynamic-state-store"
 [standalone_server]
 mysql_port = 9030
 user = "root"
+
+# A system scenario preserves the production FE/BE process boundary, but is
+# not a host-capacity benchmark.  The default runtime values derive several
+# executor pools from every visible CPU.  With one FE and three BEs that can
+# oversubscribe a developer machine before a scenario issues its first query.
+# Keep all role-local pools bounded here; a performance run that needs a
+# different capacity must provide an explicit deployment config instead of
+# making the ordinary correctness path host-dependent.
+[runtime]
+pipeline_scan_thread_pool_thread_num = 1
+pipeline_exec_thread_pool_thread_num = 1
+exchange_io_threads = 1
+data_runtime_worker_threads = 1
+data_runtime_max_blocking_threads = 2
+query_cpu_worker_threads = 1
+query_blocking_worker_threads = 1
+connector_blocking_io_max_inflight = 2
+connector_split_blocking_io_max_inflight = 1
+connector_io_tasks_per_scan_operator = 1
