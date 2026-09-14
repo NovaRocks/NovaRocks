@@ -23,6 +23,9 @@
 
 pub mod api;
 
+/// Immutable request state captured exactly once at statement admission.
+pub mod admitted_query_context;
+
 /// First-wins statement cancellation shared by query application consumers.
 pub mod cancellation;
 
