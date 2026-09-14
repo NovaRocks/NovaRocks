@@ -22,17 +22,17 @@
 //! the runtime handle and channel cache instance-owned; no Core or process
 //! global runtime participates in Backend transport work.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use novarocks_native_trust::NativeTrust;
 
-#[cfg(test)]
-use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
+#[cfg(any(test, feature = "test-support"))]
+use crate::{BackendDataRuntime, BackendNativeTransport};
 
-#[cfg(test)]
-pub(crate) fn test_backend_data_runtime() -> BackendDataRuntime {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_backend_data_runtime() -> BackendDataRuntime {
     static TEST_RUNTIME: std::sync::LazyLock<(tokio::runtime::Runtime, BackendDataRuntime)> =
         std::sync::LazyLock::new(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -50,8 +50,8 @@ pub(crate) fn test_backend_data_runtime() -> BackendDataRuntime {
     TEST_RUNTIME.1.clone()
 }
 
-#[cfg(test)]
-pub(crate) fn test_backend_native_trust() -> Arc<NativeTrust> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_backend_native_trust() -> Arc<NativeTrust> {
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeTransportMode, ValidatedSharedSecret,
     };

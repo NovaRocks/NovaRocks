@@ -45,4 +45,5 @@ tower = { workspace = true, features = ["util"] }
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-native-adapter = { workspace = true, features = ["test-support"] }
 novarocks-sql.workspace = true

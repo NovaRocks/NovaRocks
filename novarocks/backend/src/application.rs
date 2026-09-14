@@ -770,11 +770,11 @@ mod tests {
         UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
         compose_backend_application_services,
     };
-    use crate::rpc::runtime::test_backend_native_trust;
     use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
+    use novarocks_native_adapter::backend_test_support::test_backend_native_trust;
     use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
     use novarocks_proto_models::novarocks as protocol;
@@ -836,7 +836,7 @@ mod tests {
     }
 
     fn test_data_runtime() -> BackendDataRuntime {
-        crate::rpc::runtime::test_backend_data_runtime()
+        novarocks_native_adapter::backend_test_support::test_backend_data_runtime()
     }
 
     /// The tick is the only thing that turns elapsed time into a decision, so
@@ -933,7 +933,8 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: advertise_port,
             },
-            native_trust: crate::rpc::runtime::test_backend_native_trust(),
+            native_trust: novarocks_native_adapter::backend_test_support::test_backend_native_trust(
+            ),
             native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             function_set: test_execution_function_set(),
             native_transport: BackendNativeTransport::Plaintext,

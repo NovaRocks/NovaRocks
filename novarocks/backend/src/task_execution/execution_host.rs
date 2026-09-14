@@ -1799,7 +1799,8 @@ mod tests {
     }
 
     fn host(facts: Arc<StubContextFacts>) -> NativeTaskExecutionHost {
-        let data_runtime = crate::rpc::runtime::test_backend_data_runtime();
+        let data_runtime =
+            novarocks_native_adapter::backend_test_support::test_backend_data_runtime();
         let completion_supervisor =
             TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
         NativeTaskExecutionHost::new(

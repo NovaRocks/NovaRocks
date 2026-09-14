@@ -45,9 +45,11 @@ pub(crate) fn participant_for_test()
             &contribution,
         )
         .expect("a channel-less contribution decodes");
-    BackendRuntimeFilterParticipantFactory::new(crate::rpc::runtime::test_backend_data_runtime())
-        .install(participant_execution_id(), decoded)
-        .expect("a channel-less participant installs")
+    BackendRuntimeFilterParticipantFactory::new(
+        novarocks_native_adapter::backend_test_support::test_backend_data_runtime(),
+    )
+    .install(participant_execution_id(), decoded)
+    .expect("a channel-less participant installs")
 }
 
 /// The attempt `participant_for_test` installs on.

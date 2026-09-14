@@ -21,6 +21,8 @@ pub mod backend_announce;
 pub mod backend_heartbeat;
 pub mod backend_metrics;
 pub mod backend_readiness;
+#[cfg(any(test, feature = "test-support"))]
+pub mod backend_test_support;
 pub mod catalog_prune_rpc;
 pub mod connector_blocking_io;
 pub mod debug_environment;

@@ -1220,12 +1220,12 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
 
-    use crate::rpc::runtime::test_backend_data_runtime;
     use crate::runtime_filter::participant::{
         BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
     };
     use crate::task_execution::execution_host::TaskQueryContextFacts;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_native_adapter::backend_test_support::test_backend_data_runtime;
     use novarocks_native_adapter::runtime_filter_install::DecodedRuntimeFilterContribution;
     use novarocks_native_adapter::runtime_filter_participant::RuntimeFilterParticipant;
     use novarocks_native_adapter::task_shared_facts::release_runtime_filter_telemetry;
