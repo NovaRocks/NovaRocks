@@ -98,6 +98,7 @@ use novarocks_query_application::sql::{
     CoreCommandRoute, parse_single_statement, query_service_parse_error,
     strip_leading_line_comments,
 };
+use novarocks_query_application::sql::{ProductSqlCommand, lower_product_sql_command};
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
 use novarocks_user_error::UserError;
@@ -170,12 +171,19 @@ impl CoreCommandRoute for TypedCommandRoute {
                     .show_backends(context.execution().role())
                     .map(StatementResult::Query)
             }
-            ParsedStatement::Statistics(statement) => self.statistics.execute(
-                statement,
-                context.session().current_catalog(),
-                context.session().current_database(),
-                Some(context.execution()),
-            ),
+            ParsedStatement::Statistics(statement) => {
+                let Some(ProductSqlCommand::Statistics(command)) =
+                    lower_product_sql_command(&ParsedStatement::Statistics(statement.clone()))?
+                else {
+                    return Err("statistics parser admission did not produce a semantic command".to_string());
+                };
+                self.statistics.execute_command(
+                    &command,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    Some(context.execution()),
+                )
+            }
             ParsedStatement::Catalog(novarocks_parser::ast::CatalogStatement::DropDatabase(
                 statement,
             )) if context.session().current_catalog().is_none()

@@ -23,9 +23,10 @@ use crate::statistics_jobs::application::{
     StatisticsApplicationCommand, StatisticsApplicationPort, StatisticsApplicationResult,
     StatisticsColumnIntent, StatisticsTableTarget,
 };
-use novarocks_parser::ast::{AnalyzeMode, StatisticsStatement};
 use novarocks_query_application::api::build_nullable_utf8_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+use novarocks_sql::semantic::StatisticsSqlCommand;
+use novarocks_sql::semantic::command::AnalyzeModeSql;
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone)]
@@ -133,18 +134,27 @@ impl StatisticsCommandExecutor {
         Self { application }
     }
 
-    pub fn execute(
+    /// Executes the complete semantic command admitted by Query Application.
+    ///
+    /// This adapter receives no parser AST and cannot reparse source SQL. It
+    /// owns only the role-local projection to the statistics product port.
+    pub fn execute_command(
         &self,
-        statement: &StatisticsStatement,
+        command: &StatisticsSqlCommand,
         current_catalog: Option<&str>,
         current_database: &str,
         execution: Option<
             &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         >,
     ) -> Result<StatementResult, String> {
-        let command = match statement {
-            StatisticsStatement::AnalyzeTable(statement) => {
-                if statement.mode != AnalyzeMode::Default || statement.with_sync_mode {
+        let command = match command {
+            StatisticsSqlCommand::AnalyzeTable {
+                mode,
+                table,
+                columns,
+                with_sync_mode,
+            } => {
+                if *mode != AnalyzeModeSql::Default || *with_sync_mode {
                     return Err(
                         "ANALYZE mode and sync options are not supported by the statistics application"
                             .to_string(),
@@ -152,57 +162,38 @@ impl StatisticsCommandExecutor {
                 }
                 StatisticsApplicationCommand::AnalyzeTable {
                     target: statistics_application_target(
-                        &statement
-                            .name
-                            .parts
-                            .iter()
-                            .map(|part| part.value.clone())
-                            .collect::<Vec<_>>(),
+                        &table.parts,
                         current_catalog,
                         current_database,
                     )?,
-                    columns: if statement.columns.is_empty() {
+                    columns: if columns.is_empty() {
                         StatisticsColumnIntent::AllColumns
                     } else {
-                        StatisticsColumnIntent::Explicit(
-                            statement
-                                .columns
-                                .iter()
-                                .map(|column| column.value.clone())
-                                .collect(),
-                        )
+                        StatisticsColumnIntent::Explicit(columns.clone())
                     },
                 }
             }
-            StatisticsStatement::ShowAnalyzeJobs(_) => {
-                StatisticsApplicationCommand::ShowAnalyzeJobs
-            }
-            StatisticsStatement::CancelAnalyze(statement) => {
+            StatisticsSqlCommand::ShowAnalyzeJobs => StatisticsApplicationCommand::ShowAnalyzeJobs,
+            StatisticsSqlCommand::CancelAnalyze { job_id } => {
                 StatisticsApplicationCommand::CancelAnalyze {
-                    job_id: uuid::Uuid::parse_str(&statement.job_id).map_err(|error| {
-                        format!("invalid ANALYZE job ID '{}': {error}", statement.job_id)
-                    })?,
+                    job_id: uuid::Uuid::parse_str(job_id)
+                        .map_err(|error| format!("invalid ANALYZE job ID '{job_id}': {error}"))?,
                 }
             }
-            StatisticsStatement::ShowTableStats(statement) => {
+            StatisticsSqlCommand::ShowTableStats { table } => {
                 StatisticsApplicationCommand::ShowTableStats {
                     target: statistics_application_target(
-                        &statement
-                            .name
-                            .parts
-                            .iter()
-                            .map(|part| part.value.clone())
-                            .collect::<Vec<_>>(),
+                        &table.parts,
                         current_catalog,
                         current_database,
                     )?,
                 }
             }
-            StatisticsStatement::ShowBasicStatsMeta(_)
-            | StatisticsStatement::ShowHistogramStatsMeta(_)
-            | StatisticsStatement::DropStats(_)
-            | StatisticsStatement::DropHistogram(_)
-            | StatisticsStatement::DropMultipleColumnsStats(_) => {
+            StatisticsSqlCommand::ShowBasicStatsMeta
+            | StatisticsSqlCommand::ShowHistogramStatsMeta
+            | StatisticsSqlCommand::DropStats { .. }
+            | StatisticsSqlCommand::DropHistogram { .. }
+            | StatisticsSqlCommand::DropMultipleColumnsStats { .. } => {
                 return Err(
                     "statistics command is not supported by the statistics application".to_string(),
                 );
@@ -228,6 +219,18 @@ mod tests {
         StatisticsApplicationResult, StatisticsJobView, StatisticsTableStatView,
         StatisticsTableTarget,
     };
+
+    fn statistics_command(sql: &str) -> novarocks_sql::semantic::StatisticsSqlCommand {
+        let statement = novarocks_query_application::sql::parse_single_statement(sql)
+            .expect("parse statistics statement");
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Statistics(command)) =
+            novarocks_query_application::sql::lower_product_sql_command(&statement)
+                .expect("lower statistics statement")
+        else {
+            panic!("expected semantic statistics command");
+        };
+        command
+    }
 
     #[derive(Default)]
     struct RecordingStatisticsApplicationPort {
@@ -291,21 +294,15 @@ mod tests {
         let executor =
             StatisticsCommandExecutor::new(Arc::clone(&port) as Arc<dyn StatisticsApplicationPort>);
 
-        let statements = novarocks_parser::parse("ANALYZE TABLE ice.analytics.orders (order_id)")
-            .expect("parse typed analyze");
-        let [novarocks_parser::ast::Statement::Statistics(statement)] = statements.as_slice()
-        else {
-            panic!("expected statistics statement");
-        };
-        assert!(executor.execute(statement, None, "default", None).is_ok());
-        let statements = novarocks_parser::parse("SHOW TABLE STATS ice.analytics.orders")
-            .expect("parse typed table stats");
-        let [novarocks_parser::ast::Statement::Statistics(statement)] = statements.as_slice()
-        else {
-            panic!("expected statistics statement");
-        };
+        let analyze = statistics_command("ANALYZE TABLE ice.analytics.orders (order_id)");
+        assert!(
+            executor
+                .execute_command(&analyze, None, "default", None)
+                .is_ok()
+        );
+        let show = statistics_command("SHOW TABLE STATS ice.analytics.orders");
         let show_stats = executor
-            .execute(statement, None, "default", None)
+            .execute_command(&show, None, "default", None)
             .expect("show typed table stats");
         let novarocks_query_application::protocol_delivery::QuerySessionOutput::Query(show_stats) =
             show_stats
