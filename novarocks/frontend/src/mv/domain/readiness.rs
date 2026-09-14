@@ -14,7 +14,8 @@ use std::sync::Arc;
 use novarocks_mv_application::activity::CanonicalMvTarget;
 use novarocks_mv_application::process_runtime::ProcessRuntime;
 use novarocks_mv_application::readiness::{
-    MvCandidateReader as ProductCandidateReader, MvReadinessService, MvRuntimePublicationLease,
+    MvCandidateReader as ProductCandidateReader, MvDropReadiness, MvReadinessService,
+    MvRuntimePublicationLease,
 };
 use uuid::Uuid;
 
@@ -171,6 +172,31 @@ impl MvReadinessPort {
         self.block_on(
             self.service
                 .delete_ready_projection(operation_id, &canonical_mv_target(target)),
+        )
+    }
+
+    /// Synchronous bridge to the product-owned DROP durable preflight.
+    pub(crate) fn prepare_drop(
+        &self,
+        target: &MvTarget,
+        upstream: &MvDependencyObjectRef,
+        if_exists: bool,
+    ) -> Result<MvDropReadiness, MvRepositoryError> {
+        self.block_on(
+            self.service
+                .prepare_drop(&canonical_mv_target(target), upstream, if_exists),
+        )
+    }
+
+    /// Synchronous bridge to the product-owned post-provider-delete CAS.
+    pub(crate) fn delete_after_provider_drop(
+        &self,
+        operation_id: Uuid,
+        target: &MvTarget,
+    ) -> Result<(), MvRepositoryError> {
+        self.block_on(
+            self.service
+                .delete_after_provider_drop(operation_id, &canonical_mv_target(target)),
         )
     }
 

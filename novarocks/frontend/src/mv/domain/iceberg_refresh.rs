@@ -5910,8 +5910,31 @@ pub(crate) fn drop_iceberg_mv_with_ports(
             parts: stmt.name_parts.clone(),
         },
     )?;
-    if !preflight_iceberg_mv_drop_with_readiness(ports.readiness.as_ref(), &target, stmt.if_exists)?
-    {
+    let readiness_target = novarocks_sql::planning::mv::SqlMvTarget {
+        catalog: Some(target.catalog.clone()),
+        database: target.namespace.clone(),
+        name: target.table.clone(),
+    };
+    let upstream = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    );
+    if matches!(
+        ports
+            .readiness
+            .prepare_drop(&readiness_target, &upstream, stmt.if_exists)
+            .map_err(|error| {
+                if error.kind()
+                    == novarocks_mv_application::repository::MvRepositoryErrorKind::Conflict
+                {
+                    error.to_string()
+                } else {
+                    format!("load iceberg mv definition for drop failed: {error}")
+                }
+            })?,
+        novarocks_mv_application::readiness::MvDropReadiness::AlreadyAbsent
+    ) {
         return Ok(StatementResult::Ok);
     }
 
@@ -5931,7 +5954,19 @@ pub(crate) fn drop_iceberg_mv_with_ports(
         },
         connector_context.clone(),
     )?;
-    drop_iceberg_mv_metadata_with_readiness(ports.readiness.as_ref(), &target)?;
+    ports
+        .readiness
+        .delete_after_provider_drop(uuid::Uuid::now_v7(), &readiness_target)
+        .map_err(|error| {
+            if error.kind()
+                == novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption
+                && error.message().contains("metadata disappeared during drop")
+            {
+                error.to_string()
+            } else {
+                format!("drop iceberg MV accelerator projection failed: {error}")
+            }
+        })?;
     crate::catalog_application::query_catalog::drop_local_table_registration_if_exists(
         ports,
         &target.namespace,
@@ -5945,61 +5980,6 @@ pub(crate) fn drop_iceberg_mv_with_ports(
         target.table
     );
     Ok(StatementResult::Ok)
-}
-
-fn drop_iceberg_mv_metadata_with_readiness(
-    readiness: &MvReadinessPort,
-    target: &IcebergMvTarget,
-) -> Result<(), String> {
-    let target = novarocks_sql::planning::mv::SqlMvTarget {
-        catalog: Some(target.catalog.clone()),
-        database: target.namespace.clone(),
-        name: target.table.clone(),
-    };
-    let dropped = readiness
-        .delete_ready_projection(uuid::Uuid::now_v7(), &target)
-        .map_err(|e| format!("drop iceberg MV accelerator projection failed: {e}"))?;
-    if !dropped {
-        return Err(format!(
-            "materialized view {}.{}.{} metadata disappeared during drop",
-            target.catalog.as_deref().unwrap_or_default(),
-            target.database,
-            target.name
-        ));
-    };
-    Ok(())
-}
-
-fn preflight_iceberg_mv_drop_with_readiness(
-    readiness: &MvReadinessPort,
-    target: &IcebergMvTarget,
-    if_exists: bool,
-) -> Result<bool, String> {
-    let Some(_) = readiness
-        .load_ready(&novarocks_sql::planning::mv::SqlMvTarget {
-            catalog: Some(target.catalog.clone()),
-            database: target.namespace.clone(),
-            name: target.table.clone(),
-        })
-        .map_err(|e| format!("load iceberg mv definition for drop failed: {e}"))?
-    else {
-        if if_exists {
-            return Ok(false);
-        }
-        return Err(format!(
-            "materialized view does not exist: {}.{}.{}",
-            target.catalog, target.namespace, target.table
-        ));
-    };
-    crate::mv::domain::dependency_resolver::ensure_no_downstream_dependencies_with_readiness(
-        readiness,
-        &novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-        ),
-    )?;
-    Ok(true)
 }
 
 fn resolve_drop_target(

@@ -48,6 +48,14 @@ pub struct MvRuntimePublicationLease {
     publication_id: LakePublicationId,
 }
 
+/// Product decision from DROP's durable/readiness preflight. SQL and provider
+/// adapters interpret neither missing-target policy nor dependency safety.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvDropReadiness {
+    ReadyToDrop,
+    AlreadyAbsent,
+}
+
 impl Drop for MvRuntimePublicationLease {
     fn drop(&mut self) {
         self.runtime.finish(&self.target, self.publication_id);
@@ -225,6 +233,57 @@ impl MvReadinessService {
             )
             .await
     }
+    /// Validate the durable side of a DROP before its provider target effect.
+    /// An `IF EXISTS` miss is a product decision; a ready target is also
+    /// checked against every currently consumable downstream dependency.
+    pub async fn prepare_drop(
+        &self,
+        target: &MvTarget,
+        upstream: &MvDependencyObjectRef,
+        if_exists: bool,
+    ) -> Result<MvDropReadiness, MvRepositoryError> {
+        if self.load_ready(target).await?.is_none() {
+            return if if_exists {
+                Ok(MvDropReadiness::AlreadyAbsent)
+            } else {
+                Err(MvRepositoryError::new(
+                    MvRepositoryErrorKind::InvalidRequest,
+                    format!(
+                        "materialized view does not exist: {}.{}.{}",
+                        target.catalog().unwrap_or_default(),
+                        target.namespace(),
+                        target.name()
+                    ),
+                ))
+            };
+        }
+        self.ensure_no_ready_downstream_dependencies(upstream)
+            .await?;
+        Ok(MvDropReadiness::ReadyToDrop)
+    }
+
+    /// Remove the exact ready projection only after the provider drop has
+    /// completed. A disappeared projection is a corruption, not a successful
+    /// no-op, because the external target has already been removed.
+    pub async fn delete_after_provider_drop(
+        &self,
+        operation_id: Uuid,
+        target: &MvTarget,
+    ) -> Result<(), MvRepositoryError> {
+        if self.delete_ready_projection(operation_id, target).await? {
+            Ok(())
+        } else {
+            Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Corruption,
+                format!(
+                    "materialized view {}.{}.{} metadata disappeared during drop",
+                    target.catalog().unwrap_or_default(),
+                    target.namespace(),
+                    target.name()
+                ),
+            ))
+        }
+    }
     pub fn begin_publication(
         &self,
         target: MvTarget,
@@ -286,4 +345,45 @@ fn target_of(definition: &StoredMvDefinition) -> Option<MvTarget> {
         definition.target_table.clone()?,
     )
     .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{MvDropReadiness, MvReadinessService};
+    use crate::dependency::iceberg_mv_dependency_ref;
+    use crate::process_runtime::ProcessRuntime;
+    use crate::product::MvTarget;
+    use crate::repository::MvRepositoryErrorKind;
+    use crate::test_repository::InMemoryMvRepository;
+    use novarocks_spi::connector::LakePublicationId;
+
+    fn service() -> MvReadinessService {
+        MvReadinessService::new(
+            Arc::new(InMemoryMvRepository::default()),
+            Arc::<ProcessRuntime<MvTarget, LakePublicationId>>::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn drop_preflight_keeps_if_exists_and_missing_target_policy_in_product() {
+        let service = service();
+        let target = MvTarget::from_parts(Some("iceberg"), "db", "missing_mv");
+        let upstream = iceberg_mv_dependency_ref("iceberg", "db", "missing_mv");
+
+        assert_eq!(
+            service
+                .prepare_drop(&target, &upstream, true)
+                .await
+                .expect("IF EXISTS missing target is a product no-op"),
+            MvDropReadiness::AlreadyAbsent
+        );
+        let error = service
+            .prepare_drop(&target, &upstream, false)
+            .await
+            .expect_err("missing target without IF EXISTS is rejected");
+        assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
+        assert!(error.message().contains("materialized view does not exist"));
+    }
 }
