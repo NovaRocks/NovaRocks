@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Test-only connector write fixtures shared by the plan decoder and the
-//! fragment service.
+//! Test-only Native connector-write fixtures for fragment-plan decode tests.
 //!
-//! The stubs here stand in for a provider generation: they mint and recover
-//! provider write values through the SPI's own adapter, so nothing in this
-//! module can forge a value the real seam would refuse. They deliberately
-//! provide no commit authority, because a backend never has one.
+//! These helpers are compiled only through `test-support`. They construct
+//! generated Native carriers and pair them with SPI-owned provider values, so
+//! role tests exercise the same decode edge as production without making the
+//! Backend package a generated-wire fixture owner.
 
 use std::sync::{Arc, Mutex};
 
@@ -45,12 +44,12 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
 
-pub(crate) const TEST_WRITE_CATALOG: &str = "write_catalog";
+pub const TEST_WRITE_CATALOG: &str = "write_catalog";
 const TEST_WRITE_PROVIDER: &str = "test";
 const TEST_WRITE_CODEC_REVISION: u32 = 1;
 
 #[derive(Debug)]
-pub(crate) struct StubProviderRuntime {
+pub struct StubProviderRuntime {
     descriptor: ConnectorInstanceDescriptor,
     catalog_handle: CatalogHandle,
 }
@@ -69,14 +68,14 @@ impl ProviderWriteRuntime for StubProviderRuntime {
     }
 }
 
-pub(crate) fn test_write_catalog_handle() -> CatalogHandle {
+pub fn test_write_catalog_handle() -> CatalogHandle {
     CatalogHandle::new(
         ConnectorInstanceId::try_from_canonical(TEST_WRITE_CATALOG).expect("canonical instance id"),
         CatalogVersion::from_bytes([9; 32]),
     )
 }
 
-pub(crate) fn test_write_adapter() -> WriteRuntimeAdapter<StubProviderRuntime> {
+pub fn test_write_adapter() -> WriteRuntimeAdapter<StubProviderRuntime> {
     let handle = test_write_catalog_handle();
     WriteRuntimeAdapter::new(Arc::new(StubProviderRuntime {
         descriptor: ConnectorInstanceDescriptor {
@@ -167,24 +166,23 @@ fn synthetic_header(category: ConnectorCodecCategory) -> ConnectorEnvelopeHeader
     )
 }
 
-/// Records every writer it opened, so a test can prove each driver received its
-/// own writer and its own physical context.
-pub(crate) struct RecordingWriteExecution {
+/// Records every writer it opened, so a test can prove each driver received
+/// its own writer and physical context.
+pub struct RecordingWriteExecution {
     catalog_handle: CatalogHandle,
     opened: Mutex<Vec<(u32, u32, u32)>>,
     terminals: Arc<Mutex<WriterTerminals>>,
 }
 
-/// How the writers this execution handed out ended.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct WriterTerminals {
-    pub(crate) finished: usize,
-    pub(crate) aborted: usize,
-    pub(crate) appended_rows: usize,
+pub struct WriterTerminals {
+    pub finished: usize,
+    pub aborted: usize,
+    pub appended_rows: usize,
 }
 
 impl RecordingWriteExecution {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             catalog_handle: test_write_catalog_handle(),
             opened: Mutex::new(Vec::new()),
@@ -192,8 +190,7 @@ impl RecordingWriteExecution {
         }
     }
 
-    /// `(driver_id, writer_ordinal, write_target_ordinal)` per opened writer.
-    pub(crate) fn opened(&self) -> Vec<(u32, u32, u32)> {
+    pub fn opened(&self) -> Vec<(u32, u32, u32)> {
         self.opened.lock().expect("opened writers").clone()
     }
 }
@@ -244,7 +241,7 @@ impl ConnectorWriteExecution for RecordingWriteExecution {
     }
 }
 
-pub(crate) fn test_write_binding(
+pub fn test_write_binding(
     execution: Arc<RecordingWriteExecution>,
 ) -> ConnectorExecutionWriteBinding {
     ConnectorExecutionWriteBinding::new(
@@ -280,11 +277,11 @@ impl novarocks_spi::connector::ConnectorStorageResolver for NoVendedStorage {
     }
 }
 
-pub(crate) fn never_cancelled() -> Arc<dyn novarocks_spi::connector::ConnectorCancellation> {
+pub fn never_cancelled() -> Arc<dyn novarocks_spi::connector::ConnectorCancellation> {
     Arc::new(NeverCancelled)
 }
 
-pub(crate) fn test_request_context() -> novarocks_spi::connector::ConnectorRequestContext {
+pub fn test_request_context() -> novarocks_spi::connector::ConnectorRequestContext {
     novarocks_spi::connector::ConnectorRequestContext::try_new(
         std::time::Instant::now() + std::time::Duration::from_secs(60),
         never_cancelled(),
@@ -294,8 +291,7 @@ pub(crate) fn test_request_context() -> novarocks_spi::connector::ConnectorReque
     .expect("request context")
 }
 
-/// A typed runtime whose write resolver answers only for the test catalog.
-pub(crate) fn test_write_scan_runtime(
+pub fn test_write_scan_runtime(
     execution_id: QueryExecutionId,
     fragment_instance_id: UniqueId,
     execution: Arc<RecordingWriteExecution>,
@@ -335,16 +331,14 @@ pub(crate) fn test_write_scan_runtime(
     )
 }
 
-// --------------------------------------------------------------- wire builders
-
-pub(crate) fn wire_catalog_handle(name: &str) -> catalog_dto::CatalogHandle {
+pub fn wire_catalog_handle(name: &str) -> catalog_dto::CatalogHandle {
     catalog_dto::CatalogHandle {
         catalog_name: name.to_string(),
         version: vec![9; 32],
     }
 }
 
-pub(crate) fn iceberg_writer_handle(value: String) -> write_dto::ConnectorWriterHandle {
+pub fn iceberg_writer_handle(value: String) -> write_dto::ConnectorWriterHandle {
     let payload = ConnectorEncodedPayload::new(
         synthetic_header(ConnectorCodecCategory::WriteHandle),
         Bytes::from(value),
@@ -354,7 +348,7 @@ pub(crate) fn iceberg_writer_handle(value: String) -> write_dto::ConnectorWriter
     }
 }
 
-pub(crate) fn table_writer_payload(
+pub fn table_writer_payload(
     output_expr: novarocks_proto_models::expr::Expr,
     target_schema: Vec<novarocks_proto_models::common::OutputColumn>,
 ) -> plan::TableWriterNode {
@@ -375,9 +369,7 @@ pub(crate) fn table_writer_payload(
     }
 }
 
-pub(crate) fn writer_multiplex_schema(
-    schema: &WriterMultiplexSchema,
-) -> plan::WriterMultiplexSchema {
+pub fn writer_multiplex_schema(schema: &WriterMultiplexSchema) -> plan::WriterMultiplexSchema {
     let slot_ids = schema.slot_ids();
     let (columns, schema_metadata) = arrow_physical::encode_schema(
         schema.arrow_schema().as_ref(),
@@ -393,7 +385,7 @@ pub(crate) fn writer_multiplex_schema(
     }
 }
 
-pub(crate) fn root_result_schema(schema: &RootWriteResultSchema) -> plan::RootWriteResultSchema {
+pub fn root_result_schema(schema: &RootWriteResultSchema) -> plan::RootWriteResultSchema {
     let slot_ids = schema.slot_ids();
     let arrow_schema = schema.arrow_schema();
     let (columns, schema_metadata) = arrow_physical::encode_schema(
@@ -410,7 +402,7 @@ pub(crate) fn root_result_schema(schema: &RootWriteResultSchema) -> plan::RootWr
     }
 }
 
-pub(crate) fn writer_node(
+pub fn writer_node(
     node_id: i32,
     writer: plan::TableWriterNode,
     children: Vec<plan::DistributedNode>,
@@ -427,7 +419,7 @@ pub(crate) fn writer_node(
     }
 }
 
-pub(crate) fn finish_node(
+pub fn finish_node(
     node_id: i32,
     expected_target_ordinals: Vec<u32>,
     children: Vec<plan::DistributedNode>,

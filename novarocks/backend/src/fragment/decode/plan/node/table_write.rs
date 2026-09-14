@@ -1171,7 +1171,7 @@ mod tests {
     };
     use super::super::{DecodedNode, NativePlanDecodeContext, decode_node};
     use super::decode_writer_multiplex_schema;
-    use crate::connector::write_test_support::{
+    use novarocks_native_adapter::connector_write_test_support::{
         RecordingWriteExecution, TEST_WRITE_CATALOG, finish_node, iceberg_writer_handle,
         table_writer_payload, test_request_context, test_write_adapter, test_write_binding,
         test_write_catalog_handle, test_write_scan_runtime, wire_catalog_handle,
@@ -1260,7 +1260,9 @@ mod tests {
                 fragment_instance_id(),
                 execution,
             )))
-            .with_connector_cancellation(crate::connector::write_test_support::never_cancelled())
+            .with_connector_cancellation(
+                novarocks_native_adapter::connector_write_test_support::never_cancelled(),
+            )
             .with_fragment_instance_id(fragment_instance_id())
             .with_function_catalog(Arc::new(
                 novarocks_sql::compiler::build_builtin_engine_function_catalog()

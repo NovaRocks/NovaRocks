@@ -26,6 +26,8 @@ pub mod backend_test_support;
 pub mod catalog_prune_rpc;
 pub mod connector_blocking_io;
 pub mod connector_write_data_plane;
+#[cfg(any(test, feature = "test-support"))]
+pub mod connector_write_test_support;
 pub mod debug_environment;
 pub mod descriptor_snapshot;
 pub mod exchange_data_plane;
