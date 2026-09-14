@@ -12,7 +12,7 @@ use novarocks_worker::result_buffer::{
     ResultBufferKey, ResultBufferWriteHandle, ResultPublication, ResultRetainedBudget,
 };
 
-pub(crate) fn native_result_writer(
+pub fn native_result_writer(
     retained_budget: Arc<ResultRetainedBudget>,
     root_retained_byte_cap: NonZeroUsize,
 ) -> Arc<dyn FragmentResultWriter> {
@@ -22,8 +22,8 @@ pub(crate) fn native_result_writer(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn test_native_result_writer() -> Arc<dyn FragmentResultWriter> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_native_result_writer() -> Arc<dyn FragmentResultWriter> {
     native_result_writer(
         ResultRetainedBudget::new(
             NonZeroUsize::new(32 * 1024 * 1024).expect("test process result cap is nonzero"),
@@ -183,9 +183,7 @@ impl FragmentResultSession for NativeFragmentResultSession {
             .finish()
             .map(|publication| {
                 if publishes_terminal(publication) {
-                    novarocks_native_adapter::backend_metrics::record_fragment_result_terminal(
-                        "finished",
-                    );
+                    crate::backend_metrics::record_fragment_result_terminal("finished");
                 }
             })
             .map_err(|error| {
@@ -199,7 +197,7 @@ impl FragmentResultSession for NativeFragmentResultSession {
 
     fn abort(&self, reason: ResultAbort) {
         if publishes_terminal(self.handle.abort(reason)) {
-            novarocks_native_adapter::backend_metrics::record_fragment_result_terminal("aborted");
+            crate::backend_metrics::record_fragment_result_terminal("aborted");
         }
     }
 }

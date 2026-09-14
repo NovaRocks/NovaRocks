@@ -1808,7 +1808,7 @@ mod tests {
             facts,
             TaskInboundCapabilities::new(),
             novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(data_runtime),
-            crate::fragment::test_native_result_writer(),
+            novarocks_native_adapter::fragment_result_writer::test_native_result_writer(),
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(crate::runtime::sink_commit::BackendSinkCommitPort),
             test_execution_runtime(),

@@ -16,7 +16,6 @@ use novarocks_worker::{
     WorkerResultRetainedLimits,
 };
 
-use crate::fragment::native_result_writer;
 use crate::rpc::server::BackendRpcService;
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
 use crate::task_execution::{RegistryTaskExecutionIngress, backend_task_execution_ports};
@@ -35,6 +34,7 @@ use novarocks_execution_contract::task_execution::operation::{
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_native_adapter::backend_metrics::BackendMetricsRegistry;
+use novarocks_native_adapter::fragment_result_writer::native_result_writer;
 use novarocks_native_adapter::management_http::MetricsHttpServer;
 use novarocks_native_adapter::{
     BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
