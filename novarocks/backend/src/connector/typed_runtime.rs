@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-native wire fixtures and focused tests for Worker typed scan execution.
-
-pub use novarocks_worker::typed_connector_runtime::{
-    TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
-};
+//! Native wire fixtures and focused tests for Worker typed scan execution.
 
 /// Wire fixtures shared by this module's tests and the typed scan decoder's.
 ///
@@ -458,6 +454,9 @@ mod tests {
     use novarocks_worker::RuntimeFilterSessionResolver;
     use novarocks_worker::TypedConnectorReadDescriptor;
     use novarocks_worker::read_attempt::ReceivedReadSplit;
+    use novarocks_worker::typed_connector_runtime::{
+        TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
+    };
     use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 
     use super::*;

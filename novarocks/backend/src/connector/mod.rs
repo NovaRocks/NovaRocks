@@ -15,5 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod typed_runtime;
+#[cfg(test)]
+pub(crate) mod typed_runtime;
 pub(crate) mod write_data_plane;
