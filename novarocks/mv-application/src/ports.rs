@@ -128,17 +128,6 @@ pub trait MvDropProviderPort: Send + Sync {
     ) -> Result<(), MvProviderFailure>;
 }
 
-/// One execution capability for a refresh after the product has fixed its
-/// target and operation identity.
-pub trait MvQueryExecutionPort: Send + Sync {
-    fn execute_refresh(
-        &self,
-        operation: MvOperationContext,
-        target: &MvTarget,
-        full: bool,
-    ) -> Result<(), MvProviderFailure>;
-}
-
 /// Product admission is expressed as a one-operation capability, never as a
 /// workload controller or a process-global lookup.
 pub trait MvWorkScopePort: Send + Sync {
