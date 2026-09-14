@@ -804,7 +804,7 @@ pub(crate) fn mv_background_bindings(
     );
     crate::mv::background::MvBackgroundBindings {
         engine: Arc::new(
-            crate::mv::background_engine::StandaloneMvBackgroundEngine::new_with_ports(
+            crate::mv::background_engine::FrontendMvBackgroundEngine::new_with_ports(
                 iceberg_ports,
                 ports.connector_control,
                 ports.readiness,

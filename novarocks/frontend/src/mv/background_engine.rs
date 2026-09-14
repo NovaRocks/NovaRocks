@@ -69,14 +69,16 @@ fn background_connector_request_context() -> Result<ConnectorRequestContext, Str
 }
 
 #[derive(Clone)]
-pub(crate) struct StandaloneMvBackgroundEngine {
+/// FE-role adapter that binds MV background product callbacks to the native
+/// query and connector capabilities of this process.
+pub(crate) struct FrontendMvBackgroundEngine {
     ports: IcebergMvCorePorts,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
 }
 
-impl StandaloneMvBackgroundEngine {
+impl FrontendMvBackgroundEngine {
     pub(crate) fn new_with_ports(
         ports: IcebergMvCorePorts,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -119,7 +121,7 @@ impl StandaloneMvBackgroundEngine {
     }
 }
 
-impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
+impl MvBackgroundEngine for FrontendMvBackgroundEngine {
     fn resolve_refresh_steps(
         &self,
         target: &MvTarget,
@@ -172,7 +174,7 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             name_parts: vec![step.target.name.clone()],
             full: false,
         };
-        let service = crate::query_execution::mv_assembly::refresh_preparation::StandaloneMvRefreshPreparationService::new_with_ports(
+        let service = crate::query_execution::mv_assembly::refresh_preparation::FrontendMvRefreshPreparationService::new_with_ports(
             &self.ports,
             step.target.catalog.as_deref(),
             &step.target.database,

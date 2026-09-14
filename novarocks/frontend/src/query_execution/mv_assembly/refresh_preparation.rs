@@ -88,7 +88,9 @@ use novarocks_spi::connector::{
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use novarocks_sql::planning::mv::{SqlMvAggregateLayoutScope, extract_aggregate_sql_calls};
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
-pub struct StandaloneMvRefreshPreparationService<'a> {
+/// FE-role adapter that prepares one MV refresh with the caller's already
+/// admitted native query capability.
+pub struct FrontendMvRefreshPreparationService<'a> {
     source: &'a IcebergMvCorePorts,
     current_catalog: Option<&'a str>,
     current_database: &'a str,
@@ -97,7 +99,7 @@ pub struct StandaloneMvRefreshPreparationService<'a> {
     repartition_fields: Option<&'a [IcebergPartitionFieldExpr]>,
 }
 
-impl<'a> StandaloneMvRefreshPreparationService<'a> {
+impl<'a> FrontendMvRefreshPreparationService<'a> {
     pub fn new_with_ports(
         ports: &'a IcebergMvCorePorts,
         current_catalog: Option<&'a str>,
@@ -163,7 +165,7 @@ fn build_aggregate_layout_for_refresh_select_sql(
     novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(&facts)
 }
 
-impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
+impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
     fn prepare_step(
         &self,
         request: MvRefreshPreparationRequest,
