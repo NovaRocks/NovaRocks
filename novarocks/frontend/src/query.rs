@@ -49,8 +49,8 @@ use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::{
-    BackendCommandExecutor, CommandContext, ExecutionOutput, QueryExecutionError,
-    QueryExecutionErrorKind, ResultDelivery,
+    BackendCommandExecutor, CommandContext, ExecutionOutput, MaterializedViewCommand,
+    MaterializedViewCommandConsumer, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
 };
 use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
 use novarocks_query_application::api::{
@@ -117,7 +117,8 @@ struct TypedCommandRoute {
     backend: BackendCommandExecutor,
     view: ViewCommandExecutor,
     iceberg_ref: IcebergRefCommandExecutor,
-    mv: MvCommandExecutor,
+    mv: Arc<dyn MaterializedViewCommandConsumer>,
+    mv_call: MvCommandExecutor,
     maintenance: MaintenanceCommandExecutor,
     maintenance_read: MaintenanceReadCommandExecutor,
 }
@@ -133,7 +134,8 @@ impl TypedCommandRoute {
         backend: BackendCommandExecutor,
         view: ViewCommandExecutor,
         iceberg_ref: IcebergRefCommandExecutor,
-        mv: MvCommandExecutor,
+        mv: Arc<dyn MaterializedViewCommandConsumer>,
+        mv_call: MvCommandExecutor,
         maintenance: MaintenanceCommandExecutor,
         maintenance_read: MaintenanceReadCommandExecutor,
     ) -> Self {
@@ -144,6 +146,7 @@ impl TypedCommandRoute {
             view,
             iceberg_ref,
             mv,
+            mv_call,
             maintenance,
             maintenance_read,
         }
@@ -223,7 +226,7 @@ impl CoreCommandRoute for TypedCommandRoute {
             ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
                 statement,
             )) => {
-                if let Some(result) = self.mv.try_execute_typed_call(
+                if let Some(result) = self.mv_call.try_execute_typed_call(
                     statement,
                     context.session().current_database(),
                     command_context.connector_context(),
@@ -249,11 +252,9 @@ impl CoreCommandRoute for TypedCommandRoute {
             }
             ParsedStatement::MaterializedView(statement) => {
                 self.mv.execute(
-                    statement,
-                    context.session().current_catalog(),
-                    context.session().current_database(),
-                    command_context.connector_context(),
-                    context.execution(),
+                    &MaterializedViewCommand::new(statement.clone()),
+                    context,
+                    command_context,
                 )
             }
             ParsedStatement::View(statement) => {
@@ -417,6 +418,7 @@ impl FrontendQueryService {
         backend_command_executor: BackendCommandExecutor,
         view_command_executor: ViewCommandExecutor,
         iceberg_ref_command_executor: IcebergRefCommandExecutor,
+        mv_command_consumer: Arc<dyn MaterializedViewCommandConsumer>,
         mv_command_executor: MvCommandExecutor,
         maintenance_command_executor: MaintenanceCommandExecutor,
         maintenance_read_command_executor: MaintenanceReadCommandExecutor,
@@ -451,6 +453,7 @@ impl FrontendQueryService {
                 backend_command_executor,
                 view_command_executor,
                 iceberg_ref_command_executor,
+                mv_command_consumer,
                 mv_command_executor,
                 maintenance_command_executor,
                 maintenance_read_command_executor,

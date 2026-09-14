@@ -535,6 +535,11 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&mv_storage_observation),
             query_execution.clone(),
         ));
+    let mv_command_consumer: Arc<
+        dyn novarocks_query_application::api::MaterializedViewCommandConsumer,
+    > = Arc::new(crate::mv::command::FrontendMvCommandConsumer::new(
+        mv_command_executor.clone(),
+    ));
     let maintenance_command_executor =
         core_capabilities::maintenance_command_executor(maintenance_ports);
     let maintenance_read_command_executor =
@@ -558,6 +563,7 @@ fn build_frontend_query_session_factory_from_role_products(
         backend_command_executor,
         view_command_executor,
         iceberg_ref_command_executor,
+        mv_command_consumer,
         mv_command_executor,
         maintenance_command_executor,
         maintenance_read_command_executor,

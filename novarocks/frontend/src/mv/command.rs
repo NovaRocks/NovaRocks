@@ -31,8 +31,11 @@ use novarocks_parser::ast::{
     MaterializedViewRefreshPolicy as TypedRefreshPolicy, MaterializedViewStatement,
     ObjectName as TypedObjectName,
 };
-use novarocks_query_application::admitted_query_context::QueryExecutionContext;
-use novarocks_query_application::api::build_string_query_result;
+use novarocks_query_application::admitted_query_context::{QueryExecutionContext, RequestContext};
+use novarocks_query_application::api::{
+    CommandContext, MaterializedViewCommand, MaterializedViewCommandConsumer,
+    build_string_query_result,
+};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
@@ -329,6 +332,37 @@ impl MvCommandExecutor {
             );
         }
         last_result.ok_or_else(|| "MV refresh dependency planner returned no steps".to_string())
+    }
+}
+
+/// Role-local implementation of the Query Application MV consumer. It owns
+/// Connector and query-execution adapters, while product lifecycle remains in
+/// the injected `FrontendMvService` composition.
+#[derive(Clone)]
+pub struct FrontendMvCommandConsumer {
+    executor: MvCommandExecutor,
+}
+
+impl FrontendMvCommandConsumer {
+    pub fn new(executor: MvCommandExecutor) -> Self {
+        Self { executor }
+    }
+}
+
+impl MaterializedViewCommandConsumer for FrontendMvCommandConsumer {
+    fn execute(
+        &self,
+        command: &MaterializedViewCommand,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<StatementResult, String> {
+        self.executor.execute(
+            command.statement(),
+            context.session().current_catalog(),
+            context.session().current_database(),
+            command_context.connector_context(),
+            context.execution(),
+        )
     }
 }
 

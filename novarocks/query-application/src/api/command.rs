@@ -17,10 +17,13 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
+use novarocks_parser::ast::MaterializedViewStatement;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_workload_control::WorkScope;
 
 use super::ObjectPath;
+use crate::admitted_query_context::RequestContext;
+use crate::protocol_delivery::QuerySessionOutput;
 
 pub type CommandFuture =
     Pin<Box<dyn Future<Output = Result<CommandOutput, CommandError>> + Send + 'static>>;
@@ -314,50 +317,32 @@ pub trait MaintenanceCommandConsumer: Send + Sync + 'static {
     fn execute(&self, command: MaintenanceCommand, context: CommandContext) -> CommandFuture;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum MaterializedViewCommandKind {
-    Create,
-    Drop,
-    Alter,
-    Refresh,
-    Show,
-    ExplainRefresh,
-}
-
 pub struct MaterializedViewCommand {
-    kind: MaterializedViewCommandKind,
-    target: Option<ObjectPath>,
-    properties: Arc<[CommandProperty]>,
+    statement: MaterializedViewStatement,
 }
 
 impl MaterializedViewCommand {
-    #[allow(dead_code)]
-    pub(crate) fn new(
-        kind: MaterializedViewCommandKind,
-        target: Option<ObjectPath>,
-        properties: Vec<CommandProperty>,
-    ) -> Self {
-        Self {
-            kind,
-            target,
-            properties: properties.into(),
-        }
+    /// The SQL application retains the parser-admitted statement until the
+    /// injected role adapter performs product-specific lowering.
+    pub fn new(statement: MaterializedViewStatement) -> Self {
+        Self { statement }
     }
 
-    pub const fn kind(&self) -> MaterializedViewCommandKind {
-        self.kind
-    }
-    pub const fn target(&self) -> Option<&ObjectPath> {
-        self.target.as_ref()
-    }
-    pub fn properties(&self) -> &[CommandProperty] {
-        &self.properties
+    pub const fn statement(&self) -> &MaterializedViewStatement {
+        &self.statement
     }
 }
 
+/// Protocol-neutral SQL-to-MV product consumer. Query Application owns the
+/// statement and immutable admission contexts; role composition supplies the
+/// adapter that owns Connector and query-execution capabilities.
 pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
-    fn execute(&self, command: MaterializedViewCommand, context: CommandContext) -> CommandFuture;
+    fn execute(
+        &self,
+        command: &MaterializedViewCommand,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<QuerySessionOutput, String>;
 }
 
 #[cfg(test)]
@@ -418,5 +403,21 @@ mod tests {
         assert_eq!(context.scope().id(), expected_scope.id());
         assert!(context.scope().check().is_ok());
         assert!(!context.connector_context().cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn materialized_view_command_retains_the_parser_admitted_shape() {
+        let statements = novarocks_parser::parse("SHOW MATERIALIZED VIEWS FROM analytics")
+            .expect("MV statement should parse");
+        let [novarocks_parser::ast::Statement::MaterializedView(statement)] = statements.as_slice()
+        else {
+            panic!("expected one parser-admitted MV statement");
+        };
+
+        let command = MaterializedViewCommand::new(statement.clone());
+        assert!(matches!(
+            command.statement(),
+            novarocks_parser::ast::MaterializedViewStatement::Show(_)
+        ));
     }
 }
