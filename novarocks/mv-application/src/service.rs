@@ -31,7 +31,7 @@ use crate::process_runtime::{
 };
 use crate::product::{
     MvCommand, MvCreateCommand, MvOperationContext, MvProductError, MvProductErrorKind,
-    MvProductResult, MvTarget,
+    MvProductResult, MvRefreshAttemptIdentity, MvTarget,
 };
 use crate::readiness::MvDropReadiness;
 
@@ -45,6 +45,13 @@ pub struct MvProductService {
 }
 
 impl MvProductService {
+    /// Reserve the one immutable identity for a product refresh publication.
+    /// Query and provider adapters may derive their wire values from it but
+    /// cannot mint a second identity for the same product transition.
+    pub fn reserve_refresh_attempt(&self) -> MvRefreshAttemptIdentity {
+        MvRefreshAttemptIdentity::reserve()
+    }
+
     /// Execute the product-owned CREATE state machine. The outer adapter owns
     /// SQL lowering and provider capabilities, while this product owns the
     /// effect order and the distinction between pre-commit cleanup and a

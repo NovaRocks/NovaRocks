@@ -23,6 +23,7 @@
 
 use std::fmt;
 
+use novarocks_spi::connector::{ConnectorWriteOperationId, LakePublicationId};
 use uuid::Uuid;
 
 use crate::persistence::definition::CreateMvDefinitionRequest;
@@ -86,6 +87,34 @@ impl MvTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MvOperationContext {
     pub operation_id: Uuid,
+}
+
+/// Product-reserved identity for one lake-authoritative MV publication.
+/// Provider write IDs and staging names are derived from this one immutable
+/// value so an outer query adapter cannot split a publication across effects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshAttemptIdentity {
+    pub publication_id: LakePublicationId,
+}
+
+impl MvRefreshAttemptIdentity {
+    pub(crate) fn reserve() -> Self {
+        Self {
+            publication_id: LakePublicationId::new_v7(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn write_operation_id(&self) -> ConnectorWriteOperationId {
+        self.publication_id.into()
+    }
+
+    pub fn staging_branch(&self) -> String {
+        format!("__novarocks_mv_publication_{}", self.publication_id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,5 +221,19 @@ mod tests {
         assert_eq!(target.catalog(), Some("ice"));
         assert_eq!(target.namespace(), "sales");
         assert_eq!(target.name(), "daily");
+    }
+
+    #[test]
+    fn refresh_attempt_derives_all_provider_identity_from_one_publication() {
+        let attempt = MvRefreshAttemptIdentity::reserve();
+        attempt.validate().expect("complete publication identity");
+        assert_eq!(
+            attempt.write_operation_id().to_bytes(),
+            attempt.publication_id.to_bytes()
+        );
+        assert_eq!(
+            attempt.staging_branch(),
+            format!("__novarocks_mv_publication_{}", attempt.publication_id)
+        );
     }
 }

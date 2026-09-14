@@ -29,8 +29,8 @@ use crate::mv::domain::application::{
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenanceService};
 use crate::query_execution::mv_assembly::refresh_handoff::{
-    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
-    PreparedMvRefresh, PreparedMvRefreshWork,
+    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
+    PreparedMvRefreshWork,
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_mv_application::{
@@ -206,7 +206,7 @@ impl FrontendMvService {
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
         let _gate_lease = self.acquire_activity_lease(&target, owner, execution)?;
-        let attempt = self.reserve_refresh_attempt();
+        let attempt = self.product_service.reserve_refresh_attempt();
         let publication_id = attempt.publication_id.as_uuid();
         let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
             format!("mv-publication:{publication_id}"),
@@ -264,12 +264,6 @@ impl FrontendMvService {
                     "frontend MV activity admission is closed",
                 ),
             })
-    }
-
-    fn reserve_refresh_attempt(&self) -> MvRefreshAttemptIdentity {
-        MvRefreshAttemptIdentity {
-            publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
-        }
     }
 }
 
@@ -568,7 +562,7 @@ fn execute_scheduled_refresh(
         if cancellation.is_cancelled() {
             return ScheduledRefreshDisposition::ShutdownCancelled;
         }
-        let attempt = reserve_refresh_attempt();
+        let attempt = dependencies.product_service.reserve_refresh_attempt();
         let publication_id = attempt.publication_id.as_uuid();
         let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
             format!("mv-publication:{publication_id}"),
@@ -628,12 +622,6 @@ fn scheduled_refresh_test_barrier(
     _cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
 ) -> bool {
     false
-}
-
-fn reserve_refresh_attempt() -> MvRefreshAttemptIdentity {
-    MvRefreshAttemptIdentity {
-        publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
-    }
 }
 
 fn repository_disposition(

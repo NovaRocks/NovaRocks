@@ -17,9 +17,8 @@
 
 //! Frontend refresh-lifecycle handoff assembled from Core SQL facts.
 
-use novarocks_spi::connector::{
-    ConnectorProviderBindingKey, ConnectorWriteOperationId, LakePublicationId,
-};
+pub use novarocks_mv_application::product::MvRefreshAttemptIdentity;
+use novarocks_spi::connector::{ConnectorProviderBindingKey, ConnectorWriteOperationId};
 
 use super::refresh_artifact::{
     MvRefreshPublicationIntent, PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite,
@@ -27,31 +26,6 @@ use super::refresh_artifact::{
 use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 
 use crate::mv::domain::lifecycle::RefreshError;
-
-/// Frontend-preallocated identity for one MV refresh publication.
-///
-/// A publication ID is the sole cross-boundary identity. Provider-specific
-/// write IDs and ref names are derived from it at the assembly boundary, so a
-/// refresh cannot accidentally split one publication across unrelated
-/// operation IDs.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvRefreshAttemptIdentity {
-    pub publication_id: LakePublicationId,
-}
-
-impl MvRefreshAttemptIdentity {
-    pub fn validate(&self) -> Result<(), String> {
-        Ok(())
-    }
-
-    pub fn write_operation_id(&self) -> ConnectorWriteOperationId {
-        self.publication_id.into()
-    }
-
-    pub fn staging_branch(&self) -> String {
-        format!("__novarocks_mv_publication_{}", self.publication_id)
-    }
-}
 
 /// Application request supplied to the side-effect-free SQL preparation port.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,9 +136,7 @@ mod tests {
     use super::*;
 
     fn attempt() -> MvRefreshAttemptIdentity {
-        MvRefreshAttemptIdentity {
-            publication_id: LakePublicationId::new_v7(),
-        }
+        novarocks_mv_application::service::MvProductService::default().reserve_refresh_attempt()
     }
 
     #[test]
