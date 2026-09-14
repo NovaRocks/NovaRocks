@@ -41,7 +41,6 @@ use crate::query_execution::maintenance::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_catalog_application::CatalogApplicationPort;
-use novarocks_mv_application::repository::MvRepository;
 use novarocks_query_application::api::BackendTopologyService;
 use novarocks_query_application::api::{BackendCommandExecutor, BackendTopologyCommandPort};
 use novarocks_query_application::system_catalog::SystemCatalog;
@@ -427,7 +426,6 @@ pub struct MvCommandPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    repository: Arc<dyn MvRepository>,
     readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     refresh_service: Arc<FrontendMvProductAdapter>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -445,7 +443,6 @@ impl MvCommandPorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        repository: Arc<dyn MvRepository>,
         refresh_service: Arc<FrontendMvProductAdapter>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
@@ -455,7 +452,6 @@ impl MvCommandPorts {
             catalog_service,
             catalog_application,
             connector_control,
-            repository,
             readiness: refresh_service.readiness_port(),
             refresh_service,
             storage_observation,
@@ -470,7 +466,6 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
         Arc::clone(&ports.connector_control),
-        Arc::clone(&ports.repository),
         Arc::clone(&ports.readiness),
         Arc::clone(&ports.storage_observation),
     );
@@ -594,7 +589,6 @@ pub(crate) struct MvRefreshProviderActivationPorts {
     query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
     exchange_port: u16,
-    mv_repository: Arc<dyn MvRepository>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 }
@@ -611,7 +605,6 @@ impl MvRefreshProviderActivationPorts {
         query_execution: QueryExecutionService,
         backend_topology: BackendTopologyService,
         exchange_port: u16,
-        mv_repository: Arc<dyn MvRepository>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
@@ -625,7 +618,6 @@ impl MvRefreshProviderActivationPorts {
             query_execution,
             backend_topology,
             exchange_port,
-            mv_repository,
             mv_readiness,
             mv_storage_observation,
         }
@@ -654,7 +646,6 @@ pub(crate) fn mv_refresh_provider_activation(
         ports.catalog_service,
         Some(ports.catalog_application),
         ports.connector_control,
-        ports.mv_repository,
         ports.mv_readiness,
         ports.mv_storage_observation,
     );
@@ -773,7 +764,6 @@ pub(crate) struct MvBackgroundPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    repository: Arc<dyn MvRepository>,
     readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
 }
@@ -784,7 +774,6 @@ impl MvBackgroundPorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        repository: Arc<dyn MvRepository>,
         readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
@@ -793,7 +782,6 @@ impl MvBackgroundPorts {
             catalog_service,
             catalog_application,
             connector_control,
-            repository,
             readiness,
             storage_observation,
         }
@@ -811,7 +799,6 @@ pub(crate) fn mv_background_bindings(
         ports.catalog_service,
         ports.catalog_application,
         Arc::clone(&ports.connector_control),
-        Arc::clone(&ports.repository),
         Arc::clone(&ports.readiness),
         Arc::clone(&ports.storage_observation),
     );

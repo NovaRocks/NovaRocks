@@ -85,27 +85,23 @@ fn backend_config() -> ClusterBackendOpenConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_state_store_opens_and_reopens_mv_repository() {
+async fn configured_state_store_exposes_mv_repository_for_product_construction() {
     let config = state_store_input();
 
     let mut host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open its MV repository");
-    let repository = host
-        .take_mv_repository()
-        .expect("host transfers the opened MV repository to role products");
+    let repository = host.mv_repository_for_role_product_construction();
     assert!(repository.list_projections().await.is_ok());
     drop(repository);
-    host.shutdown()
-        .await
-        .expect("shutdown must release the StateStore after role products drop the repository");
+    host.shutdown().await.expect(
+        "shutdown must release the host-owned StateStore after the construction borrow drops",
+    );
 
     let mut reopened = open_host(Some(config))
         .await
         .expect("same StateStore must reopen its MV repository");
-    let repository = reopened
-        .take_mv_repository()
-        .expect("reopened host transfers the MV repository to role products");
+    let repository = reopened.mv_repository_for_role_product_construction();
     assert!(repository.list_projections().await.is_ok());
     drop(repository);
     reopened.shutdown().await.expect("reopened host shutdown");

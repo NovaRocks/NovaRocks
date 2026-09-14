@@ -144,7 +144,6 @@ struct FrontendRoleProducts {
     logical_read_launcher: Arc<dyn crate::query_execution::logical_read::LogicalReadLauncher>,
     topology: novarocks_query_application::api::BackendTopologyService,
     role: novarocks_types::ClusterRole,
-    mv_repository: Arc<dyn novarocks_mv_application::repository::MvRepository>,
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     dml_service: Arc<crate::dml::DmlService>,
     statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,
@@ -180,7 +179,6 @@ impl FrontendRoleProducts {
                     Arc::clone(&self.catalog_service),
                     Some(Arc::clone(&self.catalog_application)),
                     Arc::clone(&self.connector_control),
-                    Arc::clone(&self.mv_repository),
                     Arc::clone(&self.mv_readiness),
                     Arc::clone(&self.mv_storage_observation),
                 ),
@@ -342,7 +340,6 @@ async fn build_frontend_role_products(
             query_execution.clone(),
             topology.clone(),
             exchange_port,
-            Arc::clone(&mv_repository),
             Arc::clone(&mv_readiness),
             Arc::clone(&mv_storage_observation),
         ),
@@ -429,9 +426,8 @@ async fn build_frontend_role_products(
     // No fallible product construction follows these transfers. Keeping them
     // at the tail means an earlier failure still reaches Host's exact reverse
     // cleanup path, while a serving role owns the catalog lifecycle and its
-    // durable MV repository.
+    // MV product.
     let catalog_runtime = host.take_catalog_role_runtime()?;
-    let mv_repository = host.take_mv_repository()?;
     Ok(FrontendRoleProducts {
         catalog_runtime,
         catalog_service,
@@ -445,7 +441,6 @@ async fn build_frontend_role_products(
         logical_read_launcher,
         topology,
         role,
-        mv_repository,
         view_service,
         dml_service,
         statistics_application,
@@ -479,7 +474,6 @@ fn build_frontend_query_session_factory_from_role_products(
     let query_execution = products.query_execution.clone();
     let topology = products.topology.clone();
     let role = products.role;
-    let mv_repository = Arc::clone(&products.mv_repository);
     let view_service = Arc::clone(&products.view_service);
     let statistics_application = Arc::clone(&products.statistics_application);
     let maintenance_service = Arc::clone(&products.maintenance_service);
@@ -547,7 +541,6 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
-            Arc::clone(&mv_repository),
             mv_service,
             Arc::clone(&mv_storage_observation),
             query_execution.clone(),

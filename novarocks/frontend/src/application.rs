@@ -1460,21 +1460,6 @@ impl FrontendApplicationHost {
         )
     }
 
-    /// Transfers the durable MV repository to the immutable role graph after
-    /// its complete construction. The repository remains backed by the
-    /// Host-owned StateStore, which is released only after role products have
-    /// converged and been dropped.
-    pub(crate) fn take_mv_repository(
-        &mut self,
-    ) -> Result<Arc<dyn novarocks_mv_application::repository::MvRepository>, FrontendApplicationError>
-    {
-        self.mv_repository.take().ok_or_else(|| {
-            FrontendApplicationError::server(
-                "frontend MV repository was already transferred or was never installed",
-            )
-        })
-    }
-
     pub(crate) fn mv_scheduler_config(&self) -> MvSchedulerConfig {
         self.mv_scheduler_config.clone()
     }

@@ -112,7 +112,6 @@ use novarocks_mv_application::persistence::semantic::{
 };
 #[cfg(test)]
 use novarocks_mv_application::product::{MvIncrementalJoinMode, MvIncrementalWriteMode};
-use novarocks_mv_application::repository::MvRepository;
 use novarocks_parser::{Span, ast};
 use novarocks_query_application::engine_error::EngineError;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
@@ -152,11 +151,6 @@ trait IcebergMvRefreshSource:
     )]
     fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort>;
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    fn repository(&self) -> &dyn MvRepository;
     fn storage_observation(&self) -> &dyn MvStorageObservationPort;
 }
 
@@ -175,7 +169,6 @@ pub struct IcebergMvCorePorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    repository: Arc<dyn MvRepository>,
     readiness: Arc<MvReadinessPort>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
 }
@@ -189,7 +182,6 @@ impl IcebergMvCorePorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        repository: Arc<dyn MvRepository>,
         readiness: Arc<MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
@@ -198,7 +190,6 @@ impl IcebergMvCorePorts {
             catalog_service,
             catalog_application,
             connector_control,
-            repository,
             readiness,
             storage_observation,
         }
@@ -238,10 +229,6 @@ impl IcebergMvRefreshSource for IcebergMvCorePorts {
 
     fn connector_control(&self) -> &dyn ConnectorControlRegistry {
         self.connector_control.as_ref()
-    }
-
-    fn repository(&self) -> &dyn MvRepository {
-        self.repository.as_ref()
     }
 
     fn storage_observation(&self) -> &dyn MvStorageObservationPort {
