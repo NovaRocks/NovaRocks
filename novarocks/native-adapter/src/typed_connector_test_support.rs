@@ -21,8 +21,8 @@
 ///
 /// They live here because the carrier they build is this module's input; the
 /// decoder tests assert what the decoder does with exactly that carrier.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_proto_codec::connector_read::{ConnectorReadDecoder, encode_value_type};
     use novarocks_proto_models::connector_read as dto;
@@ -30,7 +30,7 @@ pub(crate) mod test_support {
     use novarocks_spi::connector::read_stack::ConnectorValueType;
     use novarocks_worker::read_attempt::TypedReadAttemptContext;
 
-    pub(crate) fn encoded_payload(
+    pub fn encoded_payload(
         category: novarocks_spi::connector::ConnectorCodecCategory,
         value: impl Into<bytes::Bytes>,
     ) -> novarocks_proto_models::connector_common::ConnectorEncodedPayload {
@@ -51,14 +51,14 @@ pub(crate) mod test_support {
         ))
     }
 
-    pub(crate) fn unconstrained() -> dto::TupleDomain {
+    pub fn unconstrained() -> dto::TupleDomain {
         dto::TupleDomain {
             none: false,
             column_domains: Vec::new(),
         }
     }
 
-    pub(crate) fn column_handle(field_id: i32) -> dto::ColumnHandle {
+    pub fn column_handle(field_id: i32) -> dto::ColumnHandle {
         dto::ColumnHandle {
             provider_payload: Some(encoded_payload(
                 novarocks_spi::connector::ConnectorCodecCategory::ReadColumn,
@@ -67,7 +67,7 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn catalog_table_handle() -> dto::CatalogTableHandle {
+    pub fn catalog_table_handle() -> dto::CatalogTableHandle {
         dto::CatalogTableHandle {
             catalog_handle: Some(novarocks_proto_models::catalog::CatalogHandle {
                 catalog_name: "test.typed".to_owned(),
@@ -157,7 +157,7 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn installed_read_execution() -> ConnectorExecutionReadBinding {
+    pub fn installed_read_execution() -> ConnectorExecutionReadBinding {
         ConnectorExecutionReadBinding::new(
             std::sync::Arc::new(FixtureFactory),
             std::sync::Arc::new(fixture_codec()),
@@ -289,8 +289,7 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn decoded_scan() -> novarocks_proto_codec::connector_read::DecodedConnectorReadScan
-    {
+    pub fn decoded_scan() -> novarocks_proto_codec::connector_read::DecodedConnectorReadScan {
         let raw = novarocks_proto_codec::connector_read::ConnectorTableScanSource::parse(
             scan_source_proto(),
             novarocks_proto_codec::FieldPath::root("scan"),
@@ -303,7 +302,7 @@ pub(crate) mod test_support {
         .expect("decoded scan")
     }
 
-    pub(crate) fn decoded_scheduled_split(
+    pub fn decoded_scheduled_split(
         plan_node_id: i32,
         sequence_id: u64,
     ) -> novarocks_proto_codec::connector_read::DecodedScheduledReadSplit {
@@ -319,7 +318,7 @@ pub(crate) mod test_support {
 
     /// The runtime bundle a typed decode needs, wired to the same binding
     /// generation `catalog_table_handle` names.
-    pub(crate) fn typed_scan_runtime() -> novarocks_worker::TypedScanRuntime {
+    pub fn typed_scan_runtime() -> novarocks_worker::TypedScanRuntime {
         struct NoVendedStorageResolver;
 
         impl novarocks_spi::connector::ConnectorStorageResolver for NoVendedStorageResolver {
@@ -382,7 +381,7 @@ pub(crate) mod test_support {
         )
     }
 
-    pub(crate) fn scan_source_proto() -> dto::ConnectorTableScanSource {
+    pub fn scan_source_proto() -> dto::ConnectorTableScanSource {
         dto::ConnectorTableScanSource {
             table: Some(catalog_table_handle()),
             assignments: vec![dto::ScanAssignment {
@@ -400,7 +399,7 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn split_proto(plan_node_id: i32, sequence_id: u64) -> dto::ScheduledSplit {
+    pub fn split_proto(plan_node_id: i32, sequence_id: u64) -> dto::ScheduledSplit {
         dto::ScheduledSplit {
             sequence_id,
             plan_node_id,
@@ -658,7 +657,7 @@ mod tests {
         TypedConnectorReadDescriptor::new(
             decoded_scan.relation().table().clone(),
             decoded_scan.assignments().to_vec(),
-            novarocks_native_adapter::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
+            crate::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
                 &wire_scan,
                 &decoded_scan,
             ),
@@ -666,7 +665,7 @@ mod tests {
     }
 
     fn live_dynamic_filter_factory() -> Arc<dyn TypedScanLiveDynamicFilterFactory> {
-        novarocks_native_adapter::runtime_filter_typed_scan::typed_scan_live_dynamic_filter_factory(
+        crate::runtime_filter_typed_scan::typed_scan_live_dynamic_filter_factory(
             scan_source(),
             test_support::decoded_scan(),
         )
@@ -1140,11 +1139,10 @@ mod tests {
         }];
         let scan = ConnectorTableScanSource::parse(proto, FieldPath::root("scan"))
             .expect("valid typed scan source");
-        let filter =
-            novarocks_native_adapter::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
-                &scan,
-                &test_support::decoded_scan(),
-            );
+        let filter = crate::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
+            &scan,
+            &test_support::decoded_scan(),
+        );
         assert_eq!(filter.columns_covered().len(), 1);
         // Truthful and unconstrained: never blocked, never awaitable.
         assert!(filter.current_predicate().is_all());
@@ -1154,7 +1152,7 @@ mod tests {
 
         // A scan with no binding covers nothing at all.
         assert!(
-            novarocks_native_adapter::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
+            crate::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
                 &scan_source(),
                 &test_support::decoded_scan(),
             )

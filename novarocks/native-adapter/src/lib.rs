@@ -69,6 +69,8 @@ pub mod task_protocol;
 pub mod task_protocol_fault;
 pub mod task_result_diagnostics;
 pub mod task_shared_facts;
+#[cfg(any(test, feature = "test-support"))]
+pub mod typed_connector_test_support;
 
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));

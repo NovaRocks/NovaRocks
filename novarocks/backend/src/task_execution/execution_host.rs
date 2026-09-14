@@ -2739,7 +2739,7 @@ mod tests {
                 &split_intent(
                     PlanNodeId::new(10).expect("nonnegative node"),
                     10,
-                    vec![crate::connector::typed_runtime::test_support::split_proto(
+                    vec![novarocks_native_adapter::typed_connector_test_support::test_support::split_proto(
                         10, 1,
                     )],
                     SplitOffer::batch(SplitSequence::FIRST, SplitSequence::FIRST, false)

@@ -480,7 +480,7 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks_proto_models::common;
 
-    use crate::connector::typed_runtime::test_support;
+    use novarocks_native_adapter::typed_connector_test_support::test_support;
 
     use novarocks_execution::exec::node::scan::{ScanMorsel, ScanMorsels};
 
