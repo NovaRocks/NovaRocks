@@ -19,7 +19,6 @@
 
 use arrow::datatypes::DataType;
 
-use crate::connector::batch_transform::ConnectorBatchTransform;
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
@@ -31,6 +30,7 @@ use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;
+use novarocks_worker::connector_batch_transform::ConnectorBatchTransform;
 
 /// Turn one scan's read columns into the columns its plan node outputs.
 ///

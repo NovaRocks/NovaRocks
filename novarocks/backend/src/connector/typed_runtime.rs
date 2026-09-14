@@ -46,7 +46,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::connector::batch_transform::ConnectorBatchTransform;
 use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
 use novarocks_execution::connector::{
     ConnectorPageAdapter, PageConversion, ScheduledSplitFacts, SplitPoll, SplitQueue,
@@ -69,6 +68,7 @@ use novarocks_spi::connector::read_stack::{
     PageSourceFileMetrics,
 };
 use novarocks_types::SlotId;
+use novarocks_worker::connector_batch_transform::ConnectorBatchTransform;
 
 /// How long a driver parks on an empty, non-terminal split queue before it
 /// re-checks cancellation, the deadline, and the terminal latch.

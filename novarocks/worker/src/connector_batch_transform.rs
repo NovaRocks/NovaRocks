@@ -17,8 +17,8 @@
 
 //! Execution-domain projection applied to a typed connector page.
 
-/// Backend-owned projection applied after a typed connector reader yields a
-/// batch and before execution materializes its output `Chunk`.
+/// Worker-owned projection applied after a typed connector reader yields a
+/// batch and before execution materializes its output Chunk.
 ///
 /// This deliberately exposes no connector registry, provider identity, or
 /// query lifecycle capability. Typed scan decoding resolves those exclusively

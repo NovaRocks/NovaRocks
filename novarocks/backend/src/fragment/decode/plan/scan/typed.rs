@@ -41,10 +41,10 @@ use novarocks_spi::connector::CatalogHandle;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use novarocks_types::SlotId;
 
-use crate::connector::batch_transform::ConnectorBatchTransform;
 use crate::connector::typed_runtime::{
     TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
 };
+use novarocks_worker::connector_batch_transform::ConnectorBatchTransform;
 
 use super::super::context::NativePlanDecodeContext;
 use super::super::node::DecodedNode;

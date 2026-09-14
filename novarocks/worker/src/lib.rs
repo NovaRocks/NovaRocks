@@ -29,6 +29,7 @@ mod admission_epoch;
 mod catalog_manager;
 mod catalog_manager_config;
 mod clock;
+pub mod connector_batch_transform;
 mod convergence;
 mod credential_slot;
 mod deadline;
