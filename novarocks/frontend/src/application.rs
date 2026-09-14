@@ -933,18 +933,6 @@ impl FrontendExecutionConfig {
         self
     }
 
-    #[allow(
-        dead_code,
-        reason = "Retained for frontend application-builder coverage that injects projection timing."
-    )]
-    pub(crate) fn with_catalog_projection_config(
-        mut self,
-        config: CatalogProjectionConfig,
-    ) -> Self {
-        self.catalog_projection = config;
-        self
-    }
-
     pub fn with_catalog_materialization_config(
         mut self,
         config: CatalogMaterializationConfig,
