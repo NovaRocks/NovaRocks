@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod application;
+pub(crate) mod application;
+pub use application::{
+    FrontendApplicationError, FrontendApplicationErrorKind, FrontendExecutionConfig,
+    FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
+};
 pub(crate) mod capabilities;
 mod catalog_application;
 mod catalog_controller;
@@ -33,6 +37,11 @@ pub(crate) mod query;
 mod query_execution;
 pub(crate) mod runtime_filter;
 pub(crate) mod server;
+pub use server::{
+    FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
+    open_frontend_application_for_server, serve_ready_frontend_session_factory,
+    shutdown_frontend_application_to_convergence, start_frontend_management_server,
+};
 mod state_family;
 pub(crate) mod state_store;
 pub(crate) mod statistics;

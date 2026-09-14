@@ -21,12 +21,10 @@ use std::future::Future;
 use std::sync::Arc;
 
 use novarocks_frontend::{
-    application::FrontendApplicationError,
-    server::{
-        FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
-        open_frontend_application_for_server, serve_ready_frontend_session_factory,
-        shutdown_frontend_application_to_convergence, start_frontend_management_server,
-    },
+    FrontendApplicationError, FrontendApplicationOpenConfig, FrontendManagementConfig,
+    FrontendServingConfig, open_frontend_application_for_server,
+    serve_ready_frontend_session_factory, shutdown_frontend_application_to_convergence,
+    start_frontend_management_server,
 };
 use tokio::runtime::Handle;
 
@@ -104,7 +102,7 @@ fn combine(
 #[cfg(test)]
 mod tests {
     use super::combine;
-    use novarocks_frontend::application::FrontendApplicationError;
+    use novarocks_frontend::FrontendApplicationError;
 
     #[test]
     fn cleanup_failure_keeps_the_primary_role_failure() {
@@ -116,7 +114,7 @@ mod tests {
 
         assert_eq!(
             error.kind(),
-            novarocks_frontend::application::FrontendApplicationErrorKind::Server
+            novarocks_frontend::FrontendApplicationErrorKind::Server
         );
         assert!(error.to_string().contains("serve failed"));
         assert!(error.to_string().contains("cleanup failed"));

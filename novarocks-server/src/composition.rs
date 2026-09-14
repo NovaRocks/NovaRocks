@@ -35,11 +35,8 @@ use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
 use novarocks_frontend::{
-    application::{
-        FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig,
-        FrontendQueryControlTimeouts,
-    },
-    server::{FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig},
+    FrontendApplicationOpenConfig, FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig,
+    FrontendManagementConfig, FrontendQueryControlTimeouts, FrontendServingConfig,
     topology::ClusterBackendOpenConfig,
 };
 use novarocks_fs::{
