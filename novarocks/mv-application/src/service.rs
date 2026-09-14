@@ -23,8 +23,7 @@ use crate::activity::{
     MvActivityAdmissionError, MvActivityGate, MvActivityLease, MvActivityOwner, MvActivityTicket,
 };
 use crate::process_runtime::{
-    MvBackgroundRuntime, MvBackgroundRuntimeLifecycleError, MvBackgroundRuntimeOwner,
-    MvBackgroundRuntimeStart,
+    MvBackgroundRuntimeLifecycleError, MvBackgroundRuntimeOwner, MvBackgroundRuntimeStart,
 };
 use crate::product::MvTarget;
 

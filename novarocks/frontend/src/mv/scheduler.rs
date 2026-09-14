@@ -15,58 +15,40 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend repository/provider discovery adapter for asynchronous refresh.
-//!
-//! It interprets validated durable definitions and provider observations. The
-//! MV application product owns the queue, source-revision, activity, retry and
-//! terminal state; this adapter owns no process runtime ledger.
+//! Frontend provider-observation adapter for product-owned MV scheduling.
 
 use super::background::MvBackgroundEngine;
 use crate::mv::domain::readiness::MvReadinessPort;
-use novarocks_mv_application::persistence::definition::{
-    MvDesiredRefreshPolicy, StoredMvDefinition,
-};
-use novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration;
-use novarocks_mv_application::repository::{
-    MvPublishedProjection, MvPublishedWaterline, MvRepositoryError,
-};
+use novarocks_mv_application::repository::MvRepositoryError;
 use novarocks_mv_application::{
-    scheduler::{MvSchedulerConfig, MvSchedulerSemanticDecision, mv_scheduler_semantic_decision},
-    scheduler_runtime::{MvRefreshDisposition, MvRefreshProductRuntime, MvRefreshRuntimeDecision},
+    product::MvTarget as ProductMvTarget,
+    scheduler::{MvRefreshScheduler, MvScheduledRefreshRequest, MvSchedulerConfig},
+    scheduler_runtime::{MvRefreshDisposition, MvRefreshRuntimeDecision},
 };
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 pub(crate) type ScheduledRefreshDisposition = MvRefreshDisposition;
 pub(crate) type ScheduledRefreshRuntimeDecision = MvRefreshRuntimeDecision;
 
-/// Why a refresh was made runnable.  A worker does not reinterpret this as a
-/// retry policy; it is purely observable scheduling state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScheduledRefreshReason {
-    Interval,
-    SnapshotChange,
-}
-
-/// A request that has passed scheduling admission but has not yet acquired the
-/// shared per-MV activity gate.  Waiting on that gate must not consume a
-/// refresh concurrency slot; the worker calls `mark_started` only after it has
-/// acquired the gate and its refresh permit.
+/// An immutable product-admitted refresh plus the SQL target required only by
+/// the outer provider/query-execution adapter.
 #[derive(Clone, Debug)]
 pub(crate) struct ScheduledRefreshRequest {
-    pub(crate) definition: StoredMvDefinition,
+    product: MvScheduledRefreshRequest,
     pub(crate) target: MvTarget,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) reason: ScheduledRefreshReason,
 }
 
-/// The worker-owned execution seam.  Implementations acquire the activity
-/// gate, create the bounded request context, resolve/prepares Core steps, and
-/// run the existing frontend refresh lifecycle.  They return only a typed
-/// terminal result to the scheduler; scheduling policy never inspects a
-/// display string from that work.
+impl ScheduledRefreshRequest {
+    pub(crate) fn definition(
+        &self,
+    ) -> &novarocks_mv_application::persistence::definition::StoredMvDefinition {
+        self.product.definition()
+    }
+}
+
+/// The worker-owned execution seam. Implementations acquire the activity gate,
+/// build the bounded request context, and run provider/query effects. Scheduler
+/// policy never observes an effect adapter display string.
 #[allow(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
@@ -75,386 +57,85 @@ pub(crate) trait ScheduledRefreshRunner: Send + Sync {
     fn execute(&self, request: ScheduledRefreshRequest) -> ScheduledRefreshDisposition;
 }
 
+/// Frontend has no queue, backoff, source revision, or policy state. It only
+/// drives the product's explicit current-snapshot observation transition.
 #[derive(Debug)]
 pub(crate) struct FrontendMvScheduler {
-    runtime: MvRefreshProductRuntime<
-        i64,
-        novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision,
-        ScheduledRefreshRequest,
-    >,
+    product: MvRefreshScheduler,
 }
 
 impl FrontendMvScheduler {
     pub(crate) fn new(config: MvSchedulerConfig) -> Self {
         Self {
-            runtime: MvRefreshProductRuntime::new(config),
+            product: MvRefreshScheduler::new(config),
         }
     }
 
-    /// Discover due projections and return
-    /// as many queued requests as the worker may start.  The returned requests
-    /// are still pending: callers must acquire the activity gate before calling
-    /// [`Self::mark_started`], which is what actually consumes capacity.
     pub(crate) fn poll(
         &mut self,
         readiness: &MvReadinessPort,
         engine: &dyn MvBackgroundEngine,
         now_ms: i64,
     ) -> Result<Vec<ScheduledRefreshRequest>, MvRepositoryError> {
-        if !self.runtime.enabled() {
+        if !self.product.enabled() {
             return Ok(Vec::new());
         }
 
         for projection in readiness.list_ready_projections()? {
-            self.consider_definition(engine, projection.definition, now_ms);
+            let Some(observation) = self
+                .product
+                .observe_definition(projection.definition, now_ms)
+            else {
+                continue;
+            };
+            let target = sql_target(observation.target());
+            match engine.current_base_snapshots(&target) {
+                Ok(current_base_snapshots) => self.product.resolve_current_base_snapshots(
+                    observation,
+                    current_base_snapshots,
+                    now_ms,
+                ),
+                Err(error) => self.product.record_observation_failure(
+                    &observation,
+                    ScheduledRefreshDisposition::from_background_error(error),
+                    now_ms,
+                ),
+            }
         }
 
-        Ok(self.runtime.take_ready())
+        Ok(self
+            .product
+            .take_ready()
+            .into_iter()
+            .map(|product| ScheduledRefreshRequest {
+                target: sql_target(product.target()),
+                product,
+            })
+            .collect())
     }
 
-    /// Record that a worker has obtained both its FIFO activity lease and a
-    /// refresh permit.  A worker that cannot acquire either simply lets its
-    /// request be considered again on the next poll, without holding capacity.
     pub(crate) fn mark_started(&mut self, mv_id: i64) -> bool {
-        self.runtime.mark_started(&mv_id)
+        self.product.mark_started(mv_id)
     }
 
-    /// Return a dispatched-but-not-started request to the tail of its
-    /// coalesced queue.  Worker runtimes call this when the shared activity
-    /// gate is busy; no scheduler capacity was acquired in that case.
     pub(crate) fn requeue(&mut self, request: ScheduledRefreshRequest) {
-        self.runtime.requeue(request.definition.mv_id, request);
+        self.product.requeue(request.product);
     }
 
-    /// Apply a typed terminal outcome and release the refresh concurrency slot.
-    /// Refresh watermark advancement belongs to the existing refresh finalize
-    /// path, so this method changes process-local scheduler runtime only.
     pub(crate) fn complete(
         &mut self,
         request: &ScheduledRefreshRequest,
         disposition: ScheduledRefreshDisposition,
         now_ms: i64,
     ) -> Result<ScheduledRefreshRuntimeDecision, MvRepositoryError> {
-        Ok(self
-            .runtime
-            .complete(&request.definition.mv_id, disposition, now_ms))
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn pending_len(&self) -> usize {
-        self.runtime.pending_len()
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn running_len(&self) -> usize {
-        self.runtime.running_len()
-    }
-
-    fn consider_definition(
-        &mut self,
-        engine: &dyn MvBackgroundEngine,
-        definition: StoredMvDefinition,
-        now_ms: i64,
-    ) {
-        if !self.runtime.begin_observation(
-            definition.mv_id,
-            definition.source_revision.clone(),
-            now_ms,
-        ) || definition.refresh_paused
-        {
-            return;
-        }
-
-        let target = match mv_target(&definition) {
-            Ok(target) => target,
-            Err(disposition) => {
-                self.record_runtime_disposition(&definition, disposition, now_ms);
-                return;
-            }
-        };
-        let refresh = match desired_refresh_configuration(&definition) {
-            Ok(refresh) => refresh,
-            Err(error) => {
-                self.record_runtime_disposition(
-                    &definition,
-                    ScheduledRefreshDisposition::InvalidDefinition(error),
-                    now_ms,
-                );
-                return;
-            }
-        };
-        let publication = match published_projection(&definition) {
-            Ok(publication) => publication,
-            Err(error) => {
-                self.record_runtime_disposition(
-                    &definition,
-                    ScheduledRefreshDisposition::InvalidDefinition(error),
-                    now_ms,
-                );
-                return;
-            }
-        };
-        let current_base_snapshots =
-            if matches!(&refresh.policy, MvDesiredRefreshPolicy::AsyncOnChange) {
-                match engine.current_base_snapshots(&target) {
-                    Ok(current) => Some(current),
-                    Err(error) => {
-                        self.record_runtime_disposition(
-                            &definition,
-                            ScheduledRefreshDisposition::from_background_error(error),
-                            now_ms,
-                        );
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-        let reason = match mv_scheduler_semantic_decision(
-            &refresh,
-            &publication,
-            now_ms,
-            current_base_snapshots.as_ref(),
-        ) {
-            MvSchedulerSemanticDecision::IntervalDue => ScheduledRefreshReason::Interval,
-            MvSchedulerSemanticDecision::OnChangeDue => ScheduledRefreshReason::SnapshotChange,
-            MvSchedulerSemanticDecision::Paused
-            | MvSchedulerSemanticDecision::Manual
-            | MvSchedulerSemanticDecision::IntervalNotDue { .. }
-            | MvSchedulerSemanticDecision::OnChangeNotDue => return,
-            MvSchedulerSemanticDecision::Invalid { reason } => {
-                self.record_runtime_disposition(
-                    &definition,
-                    ScheduledRefreshDisposition::InvalidDefinition(reason),
-                    now_ms,
-                );
-                return;
-            }
-        };
-        self.runtime.enqueue(
-            definition.mv_id,
-            ScheduledRefreshRequest {
-                definition: definition.clone(),
-                target,
-                reason,
-            },
-        );
-    }
-
-    fn record_runtime_disposition(
-        &mut self,
-        definition: &StoredMvDefinition,
-        disposition: ScheduledRefreshDisposition,
-        now_ms: i64,
-    ) {
-        let _ = self.runtime.record(&definition.mv_id, disposition, now_ms);
+        Ok(self.product.complete(&request.product, disposition, now_ms))
     }
 }
 
-fn mv_target(definition: &StoredMvDefinition) -> Result<MvTarget, ScheduledRefreshDisposition> {
-    match (
-        definition.target_catalog.as_deref(),
-        definition.target_namespace.as_deref(),
-        definition.target_table.as_deref(),
-    ) {
-        (Some(catalog), Some(database), Some(name)) => Ok(MvTarget {
-            catalog: Some(catalog.to_owned()),
-            database: database.to_owned(),
-            name: name.to_owned(),
-        }),
-        _ => Err(ScheduledRefreshDisposition::InvalidDefinition(
-            "scheduled materialized view is missing its canonical target".to_string(),
-        )),
-    }
-}
-
-/// Translate the accelerator projection into the complete publication fact
-/// consumed by the semantic decision. Partial fields are invalid: no scheduler
-/// path may fabricate a published waterline.
-fn desired_refresh_configuration(
-    definition: &StoredMvDefinition,
-) -> Result<MvRefreshDesiredConfiguration, String> {
-    MvRefreshDesiredConfiguration::new(
-        definition.refresh_policy.clone(),
-        definition.refresh_paused,
-        definition.refresh_interval_ms,
-        definition.max_staleness_ms,
-    )
-}
-
-fn published_projection(definition: &StoredMvDefinition) -> Result<MvPublishedProjection, String> {
-    let values = (
-        definition.last_refresh_ms,
-        definition.last_refresh_rows,
-        definition.last_refreshed_iceberg_snapshot_id,
-    );
-    match values {
-        (None, None, None)
-            if definition.last_refresh_snapshots.is_empty()
-                && definition.last_refresh_table_object_ids.is_empty() =>
-        {
-            Ok(MvPublishedProjection::NeverPublished)
-        }
-        (Some(last_refresh_ms), Some(last_refresh_rows), Some(last_refreshed_iceberg_snapshot_id))
-            if definition.last_refresh_snapshots.keys().eq(
-                definition.last_refresh_table_object_ids.keys(),
-            ) =>
-        {
-            if last_refresh_ms < 0
-                || last_refresh_rows < 0
-                || last_refreshed_iceberg_snapshot_id < 0
-                || definition
-                    .last_refresh_snapshots
-                    .values()
-                    .any(|snapshot| *snapshot < 0)
-            {
-                return Err("published MV scheduler projection contains a negative value".to_string());
-            }
-            Ok(MvPublishedProjection::Published(MvPublishedWaterline {
-                last_refresh_ms,
-                last_refresh_rows,
-                last_refreshed_iceberg_snapshot_id,
-                base_snapshots: definition.last_refresh_snapshots.clone(),
-                base_table_object_ids: definition.last_refresh_table_object_ids.clone(),
-            }))
-        }
-        _ => Err(
-            "MV scheduler projection is neither complete published state nor complete never-published state"
-                .to_string(),
-        ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-    use bytes::Bytes;
-    use novarocks_query_application::persisted_query_definition::{
-        PersistedQueryDefinition, PersistedQueryDialect,
-    };
-
-    fn definition(policy: MvDesiredRefreshPolicy) -> StoredMvDefinition {
-        let refresh_interval_ms =
-            matches!(&policy, MvDesiredRefreshPolicy::AsyncInterval).then_some(100);
-        StoredMvDefinition {
-            mv_id: 7,
-            query_definition: PersistedQueryDefinition::new(
-                "SELECT 1",
-                PersistedQueryDialect::StarRocks,
-                "iceberg",
-                "db",
-            )
-            .unwrap(),
-            base_table_refs: vec!["iceberg.db.base".to_string()],
-            primary_key_columns: Vec::new(),
-            storage_engine: "iceberg".to_string(),
-            target_catalog: Some("iceberg".to_string()),
-            target_namespace: Some("db".to_string()),
-            target_table: Some("mv".to_string()),
-            schema_contract: None,
-            partition_spec: None,
-            last_refresh_ms: None,
-            last_refresh_rows: None,
-            last_refresh_snapshots: BTreeMap::new(),
-            last_refresh_table_object_ids: BTreeMap::new(),
-            last_refreshed_iceberg_snapshot_id: None,
-            refresh_policy: policy,
-            refresh_paused: false,
-            refresh_interval_ms,
-            max_staleness_ms: None,
-            created_at_ms: 1,
-            source_revision:
-                novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision {
-                    target_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
-                        Bytes::from_static(b"scheduler-test-target"),
-                    )
-                    .expect("valid object ID"),
-                    descriptor_content_hash: "test-descriptor".to_string(),
-                    current_target_snapshot_id: None,
-                },
-        }
-    }
-
-    #[test]
-    fn coalescing_never_queues_the_same_mv_twice() {
-        let config = MvSchedulerConfig::new(true, 30_000, 1, 60_000, 1_800_000);
-        let mut scheduler = FrontendMvScheduler::new(config);
-        let definition = definition(MvDesiredRefreshPolicy::AsyncInterval);
-        let target = mv_target(&definition).expect("target");
-        scheduler.runtime.enqueue(
-            definition.mv_id,
-            ScheduledRefreshRequest {
-                definition: definition.clone(),
-                target: target.clone(),
-                reason: ScheduledRefreshReason::Interval,
-            },
-        );
-        assert_eq!(scheduler.pending_len(), 1);
-        assert_eq!(target.display_name(), "iceberg.db.mv");
-    }
-
-    #[test]
-    fn every_typed_disposition_has_an_explicit_runtime_decision() {
-        let config = MvSchedulerConfig::new(true, 30_000, 1, 10, 40);
-        let mut scheduler = FrontendMvScheduler::new(config);
-        let definition = definition(MvDesiredRefreshPolicy::AsyncInterval);
-        assert!(matches!(
-            scheduler.runtime.record(
-                &definition.mv_id,
-                ScheduledRefreshDisposition::Completed,
-                100
-            ),
-            ScheduledRefreshRuntimeDecision::Success
-        ));
-        assert!(matches!(
-            scheduler
-                .runtime
-                .record(&definition.mv_id, ScheduledRefreshDisposition::NoOp, 100),
-            ScheduledRefreshRuntimeDecision::Success
-        ));
-        assert_eq!(
-            scheduler.runtime.record(
-                &definition.mv_id,
-                ScheduledRefreshDisposition::TransientUnavailable("offline".to_string()),
-                100,
-            ),
-            ScheduledRefreshRuntimeDecision::TransientBackoff {
-                error: "offline".to_string(),
-                retry_at_ms: 110,
-            }
-        );
-        for disposition in [
-            ScheduledRefreshDisposition::InvalidDefinition("bad".to_string()),
-            ScheduledRefreshDisposition::TerminalFailure("terminal".to_string()),
-            ScheduledRefreshDisposition::Corruption("corrupt".to_string()),
-            ScheduledRefreshDisposition::InvariantViolation("invariant".to_string()),
-        ] {
-            assert!(matches!(
-                scheduler
-                    .runtime
-                    .record(&definition.mv_id, disposition, 100),
-                ScheduledRefreshRuntimeDecision::Blocked { .. }
-            ));
-        }
-        for disposition in [
-            ScheduledRefreshDisposition::AlreadyActive,
-            ScheduledRefreshDisposition::TargetGone,
-            ScheduledRefreshDisposition::ShutdownCancelled,
-        ] {
-            assert_eq!(
-                scheduler
-                    .runtime
-                    .record(&definition.mv_id, disposition, 100),
-                ScheduledRefreshRuntimeDecision::NoChange
-            );
-        }
+fn sql_target(target: &ProductMvTarget) -> MvTarget {
+    MvTarget {
+        catalog: target.catalog().map(str::to_owned),
+        database: target.namespace().to_owned(),
+        name: target.name().to_owned(),
     }
 }

@@ -438,7 +438,7 @@ fn run_scheduled_refreshes(
                 continue;
             }
         };
-        if scheduler.mark_started(request.definition.mv_id) {
+        if scheduler.mark_started(request.definition().mv_id) {
             // The scheduler has already bounded this batch. Execute its
             // transitions on this event loop rather than creating an OS thread
             // for every due MV. Keeping the activity lease and governed root local
@@ -448,7 +448,7 @@ fn run_scheduled_refreshes(
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
             if let Some((disposition_kind, reason)) = scheduler_outcome_log_fields(&disposition) {
                 tracing::warn!(
-                    mv_id = request.definition.mv_id,
+                    mv_id = request.definition().mv_id,
                     target = %request.target.display_name(),
                     disposition_kind,
                     reason = %reason,
@@ -456,7 +456,7 @@ fn run_scheduled_refreshes(
                 );
             }
             if let Err(error) = scheduler.complete(&request, disposition, now_unix_millis()) {
-                tracing::warn!(mv_id = request.definition.mv_id, error = %error, "persist frontend MV scheduler outcome failed");
+                tracing::warn!(mv_id = request.definition().mv_id, error = %error, "persist frontend MV scheduler outcome failed");
             } else if completed {
                 let _ = maintenance_wakeup_tx.try_send(());
             }
