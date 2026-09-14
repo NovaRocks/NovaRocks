@@ -35,12 +35,10 @@ use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, Nati
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
-use crate::common::backend_topology::{
-    BackendTopologyMetricsSnapshot, publish_backend_topology_metrics,
-};
 use crate::metrics::{record_backend_announce, record_backend_heartbeat};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::heartbeat as native_heartbeat;
+use crate::topology_metrics::{BackendTopologyMetricsSnapshot, publish_backend_topology_metrics};
 use novarocks_query_application::api::{
     BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome,
@@ -983,7 +981,7 @@ impl BackendTopologyPort for ClusterBackendService {
                 .scheduled_fragments
                 .saturating_add(fragment_count as u64);
         }
-        crate::common::backend_topology::record_successful_stage(backend_idx, fragment_count);
+        crate::topology_metrics::record_successful_stage(backend_idx, fragment_count);
     }
 }
 
