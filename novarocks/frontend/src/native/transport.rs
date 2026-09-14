@@ -1,7 +1,5 @@
 //! Narrow FE-to-BE native transport adapters.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tonic::Request;
@@ -9,9 +7,6 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 use crate::metrics::observe_backend_heartbeat_rtt;
-use crate::native::fragment_transport::{
-    ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
-};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_native_trust::NativeClientAuthInterceptor;
 use novarocks_proto_codec::catalog::{
@@ -20,12 +15,8 @@ use novarocks_proto_codec::catalog::{
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId, parse_reported_state,
 };
-use novarocks_proto_models::common::UniqueId as ProtoUniqueId;
-use novarocks_proto_models::novarocks::{
-    FetchResultRequest, fetch_result_response::Status as FetchStatus,
-};
 use novarocks_query_application::api::HeartbeatOutcome;
-use novarocks_types::{BackendProcessId, NativeEndpoint, UniqueId};
+use novarocks_types::{BackendProcessId, NativeEndpoint};
 
 use super::data_runtime::FrontendDataRuntime;
 use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
@@ -177,102 +168,6 @@ async fn channel(
         })?;
     data_runtime.cache_channel(endpoint, created.clone());
     Ok(created)
-}
-
-pub(crate) fn new_fragment_dispatcher(
-    backends: &[(usize, RuntimeEndpoint)],
-    data_runtime: FrontendDataRuntime,
-) -> Result<Arc<dyn FragmentDispatcher>, String> {
-    Ok(Arc::new(RemoteDispatcher::new(backends, data_runtime)?))
-}
-
-struct RemoteDispatcher {
-    clients: BTreeMap<usize, Client>,
-    endpoints: BTreeMap<usize, RuntimeEndpoint>,
-}
-impl RemoteDispatcher {
-    fn new(
-        backends: &[(usize, RuntimeEndpoint)],
-        data_runtime: FrontendDataRuntime,
-    ) -> Result<Self, String> {
-        if backends.is_empty() {
-            return Err("RemoteDispatcher requires at least one backend".to_string());
-        }
-        let mut clients = BTreeMap::new();
-        let mut endpoints = BTreeMap::new();
-        for (id, endpoint) in backends {
-            if clients
-                .insert(
-                    *id,
-                    Client::new(endpoint.native_endpoint().clone(), data_runtime.clone()),
-                )
-                .is_some()
-            {
-                return Err(format!("duplicate backend_idx {id}"));
-            }
-            endpoints.insert(*id, endpoint.clone());
-        }
-        Ok(Self { clients, endpoints })
-    }
-}
-impl FragmentDispatcher for RemoteDispatcher {
-    fn fetch_result(
-        &self,
-        backend_idx: usize,
-        finst_id: UniqueId,
-        max_wait_ms: i64,
-        expected: Option<ExpectedOutputSchemaView<'_>>,
-    ) -> Result<FetchOutcome, String> {
-        let client = self.clients.get(&backend_idx).ok_or_else(|| {
-            format!(
-                "backend_idx {backend_idx} out of range (have {} backends)",
-                self.clients.len()
-            )
-        })?;
-        let addr = &self.endpoints[&backend_idx];
-        let request = FetchResultRequest {
-            finst_id: Some(ProtoUniqueId {
-                hi: finst_id.high(),
-                lo: finst_id.low(),
-            }),
-            max_wait_ms,
-        };
-        let response = client.data_runtime.block_on(async {
-            let mut grpc = client.grpc().await?;
-            grpc.fetch_result(request)
-                .await
-                .map(|response| response.into_inner())
-                .map_err(|error| format!("fetch_result rpc failed: {error}"))
-        })??;
-        match FetchStatus::try_from(response.status).map_err(|_| {
-            format!(
-                "BE[{backend_idx}] ({addr}): remote fetch_result returned unknown status {}",
-                response.status
-            )
-        })? {
-            FetchStatus::Ready if response.eos => Ok(FetchOutcome::Eof),
-            FetchStatus::Ready if response.result_arrow_ipc.is_empty() => Err(format!(
-                "BE[{backend_idx}] ({addr}): fetch_result READY without result_arrow_ipc"
-            )),
-            FetchStatus::Ready => decode_fetched_query_batch(&response.result_arrow_ipc, expected)
-                .map(FetchOutcome::Ready)
-                .map_err(|error| {
-                    format!(
-                        "BE[{backend_idx}] ({addr}): {}",
-                        error.replacen("typed root result", "typed fetch_result", 1)
-                    )
-                }),
-            FetchStatus::NotReady => Ok(FetchOutcome::NotReady),
-            FetchStatus::Eof => Ok(FetchOutcome::Eof),
-            FetchStatus::Error => Ok(FetchOutcome::Err(response.message)),
-            FetchStatus::ResultStatusUnspecified => Err(format!(
-                "BE[{backend_idx}] ({addr}): remote fetch_result returned unspecified status"
-            )),
-        }
-    }
-    fn backend_count(&self) -> usize {
-        self.clients.len()
-    }
 }
 
 pub(crate) fn heartbeat(

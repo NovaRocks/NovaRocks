@@ -1,11 +1,9 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::runtime::result_batch::FetchResult;
 use crate::runtime::result_buffer::{
     ResultBufferKey, ResultBufferWriteHandle, ResultPublication, ResultRetainedBudget,
 };
-use crate::runtime::result_format::build_result_batch;
 use novarocks_execution::runtime::exchange;
 use novarocks_execution::runtime::fragment::io::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentResultSession,
@@ -101,14 +99,12 @@ impl FragmentResultSession for NativeFragmentResultSession {
         if chunk.is_empty() {
             return Ok(0);
         }
-        if self.spec.is_typed() {
-            if self.spec.presentation() != ResultPresentation::MysqlText {
-                return Err(FragmentIoError::new(
-                    FragmentIoOperation::ResultWrite,
-                    FragmentIoErrorKind::InvalidResponse,
-                    "typed result session only supports MYSQL text presentation",
-                ));
-            }
+        if self.spec.presentation() != ResultPresentation::MysqlText {
+            return Err(FragmentIoError::new(
+                FragmentIoOperation::ResultWrite,
+                FragmentIoErrorKind::InvalidResponse,
+                "typed result session only supports MYSQL text presentation",
+            ));
         }
         if chunk.logical_bytes() >= self.root_retained_byte_cap.get() {
             return Err(FragmentIoError::new(
@@ -141,28 +137,27 @@ impl FragmentResultSession for NativeFragmentResultSession {
     fn write_with_credit(
         &self,
         chunk: novarocks_execution::exec::chunk::Chunk,
-        mut credit: ResultWriteCredit,
+        credit: ResultWriteCredit,
     ) -> Result<(), FragmentIoError> {
         if chunk.is_empty() {
             return Ok(());
         }
-        if self.spec.is_typed() {
-            let arrow_retained_bytes = chunk.logical_bytes();
-            let encoded_byte_cap = credit
-                .bytes()
-                .checked_sub(arrow_retained_bytes)
-                .ok_or_else(|| {
-                    FragmentIoError::new(
-                        FragmentIoOperation::ResultWrite,
-                        FragmentIoErrorKind::InvalidResponse,
-                        format!(
-                            "result write owns {} joint bytes but its Arrow input retains {arrow_retained_bytes} bytes",
-                            credit.bytes()
-                        ),
-                    )
-                })?;
-            let encoded =
-                exchange::encode_chunks_bounded(&[chunk], true, encoded_byte_cap).map_err(|error| {
+        let arrow_retained_bytes = chunk.logical_bytes();
+        let encoded_byte_cap = credit
+            .bytes()
+            .checked_sub(arrow_retained_bytes)
+            .ok_or_else(|| {
+                FragmentIoError::new(
+                    FragmentIoOperation::ResultWrite,
+                    FragmentIoErrorKind::InvalidResponse,
+                    format!(
+                        "result write owns {} joint bytes but its Arrow input retains {arrow_retained_bytes} bytes",
+                        credit.bytes()
+                    ),
+                )
+            })?;
+        let encoded =
+            exchange::encode_chunks_bounded(&[chunk], true, encoded_byte_cap).map_err(|error| {
                     FragmentIoError::new(
                         FragmentIoOperation::ResultWrite,
                         FragmentIoErrorKind::Unavailable,
@@ -171,54 +166,8 @@ impl FragmentResultSession for NativeFragmentResultSession {
                         ),
                     )
                 })?;
-            return self
-                .handle
-                .write_typed_with_credit(encoded, credit)
-                .map(|_| ())
-                .map_err(|error| {
-                    FragmentIoError::new(
-                        FragmentIoOperation::ResultWrite,
-                        FragmentIoErrorKind::Internal,
-                        error,
-                    )
-                });
-        }
-
-        let batch = build_result_batch(&chunk, self.spec.projections(), self.spec.presentation())
-            .map_err(|error| {
-            FragmentIoError::new(
-                FragmentIoOperation::ResultWrite,
-                FragmentIoErrorKind::Internal,
-                error,
-            )
-        })?;
-        if batch.heap_size_bytes() > credit.bytes() {
-            return Err(FragmentIoError::new(
-                FragmentIoOperation::ResultWrite,
-                FragmentIoErrorKind::Unavailable,
-                format!(
-                    "rendered result payload of {} bytes exceeds reserved packet cap {}",
-                    batch.heap_size_bytes(),
-                    credit.bytes()
-                ),
-            ));
-        }
-        credit.shrink_to(batch.heap_size_bytes()).map_err(|error| {
-            FragmentIoError::new(
-                FragmentIoOperation::ResultWrite,
-                FragmentIoErrorKind::InvalidResponse,
-                error,
-            )
-        })?;
         self.handle
-            .write_legacy_with_credit(
-                FetchResult {
-                    packet_seq: 0,
-                    eos: false,
-                    result_batch: batch,
-                },
-                credit,
-            )
+            .write_typed_with_credit(encoded, credit)
             .map(|_| ())
             .map_err(|error| {
                 FragmentIoError::new(

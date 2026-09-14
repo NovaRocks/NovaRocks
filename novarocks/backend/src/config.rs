@@ -39,16 +39,6 @@ pub fn debug_exec_node_output() -> bool {
     debug_env_flag("NOVAROCKS_DEBUG_EXEC_NODE_OUTPUT")
 }
 
-pub fn debug_fault_inject_fetch_not_ready_count() -> Option<usize> {
-    if !cfg!(debug_assertions) {
-        return None;
-    }
-    std::env::var("NOVAROCKS_SQL_TEST_FAULT_INJECT_FETCH_NOT_READY_COUNT")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|count| *count > 0)
-}
-
 pub fn debug_emit_grpc_fragment_marker() -> bool {
     debug_env_flag("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER")
         || sql_test_fragment_failure_harness_enabled()

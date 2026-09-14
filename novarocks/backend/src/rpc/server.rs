@@ -22,7 +22,6 @@
 
 use std::sync::Arc;
 
-use crate::rpc::data_plane::BackendDataPlane;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 use tokio_stream::wrappers::ReceiverStream;
@@ -38,14 +37,13 @@ use novarocks_native_adapter::{
 use novarocks_worker::TaskInboundCapabilities;
 
 /// Backend-owned production Tonic service. Domain owners contribute the narrow
-/// ingress ports while this service composes them with `BackendDataPlane`.
+/// ingress ports while this service composes their role-local wire adapters.
 #[derive(Clone)]
 pub(crate) struct BackendRpcService {
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
     catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
     heartbeat: BackendHeartbeatResponder,
     exchange_data_plane: NativeExchangeDataPlane,
-    data_plane: BackendDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
 }
 
@@ -68,10 +66,13 @@ impl BackendRpcService {
                     task_inbound_capabilities,
                 ))],
             ),
-            data_plane: BackendDataPlane,
             runtime_filter_ingress,
         }
     }
+}
+
+fn retired_fetch_result_status() -> tonic::Status {
+    tonic::Status::unimplemented("FetchResult is retired; use FetchTaskResult")
 }
 
 #[tonic::async_trait]
@@ -172,16 +173,9 @@ impl NovaRocksGrpc for BackendRpcService {
 
     async fn fetch_result(
         &self,
-        request: tonic::Request<proto::FetchResultRequest>,
+        _request: tonic::Request<proto::FetchResultRequest>,
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
-        let kernel = self.data_plane.clone();
-        let response =
-            tokio::task::spawn_blocking(move || kernel.fetch_result(request.into_inner()))
-                .await
-                .map_err(|error| {
-                    tonic::Status::internal(format!("fetch_result handler panicked: {error}"))
-                })?;
-        Ok(tonic::Response::new(response))
+        Err(retired_fetch_result_status())
     }
 
     async fn prune_catalogs(
@@ -277,5 +271,20 @@ impl NovaRocksGrpc for BackendRpcService {
             .fetch_task_result(request.into_inner())
             .await?;
         Ok(tonic::Response::new(response))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retired_fetch_result_status;
+
+    #[test]
+    fn legacy_fragment_result_fetch_is_rejected_before_buffer_lookup() {
+        let status = retired_fetch_result_status();
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert_eq!(
+            status.message(),
+            "FetchResult is retired; use FetchTaskResult"
+        );
     }
 }

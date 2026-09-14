@@ -15,11 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fragment dispatcher port and native submission DTO.
+//! Native task-result transport and submission DTO.
 //!
-//! Two result faces live here. [`FragmentDispatcher`] is the old one, keyed by
-//! a fragment instance id — a key any participant of any attempt could name.
-//! [`TaskResultTransport`] is the task protocol's: it addresses the root
+//! [`TaskResultTransport`] addresses the root
 //! result by exact [`TaskIdentity`], so the backend can fence the poll against
 //! the exact task, the exact process, and result responsibility before it
 //! touches a buffer, and it carries the packet sequence back so a frontend can
@@ -58,7 +56,6 @@ use novarocks_task_codec::operation::{
     encode_fetch_task_result, encode_get_final_task_info,
 };
 use novarocks_task_codec::status::decode_final_task_info;
-use novarocks_types::UniqueId;
 use novarocks_types::identity::BackendProcessId;
 
 use crate::runtime_filter::feedback::TaskRuntimeFilterFeedback;
@@ -182,45 +179,10 @@ impl RawRootResultPacket {
     }
 }
 
-/// Outcome of a single `fetch_result` call.
-pub enum FetchOutcome {
-    /// A result batch is available.
-    Ready(FetchedQueryBatch),
-    /// No chunk available yet; fragment is still running.
-    NotReady,
-    /// All chunks have been delivered; the root fragment is complete.
-    Eof,
-    /// Fragment execution failed.
-    Err(String),
-}
-
-/// Result transport for an already-running native query.
-///
-/// Query startup belongs exclusively to the query lifecycle Stage/Start
-/// barrier. Query lifecycle owns cancellation and terminal convergence after
-/// that barrier has entered `Running`.
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific frontend integration and regression coverage."
-)]
-pub trait FragmentDispatcher: Send + Sync + 'static {
-    /// Poll for the next result chunk from the root fragment on the given backend.
-    fn fetch_result(
-        &self,
-        backend_idx: usize,
-        finst_id: UniqueId,
-        max_wait_ms: i64,
-        expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
-    ) -> Result<FetchOutcome, String>;
-
-    /// Number of backends this dispatcher can route to.
-    fn backend_count(&self) -> usize;
-}
-
 /// One answer from the root result data plane.
 ///
-/// Unlike [`FetchOutcome`], the end of the stream carries its own packet
-/// sequence. That is what lets a frontend distinguish "the stream ended after
+/// The end of the stream carries its own packet sequence. That is what lets a
+/// frontend distinguish "the stream ended after
 /// everything I received" from "the stream ended after packets I never saw",
 /// which the backend cannot tell it: it drops each packet as it hands it over.
 #[allow(

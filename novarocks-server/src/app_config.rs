@@ -651,7 +651,6 @@ fn reject_fault_injection_environment() -> Result<()> {
     for name in [
         novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
         novarocks_failpoint::CLEANUP_FAULT_DIR_ENV,
-        "NOVAROCKS_SQL_TEST_FAULT_INJECT_FETCH_NOT_READY_COUNT",
         "NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER",
         "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER",
         "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER",

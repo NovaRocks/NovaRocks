@@ -1145,58 +1145,6 @@ fn try_fetch_typed_inner(
     TryFetchTypedResult::NotReady
 }
 
-fn try_fetch_typed_legacy_inner(
-    guard: &mut HashMap<ResultBufferKey, BufferControlBlock>,
-    finst_id: UniqueId,
-) -> TryFetchTypedResult {
-    let key = ResultBufferKey::LegacyFragment(finst_id);
-    let Some(block) = guard.get_mut(&key) else {
-        return TryFetchTypedResult::Error(FetchError {
-            kind: FetchErrorKind::NotFound,
-            message: "no result for this query".to_string(),
-        });
-    };
-    if block.cancelled {
-        let message = block
-            .cancel_message
-            .clone()
-            .unwrap_or_else(|| "Cancelled".to_string());
-        guard.remove(&key);
-        return TryFetchTypedResult::Error(FetchError {
-            kind: FetchErrorKind::Cancelled,
-            message,
-        });
-    }
-    if let Some(message) = block.status_error.clone() {
-        guard.remove(&key);
-        return TryFetchTypedResult::Error(FetchError {
-            kind: FetchErrorKind::Failed,
-            message,
-        });
-    }
-    if block.mode == Some(ResultBufferMode::Legacy) {
-        return TryFetchTypedResult::Error(FetchError {
-            kind: FetchErrorKind::Failed,
-            message: "legacy result buffer cannot be fetched as typed Arrow IPC".to_string(),
-        });
-    }
-    if let Some(result) = block.typed_queue.pop_front() {
-        return TryFetchTypedResult::Ready(result.result);
-    }
-    if block.closed_ok && !block.eos_sent {
-        block.eos_sent = true;
-        return TryFetchTypedResult::Ready(block.make_typed_eos_result());
-    }
-    if block.closed_ok {
-        guard.remove(&key);
-        return TryFetchTypedResult::Error(FetchError {
-            kind: FetchErrorKind::NotFound,
-            message: "result stream already reached eos".to_string(),
-        });
-    }
-    TryFetchTypedResult::NotReady
-}
-
 #[allow(
     dead_code,
     reason = "Legacy fetch polling remains available to protocol adapters outside this target."
@@ -1324,28 +1272,6 @@ async fn wait_fetch_typed(
         ResultByteLimit::new(u64::MAX).expect("the test fetch limit is nonzero"),
     )
     .await
-}
-
-pub(crate) fn wait_fetch_typed_legacy(finst_id: UniqueId, max_wait_ms: i64) -> TryFetchTypedResult {
-    let c = ctx();
-    let mut guard = c.mu.lock().expect("ctx lock");
-    let initial = try_fetch_typed_legacy_inner(&mut guard, finst_id);
-    if !matches!(initial, TryFetchTypedResult::NotReady) || max_wait_ms <= 0 {
-        return initial;
-    }
-    let deadline = std::time::Instant::now() + Duration::from_millis(max_wait_ms as u64);
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return TryFetchTypedResult::NotReady;
-        }
-        let (mut next_guard, _) = c.cvar.wait_timeout(guard, remaining).expect("condvar wait");
-        let result = try_fetch_typed_legacy_inner(&mut next_guard, finst_id);
-        if !matches!(result, TryFetchTypedResult::NotReady) {
-            return result;
-        }
-        guard = next_guard;
-    }
 }
 
 #[allow(

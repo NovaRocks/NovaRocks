@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::native::fragment_transport::{
-    FinalTaskInfoRead, FragmentDispatcher, NativeTaskResultTransport, RootResultOutcome,
-    TaskReadGrace, TaskResultTransport,
+    FinalTaskInfoRead, NativeTaskResultTransport, RootResultOutcome, TaskReadGrace,
+    TaskResultTransport,
 };
 use crate::query_execution::artifact::{
     RuntimeFilterDeploymentReadyDistributedQuery, ValidatedNativeSubmission,
@@ -71,7 +71,6 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::task_transport::AttemptWireFacts;
-use crate::native::transport::new_fragment_dispatcher;
 use crate::query_execution::attempt_initialization::{
     AttemptInitializing, RoundCredentialLeaseSource,
 };
@@ -236,18 +235,15 @@ impl FrontendLiveBackendTopology {
 enum BackendServicesSource {
     Fixed {
         scheduler: FrontendFragmentScheduler,
-        dispatcher: Arc<dyn FragmentDispatcher>,
     },
     #[cfg(test)]
     Sequence {
         schedulers: Mutex<VecDeque<FrontendFragmentScheduler>>,
-        dispatcher: Arc<dyn FragmentDispatcher>,
     },
 }
 
 struct QueryBackendServices {
     scheduler: FrontendFragmentScheduler,
-    dispatcher: Arc<dyn FragmentDispatcher>,
     live_backends: Vec<LiveBackendTarget>,
 }
 
@@ -258,19 +254,12 @@ impl BackendServicesSource {
         topology: &[LiveBackendTarget],
     ) -> Result<QueryBackendServices, DistributedQueryError> {
         match self {
-            Self::Fixed {
-                scheduler,
-                dispatcher,
-            } => Ok(QueryBackendServices {
+            Self::Fixed { scheduler } => Ok(QueryBackendServices {
                 scheduler: scheduler.clone(),
-                dispatcher: Arc::clone(dispatcher),
                 live_backends: topology.to_vec(),
             }),
             #[cfg(test)]
-            Self::Sequence {
-                schedulers,
-                dispatcher,
-            } => {
+            Self::Sequence { schedulers } => {
                 let scheduler = schedulers
                     .lock()
                     .expect("frontend test backend sequence lock")
@@ -278,7 +267,6 @@ impl BackendServicesSource {
                     .expect("frontend test backend sequence exhausted");
                 Ok(QueryBackendServices {
                     scheduler,
-                    dispatcher: Arc::clone(dispatcher),
                     live_backends: topology.to_vec(),
                 })
             }
@@ -288,21 +276,10 @@ impl BackendServicesSource {
 
 fn production_backend_services(
     topology: &[LiveBackendTarget],
-    data_runtime: FrontendDataRuntime,
 ) -> Result<QueryBackendServices, DistributedQueryError> {
-    let entries = topology
-        .iter()
-        .map(|target| {
-            target
-                .endpoint()
-                .map(|endpoint| (target.backend_idx(), endpoint))
-                .map_err(|error| failed(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let snapshot = FrontendBackendSnapshot::from_live_targets(topology.to_vec())?;
     Ok(QueryBackendServices {
         scheduler: FrontendFragmentScheduler::new(snapshot),
-        dispatcher: new_fragment_dispatcher(&entries, data_runtime.clone()).map_err(failed)?,
         live_backends: topology.to_vec(),
     })
 }
@@ -380,7 +357,6 @@ impl FrontendDistributedQueryCoordinator {
     pub(crate) fn new_for_test(
         query_id: QueryId,
         scheduler: FrontendFragmentScheduler,
-        dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Self {
@@ -390,7 +366,6 @@ impl FrontendDistributedQueryCoordinator {
         Self::new_for_test_with_topology(
             query_id,
             scheduler,
-            dispatcher,
             runtime_filter_worker_count,
             _test_fixture,
             Arc::new(topology),
@@ -409,7 +384,6 @@ impl FrontendDistributedQueryCoordinator {
     pub(crate) fn new_for_test_with_topology(
         query_id: QueryId,
         scheduler: FrontendFragmentScheduler,
-        dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
         backend_topology: novarocks_query_application::api::BackendTopologyService,
@@ -422,10 +396,7 @@ impl FrontendDistributedQueryCoordinator {
                 .expect("the test result byte limit is nonzero"),
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
-            backend_services: Some(BackendServicesSource::Fixed {
-                scheduler,
-                dispatcher,
-            }),
+            backend_services: Some(BackendServicesSource::Fixed { scheduler }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(
@@ -449,7 +420,6 @@ impl FrontendDistributedQueryCoordinator {
     pub(crate) fn new_for_test_with_backend_sequence(
         query_id: QueryId,
         schedulers: Vec<FrontendFragmentScheduler>,
-        dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Self {
@@ -462,7 +432,6 @@ impl FrontendDistributedQueryCoordinator {
         Self::new_for_test_with_backend_sequence_and_topology(
             query_id,
             schedulers,
-            dispatcher,
             runtime_filter_worker_count,
             _test_fixture,
             Arc::new(topology),
@@ -477,7 +446,6 @@ impl FrontendDistributedQueryCoordinator {
     pub(crate) fn new_for_test_with_backend_sequence_and_topology(
         query_id: QueryId,
         schedulers: Vec<FrontendFragmentScheduler>,
-        dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
         backend_topology: novarocks_query_application::api::BackendTopologyService,
@@ -492,7 +460,6 @@ impl FrontendDistributedQueryCoordinator {
             backend_topology,
             backend_services: Some(BackendServicesSource::Sequence {
                 schedulers: Mutex::new(schedulers.into()),
-                dispatcher,
             }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
@@ -601,17 +568,11 @@ impl FrontendDistributedQueryCoordinator {
         #[cfg(test)]
         let backend_services = match &self.backend_services {
             Some(services) => services.resolve(parts.topology.targets())?,
-            None => {
-                production_backend_services(parts.topology.targets(), self.data_runtime.clone())?
-            }
+            None => production_backend_services(parts.topology.targets())?,
         };
         #[cfg(not(test))]
-        let backend_services =
-            production_backend_services(parts.topology.targets(), self.data_runtime.clone())?;
-        let dispatcher = Arc::clone(&backend_services.dispatcher);
-        let _query = self
-            .registry
-            .register(query_id, intent, Arc::clone(&dispatcher))?;
+        let backend_services = production_backend_services(parts.topology.targets())?;
+        let _query = self.registry.register(query_id, intent)?;
         let schedule = crate::preparation_diagnostics::observe_result(
             "attempt_instantiation",
             "schedule_attempt",
@@ -2510,8 +2471,7 @@ mod tests {
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
     };
     use crate::native::fragment_transport::{
-        DynamicFilterRead, DynamicFilterReadError, ExpectedOutputSchemaView, FetchOutcome,
-        FinalTaskInfoRead, FragmentDispatcher, RootResultOutcome,
+        DynamicFilterRead, DynamicFilterReadError, FinalTaskInfoRead, RootResultOutcome,
     };
     use crate::query_execution::completion::{
         LogicalQueryReservation, PreReadyRetryBoundary, PreparedDistributedAttempt,
@@ -2543,9 +2503,7 @@ mod tests {
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
     use novarocks_types::identity::{StageId, TaskId};
     use novarocks_types::{AttemptId, QueryExecutionId};
-    use novarocks_types::{
-        BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace, UniqueId,
-    };
+    use novarocks_types::{BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace};
     use novarocks_version::native_build_identity;
 
     #[test]
@@ -2841,24 +2799,6 @@ mod tests {
             error.message(),
             "frontend query id local sequence is exhausted"
         );
-    }
-
-    struct FailingAfterStartDispatcher;
-
-    impl FragmentDispatcher for FailingAfterStartDispatcher {
-        fn fetch_result(
-            &self,
-            _backend_idx: usize,
-            _finst_id: UniqueId,
-            _max_wait_ms: i64,
-            _expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
-        ) -> Result<FetchOutcome, String> {
-            Err("test fetch failure after retry stage/start".to_string())
-        }
-
-        fn backend_count(&self) -> usize {
-            1
-        }
     }
 
     struct RecordingRetryFactory {
@@ -3163,7 +3103,6 @@ mod tests {
             FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
                 QueryId::new(7, 11),
                 vec![old_scheduler, replacement_scheduler],
-                Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
                 Arc::new(()),
                 Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
@@ -3261,7 +3200,6 @@ mod tests {
             FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
                 QueryId::new(7, 13),
                 vec![old_scheduler, replacement_scheduler],
-                Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
                 Arc::new(()),
                 Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
@@ -3340,7 +3278,6 @@ mod tests {
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_topology(
             QueryId::new(7, 12),
             scheduler,
-            Arc::new(FailingAfterStartDispatcher),
             NonZeroUsize::new(1).expect("nonzero workers"),
             Arc::new(()),
             Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
