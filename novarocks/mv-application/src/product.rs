@@ -31,6 +31,28 @@ use crate::persistence::dependency::CreateMvDependencyRequest;
 use crate::persistence::descriptor::MvDescriptorV3;
 use crate::repository::InitialMvRefreshConfiguration;
 
+/// Join refresh shape retained until query assembly admits exact connector
+/// bindings for the corresponding write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvIncrementalJoinMode {
+    AppendOnly,
+    Coalesce,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvIncrementalWriteMode {
+    FastAppend,
+    RowDelta,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvIncrementalRewriteEvidence {
+    None,
+    Aggregate,
+    JoinAggregate,
+    BranchUnionAggregate,
+}
+
 /// An already-canonical MV target identity.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MvTarget {

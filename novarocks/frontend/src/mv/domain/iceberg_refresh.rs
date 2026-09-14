@@ -42,8 +42,6 @@ use crate::mv::domain::application::{
     MvEngineError, MvEngineErrorKind, MvRefreshRequest, PrepareMvCreateRequest, PreparedMvCreate,
     PreparedMvDefinition,
 };
-#[cfg(test)]
-use crate::mv::domain::application::{MvIncrementalJoinMode, MvIncrementalWriteMode};
 use crate::mv::domain::lifecycle::{
     BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
@@ -112,6 +110,8 @@ use novarocks_mv_application::persistence::schema::{
 use novarocks_mv_application::persistence::semantic::{
     MvDesiredSemantics, MvRefreshDesiredConfiguration,
 };
+#[cfg(test)]
+use novarocks_mv_application::product::{MvIncrementalJoinMode, MvIncrementalWriteMode};
 use novarocks_mv_application::repository::MvRepository;
 use novarocks_parser::{Span, ast};
 use novarocks_query_application::engine_error::EngineError;

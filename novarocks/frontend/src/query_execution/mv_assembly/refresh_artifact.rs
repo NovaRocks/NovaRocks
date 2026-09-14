@@ -33,7 +33,7 @@ use novarocks_spi::connector::{
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
 use novarocks_sql::planning::mv::first_refresh::{SqlMvFirstRefreshArtifact, SqlMvSnapshotPin};
 
-use crate::mv::domain::application::{
+use novarocks_mv_application::product::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
 };
 use novarocks_mv_application::publication::MvRefreshPublicationIntent;

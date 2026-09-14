@@ -23,9 +23,6 @@ use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::mv::domain::application::{
-    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
-};
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::iceberg_activation::{
@@ -39,6 +36,9 @@ use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::write_session::ConnectorWriteSession;
+use novarocks_mv_application::product::{
+    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
+};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -30,9 +30,6 @@ use crate::mv::domain::analysis::{
     canonicalize_iceberg_mv_select_query, validate_mv_partition_columns,
 };
 use crate::mv::domain::application::MvRefreshRequest;
-use crate::mv::domain::application::{
-    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
-};
 use crate::mv::domain::iceberg_refresh::{
     IcebergMvCorePorts, join_base_refs_for_schema_contract,
     plan_iceberg_mv_refresh_with_connector_context,
@@ -77,6 +74,9 @@ use novarocks_mv_application::persistence::schema::{
     MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
 };
 use novarocks_mv_application::product::MvRefreshAttemptIdentity;
+use novarocks_mv_application::product::{
+    MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
+};
 use novarocks_mv_application::publication::{
     MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };

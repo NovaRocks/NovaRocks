@@ -29,7 +29,6 @@ use novarocks_spi::connector::{
     ConnectorWriteInputRequest, ConnectorWriteLease,
 };
 
-use crate::mv::domain::application::MvIncrementalWriteMode;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::storage_observation::MvLakePublishedProjection;
 use crate::query_execution::kernels::QueryPreparationKernel;
@@ -42,6 +41,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
 };
+use novarocks_mv_application::product::MvIncrementalWriteMode;
 use novarocks_mv_application::publication::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };

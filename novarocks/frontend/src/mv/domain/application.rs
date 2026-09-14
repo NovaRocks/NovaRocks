@@ -32,28 +32,6 @@ use novarocks_query_application::api::QueryResult;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 
-/// Join refresh shape retained until query assembly admits exact connector
-/// bindings for the corresponding write.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MvIncrementalJoinMode {
-    AppendOnly,
-    Coalesce,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MvIncrementalWriteMode {
-    FastAppend,
-    RowDelta,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MvIncrementalRewriteEvidence {
-    None,
-    Aggregate,
-    JoinAggregate,
-    BranchUnionAggregate,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MvCreatePartitionField {
     Identity { column: String },
