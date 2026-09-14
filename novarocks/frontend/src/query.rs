@@ -1258,12 +1258,6 @@ impl FrontendQuerySession {
             }
         };
         let command_context = CommandContext::new(statement.scope().clone(), connector_context);
-        let product_command = match lower_product_sql_command(&parsed_statement) {
-            Ok(command) => command,
-            Err(error) => {
-                return Ok(self.governed_typed_error(internal_error(error), statement));
-            }
-        };
         let diagnostic_statement = statement.token();
         let execution_owner = statement
             .take_execution_owner()
@@ -1339,12 +1333,15 @@ impl FrontendQuerySession {
                     validate_table_statement_admission(&table_statement, &sql)
                         .map_err(RoutedExecutionError::User)
                         .and_then(|()| {
-                            let command = product_command.ok_or_else(|| {
-                                RoutedExecutionError::Engine(
+                            let command =
+                                lower_product_sql_command(&ParsedStatement::Table(table_statement))
+                                    .map_err(RoutedExecutionError::Engine)?
+                                    .ok_or_else(|| {
+                                        RoutedExecutionError::Engine(
                                     "table parser admission did not produce a product command"
                                         .to_string(),
                                 )
-                            })?;
+                                    })?;
                             command_executor
                                 .execute_product(&command, &context, &command_context)
                                 .map_err(RoutedExecutionError::Engine)
@@ -1394,18 +1391,21 @@ impl FrontendQuerySession {
                                 .map(StatementResult::Query)
                                 .map_err(RoutedExecutionError::Engine)
                         }),
-                    Err(_) => product_command
-                        .ok_or_else(|| {
-                            RoutedExecutionError::Engine(
-                                "Iceberg parser admission did not produce a product command"
-                                    .to_string(),
-                            )
-                        })
-                        .and_then(|command| {
-                            command_executor
-                                .execute_product(&command, &context, &command_context)
-                                .map_err(RoutedExecutionError::Engine)
-                        }),
+                    Err(_) => lower_product_sql_command(&ParsedStatement::Iceberg(
+                        novarocks_parser::ast::IcebergStatement::AlterTable(statement),
+                    ))
+                    .map_err(RoutedExecutionError::Engine)?
+                    .ok_or_else(|| {
+                        RoutedExecutionError::Engine(
+                            "Iceberg parser admission did not produce a product command"
+                                .to_string(),
+                        )
+                    })
+                    .and_then(|command| {
+                        command_executor
+                            .execute_product(&command, &context, &command_context)
+                            .map_err(RoutedExecutionError::Engine)
+                    }),
                 },
             )),
             ParsedStatement::ShowBackends(_) => Box::pin(execute_synchronous_statement(
@@ -1433,18 +1433,21 @@ impl FrontendQuerySession {
                     {
                         Ok(result)
                     } else {
-                        product_command
-                            .ok_or_else(|| {
-                                RoutedExecutionError::Engine(
-                                    "typed statement has no declared product or specialized owner"
-                                        .to_string(),
-                                )
-                            })
-                            .and_then(|command| {
-                                command_executor
-                                    .execute_product(&command, &context, &command_context)
-                                    .map_err(RoutedExecutionError::Engine)
-                            })
+                        lower_product_sql_command(&ParsedStatement::Maintenance(
+                            novarocks_parser::ast::MaintenanceStatement::Call(statement),
+                        ))
+                        .map_err(RoutedExecutionError::Engine)?
+                        .ok_or_else(|| {
+                            RoutedExecutionError::Engine(
+                                "typed statement has no declared product or specialized owner"
+                                    .to_string(),
+                            )
+                        })
+                        .and_then(|command| {
+                            command_executor
+                                .execute_product(&command, &context, &command_context)
+                                .map_err(RoutedExecutionError::Engine)
+                        })
                     }
                 },
             )),
@@ -1472,13 +1475,14 @@ impl FrontendQuerySession {
                         .map_err(RoutedExecutionError::Engine)
                 },
             )),
-            _ => Box::pin(execute_synchronous_statement(
+            other_statement => Box::pin(execute_synchronous_statement(
                 synchronous_command_executor,
                 worker_cancellation,
                 diagnostic_statement,
                 execution_owner,
                 move || {
-                    product_command
+                    lower_product_sql_command(&other_statement)
+                        .map_err(RoutedExecutionError::Engine)?
                         .ok_or_else(|| {
                             RoutedExecutionError::Engine(
                                 "typed statement has no declared product owner".to_string(),
