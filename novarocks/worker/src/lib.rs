@@ -61,6 +61,7 @@ mod task_registry_config;
 mod task_registry_entry;
 #[cfg(test)]
 mod task_registry_tests;
+pub mod typed_connector_runtime;
 pub mod typed_page_source;
 pub mod typed_scan_filter;
 mod typed_scan_runtime;
