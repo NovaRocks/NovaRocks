@@ -62,7 +62,7 @@ pub struct QueryCpuExecutor {
     handle: BoundedResultDecodeHandle<CpuResult>,
 }
 
-/// Fixed process limits for legacy synchronous query command edges.
+/// Fixed process limits for synchronous query command edges.
 ///
 /// This is deliberately separate from [`QueryCpuExecutorConfig`]: command
 /// routes may call providers or wait on durable catalog work, so charging them
@@ -186,7 +186,12 @@ impl QueryBlockingExecutorOwner {
 }
 
 impl QueryBlockingExecutor {
-    pub async fn run<T, F>(&self, work: F) -> Result<T, String>
+    /// Runs one already-classified command edge after bounded admission.
+    ///
+    /// This is intentionally not a generic statement runner: callers must
+    /// keep parser admission, CPU compilation, protocol delivery, and every
+    /// adapter-owned synchronous effect in separate closures.
+    pub async fn execute<T, F>(&self, work: F) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
@@ -300,7 +305,7 @@ mod tests {
             let executor = executor.clone();
             work.push(tokio::spawn(async move {
                 executor
-                    .run(move || {
+                    .execute(move || {
                         let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(current, Ordering::SeqCst);
                         let (lock, ready) = &*gate;

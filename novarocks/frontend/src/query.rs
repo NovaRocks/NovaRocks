@@ -17,8 +17,12 @@
 
 //! Frontend-owned SQL session admission and routing boundary.
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
@@ -103,6 +107,7 @@ use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
 use novarocks_user_error::UserError;
 use novarocks_workload_control::WorkError;
+use novarocks_workload_control::WorkOwner;
 use novarocks_workload_control::{
     LocalResourceAuthority, RootAdmissionHandle, WorkClass, WorkRequest,
 };
@@ -359,6 +364,38 @@ fn execute_typed_dml_statement(
             Some(query_options),
         )),
     }
+}
+
+/// Executes one declared synchronous command edge after its bounded admission.
+///
+/// Compilation and protocol delivery must not be captured here. Keeping this
+/// edge to one adapter-owned command call makes its queueing, cancellation, and
+/// statement-owner handoff explicit.
+async fn execute_synchronous_statement<F>(
+    executor: QueryBlockingExecutor,
+    cancellation: QueryCancellationView,
+    diagnostic_statement: StatementToken,
+    execution_owner: WorkOwner,
+    call: F,
+) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
+where
+    F: FnOnce() -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
+{
+    executor
+        .execute(move || {
+            let _diagnostic_scope =
+                crate::preparation_diagnostics::enter_statement(diagnostic_statement);
+            let result = if cancellation.is_cancelled() {
+                Err(RoutedExecutionError::Engine(
+                    "typed statement was cancelled before synchronous command execution began"
+                        .to_owned(),
+                ))
+            } else {
+                call()
+            };
+            (result, execution_owner)
+        })
+        .await
 }
 
 fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
@@ -1200,141 +1237,184 @@ impl FrontendQuerySession {
             }
         };
         let command_context = CommandContext::new(statement.scope().clone(), connector_context);
+        let product_command = match lower_product_sql_command(&parsed_statement) {
+            Ok(command) => command,
+            Err(error) => {
+                return Ok(self.governed_typed_error(internal_error(error), statement));
+            }
+        };
         let diagnostic_statement = statement.token();
         let execution_owner = statement
             .take_execution_owner()
             .expect("governed typed statement transfers its execution owner exactly once");
         let worker_cancellation = cancellation.clone();
-        let mut worker = Box::pin(self.service.query_blocking_executor.run(move || {
-            let _diagnostic_scope =
-                crate::preparation_diagnostics::enter_statement(diagnostic_statement);
-            let result: Result<StatementResult, RoutedExecutionError> = if worker_cancellation
-                .is_cancelled()
-            {
-                // Queue admission can outlive a session deadline. Do not let
-                // an already-cancelled command start provider work merely
-                // because a bounded worker became available later.
-                Err(RoutedExecutionError::Engine(
-                    "typed statement was cancelled before synchronous execution began".to_owned(),
-                ))
-            } else {
-                let statement = parsed_statement;
-                if matches!(statement, ParsedStatement::ExplainQuery(_)) {
-                    compiler
-                        .prepare_statement(&statement, &context, Some(query_options))
-                        .and_then(|operation| {
-                            execute_prepared_query(operation, &query_execution)
-                                .map_err(FrontendQueryCompilerError::Engine)
-                        })
-                        .map_err(|error| match error {
-                            FrontendQueryCompilerError::Engine(error) => {
-                                RoutedExecutionError::Engine(error)
-                            }
-                            FrontendQueryCompilerError::Analyze(error) => {
-                                RoutedExecutionError::User(error.to_user_error(Some(&sql)))
-                            }
-                        })
-                } else if let ParsedStatement::Dml(statement) = &statement {
+        let synchronous_command_executor = self.service.query_blocking_executor.clone();
+        let query_cpu_executor = self.service.query_cpu_executor.clone();
+        let mut worker: Pin<Box<dyn Future<Output = _> + Send>> = match parsed_statement {
+            statement @ ParsedStatement::ExplainQuery(_) => Box::pin(async move {
+                let execution_cancellation = worker_cancellation.clone();
+                let (prepared, execution_owner) = query_cpu_executor
+                    .run(move || {
+                        let _diagnostic_scope =
+                            crate::preparation_diagnostics::enter_statement(diagnostic_statement);
+                        let result = if worker_cancellation.is_cancelled() {
+                            Err(RoutedExecutionError::Engine(
+                                "typed statement was cancelled before query compilation began"
+                                    .to_owned(),
+                            ))
+                        } else {
+                            compiler
+                                .prepare_statement(&statement, &context, Some(query_options))
+                                .map_err(|error| match error {
+                                    FrontendQueryCompilerError::Engine(error) => {
+                                        RoutedExecutionError::Engine(error)
+                                    }
+                                    FrontendQueryCompilerError::Analyze(error) => {
+                                        RoutedExecutionError::User(error.to_user_error(Some(&sql)))
+                                    }
+                                })
+                        };
+                        (result, execution_owner)
+                    })
+                    .await?;
+                let result = prepared.and_then(|operation| {
+                    if execution_cancellation.is_cancelled() {
+                        Err(RoutedExecutionError::Engine(
+                            "typed statement was cancelled before prepared query execution began"
+                                .to_owned(),
+                        ))
+                    } else {
+                        execute_prepared_query(operation, &query_execution)
+                            .map_err(RoutedExecutionError::Engine)
+                    }
+                });
+                Ok((result, execution_owner))
+            }),
+            ParsedStatement::Dml(statement) => Box::pin(execute_synchronous_statement(
+                synchronous_command_executor,
+                worker_cancellation,
+                diagnostic_statement,
+                execution_owner,
+                move || {
                     execute_typed_dml_statement(
                         dml.as_ref(),
                         insert_engine.as_ref(),
                         delete_engine.as_ref(),
                         mutation_engine.as_ref(),
                         ctas_engine.as_ref(),
-                        statement,
+                        &statement,
                         &sql,
                         &context,
                         &query_options,
                     )
-                } else if let ParsedStatement::Table(table_statement) = &statement {
-                    validate_table_statement_admission(table_statement, &sql)
+                },
+            )),
+            ParsedStatement::Table(table_statement) => Box::pin(execute_synchronous_statement(
+                synchronous_command_executor,
+                worker_cancellation,
+                diagnostic_statement,
+                execution_owner,
+                move || {
+                    validate_table_statement_admission(&table_statement, &sql)
                         .map_err(RoutedExecutionError::User)
                         .and_then(|()| {
-                            let command = lower_product_sql_command(&statement)
-                                .map_err(RoutedExecutionError::Engine)?
-                                .ok_or_else(|| {
-                                    RoutedExecutionError::Engine(
-                                        "table parser admission did not produce a product command"
-                                            .to_string(),
-                                    )
-                                })?;
+                            let command = product_command.ok_or_else(|| {
+                                RoutedExecutionError::Engine(
+                                    "table parser admission did not produce a product command"
+                                        .to_string(),
+                                )
+                            })?;
                             command_executor
                                 .execute_product(&command, &context, &command_context)
                                 .map_err(RoutedExecutionError::Engine)
                         })
-                } else if let ParsedStatement::Catalog(
-                    novarocks_parser::ast::CatalogStatement::TruncateTable(statement),
-                ) = &statement
-                {
+                },
+            )),
+            ParsedStatement::Catalog(novarocks_parser::ast::CatalogStatement::TruncateTable(
+                statement,
+            )) => Box::pin(execute_synchronous_statement(
+                synchronous_command_executor,
+                worker_cancellation,
+                diagnostic_statement,
+                execution_owner,
+                move || {
                     dml.execute_truncate(
                         truncate_engine.as_ref(),
                         crate::query_execution::dml::truncate::command_from_typed_statement(
-                            statement,
+                            &statement,
                         ),
                         &context,
                         Some(&query_options),
                     )
                     .map(|()| StatementResult::Ok)
                     .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                } else if let ParsedStatement::Iceberg(
-                    novarocks_parser::ast::IcebergStatement::AlterTable(iceberg_statement),
-                ) = &statement
-                {
-                    match crate::query_execution::dml::add_files::command_from_typed_statement(
-                        iceberg_statement,
-                    ) {
-                        Ok(command) => dml
-                            .execute_add_files(
-                                add_files_engine.as_ref(),
-                                command,
-                                &context,
-                                Some(&query_options),
+                },
+            )),
+            ParsedStatement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(
+                statement,
+            )) => Box::pin(execute_synchronous_statement(
+                synchronous_command_executor,
+                worker_cancellation,
+                diagnostic_statement,
+                execution_owner,
+                move || match crate::query_execution::dml::add_files::command_from_typed_statement(
+                    &statement,
+                ) {
+                    Ok(command) => dml
+                        .execute_add_files(
+                            add_files_engine.as_ref(),
+                            command,
+                            &context,
+                            Some(&query_options),
+                        )
+                        .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                        .and_then(|count| {
+                            add_files_status(count)
+                                .map(StatementResult::Query)
+                                .map_err(RoutedExecutionError::Engine)
+                        }),
+                    Err(_) => product_command
+                        .ok_or_else(|| {
+                            RoutedExecutionError::Engine(
+                                "Iceberg parser admission did not produce a product command"
+                                    .to_string(),
                             )
-                            .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                            .and_then(|count| {
-                                add_files_status(count)
-                                    .map(StatementResult::Query)
-                                    .map_err(RoutedExecutionError::Engine)
-                            }),
-                        Err(_) => (|| -> Result<StatementResult, RoutedExecutionError> {
-                            let command = lower_product_sql_command(&statement)
-                                .map_err(RoutedExecutionError::Engine)?
-                                .ok_or_else(|| {
-                                    RoutedExecutionError::Engine(
-                                        "Iceberg parser admission did not produce a product command"
-                                            .to_string(),
-                                    )
-                                })?;
+                        })
+                        .and_then(|command| {
                             command_executor
                                 .execute_product(&command, &context, &command_context)
                                 .map_err(RoutedExecutionError::Engine)
-                        })(),
-                    }
-                } else {
-                    (|| -> Result<StatementResult, RoutedExecutionError> {
-                        if let Some(result) = command_executor
-                            .execute_special(&statement, &context, &command_context)
-                            .map_err(RoutedExecutionError::Engine)?
-                        {
-                            Ok(result)
-                        } else {
-                            let command = lower_product_sql_command(&statement)
-                                .map_err(RoutedExecutionError::Engine)?
-                                .ok_or_else(|| {
-                                    RoutedExecutionError::Engine(
+                        }),
+                },
+            )),
+            statement => Box::pin(execute_synchronous_statement(
+                synchronous_command_executor,
+                worker_cancellation,
+                diagnostic_statement,
+                execution_owner,
+                move || {
+                    if let Some(result) = command_executor
+                        .execute_special(&statement, &context, &command_context)
+                        .map_err(RoutedExecutionError::Engine)?
+                    {
+                        Ok(result)
+                    } else {
+                        product_command
+                            .ok_or_else(|| {
+                                RoutedExecutionError::Engine(
                                     "typed statement has no declared product or specialized owner"
                                         .to_string(),
                                 )
-                                })?;
-                            command_executor
-                                .execute_product(&command, &context, &command_context)
-                                .map_err(RoutedExecutionError::Engine)
-                        }
-                    })()
-                }
-            };
-            (result, execution_owner)
-        }));
+                            })
+                            .and_then(|command| {
+                                command_executor
+                                    .execute_product(&command, &context, &command_context)
+                                    .map_err(RoutedExecutionError::Engine)
+                            })
+                    }
+                },
+            )),
+        };
         let (result, execution_owner) = if let Some(timeout_duration) = timeout_duration {
             match tokio::time::timeout(timeout_duration, &mut worker).await {
                 Ok(result) => result.map_err(internal_error)?,
