@@ -27,6 +27,7 @@ pub mod catalog_prune_rpc;
 pub mod connector_blocking_io;
 pub mod debug_environment;
 pub mod exchange_data_plane;
+pub mod exchange_transmitter;
 pub mod fragment_error;
 pub mod fragment_expression;
 pub mod fragment_instance;

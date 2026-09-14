@@ -16,7 +16,7 @@ use novarocks_worker::{
     WorkerResultRetainedLimits,
 };
 
-use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
+use crate::fragment::native_result_writer;
 use crate::rpc::server::BackendRpcService;
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
 use crate::task_execution::{RegistryTaskExecutionIngress, backend_task_execution_ports};
@@ -414,7 +414,9 @@ fn compose_backend_application_services(
         )),
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::TaskQueryContextFacts>,
         Arc::clone(&inbound_capabilities),
-        grpc_exchange_transmitter(data_runtime.clone()),
+        novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
+            data_runtime.clone(),
+        ),
         native_result_writer(result_retained_budget, result_retained_limits.per_root()),
         Arc::clone(&exchange_receiver_port),
         Arc::new(

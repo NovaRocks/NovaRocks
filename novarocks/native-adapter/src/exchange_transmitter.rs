@@ -5,11 +5,9 @@ use novarocks_execution::runtime::fragment::io::{
     FragmentIoErrorKind, FragmentIoOperation,
 };
 
-use novarocks_native_adapter::{BackendDataRuntime, NativeRpcClient};
+use crate::{BackendDataRuntime, NativeRpcClient};
 
-pub(crate) fn grpc_exchange_transmitter(
-    runtime: BackendDataRuntime,
-) -> Arc<dyn ExchangeFrameTransmitter> {
+pub fn grpc_exchange_transmitter(runtime: BackendDataRuntime) -> Arc<dyn ExchangeFrameTransmitter> {
     Arc::new(GrpcExchangeFrameTransmitter { runtime })
 }
 

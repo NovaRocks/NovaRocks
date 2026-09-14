@@ -1807,7 +1807,7 @@ mod tests {
             NativeFragmentQueryRuntime::global(crate::application::test_memory_authority()),
             facts,
             TaskInboundCapabilities::new(),
-            crate::fragment::grpc_exchange_transmitter(data_runtime),
+            novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(data_runtime),
             crate::fragment::test_native_result_writer(),
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(crate::runtime::sink_commit::BackendSinkCommitPort),
