@@ -134,6 +134,9 @@ pub enum MvProductErrorKind {
     TargetReplaced,
     Corruption,
     ShutdownCancelled,
+    /// A provider-side target mutation is known committed, but a required
+    /// product finalization step did not complete.
+    KnownCommittedFinalizeFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

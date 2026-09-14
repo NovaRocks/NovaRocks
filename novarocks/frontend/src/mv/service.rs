@@ -175,7 +175,7 @@ impl MvApplicationService for FrontendMvService {
     ) -> Result<Option<MvStatementResult>, MvApplicationError> {
         match statement {
             MvApplicationStatement::Create(statement) => {
-                create::handle_create(engine, statement, context).map(Some)
+                create::handle_create(&self.product_service, engine, statement, context).map(Some)
             }
             MvApplicationStatement::Unhandled => Ok(None),
         }

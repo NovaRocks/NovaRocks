@@ -22,10 +22,14 @@ use std::time::Instant;
 use crate::activity::{
     MvActivityAdmissionError, MvActivityGate, MvActivityLease, MvActivityOwner, MvActivityTicket,
 };
+use crate::ports::{MvCatalogRegistrationPort, MvProviderFailure, MvProviderPort};
 use crate::process_runtime::{
     MvBackgroundRuntimeLifecycleError, MvBackgroundRuntimeOwner, MvBackgroundRuntimeStart,
 };
-use crate::product::MvTarget;
+use crate::product::{
+    MvCommand, MvCreateCommand, MvOperationContext, MvProductError, MvProductErrorKind,
+    MvProductResult, MvTarget,
+};
 
 /// The one process-local MV owner for activity admission and background-worker
 /// lifecycle. Hosts may inject effect callbacks, but cannot own a parallel
@@ -37,6 +41,47 @@ pub struct MvProductService {
 }
 
 impl MvProductService {
+    /// Execute the product-owned CREATE state machine. The outer adapter owns
+    /// SQL lowering and provider capabilities, while this product owns the
+    /// effect order and the distinction between pre-commit cleanup and a
+    /// known-committed finalization failure.
+    pub fn create(
+        &self,
+        operation: MvOperationContext,
+        create: MvCreateCommand,
+        provider: &dyn MvProviderPort,
+        catalog_registration: &dyn MvCatalogRegistrationPort,
+    ) -> Result<MvProductResult, MvProductError> {
+        let command = MvCommand::Create(create);
+        let target = match &command {
+            MvCommand::Create(create) => create.target.clone(),
+            MvCommand::Drop { .. } | MvCommand::Refresh { .. } | MvCommand::Show { .. } => {
+                unreachable!("CREATE product path constructed a non-CREATE command")
+            }
+        };
+        let created = provider
+            .create_target(operation, &command)
+            .map_err(MvProviderFailure::into_product_error)?;
+        let definition = match provider.inspect_created_target(operation, &created) {
+            Ok(definition) => definition,
+            Err(primary) => {
+                return Err(cleanup_after_inspection_failure(
+                    operation, provider, target, primary,
+                ));
+            }
+        };
+        provider
+            .sync_target_descriptor(operation, &created, &definition)
+            .map_err(MvProviderFailure::into_product_error)?;
+        provider
+            .project_created_target(operation, &created)
+            .map_err(known_committed_finalize_failure)?;
+        catalog_registration
+            .register_target(operation, &created)
+            .map_err(known_committed_finalize_failure)?;
+        Ok(MvProductResult::Created(created))
+    }
+
     pub fn acquire_foreground(
         &self,
         target: MvTarget,
@@ -83,10 +128,256 @@ impl MvProductService {
     }
 }
 
+fn cleanup_after_inspection_failure(
+    operation: MvOperationContext,
+    provider: &dyn MvProviderPort,
+    target: MvTarget,
+    primary: MvProviderFailure,
+) -> MvProductError {
+    let primary = primary.into_product_error();
+    match provider.drop_target(operation, &target) {
+        Ok(()) => primary,
+        Err(cleanup) => MvProductError::new(
+            primary.kind(),
+            format!("{}; target cleanup failed: {cleanup}", primary.message()),
+        ),
+    }
+}
+
+fn known_committed_finalize_failure(failure: MvProviderFailure) -> MvProductError {
+    MvProductError::new(
+        MvProductErrorKind::KnownCommittedFinalizeFailed,
+        failure.message(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::MvProductService;
     use crate::activity::{CanonicalMvTarget, MvActivityGateError, MvActivityOwner};
+    use crate::persistence::{
+        definition::{CreateMvDefinitionRequest, MvDesiredRefreshPolicy},
+        descriptor::MvDescriptorV3,
+        schema::{
+            BaseContract, BaseSchemaSnapshot, HiddenApplyKeyContract, MvSchemaContract,
+            OutputContract, TargetContract,
+        },
+        semantic::MvRefreshDesiredConfiguration,
+    };
+    use crate::ports::{
+        MvCatalogRegistrationPort, MvProviderFailure, MvProviderFailureKind, MvProviderPort,
+    };
+    use crate::product::{
+        MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition,
+        MvProductErrorKind, MvProductResult, MvTarget,
+    };
+    use crate::repository::InitialMvRefreshConfiguration;
+    use bytes::Bytes;
+    use novarocks_query_application::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
+    };
+    use novarocks_spi::connector::ConnectorTableObjectId;
+    use novarocks_sql::planning::mv::ApplyKeySource;
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct CreateEffects {
+        events: Mutex<Vec<&'static str>>,
+        fail_inspection: bool,
+        fail_projection: bool,
+    }
+
+    impl CreateEffects {
+        fn record(&self, event: &'static str) {
+            self.events.lock().expect("event lock").push(event);
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().expect("event lock").clone()
+        }
+    }
+
+    impl MvProviderPort for CreateEffects {
+        fn create_target(
+            &self,
+            _operation: MvOperationContext,
+            command: &MvCommand,
+        ) -> Result<MvCreatedTarget, MvProviderFailure> {
+            self.record("create");
+            let MvCommand::Create(create) = command else {
+                return Err(MvProviderFailure::new(
+                    MvProviderFailureKind::InvalidRequest,
+                    "CREATE adapter received a non-CREATE command",
+                ));
+            };
+            Ok(MvCreatedTarget {
+                target: create.target.clone(),
+                table_uuid: "created-table".to_string(),
+            })
+        }
+
+        fn inspect_created_target(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvCreatedTarget,
+        ) -> Result<MvPreparedDefinition, MvProviderFailure> {
+            self.record("inspect");
+            if self.fail_inspection {
+                return Err(MvProviderFailure::new(
+                    MvProviderFailureKind::Unavailable,
+                    "inspection failed",
+                ));
+            }
+            Ok(MvPreparedDefinition {
+                descriptor: test_descriptor(),
+            })
+        }
+
+        fn sync_target_descriptor(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvCreatedTarget,
+            _definition: &MvPreparedDefinition,
+        ) -> Result<(), MvProviderFailure> {
+            self.record("sync");
+            Ok(())
+        }
+
+        fn project_created_target(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvCreatedTarget,
+        ) -> Result<(), MvProviderFailure> {
+            self.record("project");
+            if self.fail_projection {
+                return Err(MvProviderFailure::new(
+                    MvProviderFailureKind::Unavailable,
+                    "projection failed",
+                ));
+            }
+            Ok(())
+        }
+
+        fn drop_target(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvTarget,
+        ) -> Result<(), MvProviderFailure> {
+            self.record("drop");
+            Ok(())
+        }
+    }
+
+    impl MvCatalogRegistrationPort for CreateEffects {
+        fn register_target(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvCreatedTarget,
+        ) -> Result<(), MvProviderFailure> {
+            self.record("register");
+            Ok(())
+        }
+
+        fn unregister_target(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvTarget,
+        ) -> Result<(), MvProviderFailure> {
+            Ok(())
+        }
+    }
+
+    fn create_command() -> MvCreateCommand {
+        MvCreateCommand {
+            target: MvTarget::from_parts(Some("iceberg"), "db", "mv"),
+            if_not_exists: false,
+            definition: CreateMvDefinitionRequest {
+                query_definition: PersistedQueryDefinition::new(
+                    "SELECT 1",
+                    PersistedQueryDialect::StarRocks,
+                    "iceberg",
+                    "db",
+                )
+                .expect("valid persisted query"),
+                base_table_refs: Vec::new(),
+                primary_key_columns: Vec::new(),
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("iceberg".to_string()),
+                target_namespace: Some("db".to_string()),
+                target_table: Some("mv".to_string()),
+                schema_contract: None,
+                partition_spec: None,
+                created_at_ms: 1,
+            },
+            refresh: InitialMvRefreshConfiguration::default(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    fn operation() -> MvOperationContext {
+        MvOperationContext {
+            operation_id: Uuid::nil(),
+        }
+    }
+
+    fn test_descriptor() -> MvDescriptorV3 {
+        MvDescriptorV3 {
+            descriptor_version: 3,
+            package_id: "test.mv".to_string(),
+            query_definition: PersistedQueryDefinition::new(
+                "SELECT 1",
+                PersistedQueryDialect::StarRocks,
+                "iceberg",
+                "db",
+            )
+            .expect("valid persisted query"),
+            visible_columns: Vec::new(),
+            hidden_columns: Vec::new(),
+            base_dependencies: Vec::new(),
+            primary_key_columns: Vec::new(),
+            schema_contract: MvSchemaContract {
+                contract_version: 1,
+                base: BaseContract {
+                    table_fqn: "iceberg.db.base".to_string(),
+                    table_object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"base"))
+                        .expect("valid object ID"),
+                    alias_at_create: None,
+                    schema_id_at_create: 0,
+                    schema_at_create: BaseSchemaSnapshot { fields: Vec::new() },
+                },
+                bases: Vec::new(),
+                output: OutputContract {
+                    columns: Vec::new(),
+                    filter: None,
+                },
+                join: None,
+                aggregate: None,
+                branch: None,
+                target: TargetContract {
+                    table_fqn: "iceberg.db.mv".to_string(),
+                    table_uuid: "created-table".to_string(),
+                    schema_id_at_create: 0,
+                    visible_columns: Vec::new(),
+                    hidden_apply_key: HiddenApplyKeyContract {
+                        column_name: "__nova_base_row_id".to_string(),
+                        target_field_id: 1,
+                        source: ApplyKeySource::BaseRowId,
+                    },
+                    partition: None,
+                },
+            },
+            refresh: MvRefreshDesiredConfiguration::new(
+                MvDesiredRefreshPolicy::Manual,
+                false,
+                None,
+                None,
+            )
+            .expect("manual refresh configuration"),
+            created_at_ms: 1,
+        }
+    }
 
     #[test]
     fn stopping_product_service_rejects_new_background_activity() {
@@ -100,5 +391,56 @@ mod tests {
             ),
             Err(MvActivityGateError::Stopping)
         ));
+    }
+
+    #[test]
+    fn create_runs_product_effects_in_required_order() {
+        let service = MvProductService::default();
+        let effects = CreateEffects::default();
+
+        let result = service
+            .create(operation(), create_command(), &effects, &effects)
+            .expect("create succeeds");
+
+        assert!(matches!(result, MvProductResult::Created(_)));
+        assert_eq!(
+            effects.events(),
+            ["create", "inspect", "sync", "project", "register"]
+        );
+    }
+
+    #[test]
+    fn create_cleans_only_after_inspection_failure() {
+        let service = MvProductService::default();
+        let effects = CreateEffects {
+            fail_inspection: true,
+            ..Default::default()
+        };
+
+        let error = service
+            .create(operation(), create_command(), &effects, &effects)
+            .expect_err("inspection failure is returned after cleanup");
+
+        assert_eq!(error.kind(), MvProductErrorKind::Unavailable);
+        assert_eq!(effects.events(), ["create", "inspect", "drop"]);
+    }
+
+    #[test]
+    fn create_marks_projection_failure_after_target_commit() {
+        let service = MvProductService::default();
+        let effects = CreateEffects {
+            fail_projection: true,
+            ..Default::default()
+        };
+
+        let error = service
+            .create(operation(), create_command(), &effects, &effects)
+            .expect_err("projection failed after target commit");
+
+        assert_eq!(
+            error.kind(),
+            MvProductErrorKind::KnownCommittedFinalizeFailed
+        );
+        assert_eq!(effects.events(), ["create", "inspect", "sync", "project"]);
     }
 }

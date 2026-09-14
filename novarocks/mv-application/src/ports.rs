@@ -52,6 +52,10 @@ impl MvProviderFailure {
         self.kind
     }
 
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     /// The product keeps the provider outcome class; in particular an unknown
     /// commit cannot become a normal retryable availability error.
     pub fn into_product_error(self) -> MvProductError {
