@@ -4,5 +4,4 @@ pub(crate) mod connector;
 mod fragment;
 mod runtime;
 pub(crate) mod runtime_filter;
-mod service;
 pub(crate) mod task_execution;
