@@ -1372,4 +1372,254 @@ mod tests {
             ) if entries.len() == 2
         ));
     }
+
+    #[test]
+    fn catalog_lowering_selects_every_parser_command_variant() {
+        let cases = [
+            ("TRUNCATE TABLE ice.db.events", "TRUNCATE TABLE"),
+            (
+                "CREATE EXTERNAL CATALOG IF NOT EXISTS lake COMMENT 'catalog' PROPERTIES ('type' = 'iceberg')",
+                "CREATE CATALOG",
+            ),
+            ("DROP CATALOG IF EXISTS lake", "DROP CATALOG"),
+            (
+                "CREATE DATABASE IF NOT EXISTS lake.analytics",
+                "CREATE DATABASE",
+            ),
+            (
+                "DROP DATABASE IF EXISTS lake.analytics FORCE",
+                "DROP DATABASE",
+            ),
+            (
+                "DROP TABLE IF EXISTS lake.analytics.events FORCE",
+                "DROP TABLE",
+            ),
+            (
+                "SHOW CREATE TABLE lake.analytics.events",
+                "SHOW CREATE TABLE",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let statement = parse_single_statement(sql).expect("parse catalog command");
+            let Some(ProductSqlCommand::Catalog(command)) =
+                lower_product_sql_command(&statement).expect("lower catalog command")
+            else {
+                panic!("{expected} must lower to a catalog command");
+            };
+            let actual = match command {
+                CatalogSqlCommand::TruncateTable { .. } => "TRUNCATE TABLE",
+                CatalogSqlCommand::CreateCatalog(_) => "CREATE CATALOG",
+                CatalogSqlCommand::DropCatalog { .. } => "DROP CATALOG",
+                CatalogSqlCommand::CreateDatabase { .. } => "CREATE DATABASE",
+                CatalogSqlCommand::DropDatabase { .. } => "DROP DATABASE",
+                CatalogSqlCommand::DropTable { .. } => "DROP TABLE",
+                CatalogSqlCommand::ShowCreateTable { .. } => "SHOW CREATE TABLE",
+                CatalogSqlCommand::CreateTable(_) | CatalogSqlCommand::AlterIcebergTable(_) => {
+                    panic!("{expected} selected an unrelated catalog variant")
+                }
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn statistics_lowering_selects_every_parser_command_variant() {
+        let cases = [
+            ("ANALYZE TABLE lake.db.events", "ANALYZE"),
+            ("SHOW ANALYZE JOBS", "SHOW ANALYZE"),
+            ("CANCEL ANALYZE job-7", "CANCEL ANALYZE"),
+            ("SHOW TABLE STATS lake.db.events", "SHOW TABLE STATS"),
+            ("SHOW BASIC STATS META", "SHOW BASIC STATS META"),
+            ("SHOW HISTOGRAM STATS META", "SHOW HISTOGRAM STATS META"),
+            ("DROP STATS lake.db.events", "DROP STATS"),
+            (
+                "DROP HISTOGRAM ON lake.db.events (event_type)",
+                "DROP HISTOGRAM",
+            ),
+            (
+                "DROP MULTIPLE COLUMNS STATS lake.db.events",
+                "DROP MULTIPLE COLUMNS STATS",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let statement = parse_single_statement(sql).expect("parse statistics command");
+            let Some(ProductSqlCommand::Statistics(command)) =
+                lower_product_sql_command(&statement).expect("lower statistics command")
+            else {
+                panic!("{expected} must lower to a statistics command");
+            };
+            let actual = match command {
+                StatisticsSqlCommand::AnalyzeTable { .. } => "ANALYZE",
+                StatisticsSqlCommand::ShowAnalyzeJobs => "SHOW ANALYZE",
+                StatisticsSqlCommand::CancelAnalyze { .. } => "CANCEL ANALYZE",
+                StatisticsSqlCommand::ShowTableStats { .. } => "SHOW TABLE STATS",
+                StatisticsSqlCommand::ShowBasicStatsMeta => "SHOW BASIC STATS META",
+                StatisticsSqlCommand::ShowHistogramStatsMeta => "SHOW HISTOGRAM STATS META",
+                StatisticsSqlCommand::DropStats { .. } => "DROP STATS",
+                StatisticsSqlCommand::DropHistogram { .. } => "DROP HISTOGRAM",
+                StatisticsSqlCommand::DropMultipleColumnsStats { .. } => {
+                    "DROP MULTIPLE COLUMNS STATS"
+                }
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn maintenance_lowering_selects_every_parser_command_variant() {
+        let cases = [
+            ("CALL system.rebuild()", "CALL"),
+            ("ALTER TABLE lake.db.events OPTIMIZE", "OPTIMIZE"),
+            (
+                "ALTER TABLE lake.db.events REWRITE MANIFESTS",
+                "REWRITE MANIFESTS",
+            ),
+            (
+                "ALTER TABLE lake.db.events EXPIRE SNAPSHOTS OLDER THAN 1700000000000",
+                "EXPIRE SNAPSHOTS",
+            ),
+            (
+                "ALTER TABLE lake.db.events REMOVE ORPHAN FILES OLDER THAN 1700000000000",
+                "REMOVE ORPHAN FILES",
+            ),
+            ("SHOW ALTER TABLE OPTIMIZE", "SHOW OPTIMIZE"),
+        ];
+
+        for (sql, expected) in cases {
+            let statement = parse_single_statement(sql).expect("parse maintenance command");
+            let Some(ProductSqlCommand::Maintenance(command)) =
+                lower_product_sql_command(&statement).expect("lower maintenance command")
+            else {
+                panic!("{expected} must lower to a maintenance command");
+            };
+            let actual = match command {
+                MaintenanceSqlCommand::Call { .. } => "CALL",
+                MaintenanceSqlCommand::Optimize { .. } => "OPTIMIZE",
+                MaintenanceSqlCommand::RewriteManifests { .. } => "REWRITE MANIFESTS",
+                MaintenanceSqlCommand::ExpireSnapshots { .. } => "EXPIRE SNAPSHOTS",
+                MaintenanceSqlCommand::RemoveOrphanFiles { .. } => "REMOVE ORPHAN FILES",
+                MaintenanceSqlCommand::ShowOptimize(_) => "SHOW OPTIMIZE",
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn iceberg_lowering_selects_every_parser_action_family() {
+        let cases = [
+            (
+                "ALTER TABLE lake.db.events ADD COLUMN added INT",
+                "schema add",
+            ),
+            (
+                "ALTER TABLE lake.db.events DROP COLUMN old_column",
+                "schema drop",
+            ),
+            (
+                "ALTER TABLE lake.db.events RENAME COLUMN old_column TO new_column",
+                "schema rename",
+            ),
+            (
+                "ALTER TABLE lake.db.events MODIFY COLUMN old_column BIGINT",
+                "schema modify",
+            ),
+            (
+                "ALTER TABLE lake.db.events ALTER COLUMN old_column SET NOT NULL",
+                "schema alter",
+            ),
+            (
+                "ALTER TABLE lake.db.events SET TBLPROPERTIES ('owner' = 'analytics')",
+                "properties set",
+            ),
+            (
+                "ALTER TABLE lake.db.events UNSET TBLPROPERTIES IF EXISTS ('owner')",
+                "properties unset",
+            ),
+            (
+                "ALTER TABLE lake.db.events COMMENT 'analytics events'",
+                "properties comment",
+            ),
+            (
+                "ALTER TABLE lake.db.events ADD PARTITION COLUMN day(event_time)",
+                "partition add",
+            ),
+            (
+                "ALTER TABLE lake.db.events DROP PARTITION COLUMN day(event_time)",
+                "partition drop",
+            ),
+            (
+                "ALTER TABLE lake.db.events CREATE BRANCH IF NOT EXISTS dev AS OF VERSION 7",
+                "reference create",
+            ),
+            (
+                "ALTER TABLE lake.db.events DROP BRANCH IF EXISTS dev",
+                "reference drop",
+            ),
+            (
+                "ALTER TABLE lake.db.events ADD FILES FROM 's3://warehouse/events'",
+                "add files",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let statement = parse_single_statement(sql).expect("parse Iceberg command");
+            let Some(ProductSqlCommand::Catalog(CatalogSqlCommand::AlterIcebergTable(command))) =
+                lower_product_sql_command(&statement).expect("lower Iceberg command")
+            else {
+                panic!("{expected} must lower to an Iceberg catalog command");
+            };
+            let actual = match command.action {
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Schema(
+                    novarocks_sql::semantic::command::IcebergSchemaSqlChange::AddColumn { .. },
+                ) => "schema add",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Schema(
+                    novarocks_sql::semantic::command::IcebergSchemaSqlChange::DropColumn { .. },
+                ) => "schema drop",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Schema(
+                    novarocks_sql::semantic::command::IcebergSchemaSqlChange::RenameColumn {
+                        ..
+                    },
+                ) => "schema rename",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Schema(
+                    novarocks_sql::semantic::command::IcebergSchemaSqlChange::ModifyColumn {
+                        ..
+                    },
+                ) => "schema modify",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Schema(
+                    novarocks_sql::semantic::command::IcebergSchemaSqlChange::AlterColumn {
+                        ..
+                    },
+                ) => "schema alter",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Properties(
+                    novarocks_sql::semantic::command::IcebergPropertiesSqlAction::Set { .. },
+                ) => "properties set",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Properties(
+                    novarocks_sql::semantic::command::IcebergPropertiesSqlAction::Unset { .. },
+                ) => "properties unset",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Properties(
+                    novarocks_sql::semantic::command::IcebergPropertiesSqlAction::Comment {
+                        ..
+                    },
+                ) => "properties comment",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Partition(
+                    novarocks_sql::semantic::command::IcebergPartitionSqlChange::Add(_),
+                ) => "partition add",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Partition(
+                    novarocks_sql::semantic::command::IcebergPartitionSqlChange::Drop(_),
+                ) => "partition drop",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Reference(
+                    novarocks_sql::semantic::command::IcebergReferenceSqlAction::Create { .. },
+                ) => "reference create",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Reference(
+                    novarocks_sql::semantic::command::IcebergReferenceSqlAction::Drop { .. },
+                ) => "reference drop",
+                novarocks_sql::semantic::command::IcebergTableSqlAction::AddFiles { .. } => {
+                    "add files"
+                }
+            };
+            assert_eq!(actual, expected);
+        }
+    }
 }
