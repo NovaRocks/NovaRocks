@@ -23,6 +23,7 @@ use crate::persistence::definition::{
     CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
 };
 use crate::persistence::dependency::CreateMvDependencyRequest;
+use crate::product::MvTarget;
 use crate::repository::{
     DeleteMvProjectionRequest, InitialMvRefreshConfiguration, MvProjectionRequest,
     MvPublishedProjection, MvPublishedWaterline, MvRepository, MvRepositoryErrorKind,
@@ -33,7 +34,6 @@ use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, StateStore, Value};
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_state_store_testkit::testing::InMemoryStateStore;
@@ -57,11 +57,7 @@ pub(crate) fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
 }
 
 pub(crate) fn target(table: &str) -> MvTarget {
-    MvTarget {
-        catalog: Some("ice".to_string()),
-        database: "sales".to_string(),
-        name: table.to_string(),
-    }
+    MvTarget::from_parts(Some("ice"), "sales", table)
 }
 
 pub(crate) fn projection_request(

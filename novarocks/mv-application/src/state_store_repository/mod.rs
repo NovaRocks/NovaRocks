@@ -42,13 +42,13 @@ use uuid::Uuid;
 use crate::dependency::MvDependencyObjectRef;
 use crate::persistence::definition::StoredMvDefinition;
 use crate::persistence::dependency::{CreateMvDependencyRequest, StoredMvDependency};
+use crate::product::MvTarget;
 use crate::repository::{
     DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
     MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
     ReplaceMvProjectionRequest,
 };
 use crate::repository_metrics::MvRepositoryMetrics;
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 use self::codec::{
@@ -718,29 +718,30 @@ fn definition_from_request(mv_id: i64, request: &MvProjectionRequest) -> StoredM
 }
 
 fn definition_target(definition: &StoredMvDefinition) -> Result<MvTarget, String> {
-    Ok(MvTarget {
-        catalog: Some(
+    MvTarget::try_new(
+        Some(
             definition
                 .target_catalog
                 .clone()
                 .ok_or_else(|| "MV projection target catalog is missing".to_string())?,
         ),
-        database: definition
+        definition
             .target_namespace
             .clone()
             .ok_or_else(|| "MV projection target namespace is missing".to_string())?,
-        name: definition
+        definition
             .target_table
             .clone()
             .ok_or_else(|| "MV projection target table is missing".to_string())?,
-    })
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn target_key(target: &MvTarget) -> Result<Key, String> {
     target_lookup_key(
-        target.catalog.as_deref().unwrap_or_default(),
-        &target.database,
-        &target.name,
+        target.catalog().unwrap_or_default(),
+        target.namespace(),
+        target.name(),
     )
 }
 

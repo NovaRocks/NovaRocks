@@ -15,10 +15,10 @@ use uuid::Uuid;
 
 use crate::mv::domain::accelerator::projection_from_lake;
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
+use novarocks_mv_application::product::MvTarget;
 use novarocks_mv_application::repository::{
     MvRepository, MvRepositoryError, MvRepositoryErrorKind, ReplaceMvProjectionRequest,
 };
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 pub(crate) struct MvAcceleratorProjector {
     repository: Arc<dyn MvRepository>,
@@ -51,11 +51,11 @@ pub(crate) async fn project_observed_repository(
 ) -> Result<(), MvRepositoryError> {
     let projection = projection_from_lake(package)
         .map_err(|error| MvRepositoryError::new(MvRepositoryErrorKind::Corruption, error))?;
-    let target = MvTarget {
-        catalog: Some(package.table.instance_id.as_str().to_string()),
-        database: package.table.namespace.to_string(),
-        name: package.table.table.to_string(),
-    };
+    let target = MvTarget::from_parts(
+        Some(package.table.instance_id.as_str()),
+        package.table.namespace.as_ref(),
+        package.table.table.as_ref(),
+    );
     let Some(current) = repository.find_by_target(&target).await? else {
         repository
             .create_projection(operation_id, projection)

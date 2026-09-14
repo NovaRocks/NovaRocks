@@ -35,7 +35,7 @@ use crate::persistence::definition::{
 };
 pub use crate::persistence::dependency::CreateMvDependencyRequest;
 use crate::persistence::dependency::StoredMvDependency;
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
+use crate::product::MvTarget;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvRepositoryErrorKind {

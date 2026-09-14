@@ -50,6 +50,7 @@ use novarocks_mv_application::persistence::definition::{
     CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
 };
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
+use novarocks_mv_application::product::MvTarget;
 use novarocks_mv_application::repository::{
     InitialMvRefreshConfiguration, MvProjectionRequest, MvPublishedProjection,
     MvPublishedWaterline, MvRepository, MvRepositoryErrorKind,
@@ -62,7 +63,6 @@ use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, ConnectorInstanceId,
     ConnectorProviderId, ConnectorTableObjectId, CredentialConsumerRole, StaticCredentialReference,
 };
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_state_store_api::{
     AttemptSupervisor, CommitOutcome, Direction, Key, KeyRange, Precondition, RangePage,
     RangeRequest, ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
@@ -461,11 +461,7 @@ fn observation() -> GcOwnedRefObservation {
 }
 
 fn mv_target() -> MvTarget {
-    MvTarget {
-        catalog: Some("ice".to_string()),
-        database: "sales".to_string(),
-        name: "orders_mv".to_string(),
-    }
+    MvTarget::from_parts(Some("ice"), "sales", "orders_mv")
 }
 
 /// Every durable record any of the three families could have written.

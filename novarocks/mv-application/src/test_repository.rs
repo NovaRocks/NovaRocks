@@ -27,12 +27,12 @@ use uuid::Uuid;
 use crate::dependency::MvDependencyObjectRef;
 use crate::persistence::definition::StoredMvDefinition;
 use crate::persistence::dependency::StoredMvDependency;
+use crate::product::MvTarget;
 use crate::repository::{
     DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
     MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
     ReplaceMvProjectionRequest,
 };
-use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 #[derive(Default)]
 pub struct InMemoryMvRepository {
@@ -74,11 +74,12 @@ impl InMemoryMvRepository {
     }
 
     fn target(definition: &StoredMvDefinition) -> Option<MvTarget> {
-        Some(MvTarget {
-            catalog: definition.target_catalog.clone(),
-            database: definition.target_namespace.clone()?,
-            name: definition.target_table.clone()?,
-        })
+        MvTarget::try_new(
+            definition.target_catalog.clone(),
+            definition.target_namespace.clone()?,
+            definition.target_table.clone()?,
+        )
+        .ok()
     }
 
     fn definition(mv_id: i64, request: &MvProjectionRequest) -> StoredMvDefinition {

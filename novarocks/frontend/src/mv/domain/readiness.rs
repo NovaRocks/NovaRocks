@@ -173,7 +173,7 @@ impl MvReadinessPort {
                 format!("MV target is unavailable: {reason}"),
             ));
         }
-        self.block_on(self.repository.find_by_target(target))
+        self.block_on(self.repository.find_by_target(&canonical))
     }
 
     /// Enumerate only projections whose current-process readiness permits
@@ -352,7 +352,7 @@ impl MvReadinessPort {
     ) -> Result<bool, MvRepositoryError> {
         self.block_on(
             self.repository
-                .wipe_projection_by_target(operation_id, target),
+                .wipe_projection_by_target(operation_id, &canonical_mv_target(target)),
         )
     }
 }
