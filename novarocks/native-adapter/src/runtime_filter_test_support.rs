@@ -1,4 +1,4 @@
-//! Backend-native runtime-filter test helpers.
+//! Native runtime-filter test helpers.
 //!
 //! These helpers construct adapter-owned participants and envelopes. Pure
 //! contract fixtures are Worker-owned in `runtime_filter::fixture`.
@@ -13,9 +13,9 @@ use novarocks_worker::runtime_filter::domain::BackendParticipantIdentity;
 /// build a route graph first. Any envelope it receives is refused by its own
 /// route authority, which is exactly what distinguishes "the participant
 /// decided" from "nobody was asked".
-pub(crate) fn participant_for_test()
--> std::sync::Arc<novarocks_native_adapter::runtime_filter_participant::RuntimeFilterParticipant> {
-    use novarocks_native_adapter::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
+pub fn participant_for_test()
+-> std::sync::Arc<crate::runtime_filter_participant::RuntimeFilterParticipant> {
+    use crate::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
 
     let contribution = novarocks_proto_codec::lifecycle::RuntimeFilterContribution::parse(
         novarocks_proto_models::novarocks::RuntimeFilterContribution {
@@ -37,21 +37,20 @@ pub(crate) fn participant_for_test()
         },
     )
     .expect("a channel-less contribution is legal");
-    let decoded =
-        novarocks_native_adapter::runtime_filter_install::decode_runtime_filter_contribution(
-            participant_execution_id(),
-            &contribution,
-        )
-        .expect("a channel-less contribution decodes");
+    let decoded = crate::runtime_filter_install::decode_runtime_filter_contribution(
+        participant_execution_id(),
+        &contribution,
+    )
+    .expect("a channel-less contribution decodes");
     NativeRuntimeFilterParticipantFactory::new(
-        novarocks_native_adapter::backend_test_support::test_backend_data_runtime(),
+        crate::backend_test_support::test_backend_data_runtime(),
     )
     .install(participant_execution_id(), decoded)
     .expect("a channel-less participant installs")
 }
 
 /// The attempt `participant_for_test` installs on.
-pub(crate) fn participant_execution_id() -> novarocks_proto_codec::lifecycle::QueryExecutionId {
+pub fn participant_execution_id() -> novarocks_proto_codec::lifecycle::QueryExecutionId {
     use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
 
     QueryExecutionId::new(
@@ -62,17 +61,17 @@ pub(crate) fn participant_execution_id() -> novarocks_proto_codec::lifecycle::Qu
 }
 
 /// One delivery envelope addressed to `participant_for_test`'s attempt.
-pub(crate) fn delivery_envelope_for_test(
+pub fn delivery_envelope_for_test(
     kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
-) -> novarocks_native_adapter::runtime_filter_rpc::BackendNativeRuntimeFilterEnvelope {
-    use novarocks_execution::runtime_filter::RuntimeFilterChannelId;
-    use novarocks_native_adapter::runtime_filter_rpc::{
+) -> crate::runtime_filter_rpc::BackendNativeRuntimeFilterEnvelope {
+    use crate::runtime_filter_rpc::{
         BackendNativeDeliveryRouteIdentity, BackendNativeRouteIdentity,
     };
+    use novarocks_execution::runtime_filter::RuntimeFilterChannelId;
     use novarocks_worker::runtime_filter::domain::{BackendRouteEdgeId, BackendTransportSequence};
 
     let execution_id = participant_execution_id();
-    novarocks_native_adapter::runtime_filter_rpc::BackendNativeRuntimeFilterEnvelope::new(
+    crate::runtime_filter_rpc::BackendNativeRuntimeFilterEnvelope::new(
         kind,
         BackendParticipantIdentity::new(
             UniqueId::new(

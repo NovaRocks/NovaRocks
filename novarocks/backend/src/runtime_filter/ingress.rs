@@ -222,7 +222,7 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use crate::runtime_filter::test_support::participant_for_test;
+    use novarocks_native_adapter::runtime_filter_test_support::participant_for_test;
     use novarocks_worker::runtime_filter::domain::{BackendAcceptStatus, BackendEnvelopeKind};
 
     struct StubAuthority {
@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn envelope() -> BackendNativeRuntimeFilterEnvelope {
-        crate::runtime_filter::test_support::delivery_envelope_for_test(
+        novarocks_native_adapter::runtime_filter_test_support::delivery_envelope_for_test(
             BackendEnvelopeKind::CompletedWithoutArtifact,
         )
     }

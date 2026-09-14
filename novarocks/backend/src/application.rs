@@ -979,10 +979,12 @@ mod tests {
     #[test]
     fn the_composed_runtime_filter_ingress_reaches_a_task_protocol_participant() {
         use super::native_runtime_filter_envelope_ingress;
-        use crate::runtime_filter::test_support::delivery_envelope_for_test;
         use novarocks_execution_contract::CredentialUpdate;
         use novarocks_execution_contract::task_execution::domain::{
             CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
+        };
+        use novarocks_native_adapter::runtime_filter_test_support::{
+            delivery_envelope_for_test, participant_execution_id,
         };
         use novarocks_proto_codec::FieldPath;
         use novarocks_proto_codec::catalog::CatalogSet;
@@ -1014,7 +1016,7 @@ mod tests {
         // the way the task protocol establishes one.
         let envelope = delivery_envelope_for_test(BackendEnvelopeKind::CompletedWithoutArtifact);
         let context = QueryContextRef::new(
-            crate::runtime_filter::test_support::participant_execution_id(),
+            participant_execution_id(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );

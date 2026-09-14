@@ -60,6 +60,8 @@ pub mod runtime_filter_membership;
 pub mod runtime_filter_participant;
 pub mod runtime_filter_rpc;
 pub mod runtime_filter_terminal;
+#[cfg(any(test, feature = "test-support"))]
+pub mod runtime_filter_test_support;
 pub mod runtime_filter_transport;
 pub mod runtime_filter_typed_scan;
 pub mod task_execution_observation;
