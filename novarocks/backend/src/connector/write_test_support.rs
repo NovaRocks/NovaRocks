@@ -299,7 +299,7 @@ pub(crate) fn test_write_scan_runtime(
     execution_id: QueryExecutionId,
     fragment_instance_id: UniqueId,
     execution: Arc<RecordingWriteExecution>,
-) -> crate::fragment::decode::plan::context::TypedScanRuntime {
+) -> novarocks_worker::TypedScanRuntime {
     let binding = test_write_binding(execution);
     let expected = test_write_catalog_handle();
     let queues = novarocks_execution::connector::SplitQueueRegistry::new().open_attempt(
@@ -314,7 +314,7 @@ pub(crate) fn test_write_scan_runtime(
         std::time::SystemTime::UNIX_EPOCH,
     )
     .expect("session");
-    crate::fragment::decode::plan::context::TypedScanRuntime::new(
+    novarocks_worker::TypedScanRuntime::new(
         execution_id,
         Arc::new(|_| Err("no query-leased test read runtime".to_owned())),
         Arc::new(move |handle| {

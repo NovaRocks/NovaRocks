@@ -65,7 +65,7 @@ pub(crate) fn decode_fragment_submission(
     instance_params: &proto::InstanceParams,
     connector_cancellation: Arc<dyn ConnectorCancellation>,
     exchange_wait: Duration,
-    typed_scan_runtime: Option<super::context::TypedScanRuntime>,
+    typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let root_path = FieldPath::root("plan_fragment").field("root");

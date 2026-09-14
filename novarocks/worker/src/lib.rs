@@ -62,6 +62,7 @@ mod task_registry_entry;
 #[cfg(test)]
 mod task_registry_tests;
 pub mod typed_scan_filter;
+mod typed_scan_runtime;
 
 /// Worker-owned runtime-filter artifacts and local resource contracts.
 pub mod runtime_filter {
@@ -149,6 +150,10 @@ pub use task_execution_ports::{
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 pub use task_registry::{DeadlineSweep, RegistryCounters, TaskExecutionRegistry};
 pub use task_registry_config::TaskExecutionRegistryConfig;
+pub use typed_scan_runtime::{
+    CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,
+    TypedScanRuntime,
+};
 
 /// Positive, ordered joint retained-result limits owned by one worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

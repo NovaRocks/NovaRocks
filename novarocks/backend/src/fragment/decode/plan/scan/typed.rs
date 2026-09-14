@@ -220,7 +220,7 @@ pub(super) fn lower_typed_connector_scan(
 
 /// The fragment-local runtime inputs a typed scan needs beyond its carrier.
 struct TypedScanRuntimeInputs {
-    catalog_read_execution: super::super::context::CatalogReadExecutionResolver,
+    catalog_read_execution: novarocks_worker::CatalogReadExecutionResolver,
     queues: Arc<
         novarocks_execution::connector::TaskAttemptSplitQueues<
             crate::fragment::ingress::ReceivedReadSplit,
@@ -230,7 +230,7 @@ struct TypedScanRuntimeInputs {
     request: novarocks_spi::connector::ConnectorRequestContext,
     reader_policy: novarocks_spi::connector::read_stack::ConnectorPageSourceProviderOptions,
     /// Absent when this attempt installed no runtime filter.
-    runtime_filter: crate::fragment::decode::plan::context::RuntimeFilterSessionResolver,
+    runtime_filter: novarocks_worker::RuntimeFilterSessionResolver,
 }
 
 /// Resolve the typed scan's runtime inputs from the fragment decode context.

@@ -46,7 +46,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
 use novarocks_execution::connector::{
     ConnectorPageAdapter, PageConversion, ScheduledSplitFacts, SplitPoll, SplitQueue,
     TaskAttemptSplitQueues,
@@ -67,6 +66,7 @@ use novarocks_spi::connector::read_stack::{
     PageSourceFileMetrics,
 };
 use novarocks_types::SlotId;
+use novarocks_worker::RuntimeFilterSessionResolver;
 use novarocks_worker::connector_batch_transform::ConnectorBatchTransform;
 use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 
@@ -1368,7 +1368,7 @@ pub(crate) mod test_support {
 
     /// The runtime bundle a typed decode needs, wired to the same binding
     /// generation `catalog_table_handle` names.
-    pub(crate) fn typed_scan_runtime() -> crate::fragment::decode::plan::context::TypedScanRuntime {
+    pub(crate) fn typed_scan_runtime() -> novarocks_worker::TypedScanRuntime {
         struct NoVendedStorageResolver;
 
         impl novarocks_spi::connector::ConnectorStorageResolver for NoVendedStorageResolver {
@@ -1413,7 +1413,7 @@ pub(crate) mod test_support {
             std::time::SystemTime::UNIX_EPOCH,
         )
         .expect("session");
-        crate::fragment::decode::plan::context::TypedScanRuntime::new(
+        novarocks_worker::TypedScanRuntime::new(
             execution_id,
             std::sync::Arc::new(move |handle| {
                 if handle == &catalog_handle {

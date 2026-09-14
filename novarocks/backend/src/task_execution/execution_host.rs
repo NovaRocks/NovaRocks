@@ -87,16 +87,15 @@ use novarocks_types::{QueryExecutionId, UniqueId};
 use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInboundCapabilities};
 use tracing::debug;
 
-use crate::fragment::decode::plan::context::{
-    CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,
-    TypedScanRuntime,
-};
 use crate::fragment::decode::request::NativeFragmentRequest;
 use crate::fragment::ingress::{ReceivedReadSplit, TypedReadAttemptContext};
 use novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_native_adapter::task_shared_facts::fragment_plan;
-use novarocks_worker::{HostRejection, RunnableTask, TaskExecutionHost, TaskStatusReporter};
+use novarocks_worker::{
+    CatalogReadExecutionResolver, CatalogWriteExecutionResolver, HostRejection, RunnableTask,
+    RuntimeFilterSessionResolver, TaskExecutionHost, TaskStatusReporter, TypedScanRuntime,
+};
 
 /// Everything one query context contributes to preparing and running a task.
 ///

@@ -83,7 +83,7 @@ impl NativeFragmentRequest {
         instance_params: proto::InstanceParams,
         connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
         exchange_wait: std::time::Duration,
-        typed_scan_runtime: Option<crate::fragment::decode::plan::context::TypedScanRuntime>,
+        typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     ) -> Result<Self, NativeFragmentIngressError> {
         let instance = decode_instance_params(&instance_params)
@@ -126,7 +126,7 @@ impl NativeFragmentRequest {
         query_options: novarocks_execution::runtime::query_options::QueryOptions,
         connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
         exchange_wait: std::time::Duration,
-        typed_scan_runtime: Option<crate::fragment::decode::plan::context::TypedScanRuntime>,
+        typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     ) -> Result<Self, NativeFragmentIngressError> {
         let instance = decode_instance_params_with_query_options(&instance_params, query_options)
