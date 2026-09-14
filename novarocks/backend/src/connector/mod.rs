@@ -17,4 +17,3 @@
 
 #[cfg(test)]
 pub(crate) mod typed_runtime;
-pub(crate) mod write_data_plane;

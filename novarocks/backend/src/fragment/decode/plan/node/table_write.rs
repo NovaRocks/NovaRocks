@@ -71,16 +71,17 @@ const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 
 use super::DecodedNode;
 use super::aggregate::decode_resolved_aggregate_signature;
-use crate::connector::write_data_plane::{
-    NativeConnectorWriteObservationPort, ObservedConnectorWriteExecution,
-    RoleBoundCommitFragmentEncoder, RootCommitFragmentCarrierValidator,
-};
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
+use novarocks_native_adapter::connector_write_data_plane::{
+    NativeConnectorWriteObservationPort, QueryScopedTableWriteAggregateGuard,
+    RoleBoundCommitFragmentEncoder, RootCommitFragmentCarrierValidator,
+};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
 use novarocks_native_adapter::fragment_plan_node::decode_unpivot_constant;
+use novarocks_worker::connector_write_runtime::ObservedConnectorWriteExecution;
 
 fn decode_writer_multiplex_schema(
     wire: Option<&plan::WriterMultiplexSchema>,
@@ -883,12 +884,10 @@ pub(super) fn lower_table_writer_node(
         )
     })?;
     #[cfg(debug_assertions)]
-    let lowered = lowered.with_aggregate_guard(Arc::new(
-        crate::connector::write_data_plane::QueryScopedTableWriteAggregateGuard::new(
-            execution_id,
-            node_id,
-        ),
-    ));
+    let lowered = lowered.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
+        execution_id,
+        node_id,
+    )));
 
     let output_schema = Arc::clone(lowered.writer_multiplex_schema().chunk_schema());
     let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());
@@ -1018,12 +1017,10 @@ pub(super) fn lower_table_finish_node(
         )
     })?;
     #[cfg(debug_assertions)]
-    let lowered = lowered.with_aggregate_guard(Arc::new(
-        crate::connector::write_data_plane::QueryScopedTableWriteAggregateGuard::new(
-            execution_id,
-            node_id,
-        ),
-    ));
+    let lowered = lowered.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
+        execution_id,
+        node_id,
+    )));
 
     let output_schema = Arc::clone(lowered.root_result_schema().chunk_schema());
     let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());
