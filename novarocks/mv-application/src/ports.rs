@@ -176,16 +176,25 @@ pub trait MvDropProjectionPort: Send + Sync {
     ) -> Result<(), MvProviderFailure>;
 }
 
-/// The one post-commit projection effect for a refresh whose external
-/// publication is already known committed. The adapter may bridge provider
-/// package decoding and durable I/O, but it cannot reinterpret a projection
-/// failure as an unknown provider commit.
-pub trait MvRefreshProjectionPort: Send + Sync {
-    fn project_known_committed(
-        &self,
+/// One consumed refresh execution capability. The adapter may retain only the
+/// request-local query, connector, and prepared-work carriers required for
+/// this operation; it cannot retain MV product lifecycle state.
+pub trait MvRefreshExecutionPort: Send {
+    fn execute_refresh(
+        self: Box<Self>,
         target: &MvTarget,
-        published: &MvRefreshPublicationFinalizationFacts,
-    ) -> Result<(), MvProviderFailure>;
+        attempt: &MvRefreshAttemptIdentity,
+    ) -> Result<Box<dyn MvRefreshKnownCommittedPort>, MvProviderFailure>;
+}
+
+/// A consumed continuation available only after the external publication is
+/// known committed. It exposes product-owned proof and performs exactly one
+/// outer projection effect when the product accepts that proof.
+pub trait MvRefreshKnownCommittedPort: Send {
+    fn finalization_facts(&self) -> &MvRefreshPublicationFinalizationFacts;
+
+    fn project_known_committed(self: Box<Self>, target: &MvTarget)
+    -> Result<(), MvProviderFailure>;
 }
 
 #[cfg(test)]

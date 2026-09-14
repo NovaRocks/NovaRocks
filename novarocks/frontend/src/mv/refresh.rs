@@ -32,7 +32,7 @@ use crate::query_execution::mv_native_write::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_mv_application::ports::{
-    MvProviderFailure, MvProviderFailureKind, MvRefreshProjectionPort,
+    MvProviderFailure, MvProviderFailureKind, MvRefreshExecutionPort, MvRefreshKnownCommittedPort,
 };
 use novarocks_mv_application::product::{
     MvProductError, MvProductErrorKind, MvProductResult, MvRefreshAttemptIdentity,
@@ -71,59 +71,102 @@ pub(super) fn execute(
         return Ok(MvStatementResult::Ok);
     }
     let product_target = product_target(&refresh.finalize.target)?;
-    let _runtime_publication = product
-        .begin_refresh_publication(&product_target, &refresh.attempt)
-        .map_err(product_error)?;
-    let catalog = refresh
-        .finalize
-        .target
-        .catalog
-        .as_deref()
-        .ok_or_else(|| invalid("MV refresh requires an explicit connector catalog"))?;
-    let instance_id =
-        ConnectorInstanceId::parse(catalog).map_err(|error| invalid(error.to_string()))?;
-    let planning = dependencies
-        .connector_control
-        .acquire_current(&instance_id)
-        .map_err(|error| unavailable(error.to_string()))?;
-    if (ConnectorProviderBindingKey {
-        instance_id: planning.binding().descriptor().instance_id.clone(),
-        incarnation: planning.binding().incarnation(),
-    }) != refresh.observed_binding
+    let attempt = refresh.attempt.clone();
+    let execution_port = Box::new(FrontendRefreshExecution {
+        dependencies,
+        refresh,
+        context,
+        execution,
+    });
+    match product
+        .execute_refresh(&product_target, &attempt, execution_port)
+        .map_err(product_error)?
     {
-        return Err(MvApplicationError::new(
-            MvApplicationErrorKind::BindingInvalidated,
-            "MV refresh connector generation changed before provider dispatch",
-        ));
+        MvProductResult::Acknowledged => Ok(MvStatementResult::Ok),
+        MvProductResult::Created(_) | MvProductResult::Dropped | MvProductResult::Listed(_) => {
+            Err(MvApplicationError::new(
+                MvApplicationErrorKind::Engine,
+                "MV refresh product returned a non-refresh result",
+            ))
+        }
     }
-    match refresh.work {
-        PreparedMvRefreshWork::NoOp => unreachable!("no-op returned above"),
-        PreparedMvRefreshWork::MetadataOnly { intent } => execute_metadata_only(
-            product,
-            dependencies,
-            &planning,
-            refresh.attempt,
-            refresh.finalize,
-            intent,
-            context,
-            false,
-        ),
-        PreparedMvRefreshWork::DataProducing { write } => execute_data(
-            product,
-            dependencies,
-            &planning,
-            refresh.attempt,
-            refresh.finalize,
-            write,
-            context,
-            execution,
-        ),
+}
+
+struct FrontendRefreshExecution<'a> {
+    dependencies: &'a FrontendMvRefreshDependencies,
+    refresh: PreparedMvRefresh,
+    context: ConnectorRequestContext,
+    execution: &'a QueryExecutionContext,
+}
+
+impl MvRefreshExecutionPort for FrontendRefreshExecution<'_> {
+    fn execute_refresh(
+        self: Box<Self>,
+        target: &ProductMvTarget,
+        attempt: &MvRefreshAttemptIdentity,
+    ) -> Result<Box<dyn MvRefreshKnownCommittedPort>, MvProviderFailure> {
+        if product_target(&self.refresh.finalize.target).map_err(provider_failure)? != *target
+            || self.refresh.attempt != *attempt
+        {
+            return Err(MvProviderFailure::new(
+                MvProviderFailureKind::InvalidRequest,
+                "MV refresh execution capability does not match its product transition",
+            ));
+        }
+        let catalog = self
+            .refresh
+            .finalize
+            .target
+            .catalog
+            .as_deref()
+            .ok_or_else(|| {
+                provider_failure(invalid("MV refresh requires an explicit connector catalog"))
+            })?;
+        let instance_id = ConnectorInstanceId::parse(catalog)
+            .map_err(|error| provider_failure(invalid(error.to_string())))?;
+        let planning = self
+            .dependencies
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(|error| provider_failure(unavailable(error.to_string())))?;
+        if (ConnectorProviderBindingKey {
+            instance_id: planning.binding().descriptor().instance_id.clone(),
+            incarnation: planning.binding().incarnation(),
+        }) != self.refresh.observed_binding
+        {
+            return Err(MvProviderFailure::new(
+                MvProviderFailureKind::TargetReplaced,
+                "MV refresh connector generation changed before provider dispatch",
+            ));
+        }
+        let known = match self.refresh.work {
+            PreparedMvRefreshWork::NoOp => unreachable!("no-op returned above"),
+            PreparedMvRefreshWork::MetadataOnly { intent } => execute_metadata_only(
+                self.dependencies,
+                &planning,
+                self.refresh.attempt,
+                self.refresh.finalize,
+                intent,
+                self.context,
+                false,
+            ),
+            PreparedMvRefreshWork::DataProducing { write } => execute_data(
+                self.dependencies,
+                &planning,
+                self.refresh.attempt,
+                self.refresh.finalize,
+                write,
+                self.context,
+                self.execution,
+            ),
+        }
+        .map_err(provider_failure)?;
+        Ok(Box::new(known))
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn execute_data(
-    product: &MvProductService,
     dependencies: &FrontendMvRefreshDependencies,
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt: MvRefreshAttemptIdentity,
@@ -131,8 +174,7 @@ fn execute_data(
     prepared: PreparedMvRefreshWrite,
     context: ConnectorRequestContext,
     execution: &QueryExecutionContext,
-) -> Result<MvStatementResult, MvApplicationError> {
-    let product_target = product_target(&finalize.target)?;
+) -> Result<FrontendKnownCommittedPublication, MvApplicationError> {
     if prepared.operation_id() != attempt.write_operation_id() {
         return Err(invalid(
             "SQL-prepared MV write does not use its Lake publication identity",
@@ -175,7 +217,6 @@ fn execute_data(
         // committed row count, and a publication that never happened has no
         // committed facts to interpret.
         return execute_metadata_only(
-            product,
             dependencies,
             planning,
             attempt,
@@ -200,40 +241,32 @@ fn execute_data(
         publication_version,
     )
     .map_err(invalid)?;
-    wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
-    let snapshot = published
-        .publication_version()
-        .snapshot_id()
-        .ok_or_else(|| {
-            MvApplicationError::new(
-                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-                "MV publication completed without a snapshot ID",
-            )
-        })?;
     let table = ConnectorTableIdentity {
         instance_id: planning.binding().descriptor().instance_id.clone(),
         namespace: finalize.target.database.into(),
         table: finalize.target.name.into(),
     };
-    let package = dependencies
-        .provider_activation
-        .observe_published_package(planning, &table, snapshot, &context)
+    let package = wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)
         .map_err(|error| error.to_string())
-        .and_then(|package| {
-            crate::mv::domain::storage_observation::lake_package_from_spi(package)
+        .and_then(|()| {
+            let snapshot = published
+                .publication_version()
+                .snapshot_id()
+                .ok_or_else(|| "MV publication completed without a snapshot ID".to_string())?;
+            dependencies
+                .provider_activation
+                .observe_published_package(planning, &table, snapshot, &context)
                 .map_err(|error| error.to_string())
-        })
-        .map_err(|error| {
-            MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
-        })?;
-    finalize_known_committed_refresh(
-        product,
-        dependencies,
-        product_target,
-        &attempt,
-        &published,
-        &package,
-    )
+                .and_then(|package| {
+                    crate::mv::domain::storage_observation::lake_package_from_spi(package)
+                        .map_err(|error| error.to_string())
+                })
+        });
+    Ok(FrontendKnownCommittedPublication {
+        readiness: Arc::clone(&dependencies.readiness),
+        package,
+        published,
+    })
 }
 
 /// The one commit authority of one MV data write.
@@ -391,7 +424,6 @@ fn publish_data_staging_branch(
 }
 
 fn execute_metadata_only(
-    product: &MvProductService,
     dependencies: &FrontendMvRefreshDependencies,
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt: MvRefreshAttemptIdentity,
@@ -399,8 +431,7 @@ fn execute_metadata_only(
     intent: MvRefreshPublicationIntent,
     context: ConnectorRequestContext,
     staging_branch_exists: bool,
-) -> Result<MvStatementResult, MvApplicationError> {
-    let product_target = product_target(&finalize.target)?;
+) -> Result<FrontendKnownCommittedPublication, MvApplicationError> {
     if intent.publication_id() != attempt.publication_id {
         return Err(invalid(
             "SQL-prepared metadata-only refresh changed its Lake publication identity",
@@ -507,81 +538,61 @@ fn execute_metadata_only(
             .ok_or_else(|| invalid("metadata-only MV publication committed without a version"))?,
     )
     .map_err(invalid)?;
-    wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
-    let snapshot = published
-        .publication_version()
-        .snapshot_id()
-        .ok_or_else(|| invalid("metadata-only MV publication committed without a snapshot ID"))?;
-    let package = dependencies
-        .provider_activation
-        .observe_published_package(planning, &table, snapshot, &context)
+    let package = wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)
         .map_err(|error| error.to_string())
-        .and_then(|package| {
-            crate::mv::domain::storage_observation::lake_package_from_spi(package)
+        .and_then(|()| {
+            let snapshot = published
+                .publication_version()
+                .snapshot_id()
+                .ok_or_else(|| {
+                    "metadata-only MV publication committed without a snapshot ID".to_string()
+                })?;
+            dependencies
+                .provider_activation
+                .observe_published_package(planning, &table, snapshot, &context)
                 .map_err(|error| error.to_string())
-        })
-        .map_err(|error| {
-            MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
-        })?;
-    finalize_known_committed_refresh(
-        product,
-        dependencies,
-        product_target,
-        &attempt,
-        &published,
-        &package,
-    )
+                .and_then(|package| {
+                    crate::mv::domain::storage_observation::lake_package_from_spi(package)
+                        .map_err(|error| error.to_string())
+                })
+        });
+    Ok(FrontendKnownCommittedPublication {
+        readiness: Arc::clone(&dependencies.readiness),
+        package,
+        published,
+    })
 }
 
 /// Provider observation and StateStore I/O remain outer effects. The product
 /// owns their known-committed finalization classification, so this adapter
 /// cannot reinterpret a projection failure as an unknown provider commit.
-struct FrontendKnownCommittedProjection<'a> {
-    readiness: &'a MvReadinessPort,
-    package: &'a crate::mv::domain::storage_observation::MvLakePackageObservation,
+struct FrontendKnownCommittedPublication {
+    readiness: Arc<MvReadinessPort>,
+    package: Result<crate::mv::domain::storage_observation::MvLakePackageObservation, String>,
+    published: MvRefreshPublicationFinalizationFacts,
 }
 
-impl MvRefreshProjectionPort for FrontendKnownCommittedProjection<'_> {
+impl MvRefreshKnownCommittedPort for FrontendKnownCommittedPublication {
+    fn finalization_facts(&self) -> &MvRefreshPublicationFinalizationFacts {
+        &self.published
+    }
+
     fn project_known_committed(
-        &self,
+        self: Box<Self>,
         _target: &ProductMvTarget,
-        published: &MvRefreshPublicationFinalizationFacts,
     ) -> Result<(), MvProviderFailure> {
-        let attempt = published.intent().publication_id();
+        let attempt = self.published.intent().publication_id();
         wait_for_known_committed_before_projector_cas(&attempt).map_err(|error| {
             MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
         })?;
+        let package = self
+            .package
+            .map_err(|error| MvProviderFailure::new(MvProviderFailureKind::Unavailable, error))?;
         self.readiness
-            .project_observed(*attempt.as_uuid(), self.package)
+            .project_observed(*attempt.as_uuid(), &package)
             .map_err(|error| {
                 MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
             })
-    }
-}
-
-fn finalize_known_committed_refresh(
-    product: &MvProductService,
-    dependencies: &FrontendMvRefreshDependencies,
-    target: ProductMvTarget,
-    attempt: &MvRefreshAttemptIdentity,
-    published: &MvRefreshPublicationFinalizationFacts,
-    package: &crate::mv::domain::storage_observation::MvLakePackageObservation,
-) -> Result<MvStatementResult, MvApplicationError> {
-    let projection = FrontendKnownCommittedProjection {
-        readiness: dependencies.readiness.as_ref(),
-        package,
-    };
-    match product
-        .finalize_known_committed_refresh(&target, attempt, published, &projection)
-        .map_err(product_error)?
-    {
-        MvProductResult::Acknowledged => Ok(MvStatementResult::Ok),
-        MvProductResult::Created(_) | MvProductResult::Dropped | MvProductResult::Listed(_) => {
-            Err(MvApplicationError::new(
-                MvApplicationErrorKind::Engine,
-                "MV refresh product returned a non-refresh result",
-            ))
-        }
     }
 }
 
@@ -802,6 +813,27 @@ fn commit_known(
 
 fn invalid(message: impl Into<String>) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, message)
+}
+
+fn provider_failure(error: MvApplicationError) -> MvProviderFailure {
+    let kind = match error.kind() {
+        MvApplicationErrorKind::InvalidRequest => MvProviderFailureKind::InvalidRequest,
+        MvApplicationErrorKind::Unavailable
+        | MvApplicationErrorKind::Repository
+        | MvApplicationErrorKind::AlreadyActive
+        | MvApplicationErrorKind::ShutdownCancelled => MvProviderFailureKind::Unavailable,
+        MvApplicationErrorKind::BindingInvalidated | MvApplicationErrorKind::TargetGone => {
+            MvProviderFailureKind::TargetReplaced
+        }
+        MvApplicationErrorKind::CommitUnknown => MvProviderFailureKind::CommitUnknown,
+        MvApplicationErrorKind::Corruption => MvProviderFailureKind::Corruption,
+        MvApplicationErrorKind::Engine
+        | MvApplicationErrorKind::TerminalFailure
+        | MvApplicationErrorKind::KnownCommittedFinalizeFailed => {
+            MvProviderFailureKind::KnownUncommitted
+        }
+    };
+    MvProviderFailure::new(kind, error.to_string())
 }
 fn unavailable(message: impl Into<String>) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::Unavailable, message)

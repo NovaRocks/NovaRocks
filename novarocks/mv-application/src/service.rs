@@ -25,7 +25,7 @@ use crate::activity::{
 };
 use crate::ports::{
     MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvDropCatalogRegistrationPort,
-    MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvRefreshProjectionPort,
+    MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvRefreshExecutionPort,
 };
 use crate::process_runtime::{
     MvBackgroundRuntimeLifecycleError, MvBackgroundRuntimeOwner, MvBackgroundRuntimeStart,
@@ -127,20 +127,22 @@ impl MvProductService {
             .map_err(readiness_error)
     }
 
-    /// Finalize a refresh only after its external publication is known
-    /// committed. The product owns this classification: an Accelerator
-    /// projection failure remains a known-committed finalization failure, not
-    /// a retryable or unknown provider outcome.
-    pub fn finalize_known_committed_refresh(
+    /// Execute and finalize one product-owned refresh transition. The outer
+    /// port is consumed once, so it cannot retain a parallel lifecycle or
+    /// replay a publication after the product has classified its outcome.
+    pub fn execute_refresh<'a>(
         &self,
         target: &MvTarget,
         attempt: &MvRefreshAttemptIdentity,
-        published: &MvRefreshPublicationFinalizationFacts,
-        projection: &dyn MvRefreshProjectionPort,
+        execution: Box<dyn MvRefreshExecutionPort + 'a>,
     ) -> Result<MvProductResult, MvProductError> {
-        validate_published_refresh(target, attempt, published)?;
-        projection
-            .project_known_committed(target, published)
+        let _publication = self.begin_refresh_publication(target, attempt)?;
+        let known_committed = execution
+            .execute_refresh(target, attempt)
+            .map_err(MvProviderFailure::into_product_error)?;
+        validate_published_refresh(target, attempt, known_committed.finalization_facts())?;
+        known_committed
+            .project_known_committed(target)
             .map_err(known_committed_finalize_failure)?;
         Ok(MvProductResult::Acknowledged)
     }
@@ -335,7 +337,7 @@ mod tests {
     use crate::ports::{
         MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvDropCatalogRegistrationPort,
         MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvProviderFailureKind,
-        MvRefreshProjectionPort,
+        MvRefreshExecutionPort, MvRefreshKnownCommittedPort,
     };
     use crate::process_runtime::ProcessRuntime;
     use crate::product::{
@@ -484,14 +486,40 @@ mod tests {
         }
     }
 
-    impl MvRefreshProjectionPort for CreateEffects {
-        fn project_known_committed(
-            &self,
+    struct RefreshExecutionEffects {
+        effects: Arc<CreateEffects>,
+        published: MvRefreshPublicationFinalizationFacts,
+    }
+
+    struct KnownCommittedEffects {
+        effects: Arc<CreateEffects>,
+        published: MvRefreshPublicationFinalizationFacts,
+    }
+
+    impl MvRefreshExecutionPort for RefreshExecutionEffects {
+        fn execute_refresh(
+            self: Box<Self>,
             _target: &MvTarget,
-            _published: &MvRefreshPublicationFinalizationFacts,
+            _attempt: &crate::product::MvRefreshAttemptIdentity,
+        ) -> Result<Box<dyn MvRefreshKnownCommittedPort>, MvProviderFailure> {
+            Ok(Box::new(KnownCommittedEffects {
+                effects: self.effects,
+                published: self.published,
+            }))
+        }
+    }
+
+    impl MvRefreshKnownCommittedPort for KnownCommittedEffects {
+        fn finalization_facts(&self) -> &MvRefreshPublicationFinalizationFacts {
+            &self.published
+        }
+
+        fn project_known_committed(
+            self: Box<Self>,
+            _target: &MvTarget,
         ) -> Result<(), MvProviderFailure> {
-            self.record("project_known_committed");
-            if self.fail_known_committed_projection {
+            self.effects.record("project_known_committed");
+            if self.effects.fail_known_committed_projection {
                 return Err(MvProviderFailure::new(
                     MvProviderFailureKind::Unavailable,
                     "known-committed projection failed",
@@ -541,6 +569,16 @@ mod tests {
             .expect("publication version"),
         )
         .expect("published facts")
+    }
+
+    fn service_with_refresh_readiness() -> MvProductService {
+        MvProductService::new_with_readiness(
+            MvSchedulerConfig::default(),
+            MvReadinessService::new(
+                Arc::new(InMemoryMvRepository::default()),
+                Arc::<ProcessRuntime<MvTarget, LakePublicationId>>::default(),
+            ),
+        )
     }
 
     impl MvDropProjectionPort for CreateEffects {
@@ -698,14 +736,21 @@ mod tests {
 
     #[test]
     fn known_committed_refresh_projection_is_product_finalization() {
-        let service = MvProductService::default();
-        let effects = CreateEffects::default();
+        let service = service_with_refresh_readiness();
+        let effects = Arc::new(CreateEffects::default());
         let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
         let attempt = service.reserve_refresh_attempt();
         let published = finalization_facts(&target, &attempt);
 
         let result = service
-            .finalize_known_committed_refresh(&target, &attempt, &published, &effects)
+            .execute_refresh(
+                &target,
+                &attempt,
+                Box::new(RefreshExecutionEffects {
+                    effects: Arc::clone(&effects),
+                    published,
+                }),
+            )
             .expect("projection succeeds");
 
         assert!(matches!(result, MvProductResult::Acknowledged));
@@ -714,15 +759,22 @@ mod tests {
 
     #[test]
     fn known_committed_refresh_rejects_a_different_publication_before_projection() {
-        let service = MvProductService::default();
-        let effects = CreateEffects::default();
+        let service = service_with_refresh_readiness();
+        let effects = Arc::new(CreateEffects::default());
         let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
         let attempt = service.reserve_refresh_attempt();
         let other_attempt = service.reserve_refresh_attempt();
         let published = finalization_facts(&target, &other_attempt);
 
         let error = service
-            .finalize_known_committed_refresh(&target, &attempt, &published, &effects)
+            .execute_refresh(
+                &target,
+                &attempt,
+                Box::new(RefreshExecutionEffects {
+                    effects: Arc::clone(&effects),
+                    published,
+                }),
+            )
             .expect_err("different publication identity must be rejected");
 
         assert_eq!(error.kind(), MvProductErrorKind::Corruption);
@@ -756,17 +808,24 @@ mod tests {
 
     #[test]
     fn known_committed_refresh_keeps_external_commit_when_projection_fails() {
-        let service = MvProductService::default();
-        let effects = CreateEffects {
+        let service = service_with_refresh_readiness();
+        let effects = Arc::new(CreateEffects {
             fail_known_committed_projection: true,
             ..Default::default()
-        };
+        });
         let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
         let attempt = service.reserve_refresh_attempt();
         let published = finalization_facts(&target, &attempt);
 
         let error = service
-            .finalize_known_committed_refresh(&target, &attempt, &published, &effects)
+            .execute_refresh(
+                &target,
+                &attempt,
+                Box::new(RefreshExecutionEffects {
+                    effects: Arc::clone(&effects),
+                    published,
+                }),
+            )
             .expect_err("projection finalization fails");
 
         assert_eq!(
