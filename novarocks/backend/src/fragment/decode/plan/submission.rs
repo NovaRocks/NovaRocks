@@ -272,7 +272,10 @@ mod tests {
     fn decode_request(
         fragment: plan::PlanFragment,
         params: proto::InstanceParams,
-    ) -> Result<NativeFragmentRequest, crate::fragment::ingress::NativeFragmentIngressError> {
+    ) -> Result<
+        NativeFragmentRequest,
+        novarocks_native_adapter::fragment_ingress_error::NativeFragmentIngressError,
+    > {
         let query_id = params.query_id.as_ref().expect("test query id");
         NativeFragmentRequest::try_decode(
             QueryExecutionId::new(
@@ -297,9 +300,12 @@ mod tests {
     }
 
     fn expect_request_error(
-        result: Result<NativeFragmentRequest, crate::fragment::ingress::NativeFragmentIngressError>,
+        result: Result<
+            NativeFragmentRequest,
+            novarocks_native_adapter::fragment_ingress_error::NativeFragmentIngressError,
+        >,
         message: &str,
-    ) -> crate::fragment::ingress::NativeFragmentIngressError {
+    ) -> novarocks_native_adapter::fragment_ingress_error::NativeFragmentIngressError {
         match result {
             Ok(_) => panic!("{message}"),
             Err(error) => error,

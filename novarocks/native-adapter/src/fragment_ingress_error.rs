@@ -21,12 +21,12 @@ use std::fmt;
 
 /// Why a fragment could not be recovered from its wire form.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NativeFragmentIngressError {
+pub struct NativeFragmentIngressError {
     message: String,
 }
 
 impl NativeFragmentIngressError {
-    pub(crate) fn new(error: impl fmt::Display) -> Self {
+    pub fn new(error: impl fmt::Display) -> Self {
         Self {
             message: error.to_string(),
         }

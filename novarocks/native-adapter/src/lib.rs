@@ -35,6 +35,7 @@ pub mod exchange_data_plane;
 pub mod exchange_transmitter;
 pub mod fragment_error;
 pub mod fragment_expression;
+pub mod fragment_ingress_error;
 pub mod fragment_instance;
 pub mod fragment_layout;
 pub mod fragment_plan_node;

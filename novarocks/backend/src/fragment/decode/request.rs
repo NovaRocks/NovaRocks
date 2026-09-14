@@ -31,7 +31,7 @@ use novarocks_proto_codec::lifecycle::decode_query_execution_id;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_types::{QueryExecutionId, QueryId, UniqueId};
 
-use crate::fragment::ingress::NativeFragmentIngressError;
+use novarocks_native_adapter::fragment_ingress_error::NativeFragmentIngressError;
 
 use super::plan::submission::decode_fragment_submission;
 use novarocks_native_adapter::fragment_instance::{
