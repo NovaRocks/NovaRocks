@@ -26,6 +26,7 @@ pub mod backend_test_support;
 pub mod catalog_prune_rpc;
 pub mod connector_blocking_io;
 pub mod debug_environment;
+pub mod descriptor_snapshot;
 pub mod exchange_data_plane;
 pub mod exchange_transmitter;
 pub mod fragment_error;
