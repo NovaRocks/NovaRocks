@@ -45,7 +45,7 @@ pub mod query_catalog;
 pub mod query_materializer;
 pub mod resolver;
 pub mod statement;
-pub mod virtual_table;
+pub mod system_catalog_facts;
 
 /// Frontend's narrow best-effort observation of its MV accelerator state.
 pub struct MvCatalogReferenceReader;

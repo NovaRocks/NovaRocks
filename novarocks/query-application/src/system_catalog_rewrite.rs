@@ -15,17 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! information_schema AST rewriter for standalone queries.
+//! Query-application-owned information_schema AST rewriter.
 //!
 //! StarRocks exposes information_schema tables (`schemata`, `tables`, ...) as
-//! real tables on the FE side. NovaRocks standalone delegates their schema and
-//! row materialization to the frontend-injected `SystemCatalog` port.
+//! real tables on the FE side. NovaRocks delegates their schema and row
+//! materialization to query-application ports.
 //!
 //! The rewriter replaces system-table references with VALUES-backed derived
 //! tables, which the standard SQL pipeline handles like ordinary relations.
-
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -35,12 +32,46 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_parser::{Span, ast};
 
-use crate::catalog_application::query_catalog::QueryCatalogService;
-use novarocks_query_application::system_catalog::{SystemCatalog, SystemCatalogInputs};
-use novarocks_spi::connector::ConnectorControlRegistry;
+use crate::system_catalog::{SystemCatalog, SystemCatalogInputs};
 use novarocks_types::schema::ColumnDef;
 
-pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
+pub const INFORMATION_SCHEMA_DB: &str = "information_schema";
+
+/// Immutable catalog names gathered by a role-local reader for one virtual
+/// table materialization. Query application owns how the names become SQL
+/// rows; role adapters own connector admission and metadata transport.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SystemCatalogFacts {
+    pub catalog_name: String,
+    pub schema_names: Vec<String>,
+    pub table_names: Vec<(String, String)>,
+}
+
+impl SystemCatalogFacts {
+    fn inputs(&self) -> SystemCatalogInputs<'_> {
+        SystemCatalogInputs {
+            catalog_name: &self.catalog_name,
+            schema_names: &self.schema_names,
+            table_names: &self.table_names,
+        }
+    }
+}
+
+/// Role-local source of catalog names needed by `information_schema`.
+///
+/// A successful external lookup is already admitted against one exact
+/// connector generation. `None` deliberately preserves downstream unknown
+/// catalog resolution instead of allowing the virtual-table path to invent a
+/// catalog error.
+pub trait SystemCatalogFactsPort: Send + Sync {
+    fn local_system_catalog_facts(&self) -> Result<SystemCatalogFacts, String>;
+
+    fn external_system_catalog_facts(
+        &self,
+        catalog_name: &str,
+        include_table_names: bool,
+    ) -> Result<Option<SystemCatalogFacts>, String>;
+}
 
 // ---------------------------------------------------------------------------
 // AST rewriter: substitute virtual-table refs with a VALUES derived table.
@@ -61,87 +92,47 @@ pub(crate) const INFORMATION_SCHEMA_DB: &str = "information_schema";
 /// Walk a query AST and replace virtual-table references with VALUES-backed
 /// derived tables. Returns `Ok(())` even when no virtual tables are matched.
 ///
-/// The three ports are taken individually because this rewrite is read-only
-/// system-table materialization: it needs the local catalog snapshot for
-/// default-catalog schema names, exact connector control for external
-/// namespace facts, and the injected system catalog for row production.
+/// The facts port is role-local and read-only; it exposes neither a Frontend
+/// aggregate nor catalog-control capability to the query application.
 pub fn rewrite_query(
-    catalog_service: &QueryCatalogService,
-    connector_control: &dyn ConnectorControlRegistry,
+    facts_port: &dyn SystemCatalogFactsPort,
     system_catalog: &dyn SystemCatalog,
     query: &mut ast::Query,
 ) -> Result<(), String> {
-    rewrite_query_inner(catalog_service, connector_control, system_catalog, query)
+    rewrite_query_inner(facts_port, system_catalog, query)
 }
 
 fn rewrite_query_inner(
-    catalog_service: &QueryCatalogService,
-    connector_control: &dyn ConnectorControlRegistry,
+    facts_port: &dyn SystemCatalogFactsPort,
     system_catalog: &dyn SystemCatalog,
     query: &mut ast::Query,
 ) -> Result<(), String> {
     if let Some(with_clause) = query.with.as_mut() {
         for cte in with_clause.ctes.iter_mut() {
-            rewrite_query_inner(
-                catalog_service,
-                connector_control,
-                system_catalog,
-                cte.query.as_mut(),
-            )?;
+            rewrite_query_inner(facts_port, system_catalog, cte.query.as_mut())?;
         }
     }
-    rewrite_set_expr(
-        catalog_service,
-        connector_control,
-        system_catalog,
-        query.body.as_mut(),
-    )
+    rewrite_set_expr(facts_port, system_catalog, query.body.as_mut())
 }
 
 fn rewrite_set_expr(
-    catalog_service: &QueryCatalogService,
-    connector_control: &dyn ConnectorControlRegistry,
+    facts_port: &dyn SystemCatalogFactsPort,
     system_catalog: &dyn SystemCatalog,
     expr: &mut ast::SetExpr,
 ) -> Result<(), String> {
     match expr {
         ast::SetExpr::Select(select) => {
             for twj in select.from.iter_mut() {
-                rewrite_table_factor(
-                    catalog_service,
-                    connector_control,
-                    system_catalog,
-                    &mut twj.relation,
-                )?;
+                rewrite_table_factor(facts_port, system_catalog, &mut twj.relation)?;
                 for join in twj.joins.iter_mut() {
-                    rewrite_table_factor(
-                        catalog_service,
-                        connector_control,
-                        system_catalog,
-                        &mut join.relation,
-                    )?;
+                    rewrite_table_factor(facts_port, system_catalog, &mut join.relation)?;
                 }
             }
         }
-        ast::SetExpr::Query(q) => rewrite_query_inner(
-            catalog_service,
-            connector_control,
-            system_catalog,
-            q.as_mut(),
-        )?,
+        ast::SetExpr::Query(q) => rewrite_query_inner(facts_port, system_catalog, q.as_mut())?,
         ast::SetExpr::SetOperation(operation) => {
-            rewrite_set_expr(
-                catalog_service,
-                connector_control,
-                system_catalog,
-                operation.left.as_mut(),
-            )?;
-            rewrite_set_expr(
-                catalog_service,
-                connector_control,
-                system_catalog,
-                operation.right.as_mut(),
-            )?;
+            rewrite_set_expr(facts_port, system_catalog, operation.left.as_mut())?;
+            rewrite_set_expr(facts_port, system_catalog, operation.right.as_mut())?;
         }
         _ => {}
     }
@@ -149,8 +140,7 @@ fn rewrite_set_expr(
 }
 
 fn rewrite_table_factor(
-    catalog_service: &QueryCatalogService,
-    connector_control: &dyn ConnectorControlRegistry,
+    facts_port: &dyn SystemCatalogFactsPort,
     system_catalog: &dyn SystemCatalog,
     factor: &mut ast::TableFactor,
 ) -> Result<(), String> {
@@ -160,8 +150,7 @@ fn rewrite_table_factor(
             // Recognize 2-part `information_schema.X` and 3-part
             // `<catalog>.information_schema.X`.
             //
-            // For `default_catalog` (the local catalog), we look up the provider
-            // in the registry and scan it against the local InMemoryCatalog.
+            // For `default_catalog`, the role adapter snapshots local names.
             //
             // For any other 3-part name with an admitted external connector,
             // intercept `information_schema.{schemata,tables}` through its exact
@@ -180,74 +169,23 @@ fn rewrite_table_factor(
                         && (tbl.eq_ignore_ascii_case("schemata")
                             || tbl.eq_ignore_ascii_case("tables")) =>
                 {
-                    // External catalog 3-part name:
-                    // `<cat>.information_schema.{schemata,tables}`. Unknown
-                    // catalogs remain untouched so downstream resolution
-                    // preserves its normal error. Every successful admission
-                    // keeps one lease for the complete lookup.
-                    let context = crate::connector::connector_request_context(
-                        None,
-                        Arc::new(AtomicBool::new(false)),
-                    )?;
-                    match crate::connector::acquire_metadata_planning_lease(connector_control, cat)
-                    {
-                        Ok(lease) => {
-                            // Both listings must come from the same admitted
-                            // generation, so the lease is shared rather than
-                            // re-acquired between them.
-                            let listing_lease = lease.clone();
-                            let namespaces =
-                                crate::connector::metadata_list_namespaces_with_planning_lease(
-                                    lease, context,
-                                )?;
-                            let mut databases = namespaces
-                                .into_iter()
-                                .map(|namespace| namespace.namespace.to_string())
-                                .collect::<Vec<_>>();
-                            databases.sort();
-                            databases.dedup();
-                            // Enumerating tables is one catalog read per
-                            // namespace, so only the provider that needs them
-                            // pays for it.
-                            let mut table_names: Vec<(String, String)> = Vec::new();
-                            if tbl.eq_ignore_ascii_case("tables") {
-                                for database in &databases {
-                                    let context = crate::connector::connector_request_context(
-                                        None,
-                                        Arc::new(AtomicBool::new(false)),
-                                    )?;
-                                    let tables =
-                                        crate::connector::metadata_list_tables_with_planning_lease(
-                                            &listing_lease,
-                                            context,
-                                            database,
-                                        )?;
-                                    table_names.extend(
-                                        tables.into_iter().map(|table| (database.clone(), table)),
-                                    );
-                                }
-                            }
-                            let inputs = SystemCatalogInputs {
-                                catalog_name: cat,
-                                schema_names: &databases,
-                                table_names: &table_names,
-                            };
-                            let Some(data) =
-                                system_catalog.resolve(INFORMATION_SCHEMA_DB, tbl, &inputs)?
-                            else {
-                                return Ok(());
-                            };
-                            let tbl_name = tbl.clone();
-                            let alias = alias.take().unwrap_or_else(|| table_alias(&tbl_name));
-                            *factor = derived_values_factor(&data.columns, &data.batches, alias)?;
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            // Unknown catalog — leave untouched; downstream will produce
-                            // a proper "unknown catalog" error.
-                            return Ok(());
-                        }
-                    }
+                    // The adapter preserves normal unknown-catalog resolution
+                    // by returning None and keeps exact connector admission
+                    // outside this application domain.
+                    let Some(facts) = facts_port
+                        .external_system_catalog_facts(cat, tbl.eq_ignore_ascii_case("tables"))?
+                    else {
+                        return Ok(());
+                    };
+                    let inputs = facts.inputs();
+                    let Some(data) = system_catalog.resolve(INFORMATION_SCHEMA_DB, tbl, &inputs)?
+                    else {
+                        return Ok(());
+                    };
+                    let tbl_name = tbl.clone();
+                    let alias = alias.take().unwrap_or_else(|| table_alias(&tbl_name));
+                    *factor = derived_values_factor(&data.columns, &data.batches, alias)?;
+                    return Ok(());
                 }
                 _ => None,
             };
@@ -259,23 +197,8 @@ fn rewrite_table_factor(
             if !db.eq_ignore_ascii_case(INFORMATION_SCHEMA_DB) {
                 return Ok(());
             }
-            let mut schema_names: Vec<String> = {
-                let catalog = catalog_service
-                    .local()
-                    .read()
-                    .expect("standalone catalog read lock");
-                catalog.database_names().map(str::to_string).collect()
-            };
-            schema_names.sort();
-            schema_names.dedup();
-            let inputs = SystemCatalogInputs {
-                catalog_name: "default_catalog",
-                schema_names: &schema_names,
-                // The local catalog's table listing is not wired here yet; the
-                // hole this closes is on external catalogs, where DROP DATABASE
-                // FORCE is the only way to remove a non-empty namespace.
-                table_names: &[],
-            };
+            let facts = facts_port.local_system_catalog_facts()?;
+            let inputs = facts.inputs();
             let Some(data) = system_catalog.resolve(&db, &tbl, &inputs)? else {
                 return Ok(());
             };
@@ -284,28 +207,15 @@ fn rewrite_table_factor(
             *factor = derived_values_factor(&data.columns, &data.batches, alias)?;
             Ok(())
         }
-        ast::TableFactor::Derived { subquery, .. } => rewrite_query_inner(
-            catalog_service,
-            connector_control,
-            system_catalog,
-            subquery.as_mut(),
-        ),
+        ast::TableFactor::Derived { subquery, .. } => {
+            rewrite_query_inner(facts_port, system_catalog, subquery.as_mut())
+        }
         ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            rewrite_table_factor(
-                catalog_service,
-                connector_control,
-                system_catalog,
-                &mut table_with_joins.relation,
-            )?;
+            rewrite_table_factor(facts_port, system_catalog, &mut table_with_joins.relation)?;
             for join in table_with_joins.joins.iter_mut() {
-                rewrite_table_factor(
-                    catalog_service,
-                    connector_control,
-                    system_catalog,
-                    &mut join.relation,
-                )?;
+                rewrite_table_factor(facts_port, system_catalog, &mut join.relation)?;
             }
             Ok(())
         }
@@ -524,4 +434,130 @@ fn literal_expr(kind: ast::LiteralKind) -> ast::Expr {
         kind,
         span: Span::new(0, 0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::system_catalog::SystemCatalogService;
+
+    struct Facts {
+        external_requests: Mutex<Vec<(String, bool)>>,
+        external: Option<SystemCatalogFacts>,
+    }
+
+    impl Facts {
+        fn local() -> Self {
+            Self {
+                external_requests: Mutex::new(Vec::new()),
+                external: None,
+            }
+        }
+
+        fn external() -> Self {
+            Self {
+                external_requests: Mutex::new(Vec::new()),
+                external: Some(SystemCatalogFacts {
+                    catalog_name: "ice".to_string(),
+                    schema_names: vec!["warehouse".to_string()],
+                    table_names: vec![("warehouse".to_string(), "orders".to_string())],
+                }),
+            }
+        }
+    }
+
+    impl SystemCatalogFactsPort for Facts {
+        fn local_system_catalog_facts(&self) -> Result<SystemCatalogFacts, String> {
+            Ok(SystemCatalogFacts {
+                catalog_name: "default_catalog".to_string(),
+                schema_names: vec!["default".to_string()],
+                table_names: Vec::new(),
+            })
+        }
+
+        fn external_system_catalog_facts(
+            &self,
+            catalog_name: &str,
+            include_table_names: bool,
+        ) -> Result<Option<SystemCatalogFacts>, String> {
+            self.external_requests
+                .lock()
+                .expect("external requests lock")
+                .push((catalog_name.to_string(), include_table_names));
+            Ok(self.external.clone())
+        }
+    }
+
+    fn parsed_query(sql: &str) -> ast::Query {
+        let mut statements = novarocks_parser::parse(sql).expect("parse query");
+        let ast::Statement::Query(query) = statements.remove(0) else {
+            panic!("expected query");
+        };
+        query
+    }
+
+    fn first_factor(query: &ast::Query) -> &ast::TableFactor {
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        &select.from[0].relation
+    }
+
+    #[test]
+    fn rewrites_local_schemata_from_read_only_facts() {
+        let facts = Facts::local();
+        let catalog = SystemCatalogService::with_defaults();
+        let mut query = parsed_query("SELECT schema_name FROM information_schema.schemata");
+
+        rewrite_query(&facts, &catalog, &mut query).expect("rewrite query");
+
+        assert!(matches!(
+            first_factor(&query),
+            ast::TableFactor::Derived { .. }
+        ));
+        assert!(
+            facts
+                .external_requests
+                .lock()
+                .expect("external requests lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn external_tables_request_table_names_once_through_facts_port() {
+        let facts = Facts::external();
+        let catalog = SystemCatalogService::with_defaults();
+        let mut query = parsed_query("SELECT table_name FROM ice.information_schema.tables");
+
+        rewrite_query(&facts, &catalog, &mut query).expect("rewrite query");
+
+        assert!(matches!(
+            first_factor(&query),
+            ast::TableFactor::Derived { .. }
+        ));
+        assert_eq!(
+            *facts
+                .external_requests
+                .lock()
+                .expect("external requests lock"),
+            vec![("ice".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn unknown_external_catalog_remains_for_normal_resolution() {
+        let facts = Facts::local();
+        let catalog = SystemCatalogService::with_defaults();
+        let mut query = parsed_query("SELECT schema_name FROM missing.information_schema.schemata");
+
+        rewrite_query(&facts, &catalog, &mut query).expect("rewrite query");
+
+        assert!(matches!(
+            first_factor(&query),
+            ast::TableFactor::Table { .. }
+        ));
+    }
 }

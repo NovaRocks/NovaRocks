@@ -59,6 +59,7 @@ pub mod statement_effect;
 
 /// Read-only `information_schema` materialization contracts and providers.
 pub mod system_catalog;
+pub mod system_catalog_rewrite;
 
 /// SQL source parsing and statement-shape admission owned by the query
 /// application before role adapters route a statement to a product consumer.

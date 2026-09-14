@@ -136,8 +136,12 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.view_service,
     );
     let system_tables = domain::SystemTableQueryKernel::new(
-        ports.catalog_service,
-        ports.connector_control,
+        Arc::new(
+            crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts::new(
+                ports.catalog_service,
+                ports.connector_control,
+            ),
+        ),
         ports.system_catalog,
         Arc::clone(&ports.mv_readiness),
     );

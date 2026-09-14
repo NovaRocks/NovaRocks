@@ -38,6 +38,7 @@ use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::sql::catalog::SessionCatalogPort;
 use novarocks_query_application::system_catalog::SystemCatalog;
+use novarocks_query_application::system_catalog_rewrite::SystemCatalogFactsPort;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
 
@@ -67,35 +68,26 @@ pub struct QueryPreparationKernel {
 /// or MV mutation capability.
 #[derive(Clone)]
 pub struct SystemTableQueryKernel {
-    catalog_service: Arc<QueryCatalogService>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
+    facts_port: Arc<dyn SystemCatalogFactsPort>,
     system_catalog: Arc<dyn SystemCatalog>,
     mv_readiness: Arc<MvReadinessPort>,
 }
 
 impl SystemTableQueryKernel {
     pub fn new(
-        catalog_service: Arc<QueryCatalogService>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
+        facts_port: Arc<dyn SystemCatalogFactsPort>,
         system_catalog: Arc<dyn SystemCatalog>,
         mv_readiness: Arc<MvReadinessPort>,
     ) -> Self {
         Self {
-            catalog_service,
-            connector_control,
+            facts_port,
             system_catalog,
             mv_readiness,
         }
     }
 
-    // System-table materialization takes these ports one by one, so the caller
-    // that owns the kernel reads them and hands Core exactly what it needs.
-    pub fn catalog_service(&self) -> &Arc<QueryCatalogService> {
-        &self.catalog_service
-    }
-
-    pub fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
-        &self.connector_control
+    pub fn facts_port(&self) -> &Arc<dyn SystemCatalogFactsPort> {
+        &self.facts_port
     }
 
     pub fn system_catalog(&self) -> &Arc<dyn SystemCatalog> {

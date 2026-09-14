@@ -1122,9 +1122,8 @@ impl TestQueryCompiler {
                         connector_context: Some(&connector_context),
                     },
                 )?;
-                crate::catalog_application::virtual_table::rewrite_query(
-                    self.system_tables.catalog_service(),
-                    self.system_tables.connector_control().as_ref(),
+                novarocks_query_application::system_catalog_rewrite::rewrite_query(
+                    self.system_tables.facts_port().as_ref(),
                     self.system_tables.system_catalog().as_ref(),
                     &mut prepared,
                 )?;

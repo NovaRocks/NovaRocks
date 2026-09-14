@@ -25,7 +25,6 @@ use crate::catalog_application::query_materializer::{
     build_catalog_service_provider,
     build_catalog_service_provider_with_bindings_and_query_local_overlays,
 };
-use crate::catalog_application::virtual_table;
 use crate::common::admitted_query_context::{
     QueryExecutionContext, RequestContext, StatementAdmissionContext,
 };
@@ -577,9 +576,8 @@ impl FrontendQueryCompiler {
             current_database,
             connector_context,
         )?;
-        virtual_table::rewrite_query(
-            self.system_tables.catalog_service(),
-            self.system_tables.connector_control().as_ref(),
+        novarocks_query_application::system_catalog_rewrite::rewrite_query(
+            self.system_tables.facts_port().as_ref(),
             self.system_tables.system_catalog().as_ref(),
             &mut prepared,
         )?;
