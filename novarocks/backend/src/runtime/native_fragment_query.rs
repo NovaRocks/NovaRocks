@@ -190,18 +190,6 @@ impl NativeFragmentQueryRuntime {
         Ok(lease)
     }
 
-    pub fn cancel_execution(
-        &self,
-        execution_id: QueryExecutionId,
-        reason: String,
-    ) -> Vec<UniqueId> {
-        let cancelled = self
-            .manager
-            .cancel_query_execution(execution_key(execution_id), reason);
-        self.publish_resource_snapshot();
-        cancelled
-    }
-
     /// Returns the read-only cancellation capability that must be passed into
     /// backend-owned connector-read decode. The decoder never receives the
     /// query manager itself.
