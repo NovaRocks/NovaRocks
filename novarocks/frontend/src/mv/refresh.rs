@@ -59,7 +59,7 @@ pub(super) fn execute(
     if matches!(refresh.work, PreparedMvRefreshWork::NoOp) {
         return Ok(MvStatementResult::Ok);
     }
-    let target = crate::mv::domain::repository::MvTarget {
+    let target = novarocks_sql::planning::mv::SqlMvTarget {
         catalog: refresh.finalize.target.catalog.clone(),
         database: refresh.finalize.target.database.clone(),
         name: refresh.finalize.target.name.clone(),

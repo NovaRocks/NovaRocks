@@ -27,12 +27,13 @@ use crate::mv::domain::application::{
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
-use crate::mv::domain::model::{MvStorageEngine, MvTarget};
+use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 use novarocks_parser::ast::Visit;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_types::naming::normalize_identifier;
 
 fn default_mv_storage_engine() -> &'static str {

@@ -429,7 +429,7 @@ fn clear_sqlite_and_rebuild_from_lake(
 ) -> Result<(), String> {
     // 1. Confirm the SQLite definition currently exists; the round-trip is only
     //    meaningful if there is a cached record to clear.
-    let target = crate::mv::domain::model::MvTarget {
+    let target = novarocks_sql::planning::mv::SqlMvTarget {
         catalog: Some(package.table.instance_id.as_str().to_string()),
         database: package.table.namespace.to_string(),
         name: package.table.table.to_string(),

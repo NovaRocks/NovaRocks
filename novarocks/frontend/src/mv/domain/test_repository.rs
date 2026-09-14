@@ -29,9 +29,10 @@ use super::persistence::definition::StoredMvDefinition;
 use super::persistence::dependency::StoredMvDependency;
 use super::repository::{
     DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
-    MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTarget,
+    MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
     ReplaceMvProjectionRequest,
 };
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 #[derive(Default)]
 pub struct InMemoryMvRepository {

@@ -14,11 +14,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::mv::domain::accelerator::projection_from_lake;
-use crate::mv::domain::model::MvTarget;
 use crate::mv::domain::repository::{
     MvRepository, MvRepositoryError, MvRepositoryErrorKind, ReplaceMvProjectionRequest,
 };
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 pub(crate) struct MvAcceleratorProjector {
     repository: Arc<dyn MvRepository>,

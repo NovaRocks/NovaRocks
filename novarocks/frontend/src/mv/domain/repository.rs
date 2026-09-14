@@ -29,13 +29,13 @@ use novarocks_state_store_api::VersionToken;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub use crate::mv::domain::model::MvTarget;
 use crate::mv::domain::persistence::definition::{
     CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
     StoredMvDefinition,
 };
 pub use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::dependency::StoredMvDependency;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvRepositoryErrorKind {

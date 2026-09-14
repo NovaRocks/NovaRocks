@@ -193,7 +193,7 @@ impl FrontendMvService {
         &self,
         preparation: &dyn MvRefreshPreparationService,
         statement: novarocks_sql::planning::mv::MvRefreshStatement,
-        target: crate::mv::domain::repository::MvTarget,
+        target: novarocks_sql::planning::mv::SqlMvTarget,
         owner: MvActivityOwner,
         connector_context: ConnectorRequestContext,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
@@ -226,7 +226,7 @@ impl FrontendMvService {
     /// remains the authority while the statement waits for its turn.
     pub(crate) fn execute_serialized<T>(
         &self,
-        target: &crate::mv::domain::repository::MvTarget,
+        target: &novarocks_sql::planning::mv::SqlMvTarget,
         owner: MvActivityOwner,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
         action: impl FnOnce() -> Result<T, String>,
@@ -239,7 +239,7 @@ impl FrontendMvService {
 
     fn acquire_activity_lease(
         &self,
-        target: &crate::mv::domain::repository::MvTarget,
+        target: &novarocks_sql::planning::mv::SqlMvTarget,
         owner: MvActivityOwner,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvActivityLease, MvApplicationError> {
@@ -596,7 +596,7 @@ fn execute_scheduled_refresh(
 /// production builds do not inspect this environment variable.
 #[cfg(debug_assertions)]
 fn scheduled_refresh_test_barrier(
-    target: &crate::mv::domain::repository::MvTarget,
+    target: &novarocks_sql::planning::mv::SqlMvTarget,
     cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
 ) -> bool {
     let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR") else {
@@ -617,7 +617,7 @@ fn scheduled_refresh_test_barrier(
 
 #[cfg(not(debug_assertions))]
 fn scheduled_refresh_test_barrier(
-    _target: &crate::mv::domain::repository::MvTarget,
+    _target: &novarocks_sql::planning::mv::SqlMvTarget,
     _cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
 ) -> bool {
     false

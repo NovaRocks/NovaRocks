@@ -489,7 +489,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing_verified(
     // accepting a mismatch would let a restart reinterpret user SQL under a
     // different frozen context.
     let existing = readiness
-        .load_ready(&crate::mv::domain::model::MvTarget {
+        .load_ready(&novarocks_sql::planning::mv::SqlMvTarget {
             catalog: Some(package.table.instance_id.as_str().to_string()),
             database: package.table.namespace.to_string(),
             name: package.table.table.to_string(),

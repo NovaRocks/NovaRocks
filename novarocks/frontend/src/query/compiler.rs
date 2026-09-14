@@ -104,7 +104,7 @@ fn reject_quarantined_mv_targets(
     for (_, binding) in bindings.captured_bindings() {
         let identity =
             novarocks_sql::planning::catalog::materialization_identity_facts(&binding.resolved);
-        let target = crate::mv::domain::model::MvTarget {
+        let target = novarocks_sql::planning::mv::SqlMvTarget {
             catalog: Some(identity.catalog().to_string()),
             database: identity.namespace().to_string(),
             name: identity.table().to_string(),

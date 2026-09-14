@@ -24,8 +24,8 @@ use std::fmt;
 use crate::mv::domain::application::{
     MvCreateStatement, MvDropStatement, MvRefreshRequest, MvShowStatement,
 };
-use crate::mv::domain::model::MvTarget;
 use crate::mv::domain::refresh::planning::RefreshPlanContract;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 #[derive(Clone)]
 pub struct CreateMvRequest {

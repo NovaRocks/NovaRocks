@@ -20,13 +20,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::mv::domain::repository::MvTarget;
 use crate::query_execution::maintenance::TableMaintenanceEngine;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, PreparedMvRefresh,
 };
 use novarocks_mv_application::maintenance::{MvBackgroundEngineError, MvMaintenanceFacts};
 use novarocks_spi::connector::ConnectorRequestContext;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_table_maintenance::MaintenanceTarget;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

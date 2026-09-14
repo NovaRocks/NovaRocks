@@ -19,10 +19,11 @@ use crate::mv::domain::dependency::graph::topological_upstream_order_for_edges;
 use crate::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use crate::mv::domain::model::{MvStorageEngine, MvTarget};
+use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::dependency::stored_definition_dependency_ref;
 use crate::mv::domain::readiness::MvReadinessPort;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvRefreshDependencyStep {

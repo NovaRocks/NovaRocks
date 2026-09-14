@@ -28,7 +28,7 @@ use crate::mv::domain::persistence::definition::{
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::repository::{
     DeleteMvProjectionRequest, InitialMvRefreshConfiguration, MvProjectionRequest,
-    MvPublishedProjection, MvPublishedWaterline, MvRepository, MvRepositoryErrorKind, MvTarget,
+    MvPublishedProjection, MvPublishedWaterline, MvRepository, MvRepositoryErrorKind,
     ReplaceMvProjectionRequest,
 };
 use crate::state_store::testing as state_store_fixture;
@@ -37,6 +37,7 @@ use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
 use novarocks_state_store_runtime::{StateStoreHost, StateStoreRunPolicy};
 

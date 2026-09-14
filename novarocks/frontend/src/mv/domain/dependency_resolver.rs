@@ -79,7 +79,7 @@ pub(crate) fn resolve_create_mv_dependencies_with_readiness(
                 table,
             } => {
                 let is_mv_dependency = readiness
-                    .load_ready(&crate::mv::domain::model::MvTarget {
+                    .load_ready(&novarocks_sql::planning::mv::SqlMvTarget {
                         catalog: Some(catalog.clone()),
                         database: namespace.clone(),
                         name: table.clone(),

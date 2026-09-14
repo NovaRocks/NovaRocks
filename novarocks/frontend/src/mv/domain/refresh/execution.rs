@@ -17,9 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget};
+use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine};
 use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
 use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_types::naming::TableIdentity;
 
 #[allow(
@@ -242,10 +243,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget};
+    use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine};
     use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
     use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
     use novarocks_spi::connector::ConnectorTableObjectId;
+    use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
     use novarocks_types::naming::TableIdentity;
 
     fn object_id(value: &str) -> ConnectorTableObjectId {

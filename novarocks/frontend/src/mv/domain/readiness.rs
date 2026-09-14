@@ -24,10 +24,11 @@ use crate::mv::domain::persistence::dependency::StoredMvDependency;
 use crate::mv::domain::projector::MvAcceleratorProjector;
 use crate::mv::domain::repository::{
     DeleteMvProjectionRequest, LoadedMvProjection, MvRepository, MvRepositoryError,
-    MvRepositoryErrorKind, MvTarget,
+    MvRepositoryErrorKind,
 };
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
 use novarocks_spi::connector::LakePublicationId;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 /// The synchronous face of an asynchronous MV projection store.
 ///

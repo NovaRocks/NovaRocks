@@ -58,10 +58,6 @@ impl MvStorageEngine {
     }
 }
 
-/// Compatibility path for the SQL-owned target identity. Application model
-/// and repository users retain this import while lifecycle adapters migrate.
-pub use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshMode {
     Noop,

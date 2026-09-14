@@ -28,12 +28,13 @@ use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredM
 use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::{
-    MvPublishedProjection, MvPublishedWaterline, MvRepositoryError, MvTarget,
+    MvPublishedProjection, MvPublishedWaterline, MvRepositoryError,
 };
 use novarocks_mv_application::{
     scheduler::MvSchedulerConfig,
     scheduler_runtime::{MvRefreshDisposition, MvRefreshProductRuntime, MvRefreshRuntimeDecision},
 };
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 pub(crate) type ScheduledRefreshDisposition = MvRefreshDisposition;
 pub(crate) type ScheduledRefreshRuntimeDecision = MvRefreshRuntimeDecision;

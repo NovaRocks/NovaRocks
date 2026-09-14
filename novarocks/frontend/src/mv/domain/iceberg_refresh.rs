@@ -48,7 +48,7 @@ use crate::mv::domain::dependency::model::{MvDependencyObjectType, MvDependencyS
 use crate::mv::domain::lifecycle::{
     BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
-use crate::mv::domain::model::{MvStorageEngine, MvTarget, RefreshMode};
+use crate::mv::domain::model::{MvStorageEngine, RefreshMode};
 use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
@@ -120,6 +120,7 @@ use novarocks_spi::connector::{
 use novarocks_sql::planning::mv::FULL_REFRESH_DISABLED_MESSAGE;
 #[cfg(test)]
 use novarocks_sql::planning::mv::MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_sql::planning::mv::UnionBranchKind;
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
@@ -5945,7 +5946,7 @@ fn drop_iceberg_mv_metadata_with_readiness(
     readiness: &MvReadinessPort,
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
-    let target = crate::mv::domain::model::MvTarget {
+    let target = novarocks_sql::planning::mv::SqlMvTarget {
         catalog: Some(target.catalog.clone()),
         database: target.namespace.clone(),
         name: target.table.clone(),
@@ -5970,7 +5971,7 @@ fn preflight_iceberg_mv_drop_with_readiness(
     if_exists: bool,
 ) -> Result<bool, String> {
     let Some(_) = readiness
-        .load_ready(&crate::mv::domain::model::MvTarget {
+        .load_ready(&novarocks_sql::planning::mv::SqlMvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
             name: target.table.clone(),

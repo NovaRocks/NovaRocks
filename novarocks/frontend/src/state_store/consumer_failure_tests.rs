@@ -47,7 +47,7 @@ use crate::mv::domain::persistence::definition::{
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::repository::{
     InitialMvRefreshConfiguration, MvProjectionRequest, MvPublishedProjection,
-    MvPublishedWaterline, MvRepository, MvRepositoryErrorKind, MvTarget,
+    MvPublishedWaterline, MvRepository, MvRepositoryErrorKind,
 };
 use crate::mv::repository::StateStoreMvRepository;
 use async_trait::async_trait;
@@ -62,6 +62,7 @@ use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, ConnectorInstanceId,
     ConnectorProviderId, ConnectorTableObjectId, CredentialConsumerRole, StaticCredentialReference,
 };
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_state_store_api::{
     AttemptSupervisor, CommitOutcome, Direction, Key, KeyRange, Precondition, RangePage,
     RangeRequest, ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,

@@ -44,10 +44,11 @@ use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::dependency::{CreateMvDependencyRequest, StoredMvDependency};
 use crate::mv::domain::repository::{
     DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
-    MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTarget,
-    MvTargetLookup, ReplaceMvProjectionRequest,
+    MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
+    ReplaceMvProjectionRequest,
 };
 use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 use self::codec::{

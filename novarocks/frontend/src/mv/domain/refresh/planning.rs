@@ -17,11 +17,12 @@
 
 use std::collections::BTreeMap;
 
-use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget, RefreshMode};
+use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine, RefreshMode};
 use crate::mv::domain::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision, decide_refresh,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_types::naming::TableIdentity;
 
 pub(crate) struct RefreshPlanningInput<'a> {
@@ -91,13 +92,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::mv::domain::model::{
-        AffectedTargetPartitions, MvStorageEngine, MvTarget, RefreshMode,
-    };
+    use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine, RefreshMode};
     use crate::mv::domain::refresh::snapshot::{
         BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
     };
     use novarocks_spi::connector::ConnectorTableObjectId;
+    use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
     use novarocks_types::naming::TableIdentity;
 
     fn object_id(value: &str) -> ConnectorTableObjectId {

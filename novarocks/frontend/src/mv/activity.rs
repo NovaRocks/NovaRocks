@@ -19,7 +19,7 @@
 
 use novarocks_mv_application::activity::CanonicalMvTarget;
 
-use crate::mv::domain::repository::MvTarget;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 /// Adapts a frontend repository target to the product's provider-neutral key.
 pub(crate) fn canonical_mv_target(target: &MvTarget) -> CanonicalMvTarget {

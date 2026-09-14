@@ -24,11 +24,12 @@ use uuid::Uuid;
 use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::descriptor::MvDescriptorV3;
-use crate::mv::domain::repository::{InitialMvRefreshConfiguration, MvTarget};
+use crate::mv::domain::repository::InitialMvRefreshConfiguration;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
 };
 use novarocks_query_application::api::QueryResult;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 
 /// Join refresh shape retained until query assembly admits exact connector

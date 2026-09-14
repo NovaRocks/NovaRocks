@@ -29,7 +29,6 @@ use crate::mv::domain::lifecycle::{RefreshError, RefreshErrorKind};
 use crate::mv::domain::refresh::{
     definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
 };
-use crate::mv::domain::repository::MvTarget;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     PreparedMvRefresh,
@@ -39,6 +38,7 @@ use novarocks_spi::connector::{
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 use novarocks_sql::planning::mv::MvRefreshStatement;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_table_maintenance::MaintenanceTarget;
 
 use super::background::{MvBackgroundEngine, MvRefreshStep};

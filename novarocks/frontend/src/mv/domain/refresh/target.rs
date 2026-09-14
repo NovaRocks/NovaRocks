@@ -22,9 +22,9 @@ use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::refresh::target_binding::{
     MvTargetBinding, load_mv_target_binding_with_ports, load_mv_target_binding_with_ports_typed,
 };
-use crate::mv::domain::repository::MvTarget;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorError, ConnectorRequestContext};
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_sql::semantic::ObjectName;
 use novarocks_types::naming::{TableIdentity, normalize_identifier};
 
