@@ -59,6 +59,7 @@ pub mod runtime_filter_rpc;
 pub mod runtime_filter_terminal;
 pub mod runtime_filter_transport;
 pub mod runtime_filter_typed_scan;
+pub mod task_execution_observation;
 pub mod task_protocol;
 pub mod task_protocol_fault;
 pub mod task_result_diagnostics;

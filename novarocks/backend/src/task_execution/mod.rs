@@ -45,8 +45,6 @@ mod context_host;
 mod execution_host;
 mod feedback;
 pub(crate) mod ingress;
-mod marker;
-mod ports;
 
 #[cfg(test)]
 mod tests;
@@ -54,4 +52,3 @@ mod tests;
 pub(crate) use context_host::NativeQueryContextHost;
 pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
 pub(crate) use ingress::RegistryTaskExecutionIngress;
-pub(crate) use ports::backend_task_execution_ports;

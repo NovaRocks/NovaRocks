@@ -15,27 +15,62 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend rendering for typed Worker task-protocol evidence.
+//! Native rendering of already-decided Worker task lifecycle facts.
+//!
+//! The Worker remains the only task/context lifecycle owner. This adapter
+//! renders its settled facts as role-local evidence, metrics, and result-buffer
+//! cleanup without gaining a second transition or admission authority.
+
+use std::sync::Arc;
 
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
-use novarocks_worker::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
+use novarocks_worker::{
+    RuntimeFilterReleaseObservation, TaskExecutionMetrics, TaskExecutionPorts, TaskProtocolEvent,
+    TaskProtocolObserver, TaskResultLifecycle,
+};
 
-/// Whether this process emits task-protocol operation evidence.
-///
-/// It shares the connector-reader switch rather than owning a second one: a
-/// distributed case arms one marker environment and then asserts on whatever
-/// evidence the run owes it.
-fn enabled() -> bool {
-    novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker()
+#[derive(Debug)]
+struct NativeTaskExecutionPorts;
+
+impl TaskProtocolObserver for NativeTaskExecutionPorts {
+    fn observe(&self, event: TaskProtocolEvent) {
+        emit(event);
+    }
 }
 
-/// One context-scoped line. The backend process id is part of the identity so
-/// a per-backend count still means something when logs are merged.
+impl TaskResultLifecycle for NativeTaskExecutionPorts {
+    fn discard_task(&self, identity: TaskIdentity) {
+        novarocks_worker::result_buffer::discard_task(identity);
+    }
+
+    fn retire_task_result(&self, identity: TaskIdentity) {
+        novarocks_worker::result_buffer::retire_task_result(identity);
+    }
+}
+
+impl TaskExecutionMetrics for NativeTaskExecutionPorts {
+    fn record_task_created(&self) {
+        crate::backend_metrics::record_task_execution_task_created();
+    }
+}
+
+/// Builds the Native role-local effects injected into the Worker task owner.
+pub fn backend_task_execution_ports() -> TaskExecutionPorts {
+    let adapter = Arc::new(NativeTaskExecutionPorts);
+    let observer: Arc<dyn TaskProtocolObserver> = adapter.clone();
+    let result_lifecycle: Arc<dyn TaskResultLifecycle> = adapter.clone();
+    let metrics: Arc<dyn TaskExecutionMetrics> = adapter;
+    TaskExecutionPorts::new(observer, result_lifecycle, metrics)
+}
+
+fn enabled() -> bool {
+    crate::debug_environment::debug_emit_connector_reader_marker()
+}
+
 fn emit_context(name: &str, context: QueryContextRef) {
     emit_context_with(name, context, "");
 }
 
-/// One context-scoped line with extra `key=value` words appended.
 fn emit_context_with(name: &str, context: QueryContextRef, extra: &str) {
     let execution = context.query_execution_id();
     let separator = if extra.is_empty() { "" } else { " " };
@@ -50,7 +85,6 @@ fn emit_context_with(name: &str, context: QueryContextRef, extra: &str) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
-/// One task-scoped line, carrying the stage and task that name the subject.
 fn emit_task(name: &str, identity: TaskIdentity) {
     let execution = identity.query_execution_id();
     println!(
@@ -65,12 +99,7 @@ fn emit_task(name: &str, identity: TaskIdentity) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
-/// How one establish settled.
-///
-/// A terminal receipt, an identity mismatch, and an illegal state emit
-/// nothing: none of them is a progression of the establish domain, and naming
-/// them here would make a count of applies or conflicts unreadable.
-pub(super) fn emit(event: TaskProtocolEvent) {
+fn emit(event: TaskProtocolEvent) {
     if !enabled() {
         return;
     }
