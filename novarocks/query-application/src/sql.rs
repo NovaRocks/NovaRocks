@@ -21,6 +21,9 @@ use std::fmt;
 
 use novarocks_parser::{ParserError, ast::Statement};
 
+use crate::admitted_query_context::RequestContext;
+use crate::api::CommandContext;
+use crate::protocol_delivery::QuerySessionOutput;
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
 /// SQL batch admission and test-only stable error injection.
@@ -44,6 +47,20 @@ pub mod kill;
 
 /// Query-result scalar conversion used by SQL session user variables.
 pub mod user_variable;
+
+/// Product-command port consumed after SQL admission has selected a typed
+/// statement. Implementations remain role-local adapters: the port transfers
+/// only immutable admitted context and the governed command context.
+pub trait CoreCommandRoute: Send + Sync {
+    fn execute_typed(
+        &self,
+        _statement: &Statement,
+        _context: &RequestContext,
+        _command_context: &CommandContext,
+    ) -> Result<QuerySessionOutput, String> {
+        Err("typed command route is unavailable".to_string())
+    }
+}
 
 /// The application boundary accepts one framed SQL statement.
 ///

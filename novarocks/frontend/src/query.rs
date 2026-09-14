@@ -95,7 +95,8 @@ use novarocks_query_application::sql::session::{
 use novarocks_query_application::sql::session_admit::SessionAdmitError;
 use novarocks_query_application::sql::user_variable::query_result_to_user_variable_literal;
 use novarocks_query_application::sql::{
-    parse_single_statement, query_service_parse_error, strip_leading_line_comments,
+    CoreCommandRoute, parse_single_statement, query_service_parse_error,
+    strip_leading_line_comments,
 };
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
@@ -108,17 +109,6 @@ use novarocks_workload_control::{
 pub(crate) mod compiler;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
-
-pub trait CoreCommandRoute: Send + Sync {
-    fn execute_typed(
-        &self,
-        _statement: &ParsedStatement,
-        _context: &RequestContext,
-        _command_context: &CommandContext,
-    ) -> Result<StatementResult, String> {
-        Err("typed command route is unavailable".to_string())
-    }
-}
 
 #[derive(Clone)]
 struct TypedCommandRoute {
