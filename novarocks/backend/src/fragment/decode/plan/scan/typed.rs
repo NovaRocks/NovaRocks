@@ -42,15 +42,13 @@ use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use novarocks_types::SlotId;
 
 use novarocks_worker::connector_batch_transform::ConnectorBatchTransform;
+use novarocks_worker::connector_variant_transform::ConnectorVariantPathTransform;
 use novarocks_worker::typed_connector_runtime::{
     TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
 };
 
 use super::super::node::DecodedNode;
-use super::common::{
-    ConnectorVariantPathTransform, lower_scan_predicate, parse_scan_limit,
-    validate_variant_path_read_slots,
-};
+use super::common::{lower_scan_predicate, parse_scan_limit, validate_variant_path_read_slots};
 use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
 use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
 
