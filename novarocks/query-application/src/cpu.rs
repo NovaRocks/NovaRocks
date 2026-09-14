@@ -17,9 +17,12 @@
 
 use std::{any::Any, num::NonZeroUsize, time::Instant};
 
-use crate::coordination::{
-    BoundedResultDecodeHandle, BoundedResultDecodeOwner, ResultDecodeExecutorConfig,
-    ResultDecodeJob,
+use crate::{
+    cancellation::{QueryCancellationReason, QueryCancellationView},
+    coordination::{
+        BoundedResultDecodeHandle, BoundedResultDecodeOwner, ResultDecodeExecutorConfig,
+        ResultDecodeJob,
+    },
 };
 
 type CpuResult = Box<dyn Any + Send>;
@@ -60,6 +63,13 @@ pub struct QueryCpuExecutorOwner {
 #[derive(Clone)]
 pub struct QueryCpuExecutor {
     handle: BoundedResultDecodeHandle<CpuResult>,
+}
+
+/// The outcome of waiting for query-preparation CPU work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryCpuRunError {
+    Cancelled(QueryCancellationReason),
+    Executor(String),
 }
 
 /// Fixed process limits for synchronous query command edges.
@@ -152,6 +162,40 @@ impl QueryCpuExecutor {
             .map(|result| *result)
             .map_err(|_| "query CPU worker returned an invalid result type".to_owned())
     }
+
+    /// Runs preparation work until it completes or the statement is cancelled.
+    ///
+    /// This does not interrupt a synchronous worker that already owns a job.
+    /// It does release the awaiting statement immediately, and a job that only
+    /// reaches a worker after cancellation skips its closure entirely. Callers
+    /// must therefore use it only before handing off any external effect.
+    pub async fn run_cancellable<T, F>(
+        &self,
+        cancellation: QueryCancellationView,
+        work: F,
+    ) -> Result<T, QueryCpuRunError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        if let Some(reason) = cancellation.reason() {
+            return Err(QueryCpuRunError::Cancelled(reason));
+        }
+        let worker_cancellation = cancellation.clone();
+        let run = self.run(move || (!worker_cancellation.is_cancelled()).then(work));
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => Err(QueryCpuRunError::Cancelled(reason)),
+            result = &mut run => match result {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => Err(QueryCpuRunError::Cancelled(
+                    cancellation.reason().expect("cancelled CPU work retains its reason"),
+                )),
+                Err(error) => Err(QueryCpuRunError::Executor(error)),
+            },
+        }
+    }
 }
 
 impl QueryBlockingExecutorOwner {
@@ -222,9 +266,11 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use crate::cancellation::{QueryCancellationReason, QueryCancellationSource};
+
     use super::{
         QueryBlockingExecutorConfig, QueryBlockingExecutorOwner, QueryCpuExecutorConfig,
-        QueryCpuExecutorOwner,
+        QueryCpuExecutorOwner, QueryCpuRunError,
     };
 
     fn executor(workers: usize, queue: usize) -> QueryCpuExecutorOwner {
@@ -280,6 +326,87 @@ mod tests {
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         drop(executor);
         let mut owner = owner;
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shut down CPU workers");
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_cpu_work_releases_its_waiter_without_running() {
+        let mut owner = executor(1, 2);
+        let executor = owner.executor();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let running_gate = Arc::clone(&gate);
+        let running = tokio::spawn({
+            let executor = executor.clone();
+            async move {
+                executor
+                    .run(move || {
+                        let (lock, ready) = &*running_gate;
+                        let mut open = lock.lock().expect("gate lock");
+                        while !*open {
+                            open = ready.wait(open).expect("gate wait");
+                        }
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.handle.snapshot().running != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("CPU worker did not start");
+
+        let cancellation = QueryCancellationSource::new();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let waiting = tokio::spawn({
+            let executor = executor.clone();
+            let ran = Arc::clone(&ran);
+            let cancellation = cancellation.view();
+            async move {
+                executor
+                    .run_cancellable(cancellation, move || {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.handle.snapshot().queued != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellable CPU work was not queued");
+
+        assert_eq!(
+            cancellation.request(QueryCancellationReason::ClientDisconnected),
+            crate::cancellation::QueryCancellationRequestResult::Requested
+        );
+        assert_eq!(
+            waiting.await.expect("waiting task"),
+            Err(QueryCpuRunError::Cancelled(
+                QueryCancellationReason::ClientDisconnected
+            ))
+        );
+
+        let (lock, ready) = &*gate;
+        *lock.lock().expect("gate lock") = true;
+        ready.notify_all();
+        running.await.expect("running task").expect("CPU work");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.handle.snapshot().queued != 0 || executor.handle.snapshot().running != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("CPU queue did not drain");
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        drop(executor);
         owner
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await

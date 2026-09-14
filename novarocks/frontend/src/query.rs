@@ -63,7 +63,7 @@ use novarocks_query_application::api::{
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use novarocks_query_application::client_connection::ClientConnectionControlPort;
-use novarocks_query_application::cpu::{QueryBlockingExecutor, QueryCpuExecutor};
+use novarocks_query_application::cpu::{QueryBlockingExecutor, QueryCpuExecutor, QueryCpuRunError};
 use novarocks_query_application::protocol_delivery::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult,
     GovernedImmediateStatementResult, QuerySessionOutput as StatementResult,
@@ -118,6 +118,13 @@ use novarocks_workload_control::{
 pub(crate) mod compiler;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
+
+/// Preparation failures retain whether cancellation, rather than a compiler
+/// failure, stopped work before the logical-execution handoff.
+enum GovernedPreparationError {
+    Service(QueryServiceError),
+    Cancelled(QueryServiceError),
+}
 
 fn command_error(kind: CommandErrorKind, error: impl Into<String>) -> CommandError {
     CommandError::new(kind, error.into())
@@ -1007,14 +1014,18 @@ impl FrontendQuerySession {
         timeout_ms: Option<u64>,
         statement_token: StatementToken,
         cancellation: novarocks_workload_control::CancellationView,
-    ) -> Result<PreparedQueryOperation, QueryServiceError> {
-        let parsed_statement = state
-            .substitute_user_variables(parsed_statement)
-            .map_err(|error| internal_error(error.to_string()))?;
+    ) -> Result<PreparedQueryOperation, GovernedPreparationError> {
+        let parsed_statement =
+            state
+                .substitute_user_variables(parsed_statement)
+                .map_err(|error| {
+                    GovernedPreparationError::Service(internal_error(error.to_string()))
+                })?;
         let cancellation = QueryCancellationView::governed(cancellation, timeout_ms);
         let topology =
             wait_for_initial_query_topology(&self.service.topology, &cancellation, deadline)
-                .await?;
+                .await
+                .map_err(|error| governed_preparation_error(error, &cancellation))?;
         let (current_catalog, current_database, execution_settings, mut optimizer_settings) =
             state.into_query_attempt_inputs();
         if optimizer_settings.optimizer_query_mem_limit_bytes.is_none() {
@@ -1027,7 +1038,7 @@ impl FrontendQuerySession {
             self.service.role,
             topology,
             deadline,
-            cancellation,
+            cancellation.clone(),
             optimizer_settings,
         ));
         let query_options = with_query_hints(
@@ -1041,19 +1052,30 @@ impl FrontendQuerySession {
         let prepared = self
             .service
             .query_cpu_executor
-            .run(move || {
+            .run_cancellable(cancellation, move || {
                 let _diagnostic_scope =
                     crate::preparation_diagnostics::enter_statement(statement_token);
                 compiler.prepare_statement(&parsed_statement, &context, Some(query_options))
             })
             .await
-            .map_err(internal_error)?;
+            .map_err(|error| match error {
+                QueryCpuRunError::Cancelled(reason) => {
+                    GovernedPreparationError::Cancelled(cancellation_error(reason))
+                }
+                QueryCpuRunError::Executor(error) => {
+                    GovernedPreparationError::Service(internal_error(error))
+                }
+            })?;
         match prepared {
             Ok(operation) => Ok(operation),
-            Err(FrontendQueryCompilerError::Engine(error)) => Err(internal_error(error)),
-            Err(FrontendQueryCompilerError::Analyze(error)) => Err(
-                QueryServiceError::from_user_error(error.to_user_error(Some(sql))),
-            ),
+            Err(FrontendQueryCompilerError::Engine(error)) => {
+                Err(GovernedPreparationError::Service(internal_error(error)))
+            }
+            Err(FrontendQueryCompilerError::Analyze(error)) => {
+                Err(GovernedPreparationError::Service(
+                    QueryServiceError::from_user_error(error.to_user_error(Some(sql))),
+                ))
+            }
         }
     }
 
@@ -1173,7 +1195,11 @@ impl FrontendQuerySession {
                 statement.token(),
                 statement.cancellation().clone(),
             )
-            .await?;
+            .await
+            .map_err(|error| match error {
+                GovernedPreparationError::Service(error)
+                | GovernedPreparationError::Cancelled(error) => error,
+            })?;
         let child = statement
             .scope()
             .child(WorkRequest::new(WorkClass::Query))
@@ -1260,12 +1286,12 @@ impl FrontendQuerySession {
             .await
         {
             Ok(prepared) => prepared,
-            Err(error) => {
-                let _ = if statement.cancellation().reason().is_some() {
-                    statement.finish_unstarted_read_after_cancellation()
-                } else {
-                    statement.finish()
-                };
+            Err(GovernedPreparationError::Cancelled(error)) => {
+                let _ = statement.finish_unstarted_read_after_cancellation();
+                return Err(error);
+            }
+            Err(GovernedPreparationError::Service(error)) => {
+                let _ = statement.finish();
                 return Err(error);
             }
         };
@@ -1850,6 +1876,27 @@ impl FrontendQuerySession {
             self.service.workload_resources.clone(),
             statement,
         ))
+    }
+}
+
+/// A read that stops before its execution owner is transferred has no actor
+/// to settle a queued cancellation control. Preserve that fact through every
+/// preparation wait, not only through the CPU executor.
+fn governed_preparation_error(
+    error: QueryServiceError,
+    cancellation: &QueryCancellationView,
+) -> GovernedPreparationError {
+    if cancellation.reason().is_some()
+        || matches!(
+            error.kind(),
+            QueryServiceErrorKind::Interrupted
+                | QueryServiceErrorKind::Timeout
+                | QueryServiceErrorKind::FrontendDraining
+        )
+    {
+        GovernedPreparationError::Cancelled(error)
+    } else {
+        GovernedPreparationError::Service(error)
     }
 }
 
@@ -3282,6 +3329,26 @@ mod tests {
             .kind(),
             QueryServiceErrorKind::Interrupted
         );
+    }
+
+    #[test]
+    fn preparation_cancellation_errors_retain_the_unstarted_read_boundary() {
+        let cancellation =
+            novarocks_query_application::cancellation::QueryCancellationSource::new().view();
+        assert!(matches!(
+            governed_preparation_error(
+                QueryServiceError::new(QueryServiceErrorKind::Timeout, "deadline elapsed"),
+                &cancellation,
+            ),
+            GovernedPreparationError::Cancelled(_)
+        ));
+        assert!(matches!(
+            governed_preparation_error(
+                QueryServiceError::new(QueryServiceErrorKind::Unavailable, "topology unavailable"),
+                &cancellation,
+            ),
+            GovernedPreparationError::Service(_)
+        ));
     }
 
     #[test]

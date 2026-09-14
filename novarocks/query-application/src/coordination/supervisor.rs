@@ -538,7 +538,23 @@ async fn run_logical_execution(
         cancellation.clone(),
         native_seed,
     );
-    let opened = await_with_shutdown(native.open(open_request), &mut shutdown, &requester).await;
+    let opened = match await_before_actor_install(
+        native.open(open_request),
+        cancellation.clone(),
+        &mut shutdown,
+        &requester,
+    )
+    .await
+    {
+        PreInstallWait::Completed(opened) => opened,
+        PreInstallWait::Cancelled(reason) => {
+            return fail_uninstalled_start(
+                pending_owner,
+                reply,
+                pre_install_cancellation_error(reason),
+            );
+        }
+    };
     let mut session =
         match opened.and_then(|session| open_acceptance.accept(session).map_err(Into::into)) {
             Ok(session) => session,
@@ -552,8 +568,23 @@ async fn run_logical_execution(
             return fail_uninstalled_start(pending_owner, reply, contract_error(error));
         }
     };
-    let prepared =
-        await_with_shutdown(session.prepare(attempt_request), &mut shutdown, &requester).await;
+    let prepared = match await_before_actor_install(
+        session.prepare(attempt_request),
+        cancellation.clone(),
+        &mut shutdown,
+        &requester,
+    )
+    .await
+    {
+        PreInstallWait::Completed(prepared) => prepared,
+        PreInstallWait::Cancelled(reason) => {
+            return fail_uninstalled_start(
+                pending_owner,
+                reply,
+                pre_install_cancellation_error(reason),
+            );
+        }
+    };
     let prepared = match prepared
         .and_then(|prepared| attempt_acceptance.accept(prepared).map_err(Into::into))
     {
@@ -586,9 +617,25 @@ async fn run_logical_execution(
         Ok(admission) => admission,
         Err(error) => return fail_uninstalled_start(pending_owner, reply, work_error(error)),
     };
-    let stage = match await_with_shutdown(stage_admission, &mut shutdown, &requester).await {
-        Ok(stage) => stage,
-        Err(error) => return fail_uninstalled_start(pending_owner, reply, work_error(error)),
+    let stage = match await_before_actor_install(
+        stage_admission,
+        cancellation.clone(),
+        &mut shutdown,
+        &requester,
+    )
+    .await
+    {
+        PreInstallWait::Completed(Ok(stage)) => stage,
+        PreInstallWait::Completed(Err(error)) => {
+            return fail_uninstalled_start(pending_owner, reply, work_error(error));
+        }
+        PreInstallWait::Cancelled(reason) => {
+            return fail_uninstalled_start(
+                pending_owner,
+                reply,
+                pre_install_cancellation_error(reason),
+            );
+        }
     };
     let contexts = schedule.contexts().to_vec();
     let reservation = match registry.reserve(initial_execution, contexts.clone()) {
@@ -1677,6 +1724,60 @@ where
     }
 }
 
+/// Outcome of waiting for an operation before its work owner transfers to a
+/// logical-execution actor.
+enum PreInstallWait<T> {
+    Completed(T),
+    Cancelled(CancellationReason),
+}
+
+/// Waits for a pre-install operation without letting a deadline strand the
+/// only work owner behind an unbounded Native or admission wait.
+///
+/// This is deliberately limited to the interval before actor installation:
+/// there is then no Task, output, or effect owner whose convergence must be
+/// observed. Once installed, cancellation remains actor-owned and ordinary
+/// control delivery cannot be acknowledged as a substitute for terminal
+/// facts. Shutdown retains its existing behavior and lets the in-flight
+/// operation observe its shutdown cancellation before returning.
+async fn await_before_actor_install<F>(
+    future: F,
+    cancellation: novarocks_workload_control::CancellationView,
+    shutdown: &mut watch::Receiver<bool>,
+    requester: &novarocks_workload_control::WorkCancellationRequester,
+) -> PreInstallWait<F::Output>
+where
+    F: Future,
+{
+    if let Some(reason) = cancellation.reason() {
+        return PreInstallWait::Cancelled(reason);
+    }
+    tokio::pin!(future);
+    let mut shutdown_open = true;
+    loop {
+        if *shutdown.borrow() {
+            let _ = requester.request(CancellationReason::ServerShutdown);
+            return PreInstallWait::Completed(future.await);
+        }
+        tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => {
+                let _ = requester.request(reason.clone());
+                return PreInstallWait::Cancelled(
+                    cancellation.reason().unwrap_or(reason),
+                );
+            }
+            output = &mut future => return PreInstallWait::Completed(output),
+            changed = shutdown.changed(), if shutdown_open => {
+                shutdown_open = changed.is_ok();
+                if !shutdown_open || *shutdown.borrow() {
+                    let _ = requester.request(CancellationReason::ServerShutdown);
+                }
+            }
+        }
+    }
+}
+
 struct PendingWorkOwner(Option<WorkOwner>);
 
 impl PendingWorkOwner {
@@ -1772,6 +1873,20 @@ fn work_error(error: WorkError) -> QueryExecutionError {
         _ => QueryExecutionErrorKind::Failed,
     };
     QueryExecutionError::new(kind, error.to_string())
+}
+
+fn pre_install_cancellation_error(reason: CancellationReason) -> QueryExecutionError {
+    let kind = match reason {
+        CancellationReason::DeadlineExceeded
+        | CancellationReason::FrontendDrainDeadlineExceeded => {
+            QueryExecutionErrorKind::DeadlineExceeded
+        }
+        _ => QueryExecutionErrorKind::Cancelled,
+    };
+    QueryExecutionError::new(
+        kind,
+        format!("logical execution cancelled before actor installation: {reason:?}"),
+    )
 }
 
 fn native_future_panicked(message: &'static str) -> QueryExecutionError {
@@ -4039,6 +4154,82 @@ mod tests {
                 )
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct PendingOpenNativePort {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl LogicalExecutionNativePort for PendingOpenNativePort {
+        fn open(&self, _request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.notify_one();
+                std::future::pending::<Result<LogicalNativeSession, LogicalNativeOpenError>>().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_before_actor_install_settles_its_cancel_control() {
+        let (control, root) = {
+            let control = WorkloadControl::try_new(
+                WorkloadConfig::default(),
+                ResourceConfig {
+                    total_bytes: 1 << 20,
+                    control_bytes: 1 << 12,
+                    per_scope_bytes: (1 << 20) - (1 << 12),
+                },
+            )
+            .unwrap();
+            control.mark_ready().unwrap();
+            let root = control
+                .try_begin_root(WorkRequest {
+                    class: WorkClass::Query,
+                    deadline: Some((Instant::now() + Duration::from_millis(25)).into()),
+                })
+                .unwrap();
+            (control, root)
+        };
+        let scope = root.owner.scope();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(PendingOpenNativePort {
+                entered: Arc::clone(&entered),
+            }),
+            control.resources(),
+            QueryProcessNamespace::new(0x4a),
+            FrontendProcessId::new_v7(),
+            supervisor_config(4),
+        );
+
+        let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("Native open did not begin");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        control.expire_deadlines();
+
+        let start = tokio::time::timeout(Duration::from_secs(1), start)
+            .await
+            .expect("deadline must stop a pre-install Native open");
+        let Err(error) = start else {
+            panic!("deadline must not return an execution handle");
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
+        root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        scope.wait_released().await;
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert!(
+            control.next_control().is_none(),
+            "the terminal pre-install failure must settle its cancellation control"
+        );
     }
 
     #[tokio::test]
