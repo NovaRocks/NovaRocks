@@ -1625,15 +1625,6 @@ fn default_out_of_range(type_name: &str, value: i64) -> String {
     format!("DEFAULT value {value} out of range for {type_name}")
 }
 
-pub fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
-    matches!(
-        novarocks_parser::parse(sql).ok().as_deref(),
-        Some([novarocks_parser::ast::Statement::Maintenance(
-            novarocks_parser::ast::MaintenanceStatement::ShowOptimize(_)
-        )])
-    )
-}
-
 #[cfg(test)]
 mod drop_table_if_exists_tests {
     #[test]
@@ -1655,25 +1646,6 @@ mod drop_table_if_exists_tests {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn looks_like_show_alter_table_optimize_detects_only_live_show_route() {
-        assert!(super::looks_like_show_alter_table_optimize(
-            "SHOW ALTER TABLE OPTIMIZE"
-        ));
-        assert!(super::looks_like_show_alter_table_optimize(
-            " show alter table optimize from db "
-        ));
-        assert!(!super::looks_like_show_alter_table_optimize(
-            "ALTER TABLE ice.db.orders OPTIMIZE"
-        ));
-        assert!(!super::looks_like_show_alter_table_optimize(
-            "SHOW CREATE TABLE ice.db.orders"
-        ));
-        assert!(!super::looks_like_show_alter_table_optimize(
-            "SHOW ALTER TABLE orders OPTIMIZE"
-        ));
-    }
-
     #[test]
     fn semantic_create_table_lowering_materializes_catalog_request() {
         let sql = "CREATE TABLE IF NOT EXISTS ice.db.orders (id BIGINT DEFAULT 3, amount DECIMAL(10,2) DEFAULT '12.30', payload BINARY DEFAULT X'CAFE') DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 8 PARTITION BY (month(id)) PROPERTIES ('format-version' = '2') COMMENT 'orders'";
