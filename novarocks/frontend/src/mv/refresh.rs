@@ -771,32 +771,6 @@ fn invalid(message: impl Into<String>) -> MvApplicationError {
 fn unavailable(message: impl Into<String>) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::Unavailable, message)
 }
-fn repository_error(
-    error: novarocks_mv_application::repository::MvRepositoryError,
-) -> MvApplicationError {
-    let kind = match error.kind() {
-        novarocks_mv_application::repository::MvRepositoryErrorKind::Conflict => {
-            MvApplicationErrorKind::AlreadyActive
-        }
-        novarocks_mv_application::repository::MvRepositoryErrorKind::NotFound => {
-            MvApplicationErrorKind::TargetGone
-        }
-        novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption => {
-            MvApplicationErrorKind::Corruption
-        }
-        novarocks_mv_application::repository::MvRepositoryErrorKind::CommitUnknown => {
-            MvApplicationErrorKind::CommitUnknown
-        }
-        novarocks_mv_application::repository::MvRepositoryErrorKind::Unavailable => {
-            MvApplicationErrorKind::Unavailable
-        }
-        novarocks_mv_application::repository::MvRepositoryErrorKind::InvalidRequest => {
-            MvApplicationErrorKind::Repository
-        }
-    };
-    MvApplicationError::new(kind, error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
