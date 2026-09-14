@@ -151,7 +151,7 @@ pub struct BackendApplicationHost {
     ready_marker: String,
     grpc_server: NativeRpcServerHandle,
     execution_runtime: Arc<ExecutionRuntime>,
-    task_completion_supervisor: Arc<crate::task_execution::TaskCompletionSupervisor>,
+    task_completion_supervisor: Arc<novarocks_worker::TaskCompletionSupervisor>,
     task_deadline_tick: WorkerDeadlineSupervisor,
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
@@ -176,7 +176,7 @@ struct BackendApplicationServices {
     execution_runtime: Arc<ExecutionRuntime>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     task_execution_registry: Arc<TaskExecutionRegistry>,
-    task_completion_supervisor: Arc<crate::task_execution::TaskCompletionSupervisor>,
+    task_completion_supervisor: Arc<novarocks_worker::TaskCompletionSupervisor>,
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
     /// The task substrate's exchange-destination authority. The RPC data
     /// plane needs it directly: without it no created task can receive an
@@ -404,8 +404,8 @@ fn compose_backend_application_services(
         novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
         novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
     );
-    let task_completion_supervisor = crate::task_execution::TaskCompletionSupervisor::start(
-        data_runtime.clone(),
+    let task_completion_supervisor = novarocks_worker::TaskCompletionSupervisor::start(
+        data_runtime.handle().clone(),
         task_execution_registry_config.max_active_tasks_per_backend,
     );
     let execution_host = Arc::new(crate::task_execution::NativeTaskExecutionHost::new(

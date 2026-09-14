@@ -84,7 +84,7 @@ use novarocks_spi::connector::{
 use novarocks_task_codec::domain::{WireContent, stored_message};
 use novarocks_task_codec::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
 use novarocks_types::{QueryExecutionId, UniqueId};
-use novarocks_worker::TaskInboundCapabilities;
+use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInboundCapabilities};
 use tracing::debug;
 
 use crate::fragment::decode::plan::context::{
@@ -95,7 +95,6 @@ use crate::fragment::decode::request::NativeFragmentRequest;
 use crate::fragment::ingress::{ReceivedReadSplit, TypedReadAttemptContext};
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 
-use super::completion::{TaskCompletionSignal, TaskCompletionSupervisor};
 use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_native_adapter::task_shared_facts::fragment_plan;
 use novarocks_worker::{HostRejection, RunnableTask, TaskExecutionHost, TaskStatusReporter};
@@ -1801,7 +1800,8 @@ mod tests {
 
     fn host(facts: Arc<StubContextFacts>) -> NativeTaskExecutionHost {
         let data_runtime = crate::rpc::runtime::test_backend_data_runtime();
-        let completion_supervisor = TaskCompletionSupervisor::start(data_runtime.clone(), 64);
+        let completion_supervisor =
+            TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
         NativeTaskExecutionHost::new(
             NativeFragmentQueryRuntime::global(crate::application::test_memory_authority()),
             facts,

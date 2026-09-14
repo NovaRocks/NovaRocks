@@ -17,6 +17,6 @@ novarocks-execution.workspace = true
 novarocks-spi.workspace = true
 novarocks-types.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 uuid = { workspace = true, features = ["v4"] }
 tracing.workspace = true

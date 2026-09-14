@@ -29,18 +29,17 @@ use std::time::Duration;
 
 use novarocks_execution::runtime::fragment::FragmentTerminalFact;
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, watch};
-
-use novarocks_native_adapter::BackendDataRuntime;
 
 const COMPLETION_STATE_LOCK: &str = "task completion supervisor state lock";
 const COMPLETION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-type CompletionAction = Box<dyn FnOnce(FragmentTerminalFact) + Send + 'static>;
+pub type TaskCompletionAction = Box<dyn FnOnce(FragmentTerminalFact) + Send + 'static>;
 
 struct CompletionSlot {
     expected_fragment: novarocks_types::UniqueId,
-    action: Option<CompletionAction>,
+    action: Option<TaskCompletionAction>,
     fact: Option<FragmentTerminalFact>,
     creation_committed: bool,
     queued: bool,
@@ -147,7 +146,7 @@ impl CompletionShared {
     fn take_ready(
         &self,
         identity: TaskIdentity,
-    ) -> Option<(CompletionAction, FragmentTerminalFact)> {
+    ) -> Option<(TaskCompletionAction, FragmentTerminalFact)> {
         let mut state = self.state.lock().expect(COMPLETION_STATE_LOCK);
         let Some(mut slot) = state.slots.remove(&identity) else {
             Self::fail_locked(
@@ -189,24 +188,24 @@ impl CompletionShared {
 
 /// The exact one-shot publisher attached to a running fragment.
 #[derive(Clone)]
-pub(super) struct TaskCompletionSignal {
+pub struct TaskCompletionSignal {
     identity: TaskIdentity,
     shared: Arc<CompletionShared>,
 }
 
 impl TaskCompletionSignal {
-    pub(super) fn publish(&self, fact: FragmentTerminalFact) {
+    pub fn publish(&self, fact: FragmentTerminalFact) {
         self.shared.publish(self.identity, fact);
     }
 
-    pub(super) fn commit_creation(&self) {
+    pub fn commit_creation(&self) {
         self.shared.commit_creation(self.identity);
     }
 }
 
 /// One fixed async owner and its bounded set of exact task slots.
-pub(crate) struct TaskCompletionSupervisor {
-    runtime: BackendDataRuntime,
+pub struct TaskCompletionSupervisor {
+    runtime: Handle,
     capacity: usize,
     shared: Arc<CompletionShared>,
     stop: watch::Sender<bool>,
@@ -226,7 +225,7 @@ impl fmt::Debug for TaskCompletionSupervisor {
 }
 
 impl TaskCompletionSupervisor {
-    pub(crate) fn start(runtime: BackendDataRuntime, capacity: usize) -> Arc<Self> {
+    pub fn start(runtime: Handle, capacity: usize) -> Arc<Self> {
         assert!(capacity > 0, "task completion capacity must be positive");
         let (ready, mut receiver) = mpsc::channel(capacity);
         let shared = Arc::new(CompletionShared {
@@ -240,7 +239,7 @@ impl TaskCompletionSupervisor {
         });
         let (stop, mut stopped) = watch::channel(false);
         let owner_shared = Arc::clone(&shared);
-        let join = runtime.handle().spawn(async move {
+        let join = runtime.spawn(async move {
             loop {
                 let identity = tokio::select! {
                     biased;
@@ -276,11 +275,11 @@ impl TaskCompletionSupervisor {
         })
     }
 
-    pub(super) fn reserve(
+    pub fn reserve(
         &self,
         identity: TaskIdentity,
         expected_fragment: novarocks_types::UniqueId,
-        action: CompletionAction,
+        action: TaskCompletionAction,
     ) -> Result<TaskCompletionSignal, String> {
         let mut state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
         if !state.accepting {
@@ -314,7 +313,7 @@ impl TaskCompletionSupervisor {
         })
     }
 
-    pub(crate) fn poll_failure(&self) -> Option<String> {
+    pub fn poll_failure(&self) -> Option<String> {
         self.shared
             .state
             .lock()
@@ -323,13 +322,13 @@ impl TaskCompletionSupervisor {
             .clone()
     }
 
-    pub(crate) fn shutdown(&self) -> Result<(), String> {
+    pub fn shutdown(&self) -> Result<(), String> {
         {
             let mut state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
             state.accepting = false;
         }
         let shared = Arc::clone(&self.shared);
-        let drain_result = self.runtime.block_on(async move {
+        let drain_result = self.block_on(async move {
             tokio::time::timeout(COMPLETION_SHUTDOWN_TIMEOUT, async {
                 loop {
                     let changed = shared.changed.notified();
@@ -353,8 +352,7 @@ impl TaskCompletionSupervisor {
         let _ = self.stop.send(true);
         let join = self.join.lock().expect(COMPLETION_STATE_LOCK).take();
         let join_result = if let Some(join) = join {
-            self.runtime
-                .block_on(async move { join.await })
+            self.block_on(async move { join.await })
                 .map_err(|error| format!("task completion owner stopped unexpectedly: {error}"))
         } else {
             Ok(())
@@ -363,6 +361,18 @@ impl TaskCompletionSupervisor {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(error), Err(join_error)) => Err(format!("{error}; {join_error}")),
+        }
+    }
+
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        if Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.runtime.block_on(future))
+        } else {
+            self.runtime.block_on(future)
         }
     }
 }
@@ -381,6 +391,13 @@ mod tests {
     };
 
     use super::TaskCompletionSupervisor;
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .expect("completion test runtime")
+    }
 
     fn identity(query: i64, task: u32) -> TaskIdentity {
         TaskIdentity::new(
@@ -418,8 +435,8 @@ mod tests {
 
     #[test]
     fn completion_before_creation_commit_is_delivered_once_after_commit() {
-        let supervisor =
-            TaskCompletionSupervisor::start(crate::rpc::runtime::test_backend_data_runtime(), 2);
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 2);
         let identity = identity(91_001, 1);
         let fragment = UniqueId::new(91_003, 91_004);
         let completions = Arc::new(AtomicUsize::new(0));
@@ -449,8 +466,8 @@ mod tests {
 
     #[test]
     fn exact_slot_bound_rejects_excess_work_before_start() {
-        let supervisor =
-            TaskCompletionSupervisor::start(crate::rpc::runtime::test_backend_data_runtime(), 1);
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
         let first = identity(92_001, 1);
         let second = identity(92_011, 1);
         let first_fragment = UniqueId::new(92_003, 92_004);
@@ -468,8 +485,8 @@ mod tests {
 
     #[test]
     fn owner_panic_is_supervision_failure_and_does_not_run_later_steps() {
-        let supervisor =
-            TaskCompletionSupervisor::start(crate::rpc::runtime::test_backend_data_runtime(), 1);
+        let runtime = test_runtime();
+        let supervisor = TaskCompletionSupervisor::start(runtime.handle().clone(), 1);
         let identity = identity(93_001, 1);
         let fragment = UniqueId::new(93_003, 93_004);
         let actual_stop = Arc::new(AtomicUsize::new(0));
@@ -498,6 +515,32 @@ mod tests {
         assert_eq!(actual_stop.load(Ordering::Acquire), 1);
         assert_eq!(converged.load(Ordering::Acquire), 0);
         assert!(supervisor.shutdown().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drains_when_called_from_the_runtime() {
+        let supervisor = TaskCompletionSupervisor::start(tokio::runtime::Handle::current(), 1);
+        let identity = identity(94_001, 1);
+        let fragment = UniqueId::new(94_003, 94_004);
+        let completions = Arc::new(AtomicUsize::new(0));
+        let action_completions = Arc::clone(&completions);
+        let signal = supervisor
+            .reserve(
+                identity,
+                fragment,
+                Box::new(move |_| {
+                    action_completions.fetch_add(1, Ordering::Release);
+                }),
+            )
+            .expect("reserve exact slot");
+
+        signal.commit_creation();
+        signal.publish(terminal(identity, fragment));
+
+        supervisor
+            .shutdown()
+            .expect("completion owner drains from the runtime");
+        assert_eq!(completions.load(Ordering::Acquire), 1);
     }
 }
 

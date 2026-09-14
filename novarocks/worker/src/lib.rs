@@ -45,6 +45,7 @@ mod receipt;
 mod reliable_transport;
 mod runtime_filter_error;
 mod status;
+mod task_completion;
 mod task_creation_gate;
 mod task_domain_execution;
 mod task_execution_ports;
@@ -128,6 +129,7 @@ pub use status::{
     METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
     TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
 };
+pub use task_completion::{TaskCompletionAction, TaskCompletionSignal, TaskCompletionSupervisor};
 pub use task_creation_gate::{NoopTaskCreationGate, TaskCreationGate};
 pub use task_domain_execution::{
     DomainExecutionRejection, apply_planned_task_domain_updates, apply_task_domain_updates,

@@ -41,7 +41,6 @@
 //! steps.
 // Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
-mod completion;
 mod context_host;
 mod execution_host;
 mod feedback;
@@ -52,7 +51,6 @@ mod ports;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use completion::TaskCompletionSupervisor;
 pub(crate) use context_host::NativeQueryContextHost;
 pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
 pub(crate) use ingress::RegistryTaskExecutionIngress;
