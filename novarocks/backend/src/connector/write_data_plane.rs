@@ -274,7 +274,7 @@ fn carrier_error(target: WriteTargetOrdinal, detail: String) -> ConnectorError {
 /// `connector_write_writer_open` event above says the same thing to an
 /// operator; this says it on a stream a cross-process test can read.
 fn emit_writer_marker(marker: &str, plan_node_id: i32, target: WriteTargetOrdinal) {
-    if !crate::config::debug_emit_connector_writer_marker() {
+    if !novarocks_native_adapter::debug_environment::debug_emit_connector_writer_marker() {
         return;
     }
     println!(

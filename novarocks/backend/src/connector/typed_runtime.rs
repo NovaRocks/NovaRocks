@@ -191,7 +191,7 @@ fn materialize_output(
 /// It prints scheduling identity and nothing else: a marker must never carry a
 /// credential, a key metadata blob, or any part of a data value.
 fn emit_page_source_marker(marker: &str, plan_node_id: i32, sequence_id: Option<u64>) {
-    if !crate::config::debug_emit_connector_reader_marker() {
+    if !novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker() {
         return;
     }
     match sequence_id {
@@ -220,7 +220,7 @@ struct TypedConnectorReaderMarker {
 
 impl TypedConnectorReaderMarker {
     fn for_split(split: &crate::fragment::ingress::ReceivedReadSplit) -> Option<Self> {
-        if !crate::config::debug_emit_connector_reader_marker() {
+        if !novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker() {
             return None;
         }
         let binding = split.split().binding();

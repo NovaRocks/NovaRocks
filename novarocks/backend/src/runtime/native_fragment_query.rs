@@ -295,7 +295,9 @@ impl NativeFragmentAdmissionResources {
         )
         .with_scan_registration_port(self.scan_registration)
         .with_fragment_commit_port(Arc::new(BackendSinkCommitPort))
-        .with_debug_exec_node_output(crate::config::debug_exec_node_output())
+        .with_debug_exec_node_output(
+            novarocks_native_adapter::debug_environment::debug_exec_node_output(),
+        )
     }
 }
 

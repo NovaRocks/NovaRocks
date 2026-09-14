@@ -14,7 +14,7 @@ fn emit_typed_fetch_marker(
     eos: bool,
     payload_bytes: usize,
 ) {
-    if crate::config::debug_emit_grpc_fragment_marker()
+    if novarocks_native_adapter::debug_environment::debug_emit_grpc_fragment_marker()
         && should_emit_typed_fetch_marker(status, packet_seq, eos)
     {
         println!(

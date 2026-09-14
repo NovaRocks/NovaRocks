@@ -26,7 +26,7 @@ use novarocks_worker::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 /// distributed case arms one marker environment and then asserts on whatever
 /// evidence the run owes it.
 fn enabled() -> bool {
-    crate::config::debug_emit_connector_reader_marker()
+    novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker()
 }
 
 /// One context-scoped line. The backend process id is part of the identity so

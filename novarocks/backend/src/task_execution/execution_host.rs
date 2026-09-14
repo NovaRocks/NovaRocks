@@ -557,7 +557,7 @@ impl NativeTaskExecutionHost {
         // delivery path; the cutover moved the work here and has to move the
         // evidence with it, or every case asserting it counts zero on a
         // cluster where splits are in fact being delivered.
-        if crate::config::debug_emit_connector_reader_marker() {
+        if novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker() {
             let execution_id = identity.query_execution_id();
             let finst = fragment_instance_id;
             let duplicate_count = preflight.duplicate_sequences().len();

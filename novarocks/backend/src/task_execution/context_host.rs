@@ -625,7 +625,7 @@ impl NativeQueryContextHost {
                         factories
                             .bind(
                                 properties,
-                                crate::config::debug_emit_catalog_materialization_marker(),
+                                novarocks_native_adapter::debug_environment::debug_emit_catalog_materialization_marker(),
                             )
                             .map_err(CatalogManagerError::from_materialization)
                     },
@@ -1033,7 +1033,7 @@ const CATALOG_INSTALL_HOLD_POLL: std::time::Duration = std::time::Duration::from
 /// `execution_id=<high>:<low>:<attempt>` word the operation markers use -- so
 /// one execution's evidence can be selected across all of them.
 fn emit_catalog_install_started(execution_id: QueryExecutionId, catalog_count: usize) {
-    if !crate::config::debug_emit_catalog_lifecycle_marker() {
+    if !novarocks_native_adapter::debug_environment::debug_emit_catalog_lifecycle_marker() {
         return;
     }
     println!(
@@ -1059,7 +1059,9 @@ fn emit_catalog_install_started(execution_id: QueryExecutionId, catalog_count: u
 /// rejection here is what keeps the provider bind below from running at all,
 /// so a cancelled attempt materializes no catalog runtime.
 fn hold_cold_catalog_install(installed: &InstalledContext) -> Result<(), HostRejection> {
-    let Some(hold_file) = crate::config::debug_catalog_install_hold_file() else {
+    let Some(hold_file) =
+        novarocks_native_adapter::debug_environment::debug_catalog_install_hold_file()
+    else {
         return Ok(());
     };
     while hold_file.exists() {
@@ -1090,12 +1092,12 @@ fn inject_catalog_install_failure(
     execution_id: QueryExecutionId,
     installed: &InstalledContext,
 ) -> Result<(), HostRejection> {
-    let armed = crate::config::debug_catalog_install_failure_file()
+    let armed = novarocks_native_adapter::debug_environment::debug_catalog_install_failure_file()
         .is_some_and(|failure_file| failure_file.exists());
     if !armed {
         return Ok(());
     }
-    if crate::config::debug_emit_catalog_lifecycle_marker() {
+    if novarocks_native_adapter::debug_environment::debug_emit_catalog_lifecycle_marker() {
         println!(
             "NOVAROCKS_CATALOG_INSTALL_FAILED execution_id={}:{}:{}",
             execution_id.query_id().high(),

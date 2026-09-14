@@ -203,7 +203,7 @@ fn emit_advertised_marker(
     channel_id: RuntimeFilterChannelId,
     version: DomainVersion,
 ) {
-    if !crate::config::debug_emit_connector_reader_marker() {
+    if !novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker() {
         return;
     }
     let execution = carrier.query_execution_id();
