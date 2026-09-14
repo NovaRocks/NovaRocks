@@ -124,6 +124,7 @@ struct TypedConnectorScanShared {
     /// lifecycle refuses a session without one.
     runtime_filter: RuntimeFilterSessionResolver,
     live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
+    emit_reader_markers: bool,
     /// This fragment's runtime-filter consumer contracts, by the filter id the
     /// scan carrier binds. Empty when the scan consumes no runtime filter.
     runtime_filter_contracts: BTreeMap<u32, RuntimeFilterConsumerContract>,
@@ -191,8 +192,13 @@ fn materialize_output(
 ///
 /// It prints scheduling identity and nothing else: a marker must never carry a
 /// credential, a key metadata blob, or any part of a data value.
-fn emit_page_source_marker(marker: &str, plan_node_id: i32, sequence_id: Option<u64>) {
-    if !novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker() {
+fn emit_page_source_marker(
+    enabled: bool,
+    marker: &str,
+    plan_node_id: i32,
+    sequence_id: Option<u64>,
+) {
+    if !enabled {
         return;
     }
     match sequence_id {
@@ -220,8 +226,11 @@ struct TypedConnectorReaderMarker {
 }
 
 impl TypedConnectorReaderMarker {
-    fn for_split(split: &crate::fragment::ingress::ReceivedReadSplit) -> Option<Self> {
-        if !novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker() {
+    fn for_split(
+        split: &crate::fragment::ingress::ReceivedReadSplit,
+        enabled: bool,
+    ) -> Option<Self> {
+        if !enabled {
             return None;
         }
         let binding = split.split().binding();
@@ -266,6 +275,7 @@ impl TypedConnectorScanSource {
         slot_ids: Vec<SlotId>,
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
+        emit_reader_markers: bool,
     ) -> Self {
         let dynamic_filter = complete_all_scan_dynamic_filter(&wire_scan, &scan);
         Self {
@@ -276,6 +286,7 @@ impl TypedConnectorScanSource {
                 session,
                 runtime_filter,
                 live_dynamic_filter_factory,
+                emit_reader_markers,
                 runtime_filter_contracts: BTreeMap::new(),
                 request,
                 plan_node_id,
@@ -367,6 +378,7 @@ impl TypedConnectorScanSource {
                 session: self.shared.session.clone(),
                 runtime_filter: Arc::clone(&self.shared.runtime_filter),
                 live_dynamic_filter_factory: Arc::clone(&self.shared.live_dynamic_filter_factory),
+                emit_reader_markers: self.shared.emit_reader_markers,
                 runtime_filter_contracts: self.shared.runtime_filter_contracts.clone(),
                 request: self.shared.request.clone(),
                 plan_node_id: self.shared.plan_node_id,
@@ -597,7 +609,7 @@ impl TypedConnectorSplitIter {
                 )
             })?;
         let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
-        let marker = TypedConnectorReaderMarker::for_split(split);
+        let marker = TypedConnectorReaderMarker::for_split(split, self.shared.emit_reader_markers);
         self.current = Some(
             self.sources
                 .register(adapter, marker, self.profile.clone())?,
@@ -606,6 +618,7 @@ impl TypedConnectorSplitIter {
         // opened on this backend for this exact scheduled split, which a
         // result-only assertion cannot show.
         emit_page_source_marker(
+            self.shared.emit_reader_markers,
             "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
             self.shared.plan_node_id,
             Some(split.sequence_id()),
@@ -621,6 +634,7 @@ impl TypedConnectorSplitIter {
             Some(source) => {
                 let closed = source.close();
                 emit_page_source_marker(
+                    self.shared.emit_reader_markers,
                     "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
                     self.shared.plan_node_id,
                     None,
@@ -1733,6 +1747,7 @@ mod tests {
             vec![SlotId::new(1)],
             no_runtime_filter(),
             live_dynamic_filter_factory(),
+            false,
         )
     }
 
@@ -1814,6 +1829,7 @@ mod tests {
             request(Arc::new(NeverCancelled)),
             NODE,
             vec![SlotId::new(1)],
+            false,
         )
     }
 
@@ -2116,6 +2132,7 @@ mod tests {
             vec![SlotId::new(1)],
             no_runtime_filter(),
             live_dynamic_filter_factory(),
+            false,
         )
         .with_backend_dynamic_filter(Arc::new(CompleteAllDynamicFilter::new(covered)));
         let op = bind(&source);
@@ -2187,6 +2204,7 @@ struct TypedSystemTableScanShared {
     session: ConnectorSession,
     request: ConnectorRequestContext,
     plan_node_id: i32,
+    emit_reader_markers: bool,
     /// Ordered read slot ids. `slot_ids[i]` names page channel `i`.
     slot_ids: Vec<SlotId>,
     /// Builds the columns the connector does not read, exactly as an ordinary
@@ -2223,6 +2241,7 @@ impl TypedConnectorSystemTableScanSource {
         request: ConnectorRequestContext,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
+        emit_reader_markers: bool,
     ) -> Self {
         Self {
             shared: Arc::new(TypedSystemTableScanShared {
@@ -2231,6 +2250,7 @@ impl TypedConnectorSystemTableScanSource {
                 session,
                 request,
                 plan_node_id,
+                emit_reader_markers,
                 slot_ids,
                 output_materialization: None,
             }),
@@ -2365,6 +2385,7 @@ impl TypedSystemTableIter {
         // would be the first step toward asserting scheduling identity it does
         // not have.
         emit_page_source_marker(
+            self.shared.emit_reader_markers,
             "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
             self.shared.plan_node_id,
             None,
@@ -2380,6 +2401,7 @@ impl TypedSystemTableIter {
             Some(source) => {
                 let closed = source.close();
                 emit_page_source_marker(
+                    self.shared.emit_reader_markers,
                     "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
                     self.shared.plan_node_id,
                     None,

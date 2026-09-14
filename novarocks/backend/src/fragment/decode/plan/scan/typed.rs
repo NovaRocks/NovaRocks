@@ -161,6 +161,7 @@ pub(super) fn lower_typed_connector_scan(
                 read_slot_ids,
                 inputs.runtime_filter,
                 live_dynamic_filter_factory,
+                novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker(),
             );
             match output_materialization {
                 Some(transform) => Arc::new(
@@ -184,6 +185,7 @@ pub(super) fn lower_typed_connector_scan(
                 inputs.request,
                 node.node_id,
                 read_slot_ids,
+                novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker(),
             );
             match output_materialization {
                 Some(transform) => Arc::new(
