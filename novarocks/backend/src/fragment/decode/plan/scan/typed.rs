@@ -48,9 +48,11 @@ use novarocks_worker::typed_connector_runtime::{
 };
 
 use super::super::node::DecodedNode;
-use super::common::{lower_scan_predicate, parse_scan_limit, validate_variant_path_read_slots};
 use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
 use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
+use novarocks_native_adapter::fragment_scan_decode::{
+    lower_scan_predicate, parse_scan_limit, validate_variant_path_read_slots,
+};
 
 /// Lower one `ScanSource.typed_connector_read` into an execution scan node.
 pub(super) fn lower_typed_connector_scan(

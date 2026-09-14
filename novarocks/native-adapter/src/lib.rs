@@ -43,6 +43,7 @@ pub mod fragment_plan_node;
 pub mod fragment_result_writer;
 pub mod fragment_runtime_filter;
 pub mod fragment_runtime_filter_binding;
+pub mod fragment_scan_decode;
 pub mod fragment_scan_output;
 pub mod fragment_sink;
 pub mod fragment_submission;

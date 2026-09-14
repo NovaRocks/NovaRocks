@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared fragment scan decoding helpers.
+//! Native fragment scan decoding helpers.
 
 use arrow::datatypes::DataType;
 
+use crate::fragment_error::NativeFragmentLeafDecodeError;
+use crate::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::variant_read::VariantPathSpec;
-use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
-use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;
@@ -34,7 +34,7 @@ use novarocks_types::SlotId;
 /// `field` names the wire field that decided the read layout, which differs per
 /// carrier: the opaque one publishes it as an Arrow schema, the typed one as
 /// its ordered assignments.
-pub(super) fn validate_variant_path_read_slots(
+pub fn validate_variant_path_read_slots(
     specs: &[VariantPathSpec],
     read_slot_ids: &[SlotId],
     field: &'static str,
@@ -54,7 +54,7 @@ pub(super) fn validate_variant_path_read_slots(
     Ok(())
 }
 
-pub(super) fn lower_scan_predicate(
+pub fn lower_scan_predicate(
     scan: &plan::ScanNode,
     arena: &mut ExprArena,
     layout: &Layout,
@@ -83,7 +83,7 @@ pub(super) fn lower_scan_predicate(
     Ok(predicate)
 }
 
-pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, NativeFragmentLeafDecodeError> {
+pub fn parse_scan_limit(limit: i64) -> Result<Option<usize>, NativeFragmentLeafDecodeError> {
     if limit == -1 {
         Ok(None)
     } else if limit < 0 {

@@ -17,7 +17,6 @@
 
 //! Fragment scan plan decoding.
 
-mod common;
 mod typed;
 
 use super::node::DecodedNode;
