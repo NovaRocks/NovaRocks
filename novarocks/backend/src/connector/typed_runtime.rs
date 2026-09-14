@@ -68,6 +68,7 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_types::SlotId;
 use novarocks_worker::RuntimeFilterSessionResolver;
 use novarocks_worker::connector_batch_transform::ConnectorBatchTransform;
+use novarocks_worker::read_attempt::ReceivedReadSplit;
 use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 
 /// How long a driver parks on an empty, non-terminal split queue before it
@@ -226,10 +227,7 @@ struct TypedConnectorReaderMarker {
 }
 
 impl TypedConnectorReaderMarker {
-    fn for_split(
-        split: &crate::fragment::ingress::ReceivedReadSplit,
-        enabled: bool,
-    ) -> Option<Self> {
+    fn for_split(split: &ReceivedReadSplit, enabled: bool) -> Option<Self> {
         if !enabled {
             return None;
         }
@@ -260,7 +258,7 @@ impl TypedConnectorReaderMarker {
 /// per-plan-node queue, so binding it never waits for enumeration.
 pub struct TypedConnectorScanSource {
     shared: Arc<TypedConnectorScanShared>,
-    queues: Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>,
+    queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
 }
 
 impl TypedConnectorScanSource {
@@ -270,7 +268,7 @@ impl TypedConnectorScanSource {
         provider: Arc<dyn ConnectorReadPageSourceProvider>,
         session: ConnectorSession,
         request: ConnectorRequestContext,
-        queues: Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>,
+        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         runtime_filter: RuntimeFilterSessionResolver,
@@ -472,7 +470,7 @@ impl ScanSource for TypedConnectorScanSource {
 /// One bound typed connector scan.
 pub struct TypedConnectorScanOp {
     shared: Arc<TypedConnectorScanShared>,
-    queue: Arc<SplitQueue<crate::fragment::ingress::ReceivedReadSplit>>,
+    queue: Arc<SplitQueue<ReceivedReadSplit>>,
     waiter: Arc<SplitWaiter>,
     sources: Arc<TypedPageSourceGroup>,
 }
@@ -576,7 +574,7 @@ impl ScanOp for TypedConnectorScanOp {
 /// The chunk stream of one driver over this scan's split queue.
 struct TypedConnectorSplitIter {
     shared: Arc<TypedConnectorScanShared>,
-    queue: Arc<SplitQueue<crate::fragment::ingress::ReceivedReadSplit>>,
+    queue: Arc<SplitQueue<ReceivedReadSplit>>,
     waiter: Arc<SplitWaiter>,
     sources: Arc<TypedPageSourceGroup>,
     /// The split currently being read. `None` between two splits.
@@ -586,10 +584,7 @@ struct TypedConnectorSplitIter {
 }
 
 impl TypedConnectorSplitIter {
-    fn open_page_source(
-        &mut self,
-        split: &crate::fragment::ingress::ReceivedReadSplit,
-    ) -> Result<(), String> {
+    fn open_page_source(&mut self, split: &ReceivedReadSplit) -> Result<(), String> {
         self.shared.check_liveness("page source open")?;
         let page_source = self
             .shared
@@ -1078,6 +1073,7 @@ pub(crate) mod test_support {
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::ConnectorExecutionReadBinding;
     use novarocks_spi::connector::read_stack::ConnectorValueType;
+    use novarocks_worker::read_attempt::TypedReadAttemptContext;
 
     pub(crate) fn encoded_payload(
         category: novarocks_spi::connector::ConnectorCodecCategory,
@@ -1426,7 +1422,7 @@ pub(crate) mod test_support {
             queues,
             session,
             std::sync::Arc::new(|| Ok(None)),
-            std::sync::Arc::new(crate::fragment::ingress::TypedReadAttemptContext::new()),
+            std::sync::Arc::new(TypedReadAttemptContext::new()),
             std::sync::Arc::new(NoVendedStorageResolver),
         )
     }
@@ -1693,18 +1689,13 @@ mod tests {
         SourcePage::try_new(positions, vec![column]).expect("valid page")
     }
 
-    fn scheduled_split(sequence_id: u64) -> crate::fragment::ingress::ReceivedReadSplit {
+    fn scheduled_split(sequence_id: u64) -> ReceivedReadSplit {
         let (evidence, split) =
             test_support::decoded_scheduled_split(NODE, sequence_id).into_parts();
-        crate::fragment::ingress::ReceivedReadSplit::new(
-            evidence.sequence_id(),
-            evidence.plan_node_id(),
-            split,
-        )
+        ReceivedReadSplit::new(evidence.sequence_id(), evidence.plan_node_id(), split)
     }
 
-    fn attempt_queues() -> Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>
-    {
+    fn attempt_queues() -> Arc<TaskAttemptSplitQueues<ReceivedReadSplit>> {
         let registry = SplitQueueRegistry::new();
         registry.open_attempt(
             TaskAttemptKey::new(
@@ -1733,7 +1724,7 @@ mod tests {
 
     fn source_with(
         provider: Arc<ScriptedProvider>,
-        queues: Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>,
+        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
         cancellation: Arc<dyn ConnectorCancellation>,
     ) -> TypedConnectorScanSource {
         TypedConnectorScanSource::new(

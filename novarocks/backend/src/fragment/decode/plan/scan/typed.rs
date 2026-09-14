@@ -223,7 +223,7 @@ struct TypedScanRuntimeInputs {
     catalog_read_execution: novarocks_worker::CatalogReadExecutionResolver,
     queues: Arc<
         novarocks_execution::connector::TaskAttemptSplitQueues<
-            crate::fragment::ingress::ReceivedReadSplit,
+            novarocks_worker::read_attempt::ReceivedReadSplit,
         >,
     >,
     session: novarocks_spi::connector::read_stack::ConnectorSession,

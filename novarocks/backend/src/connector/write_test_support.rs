@@ -330,7 +330,7 @@ pub(crate) fn test_write_scan_runtime(
         queues,
         session,
         Arc::new(|| Ok(None)),
-        Arc::new(crate::fragment::ingress::TypedReadAttemptContext::new()),
+        Arc::new(novarocks_worker::read_attempt::TypedReadAttemptContext::new()),
         Arc::new(NoVendedStorage),
     )
 }
