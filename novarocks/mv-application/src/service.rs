@@ -17,6 +17,7 @@
 
 //! Product-owned process lifecycle for materialized-view activity and workers.
 
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::activity::{
@@ -34,17 +35,55 @@ use crate::product::{
     MvProductResult, MvRefreshAttemptIdentity, MvTarget,
 };
 use crate::readiness::MvDropReadiness;
+use crate::scheduler::{MvRefreshScheduler, MvSchedulerConfig};
 
 /// The one process-local MV owner for activity admission and background-worker
 /// lifecycle. Hosts may inject effect callbacks, but cannot own a parallel
 /// gate, shutdown state, or worker supervisor.
-#[derive(Default)]
 pub struct MvProductService {
     activity_gate: MvActivityGate,
     background: MvBackgroundRuntimeOwner,
+    scheduler_config: MvSchedulerConfig,
+    scheduler: Mutex<MvRefreshScheduler>,
+}
+
+impl Default for MvProductService {
+    fn default() -> Self {
+        Self::new(MvSchedulerConfig::default())
+    }
 }
 
 impl MvProductService {
+    /// Construct the one product owner for this process' MV scheduler state.
+    /// The host may use the tick interval to arrange a wakeup, but the queue,
+    /// source revisions, retry ledger and terminal transitions remain here.
+    pub fn new(scheduler_config: MvSchedulerConfig) -> Self {
+        Self {
+            activity_gate: MvActivityGate::default(),
+            background: MvBackgroundRuntimeOwner::default(),
+            scheduler: Mutex::new(MvRefreshScheduler::new(scheduler_config.clone())),
+            scheduler_config,
+        }
+    }
+
+    pub fn scheduler_tick_interval_ms(&self) -> u64 {
+        self.scheduler_config.tick_interval_ms()
+    }
+
+    /// Run one provider-observation adapter transition against the single
+    /// product scheduler. The callback receives no clone or handle that could
+    /// retain scheduler state outside this process product owner.
+    pub fn with_refresh_scheduler<T>(
+        &self,
+        operation: impl FnOnce(&mut MvRefreshScheduler) -> T,
+    ) -> T {
+        let mut scheduler = self
+            .scheduler
+            .lock()
+            .expect("MV product scheduler state lock poisoned");
+        operation(&mut scheduler)
+    }
+
     /// Reserve the one immutable identity for a product refresh publication.
     /// Query and provider adapters may derive their wire values from it but
     /// cannot mint a second identity for the same product transition.
@@ -213,6 +252,7 @@ mod tests {
     };
     use crate::readiness::MvDropReadiness;
     use crate::repository::InitialMvRefreshConfiguration;
+    use crate::scheduler::MvSchedulerConfig;
     use bytes::Bytes;
     use novarocks_query_application::persisted_query_definition::{
         PersistedQueryDefinition, PersistedQueryDialect,
@@ -470,6 +510,14 @@ mod tests {
             ),
             Err(MvActivityGateError::Stopping)
         ));
+    }
+
+    #[test]
+    fn product_service_retains_the_configured_scheduler_instance() {
+        let service = MvProductService::new(MvSchedulerConfig::new(true, 73, 2, 11, 99));
+
+        assert_eq!(service.scheduler_tick_interval_ms(), 73);
+        assert!(service.with_refresh_scheduler(|scheduler| scheduler.enabled()));
     }
 
     #[test]

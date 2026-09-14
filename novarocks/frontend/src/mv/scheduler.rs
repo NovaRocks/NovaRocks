@@ -22,8 +22,9 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::repository::MvRepositoryError;
 use novarocks_mv_application::{
     product::MvTarget as ProductMvTarget,
-    scheduler::{MvRefreshScheduler, MvScheduledRefreshRequest, MvSchedulerConfig},
+    scheduler::MvScheduledRefreshRequest,
     scheduler_runtime::{MvRefreshDisposition, MvRefreshRuntimeDecision},
+    service::MvProductService,
 };
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
@@ -57,45 +58,33 @@ pub(crate) trait ScheduledRefreshRunner: Send + Sync {
     fn execute(&self, request: ScheduledRefreshRequest) -> ScheduledRefreshDisposition;
 }
 
-/// Frontend has no queue, backoff, source revision, or policy state. It only
-/// drives the product's explicit current-snapshot observation transition.
-#[derive(Debug)]
-pub(crate) struct FrontendMvScheduler {
-    product: MvRefreshScheduler,
-}
-
-impl FrontendMvScheduler {
-    pub(crate) fn new(config: MvSchedulerConfig) -> Self {
-        Self {
-            product: MvRefreshScheduler::new(config),
-        }
-    }
-
-    pub(crate) fn poll(
-        &mut self,
-        readiness: &MvReadinessPort,
-        engine: &dyn MvBackgroundEngine,
-        now_ms: i64,
-    ) -> Result<Vec<ScheduledRefreshRequest>, MvRepositoryError> {
-        if !self.product.enabled() {
+/// Drive the product-owned scheduler with exact outer observations. Frontend
+/// neither constructs nor retains queue, backoff, source-revision or policy
+/// state; it supplies the one provider snapshot read the product admits.
+pub(crate) fn poll(
+    product: &MvProductService,
+    readiness: &MvReadinessPort,
+    engine: &dyn MvBackgroundEngine,
+    now_ms: i64,
+) -> Result<Vec<ScheduledRefreshRequest>, MvRepositoryError> {
+    product.with_refresh_scheduler(|scheduler| {
+        if !scheduler.enabled() {
             return Ok(Vec::new());
         }
 
         for projection in readiness.list_ready_projections()? {
-            let Some(observation) = self
-                .product
-                .observe_definition(projection.definition, now_ms)
+            let Some(observation) = scheduler.observe_definition(projection.definition, now_ms)
             else {
                 continue;
             };
             let target = sql_target(observation.target());
             match engine.current_base_snapshots(&target) {
-                Ok(current_base_snapshots) => self.product.resolve_current_base_snapshots(
+                Ok(current_base_snapshots) => scheduler.resolve_current_base_snapshots(
                     observation,
                     current_base_snapshots,
                     now_ms,
                 ),
-                Err(error) => self.product.record_observation_failure(
+                Err(error) => scheduler.record_observation_failure(
                     &observation,
                     ScheduledRefreshDisposition::from_background_error(error),
                     now_ms,
@@ -103,8 +92,7 @@ impl FrontendMvScheduler {
             }
         }
 
-        Ok(self
-            .product
+        Ok(scheduler
             .take_ready()
             .into_iter()
             .map(|product| ScheduledRefreshRequest {
@@ -112,24 +100,26 @@ impl FrontendMvScheduler {
                 product,
             })
             .collect())
-    }
+    })
+}
 
-    pub(crate) fn mark_started(&mut self, mv_id: i64) -> bool {
-        self.product.mark_started(mv_id)
-    }
+pub(crate) fn mark_started(product: &MvProductService, mv_id: i64) -> bool {
+    product.with_refresh_scheduler(|scheduler| scheduler.mark_started(mv_id))
+}
 
-    pub(crate) fn requeue(&mut self, request: ScheduledRefreshRequest) {
-        self.product.requeue(request.product);
-    }
+pub(crate) fn requeue(product: &MvProductService, request: ScheduledRefreshRequest) {
+    product.with_refresh_scheduler(|scheduler| scheduler.requeue(request.product));
+}
 
-    pub(crate) fn complete(
-        &mut self,
-        request: &ScheduledRefreshRequest,
-        disposition: ScheduledRefreshDisposition,
-        now_ms: i64,
-    ) -> Result<ScheduledRefreshRuntimeDecision, MvRepositoryError> {
-        Ok(self.product.complete(&request.product, disposition, now_ms))
-    }
+pub(crate) fn complete(
+    product: &MvProductService,
+    request: &ScheduledRefreshRequest,
+    disposition: ScheduledRefreshDisposition,
+    now_ms: i64,
+) -> ScheduledRefreshRuntimeDecision {
+    product.with_refresh_scheduler(|scheduler| {
+        scheduler.complete(&request.product, disposition, now_ms)
+    })
 }
 
 fn sql_target(target: &ProductMvTarget) -> MvTarget {

@@ -52,7 +52,7 @@ use super::{
     create,
     maintenance_worker::{FrontendMaintenanceWorker, FrontendMaintenanceWorkerDependencies},
     refresh,
-    scheduler::{FrontendMvScheduler, ScheduledRefreshDisposition, ScheduledRefreshRequest},
+    scheduler::{self, ScheduledRefreshDisposition, ScheduledRefreshRequest},
 };
 
 /// Frontend composition and statement adapter for materialized-view products.
@@ -63,7 +63,6 @@ pub struct FrontendMvService {
     readiness: Arc<MvReadinessPort>,
     refresh: refresh::FrontendMvRefreshDependencies,
     product_service: Arc<MvProductService>,
-    scheduler_config: MvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
     execution_role: novarocks_types::ClusterRole,
@@ -104,8 +103,7 @@ impl FrontendMvService {
                 readiness: Arc::clone(&readiness),
             },
             readiness,
-            product_service: Arc::new(MvProductService::default()),
-            scheduler_config,
+            product_service: Arc::new(MvProductService::new(scheduler_config)),
             maintenance_config,
             table_maintenance_service,
             execution_role,
@@ -157,7 +155,6 @@ impl FrontendMvService {
             background_engine: bindings.engine,
             topology,
             role: self.execution_role,
-            scheduler_config: self.scheduler_config.clone(),
             maintenance_config: self.maintenance_config.clone(),
             table_maintenance_engine: bindings.table_maintenance_engine,
             table_maintenance_service,
@@ -292,7 +289,6 @@ struct RefreshWorkerDependencies {
     background_engine: Arc<dyn MvBackgroundEngine>,
     topology: BackendTopologyService,
     role: novarocks_types::ClusterRole,
-    scheduler_config: MvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
@@ -305,7 +301,12 @@ struct RefreshWorkerDependencies {
 fn start_background_workers(
     dependencies: RefreshWorkerDependencies,
 ) -> Result<MvBackgroundRuntime, MvBackgroundEngineError> {
-    let interval = Duration::from_millis(dependencies.scheduler_config.tick_interval_ms().max(1));
+    let interval = Duration::from_millis(
+        dependencies
+            .product_service
+            .scheduler_tick_interval_ms()
+            .max(1),
+    );
     let maintenance_interval =
         Duration::from_millis(dependencies.maintenance_config.tick_interval_ms.max(1));
     let maintenance = Arc::new(FrontendMaintenanceWorker::new(
@@ -322,19 +323,12 @@ fn start_background_workers(
         },
     ));
     let refresh_task_dependencies = dependencies;
-    let mut refresh_scheduler =
-        FrontendMvScheduler::new(refresh_task_dependencies.scheduler_config.clone());
     MvBackgroundRuntime::start(
         interval,
         maintenance_interval,
         MvBackgroundTasks::new(
             Box::new(move |stop, maintenance_wakeup_tx| {
-                run_refresh_event(
-                    &refresh_task_dependencies,
-                    &mut refresh_scheduler,
-                    stop,
-                    maintenance_wakeup_tx,
-                );
+                run_refresh_event(&refresh_task_dependencies, stop, maintenance_wakeup_tx);
             }),
             Box::new(move |_| {
                 if let Err(error) = maintenance.run_once(now_unix_millis()) {
@@ -357,24 +351,18 @@ fn lifecycle_error(error: impl std::fmt::Display) -> MvBackgroundEngineError {
 
 fn run_refresh_event(
     dependencies: &RefreshWorkerDependencies,
-    scheduler: &mut FrontendMvScheduler,
     stop: &MvBackgroundStop,
     maintenance_wakeup_tx: &std::sync::mpsc::SyncSender<()>,
 ) {
     let now_ms = now_unix_millis();
-    match scheduler.poll(
+    match scheduler::poll(
+        dependencies.product_service.as_ref(),
         dependencies.readiness.as_ref(),
         dependencies.background_engine.as_ref(),
         now_ms,
     ) {
         Ok(requests) => {
-            run_scheduled_refreshes(
-                dependencies,
-                scheduler,
-                requests,
-                stop,
-                maintenance_wakeup_tx,
-            );
+            run_scheduled_refreshes(dependencies, requests, stop, maintenance_wakeup_tx);
         }
         Err(error) => tracing::warn!(error = %error, "frontend MV scheduler poll failed"),
     }
@@ -382,14 +370,13 @@ fn run_refresh_event(
 
 fn run_scheduled_refreshes(
     dependencies: &RefreshWorkerDependencies,
-    scheduler: &mut FrontendMvScheduler,
     requests: Vec<ScheduledRefreshRequest>,
     stop: &MvBackgroundStop,
     maintenance_wakeup_tx: &std::sync::mpsc::SyncSender<()>,
 ) {
     for request in requests {
         if stop.is_requested() {
-            scheduler.requeue(request);
+            scheduler::requeue(dependencies.product_service.as_ref(), request);
             break;
         }
         let RootWork { owner, business } = match dependencies
@@ -400,7 +387,7 @@ fn run_scheduled_refreshes(
             Err(_) => {
                 // Draining is terminal for this process runtime. Preserve the
                 // coalesced request without creating a new refresh attempt.
-                scheduler.requeue(request);
+                scheduler::requeue(dependencies.product_service.as_ref(), request);
                 break;
             }
         };
@@ -410,7 +397,7 @@ fn run_scheduled_refreshes(
             ),
             Err(_) => {
                 finish_background_root(owner, business);
-                scheduler.requeue(request);
+                scheduler::requeue(dependencies.product_service.as_ref(), request);
                 break;
             }
         };
@@ -428,7 +415,7 @@ fn run_scheduled_refreshes(
             Ok(Some(lease)) => lease,
             Ok(None) => {
                 finish_background_root(owner, business);
-                scheduler.requeue(request);
+                scheduler::requeue(dependencies.product_service.as_ref(), request);
                 continue;
             }
             Err(_) => {
@@ -436,7 +423,10 @@ fn run_scheduled_refreshes(
                 continue;
             }
         };
-        if scheduler.mark_started(request.definition().mv_id) {
+        if scheduler::mark_started(
+            dependencies.product_service.as_ref(),
+            request.definition().mv_id,
+        ) {
             // The scheduler has already bounded this batch. Execute its
             // transitions on this event loop rather than creating an OS thread
             // for every due MV. Keeping the activity lease and governed root local
@@ -453,9 +443,13 @@ fn run_scheduled_refreshes(
                     "frontend MV scheduler refresh did not complete"
                 );
             }
-            if let Err(error) = scheduler.complete(&request, disposition, now_unix_millis()) {
-                tracing::warn!(mv_id = request.definition().mv_id, error = %error, "persist frontend MV scheduler outcome failed");
-            } else if completed {
+            let _decision = scheduler::complete(
+                dependencies.product_service.as_ref(),
+                &request,
+                disposition,
+                now_unix_millis(),
+            );
+            if completed {
                 let _ = maintenance_wakeup_tx.try_send(());
             }
             // Release the activity lease only after the scheduler terminal is
@@ -464,7 +458,7 @@ fn run_scheduled_refreshes(
             finish_background_root(owner, business);
         } else {
             finish_background_root(owner, business);
-            scheduler.requeue(request);
+            scheduler::requeue(dependencies.product_service.as_ref(), request);
         }
     }
 }
