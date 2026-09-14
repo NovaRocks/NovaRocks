@@ -190,70 +190,6 @@ impl NativeFragmentQueryRuntime {
         Ok(lease)
     }
 
-    /// Legacy native admission retained for non-lifecycle test fixtures. The
-    /// distributed backend always calls the attempt-aware variant above.
-    #[allow(
-        dead_code,
-        reason = "Legacy admission remains available to non-lifecycle native fragment test fixtures."
-    )]
-    pub fn prepare_admission(
-        &self,
-        query_id: QueryId,
-        fragment_instance_id: UniqueId,
-        delivery_expire: Duration,
-        query_expire: Duration,
-        runtime_filter: Option<RuntimeFilterSessionRef>,
-    ) -> Result<NativeFragmentAdmissionResources, String> {
-        self.manager
-            .ensure_native_context(query_id, false, delivery_expire, query_expire)?;
-        let query_mem_tracker = self
-            .manager
-            .query_mem_tracker(query_id)
-            .ok_or_else(|| "QueryContext missing mem_tracker".to_string())?;
-        let fragment_label = format!(
-            "fragment_{:x}_{:x}",
-            fragment_instance_id.high(),
-            fragment_instance_id.low()
-        );
-        let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
-        Ok(NativeFragmentAdmissionResources {
-            query_mem_tracker,
-            fragment_mem_tracker,
-            runtime_filter,
-            scan_registration: self.scan_registration_port(),
-        })
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Legacy registration remains available to non-lifecycle native fragment test fixtures."
-    )]
-    pub fn register_fragment(
-        &self,
-        query_id: QueryId,
-        fragment_instance_id: UniqueId,
-        delivery_expire: Duration,
-        query_expire: Duration,
-    ) -> Result<NativeFragmentRegistrationLease, String> {
-        self.manager
-            .get_or_register_native(query_id, false, delivery_expire, query_expire)?;
-        self.manager.register_finst(fragment_instance_id, query_id);
-        Ok(NativeFragmentRegistrationLease {
-            runtime: self.clone(),
-            execution: QueryExecutionKey::native(query_id),
-            fragment_instance_id,
-            active: true,
-        })
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Legacy cancellation remains available to non-lifecycle native fragment test fixtures."
-    )]
-    pub fn cancel_query(&self, query_id: QueryId, reason: String) -> Vec<UniqueId> {
-        self.manager.cancel_query(query_id, reason)
-    }
-
     pub fn cancel_execution(
         &self,
         execution_id: QueryExecutionId,
@@ -286,14 +222,6 @@ impl NativeFragmentQueryRuntime {
         self.manager
             .finish_fragment_execution(execution_key(execution_id));
         self.publish_resource_snapshot();
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Legacy unregistration remains available to non-lifecycle native fragment test fixtures."
-    )]
-    pub fn unregister_fragment(&self, fragment_instance_id: UniqueId) {
-        self.manager.unregister_finst(fragment_instance_id);
     }
 
     pub fn unregister_fragment_execution(
@@ -547,41 +475,5 @@ mod tests {
             .request_grant(4096)
             .expect("the account policy must still have its whole limit available");
         admitted.query_mem_tracker().release(8192);
-    }
-
-    #[test]
-    fn pre_start_registration_lease_drop_rolls_back_only_its_fragment() {
-        let manager = QueryContextManager::new_for_test();
-        let runtime = NativeFragmentQueryRuntime {
-            manager: manager.clone(),
-            memory_authority: crate::application::test_memory_authority(),
-        };
-        let query_id = QueryId::new(91_001, 91_002);
-        let first = UniqueId::new(91_003, 1);
-        let second = UniqueId::new(91_003, 2);
-
-        let first_registration = runtime
-            .register_fragment(
-                query_id,
-                first,
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-            )
-            .expect("register first fragment");
-        let second_registration = runtime
-            .register_fragment(
-                query_id,
-                second,
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-            )
-            .expect("register second fragment");
-
-        drop(second_registration);
-        assert_eq!(manager.fragment_counts_for_test(query_id), Some((1, 1)));
-        assert_eq!(manager.query_id_by_finst(first), Some(query_id));
-        assert_eq!(manager.query_id_by_finst(second), None);
-
-        first_registration.into_running();
     }
 }
