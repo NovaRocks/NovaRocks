@@ -985,6 +985,12 @@ fn wait_for_rows(
         }
         if context.remaining(action).is_err() {
             let observed = conn.query::<(i32, i64), _>(sql).ok();
+            // Keep the controlled fixture result in the structured evidence so
+            // an asynchronous refresh timeout remains diagnosable after the
+            // harness redacts its full process-log diagnostic.
+            context.action(format!(
+                "{action} timed out with observed rows {observed:?}"
+            ));
             bail!(
                 "timed out waiting for {action}; expected={expected:?}; observed={observed:?}; {}",
                 context.diagnostics()
