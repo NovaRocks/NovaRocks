@@ -29,6 +29,9 @@ use std::sync::Arc;
 use novarocks_native_trust::NativeTrust;
 
 #[cfg(any(test, feature = "test-support"))]
+use novarocks_memory::MemoryAuthority;
+
+#[cfg(any(test, feature = "test-support"))]
 use crate::{BackendDataRuntime, BackendNativeTransport};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -64,6 +67,21 @@ pub fn test_backend_native_trust() -> Arc<NativeTrust> {
         NativeCallerSubject::parse("be@127.0.0.1:9070").expect("valid subject"),
         NativeTransportMode::Disabled,
     ))
+}
+
+/// A real, small memory authority for Native adapter tests and Backend role
+/// tests that construct the adapter's query runtime.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_memory_authority() -> Arc<MemoryAuthority> {
+    const BOUND: u64 = 64 * 1024 * 1024;
+    Arc::new(
+        MemoryAuthority::new(novarocks_memory::AuthorityConfig::new(
+            BOUND,
+            BOUND - BOUND / 4,
+            BOUND / 4,
+        ))
+        .expect("the test partition must be valid"),
+    )
 }
 
 #[cfg(test)]

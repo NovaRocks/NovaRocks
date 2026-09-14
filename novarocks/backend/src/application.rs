@@ -290,23 +290,6 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
     }
 }
 
-/// A real, small memory authority for backend tests.
-///
-/// Backend tests build the production types, so they build the production
-/// authority too: a stub here would let a wiring mistake reach the role.
-#[cfg(test)]
-pub(crate) fn test_memory_authority() -> Arc<MemoryAuthority> {
-    const BOUND: u64 = 64 * 1024 * 1024;
-    Arc::new(
-        MemoryAuthority::new(novarocks_memory::AuthorityConfig::new(
-            BOUND,
-            BOUND - BOUND / 4,
-            BOUND / 4,
-        ))
-        .expect("the test partition must be valid"),
-    )
-}
-
 struct BackendExecutionRuntimeInput {
     config: ExecutionRuntimeConfig,
     function_set: Arc<SealedExecutionFunctionSet>,
@@ -929,7 +912,8 @@ mod tests {
 
     fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         BackendServerConfig {
-            memory_authority: crate::application::test_memory_authority(),
+            memory_authority: novarocks_native_adapter::backend_test_support::test_memory_authority(
+            ),
             bind_host: "127.0.0.1".to_string(),
             grpc_port,
             metrics_http_port: unused_port(),
@@ -1002,7 +986,7 @@ mod tests {
             BackendExecutionRuntimeInput::new(
                 execution_runtime_config(),
                 test_execution_function_set(),
-                crate::application::test_memory_authority(),
+                novarocks_native_adapter::backend_test_support::test_memory_authority(),
             ),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ConfidentialTransport::Plaintext,

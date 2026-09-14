@@ -48,7 +48,7 @@ fn test_execution_function_set()
 
 fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
     BackendServerConfig {
-        memory_authority: crate::application::test_memory_authority(),
+        memory_authority: novarocks_native_adapter::backend_test_support::test_memory_authority(),
         bind_host: "127.0.0.1".to_string(),
         grpc_port,
         metrics_http_port: unused_port(),

@@ -3,6 +3,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::native_fragment_query::NativeFragmentQueryRuntime;
     use novarocks_execution::exec::expr::agg::{
         ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
     };
@@ -11,7 +12,6 @@ mod tests {
     };
     use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
     use novarocks_execution::runtime::runtime_state::RuntimeState;
-    use novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::{QueryId, UniqueId};
     use novarocks_worker::query_context::QueryContextManager;
@@ -52,7 +52,7 @@ mod tests {
             ExecutionRuntime::new(
                 config,
                 function_set,
-                crate::application::test_memory_authority(),
+                crate::backend_test_support::test_memory_authority(),
             )
             .expect("execution runtime"),
         )
@@ -71,7 +71,7 @@ mod tests {
         let manager = QueryContextManager::new_for_test();
         let runtime = NativeFragmentQueryRuntime::new_for_test(
             manager.clone(),
-            crate::application::test_memory_authority(),
+            crate::backend_test_support::test_memory_authority(),
         );
         let query_id = QueryId::new(91_101, 91_102);
         let execution_id =
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn the_query_limit_lands_on_the_account_as_well_as_the_tracker() {
         let manager = QueryContextManager::new_for_test();
-        let authority = crate::application::test_memory_authority();
+        let authority = crate::backend_test_support::test_memory_authority();
         let runtime =
             NativeFragmentQueryRuntime::new_for_test(manager.clone(), Arc::clone(&authority));
         let query_id = QueryId::new(91_201, 91_202);
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn the_account_policy_refuses_nothing_while_charges_still_live_on_the_tracker() {
         let manager = QueryContextManager::new_for_test();
-        let authority = crate::application::test_memory_authority();
+        let authority = crate::backend_test_support::test_memory_authority();
         let runtime =
             NativeFragmentQueryRuntime::new_for_test(manager.clone(), Arc::clone(&authority));
         let query_id = QueryId::new(91_301, 91_302);
@@ -230,7 +230,7 @@ mod tests {
         let manager = QueryContextManager::new_for_test();
         let runtime = NativeFragmentQueryRuntime::new_for_test(
             manager,
-            crate::application::test_memory_authority(),
+            crate::backend_test_support::test_memory_authority(),
         );
         let execution_id =
             QueryExecutionId::new(query_id, AttemptId::new(1).expect("nonzero attempt"))

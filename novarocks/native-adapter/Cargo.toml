@@ -48,4 +48,6 @@ protoc-bin-vendored.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+novarocks-sql.workspace = true
+novarocks-worker = { workspace = true, features = ["test-support"] }
 sha2.workspace = true

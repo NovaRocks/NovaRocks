@@ -1794,7 +1794,7 @@ mod tests {
                     sink_io_max_blocking_threads: 1,
                 },
                 function_set,
-                crate::application::test_memory_authority(),
+                novarocks_native_adapter::backend_test_support::test_memory_authority(),
             )
             .expect("test execution runtime"),
         )
@@ -1806,7 +1806,9 @@ mod tests {
         let completion_supervisor =
             TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
         NativeTaskExecutionHost::new(
-            NativeFragmentQueryRuntime::global(crate::application::test_memory_authority()),
+            NativeFragmentQueryRuntime::global(
+                novarocks_native_adapter::backend_test_support::test_memory_authority(),
+            ),
             facts,
             TaskInboundCapabilities::new(),
             novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(data_runtime),

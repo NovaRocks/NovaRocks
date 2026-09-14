@@ -55,6 +55,8 @@ pub mod native_client;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
 pub mod native_fragment_query;
+#[cfg(test)]
+mod native_fragment_query_tests;
 pub mod native_server;
 pub use native_server::NativeRpcServerHandle;
 pub mod query_options;
