@@ -19,10 +19,6 @@ use super::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
     FrontendExecutionConfig,
 };
-use crate::view::{
-    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
-    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
-};
 use crate::{state_store::testing as state_store_fixture, topology::ClusterBackendOpenConfig};
 use bytes::Bytes;
 use novarocks_native_adapter::FrontendNativeTransport;
@@ -33,6 +29,10 @@ use novarocks_parser::{
     ast::{Query, Statement as ParsedStatement},
     parse as parse_typed_statement,
     printer::print_query,
+};
+use novarocks_query_application::view::{
+    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
+    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
 use novarocks_secret::SecretValue;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
@@ -323,7 +323,7 @@ async fn shared_test_provider_allows_multiple_live_hosts() {
 
 #[test]
 fn local_view_service_does_not_restore_state_across_process_instances() {
-    let host = crate::view::FrontendViewService::new();
+    let host = crate::view::QueryViewService::new();
     execute_view_statement(
         &host,
         &SessionViewEngine,
@@ -340,7 +340,7 @@ fn local_view_service_does_not_restore_state_across_process_instances() {
     );
     // A local view is process runtime state: it ends with the process instance
     // that defined it. Durable views live in an external catalog.
-    let reopened = crate::view::FrontendViewService::new();
+    let reopened = crate::view::QueryViewService::new();
     let mut query = parse_query("SELECT * FROM local_view");
     reopened
         .rewrite_query(&SessionViewEngine, &mut query, view_context())

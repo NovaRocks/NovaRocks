@@ -29,6 +29,8 @@ use novarocks_spi::connector::{ConnectorRequestContext, DropPolicy};
 use crate::api::QueryResult;
 use crate::persisted_query_definition::PersistedQueryDefinition;
 
+pub use crate::view_service::QueryViewService;
+
 #[derive(Clone, Copy)]
 pub struct ViewRequestContext<'a> {
     pub current_catalog: Option<&'a str>,

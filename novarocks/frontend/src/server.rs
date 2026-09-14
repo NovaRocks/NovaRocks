@@ -285,7 +285,7 @@ async fn build_frontend_role_products(
     let role = host.execution_role();
     let mv_repository = host.mv_repository_for_role_product_construction();
     let view_service: Arc<dyn crate::view::ViewService> =
-        Arc::new(crate::view::FrontendViewService::new());
+        Arc::new(crate::view::QueryViewService::new());
     let dml_service = Arc::new(crate::dml::DmlService::new());
     let maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService> =
         Arc::new(

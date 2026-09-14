@@ -19,19 +19,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::{
-    CreateExternalViewRequest, ExternalViewResolution, FrontendViewService, ResolvedExternalView,
-    ViewColumnDefinition, ViewEngine, ViewRequestContext, ViewService, ViewStatementResult,
-    ViewTarget,
+use crate::api::QueryResult;
+use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
+use crate::view::{
+    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
+    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
+use crate::view_service::QueryViewService;
 use arrow::array::{Array, StringArray};
 use novarocks_parser::{
     Span,
     ast::{Ident, ObjectName, Query, SetExpr, Statement as ParsedStatement, TypeName},
     printer::print_query,
-};
-use novarocks_query_application::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorRequestContext};
 
@@ -253,7 +252,7 @@ trait ViewServiceTestExt {
     ) -> Result<Option<ViewStatementResult>, String>;
 }
 
-impl ViewServiceTestExt for FrontendViewService {
+impl ViewServiceTestExt for QueryViewService {
     fn try_handle_statement(
         &self,
         engine: &dyn ViewEngine,
@@ -276,16 +275,14 @@ fn parse_query(sql: &str) -> Query {
     query.clone()
 }
 
-fn query_result(
-    result: Option<ViewStatementResult>,
-) -> novarocks_query_application::api::QueryResult {
+fn query_result(result: Option<ViewStatementResult>) -> QueryResult {
     let Some(ViewStatementResult::Query(result)) = result else {
         panic!("expected query result");
     };
     result
 }
 
-fn query_rows(result: &novarocks_query_application::api::QueryResult) -> Vec<String> {
+fn query_rows(result: &QueryResult) -> Vec<String> {
     result
         .batches
         .iter()
@@ -302,10 +299,7 @@ fn query_rows(result: &novarocks_query_application::api::QueryResult) -> Vec<Str
         .collect()
 }
 
-fn query_rows_at(
-    result: &novarocks_query_application::api::QueryResult,
-    column: usize,
-) -> Vec<String> {
+fn query_rows_at(result: &QueryResult, column: usize) -> Vec<String> {
     result
         .batches
         .iter()
@@ -324,7 +318,7 @@ fn query_rows_at(
 
 #[test]
 fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
     let ctx = context(None, "db");
 
@@ -373,7 +367,7 @@ fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
 
 #[test]
 fn default_catalog_one_two_and_three_part_names_share_session_registry() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
 
     service
@@ -412,7 +406,7 @@ fn default_catalog_one_two_and_three_part_names_share_session_registry() {
 
 #[test]
 fn session_view_rewrite_uses_its_frozen_creation_database() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
 
     service
@@ -435,7 +429,7 @@ fn session_view_rewrite_uses_its_frozen_creation_database() {
 
 #[test]
 fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     let shadow = ViewTarget {
         catalog: "ice".to_string(),
@@ -507,7 +501,7 @@ fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
 
 #[test]
 fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     let target = ViewTarget {
         catalog: "ice".to_string(),
@@ -568,7 +562,7 @@ fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
 
 #[test]
 fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     service
         .try_handle_statement(
@@ -632,7 +626,7 @@ fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
 
 #[test]
 fn session_cte_shadows_a_same_named_session_view() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
     service
         .try_handle_statement(
@@ -654,7 +648,7 @@ fn session_cte_shadows_a_same_named_session_view() {
 
 #[test]
 fn session_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
     for view in ["nested", "first", "second"] {
         service
@@ -687,7 +681,7 @@ fn session_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
 
 #[test]
 fn external_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     for view in ["nested", "first", "second"] {
         engine.insert_view(
@@ -722,7 +716,7 @@ fn external_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
 
 #[test]
 fn external_view_qualification_preserves_ctes_inside_nested_queries() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     engine.insert_view(
         ViewTarget {
@@ -746,7 +740,7 @@ fn external_view_qualification_preserves_ctes_inside_nested_queries() {
 
 #[test]
 fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_control_result() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     let table = ViewTarget {
         catalog: "ice".to_string(),
@@ -805,7 +799,7 @@ fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_control_resu
 
 #[test]
 fn dropping_external_database_does_not_remove_default_catalog_views() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
     service
         .try_handle_statement(
@@ -837,7 +831,7 @@ fn local_views_do_not_exist_on_a_new_service_instance() {
     // The durable half of this case retired with `ViewRepository`. A local view
     // is process runtime state, so the observable contract is the opposite one:
     // a new service instance starts from an empty registry.
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
     service
         .try_handle_statement(
@@ -853,7 +847,7 @@ fn local_views_do_not_exist_on_a_new_service_instance() {
     assert_eq!(print_query(&visible), "SELECT * FROM (SELECT 1 AS a) v");
     drop(service);
 
-    let restarted = FrontendViewService::new();
+    let restarted = QueryViewService::new();
     let mut absent = parse_query("SELECT * FROM v");
     restarted
         .rewrite_query(&engine, &mut absent, context(None, "db"))
@@ -873,7 +867,7 @@ fn local_views_do_not_exist_on_a_new_service_instance() {
 
 #[test]
 fn starrocks_view_sql_uses_the_same_parser_for_local_and_external_views() {
-    let service = FrontendViewService::new();
+    let service = QueryViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     service
         .try_handle_statement(

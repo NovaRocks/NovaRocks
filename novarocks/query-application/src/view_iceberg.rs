@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::{
     CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
 };
@@ -22,15 +23,12 @@ use novarocks_parser::{
     ast::{CreateView, ObjectName},
     printer,
 };
-use novarocks_query_application::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
 use novarocks_spi::connector::DropPolicy;
 use novarocks_types::naming::normalize_identifier;
 
-use super::{DEFAULT_CATALOG, build_query_result};
+use crate::view_service::{DEFAULT_CATALOG, build_query_result, parse_query};
 
-pub(super) fn resolve_external_target_parts(
+pub(crate) fn resolve_external_target_parts(
     _engine: &dyn ViewEngine,
     parts: &[String],
     context: ViewRequestContext<'_>,
@@ -67,7 +65,7 @@ pub(super) fn resolve_external_target_parts(
     Ok(Some(target))
 }
 
-pub(super) fn create_external_view(
+pub(crate) fn create_external_view(
     engine: &dyn ViewEngine,
     target: ViewTarget,
     statement: &CreateView,
@@ -83,10 +81,8 @@ pub(super) fn create_external_view(
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,
     )?;
-    let mut analyzed_query = super::parse_query(&definition.raw_query_source)?
-        .as_ref()
-        .clone();
-    super::rewrite::expand_external_views(
+    let mut analyzed_query = parse_query(&definition.raw_query_source)?.as_ref().clone();
+    crate::view_rewrite::expand_external_views(
         engine,
         &mut analyzed_query,
         ViewRequestContext {
@@ -141,7 +137,7 @@ fn literal_to_string(literal: &novarocks_parser::ast::Literal) -> String {
     }
 }
 
-pub(super) fn drop_external_view(
+pub(crate) fn drop_external_view(
     engine: &dyn ViewEngine,
     target: &ViewTarget,
     if_exists: bool,
@@ -161,7 +157,7 @@ pub(super) fn drop_external_view(
     )
 }
 
-pub(super) fn show_create_view(
+pub(crate) fn show_create_view(
     engine: &dyn ViewEngine,
     name: &ObjectName,
     context: ViewRequestContext<'_>,

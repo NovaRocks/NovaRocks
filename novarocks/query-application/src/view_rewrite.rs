@@ -25,12 +25,12 @@ use novarocks_parser::{
     ast::{Ident, ObjectName, Query, SetExpr, Statement, TableAlias, TableFactor},
 };
 
-use super::iceberg::resolve_external_target_parts;
-use super::{DEFAULT_CATALOG, SessionViewKey, StoredView};
+use crate::view_iceberg::resolve_external_target_parts;
+use crate::view_service::{DEFAULT_CATALOG, SessionViewKey, StoredView};
 
 type ExternalViewKey = (String, String, String);
 
-pub(super) fn expand_session_views(
+pub(crate) fn expand_session_views(
     query: &mut Query,
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
@@ -204,7 +204,7 @@ fn session_key(catalog: &str, database: &str, view: &str) -> SessionViewKey {
     }
 }
 
-pub(super) fn expand_external_views(
+pub(crate) fn expand_external_views(
     engine: &dyn ViewEngine,
     query: &mut Query,
     context: ViewRequestContext<'_>,
