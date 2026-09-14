@@ -39,11 +39,11 @@ impl TaskProtocolObserver for BackendTaskExecutionPorts {
 
 impl TaskResultLifecycle for BackendTaskExecutionPorts {
     fn discard_task(&self, identity: TaskIdentity) {
-        crate::runtime::result_buffer::discard_task(identity);
+        novarocks_worker::result_buffer::discard_task(identity);
     }
 
     fn retire_task_result(&self, identity: TaskIdentity) {
-        crate::runtime::result_buffer::retire_task_result(identity);
+        novarocks_worker::result_buffer::retire_task_result(identity);
     }
 }
 

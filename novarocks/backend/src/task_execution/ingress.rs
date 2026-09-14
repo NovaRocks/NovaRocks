@@ -278,10 +278,10 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
         &self,
         request: TaskResultReadRequest,
     ) -> Result<TaskResultRead, TaskResultReadError> {
-        use crate::runtime::result_buffer::{
+        use novarocks_native_adapter::task_result_diagnostics::emit_task_fetch_marker;
+        use novarocks_worker::result_buffer::{
             TryFetchTypedResult, replays_task_terminal_ack, wait_fetch_task_typed,
         };
-        use novarocks_native_adapter::task_result_diagnostics::emit_task_fetch_marker;
         use proto::fetch_result_response::Status as FetchStatus;
 
         let identity = request.identity();

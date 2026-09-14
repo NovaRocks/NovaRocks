@@ -396,7 +396,7 @@ fn compose_backend_application_services(
         data_runtime.clone(),
     ));
     let inbound_capabilities = novarocks_worker::TaskInboundCapabilities::new();
-    let result_retained_budget = crate::runtime::result_buffer::ResultRetainedBudget::new(
+    let result_retained_budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(
         result_retained_limits.per_process(),
     );
     let task_execution_registry_config = TaskExecutionRegistryConfig::for_process(

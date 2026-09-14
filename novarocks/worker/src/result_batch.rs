@@ -68,10 +68,10 @@ impl ResultBatch {
     reason = "Legacy fetch results are retained for protocol adapters outside the backend lib test configuration."
 )]
 #[derive(Clone, Debug)]
-pub(crate) struct FetchResult {
-    pub(crate) packet_seq: i64,
-    pub(crate) eos: bool,
-    pub(crate) result_batch: ResultBatch,
+pub struct FetchResult {
+    pub packet_seq: i64,
+    pub eos: bool,
+    pub result_batch: ResultBatch,
 }
 
 #[cfg(test)]

@@ -1,9 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::runtime::result_buffer::{
-    ResultBufferKey, ResultBufferWriteHandle, ResultPublication, ResultRetainedBudget,
-};
 use novarocks_execution::runtime::exchange;
 use novarocks_execution::runtime::fragment::io::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentResultSession,
@@ -11,6 +8,9 @@ use novarocks_execution::runtime::fragment::io::{
     ResultWriteSpec,
 };
 use novarocks_execution::runtime::observable::Observable;
+use novarocks_worker::result_buffer::{
+    ResultBufferKey, ResultBufferWriteHandle, ResultPublication, ResultRetainedBudget,
+};
 
 pub(crate) fn native_result_writer(
     retained_budget: Arc<ResultRetainedBudget>,

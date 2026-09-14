@@ -43,6 +43,8 @@ mod observation;
 mod operation;
 mod receipt;
 mod reliable_transport;
+pub mod result_batch;
+pub mod result_buffer;
 mod runtime_filter_error;
 mod status;
 mod task_completion;

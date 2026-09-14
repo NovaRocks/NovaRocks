@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::runtime::result_batch::{FetchResult, ResultBatch};
+use crate::result_batch::{FetchResult, ResultBatch};
 use bytes::Bytes;
 use novarocks_execution::runtime::exchange::BoundedExchangePayload;
 use novarocks_execution::runtime::fragment::io::{
@@ -39,7 +39,7 @@ enum ResultBufferMode {
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ResultBufferKey {
+pub enum ResultBufferKey {
     LegacyFragment(UniqueId),
     Task(TaskIdentity),
 }
@@ -75,7 +75,7 @@ pub struct ResultBufferWriteHandle {
     retained_budget: Arc<ResultRetainedBudget>,
 }
 
-pub(crate) struct ResultRetainedBudget {
+pub struct ResultRetainedBudget {
     process_byte_cap: usize,
     state: Mutex<ResultRetainedState>,
     writable: Arc<Observable>,
@@ -89,7 +89,7 @@ struct ResultRetainedState {
 }
 
 impl ResultRetainedBudget {
-    pub(crate) fn new(process_byte_cap: NonZeroUsize) -> Arc<Self> {
+    pub fn new(process_byte_cap: NonZeroUsize) -> Arc<Self> {
         Arc::new(Self {
             process_byte_cap: process_byte_cap.get(),
             state: Mutex::new(ResultRetainedState::default()),
@@ -526,10 +526,10 @@ fn fetch_result_bytes(result: &FetchResult) -> usize {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TypedFetchResult {
-    pub(crate) packet_seq: i64,
-    pub(crate) eos: bool,
-    pub(crate) payload: Bytes,
+pub struct TypedFetchResult {
+    pub packet_seq: i64,
+    pub eos: bool,
+    pub payload: Bytes,
 }
 
 #[derive(Debug)]
@@ -627,10 +627,7 @@ fn insert_with_credit(
     dead_code,
     reason = "Legacy fragment-addressed insertion remains for compatibility adapters and tests."
 )]
-pub(crate) fn insert_typed(
-    finst_id: UniqueId,
-    payload: Vec<u8>,
-) -> Result<ResultPublication, String> {
+pub fn insert_typed(finst_id: UniqueId, payload: Vec<u8>) -> Result<ResultPublication, String> {
     insert_typed_with_credit(
         ResultBufferKey::LegacyFragment(finst_id),
         Bytes::from(payload),
@@ -638,8 +635,8 @@ pub(crate) fn insert_typed(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn insert_task_typed(
+#[cfg(any(test, feature = "test-support"))]
+pub fn insert_task_typed(
     identity: TaskIdentity,
     payload: Vec<u8>,
 ) -> Result<ResultPublication, String> {
@@ -683,8 +680,8 @@ pub(crate) fn close_ok(finst_id: UniqueId) -> ResultPublication {
     close_ok_for_key(ResultBufferKey::LegacyFragment(finst_id))
 }
 
-#[cfg(test)]
-pub(crate) fn close_task_ok(identity: TaskIdentity) -> ResultPublication {
+#[cfg(any(test, feature = "test-support"))]
+pub fn close_task_ok(identity: TaskIdentity) -> ResultPublication {
     close_ok_for_key(ResultBufferKey::Task(identity))
 }
 
@@ -798,8 +795,8 @@ pub(crate) fn create_typed_sender(finst_id: UniqueId) {
     block.fail_mode_mismatch(ResultBufferMode::Typed);
 }
 
-#[cfg(test)]
-pub(crate) fn create_task_typed_sender(identity: TaskIdentity) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn create_task_typed_sender(identity: TaskIdentity) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
     let block = guard
@@ -835,22 +832,19 @@ fn try_create_sender_with_key_mode(
     Ok(())
 }
 
-#[allow(
-    dead_code,
-    reason = "Legacy fragment-addressed cleanup remains for compatibility adapters and tests."
-)]
-pub(crate) fn discard(finst_id: UniqueId) -> ResultPublication {
+#[cfg(any(test, feature = "test-support"))]
+pub fn discard(finst_id: UniqueId) -> ResultPublication {
     discard_key(ResultBufferKey::LegacyFragment(finst_id))
 }
 
-pub(crate) fn discard_task(identity: TaskIdentity) -> ResultPublication {
+pub fn discard_task(identity: TaskIdentity) -> ResultPublication {
     discard_key(ResultBufferKey::Task(identity))
 }
 
 /// Retires one task's result payload while preserving only an acknowledged EOS
 /// replay record. The record is zero-byte and is reclaimed with the owning
 /// context or the task retention fence.
-pub(crate) fn retire_task_result(identity: TaskIdentity) -> ResultPublication {
+pub fn retire_task_result(identity: TaskIdentity) -> ResultPublication {
     let key = ResultBufferKey::Task(identity);
     let c = ctx();
     let removed = {
@@ -873,7 +867,7 @@ pub(crate) fn retire_task_result(identity: TaskIdentity) -> ResultPublication {
 ///
 /// This read is intentionally sequence-sensitive. It is used only after the
 /// task registry has proved that the retired task owned the root result.
-pub(crate) fn replays_task_terminal_ack(
+pub fn replays_task_terminal_ack(
     identity: TaskIdentity,
     acknowledged_packet_seq: Option<i64>,
 ) -> bool {
@@ -958,7 +952,7 @@ pub enum TryFetchResult {
 }
 
 #[derive(Debug)]
-pub(crate) enum TryFetchTypedResult {
+pub enum TryFetchTypedResult {
     Ready(TypedFetchResult),
     EndAcknowledged,
     NotReady,
@@ -1244,7 +1238,7 @@ async fn wait_fetch_typed_for_key(
     }
 }
 
-pub(crate) async fn wait_fetch_task_typed(
+pub async fn wait_fetch_task_typed(
     identity: TaskIdentity,
     acknowledged_packet_seq: Option<i64>,
     max_wait: Duration,
@@ -1274,48 +1268,18 @@ async fn wait_fetch_typed(
     .await
 }
 
-#[allow(
-    dead_code,
-    reason = "Legacy fetch timeout fallback remains available to protocol adapters outside this target."
-)]
-fn fallback_fetch_wait_timeout() -> Duration {
-    Duration::from_secs(300)
-}
-
-#[allow(
-    dead_code,
-    reason = "Legacy fetch timeout lookup remains available to protocol adapters outside this target."
-)]
-pub fn fetch_wait_timeout(finst_id: UniqueId) -> Duration {
-    use crate::runtime::query_context::query_context_manager;
-
-    query_context_manager()
-        .get_query_timeout_by_finst(finst_id)
-        .unwrap_or_else(fallback_fetch_wait_timeout)
-}
-
-#[allow(
-    dead_code,
-    reason = "Legacy millisecond timeout lookup remains available to protocol adapters outside this target."
-)]
-pub fn fetch_wait_timeout_ms(finst_id: UniqueId) -> i64 {
-    let millis = fetch_wait_timeout(finst_id).as_millis();
-    i64::try_from(millis).unwrap_or(i64::MAX).max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::query_context::query_context_manager;
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field};
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use novarocks_execution::runtime::exchange::encode_chunks_bounded;
     use novarocks_execution::runtime::fragment::io::ResultAbort;
+    use novarocks_types::SlotId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId as NativeQueryId, StageId, TaskId,
     };
-    use novarocks_types::{QueryId, SlotId};
 
     fn test_result_cap() -> NonZeroUsize {
         NonZeroUsize::new(1024 * 1024).expect("nonzero test result cap")
@@ -1650,26 +1614,6 @@ mod tests {
         };
         assert_eq!(batch.packet_seq, 0);
         assert_eq!(batch.result_batch.rows.len(), 1);
-    }
-
-    #[test]
-    fn fetch_wait_timeout_prefers_query_context() {
-        let query_id = QueryId::new(101, 202);
-        let finst_id = UniqueId::new(303, 404);
-        let mgr = query_context_manager();
-        mgr.ensure_native_context(
-            query_id,
-            false,
-            Duration::from_secs(5),
-            Duration::from_secs(12),
-        )
-        .expect("ensure query context");
-        mgr.register_finst(finst_id, query_id);
-
-        assert_eq!(fetch_wait_timeout_ms(finst_id), 12_000);
-
-        mgr.unregister_finst(finst_id);
-        mgr.finish_fragment(query_id);
     }
 
     #[test]

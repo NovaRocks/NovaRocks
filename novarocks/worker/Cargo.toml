@@ -10,8 +10,12 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+test-support = []
+
 [dependencies]
 arrow.workspace = true
+bytes.workspace = true
 novarocks-execution-contract.workspace = true
 novarocks-execution.workspace = true
 novarocks-spi.workspace = true

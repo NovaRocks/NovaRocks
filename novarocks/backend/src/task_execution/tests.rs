@@ -2509,10 +2509,10 @@ fn a_cancel_stands_a_task_down_and_a_late_cancel_is_settled() {
     let identity = fixture.identity(1, 1, 1);
     let reporter = fixture.create(identity, 5);
     assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
-    crate::runtime::result_buffer::create_task_typed_sender(identity);
-    crate::runtime::result_buffer::insert_task_typed(identity, vec![1, 2, 3])
+    novarocks_worker::result_buffer::create_task_typed_sender(identity);
+    novarocks_worker::result_buffer::insert_task_typed(identity, vec![1, 2, 3])
         .expect("retain produced output before cancellation");
-    crate::runtime::result_buffer::close_task_ok(identity);
+    novarocks_worker::result_buffer::close_task_ok(identity);
 
     let request = CancelTask::new(
         TaskOperationId::new_v7(),
@@ -2645,8 +2645,8 @@ fn a_root_result_above_the_requested_cap_is_not_delivered_or_acknowledged() {
     let root = fixture.identity(79, 79, 1);
     let reporter = fixture.create(root, 5);
     assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
-    crate::runtime::result_buffer::create_task_typed_sender(root);
-    crate::runtime::result_buffer::insert_task_typed(root, vec![1, 2, 3, 4])
+    novarocks_worker::result_buffer::create_task_typed_sender(root);
+    novarocks_worker::result_buffer::insert_task_typed(root, vec![1, 2, 3, 4])
         .expect("one retained payload");
 
     let refused = poll_root_result_after_with_limit(&fixture.registry, root, None, 3);
@@ -2661,7 +2661,7 @@ fn a_root_result_above_the_requested_cap_is_not_delivered_or_acknowledged() {
     assert_eq!(fetch_status(&delivered), FetchStatus::Ready);
     assert_eq!(delivered.packet_seq, 0);
     assert_eq!(delivered.result_arrow_ipc.as_ref(), &[1, 2, 3, 4]);
-    crate::runtime::result_buffer::discard_task(root);
+    novarocks_worker::result_buffer::discard_task(root);
 }
 
 fn fetch_status(
@@ -2759,7 +2759,7 @@ fn a_result_poll_is_fenced_against_a_foreign_process_and_an_unknown_task() {
         FetchStatus::Error
     );
 
-    crate::runtime::result_buffer::discard(UniqueId::new(73, 1));
+    novarocks_worker::result_buffer::discard(UniqueId::new(73, 1));
 }
 
 #[test]
@@ -2772,12 +2772,12 @@ fn the_root_stays_flushing_until_the_frontend_consumes_end_of_stream() {
     let reporter = fixture.create(root, 5);
     assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
 
-    crate::runtime::result_buffer::create_task_typed_sender(root);
-    crate::runtime::result_buffer::insert_task_typed(root, vec![1, 2, 3]).expect("one payload");
+    novarocks_worker::result_buffer::create_task_typed_sender(root);
+    novarocks_worker::result_buffer::insert_task_typed(root, vec![1, 2, 3]).expect("one payload");
     // The pipeline is done producing, so the runtime moves the task to
     // FLUSHING and closes the buffer. The output responsibility is still
     // outstanding: the coordinator has not read a byte.
-    crate::runtime::result_buffer::close_task_ok(root);
+    novarocks_worker::result_buffer::close_task_ok(root);
     assert!(matches!(reporter.flushing(), StatusAdvance::Published(_)));
     assert_eq!(reporter.current().state(), TaskState::Flushing);
     assert!(!reporter.current().output().responsibility_complete());
@@ -2829,7 +2829,7 @@ fn the_root_stays_flushing_until_the_frontend_consumes_end_of_stream() {
         "final info is exactly the terminal that was published"
     );
 
-    crate::runtime::result_buffer::discard_task(root);
+    novarocks_worker::result_buffer::discard_task(root);
 }
 
 #[test]
@@ -2841,8 +2841,8 @@ fn final_eos_ack_replays_after_task_retirement_until_context_release() {
     let root = fixture.identity(78, 78, 1);
     let reporter = fixture.create(root, 5);
     assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
-    crate::runtime::result_buffer::create_task_typed_sender(root);
-    crate::runtime::result_buffer::close_task_ok(root);
+    novarocks_worker::result_buffer::create_task_typed_sender(root);
+    novarocks_worker::result_buffer::close_task_ok(root);
     assert!(matches!(reporter.flushing(), StatusAdvance::Published(_)));
     reporter.note_actual_stopped();
     reporter.note_resources_converged();
