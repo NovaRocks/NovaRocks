@@ -32,7 +32,7 @@ mod preparation_diagnostics;
 pub(crate) mod query;
 mod query_execution;
 pub(crate) mod runtime_filter;
-pub mod server;
+pub(crate) mod server;
 mod state_family;
 pub(crate) mod state_store;
 pub(crate) mod statistics;
