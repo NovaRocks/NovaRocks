@@ -86,11 +86,11 @@ pub use resource::{
     ResultCreditStage,
 };
 pub use scope::{
-    BusinessPermit, RootAdmissionHandle, RootWork, ServingState, WorkCancellationRequestOutcome,
-    WorkCancellationRequester, WorkClass, WorkId, WorkOwner, WorkRequest, WorkScope,
-    WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig, WorkloadControl,
-    WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision, WorkloadShutdown,
-    WorkloadShutdownError, WorkloadShutdownFailure,
+    BusinessPermit, DeadlineExpiryHandle, RootAdmissionHandle, RootWork, ServingState,
+    WorkCancellationRequestOutcome, WorkCancellationRequester, WorkClass, WorkId, WorkOwner,
+    WorkRequest, WorkScope, WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig,
+    WorkloadControl, WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision,
+    WorkloadShutdown, WorkloadShutdownError, WorkloadShutdownFailure,
 };
 
 /// Admission failures never imply cancellation, physical stop, or release.

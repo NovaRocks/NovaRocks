@@ -37,8 +37,9 @@ use novarocks_query_application::cpu::{
     QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
 };
 use novarocks_workload_control::{
-    CancellationReason, LocalResourceAuthority, ResourceConfig, RootAdmissionHandle,
-    WorkloadConfig, WorkloadControl, WorkloadObservationHandle, WorkloadShutdownError,
+    CancellationReason, DeadlineExpiryHandle, LocalResourceAuthority, ResourceConfig,
+    RootAdmissionHandle, WorkloadConfig, WorkloadControl, WorkloadObservationHandle,
+    WorkloadShutdownError,
 };
 
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
@@ -191,6 +192,7 @@ struct FrontendExecutionRuntimeOwner {
     logical_execution_client: QueryExecutionClient,
     lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     workload: Option<WorkloadControl>,
+    deadline_supervisor: FrontendWorkloadDeadlineSupervisor,
     root_admission: RootAdmissionHandle,
     workload_observation: WorkloadObservationHandle,
     resources: LocalResourceAuthority,
@@ -202,6 +204,58 @@ struct FrontendExecutionRuntimeOwner {
     decode_runtime: RootResultDecodeRuntime,
     terminal_error: Option<String>,
     shutdown_complete: bool,
+}
+
+/// FE-owned, asynchronous deadline progression for the unique workload
+/// authority. The worker holds only a narrow expiry capability: it cannot
+/// admit, complete, or release business work.
+struct FrontendWorkloadDeadlineSupervisor {
+    stop: tokio::sync::watch::Sender<bool>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl FrontendWorkloadDeadlineSupervisor {
+    fn start(runtime: &Handle, deadlines: DeadlineExpiryHandle) -> Self {
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let worker = runtime.spawn(async move {
+            loop {
+                deadlines.expire_deadlines();
+                let after = deadlines.progress_revision();
+                let next_deadline = deadlines.next_deadline();
+                tokio::select! {
+                    changed = stopped.changed() => {
+                        if changed.is_err() || *stopped.borrow() {
+                            break;
+                        }
+                    }
+                    _ = deadlines.wait_state_change(after) => {}
+                    _ = async {
+                        match next_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {}
+                }
+            }
+        });
+        Self { stop, worker }
+    }
+
+    async fn shutdown(&mut self) {
+        self.stop.send_replace(true);
+        let _ = (&mut self.worker).await;
+    }
+
+    fn abort_for_process_exit(&self) {
+        self.stop.send_replace(true);
+        self.worker.abort();
+    }
+}
+
+impl Drop for FrontendWorkloadDeadlineSupervisor {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
 }
 
 /// Frozen native-read policy consumed while Server composes one Frontend role
@@ -279,18 +333,23 @@ impl FrontendExecutionRuntimeOwner {
         }
         let lifecycle_diagnostics = Arc::new(FrontendLifecycleDiagnostics::default());
         let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::new(
-            runtime,
+            runtime.clone(),
             Arc::new(FrontendLogicalExecutionNativePort),
             workload.resources.clone(),
             namespace,
             frontend_process_id,
             supervisor_config,
         );
+        let deadline_supervisor = FrontendWorkloadDeadlineSupervisor::start(
+            &runtime,
+            workload.owner.deadline_expiry_handle(),
+        );
         Ok(Self {
             supervisor,
             logical_execution_client,
             lifecycle_diagnostics,
             workload: Some(workload.owner),
+            deadline_supervisor,
             root_admission: workload.root_admission,
             workload_observation: workload.observation,
             resources: workload.resources,
@@ -367,6 +426,7 @@ impl FrontendExecutionRuntimeOwner {
         if self.workload.is_some() {
             self.shutdown_workload_until(deadline).await?;
         }
+        self.deadline_supervisor.shutdown().await;
 
         if let Err(error) = self.query_cpu.shutdown_until(deadline).await {
             return Err(error);
@@ -389,6 +449,7 @@ impl FrontendExecutionRuntimeOwner {
 
     fn abandon_for_process_exit(&mut self) {
         self.close_admission();
+        self.deadline_supervisor.abort_for_process_exit();
         self.supervisor.abandon_for_process_exit();
         self.query_cpu.request_shutdown_for_process_exit();
         self.query_blocking.request_shutdown_for_process_exit();
@@ -1933,6 +1994,71 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("retry converges the exact retained owner graph");
+    }
+
+    #[tokio::test]
+    async fn execution_runtime_supervises_admitted_statement_deadlines() {
+        let mut runtime = FrontendExecutionRuntimeOwner::try_new(
+            tokio::runtime::Handle::current(),
+            LogicalExecutionSupervisorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                LogicalExecutionRowsConfig::new(
+                    NonZeroUsize::new(1).unwrap(),
+                    NonZeroU32::new(1).unwrap(),
+                    Duration::from_secs(1),
+                    MaxWait::new(Duration::from_millis(20)).unwrap(),
+                    ResultByteLimit::new(1024).unwrap(),
+                ),
+            ),
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 10,
+                per_scope_bytes: 1 << 18,
+            },
+            QueryCpuExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .expect("execution runtime opens");
+        runtime.mark_ready().expect("workload authority ready");
+        let mut request = WorkRequest::new(WorkClass::Query);
+        request.deadline = Some(tokio::time::Instant::from_std(
+            Instant::now() + Duration::from_millis(20),
+        ));
+        let work = runtime
+            .root_admission()
+            .try_begin_root(request)
+            .expect("deadline-bound root work admitted");
+        let cancellation = work
+            .owner
+            .scope()
+            .cancellation()
+            .expect("root cancellation view");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled())
+                .await
+                .expect("role deadline supervisor delivers cancellation"),
+            novarocks_workload_control::CancellationReason::DeadlineExceeded
+        );
+
+        work.owner.complete();
+        work.business.release();
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("deadline-cancelled root still converges through its owner");
     }
 
     #[tokio::test]

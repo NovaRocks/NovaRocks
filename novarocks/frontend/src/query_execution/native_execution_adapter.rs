@@ -1912,7 +1912,18 @@ where
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             let cancellation = request.cancellation();
-            let mut state = state.lock().await;
+            let mut state = tokio::select! {
+                reason = cancellation.cancelled() => {
+                    return Err(attempt_failure(
+                        AttemptFailureClass::ExecutionFailure,
+                        QueryExecutionErrorKind::Cancelled,
+                        format!(
+                            "Native attempt preparation was cancelled before acquiring its serialization: {reason:?}"
+                        ),
+                    ));
+                }
+                state = state.lock() => state,
+            };
             let snapshot = match state.last_topology_revision {
                 None => state.topology.snapshot().map_err(|error| {
                     attempt_failure(

@@ -1692,8 +1692,12 @@ impl PendingWorkOwner {
             .expect("pending start transfers its work owner once")
     }
 
-    fn complete(mut self) {
-        self.take().complete();
+    /// A start that failed before installing an actor has no Task, output, or
+    /// external-effect owner left to deliver its cancellation control. Its
+    /// terminal error is therefore the exact settlement boundary for a queued
+    /// cancel intent.
+    fn complete_uninstalled_failure(mut self) {
+        self.take().complete_after_terminal_cancel_settled();
     }
 }
 
@@ -1710,7 +1714,7 @@ fn fail_uninstalled_start(
     reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
     error: QueryExecutionError,
 ) -> Result<(), QueryExecutionError> {
-    owner.complete();
+    owner.complete_uninstalled_failure();
     let _ = reply.send(Err(error));
     Ok(())
 }
@@ -1793,7 +1797,8 @@ mod tests {
     use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
     use novarocks_workload_control::{
-        ResourceConfig, RootWork, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        CancellationReason, ResourceConfig, RootWork, WorkClass, WorkRequest, WorkloadConfig,
+        WorkloadControl,
     };
 
     use crate::api::{
@@ -1846,6 +1851,23 @@ mod tests {
         )
         .unwrap();
         control.resources()
+    }
+
+    #[tokio::test]
+    async fn uninstalled_failure_settles_its_known_cancel_control() {
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        root.owner.cancel(CancellationReason::Requested);
+
+        PendingWorkOwner(Some(root.owner)).complete_uninstalled_failure();
+        root.business.release();
+
+        scope.wait_released().await;
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert!(
+            control.next_control().is_none(),
+            "a failure before actor installation has no effect owner left to acknowledge"
+        );
     }
 
     fn completion_request(attempts: impl NativeAttemptPreparationPort) -> QueryExecutionRequest {

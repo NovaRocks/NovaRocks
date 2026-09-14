@@ -1261,7 +1261,11 @@ impl FrontendQuerySession {
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _ = statement.finish();
+                let _ = if statement.cancellation().reason().is_some() {
+                    statement.finish_unstarted_read_after_cancellation()
+                } else {
+                    statement.finish()
+                };
                 return Err(error);
             }
         };

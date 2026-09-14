@@ -468,6 +468,14 @@ pub struct RootAdmissionHandle {
     inner: Arc<Inner>,
 }
 
+/// Cloneable capability used only by role supervision to deliver elapsed
+/// deadline cancellation. It cannot admit, release, or otherwise mutate
+/// business responsibility.
+#[derive(Clone)]
+pub struct DeadlineExpiryHandle {
+    inner: Arc<Inner>,
+}
+
 /// Complete process-composition result for one workload authority.
 ///
 /// The owner is unique. Each handle is intentionally a separate capability so
@@ -645,6 +653,15 @@ impl WorkloadControl {
         try_begin_root(&self.inner, request)
     }
 
+    /// Returns the narrow process-supervision capability for observing new
+    /// deadlines and delivering their cancellation intent without handing a
+    /// long-lived task the unique workload owner.
+    pub fn deadline_expiry_handle(&self) -> DeadlineExpiryHandle {
+        DeadlineExpiryHandle {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     /// Close new roots; existing work and control retain their authority.
     pub fn close_admission(&self) {
         self.inner.update(|state| state.closed = true);
@@ -735,47 +752,11 @@ impl WorkloadControl {
     /// Role supervision drives this together with `next_deadline`; no work owns
     /// an OS waiting thread, and timeout only creates cancellation intent.
     pub fn expire_deadlines(&self) {
-        let notifications = self.inner.update(|state| {
-            let cancelled = state
-                .nodes
-                .iter()
-                .filter_map(|(&id, node)| {
-                    (!node.cancellation_signalled && node.cancellation.check_reason().is_some())
-                        .then_some(id)
-                })
-                .collect::<Vec<_>>();
-            let mut notifications = Vec::new();
-            for id in cancelled {
-                let cancellation = Arc::clone(&state.nodes[&id].cancellation);
-                let reason = cancellation.check_reason().unwrap();
-                notifications.push((cancellation, reason));
-                state.nodes.get_mut(&id).unwrap().cancellation_signalled = true;
-                crate::observation::queue_control(state, id, crate::ControlIntent::Cancel).unwrap();
-            }
-            notifications
-        });
-        for (cancellation, reason) in notifications {
-            cancellation.request(reason);
-        }
+        self.deadline_expiry_handle().expire_deadlines();
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        let state = self.inner.state.lock().unwrap();
-        state
-            .nodes
-            .values()
-            .filter(|node| !node.cancellation_signalled)
-            .filter_map(|node| node.cancellation.view().deadline())
-            .chain(
-                state
-                    .requests
-                    .values()
-                    .filter(|request| {
-                        !matches!(request.state, crate::admission::AdmissionState::Rejected(_))
-                    })
-                    .map(|request| request.wait_deadline),
-            )
-            .min()
+        self.deadline_expiry_handle().next_deadline()
     }
 
     /// Capture the current event revision before attempting a state-dependent
@@ -835,6 +816,79 @@ impl WorkloadControl {
             }
         };
         result.map_err(|error| WorkloadShutdownFailure { error, owner: self })
+    }
+}
+
+impl DeadlineExpiryHandle {
+    /// Role supervision drives this together with [`Self::next_deadline`]; no
+    /// work owns an OS waiting thread, and timeout only creates cancellation
+    /// intent.
+    pub fn expire_deadlines(&self) {
+        let notifications = self.inner.update(|state| {
+            let cancelled = state
+                .nodes
+                .iter()
+                .filter_map(|(&id, node)| {
+                    (!node.completed
+                        && !node.cancellation_signalled
+                        && node.cancellation.check_reason().is_some())
+                    .then_some(id)
+                })
+                .collect::<Vec<_>>();
+            let mut notifications = Vec::new();
+            for id in cancelled {
+                let cancellation = Arc::clone(&state.nodes[&id].cancellation);
+                let reason = cancellation.check_reason().unwrap();
+                notifications.push((cancellation, reason));
+                state.nodes.get_mut(&id).unwrap().cancellation_signalled = true;
+                crate::observation::queue_control(state, id, crate::ControlIntent::Cancel).unwrap();
+            }
+            notifications
+        });
+        for (cancellation, reason) in notifications {
+            cancellation.request(reason);
+        }
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let state = self.inner.state.lock().unwrap();
+        state
+            .nodes
+            .values()
+            .filter(|node| !node.completed && !node.cancellation_signalled)
+            .filter_map(|node| node.cancellation.view().deadline())
+            .chain(
+                state
+                    .requests
+                    .values()
+                    .filter(|request| {
+                        !matches!(request.state, crate::admission::AdmissionState::Rejected(_))
+                    })
+                    .map(|request| request.wait_deadline),
+            )
+            .min()
+    }
+
+    /// Capture the current event revision before waiting for a later deadline
+    /// or state transition.
+    pub fn progress_revision(&self) -> WorkloadProgressRevision {
+        WorkloadProgressRevision(self.inner.state.lock().unwrap().progress_revision)
+    }
+
+    /// Wait for any state revision without treating an idle, open authority as
+    /// shutdown-drained. Deadline supervision uses this to learn about a newly
+    /// admitted earlier deadline without polling or spinning while idle.
+    pub async fn wait_state_change(&self, after: WorkloadProgressRevision) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if WorkloadProgressRevision(self.inner.state.lock().unwrap().progress_revision) != after
+            {
+                return;
+            }
+            changed.await;
+        }
     }
 }
 
@@ -1268,6 +1322,28 @@ mod tests {
             .await
             .expect("observation wakes when the last root is released")
             .expect("wait task joins");
+    }
+
+    #[tokio::test]
+    async fn completed_work_is_not_reenqueued_when_its_deadline_elapses() {
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest {
+                class: WorkClass::Query,
+                deadline: Some(tokio::time::Instant::now() + Duration::from_millis(10)),
+            })
+            .expect("admit deadline-bound root");
+
+        work.owner.complete();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        control.expire_deadlines();
+
+        assert!(control.next_deadline().is_none());
+        assert!(
+            control.next_control().is_none(),
+            "completed work has no owner left to deliver a later deadline control"
+        );
+        work.business.release();
     }
 
     #[test]

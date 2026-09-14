@@ -599,6 +599,26 @@ impl GovernedQueryStatementOwner {
         self.finish_inner()
     }
 
+    /// Finish a cancelled read before its root owner has been handed to the
+    /// logical-execution supervisor. At this point no attempt, output, or
+    /// external-effect owner exists, so the known cancellation control reaches
+    /// its terminal boundary with the local read start failure.
+    pub fn finish_unstarted_read_after_cancellation(mut self) -> GovernedStatementFinishOutcome {
+        if self.finished {
+            return GovernedStatementFinishOutcome::Stale;
+        }
+        self.finished = true;
+        if let Some(owner) = self.execution_owner.take() {
+            owner.complete_after_terminal_cancel_settled();
+        }
+        let outcome = self
+            .service
+            .port
+            .finish_governed_statement(self.registration.token());
+        self.business.take();
+        outcome
+    }
+
     pub fn fail(mut self, reason: CancellationReason) -> GovernedStatementFinishOutcome {
         if self.success_visibility_sealed {
             return self.protocol_fail_inner();

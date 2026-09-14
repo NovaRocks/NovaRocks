@@ -875,6 +875,32 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_unstarted_read_settles_its_known_control() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let statement = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .expect("governed query statement");
+
+        assert_eq!(
+            control.cancel_session_statement(
+                session,
+                QueryCancellationReason::DeadlineExceeded { timeout_ms: 50 },
+            ),
+            QueryCancelOutcome::Requested
+        );
+        assert_eq!(
+            statement.finish_unstarted_read_after_cancellation(),
+            GovernedStatementFinishOutcome::Cancelled(CancellationReason::DeadlineExceeded)
+        );
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+        assert!(
+            workload.next_control().is_none(),
+            "an unstarted read has no logical-execution owner left to acknowledge cancellation"
+        );
+    }
+
+    #[test]
     fn governed_generation_and_business_permit_span_execution_start_to_protocol_finish() {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
