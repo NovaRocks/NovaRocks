@@ -31,7 +31,6 @@ use tokio::runtime::Handle;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::{command as catalog_command, iceberg_ref_command};
 use crate::connector::UnifiedStatisticsResolver;
-use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
 use crate::query_execution::kernels as domain;
@@ -430,7 +429,6 @@ pub struct MvCommandPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     repository: Arc<dyn MvRepository>,
     readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-    create_application: Arc<dyn MvApplicationService>,
     refresh_service: Arc<FrontendMvService>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     #[allow(
@@ -448,7 +446,6 @@ impl MvCommandPorts {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         repository: Arc<dyn MvRepository>,
-        create_application: Arc<dyn MvApplicationService>,
         refresh_service: Arc<FrontendMvService>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
@@ -460,7 +457,6 @@ impl MvCommandPorts {
             connector_control,
             repository,
             readiness: refresh_service.readiness_port(),
-            create_application,
             refresh_service,
             storage_observation,
             query_execution,
@@ -483,7 +479,6 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
     );
     mv_command::MvCommandExecutor::new(
         iceberg_ports,
-        ports.create_application,
         ports.refresh_service,
         Arc::clone(&ports.storage_observation),
         backend,

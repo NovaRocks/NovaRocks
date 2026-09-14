@@ -1128,66 +1128,6 @@ fn prepare_iceberg_mv_create_with_ports(
     })
 }
 
-pub(crate) fn create_iceberg_mv_with_ports(
-    ports: IcebergMvCorePorts,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    stmt: &MvCreateStatement,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    let statement = stmt.clone();
-    let engine = StandaloneMvEngine::new_with_ports(ports.clone(), connector_context.clone());
-    let plan = engine
-        .prepare_create(PrepareMvCreateRequest {
-            statement: &statement,
-            context: crate::mv::domain::application::MvRequestContext {
-                current_catalog,
-                current_database,
-            },
-        })
-        .map_err(|error| error.to_string())?;
-    let operation_id = uuid::Uuid::now_v7();
-    let target = engine
-        .create_target(&plan, operation_id)
-        .map_err(|error| error.to_string())?;
-    let definition = match engine.inspect_created_target(&plan, &target) {
-        Ok(definition) => definition,
-        Err(error) => {
-            return Err(legacy_cleanup_created_target(
-                &engine,
-                &target,
-                error.to_string(),
-            ));
-        }
-    };
-    if let Err(error) = engine.sync_target_descriptor(&target, &definition.descriptor) {
-        // Descriptor commit status is part of the external authority boundary.
-        // Do not purge the target after a mutation attempt: a commit-unknown
-        // descriptor must remain discoverable rather than being erased.
-        return Err(error.to_string());
-    }
-    engine
-        .project_created_target(&target, operation_id)
-        .map_err(|error| {
-            known_committed_create_finalize_error("StateStore accelerator projection", error)
-        })?;
-    if let Err(error) = engine.register_target(&target) {
-        return Err(known_committed_create_finalize_error(
-            "catalog registration",
-            error,
-        ));
-    }
-    Ok(StatementResult::Ok)
-}
-
-fn known_committed_create_finalize_error(phase: &str, error: impl std::fmt::Display) -> String {
-    EngineError::commit_known_committed_finalize_failed(format!(
-        "Iceberg MV repository create committed but {phase} failed: {error}"
-    ))
-    .to_bracketed_user_message()
-}
-
 fn persist_iceberg_mv_descriptor_with_ports(
     ports: &IcebergMvCorePorts,
     target: &CreatedMvTarget,
@@ -1239,15 +1179,6 @@ fn persist_iceberg_mv_descriptor_with_ports(
     )
     .map_err(|error| error.to_string())?;
     Ok(())
-}
-
-fn legacy_cleanup_created_target(
-    engine: &dyn MvEngine,
-    target: &CreatedMvTarget,
-    primary: String,
-) -> String {
-    let cleanup = engine.drop_created_target(target);
-    format!("{primary}; target cleanup={cleanup:?}")
 }
 
 fn ensure_mv_create_target_absent_with_ports(

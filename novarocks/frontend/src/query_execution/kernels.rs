@@ -25,7 +25,6 @@ use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
-use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
@@ -356,7 +355,6 @@ pub struct MvExecutionKernel {
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_backend: Arc<IcebergMvBackend>,
     repository: Arc<dyn MvRepository>,
-    application: Arc<dyn MvApplicationService>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
 }
@@ -374,7 +372,6 @@ impl MvExecutionKernel {
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_backend: Arc<IcebergMvBackend>,
         repository: Arc<dyn MvRepository>,
-        application: Arc<dyn MvApplicationService>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
     ) -> Self {
@@ -385,7 +382,6 @@ impl MvExecutionKernel {
             unified_statistics,
             mv_backend,
             repository,
-            application,
             storage_observation,
             query_execution,
         }
@@ -413,10 +409,6 @@ impl MvExecutionKernel {
 
     pub(crate) fn repository(&self) -> &Arc<dyn MvRepository> {
         &self.repository
-    }
-
-    pub(crate) fn application(&self) -> &Arc<dyn MvApplicationService> {
-        &self.application
     }
 
     pub(crate) fn storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {

@@ -19,7 +19,7 @@
 
 use crate::mv::domain::application::{
     CreatedMvTarget, MvApplicationError, MvApplicationErrorKind, MvCreateStatement, MvEngine,
-    MvEngineError, MvEngineErrorKind, MvRequestContext, MvStatementResult, PreparedMvCreate,
+    MvEngineError, MvEngineErrorKind, MvRequestContext, PreparedMvCreate,
 };
 use novarocks_mv_application::ports::{
     MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvProviderFailure, MvProviderFailureKind,
@@ -37,7 +37,7 @@ pub(super) fn handle_create(
     engine: &dyn MvEngine,
     statement: &MvCreateStatement,
     context: MvRequestContext<'_>,
-) -> Result<MvStatementResult, MvApplicationError> {
+) -> Result<(), MvApplicationError> {
     let plan = engine
         .prepare_create(crate::mv::domain::application::PrepareMvCreateRequest {
             statement,
@@ -66,7 +66,7 @@ pub(super) fn handle_create(
         )
         .map_err(product_error)?
     {
-        MvProductResult::Created(_) => Ok(MvStatementResult::Ok),
+        MvProductResult::Created(_) => Ok(()),
         MvProductResult::Acknowledged | MvProductResult::Dropped | MvProductResult::Listed(_) => {
             Err(MvApplicationError::new(
                 MvApplicationErrorKind::Engine,

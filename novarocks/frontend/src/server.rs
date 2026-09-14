@@ -469,9 +469,6 @@ fn build_frontend_query_session_factory_from_role_products(
     let mv_readiness = Arc::clone(&products.mv_readiness);
     let mv_candidate_reader = products.mv_candidate_reader.clone();
     let mv_service = Arc::clone(&products.mv_service);
-    let mv_application_service = Arc::clone(&mv_service);
-    let mv_application: Arc<dyn crate::mv::domain::application::MvApplicationService> =
-        mv_application_service;
     let maintenance_ports = products.maintenance_ports.clone();
     let mv_storage_observation = Arc::clone(&products.mv_storage_observation);
     let exchange_port = products.exchange_port;
@@ -534,7 +531,6 @@ fn build_frontend_query_session_factory_from_role_products(
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
             Arc::clone(&mv_repository),
-            mv_application,
             mv_service,
             Arc::clone(&mv_storage_observation),
             query_execution.clone(),

@@ -28,7 +28,6 @@ use novarocks_mv_application::repository::InitialMvRefreshConfiguration;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
 };
-use novarocks_query_application::api::QueryResult;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 
@@ -258,26 +257,10 @@ pub struct MvCreateStatement {
     pub primary_key: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The SQL-facing statement carrier retains its direct create payload to preserve the existing application boundary."
-)]
-pub enum MvApplicationStatement {
-    Create(MvCreateStatement),
-    Unhandled,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct MvRequestContext<'a> {
     pub current_catalog: Option<&'a str>,
     pub current_database: &'a str,
-}
-
-#[derive(Clone, Debug)]
-pub enum MvStatementResult {
-    Ok,
-    Query(QueryResult),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,15 +394,6 @@ pub struct PreparedMvDefinition {
     /// The complete lake authority assembled only after exact target
     /// observation. It must commit before the StateStore projection exists.
     pub descriptor: MvDescriptorV3,
-}
-
-pub trait MvApplicationService: Send + Sync {
-    fn try_handle_statement(
-        &self,
-        engine: &dyn MvEngine,
-        statement: &MvApplicationStatement,
-        context: MvRequestContext<'_>,
-    ) -> Result<Option<MvStatementResult>, MvApplicationError>;
 }
 
 pub trait MvEngine: Send + Sync {

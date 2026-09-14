@@ -18,9 +18,8 @@
 //! Closed typed executor for Iceberg MV statements.
 
 use crate::mv::domain::application::{
-    MvAlterAction, MvAlterStatement, MvApplicationService, MvCreateDistribution,
-    MvCreatePartitionField, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement,
-    MvRefreshRequest, MvShowStatement, MvStatementResult,
+    MvAlterAction, MvAlterStatement, MvCreateDistribution, MvCreatePartitionField,
+    MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest, MvShowStatement,
 };
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
@@ -50,7 +49,6 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct MvCommandExecutor {
     ports: IcebergMvCorePorts,
-    create_application: Arc<dyn MvApplicationService>,
     refresh_service: Arc<FrontendMvService>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_backend: Arc<IcebergMvBackend>,
@@ -59,14 +57,12 @@ pub struct MvCommandExecutor {
 impl MvCommandExecutor {
     pub fn new(
         ports: IcebergMvCorePorts,
-        create_application: Arc<dyn MvApplicationService>,
         refresh_service: Arc<FrontendMvService>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_backend: Arc<IcebergMvBackend>,
     ) -> Self {
         Self {
             ports,
-            create_application,
             refresh_service,
             storage_observation,
             mv_backend,
@@ -100,8 +96,7 @@ impl MvCommandExecutor {
                     || {
                         create_mv_with_ports(
                             &self.ports,
-                            self.create_application.as_ref(),
-                            self.mv_backend.as_ref(),
+                            self.refresh_service.as_ref(),
                             current_catalog,
                             current_database,
                             &statement,
@@ -265,7 +260,7 @@ impl MvCommandExecutor {
                 connector_context.clone(),
                 execution,
             )
-            .map(statement_result)
+            .map(|()| StatementResult::Ok)
             .map_err(|error| error.to_string())
     }
 
@@ -329,7 +324,7 @@ impl MvCommandExecutor {
                         connector_context.clone(),
                         execution,
                     )
-                    .map(statement_result)
+                    .map(|()| StatementResult::Ok)
                     .map_err(|error| error.to_string())?,
             );
         }
@@ -648,13 +643,6 @@ fn lower_typed_string(value: &Literal, context: &str) -> Result<String, String> 
         return Err(format!("{context} expects a string"));
     };
     Ok(value.clone())
-}
-
-fn statement_result(result: MvStatementResult) -> StatementResult {
-    match result {
-        MvStatementResult::Ok => StatementResult::Ok,
-        MvStatementResult::Query(result) => StatementResult::Query(result),
-    }
 }
 
 #[cfg(test)]

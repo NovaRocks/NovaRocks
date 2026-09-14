@@ -22,10 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::background::{MvBackgroundBindings, MvBackgroundEngine};
-use crate::mv::domain::application::{
-    MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
-    MvStatementResult,
-};
+use crate::mv::domain::application::{MvApplicationError, MvEngine, MvRequestContext};
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenanceService};
 use crate::query_execution::mv_assembly::refresh_handoff::{
@@ -170,29 +167,22 @@ impl FrontendMvService {
     }
 }
 
-impl MvApplicationService for FrontendMvService {
-    fn try_handle_statement(
+impl FrontendMvService {
+    pub(crate) fn execute_create(
         &self,
         engine: &dyn MvEngine,
-        statement: &MvApplicationStatement,
+        statement: &crate::mv::domain::application::MvCreateStatement,
         context: MvRequestContext<'_>,
-    ) -> Result<Option<MvStatementResult>, MvApplicationError> {
-        match statement {
-            MvApplicationStatement::Create(statement) => {
-                create::handle_create(&self.product_service, engine, statement, context).map(Some)
-            }
-            MvApplicationStatement::Unhandled => Ok(None),
-        }
+    ) -> Result<(), MvApplicationError> {
+        create::handle_create(&self.product_service, engine, statement, context)
     }
-}
 
-impl FrontendMvService {
     pub fn execute_prepared_refresh(
         &self,
         refresh_plan: PreparedMvRefresh,
         connector_context: ConnectorRequestContext,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    ) -> Result<MvStatementResult, MvApplicationError> {
+    ) -> Result<(), MvApplicationError> {
         refresh::execute(
             self.product_service.as_ref(),
             &self.refresh,
@@ -210,7 +200,7 @@ impl FrontendMvService {
         owner: MvActivityOwner,
         connector_context: ConnectorRequestContext,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    ) -> Result<MvStatementResult, MvApplicationError> {
+    ) -> Result<(), MvApplicationError> {
         let _gate_lease = self.acquire_activity_lease(&target, owner, execution)?;
         let attempt = self.product_service.reserve_refresh_attempt();
         let publication_id = attempt.publication_id.as_uuid();

@@ -19,14 +19,13 @@
 
 use std::sync::Arc;
 
-use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::application::{
     MvAlterAction, MvAlterStatement, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement,
     MvShowStatement,
 };
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::domain::lifecycle::{CreateMvRequest, ListMvsRequest};
+use crate::mv::domain::lifecycle::ListMvsRequest;
 use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
@@ -143,8 +142,7 @@ fn load_definition_for_alter(
 /// injected backend rather than a string-keyed connector registry lookup.
 pub fn create_mv_with_ports(
     ports: &IcebergMvCorePorts,
-    application: &dyn MvApplicationService,
-    mv_backend: &IcebergMvBackend,
+    service: &crate::mv::FrontendMvService,
     current_catalog: Option<&str>,
     db: &str,
     stmt: &MvCreateStatement,
@@ -158,31 +156,16 @@ pub fn create_mv_with_ports(
         ports.clone(),
         connector_context.clone(),
     );
-    let application_statement =
-        crate::mv::domain::application::MvApplicationStatement::Create(stmt.clone());
-    match application.try_handle_statement(
-        &engine,
-        &application_statement,
-        crate::mv::domain::application::MvRequestContext {
-            current_catalog,
-            current_database: db,
-        },
-    ) {
-        Ok(Some(crate::mv::domain::application::MvStatementResult::Ok)) => {
-            return Ok(StatementResult::Ok);
-        }
-        Ok(Some(crate::mv::domain::application::MvStatementResult::Query(result))) => {
-            return Ok(StatementResult::Query(result));
-        }
-        Ok(None) => {}
-        Err(error) => return Err(error.to_string()),
-    }
-    mv_backend.create_mv(CreateMvRequest {
-        stmt: stmt.clone(),
-        current_catalog: current_catalog.map(str::to_string),
-        current_database: db.to_string(),
-        connector_context: connector_context.clone(),
-    })?;
+    service
+        .execute_create(
+            &engine,
+            stmt,
+            crate::mv::domain::application::MvRequestContext {
+                current_catalog,
+                current_database: db,
+            },
+        )
+        .map_err(|error| error.to_string())?;
     Ok(StatementResult::Ok)
 }
 

@@ -20,9 +20,7 @@ use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::time::{Duration, Instant};
 
-use crate::mv::domain::application::{
-    MvApplicationError, MvApplicationErrorKind, MvStatementResult,
-};
+use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
@@ -66,9 +64,9 @@ pub(super) fn execute(
     refresh: PreparedMvRefresh,
     context: ConnectorRequestContext,
     execution: &QueryExecutionContext,
-) -> Result<MvStatementResult, MvApplicationError> {
+) -> Result<(), MvApplicationError> {
     if matches!(refresh.work, PreparedMvRefreshWork::NoOp) {
-        return Ok(MvStatementResult::Ok);
+        return Ok(());
     }
     let product_target = product_target(&refresh.finalize.target)?;
     let attempt = refresh.attempt.clone();
@@ -82,7 +80,7 @@ pub(super) fn execute(
         .execute_refresh(&product_target, &attempt, execution_port)
         .map_err(product_error)?
     {
-        MvProductResult::Acknowledged => Ok(MvStatementResult::Ok),
+        MvProductResult::Acknowledged => Ok(()),
         MvProductResult::Created(_) | MvProductResult::Dropped | MvProductResult::Listed(_) => {
             Err(MvApplicationError::new(
                 MvApplicationErrorKind::Engine,

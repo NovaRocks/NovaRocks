@@ -17,7 +17,7 @@
 
 //! Iceberg-backed materialized-view backend.
 
-use crate::mv::domain::lifecycle::{CreateMvRequest, ListMvsRequest, MvListRow};
+use crate::mv::domain::lifecycle::{ListMvsRequest, MvListRow};
 use crate::mv::domain::model::MvStorageEngine;
 
 pub struct IcebergMvBackend {
@@ -31,17 +31,6 @@ impl IcebergMvBackend {
 }
 
 impl IcebergMvBackend {
-    pub fn create_mv(&self, req: CreateMvRequest) -> Result<(), String> {
-        crate::mv::domain::iceberg_refresh::create_iceberg_mv_with_ports(
-            self.ports.clone(),
-            req.current_catalog.as_deref(),
-            &req.current_database,
-            &req.stmt,
-            &req.connector_context,
-        )
-        .map(|_| ())
-    }
-
     pub fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String> {
         crate::mv::domain::analysis_adapter::list_mv_rows_with_ports(
             self.ports.readiness().as_ref(),
