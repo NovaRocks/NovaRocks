@@ -1113,6 +1113,7 @@ impl TestQueryCompiler {
                 novarocks_query_application::system_catalog_rewrite::rewrite_query(
                     self.system_tables.facts_port().as_ref(),
                     self.system_tables.system_catalog().as_ref(),
+                    &connector_context,
                     &mut prepared,
                 )?;
                 if has_time_travel_refs(&prepared) {

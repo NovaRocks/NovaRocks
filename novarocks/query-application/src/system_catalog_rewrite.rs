@@ -31,6 +31,7 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_parser::{Span, ast};
+use novarocks_spi::connector::ConnectorRequestContext;
 
 use crate::system_catalog::{SystemCatalog, SystemCatalogInputs};
 use novarocks_types::schema::ColumnDef;
@@ -68,6 +69,7 @@ pub trait SystemCatalogFactsPort: Send + Sync {
 
     fn external_system_catalog_facts(
         &self,
+        request: &ConnectorRequestContext,
         catalog_name: &str,
         include_table_names: bool,
     ) -> Result<Option<SystemCatalogFacts>, String>;
@@ -97,42 +99,77 @@ pub trait SystemCatalogFactsPort: Send + Sync {
 pub fn rewrite_query(
     facts_port: &dyn SystemCatalogFactsPort,
     system_catalog: &dyn SystemCatalog,
+    connector_context: &ConnectorRequestContext,
     query: &mut ast::Query,
 ) -> Result<(), String> {
-    rewrite_query_inner(facts_port, system_catalog, query)
+    rewrite_query_inner(facts_port, system_catalog, connector_context, query)
 }
 
 fn rewrite_query_inner(
     facts_port: &dyn SystemCatalogFactsPort,
     system_catalog: &dyn SystemCatalog,
+    connector_context: &ConnectorRequestContext,
     query: &mut ast::Query,
 ) -> Result<(), String> {
     if let Some(with_clause) = query.with.as_mut() {
         for cte in with_clause.ctes.iter_mut() {
-            rewrite_query_inner(facts_port, system_catalog, cte.query.as_mut())?;
+            rewrite_query_inner(
+                facts_port,
+                system_catalog,
+                connector_context,
+                cte.query.as_mut(),
+            )?;
         }
     }
-    rewrite_set_expr(facts_port, system_catalog, query.body.as_mut())
+    rewrite_set_expr(
+        facts_port,
+        system_catalog,
+        connector_context,
+        query.body.as_mut(),
+    )
 }
 
 fn rewrite_set_expr(
     facts_port: &dyn SystemCatalogFactsPort,
     system_catalog: &dyn SystemCatalog,
+    connector_context: &ConnectorRequestContext,
     expr: &mut ast::SetExpr,
 ) -> Result<(), String> {
     match expr {
         ast::SetExpr::Select(select) => {
             for twj in select.from.iter_mut() {
-                rewrite_table_factor(facts_port, system_catalog, &mut twj.relation)?;
+                rewrite_table_factor(
+                    facts_port,
+                    system_catalog,
+                    connector_context,
+                    &mut twj.relation,
+                )?;
                 for join in twj.joins.iter_mut() {
-                    rewrite_table_factor(facts_port, system_catalog, &mut join.relation)?;
+                    rewrite_table_factor(
+                        facts_port,
+                        system_catalog,
+                        connector_context,
+                        &mut join.relation,
+                    )?;
                 }
             }
         }
-        ast::SetExpr::Query(q) => rewrite_query_inner(facts_port, system_catalog, q.as_mut())?,
+        ast::SetExpr::Query(q) => {
+            rewrite_query_inner(facts_port, system_catalog, connector_context, q.as_mut())?
+        }
         ast::SetExpr::SetOperation(operation) => {
-            rewrite_set_expr(facts_port, system_catalog, operation.left.as_mut())?;
-            rewrite_set_expr(facts_port, system_catalog, operation.right.as_mut())?;
+            rewrite_set_expr(
+                facts_port,
+                system_catalog,
+                connector_context,
+                operation.left.as_mut(),
+            )?;
+            rewrite_set_expr(
+                facts_port,
+                system_catalog,
+                connector_context,
+                operation.right.as_mut(),
+            )?;
         }
         _ => {}
     }
@@ -142,6 +179,7 @@ fn rewrite_set_expr(
 fn rewrite_table_factor(
     facts_port: &dyn SystemCatalogFactsPort,
     system_catalog: &dyn SystemCatalog,
+    connector_context: &ConnectorRequestContext,
     factor: &mut ast::TableFactor,
 ) -> Result<(), String> {
     match factor {
@@ -172,8 +210,11 @@ fn rewrite_table_factor(
                     // The adapter preserves normal unknown-catalog resolution
                     // by returning None and keeps exact connector admission
                     // outside this application domain.
-                    let Some(facts) = facts_port
-                        .external_system_catalog_facts(cat, tbl.eq_ignore_ascii_case("tables"))?
+                    let Some(facts) = facts_port.external_system_catalog_facts(
+                        connector_context,
+                        cat,
+                        tbl.eq_ignore_ascii_case("tables"),
+                    )?
                     else {
                         return Ok(());
                     };
@@ -207,15 +248,28 @@ fn rewrite_table_factor(
             *factor = derived_values_factor(&data.columns, &data.batches, alias)?;
             Ok(())
         }
-        ast::TableFactor::Derived { subquery, .. } => {
-            rewrite_query_inner(facts_port, system_catalog, subquery.as_mut())
-        }
+        ast::TableFactor::Derived { subquery, .. } => rewrite_query_inner(
+            facts_port,
+            system_catalog,
+            connector_context,
+            subquery.as_mut(),
+        ),
         ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            rewrite_table_factor(facts_port, system_catalog, &mut table_with_joins.relation)?;
+            rewrite_table_factor(
+                facts_port,
+                system_catalog,
+                connector_context,
+                &mut table_with_joins.relation,
+            )?;
             for join in table_with_joins.joins.iter_mut() {
-                rewrite_table_factor(facts_port, system_catalog, &mut join.relation)?;
+                rewrite_table_factor(
+                    facts_port,
+                    system_catalog,
+                    connector_context,
+                    &mut join.relation,
+                )?;
             }
             Ok(())
         }
@@ -438,10 +492,33 @@ fn literal_expr(kind: ast::LiteralKind) -> ast::Expr {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::system_catalog::SystemCatalogService;
+    use novarocks_spi::connector::ConnectorCancellation;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn connector_context() -> &'static ConnectorRequestContext {
+        static CONTEXT: OnceLock<ConnectorRequestContext> = OnceLock::new();
+        CONTEXT.get_or_init(|| {
+            ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(300),
+                Arc::new(NeverCancelled),
+                novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+            )
+            .expect("test connector context")
+        })
+    }
 
     struct Facts {
         external_requests: Mutex<Vec<(String, bool)>>,
@@ -479,6 +556,7 @@ mod tests {
 
         fn external_system_catalog_facts(
             &self,
+            _request: &ConnectorRequestContext,
             catalog_name: &str,
             include_table_names: bool,
         ) -> Result<Option<SystemCatalogFacts>, String> {
@@ -511,7 +589,7 @@ mod tests {
         let catalog = SystemCatalogService::with_defaults();
         let mut query = parsed_query("SELECT schema_name FROM information_schema.schemata");
 
-        rewrite_query(&facts, &catalog, &mut query).expect("rewrite query");
+        rewrite_query(&facts, &catalog, connector_context(), &mut query).expect("rewrite query");
 
         assert!(matches!(
             first_factor(&query),
@@ -532,7 +610,7 @@ mod tests {
         let catalog = SystemCatalogService::with_defaults();
         let mut query = parsed_query("SELECT table_name FROM ice.information_schema.tables");
 
-        rewrite_query(&facts, &catalog, &mut query).expect("rewrite query");
+        rewrite_query(&facts, &catalog, connector_context(), &mut query).expect("rewrite query");
 
         assert!(matches!(
             first_factor(&query),
@@ -553,7 +631,7 @@ mod tests {
         let catalog = SystemCatalogService::with_defaults();
         let mut query = parsed_query("SELECT schema_name FROM missing.information_schema.schemata");
 
-        rewrite_query(&facts, &catalog, &mut query).expect("rewrite query");
+        rewrite_query(&facts, &catalog, connector_context(), &mut query).expect("rewrite query");
 
         assert!(matches!(
             first_factor(&query),

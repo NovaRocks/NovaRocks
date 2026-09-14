@@ -18,7 +18,6 @@
 //! Frontend adapter for the query application's system-catalog facts port.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use novarocks_query_application::system_catalog_rewrite::{
     SystemCatalogFacts, SystemCatalogFactsPort,
@@ -70,11 +69,10 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
 
     fn external_system_catalog_facts(
         &self,
+        request: &novarocks_spi::connector::ConnectorRequestContext,
         catalog_name: &str,
         include_table_names: bool,
     ) -> Result<Option<SystemCatalogFacts>, String> {
-        let context =
-            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
         let lease = match crate::connector::acquire_metadata_planning_lease(
             self.connector_control.as_ref(),
             catalog_name,
@@ -86,7 +84,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
         };
         let listing_lease = lease.clone();
         let mut schema_names =
-            crate::connector::metadata_list_namespaces_with_planning_lease(lease, context)?
+            crate::connector::metadata_list_namespaces_with_planning_lease(lease, request.clone())?
                 .into_iter()
                 .map(|namespace| namespace.namespace.to_string())
                 .collect::<Vec<_>>();
@@ -96,13 +94,9 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
         let mut table_names = Vec::new();
         if include_table_names {
             for schema_name in &schema_names {
-                let context = crate::connector::connector_request_context(
-                    None,
-                    Arc::new(AtomicBool::new(false)),
-                )?;
                 let tables = crate::connector::metadata_list_tables_with_planning_lease(
                     &listing_lease,
-                    context,
+                    request.clone(),
                     schema_name,
                 )?;
                 table_names.extend(tables.into_iter().map(|table| (schema_name.clone(), table)));
