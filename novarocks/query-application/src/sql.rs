@@ -77,15 +77,47 @@ pub trait CoreCommandRoute: Send + Sync {
         Err("semantic product command route is unavailable".to_string())
     }
 
-    /// Executes a deliberately specialized parser-owned family such as MV.
-    /// Product commands must not use this fallback.
-    fn execute_special(
+    /// Executes the role-gated `SHOW BACKENDS` command.
+    fn execute_show_backends(
         &self,
-        _statement: &Statement,
+        _context: &RequestContext,
+        _command_context: &CommandContext,
+    ) -> Result<QuerySessionOutput, String> {
+        Err("SHOW BACKENDS command route is unavailable".to_string())
+    }
+
+    /// Executes the test-only stateless-rebuild procedure when it owns this
+    /// exact CALL. `None` leaves the already-lowered maintenance command to
+    /// its normal product consumer.
+    fn execute_maintenance_call(
+        &self,
+        _statement: &novarocks_parser::ast::CallStatement,
         _context: &RequestContext,
         _command_context: &CommandContext,
     ) -> Result<Option<QuerySessionOutput>, String> {
         Ok(None)
+    }
+
+    /// Executes the deliberately specialized, complete MV parser input.
+    /// MV must not acquire a second semantic command mirror.
+    fn execute_materialized_view(
+        &self,
+        _statement: &novarocks_parser::ast::MaterializedViewStatement,
+        _context: &RequestContext,
+        _command_context: &CommandContext,
+    ) -> Result<QuerySessionOutput, String> {
+        Err("materialized view command route is unavailable".to_string())
+    }
+
+    /// Executes the query-owned View family, which is outside the product
+    /// command vocabulary.
+    fn execute_view(
+        &self,
+        _statement: &novarocks_parser::ast::ViewStatement,
+        _context: &RequestContext,
+        _command_context: &CommandContext,
+    ) -> Result<QuerySessionOutput, String> {
+        Err("view command route is unavailable".to_string())
     }
 }
 

@@ -235,48 +235,69 @@ impl CoreCommandRoute for TypedCommandRoute {
         }
     }
 
-    fn execute_special(
+    fn execute_show_backends(
         &self,
-        statement: &ParsedStatement,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<StatementResult, String> {
+        command_context
+            .scope()
+            .check()
+            .map_err(|error| format!("SHOW BACKENDS command scope is no longer active: {error}"))?;
+        self.backend
+            .show_backends(context.execution().role())
+            .map(StatementResult::Query)
+    }
+
+    fn execute_maintenance_call(
+        &self,
+        statement: &novarocks_parser::ast::CallStatement,
         context: &RequestContext,
         command_context: &CommandContext,
     ) -> Result<Option<StatementResult>, String> {
         command_context
             .scope()
             .check()
-            .map_err(|error| format!("special command scope is no longer active: {error}"))?;
-        match statement {
-            ParsedStatement::ShowBackends(_) => self
-                .backend
-                .show_backends(context.execution().role())
-                .map(StatementResult::Query)
-                .map(Some),
-            ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
-                statement,
-            )) => self.mv_call.try_execute_typed_call(
-                statement,
-                context.session().current_database(),
-                command_context.connector_context(),
-            ),
-            ParsedStatement::MaterializedView(statement) => self
-                .mv
-                .execute(
-                    &MaterializedViewCommand::new(statement.clone()),
-                    context,
-                    command_context,
-                )
-                .map(Some),
-            ParsedStatement::View(statement) => self
-                .view
-                .execute(
-                    statement,
-                    context.session().current_catalog(),
-                    context.session().current_database(),
-                    command_context.connector_context(),
-                )
-                .map(Some),
-            _ => Ok(None),
-        }
+            .map_err(|error| format!("CALL command scope is no longer active: {error}"))?;
+        self.mv_call.try_execute_typed_call(
+            statement,
+            context.session().current_database(),
+            command_context.connector_context(),
+        )
+    }
+
+    fn execute_materialized_view(
+        &self,
+        statement: &novarocks_parser::ast::MaterializedViewStatement,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<StatementResult, String> {
+        command_context.scope().check().map_err(|error| {
+            format!("materialized view command scope is no longer active: {error}")
+        })?;
+        self.mv.execute(
+            &MaterializedViewCommand::new(statement.clone()),
+            context,
+            command_context,
+        )
+    }
+
+    fn execute_view(
+        &self,
+        statement: &novarocks_parser::ast::ViewStatement,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<StatementResult, String> {
+        command_context
+            .scope()
+            .check()
+            .map_err(|error| format!("view command scope is no longer active: {error}"))?;
+        self.view.execute(
+            statement,
+            context.session().current_catalog(),
+            context.session().current_database(),
+            command_context.connector_context(),
+        )
     }
 }
 
@@ -1387,14 +1408,27 @@ impl FrontendQuerySession {
                         }),
                 },
             )),
-            statement => Box::pin(execute_synchronous_statement(
+            ParsedStatement::ShowBackends(_) => Box::pin(execute_synchronous_statement(
+                synchronous_command_executor,
+                worker_cancellation,
+                diagnostic_statement,
+                execution_owner,
+                move || {
+                    command_executor
+                        .execute_show_backends(&context, &command_context)
+                        .map_err(RoutedExecutionError::Engine)
+                },
+            )),
+            ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
+                statement,
+            )) => Box::pin(execute_synchronous_statement(
                 synchronous_command_executor,
                 worker_cancellation,
                 diagnostic_statement,
                 execution_owner,
                 move || {
                     if let Some(result) = command_executor
-                        .execute_special(&statement, &context, &command_context)
+                        .execute_maintenance_call(&statement, &context, &command_context)
                         .map_err(RoutedExecutionError::Engine)?
                     {
                         Ok(result)
@@ -1412,6 +1446,49 @@ impl FrontendQuerySession {
                                     .map_err(RoutedExecutionError::Engine)
                             })
                     }
+                },
+            )),
+            ParsedStatement::MaterializedView(statement) => {
+                Box::pin(execute_synchronous_statement(
+                    synchronous_command_executor,
+                    worker_cancellation,
+                    diagnostic_statement,
+                    execution_owner,
+                    move || {
+                        command_executor
+                            .execute_materialized_view(&statement, &context, &command_context)
+                            .map_err(RoutedExecutionError::Engine)
+                    },
+                ))
+            }
+            ParsedStatement::View(statement) => Box::pin(execute_synchronous_statement(
+                synchronous_command_executor,
+                worker_cancellation,
+                diagnostic_statement,
+                execution_owner,
+                move || {
+                    command_executor
+                        .execute_view(&statement, &context, &command_context)
+                        .map_err(RoutedExecutionError::Engine)
+                },
+            )),
+            _ => Box::pin(execute_synchronous_statement(
+                synchronous_command_executor,
+                worker_cancellation,
+                diagnostic_statement,
+                execution_owner,
+                move || {
+                    product_command
+                        .ok_or_else(|| {
+                            RoutedExecutionError::Engine(
+                                "typed statement has no declared product owner".to_string(),
+                            )
+                        })
+                        .and_then(|command| {
+                            command_executor
+                                .execute_product(&command, &context, &command_context)
+                                .map_err(RoutedExecutionError::Engine)
+                        })
                 },
             )),
         };
