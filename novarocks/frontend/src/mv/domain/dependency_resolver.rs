@@ -304,10 +304,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_internal_mv_base_table_is_rejected() {
         let repository = novarocks_mv_application::test_repository::InMemoryMvRepository::default();
-        let readiness = MvReadinessPort::new(
-            std::sync::Arc::new(repository),
-            std::sync::Arc::new(
-                novarocks_mv_application::process_runtime::ProcessRuntime::default(),
+        let readiness = MvReadinessPort::from_product(
+            novarocks_mv_application::readiness::MvReadinessService::new(
+                std::sync::Arc::new(repository),
+                std::sync::Arc::new(
+                    novarocks_mv_application::process_runtime::ProcessRuntime::default(),
+                ),
             ),
             tokio::runtime::Handle::current(),
         );

@@ -17,7 +17,7 @@
 
 //! Product-owned process lifecycle for materialized-view activity and workers.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::activity::{
@@ -29,6 +29,7 @@ use crate::ports::{
 };
 use crate::process_runtime::{
     MvBackgroundRuntimeLifecycleError, MvBackgroundRuntimeOwner, MvBackgroundRuntimeStart,
+    ProcessRuntime,
 };
 use crate::product::{
     MvCommand, MvCreateCommand, MvOperationContext, MvProductError, MvProductErrorKind,
@@ -36,7 +37,7 @@ use crate::product::{
 };
 use crate::publication::MvRefreshPublicationFinalizationFacts;
 use crate::readiness::{MvDropReadiness, MvReadinessService, MvRuntimePublicationLease};
-use crate::repository::{MvRepositoryError, MvRepositoryErrorKind};
+use crate::repository::{MvRepository, MvRepositoryError, MvRepositoryErrorKind};
 use crate::scheduler::{MvRefreshScheduler, MvSchedulerConfig};
 
 /// The one process-local MV owner for activity admission and background-worker
@@ -81,6 +82,30 @@ impl MvProductService {
         let mut service = Self::new(scheduler_config);
         service.readiness = Some(readiness);
         service
+    }
+
+    /// Construct the serving product together with its sole readiness state.
+    ///
+    /// Role adapters may receive a clone through [`Self::readiness_service`],
+    /// but they cannot construct a second repository/runtime pair.
+    pub fn new_with_readiness_runtime(
+        scheduler_config: MvSchedulerConfig,
+        repository: Arc<dyn MvRepository>,
+        runtime: Arc<ProcessRuntime<MvTarget, novarocks_spi::connector::LakePublicationId>>,
+    ) -> Self {
+        Self::new_with_readiness(
+            scheduler_config,
+            MvReadinessService::new(repository, runtime),
+        )
+    }
+
+    /// Return the serving product's readiness adapter input.
+    ///
+    /// Unit-only products deliberately have no readiness state. A production
+    /// composition must construct the product through
+    /// [`Self::new_with_readiness_runtime`].
+    pub fn readiness_service(&self) -> Option<MvReadinessService> {
+        self.readiness.clone()
     }
 
     pub fn scheduler_tick_interval_ms(&self) -> u64 {

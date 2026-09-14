@@ -849,9 +849,11 @@ mod tests {
     async fn incomplete_catalog_quarantine_hides_retained_projection_from_readiness_consumers() {
         let repository = Arc::new(InMemoryMvRepository::default());
         let repository_port: Arc<dyn MvRepository> = repository;
-        let readiness = MvReadinessPort::new(
-            Arc::clone(&repository_port),
-            Arc::new(ProcessRuntime::default()),
+        let readiness = MvReadinessPort::from_product(
+            novarocks_mv_application::readiness::MvReadinessService::new(
+                Arc::clone(&repository_port),
+                Arc::new(ProcessRuntime::default()),
+            ),
             tokio::runtime::Handle::current(),
         );
         let package = sample_package(sample_publication());
@@ -892,9 +894,11 @@ mod tests {
     async fn incomplete_catalog_quarantine_preserves_other_catalog_projections() {
         let repository = Arc::new(InMemoryMvRepository::default());
         let repository_port: Arc<dyn MvRepository> = repository;
-        let readiness = MvReadinessPort::new(
-            Arc::clone(&repository_port),
-            Arc::new(ProcessRuntime::default()),
+        let readiness = MvReadinessPort::from_product(
+            novarocks_mv_application::readiness::MvReadinessService::new(
+                Arc::clone(&repository_port),
+                Arc::new(ProcessRuntime::default()),
+            ),
             tokio::runtime::Handle::current(),
         );
         let affected = sample_package_for_catalog("ice_a", "analytics_a", "mv_orders_a");

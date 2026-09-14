@@ -317,9 +317,17 @@ async fn build_frontend_role_products(
     )
     .map_err(FrontendApplicationError::server)?;
 
-    let mv_readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::new(
+    // The role composition root owns construction of the MV process product.
+    // Frontend adapters receive only its already-created readiness service.
+    let mv_product_service = Arc::new(MvProductService::new_with_readiness_runtime(
+        host.mv_scheduler_config(),
         Arc::clone(&mv_repository),
         Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
+    ));
+    let mv_readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
+        mv_product_service
+            .readiness_service()
+            .expect("serving MV product must own readiness state"),
         tokio::runtime::Handle::current(),
     ));
     let mv_candidate_reader = mv_readiness.candidate_reader();
@@ -339,12 +347,6 @@ async fn build_frontend_role_products(
             Arc::clone(&mv_storage_observation),
         ),
     );
-    // The role composition root owns construction of the MV process product;
-    // FrontendMvProductAdapter only adapts product commands to role-local capabilities.
-    let mv_product_service = Arc::new(MvProductService::new_with_readiness(
-        host.mv_scheduler_config(),
-        mv_readiness.product_readiness_service(),
-    ));
     let mv_service = Arc::new(
         crate::mv::FrontendMvProductAdapter::with_refresh_dependencies(
             Arc::clone(&mv_readiness),
@@ -1606,6 +1608,10 @@ mod tests {
             products.mv_product_service.as_ref(),
             products.mv_service.product_service(),
         ));
+        assert!(
+            products.mv_product_service.readiness_service().is_some(),
+            "serving role product must retain the readiness state injected into its adapters"
+        );
 
         drop(session_factory);
         shutdown_frontend_role_products_to_convergence(&mut products, Duration::from_secs(1))

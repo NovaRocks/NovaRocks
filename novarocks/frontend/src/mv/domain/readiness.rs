@@ -9,10 +9,7 @@
 //! unavailable target never falls back to a retained projection, so SHOW,
 //! rewrite, and scheduling cannot accidentally consume stale lake facts.
 
-use std::sync::Arc;
-
 use novarocks_mv_application::activity::CanonicalMvTarget;
-use novarocks_mv_application::process_runtime::ProcessRuntime;
 use novarocks_mv_application::readiness::{
     MvCandidateReader as ProductCandidateReader, MvDropReadiness, MvReadinessService,
 };
@@ -24,8 +21,7 @@ use crate::mv::domain::storage_observation::MvLakePackageObservation;
 use novarocks_mv_application::dependency::MvDependencyObjectRef;
 use novarocks_mv_application::persistence::definition::StoredMvDefinition;
 use novarocks_mv_application::persistence::dependency::StoredMvDependency;
-use novarocks_mv_application::repository::{LoadedMvProjection, MvRepository, MvRepositoryError};
-use novarocks_spi::connector::LakePublicationId;
+use novarocks_mv_application::repository::{LoadedMvProjection, MvRepositoryError};
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 /// The synchronous face of an asynchronous MV projection store.
@@ -60,15 +56,14 @@ pub(crate) struct MvCandidateReader {
 }
 
 impl MvReadinessPort {
-    pub(crate) fn new(
-        repository: Arc<dyn MvRepository>,
-        runtime: Arc<ProcessRuntime<CanonicalMvTarget, LakePublicationId>>,
+    /// Construct the role-local synchronous adapter from the already-owned
+    /// product readiness service. This adapter cannot create an independent
+    /// repository/runtime state pair.
+    pub(crate) fn from_product(
+        service: MvReadinessService,
         handle: tokio::runtime::Handle,
     ) -> Self {
-        Self {
-            service: MvReadinessService::new(repository, runtime),
-            handle,
-        }
+        Self { service, handle }
     }
 
     /// Construct the separate query inventory from the same product-owned
@@ -76,13 +71,6 @@ impl MvReadinessPort {
     /// process-local readiness or refresh authority.
     pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
         MvCandidateReader::new(self.service.candidate_reader(), self.handle.clone())
-    }
-
-    /// Supply the serving MV product with the same product-owned readiness
-    /// runtime. This bridge retains synchronous read adapters only; it does
-    /// not retain refresh publication admission.
-    pub(crate) fn product_readiness_service(&self) -> MvReadinessService {
-        self.service.clone()
     }
 
     /// Drives one durable MV operation from a synchronous caller. Confined to
