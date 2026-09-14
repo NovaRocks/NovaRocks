@@ -64,8 +64,11 @@ user = "root"
 pipeline_scan_thread_pool_thread_num = 1
 pipeline_exec_thread_pool_thread_num = 1
 exchange_io_threads = 1
-data_runtime_worker_threads = 1
-data_runtime_max_blocking_threads = 2
+# Iceberg split discovery synchronously bridges onto this runtime from a data
+# runtime worker. The bridge also performs blocking metadata reads, so retain
+# core and blocking capacity beyond the two admitted Connector jobs.
+data_runtime_worker_threads = 2
+data_runtime_max_blocking_threads = 4
 query_cpu_worker_threads = 1
 query_blocking_worker_threads = 1
 connector_blocking_io_max_inflight = 2
