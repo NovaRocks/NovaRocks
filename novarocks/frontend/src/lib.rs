@@ -48,6 +48,7 @@ pub(crate) mod statistics;
 pub(crate) mod statistics_jobs;
 pub(crate) mod table_maintenance;
 pub(crate) mod task_execution;
-pub mod topology;
+pub(crate) mod topology;
+pub use topology::ClusterBackendOpenConfig;
 mod view;
 pub(crate) mod workload_lifecycle;
