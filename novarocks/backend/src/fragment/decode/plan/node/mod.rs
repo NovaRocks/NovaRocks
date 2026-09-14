@@ -17,7 +17,8 @@
 
 //! Fragment-native protocol plan-node decoding.
 
-mod aggregate;
+#[cfg(test)]
+mod aggregate_tests;
 #[cfg(test)]
 mod change_event_expand;
 #[cfg(test)]
@@ -1388,16 +1389,18 @@ fn lower_physical_node(
                 arena,
             )
         }
-        plan::plan_node::Kind::HashAggregate(aggregate) => aggregate::lower_hash_aggregate_node(
-            node,
-            physical,
-            aggregate,
-            path.clone().field("hash_aggregate"),
-            physical_output_path.clone(),
-            children,
-            arena,
-            ctx,
-        ),
+        plan::plan_node::Kind::HashAggregate(aggregate) => {
+            novarocks_native_adapter::fragment_aggregate::lower_hash_aggregate_node(
+                node,
+                physical,
+                aggregate,
+                path.clone().field("hash_aggregate"),
+                physical_output_path.clone(),
+                children,
+                arena,
+                ctx,
+            )
+        }
         plan::plan_node::Kind::HashJoin(join) => {
             novarocks_native_adapter::fragment_hash_join::lower_hash_join_node(
                 node,

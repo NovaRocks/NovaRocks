@@ -22,7 +22,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
-use super::aggregate::decode_resolved_aggregate_signature;
 use super::{DecodedNode, NativePlanDecodeContext};
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -33,6 +32,7 @@ use novarocks_execution::exec::node::analytic::{
 };
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_aggregate::decode_resolved_aggregate_signature;
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
