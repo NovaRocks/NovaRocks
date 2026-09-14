@@ -152,7 +152,7 @@ struct FrontendRoleProducts {
     maintenance_engine: Arc<dyn crate::query_execution::maintenance::TableMaintenanceEngine>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_candidate_reader: crate::mv::domain::readiness::MvCandidateReader,
-    mv_service: Arc<crate::mv::FrontendMvService>,
+    mv_service: Arc<crate::mv::FrontendMvProductAdapter>,
     maintenance_ports: core_capabilities::MaintenanceCommandPorts,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     exchange_port: u16,
@@ -335,26 +335,28 @@ async fn build_frontend_role_products(
         ),
     );
     // The role composition root owns construction of the MV process product;
-    // FrontendMvService only adapts product commands to role-local capabilities.
+    // FrontendMvProductAdapter only adapts product commands to role-local capabilities.
     let mv_product_service = Arc::new(MvProductService::new_with_readiness(
         host.mv_scheduler_config(),
         mv_readiness.product_readiness_service(),
     ));
-    let mv_service = Arc::new(crate::mv::FrontendMvService::with_refresh_dependencies(
-        Arc::clone(&mv_readiness),
-        query_execution.clone(),
-        Arc::clone(&connector_control),
-        mv_activation,
-        role,
-        topology.clone(),
-        mv_product_service,
-        host.mv_maintenance_config(),
-        Arc::clone(&maintenance_service),
-        host.optimizer_query_mem_limit_bytes(),
-        host.lake_publication_runtime_policy()
-            .max_attempt_duration(),
-        host.workload_root_admission(),
-    ));
+    let mv_service = Arc::new(
+        crate::mv::FrontendMvProductAdapter::with_refresh_dependencies(
+            Arc::clone(&mv_readiness),
+            query_execution.clone(),
+            Arc::clone(&connector_control),
+            mv_activation,
+            role,
+            topology.clone(),
+            mv_product_service,
+            host.mv_maintenance_config(),
+            Arc::clone(&maintenance_service),
+            host.optimizer_query_mem_limit_bytes(),
+            host.lake_publication_runtime_policy()
+                .max_attempt_duration(),
+            host.workload_root_admission(),
+        ),
+    );
     let startup_restore = crate::mv::startup_restore::FrontendMvStartupRestore::new(
         Arc::clone(&connector_control),
         Arc::clone(&catalog_projection),

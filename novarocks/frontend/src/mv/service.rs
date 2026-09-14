@@ -55,7 +55,7 @@ use super::{
 ///
 /// MVX-1 owns only Iceberg CREATE sequencing. Other MV statement classes
 /// deliberately return `None` so their existing core routes remain active.
-pub struct FrontendMvService {
+pub struct FrontendMvProductAdapter {
     readiness: Arc<MvReadinessPort>,
     refresh: refresh::FrontendMvRefreshDependencies,
     product_service: Arc<MvProductService>,
@@ -70,7 +70,7 @@ pub struct FrontendMvService {
     root_admission: RootAdmissionHandle,
 }
 
-impl FrontendMvService {
+impl FrontendMvProductAdapter {
     #[expect(
         clippy::too_many_arguments,
         reason = "Frontend MV composition keeps independently owned ports explicit at the application boundary."
@@ -163,7 +163,7 @@ impl FrontendMvService {
     }
 }
 
-impl FrontendMvService {
+impl FrontendMvProductAdapter {
     pub(crate) fn execute_create(
         &self,
         engine: &dyn MvEngine,

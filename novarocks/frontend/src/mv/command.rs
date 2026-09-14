@@ -41,7 +41,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 use novarocks_types::naming::normalize_identifier;
 
-use super::FrontendMvService;
+use super::FrontendMvProductAdapter;
 use crate::mv::domain::refresh::resolve_refresh_mv_target;
 use crate::mv::domain::{
     alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
@@ -52,7 +52,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct MvCommandExecutor {
     ports: IcebergMvCorePorts,
-    refresh_service: Arc<FrontendMvService>,
+    refresh_service: Arc<FrontendMvProductAdapter>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_backend: Arc<IcebergMvBackend>,
 }
@@ -60,7 +60,7 @@ pub struct MvCommandExecutor {
 impl MvCommandExecutor {
     pub fn new(
         ports: IcebergMvCorePorts,
-        refresh_service: Arc<FrontendMvService>,
+        refresh_service: Arc<FrontendMvProductAdapter>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_backend: Arc<IcebergMvBackend>,
     ) -> Self {
@@ -337,7 +337,7 @@ impl MvCommandExecutor {
 
 /// Role-local implementation of the Query Application MV consumer. It owns
 /// Connector and query-execution adapters, while product lifecycle remains in
-/// the injected `FrontendMvService` composition.
+/// the injected `FrontendMvProductAdapter` composition.
 #[derive(Clone)]
 pub struct FrontendMvCommandConsumer {
     executor: MvCommandExecutor,

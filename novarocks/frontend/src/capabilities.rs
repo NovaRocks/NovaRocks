@@ -48,7 +48,7 @@ use novarocks_query_application::system_catalog::SystemCatalog;
 use novarocks_query_application::view::ViewService;
 use novarocks_spi::connector::MvStorageObservationPort;
 
-use crate::mv::{FrontendMvService, command as mv_command};
+use crate::mv::{FrontendMvProductAdapter, command as mv_command};
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::statistics_jobs::application::StatisticsApplicationPort;
 use crate::view::command::ViewCommandExecutor;
@@ -429,7 +429,7 @@ pub struct MvCommandPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     repository: Arc<dyn MvRepository>,
     readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
-    refresh_service: Arc<FrontendMvService>,
+    refresh_service: Arc<FrontendMvProductAdapter>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     #[allow(
         dead_code,
@@ -446,7 +446,7 @@ impl MvCommandPorts {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         repository: Arc<dyn MvRepository>,
-        refresh_service: Arc<FrontendMvService>,
+        refresh_service: Arc<FrontendMvProductAdapter>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
     ) -> Self {

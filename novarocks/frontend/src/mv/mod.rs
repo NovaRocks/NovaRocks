@@ -29,4 +29,4 @@ mod service;
 #[allow(dead_code)]
 pub(crate) mod startup_restore;
 
-pub use service::FrontendMvService;
+pub use service::FrontendMvProductAdapter;

@@ -142,7 +142,7 @@ fn load_definition_for_alter(
 /// injected backend rather than a string-keyed connector registry lookup.
 pub fn create_mv_with_ports(
     ports: &IcebergMvCorePorts,
-    service: &crate::mv::FrontendMvService,
+    service: &crate::mv::FrontendMvProductAdapter,
     current_catalog: Option<&str>,
     db: &str,
     stmt: &MvCreateStatement,
