@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorCommittedVersion, ConnectorProviderBindingKey, ConnectorTableHandle,
-    ConnectorTableObjectId, ConnectorWriteCohortId, ConnectorWriteOperationId,
+    ConnectorProviderBindingKey, ConnectorTableHandle, ConnectorTableObjectId,
+    ConnectorWriteCohortId, ConnectorWriteOperationId,
 };
 
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
@@ -36,41 +36,13 @@ use novarocks_sql::planning::mv::first_refresh::{SqlMvFirstRefreshArtifact, SqlM
 use crate::mv::domain::application::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
 };
-use novarocks_mv_application::publication::{MvRefreshCommittedFacts, MvRefreshPublicationIntent};
+use novarocks_mv_application::publication::MvRefreshPublicationIntent;
 
 /// The application commit semantics selected after first-refresh SQL planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MvStagedRefreshWriteMode {
     Append,
     FullOverwrite,
-}
-
-/// Facts available only after the publication action is known committed and
-/// provider finalization completed. The frontend constructs this value after
-/// recording the catalog action; it never changes the provider outcome.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvRefreshPublishedFacts {
-    committed: MvRefreshCommittedFacts,
-    publication_version: ConnectorCommittedVersion,
-}
-
-impl MvRefreshPublishedFacts {
-    pub fn try_new(
-        committed: MvRefreshCommittedFacts,
-        publication_version: ConnectorCommittedVersion,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            committed,
-            publication_version,
-        })
-    }
-
-    pub fn committed(&self) -> &MvRefreshCommittedFacts {
-        &self.committed
-    }
-    pub fn publication_version(&self) -> &ConnectorCommittedVersion {
-        &self.publication_version
-    }
 }
 
 /// Application facts retained for the typed join activation path. The SQL

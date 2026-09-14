@@ -264,6 +264,35 @@ impl MvRefreshCommittedFacts {
     }
 }
 
+/// Facts available only after the publication action is known committed and
+/// provider finalization completed. Constructing this value records the exact
+/// provider result; it never changes the provider outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshPublishedFacts {
+    committed: MvRefreshCommittedFacts,
+    publication_version: ConnectorCommittedVersion,
+}
+
+impl MvRefreshPublishedFacts {
+    pub fn try_new(
+        committed: MvRefreshCommittedFacts,
+        publication_version: ConnectorCommittedVersion,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            committed,
+            publication_version,
+        })
+    }
+
+    pub fn committed(&self) -> &MvRefreshCommittedFacts {
+        &self.committed
+    }
+
+    pub fn publication_version(&self) -> &ConnectorCommittedVersion {
+        &self.publication_version
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
