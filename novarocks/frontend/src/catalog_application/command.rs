@@ -34,7 +34,8 @@ use crate::catalog_application::statement::{
     CatalogDropContext, CatalogMutationContext, execute_create_database_statement,
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement,
-    lower_semantic_create_table_statement,
+    lower_semantic_create_table_statement, lower_semantic_iceberg_partition_change,
+    lower_semantic_iceberg_properties_action, lower_semantic_iceberg_schema_change,
 };
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
@@ -42,7 +43,9 @@ use novarocks_query_application::api::build_utf8_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::literal::arrow_data_type_to_sql_type;
-use novarocks_sql::semantic::command::CreateTableSqlCommand;
+use novarocks_sql::semantic::command::{
+    AlterIcebergTableSqlCommand, CreateTableSqlCommand, IcebergTableSqlAction,
+};
 use novarocks_sql::semantic::command::{
     CatalogCreateCommand as SemanticCatalogCreateCommand, CommandLiteral,
 };
@@ -212,57 +215,48 @@ impl CatalogCommandExecutor {
         )
     }
 
-    /// Executes an admitted Iceberg `ALTER TABLE` syntax node without a SQL
-    /// text round-trip. Reference mutations belong to their dedicated owner;
-    /// ADD FILES belongs to the DML lifecycle owner.
-    pub fn execute_iceberg_typed(
+    /// Executes a semantic Iceberg `ALTER TABLE` command owned by the catalog
+    /// application. Reference and ADD FILES remain explicit owner cuts.
+    pub fn execute_iceberg_command(
         &self,
-        statement: &novarocks_parser::ast::AlterIcebergTable,
+        command: &AlterIcebergTableSqlCommand,
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
-        use novarocks_parser::ast::IcebergTableAction;
-
-        match &statement.action {
-            IcebergTableAction::Schema(change) => execute_alter_iceberg_schema(
+        match &command.action {
+            IcebergTableSqlAction::Schema(change) => execute_alter_iceberg_schema(
                 self,
                 crate::catalog_application::statement::AlterIcebergSchemaStmt {
-                    table: typed_object_name(&statement.table),
-                    change: crate::catalog_application::statement::lower_typed_iceberg_schema_change(
-                        change,
-                    )?,
+                    table: command.table.clone(),
+                    change: lower_semantic_iceberg_schema_change(change)?,
                 },
                 current_catalog,
                 current_database,
                 connector_context,
             ),
-            IcebergTableAction::Properties(action) => execute_alter_iceberg_properties(
+            IcebergTableSqlAction::Properties(action) => execute_alter_iceberg_properties(
                 self,
                 crate::catalog_application::statement::AlterIcebergPropertiesStmt {
-                    table: typed_object_name(&statement.table),
-                    op: crate::catalog_application::statement::lower_typed_iceberg_properties_action(
-                        action,
-                    )?,
+                    table: command.table.clone(),
+                    op: lower_semantic_iceberg_properties_action(action)?,
                 },
                 current_catalog,
                 current_database,
                 connector_context,
             ),
-            IcebergTableAction::Partition(change) => execute_alter_partition_spec(
+            IcebergTableSqlAction::Partition(change) => execute_alter_partition_spec(
                 self,
-                typed_object_name(&statement.table),
-                crate::catalog_application::statement::lower_typed_iceberg_partition_change(
-                    change,
-                )?,
+                command.table.clone(),
+                lower_semantic_iceberg_partition_change(change)?,
                 current_catalog,
                 current_database,
                 connector_context,
             ),
-            IcebergTableAction::Reference(_) => Err(
-                "Iceberg reference command belongs to the ref command executor".to_string(),
-            ),
-            IcebergTableAction::AddFiles(_) => {
+            IcebergTableSqlAction::Reference(_) => {
+                Err("Iceberg reference command belongs to the ref command executor".to_string())
+            }
+            IcebergTableSqlAction::AddFiles { .. } => {
                 Err("ADD FILES belongs to the DML lifecycle executor".to_string())
             }
         }
@@ -279,12 +273,6 @@ impl CatalogCommandExecutor {
             .create_catalog(command)
             .map_err(|error| error.to_string())?;
         Ok(StatementResult::Ok)
-    }
-}
-
-fn typed_object_name(name: &novarocks_parser::ast::ObjectName) -> ObjectName {
-    ObjectName {
-        parts: name.parts.iter().map(|part| part.value.clone()).collect(),
     }
 }
 

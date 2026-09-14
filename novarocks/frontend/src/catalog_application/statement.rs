@@ -38,7 +38,9 @@ use novarocks_spi::connector::{
 };
 use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use novarocks_sql::semantic::command::{
-    CommandLiteral, CreateTableSqlCommand, TablePartitionSqlCommand,
+    ColumnPositionSql, CommandLiteral, CreateTableSqlCommand, IcebergColumnSqlAction,
+    IcebergPartitionSqlChange, IcebergPropertiesSqlAction, IcebergSchemaSqlChange,
+    TablePartitionSqlCommand,
 };
 use novarocks_sql::semantic::{
     ColumnAggregation, DefaultLiteral, IcebergPartitionFieldExpr, ObjectName, TableColumnDef,
@@ -1298,6 +1300,240 @@ pub(crate) fn lower_typed_iceberg_partition_change(
     }
 }
 
+/// Lowers a semantic Iceberg property command without accepting parser AST.
+pub(crate) fn lower_semantic_iceberg_properties_action(
+    action: &IcebergPropertiesSqlAction,
+) -> Result<PropertiesOp, String> {
+    match action {
+        IcebergPropertiesSqlAction::Set { entries } => {
+            if entries.is_empty() {
+                return Err("SET TBLPROPERTIES requires at least one key=value pair".to_string());
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut lowered = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                if !seen.insert(key.clone()) {
+                    return Err(format!("duplicate key '{key}' in SET TBLPROPERTIES"));
+                }
+                lowered.push((key.clone(), semantic_property_string(value)?));
+            }
+            Ok(PropertiesOp::Set { entries: lowered })
+        }
+        IcebergPropertiesSqlAction::Unset { keys, if_exists } => {
+            if keys.is_empty() {
+                return Err("UNSET TBLPROPERTIES requires at least one key".to_string());
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut lowered = Vec::with_capacity(keys.len());
+            for key in keys {
+                if !seen.insert(key.clone()) {
+                    return Err(format!("duplicate key '{key}' in UNSET TBLPROPERTIES"));
+                }
+                lowered.push(key.clone());
+            }
+            Ok(PropertiesOp::Unset {
+                keys: lowered,
+                if_exists: *if_exists,
+            })
+        }
+        IcebergPropertiesSqlAction::Comment { value } => Ok(PropertiesOp::Set {
+            entries: vec![("comment".to_string(), semantic_property_string(value)?)],
+        }),
+    }
+}
+
+/// Lowers a semantic partition change to the connector representation.
+pub(crate) fn lower_semantic_iceberg_partition_change(
+    change: &IcebergPartitionSqlChange,
+) -> Result<IcebergPartitionSpecChange, String> {
+    let lower = |field: &IcebergPartitionFieldExpr| -> Result<ConnectorPartitionTransform, String> {
+        let normalized = normalize_semantic_partition_transform(field)?;
+        Ok(connector_partition_transform(&normalized))
+    };
+    match change {
+        IcebergPartitionSqlChange::Add(field) => Ok(IcebergPartitionSpecChange::Add(lower(field)?)),
+        IcebergPartitionSqlChange::Drop(field) => {
+            Ok(IcebergPartitionSpecChange::Drop(lower(field)?))
+        }
+    }
+}
+
+/// Lowers a semantic schema change to the catalog product request.
+pub(crate) fn lower_semantic_iceberg_schema_change(
+    change: &IcebergSchemaSqlChange,
+) -> Result<IcebergSchemaChange, String> {
+    match change {
+        IcebergSchemaSqlChange::AddColumn {
+            path,
+            data_type,
+            nullable,
+            default,
+            position,
+        } => {
+            if matches!(nullable, Some(false)) {
+                return Err(
+                    "ADD COLUMN NOT NULL is not supported for Iceberg schema evolution".to_string(),
+                );
+            }
+            let (parent, name) = semantic_add_column_path(path)?;
+            Ok(IcebergSchemaChange::AddColumn {
+                parent,
+                name,
+                data_type: data_type.clone(),
+                default: default
+                    .as_ref()
+                    .map(|value| lower_semantic_default_literal(value, data_type))
+                    .transpose()?,
+                position: lower_semantic_add_position(position, true)?,
+            })
+        }
+        IcebergSchemaSqlChange::DropColumn { path } => Ok(IcebergSchemaChange::DropColumn {
+            path: semantic_column_path(path)?,
+        }),
+        IcebergSchemaSqlChange::RenameColumn { from, to } => {
+            let path = semantic_column_path(from)?;
+            let target = semantic_column_path(to)?;
+            let source_parent = path.parent();
+            let target_parent = target.parent();
+            if !target_parent.is_empty() && target_parent != source_parent {
+                return Err(
+                    "RENAME COLUMN target must share the same parent path as the source"
+                        .to_string(),
+                );
+            }
+            Ok(IcebergSchemaChange::RenameColumn {
+                path,
+                new_name: target
+                    .last()
+                    .expect("semantic column path is non-empty")
+                    .to_owned(),
+            })
+        }
+        IcebergSchemaSqlChange::ModifyColumn { path, data_type } => {
+            Ok(IcebergSchemaChange::ModifyColumn {
+                path: semantic_column_path(path)?,
+                new_type: data_type.clone(),
+            })
+        }
+        IcebergSchemaSqlChange::AlterColumn { path, action } => {
+            let path = semantic_column_path(path)?;
+            match action {
+                IcebergColumnSqlAction::Reorder(position) => Ok(IcebergSchemaChange::Reorder {
+                    path,
+                    position: lower_semantic_add_position(position, false)?,
+                }),
+                IcebergColumnSqlAction::SetNullable(nullable) => {
+                    Ok(IcebergSchemaChange::SetNullable {
+                        path,
+                        nullable: *nullable,
+                    })
+                }
+                IcebergColumnSqlAction::Comment(comment) => {
+                    Ok(IcebergSchemaChange::UpdateComment {
+                        path,
+                        comment: semantic_property_string(comment).map_err(|_| {
+                            "ALTER COLUMN COMMENT requires a string literal".to_string()
+                        })?,
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn semantic_property_string(literal: &CommandLiteral) -> Result<String, String> {
+    match literal {
+        CommandLiteral::String(value) => Ok(value.clone()),
+        _ => Err("TBLPROPERTIES key/value must be a string literal".to_string()),
+    }
+}
+
+fn semantic_column_path(parts: &[String]) -> Result<ColumnPath, String> {
+    if parts.is_empty() {
+        return Err("column path is empty".to_string());
+    }
+    Ok(ColumnPath::from_segments(parts.to_vec()))
+}
+
+fn semantic_add_column_path(parts: &[String]) -> Result<(ColumnPath, String), String> {
+    let mut path = semantic_column_path(parts)?;
+    let name = path
+        .segments
+        .pop()
+        .ok_or_else(|| "ADD COLUMN requires a column path".to_string())?;
+    Ok((path, name))
+}
+
+fn lower_semantic_add_position(
+    position: &ColumnPositionSql,
+    add_column: bool,
+) -> Result<AddPosition, String> {
+    let target = |path: &[String]| {
+        let path = semantic_column_path(path)?;
+        if add_column && path.segments.len() != 1 {
+            return Err(
+                "ADD COLUMN position target must be a single column identifier".to_string(),
+            );
+        }
+        path.last()
+            .map(str::to_owned)
+            .ok_or_else(|| "column position target is empty".to_string())
+    };
+    match position {
+        ColumnPositionSql::Default => Ok(AddPosition::Default),
+        ColumnPositionSql::First => Ok(AddPosition::First),
+        ColumnPositionSql::After(path) => Ok(AddPosition::After(target(path)?)),
+        ColumnPositionSql::Before(path) => Ok(AddPosition::Before(target(path)?)),
+    }
+}
+
+fn normalize_semantic_partition_transform(
+    field: &IcebergPartitionFieldExpr,
+) -> Result<IcebergPartitionFieldExpr, String> {
+    let normalize = |column: &str| normalize_identifier(column);
+    Ok(match field {
+        IcebergPartitionFieldExpr::Identity { column } => IcebergPartitionFieldExpr::Identity {
+            column: normalize(column)?,
+        },
+        IcebergPartitionFieldExpr::Year { column } => IcebergPartitionFieldExpr::Year {
+            column: normalize(column)?,
+        },
+        IcebergPartitionFieldExpr::Month { column } => IcebergPartitionFieldExpr::Month {
+            column: normalize(column)?,
+        },
+        IcebergPartitionFieldExpr::Day { column } => IcebergPartitionFieldExpr::Day {
+            column: normalize(column)?,
+        },
+        IcebergPartitionFieldExpr::Hour { column } => IcebergPartitionFieldExpr::Hour {
+            column: normalize(column)?,
+        },
+        IcebergPartitionFieldExpr::Void { column } => IcebergPartitionFieldExpr::Void {
+            column: normalize(column)?,
+        },
+        IcebergPartitionFieldExpr::Bucket {
+            column,
+            num_buckets,
+        } => {
+            if *num_buckets == 0 {
+                return Err("bucket count must be positive".to_string());
+            }
+            IcebergPartitionFieldExpr::Bucket {
+                column: normalize(column)?,
+                num_buckets: *num_buckets,
+            }
+        }
+        IcebergPartitionFieldExpr::Truncate { column, width } => {
+            if *width == 0 {
+                return Err("truncate width must be positive".to_string());
+            }
+            IcebergPartitionFieldExpr::Truncate {
+                column: normalize(column)?,
+                width: *width,
+            }
+        }
+    })
+}
+
 fn lower_typed_property_string(literal: &novarocks_parser::ast::Literal) -> Result<String, String> {
     let novarocks_parser::ast::LiteralKind::String(value) = &literal.kind else {
         return Err("TBLPROPERTIES key/value must be a string literal".to_string());
@@ -2294,6 +2530,83 @@ mod tests {
                 .expect_err("zero bucket count must fail")
                 .contains("must be positive")
         );
+    }
+
+    #[test]
+    fn semantic_iceberg_lowering_matches_typed_product_dtos() {
+        let schema_sql =
+            "ALTER TABLE ice.db.orders ADD COLUMN total DECIMAL(10,2) DEFAULT '1.20' AFTER id";
+        let typed_schema = typed_iceberg_action(schema_sql);
+        let semantic_schema = semantic_iceberg_action(schema_sql);
+        let novarocks_parser::ast::IcebergTableAction::Schema(typed_schema) = typed_schema else {
+            panic!("expected typed schema action");
+        };
+        let novarocks_sql::semantic::command::IcebergTableSqlAction::Schema(semantic_schema) =
+            semantic_schema
+        else {
+            panic!("expected semantic schema action");
+        };
+        assert_eq!(
+            super::lower_semantic_iceberg_schema_change(&semantic_schema)
+                .expect("lower semantic schema"),
+            super::lower_typed_iceberg_schema_change(&typed_schema).expect("lower typed schema"),
+        );
+
+        let properties_sql =
+            "ALTER TABLE ice.db.orders SET TBLPROPERTIES ('write.format.default' = 'parquet')";
+        let typed_properties = typed_iceberg_action(properties_sql);
+        let semantic_properties = semantic_iceberg_action(properties_sql);
+        let novarocks_parser::ast::IcebergTableAction::Properties(typed_properties) =
+            typed_properties
+        else {
+            panic!("expected typed properties action");
+        };
+        let novarocks_sql::semantic::command::IcebergTableSqlAction::Properties(
+            semantic_properties,
+        ) = semantic_properties
+        else {
+            panic!("expected semantic properties action");
+        };
+        assert_eq!(
+            super::lower_semantic_iceberg_properties_action(&semantic_properties)
+                .expect("lower semantic properties"),
+            super::lower_typed_iceberg_properties_action(&typed_properties)
+                .expect("lower typed properties"),
+        );
+
+        let partition_sql = "ALTER TABLE ice.db.orders ADD PARTITION COLUMN bucket(User_Id, 32)";
+        let typed_partition = typed_iceberg_action(partition_sql);
+        let semantic_partition = semantic_iceberg_action(partition_sql);
+        let novarocks_parser::ast::IcebergTableAction::Partition(typed_partition) = typed_partition
+        else {
+            panic!("expected typed partition action");
+        };
+        let novarocks_sql::semantic::command::IcebergTableSqlAction::Partition(semantic_partition) =
+            semantic_partition
+        else {
+            panic!("expected semantic partition action");
+        };
+        assert_eq!(
+            super::lower_semantic_iceberg_partition_change(&semantic_partition)
+                .expect("lower semantic partition"),
+            super::lower_typed_iceberg_partition_change(&typed_partition)
+                .expect("lower typed partition"),
+        );
+    }
+
+    fn semantic_iceberg_action(
+        sql: &str,
+    ) -> novarocks_sql::semantic::command::IcebergTableSqlAction {
+        let statement = novarocks_query_application::sql::parse_single_statement(sql)
+            .expect("parse semantic Iceberg command");
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(
+            novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(statement),
+        )) = novarocks_query_application::sql::lower_product_sql_command(&statement)
+            .expect("lower semantic Iceberg command")
+        else {
+            panic!("expected semantic Iceberg ALTER TABLE statement");
+        };
+        statement.action
     }
 }
 

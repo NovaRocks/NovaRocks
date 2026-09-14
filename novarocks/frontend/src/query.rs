@@ -222,8 +222,16 @@ impl CoreCommandRoute for TypedCommandRoute {
             ParsedStatement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(
                 statement,
             )) => {
-                self.catalog.execute_iceberg_typed(
-                    statement,
+                let Some(ProductSqlCommand::Catalog(
+                    novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command),
+                )) = lower_product_sql_command(&ParsedStatement::Iceberg(
+                    novarocks_parser::ast::IcebergStatement::AlterTable(statement.clone()),
+                ))?
+                else {
+                    return Err("Iceberg parser admission did not produce ALTER TABLE".to_string());
+                };
+                self.catalog.execute_iceberg_command(
+                    &command,
                     context.session().current_catalog(),
                     context.session().current_database(),
                     command_context.connector_context(),
