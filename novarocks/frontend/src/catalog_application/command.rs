@@ -38,12 +38,14 @@ use crate::catalog_application::statement::{
 };
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
-use novarocks_parser::ast::{CatalogStatement, LiteralKind};
 use novarocks_query_application::api::build_utf8_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::literal::arrow_data_type_to_sql_type;
-use novarocks_sql::semantic::{ObjectName, TableColumnDef};
+use novarocks_sql::semantic::command::{
+    CatalogCreateCommand as SemanticCatalogCreateCommand, CommandLiteral,
+};
+use novarocks_sql::semantic::{CatalogSqlCommand, ObjectName, TableColumnDef};
 
 /// Catalog DDL capability built from catalog-only leaf ports.
 ///
@@ -110,54 +112,73 @@ impl CatalogCommandExecutor {
         }
     }
 
-    /// Executes the SQLP-3 basic catalog family without reparsing source SQL.
-    pub fn execute_typed(
+    /// Executes a complete catalog command lowered by Query Application.
+    ///
+    /// This role-local adapter deliberately accepts no parser AST and never
+    /// reconstructs source SQL.  Table and Iceberg actions remain on their
+    /// dedicated semantic adapter cut; accepting them here before that cut
+    /// would create a fallback around their product owners.
+    pub fn execute_command(
         &self,
-        statement: &CatalogStatement,
+        command: &CatalogSqlCommand,
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
-        match statement {
-            CatalogStatement::CreateCatalog(statement) => {
-                self.execute_create_catalog(lower_create_catalog(statement)?)
+        match command {
+            CatalogSqlCommand::CreateCatalog(command) => {
+                self.execute_create_catalog(lower_semantic_create_catalog(command)?)
             }
-            CatalogStatement::DropCatalog(statement) => {
-                execute_drop_catalog_statement(self, &statement.name.value, statement.if_exists)
+            CatalogSqlCommand::DropCatalog { name, if_exists } => {
+                execute_drop_catalog_statement(self, name, *if_exists)
             }
-            CatalogStatement::CreateDatabase(statement) => execute_create_database_statement(
+            CatalogSqlCommand::CreateDatabase {
+                name,
+                if_not_exists,
+            } => execute_create_database_statement(
                 self,
-                &typed_object_name(&statement.name),
-                statement.if_not_exists,
+                name,
+                *if_not_exists,
                 current_catalog,
                 connector_context,
             ),
-            CatalogStatement::DropDatabase(statement) => execute_drop_database_statement(
+            CatalogSqlCommand::DropDatabase {
+                name,
+                if_exists,
+                force,
+            } => execute_drop_database_statement(
                 self,
-                &typed_object_name(&statement.name),
+                name,
                 current_catalog,
-                statement.if_exists,
-                statement.force,
+                *if_exists,
+                *force,
                 connector_context,
             ),
-            CatalogStatement::DropTable(statement) => execute_drop_table_statement(
+            CatalogSqlCommand::DropTable {
+                name,
+                if_exists,
+                force,
+            } => execute_drop_table_statement(
                 self,
-                &typed_object_name(&statement.name),
+                name,
                 current_catalog,
                 current_database,
-                statement.if_exists,
-                statement.force,
+                *if_exists,
+                *force,
                 connector_context,
             ),
-            CatalogStatement::ShowCreateTable(statement) => execute_show_create_table(
+            CatalogSqlCommand::ShowCreateTable { name } => execute_show_create_table(
                 self,
-                typed_object_name(&statement.name),
+                name.clone(),
                 current_catalog,
                 current_database,
                 connector_context,
             ),
-            CatalogStatement::TruncateTable(_) => {
-                Err("catalog statement belongs to a later typed command owner".to_string())
+            CatalogSqlCommand::TruncateTable { .. } => {
+                Err("TRUNCATE belongs to the DML lifecycle executor".to_string())
+            }
+            CatalogSqlCommand::CreateTable(_) | CatalogSqlCommand::AlterIcebergTable(_) => {
+                Err("catalog command belongs to a dedicated semantic adapter".to_string())
             }
         }
     }
@@ -270,34 +291,34 @@ fn typed_object_name(name: &novarocks_parser::ast::ObjectName) -> ObjectName {
     }
 }
 
-fn catalog_property_text(literal: &novarocks_parser::ast::Literal) -> Result<String, String> {
-    match &literal.kind {
-        LiteralKind::String(value) => Ok(value.clone()),
-        _ => Err("catalog properties require identifier or string values".to_string()),
-    }
-}
-
-fn lower_create_catalog(
-    statement: &novarocks_parser::ast::CreateCatalog,
+fn lower_semantic_create_catalog(
+    command: &SemanticCatalogCreateCommand,
 ) -> Result<CatalogCreateCommand, String> {
-    let properties = statement
+    let properties = command
         .properties
         .iter()
         .map(|property| {
             Ok((
-                catalog_property_text(&property.key)?,
-                catalog_property_text(&property.value)?,
+                catalog_command_literal_text(&property.key)?,
+                catalog_command_literal_text(&property.value)?,
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let instance_id = ConnectorInstanceId::parse(&normalize_identifier(&statement.name.value)?)
+    let instance_id = ConnectorInstanceId::parse(&normalize_identifier(&command.name)?)
         .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
     Ok(CatalogCreateCommand {
         instance_id,
-        display_name: statement.name.value.clone(),
+        display_name: command.name.clone(),
         properties,
-        if_not_exists: statement.if_not_exists,
+        if_not_exists: command.if_not_exists,
     })
+}
+
+fn catalog_command_literal_text(literal: &CommandLiteral) -> Result<String, String> {
+    match literal {
+        CommandLiteral::String(value) => Ok(value.clone()),
+        _ => Err("catalog properties require identifier or string values".to_string()),
+    }
 }
 
 fn execute_alter_iceberg_properties(
@@ -655,9 +676,9 @@ fn execute_show_create_table(
 
 #[cfg(test)]
 mod tests {
-    use novarocks_parser::ast::{CatalogStatement, Statement};
+    use novarocks_parser::ast::Statement;
 
-    use super::{CatalogCommandExecutor, lower_create_catalog};
+    use super::{CatalogCommandExecutor, lower_semantic_create_catalog};
 
     #[test]
     fn non_catalog_statement_is_not_claimed() {
@@ -671,17 +692,19 @@ mod tests {
 
     #[test]
     fn typed_create_catalog_lowers_without_the_legacy_sql_facade() {
-        let statement = novarocks_parser::parse(
+        let statement = novarocks_query_application::sql::parse_single_statement(
             "CREATE EXTERNAL CATALOG IF NOT EXISTS Warehouse PROPERTIES ('type'='iceberg')",
         )
-        .expect("parse catalog statement")
-        .pop()
-        .expect("one statement");
-        let Statement::Catalog(CatalogStatement::CreateCatalog(statement)) = statement else {
-            panic!("expected CREATE CATALOG");
+        .expect("parse catalog statement");
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(
+            novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(statement),
+        )) = novarocks_query_application::sql::lower_product_sql_command(&statement)
+            .expect("lower catalog statement")
+        else {
+            panic!("expected semantic CREATE CATALOG");
         };
 
-        let command = lower_create_catalog(&statement).expect("lower catalog command");
+        let command = lower_semantic_create_catalog(&statement).expect("lower catalog command");
         assert_eq!(command.instance_id.as_str(), "warehouse");
         assert_eq!(command.display_name, "Warehouse");
         assert_eq!(

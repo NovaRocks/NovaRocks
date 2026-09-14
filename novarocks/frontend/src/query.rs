@@ -194,8 +194,13 @@ impl CoreCommandRoute for TypedCommandRoute {
                 Ok(StatementResult::Ok)
             }
             ParsedStatement::Catalog(statement) => {
-                self.catalog.execute_typed(
-                    statement,
+                let Some(ProductSqlCommand::Catalog(command)) =
+                    lower_product_sql_command(&ParsedStatement::Catalog(statement.clone()))?
+                else {
+                    return Err("catalog parser admission did not produce a semantic command".to_string());
+                };
+                self.catalog.execute_command(
+                    &command,
                     context.session().current_catalog(),
                     context.session().current_database(),
                     command_context.connector_context(),
