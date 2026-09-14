@@ -17,23 +17,22 @@
 
 //! Fragment exchange-node decoding.
 
-use super::{DecodedNode, NativePlanDecodeContext};
+use crate::fragment_decode_context::NativePlanDecodeContext;
+use crate::fragment_error::NativeFragmentDecodeError;
+use crate::fragment_expression::decode_expr_for_slot_layout;
+use crate::fragment_layout::decode_fragment_output_layout;
+use crate::fragment_plan_node::NativeLoweredPlanNode as DecodedNode;
+use crate::fragment_plan_node::{lower_sort_items_for_layout, parse_optional_nonnegative_i64};
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::node::exchange_source::ExchangeSourceNode;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::sort::{SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
-use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
-use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
-use novarocks_native_adapter::fragment_plan_node::{
-    lower_sort_items_for_layout, parse_optional_nonnegative_i64,
-};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
-pub(super) fn lower_exchange_receiver(
+pub fn lower_exchange_receiver(
     node: &plan::DistributedNode,
     exchange: &plan::ExchangeReceiver,
     path: FieldPath,
@@ -217,7 +216,31 @@ fn decode_hash_partition_exprs(
 mod tests {
     use arrow::datatypes::DataType;
 
-    use super::super::{NativePlanDecodeContext, decode_node};
+    use super::{DecodedNode, NativePlanDecodeContext};
+    use novarocks_proto_codec::FieldPath;
+
+    fn decode_node(
+        node: &plan::DistributedNode,
+        arena: &mut ExprArena,
+        ctx: &NativePlanDecodeContext,
+    ) -> Result<DecodedNode, crate::fragment_error::NativeFragmentDecodeError> {
+        let Some(plan::distributed_node::Payload::Exchange(exchange)) = node.payload.as_ref()
+        else {
+            panic!("fixture node carries an exchange payload");
+        };
+        super::lower_exchange_receiver(
+            node,
+            exchange,
+            FieldPath::root("plan_fragment")
+                .field("root")
+                .field("payload")
+                .field("exchange"),
+            Vec::new(),
+            arena,
+            ctx,
+        )
+    }
+
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::runtime::exchange::ExchangeKey;

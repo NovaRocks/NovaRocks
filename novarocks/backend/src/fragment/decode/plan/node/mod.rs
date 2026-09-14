@@ -20,7 +20,6 @@
 mod aggregate;
 #[cfg(test)]
 mod change_event_expand;
-mod exchange;
 #[cfg(test)]
 mod filter;
 mod hash_join;
@@ -167,14 +166,16 @@ fn decode_node_inner(
             arena,
             ctx,
         ),
-        plan::distributed_node::Payload::Exchange(exchange) => exchange::lower_exchange_receiver(
-            node,
-            exchange,
-            path.clone().field("payload").field("exchange"),
-            children,
-            arena,
-            ctx,
-        ),
+        plan::distributed_node::Payload::Exchange(exchange) => {
+            novarocks_native_adapter::fragment_exchange_receiver::lower_exchange_receiver(
+                node,
+                exchange,
+                path.clone().field("payload").field("exchange"),
+                children,
+                arena,
+                ctx,
+            )
+        }
         // The write dataflow nodes reach their exact query-leased write role
         // binding through the typed runtime; neither is a terminal sink, so
         // both lower like any other relational node.

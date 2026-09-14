@@ -35,6 +35,7 @@ pub mod exchange_data_plane;
 pub mod exchange_transmitter;
 pub mod fragment_decode_context;
 pub mod fragment_error;
+pub mod fragment_exchange_receiver;
 pub mod fragment_expression;
 pub mod fragment_ingress_error;
 pub mod fragment_instance;
