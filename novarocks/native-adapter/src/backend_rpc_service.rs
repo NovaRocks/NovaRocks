@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Production Backend gRPC service and its domain handlers.
+//! Native Backend gRPC service and its domain handlers.
 //!
 //! The generic generated listener, authenticated transport, and its lifecycle
 //! are owned by `novarocks-native-adapter`; this role owns its service facts.
@@ -26,7 +26,7 @@ use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 use tokio_stream::wrappers::ReceiverStream;
 
-use novarocks_native_adapter::{
+use crate::{
     backend_heartbeat::BackendHeartbeatResponder,
     catalog_prune_rpc::{CatalogReachabilityAuthority, handle_prune_catalogs},
     exchange_data_plane::{NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority},
@@ -39,7 +39,7 @@ use novarocks_worker::TaskInboundCapabilities;
 /// Backend-owned production Tonic service. Domain owners contribute the narrow
 /// ingress ports while this service composes their role-local wire adapters.
 #[derive(Clone)]
-pub(crate) struct BackendRpcService {
+pub struct BackendRpcService {
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
     catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
     heartbeat: BackendHeartbeatResponder,
@@ -48,7 +48,7 @@ pub(crate) struct BackendRpcService {
 }
 
 impl BackendRpcService {
-    pub(crate) fn new(
+    pub fn new(
         task_execution_ingress: Arc<dyn TaskExecutionIngress>,
         catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,

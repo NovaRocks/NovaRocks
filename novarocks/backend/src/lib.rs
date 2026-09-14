@@ -2,7 +2,6 @@
 pub mod application;
 pub(crate) mod connector;
 mod fragment;
-pub(crate) mod rpc;
 mod runtime;
 pub(crate) mod runtime_filter;
 mod service;
