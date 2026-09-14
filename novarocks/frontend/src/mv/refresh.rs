@@ -32,6 +32,13 @@ use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
 };
 use crate::query_execution::service::QueryExecutionService;
+use novarocks_mv_application::ports::{
+    MvProviderFailure, MvProviderFailureKind, MvRefreshProjectionPort,
+};
+use novarocks_mv_application::product::{
+    MvProductError, MvProductErrorKind, MvProductResult, MvTarget as ProductMvTarget,
+};
+use novarocks_mv_application::service::MvProductService;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorControlRegistry, ConnectorInstanceId,
@@ -51,6 +58,7 @@ pub(super) struct FrontendMvRefreshDependencies {
 }
 
 pub(super) fn execute(
+    product: &MvProductService,
     dependencies: &FrontendMvRefreshDependencies,
     refresh: PreparedMvRefresh,
     context: ConnectorRequestContext,
@@ -93,6 +101,7 @@ pub(super) fn execute(
     match refresh.work {
         PreparedMvRefreshWork::NoOp => unreachable!("no-op returned above"),
         PreparedMvRefreshWork::MetadataOnly { intent } => execute_metadata_only(
+            product,
             dependencies,
             &planning,
             refresh.attempt,
@@ -102,6 +111,7 @@ pub(super) fn execute(
             false,
         ),
         PreparedMvRefreshWork::DataProducing { write } => execute_data(
+            product,
             dependencies,
             &planning,
             refresh.attempt,
@@ -115,6 +125,7 @@ pub(super) fn execute(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_data(
+    product: &MvProductService,
     dependencies: &FrontendMvRefreshDependencies,
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt: MvRefreshAttemptIdentity,
@@ -123,6 +134,7 @@ fn execute_data(
     context: ConnectorRequestContext,
     execution: &QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
+    let product_target = product_target(&finalize.target)?;
     if prepared.operation_id() != attempt.write_operation_id() {
         return Err(invalid(
             "SQL-prepared MV write does not use its Lake publication identity",
@@ -165,6 +177,7 @@ fn execute_data(
         // committed row count, and a publication that never happened has no
         // committed facts to interpret.
         return execute_metadata_only(
+            product,
             dependencies,
             planning,
             attempt,
@@ -207,12 +220,7 @@ fn execute_data(
         .map_err(|error| {
             MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
         })?;
-    wait_for_known_committed_before_projector_cas(&attempt.publication_id)?;
-    dependencies
-        .readiness
-        .project_observed(*attempt.publication_id.as_uuid(), &package)
-        .map_err(known_committed_projection_error)?;
-    Ok(MvStatementResult::Ok)
+    finalize_known_committed_refresh(product, dependencies, product_target, &attempt, &package)
 }
 
 /// The one commit authority of one MV data write.
@@ -370,6 +378,7 @@ fn publish_data_staging_branch(
 }
 
 fn execute_metadata_only(
+    product: &MvProductService,
     dependencies: &FrontendMvRefreshDependencies,
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt: MvRefreshAttemptIdentity,
@@ -378,6 +387,7 @@ fn execute_metadata_only(
     context: ConnectorRequestContext,
     staging_branch_exists: bool,
 ) -> Result<MvStatementResult, MvApplicationError> {
+    let product_target = product_target(&finalize.target)?;
     if intent.publication_id() != attempt.publication_id {
         return Err(invalid(
             "SQL-prepared metadata-only refresh changed its Lake publication identity",
@@ -492,12 +502,86 @@ fn execute_metadata_only(
         .map_err(|error| {
             MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
         })?;
-    wait_for_known_committed_before_projector_cas(&attempt.publication_id)?;
-    dependencies
-        .readiness
-        .project_observed(*attempt.publication_id.as_uuid(), &package)
-        .map_err(known_committed_projection_error)?;
-    Ok(MvStatementResult::Ok)
+    finalize_known_committed_refresh(product, dependencies, product_target, &attempt, &package)
+}
+
+/// Provider observation and StateStore I/O remain outer effects. The product
+/// owns their known-committed finalization classification, so this adapter
+/// cannot reinterpret a projection failure as an unknown provider commit.
+struct FrontendKnownCommittedProjection<'a> {
+    readiness: &'a MvReadinessPort,
+    package: &'a crate::mv::domain::storage_observation::MvLakePackageObservation,
+}
+
+impl MvRefreshProjectionPort for FrontendKnownCommittedProjection<'_> {
+    fn project_known_committed(
+        &self,
+        _target: &ProductMvTarget,
+        attempt: &MvRefreshAttemptIdentity,
+    ) -> Result<(), MvProviderFailure> {
+        wait_for_known_committed_before_projector_cas(&attempt.publication_id).map_err(
+            |error| MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string()),
+        )?;
+        self.readiness
+            .project_observed(*attempt.publication_id.as_uuid(), self.package)
+            .map_err(|error| {
+                MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
+            })
+    }
+}
+
+fn finalize_known_committed_refresh(
+    product: &MvProductService,
+    dependencies: &FrontendMvRefreshDependencies,
+    target: ProductMvTarget,
+    attempt: &MvRefreshAttemptIdentity,
+    package: &crate::mv::domain::storage_observation::MvLakePackageObservation,
+) -> Result<MvStatementResult, MvApplicationError> {
+    let projection = FrontendKnownCommittedProjection {
+        readiness: dependencies.readiness.as_ref(),
+        package,
+    };
+    match product
+        .finalize_known_committed_refresh(&target, attempt, &projection)
+        .map_err(product_error)?
+    {
+        MvProductResult::Acknowledged => Ok(MvStatementResult::Ok),
+        MvProductResult::Created(_) | MvProductResult::Dropped | MvProductResult::Listed(_) => {
+            Err(MvApplicationError::new(
+                MvApplicationErrorKind::Engine,
+                "MV refresh product returned a non-refresh result",
+            ))
+        }
+    }
+}
+
+fn product_target(
+    target: &novarocks_sql::planning::mv::SqlMvTarget,
+) -> Result<ProductMvTarget, MvApplicationError> {
+    ProductMvTarget::try_new(
+        target.catalog.clone(),
+        target.database.clone(),
+        target.name.clone(),
+    )
+    .map_err(|error| {
+        MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, error.to_string())
+    })
+}
+
+fn product_error(error: MvProductError) -> MvApplicationError {
+    let kind = match error.kind() {
+        MvProductErrorKind::KnownCommittedFinalizeFailed => {
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed
+        }
+        MvProductErrorKind::Unavailable => MvApplicationErrorKind::Unavailable,
+        MvProductErrorKind::InvalidRequest => MvApplicationErrorKind::InvalidRequest,
+        MvProductErrorKind::CommitUnknown => MvApplicationErrorKind::CommitUnknown,
+        MvProductErrorKind::TargetReplaced => MvApplicationErrorKind::BindingInvalidated,
+        MvProductErrorKind::ProviderKnownUncommitted
+        | MvProductErrorKind::Corruption
+        | MvProductErrorKind::ShutdownCancelled => MvApplicationErrorKind::Engine,
+    };
+    MvApplicationError::new(kind, error.to_string())
 }
 
 /// Debug-only runner seam for the two durable MV recovery windows that are
@@ -715,19 +799,6 @@ fn repository_error(
         }
     };
     MvApplicationError::new(kind, error.to_string())
-}
-
-/// A provider publication has already crossed its external commit boundary.
-/// Accelerator projection is therefore finalization, never evidence that the
-/// provider outcome became unknown. Keep the known-committed fact visible to
-/// recovery even when the projector's own CAS/read path is unavailable.
-fn known_committed_projection_error(
-    error: novarocks_mv_application::repository::MvRepositoryError,
-) -> MvApplicationError {
-    MvApplicationError::new(
-        MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-        format!("MV publication is known committed but accelerator projection failed: {error}"),
-    )
 }
 
 #[cfg(test)]
@@ -989,17 +1060,15 @@ mod tests {
 
     #[test]
     fn known_committed_publication_keeps_its_fact_when_projection_fails() {
-        let error = known_committed_projection_error(
-            novarocks_mv_application::repository::MvRepositoryError::new(
-                novarocks_mv_application::repository::MvRepositoryErrorKind::Unavailable,
-                "projector store unavailable",
-            ),
-        );
+        let error = product_error(MvProductError::new(
+            MvProductErrorKind::KnownCommittedFinalizeFailed,
+            "projector store unavailable",
+        ));
 
         assert_eq!(
             error.kind(),
             MvApplicationErrorKind::KnownCommittedFinalizeFailed
         );
-        assert!(error.message().contains("known committed"));
+        assert!(error.message().contains("projector store unavailable"));
     }
 }

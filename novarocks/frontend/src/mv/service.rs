@@ -190,7 +190,13 @@ impl FrontendMvService {
         connector_context: ConnectorRequestContext,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
-        refresh::execute(&self.refresh, refresh_plan, connector_context, execution)
+        refresh::execute(
+            self.product_service.as_ref(),
+            &self.refresh,
+            refresh_plan,
+            connector_context,
+            execution,
+        )
     }
 
     pub(crate) fn prepare_and_execute_refresh(
@@ -572,6 +578,7 @@ fn execute_scheduled_refresh(
         };
         let no_op = matches!(prepared.work, PreparedMvRefreshWork::NoOp);
         if let Err(error) = refresh::execute(
+            dependencies.product_service.as_ref(),
             &dependencies.refresh,
             prepared,
             connector_context.clone(),

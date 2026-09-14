@@ -25,7 +25,7 @@ use crate::activity::{
 };
 use crate::ports::{
     MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvDropCatalogRegistrationPort,
-    MvDropProjectionPort, MvDropProviderPort, MvProviderFailure,
+    MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvRefreshProjectionPort,
 };
 use crate::process_runtime::{
     MvBackgroundRuntimeLifecycleError, MvBackgroundRuntimeOwner, MvBackgroundRuntimeStart,
@@ -89,6 +89,22 @@ impl MvProductService {
     /// cannot mint a second identity for the same product transition.
     pub fn reserve_refresh_attempt(&self) -> MvRefreshAttemptIdentity {
         MvRefreshAttemptIdentity::reserve()
+    }
+
+    /// Finalize a refresh only after its external publication is known
+    /// committed. The product owns this classification: an Accelerator
+    /// projection failure remains a known-committed finalization failure, not
+    /// a retryable or unknown provider outcome.
+    pub fn finalize_known_committed_refresh(
+        &self,
+        target: &MvTarget,
+        attempt: &MvRefreshAttemptIdentity,
+        projection: &dyn MvRefreshProjectionPort,
+    ) -> Result<MvProductResult, MvProductError> {
+        projection
+            .project_known_committed(target, attempt)
+            .map_err(known_committed_finalize_failure)?;
+        Ok(MvProductResult::Acknowledged)
     }
 
     /// Execute the product-owned CREATE state machine. The outer adapter owns
@@ -245,6 +261,7 @@ mod tests {
     use crate::ports::{
         MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvDropCatalogRegistrationPort,
         MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvProviderFailureKind,
+        MvRefreshProjectionPort,
     };
     use crate::product::{
         MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition,
@@ -266,6 +283,7 @@ mod tests {
         events: Mutex<Vec<&'static str>>,
         fail_inspection: bool,
         fail_projection: bool,
+        fail_known_committed_projection: bool,
         drop_absent: bool,
     }
 
@@ -379,6 +397,23 @@ mod tests {
             _target: &MvTarget,
         ) -> Result<(), MvProviderFailure> {
             self.record("unregister");
+            Ok(())
+        }
+    }
+
+    impl MvRefreshProjectionPort for CreateEffects {
+        fn project_known_committed(
+            &self,
+            _target: &MvTarget,
+            _attempt: &crate::product::MvRefreshAttemptIdentity,
+        ) -> Result<(), MvProviderFailure> {
+            self.record("project_known_committed");
+            if self.fail_known_committed_projection {
+                return Err(MvProviderFailure::new(
+                    MvProviderFailureKind::Unavailable,
+                    "known-committed projection failed",
+                ));
+            }
             Ok(())
         }
     }
@@ -534,6 +569,42 @@ mod tests {
             effects.events(),
             ["create", "inspect", "sync", "project", "register"]
         );
+    }
+
+    #[test]
+    fn known_committed_refresh_projection_is_product_finalization() {
+        let service = MvProductService::default();
+        let effects = CreateEffects::default();
+        let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
+        let attempt = service.reserve_refresh_attempt();
+
+        let result = service
+            .finalize_known_committed_refresh(&target, &attempt, &effects)
+            .expect("projection succeeds");
+
+        assert!(matches!(result, MvProductResult::Acknowledged));
+        assert_eq!(effects.events(), ["project_known_committed"]);
+    }
+
+    #[test]
+    fn known_committed_refresh_keeps_external_commit_when_projection_fails() {
+        let service = MvProductService::default();
+        let effects = CreateEffects {
+            fail_known_committed_projection: true,
+            ..Default::default()
+        };
+        let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
+        let attempt = service.reserve_refresh_attempt();
+
+        let error = service
+            .finalize_known_committed_refresh(&target, &attempt, &effects)
+            .expect_err("projection finalization fails");
+
+        assert_eq!(
+            error.kind(),
+            MvProductErrorKind::KnownCommittedFinalizeFailed
+        );
+        assert_eq!(effects.events(), ["project_known_committed"]);
     }
 
     #[test]

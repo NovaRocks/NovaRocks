@@ -21,7 +21,7 @@ use std::fmt;
 
 use crate::product::{
     MvCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition, MvProductError,
-    MvProductErrorKind, MvTarget,
+    MvProductErrorKind, MvRefreshAttemptIdentity, MvTarget,
 };
 use crate::readiness::MvDropReadiness;
 
@@ -183,6 +183,18 @@ pub trait MvDropProjectionPort: Send + Sync {
         &self,
         operation: MvOperationContext,
         target: &MvTarget,
+    ) -> Result<(), MvProviderFailure>;
+}
+
+/// The one post-commit projection effect for a refresh whose external
+/// publication is already known committed. The adapter may bridge provider
+/// package decoding and durable I/O, but it cannot reinterpret a projection
+/// failure as an unknown provider commit.
+pub trait MvRefreshProjectionPort: Send + Sync {
+    fn project_known_committed(
+        &self,
+        target: &MvTarget,
+        attempt: &MvRefreshAttemptIdentity,
     ) -> Result<(), MvProviderFailure>;
 }
 
