@@ -231,11 +231,21 @@ impl CoreCommandRoute for TypedCommandRoute {
             }
             ParsedStatement::Maintenance(
                 novarocks_parser::ast::MaintenanceStatement::ShowOptimize(statement),
-            ) => self.maintenance_read.execute(
-                statement,
-                context.session().current_catalog(),
-                context.session().current_database(),
-            ),
+            ) => {
+                let Some(ProductSqlCommand::Maintenance(
+                    novarocks_sql::semantic::MaintenanceSqlCommand::ShowOptimize(command),
+                )) = lower_product_sql_command(&ParsedStatement::Maintenance(
+                    novarocks_parser::ast::MaintenanceStatement::ShowOptimize(statement.clone()),
+                ))?
+                else {
+                    return Err("maintenance parser admission did not produce SHOW OPTIMIZE".to_string());
+                };
+                self.maintenance_read.execute_command(
+                    &command,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                )
+            }
             ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
                 statement,
             )) => {
@@ -246,8 +256,15 @@ impl CoreCommandRoute for TypedCommandRoute {
                 )? {
                     return Ok(result);
                 }
-                self.maintenance.execute(
-                    &novarocks_parser::ast::MaintenanceStatement::Call(statement.clone()),
+                let Some(ProductSqlCommand::Maintenance(command)) = lower_product_sql_command(
+                    &ParsedStatement::Maintenance(
+                        novarocks_parser::ast::MaintenanceStatement::Call(statement.clone()),
+                    ),
+                )? else {
+                    return Err("maintenance parser admission did not produce a semantic command".to_string());
+                };
+                self.maintenance.execute_command(
+                    &command,
                     context.session().current_catalog(),
                     context.session().current_database(),
                     context.execution(),
@@ -255,8 +272,13 @@ impl CoreCommandRoute for TypedCommandRoute {
                 )
             }
             ParsedStatement::Maintenance(statement) => {
-                self.maintenance.execute(
-                    statement,
+                let Some(ProductSqlCommand::Maintenance(command)) = lower_product_sql_command(
+                    &ParsedStatement::Maintenance(statement.clone()),
+                )? else {
+                    return Err("maintenance parser admission did not produce a semantic command".to_string());
+                };
+                self.maintenance.execute_command(
+                    &command,
                     context.session().current_catalog(),
                     context.session().current_database(),
                     context.execution(),

@@ -43,17 +43,20 @@ impl MaintenanceCommandExecutor {
         Self { kernel, runtime }
     }
 
-    /// Executes one parser-admitted maintenance write without reparsing SQL.
-    pub fn execute(
+    /// Executes one Query-Application semantic maintenance command.
+    ///
+    /// The command has already been parser-admitted and lowered, so this
+    /// adapter never receives source syntax or performs an AST round trip.
+    pub fn execute_command(
         &self,
-        statement: &novarocks_parser::ast::MaintenanceStatement,
+        command: &novarocks_sql::semantic::MaintenanceSqlCommand,
         current_catalog: Option<&str>,
         current_database: &str,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
-        let lowered = crate::table_maintenance::lower_typed_maintenance_statement(
-            statement,
+        let lowered = crate::table_maintenance::lower_semantic_maintenance_statement(
+            command,
             MaintenanceRequestContext {
                 current_catalog,
                 current_database,
@@ -64,29 +67,18 @@ impl MaintenanceCommandExecutor {
             execution.clone(),
             connector_context.clone(),
         );
-        // The maintenance domain contract is async, because its durable work is
-        // I/O. This call site is not: every SQL statement runs inside the
-        // process-owned bounded query-blocking worker in `query.rs`, which is
-        // where the foreground statement lease, timeout and cancellation are
-        // anchored.
-        //
-        // Hoisting the command branch out of that closure means restructuring
-        // statement admission itself, which belongs to the query-application and
-        // query-preparation work lines, not here. So the adapter sits at this
-        // edge — the SQL routing boundary another work line owns — and never in
-        // a domain contract. The worker has no Tokio reactor, so composition
-        // supplies the process runtime explicitly rather than this boundary
-        // manufacturing a runtime or assuming `Handle::current()` succeeds.
-        let spark_call = crate::table_maintenance::is_typed_spark_maintenance_call(statement);
+        let spark_call = matches!(
+            command,
+            novarocks_sql::semantic::MaintenanceSqlCommand::Call { .. }
+        );
         let service = self.kernel.service();
         let context = MaintenanceRequestContext {
             current_catalog,
             current_database,
         };
-        let outcome = self
-            .runtime
-            .block_on(service.handle_typed_statement(&engine, lowered, spark_call, context));
-        outcome.map(statement_result)
+        self.runtime
+            .block_on(service.handle_typed_statement(&engine, lowered, spark_call, context))
+            .map(statement_result)
     }
 }
 
@@ -100,17 +92,16 @@ impl MaintenanceReadCommandExecutor {
         Self { service }
     }
 
-    /// Executes a parser-admitted `SHOW ALTER TABLE OPTIMIZE` presentation
-    /// without recreating a raw parser or a maintenance engine.
-    pub fn execute(
+    /// Executes a semantic `SHOW ALTER TABLE OPTIMIZE` presentation command.
+    pub fn execute_command(
         &self,
-        statement: &novarocks_parser::ast::ShowAlterTableOptimize,
+        statement: &novarocks_sql::semantic::command::ShowOptimizeSqlCommand,
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
         self.service
             .handle_typed_show_optimize(
-                crate::table_maintenance::lower_typed_show_optimize(statement)?,
+                crate::table_maintenance::lower_semantic_show_optimize(statement)?,
                 MaintenanceRequestContext {
                     current_catalog,
                     current_database,
@@ -185,18 +176,18 @@ mod tests {
             called: std::sync::atomic::AtomicBool::new(false),
         });
         let executor = MaintenanceReadCommandExecutor::new(Arc::clone(&service) as Arc<_>);
-        let statements =
-            novarocks_parser::parse("SHOW ALTER TABLE OPTIMIZE").expect("parser statement");
-        let [
-            novarocks_parser::ast::Statement::Maintenance(
-                novarocks_parser::ast::MaintenanceStatement::ShowOptimize(statement),
-            ),
-        ] = statements.as_slice()
+        let statement =
+            novarocks_query_application::sql::parse_single_statement("SHOW ALTER TABLE OPTIMIZE")
+                .expect("parser statement");
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Maintenance(
+            novarocks_sql::semantic::MaintenanceSqlCommand::ShowOptimize(command),
+        )) = novarocks_query_application::sql::lower_product_sql_command(&statement)
+            .expect("lower semantic command")
         else {
-            panic!("expected SHOW ALTER TABLE OPTIMIZE");
+            panic!("expected semantic SHOW ALTER TABLE OPTIMIZE");
         };
         let result = executor
-            .execute(statement, Some("ice"), "db")
+            .execute_command(&command, Some("ice"), "db")
             .expect("execute");
         assert!(matches!(result, StatementResult::Ok));
         assert!(service.called.load(std::sync::atomic::Ordering::SeqCst));

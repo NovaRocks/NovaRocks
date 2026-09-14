@@ -19,6 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::query_execution::maintenance::MaintenanceRequestContext;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use novarocks_sql::semantic::command::{
+    CommandLiteral, ExpireSnapshotsOptionSql, MaintenanceSqlCommand, MaintenanceValueSql,
+    ProcedureArgumentModeSql, SortDirectionSql,
+};
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +103,291 @@ pub(crate) fn lower_typed_maintenance_statement(
             Ok(ParsedMaintenanceStatement::ShowOptimize)
         }
     }
+}
+
+/// Lowers the Query-Application semantic command into the maintenance
+/// product's admitted DTOs. This is deliberately a value-to-value mapping;
+/// no parser AST is reconstructed or accepted at this boundary.
+pub(crate) fn lower_semantic_maintenance_statement(
+    statement: &MaintenanceSqlCommand,
+    context: MaintenanceRequestContext<'_>,
+) -> Result<ParsedMaintenanceStatement, String> {
+    match statement {
+        MaintenanceSqlCommand::Call {
+            procedure,
+            arguments,
+            argument_mode,
+        } => lower_semantic_call(procedure, arguments, *argument_mode, context),
+        MaintenanceSqlCommand::Optimize { table } => {
+            Ok(ParsedMaintenanceStatement::SubmitOptimize {
+                name_parts: normalize_semantic_object_name(table)?,
+            })
+        }
+        MaintenanceSqlCommand::RewriteManifests { table } => {
+            let name_parts = normalize_semantic_object_name(table)?;
+            reject_branch_suffix(&name_parts, "REWRITE MANIFESTS")?;
+            Ok(ParsedMaintenanceStatement::Execute {
+                name_parts,
+                action: ParsedMaintenanceAction::RewriteManifests {
+                    use_caching: None,
+                    spec_id: None,
+                },
+            })
+        }
+        MaintenanceSqlCommand::ExpireSnapshots { table, options } => {
+            let name_parts = normalize_semantic_object_name(table)?;
+            reject_branch_suffix(&name_parts, "EXPIRE SNAPSHOTS")?;
+            let mut older_than_ms = None;
+            let mut retain_last = None;
+            for option in options {
+                match option {
+                    ExpireSnapshotsOptionSql::OlderThan(value) => {
+                        if older_than_ms.is_some() {
+                            return Err("EXPIRE SNAPSHOTS: duplicate OLDER THAN clause".to_string());
+                        }
+                        older_than_ms = Some(lower_semantic_expire_timestamp_ms(value)?);
+                    }
+                    ExpireSnapshotsOptionSql::RetainLast(value) => {
+                        if retain_last.is_some() {
+                            return Err(
+                                "EXPIRE SNAPSHOTS: duplicate RETAIN LAST clause".to_string()
+                            );
+                        }
+                        retain_last = Some(lower_semantic_expire_retain_last(value)?);
+                    }
+                }
+            }
+            if older_than_ms.is_none() && retain_last.is_none() {
+                return Err(
+                    "EXPIRE SNAPSHOTS requires at least OLDER THAN or RETAIN LAST clause"
+                        .to_string(),
+                );
+            }
+            Ok(ParsedMaintenanceStatement::Execute {
+                name_parts,
+                action: ParsedMaintenanceAction::ExpireSnapshots {
+                    older_than_ms,
+                    retain_last,
+                },
+            })
+        }
+        MaintenanceSqlCommand::RemoveOrphanFiles { table, older_than } => {
+            let name_parts = normalize_semantic_object_name(table)?;
+            reject_branch_suffix(&name_parts, "REMOVE ORPHAN FILES")?;
+            Ok(ParsedMaintenanceStatement::Execute {
+                name_parts,
+                action: ParsedMaintenanceAction::RemoveOrphanFiles {
+                    older_than_ms: lower_semantic_expire_timestamp_ms(older_than)?,
+                },
+            })
+        }
+        MaintenanceSqlCommand::ShowOptimize(statement) => {
+            let _ = lower_semantic_show_optimize(statement)?;
+            Ok(ParsedMaintenanceStatement::ShowOptimize)
+        }
+    }
+}
+
+pub(crate) fn lower_semantic_show_optimize(
+    statement: &novarocks_sql::semantic::command::ShowOptimizeSqlCommand,
+) -> Result<ParsedShowOptimize, String> {
+    let (catalog, database) = match statement.from.as_ref() {
+        Some(name) => match normalize_semantic_object_name(name)?.as_slice() {
+            [database] => (None, Some(database.clone())),
+            [catalog, database] => (Some(catalog.clone()), Some(database.clone())),
+            _ => {
+                return Err(
+                    "SHOW ALTER TABLE OPTIMIZE FROM only supports db or catalog.db".to_string(),
+                );
+            }
+        },
+        None => (None, None),
+    };
+    let table_name = match statement.filter.as_ref() {
+        Some(filter) => {
+            if !filter.column.eq_ignore_ascii_case("TableName") {
+                return Err(
+                    "SHOW ALTER TABLE OPTIMIZE only supports WHERE TableName = '...'".to_string(),
+                );
+            }
+            let CommandLiteral::String(value) = &filter.value else {
+                return Err(
+                    "SHOW ALTER TABLE OPTIMIZE only supports WHERE TableName = '...'".to_string(),
+                );
+            };
+            Some(normalize_identifier(value)?)
+        }
+        None => None,
+    };
+    let order_by_create_time_desc = match statement.order_by.as_ref() {
+        Some(order_by) => {
+            if !order_by.column.eq_ignore_ascii_case("CreateTime") {
+                return Err(
+                    "SHOW ALTER TABLE OPTIMIZE only supports ORDER BY CreateTime".to_string(),
+                );
+            }
+            matches!(order_by.direction, Some(SortDirectionSql::Desc))
+        }
+        None => false,
+    };
+    let limit = match statement.limit.as_ref() {
+        Some(CommandLiteral::Number(value)) => Some(
+            value
+                .parse::<usize>()
+                .map_err(|error| format!("parse SHOW ALTER TABLE OPTIMIZE LIMIT: {error}"))?,
+        ),
+        Some(_) => return Err("SHOW ALTER TABLE OPTIMIZE LIMIT expects number".to_string()),
+        None => None,
+    };
+    Ok(ParsedShowOptimize {
+        catalog,
+        database,
+        table_name,
+        order_by_create_time_desc,
+        limit,
+    })
+}
+
+fn lower_semantic_call(
+    procedure: &novarocks_sql::semantic::ObjectName,
+    arguments: &[novarocks_sql::semantic::command::ProcedureArgumentSql],
+    declared_mode: ProcedureArgumentModeSql,
+    context: MaintenanceRequestContext<'_>,
+) -> Result<ParsedMaintenanceStatement, String> {
+    let name_parts = normalize_semantic_object_name(procedure)?;
+    let [catalog, namespace, procedure] = name_parts.as_slice() else {
+        return Err("CALL procedure name must be catalog.system.procedure".to_string());
+    };
+    if namespace != "system" {
+        return Err("Iceberg procedures must use system namespace".to_string());
+    }
+    let args = arguments
+        .iter()
+        .map(|argument| {
+            Ok(ProcedureArg {
+                name: argument
+                    .name
+                    .as_ref()
+                    .map(|name| normalize_identifier(name))
+                    .transpose()?,
+                value: lower_semantic_procedure_value(&argument.value)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mode = classify_arg_mode(&args)?;
+    let declared_mode = match declared_mode {
+        ProcedureArgumentModeSql::Empty => ProcedureArgMode::Empty,
+        ProcedureArgumentModeSql::Named => ProcedureArgMode::Named,
+        ProcedureArgumentModeSql::Positional => ProcedureArgMode::Positional,
+    };
+    if mode != declared_mode {
+        return Err("CALL procedure argument mode does not match arguments".to_string());
+    }
+    ensure_no_duplicate_named_args(&args)?;
+    lower_call_procedure(
+        &CallProcedure {
+            catalog: catalog.clone(),
+            procedure: procedure.clone(),
+            args,
+            mode,
+        },
+        context,
+    )
+}
+
+fn lower_semantic_procedure_value(
+    value: &MaintenanceValueSql,
+) -> Result<ProcedureArgValue, String> {
+    match value {
+        MaintenanceValueSql::Literal(value) => lower_semantic_procedure_literal(value),
+        MaintenanceValueSql::Timestamp(CommandLiteral::String(value)) => {
+            parse_timestamp_millis(value)
+                .map(ProcedureArgValue::TimestampMillis)
+                .map_err(|error| format!("CALL procedure invalid TIMESTAMP literal: {error}"))
+        }
+        MaintenanceValueSql::Timestamp(_) => {
+            Err("CALL procedure TIMESTAMP expects a single quoted string".to_string())
+        }
+        MaintenanceValueSql::Map(entries) => {
+            let mut values = BTreeMap::new();
+            for (key, value) in entries {
+                let (CommandLiteral::String(key), CommandLiteral::String(value)) = (key, value)
+                else {
+                    return Err(
+                        "CALL procedure map key/value expects a single quoted string".to_string(),
+                    );
+                };
+                if values.insert(key.clone(), value.clone()).is_some() {
+                    return Err(format!("duplicate CALL procedure map key '{key}'"));
+                }
+            }
+            Ok(ProcedureArgValue::StringMap(values))
+        }
+    }
+}
+
+fn lower_semantic_procedure_literal(value: &CommandLiteral) -> Result<ProcedureArgValue, String> {
+    match value {
+        CommandLiteral::String(value) => Ok(ProcedureArgValue::String(value.clone())),
+        CommandLiteral::Number(value) => value
+            .parse::<i64>()
+            .map(ProcedureArgValue::Integer)
+            .map_err(|error| format!("CALL procedure invalid integer argument '{value}': {error}")),
+        CommandLiteral::Bool(value) => Ok(ProcedureArgValue::Boolean(*value)),
+        CommandLiteral::Null => Ok(ProcedureArgValue::Null),
+        CommandLiteral::Binary(_) => Err("CALL procedure unsupported argument value".to_string()),
+    }
+}
+
+fn lower_semantic_expire_timestamp_ms(value: &MaintenanceValueSql) -> Result<i64, String> {
+    let MaintenanceValueSql::Literal(value) = value else {
+        return Err(
+            "EXPIRE SNAPSHOTS: expected timestamp literal (quoted string or integer)".to_string(),
+        );
+    };
+    match value {
+        CommandLiteral::String(value) => {
+            if let Ok(value) = DateTime::parse_from_rfc3339(value) {
+                return Ok(value.with_timezone(&Utc).timestamp_millis());
+            }
+            if let Ok(value) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
+                return Ok(value.and_utc().timestamp_millis());
+            }
+            Err(format!(
+                "EXPIRE SNAPSHOTS: cannot parse timestamp '{value}'; expected RFC 3339 (e.g. '2026-04-01T00:00:00Z') or 'YYYY-MM-DD HH:MM:SS'"
+            ))
+        }
+        CommandLiteral::Number(value) => value.parse::<i64>().map_err(|error| {
+            format!("EXPIRE SNAPSHOTS: invalid epoch-ms integer '{value}': {error}")
+        }),
+        _ => Err(
+            "EXPIRE SNAPSHOTS: expected timestamp literal (quoted string or integer)".to_string(),
+        ),
+    }
+}
+
+fn lower_semantic_expire_retain_last(value: &MaintenanceValueSql) -> Result<u32, String> {
+    let MaintenanceValueSql::Literal(CommandLiteral::Number(value)) = value else {
+        return Err("EXPIRE SNAPSHOTS: expected integer for RETAIN LAST".to_string());
+    };
+    let value = value.parse::<u64>().map_err(|error| {
+        format!("EXPIRE SNAPSHOTS: invalid RETAIN LAST value '{value}': {error}")
+    })?;
+    if value == 0 {
+        return Err("EXPIRE SNAPSHOTS: RETAIN LAST must be >= 1".to_string());
+    }
+    value
+        .try_into()
+        .map_err(|_| "EXPIRE SNAPSHOTS: RETAIN LAST value too large".to_string())
+}
+
+fn normalize_semantic_object_name(
+    name: &novarocks_sql::semantic::ObjectName,
+) -> Result<Vec<String>, String> {
+    name.parts
+        .iter()
+        .map(|part| normalize_identifier(part))
+        .collect()
 }
 
 /// Lowers typed `SHOW ALTER TABLE OPTIMIZE` presentation clauses.
@@ -920,6 +1209,44 @@ mod tests {
                 .expect_err("typed syntax outside legacy maintenance admission must fail");
             assert!(error.contains(expected), "{source}: {error}");
         }
+    }
+
+    #[test]
+    fn semantic_lowering_matches_typed_expire_snapshot_admission() {
+        let source = "ALTER TABLE ice.analytics.orders EXPIRE SNAPSHOTS OLDER THAN 1700000000000 RETAIN LAST 3";
+        let typed = typed_maintenance(source);
+        let statement = novarocks_query_application::sql::parse_single_statement(source)
+            .expect("parse semantic maintenance command");
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Maintenance(command)) =
+            novarocks_query_application::sql::lower_product_sql_command(&statement)
+                .expect("lower semantic maintenance command")
+        else {
+            panic!("expected semantic maintenance command");
+        };
+
+        assert_eq!(
+            lower_semantic_maintenance_statement(&command, context()),
+            lower_typed_maintenance_statement(&typed, context()),
+        );
+    }
+
+    #[test]
+    fn semantic_lowering_matches_typed_procedure_admission() {
+        let source = "CALL ice.system.rewrite_manifests(table => 'analytics.orders', use_caching => TRUE, spec_id => 3)";
+        let typed = typed_maintenance(source);
+        let statement = novarocks_query_application::sql::parse_single_statement(source)
+            .expect("parse semantic maintenance command");
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Maintenance(command)) =
+            novarocks_query_application::sql::lower_product_sql_command(&statement)
+                .expect("lower semantic maintenance command")
+        else {
+            panic!("expected semantic maintenance command");
+        };
+
+        assert_eq!(
+            lower_semantic_maintenance_statement(&command, context()),
+            lower_typed_maintenance_statement(&typed, context()),
+        );
     }
 
     #[test]

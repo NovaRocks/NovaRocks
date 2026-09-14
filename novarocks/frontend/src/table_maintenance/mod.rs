@@ -32,7 +32,7 @@ use tokio::runtime::Handle;
 
 pub(crate) use self::admission::{
     ParsedMaintenanceAction, ParsedMaintenanceStatement, ParsedShowOptimize,
-    is_typed_spark_maintenance_call, lower_typed_maintenance_statement, lower_typed_show_optimize,
+    lower_semantic_maintenance_statement, lower_semantic_show_optimize,
 };
 use self::result::{action_result, optimize_jobs_result};
 use self::worker::{
