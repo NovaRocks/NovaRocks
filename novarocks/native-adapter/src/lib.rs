@@ -82,6 +82,7 @@ pub mod task_execution_observation;
 pub mod task_protocol;
 pub mod task_protocol_fault;
 pub mod task_protocol_ingress;
+pub mod task_query_context_options;
 pub mod task_result_diagnostics;
 pub mod task_shared_facts;
 #[cfg(any(test, feature = "test-support"))]

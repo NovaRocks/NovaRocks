@@ -62,12 +62,9 @@ use novarocks_execution::runtime::fragment::{
 };
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
-use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution_contract::task_execution::domain::{
-    CodecOwnedContent, ContentFingerprint, DomainVersion,
-};
+use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
 use novarocks_execution_contract::task_execution::status::{
@@ -81,8 +78,7 @@ use novarocks_spi::connector::{
     CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
     ConnectorStorageResolver, read_stack::ConnectorSession,
 };
-use novarocks_task_codec::domain::{WireContent, stored_message};
-use novarocks_task_codec::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
+use novarocks_task_codec::domain::stored_message;
 use novarocks_types::{QueryExecutionId, UniqueId};
 use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInboundCapabilities};
 use tracing::debug;
@@ -105,34 +101,9 @@ use novarocks_worker::{
 /// depend on the lifecycle owner's admission permit. Here they are one
 /// injected port, implemented by the query-context half of execution, so the
 /// task side holds no query-wide authority of its own.
-#[derive(Clone, Debug)]
-pub struct QueryContextOptions {
-    runtime: Arc<QueryOptions>,
-    fingerprint: ContentFingerprint,
-}
-
-fn query_options_fingerprint(
-    wire: novarocks_proto_models::novarocks::QueryOptions,
-) -> ContentFingerprint {
-    WireContent::new(ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG, wire).fingerprint()
-}
-
-impl QueryContextOptions {
-    pub(super) const fn new(runtime: Arc<QueryOptions>, fingerprint: ContentFingerprint) -> Self {
-        Self {
-            runtime,
-            fingerprint,
-        }
-    }
-
-    pub fn runtime(&self) -> &Arc<QueryOptions> {
-        &self.runtime
-    }
-
-    pub const fn fingerprint(&self) -> ContentFingerprint {
-        self.fingerprint
-    }
-}
+pub use novarocks_native_adapter::task_query_context_options::{
+    QueryContextOptions, query_options_fingerprint,
+};
 
 pub trait TaskQueryContextFacts: Send + Sync {
     /// The immutable execution options installed by this query context.
