@@ -4484,6 +4484,7 @@ name = "novarocks-worker"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "novarocks-execution",
  "novarocks-execution-contract",

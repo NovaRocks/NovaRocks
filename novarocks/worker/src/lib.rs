@@ -30,6 +30,7 @@ mod catalog_manager;
 mod catalog_manager_config;
 mod clock;
 pub mod connector_batch_transform;
+pub mod connector_write_runtime;
 mod convergence;
 mod credential_slot;
 mod deadline;

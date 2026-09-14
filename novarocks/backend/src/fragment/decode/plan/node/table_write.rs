@@ -72,8 +72,8 @@ const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 use super::DecodedNode;
 use super::aggregate::decode_resolved_aggregate_signature;
 use crate::connector::write_data_plane::{
-    ObservedConnectorWriteExecution, RoleBoundCommitFragmentEncoder,
-    RootCommitFragmentCarrierValidator,
+    NativeConnectorWriteObservationPort, ObservedConnectorWriteExecution,
+    RoleBoundCommitFragmentEncoder, RootCommitFragmentCarrierValidator,
 };
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
@@ -853,6 +853,8 @@ pub(super) fn lower_table_writer_node(
         binding.execution(),
         execution_id,
         node_id,
+        Arc::new(NativeConnectorWriteObservationPort),
+        novarocks_native_adapter::debug_environment::debug_emit_connector_writer_marker(),
     ));
     let fragment_encoder = Arc::new(RoleBoundCommitFragmentEncoder::new(
         binding.fragment_encoder(),
