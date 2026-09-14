@@ -28,12 +28,12 @@
 
 use std::sync::Arc;
 
+use crate::fragment_scan_output::DecodedScanOutputColumns;
+use crate::fragment_variant_path::NativeVariantPathPlan;
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::{BoundScanRanges, ScanSource};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_native_adapter::fragment_scan_output::DecodedScanOutputColumns;
-use novarocks_native_adapter::fragment_variant_path::NativeVariantPathPlan;
 use novarocks_proto_codec::connector_read::{ConnectorRelation, ConnectorRelationKind};
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{connector_read as dto, plan};
@@ -47,15 +47,73 @@ use novarocks_worker::typed_connector_runtime::{
     TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
 };
 
-use super::super::node::DecodedNode;
-use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
-use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
-use novarocks_native_adapter::fragment_scan_decode::{
+use crate::fragment_decode_context::NativePlanDecodeContext;
+use crate::fragment_error::NativeFragmentDecodeError;
+use crate::fragment_error::NativeFragmentLeafDecodeError;
+use crate::fragment_plan_node::NativeLoweredPlanNode as DecodedNode;
+use crate::fragment_scan_decode::{
     lower_scan_predicate, parse_scan_limit, validate_variant_path_read_slots,
 };
 
+/// Lowers one native ScanNode after the outer plan decoder has validated the
+/// enclosing physical-node shape.
+///
+/// Native scan carrier validation and Worker source assembly share this one
+/// adapter boundary. Backend plan traversal receives only the lowered node.
+pub fn lower_scan_node(
+    node: &plan::DistributedNode,
+    _physical: &plan::PlanNode,
+    scan: &plan::ScanNode,
+    path: FieldPath,
+    ctx: &NativePlanDecodeContext,
+    arena: &mut ExprArena,
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    if !scan.dict_columns.is_empty() {
+        return Err(NativeFragmentDecodeError::unsupported(
+            path.clone().field("dict_columns"),
+            "ScanNode dict_columns are not supported by native lowering yet",
+        ));
+    }
+    let table = scan.table.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(path.clone().field("table"), "ScanNode table missing")
+    })?;
+    let source = table.source.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("table").field("source"),
+            "ScanNode table source missing",
+        )
+    })?;
+    let source = source.kind.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("table").field("source").field("kind"),
+            "ScanNode table source kind missing",
+        )
+    })?;
+    let source_path = path.clone().field("table").field("source");
+    let output_columns =
+        crate::fragment_scan_output::decode_scan_output_columns(scan, path.clone())?;
+    let variant_path_plan = crate::fragment_variant_path::parse_native_scan_variant_path_columns(
+        scan,
+        table,
+        output_columns.columns(),
+    )
+    .map_err(|error| error.into_native(path.clone()))?;
+    match source {
+        plan::scan_source::Kind::TypedConnectorRead(source) => lower_typed_connector_scan(
+            node,
+            scan,
+            source,
+            &output_columns,
+            &variant_path_plan,
+            ctx,
+            arena,
+        )
+        .map_err(|error| error.into_native(source_path.field("typed_connector_read"))),
+    }
+}
+
 /// Lower one `ScanSource.typed_connector_read` into an execution scan node.
-pub(super) fn lower_typed_connector_scan(
+fn lower_typed_connector_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &dto::ConnectorTableScanSource,
@@ -124,7 +182,7 @@ pub(super) fn lower_typed_connector_scan(
     let descriptor = novarocks_worker::TypedConnectorReadDescriptor::new(
         decoded_scan.relation().table().clone(),
         decoded_scan.assignments().to_vec(),
-        novarocks_native_adapter::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
+        crate::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
             &scan_source,
             &decoded_scan,
         ),
@@ -154,7 +212,7 @@ pub(super) fn lower_typed_connector_scan(
                 .create_page_source_provider(&inputs.request, inputs.reader_policy)
                 .map_err(provider_refusal)?;
             let live_dynamic_filter_factory =
-                novarocks_native_adapter::runtime_filter_typed_scan::typed_scan_live_dynamic_filter_factory(
+                crate::runtime_filter_typed_scan::typed_scan_live_dynamic_filter_factory(
                     scan_source.clone(),
                     decoded_scan.clone(),
                 );
@@ -168,7 +226,7 @@ pub(super) fn lower_typed_connector_scan(
                 read_slot_ids,
                 inputs.runtime_filter,
                 live_dynamic_filter_factory,
-                novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker(),
+                crate::debug_environment::debug_emit_connector_reader_marker(),
             );
             match output_materialization {
                 Some(transform) => Arc::new(
@@ -192,7 +250,7 @@ pub(super) fn lower_typed_connector_scan(
                 inputs.request,
                 node.node_id,
                 read_slot_ids,
-                novarocks_native_adapter::debug_environment::debug_emit_connector_reader_marker(),
+                crate::debug_environment::debug_emit_connector_reader_marker(),
             );
             match output_materialization {
                 Some(transform) => Arc::new(
@@ -480,12 +538,38 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks_proto_models::common;
 
-    use novarocks_native_adapter::typed_connector_test_support::test_support;
+    use crate::typed_connector_test_support::test_support;
 
     use novarocks_execution::exec::node::scan::{ScanMorsel, ScanMorsels};
 
-    use super::super::super::node::decode_node;
     use super::*;
+
+    /// Decodes the fixture's scan leaf through the adapter-owned Native boundary.
+    fn decode_node(
+        node: &plan::DistributedNode,
+        arena: &mut ExprArena,
+        ctx: &NativePlanDecodeContext,
+    ) -> Result<DecodedNode, NativeFragmentDecodeError> {
+        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
+        else {
+            panic!("fixture node carries a physical payload");
+        };
+        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+            panic!("fixture node carries a scan");
+        };
+        lower_scan_node(
+            node,
+            physical,
+            scan,
+            FieldPath::root("plan_fragment")
+                .field("root")
+                .field("payload")
+                .field("physical")
+                .field("scan"),
+            ctx,
+            arena,
+        )
+    }
 
     /// A live attempt, so a decode reaches the binding instead of failing on a
     /// cancellation it was never given.
@@ -891,17 +975,15 @@ mod tests {
         let scan = scan_of(&node);
         let table = scan.table.as_ref().expect("fixture table");
         let output_columns =
-            novarocks_native_adapter::fragment_scan_output::decode_scan_output_columns(
+            crate::fragment_scan_output::decode_scan_output_columns(scan, FieldPath::root("scan"))
+                .expect("decode scan output columns");
+        let variant_path_plan =
+            crate::fragment_variant_path::parse_native_scan_variant_path_columns(
                 scan,
-                FieldPath::root("scan"),
+                table,
+                output_columns.columns(),
             )
-            .expect("decode scan output columns");
-        let variant_path_plan = novarocks_native_adapter::fragment_variant_path::parse_native_scan_variant_path_columns(
-            scan,
-            table,
-            output_columns.columns(),
-        )
-        .expect("parse variant path columns");
+            .expect("parse variant path columns");
 
         // One assignment, one page channel, one read slot: the synthetic column
         // is not among them.
@@ -933,17 +1015,15 @@ mod tests {
         scan.required_columns = vec!["__nr_var_v_0".to_string(), "id".to_string()];
         let table = scan.table.as_ref().expect("fixture table");
         let output_columns =
-            novarocks_native_adapter::fragment_scan_output::decode_scan_output_columns(
+            crate::fragment_scan_output::decode_scan_output_columns(scan, FieldPath::root("scan"))
+                .expect("decode narrowed output columns");
+        let variant_path_plan =
+            crate::fragment_variant_path::parse_native_scan_variant_path_columns(
                 scan,
-                FieldPath::root("scan"),
+                table,
+                output_columns.columns(),
             )
-            .expect("decode narrowed output columns");
-        let variant_path_plan = novarocks_native_adapter::fragment_variant_path::parse_native_scan_variant_path_columns(
-            scan,
-            table,
-            output_columns.columns(),
-        )
-        .expect("parse variant path columns");
+            .expect("parse variant path columns");
 
         assert_eq!(
             connector_read_slot_ids(scan, &output_columns, &variant_path_plan),

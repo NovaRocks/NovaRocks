@@ -1376,14 +1376,16 @@ fn lower_physical_node(
         plan::plan_node::Kind::AssertOneRow(assert) => {
             lower_assert_one_row_node(node, assert, path.clone().field("assert_one_row"), children)
         }
-        plan::plan_node::Kind::Scan(scan) => super::scan::lower_scan_node(
-            node,
-            physical,
-            scan,
-            path.clone().field("scan"),
-            ctx,
-            arena,
-        ),
+        plan::plan_node::Kind::Scan(scan) => {
+            novarocks_native_adapter::fragment_typed_connector_scan::lower_scan_node(
+                node,
+                physical,
+                scan,
+                path.clone().field("scan"),
+                ctx,
+                arena,
+            )
+        }
         plan::plan_node::Kind::HashAggregate(aggregate) => aggregate::lower_hash_aggregate_node(
             node,
             physical,

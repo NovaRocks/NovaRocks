@@ -47,6 +47,7 @@ pub mod fragment_scan_decode;
 pub mod fragment_scan_output;
 pub mod fragment_sink;
 pub mod fragment_submission;
+pub mod fragment_typed_connector_scan;
 pub mod fragment_validation;
 pub mod fragment_variant_path;
 pub mod management_http;
