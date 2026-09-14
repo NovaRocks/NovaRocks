@@ -65,10 +65,13 @@ pub mod kill;
 /// Query-result scalar conversion used by SQL session user variables.
 pub mod user_variable;
 
-/// Product-command port consumed after SQL admission has selected a typed
-/// statement. Implementations remain role-local adapters: the port transfers
-/// only immutable admitted context and the governed command context.
-pub trait CoreCommandRoute: Send + Sync {
+/// Role-local route for the statement families intentionally outside the
+/// closed product-command vocabulary.
+///
+/// Product statements use [`ProductCommandRouter`] after semantic lowering.
+/// This route admits only the explicit MV, View, `SHOW BACKENDS`, and
+/// test-only maintenance-call shapes; it is not a generic parser-AST route.
+pub trait SpecializedStatementRoute: Send + Sync {
     /// Executes the role-gated `SHOW BACKENDS` command.
     fn execute_show_backends(
         &self,

@@ -100,11 +100,11 @@ use novarocks_query_application::sql::session::{
 use novarocks_query_application::sql::session_admit::SessionAdmitError;
 use novarocks_query_application::sql::user_variable::query_result_to_user_variable_literal;
 use novarocks_query_application::sql::{
-    CoreCommandRoute, parse_single_statement, query_service_parse_error,
-    strip_leading_line_comments,
+    ProductCommandRouter, ProductSqlCommand, lower_product_sql_command,
 };
 use novarocks_query_application::sql::{
-    ProductCommandRouter, ProductSqlCommand, lower_product_sql_command,
+    SpecializedStatementRoute, parse_single_statement, query_service_parse_error,
+    strip_leading_line_comments,
 };
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
@@ -366,7 +366,7 @@ impl TypedCommandRoute {
     }
 }
 
-impl CoreCommandRoute for TypedCommandRoute {
+impl SpecializedStatementRoute for TypedCommandRoute {
     fn execute_show_backends(
         &self,
         context: &RequestContext,
@@ -595,7 +595,7 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 pub struct FrontendQueryService {
     session_catalog_resolver: SessionCatalogService,
     query_compiler: FrontendQueryCompiler,
-    command_executor: Arc<dyn CoreCommandRoute>,
+    command_executor: Arc<dyn SpecializedStatementRoute>,
     product_command_router: ProductCommandRouter,
     query_control: QueryControlService,
     client_connection_control: Arc<dyn ClientConnectionControlPort>,
@@ -2813,7 +2813,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingCoreCommand {
+    struct RecordingSpecializedRoute {
         calls: AtomicUsize,
         #[allow(
             dead_code,
@@ -2890,7 +2890,7 @@ mod tests {
         }
     }
 
-    impl CoreCommandRoute for RecordingCoreCommand {}
+    impl SpecializedStatementRoute for RecordingSpecializedRoute {}
 
     #[derive(Default)]
     struct RecordingInsertEngine {
@@ -2973,7 +2973,7 @@ mod tests {
         delete_engine: &dyn DeleteEngine,
         mutation_engine: Option<&dyn MutationEngine>,
         ctas_route: C,
-        _command: &dyn CoreCommandRoute,
+        _command: &dyn SpecializedStatementRoute,
         sql: &str,
         context: &RequestContext,
         query_options: QueryOptions,
@@ -3043,7 +3043,7 @@ mod tests {
     fn sqlx2_application_frontend_router_handles_insert_before_core_command() {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
-        let command = RecordingCoreCommand::default();
+        let command = RecordingSpecializedRoute::default();
         let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let context =
@@ -3070,7 +3070,7 @@ mod tests {
     fn sqlx2_application_frontend_router_passes_one_request_context_to_dml() {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
-        let command = RecordingCoreCommand::default();
+        let command = RecordingSpecializedRoute::default();
         let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -3103,7 +3103,7 @@ mod tests {
     fn sqlx2_application_frontend_router_handles_delete_before_core_command() {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
-        let command = RecordingCoreCommand::default();
+        let command = RecordingSpecializedRoute::default();
         let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -3134,7 +3134,7 @@ mod tests {
     fn frontend_router_orders_ctas_before_truncate_and_fallback() {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
-        let command = RecordingCoreCommand::default();
+        let command = RecordingSpecializedRoute::default();
         let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let context =
@@ -3165,7 +3165,7 @@ mod tests {
     fn frontend_router_target_errors_never_fall_back() {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
-        let command = RecordingCoreCommand::default();
+        let command = RecordingSpecializedRoute::default();
         let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let context =
@@ -3192,7 +3192,7 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let mutation = RejectingMutationEngine;
-        let command = RecordingCoreCommand::default();
+        let command = RecordingSpecializedRoute::default();
         let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let context =
