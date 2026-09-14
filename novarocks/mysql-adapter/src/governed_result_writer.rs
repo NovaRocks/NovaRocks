@@ -577,12 +577,13 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
         let delivery = match next {
             Ok(delivery) => delivery,
             Err(error) => {
-                let kind = if error.kind() == QueryExecutionErrorKind::Cancelled {
+                let error = normalize_terminal_cancellation(error);
+                let kind = if is_terminal_cancellation(&error) {
                     ErrorKind::ER_QUERY_INTERRUPTED
                 } else {
                     ErrorKind::ER_UNKNOWN_ERROR
                 };
-                if error.kind() == QueryExecutionErrorKind::Cancelled {
+                if is_terminal_cancellation(&error) {
                     let _ = result.settle_cancellation();
                 } else {
                     let _ = result.fail();
@@ -649,12 +650,13 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
                 let delivery = match reserved {
                     Ok(delivery) => delivery,
                     Err(error) => {
-                        let kind = if error.kind() == QueryExecutionErrorKind::Cancelled {
+                        let error = normalize_terminal_cancellation(error);
+                        let kind = if is_terminal_cancellation(&error) {
                             ErrorKind::ER_QUERY_INTERRUPTED
                         } else {
                             ErrorKind::ER_UNKNOWN_ERROR
                         };
-                        if error.kind() == QueryExecutionErrorKind::Cancelled {
+                        if is_terminal_cancellation(&error) {
                             let _ = result.settle_cancellation();
                         } else {
                             let _ = result.fail();
@@ -748,13 +750,14 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
                 } {
                     Ok(reservation) => reservation,
                     Err(error) => {
-                        let kind = if error.kind() == QueryExecutionErrorKind::Cancelled {
+                        let error = normalize_terminal_cancellation(error);
+                        let kind = if is_terminal_cancellation(&error) {
                             ErrorKind::ER_QUERY_INTERRUPTED
                         } else {
                             ErrorKind::ER_UNKNOWN_ERROR
                         };
                         delivery.fail(error.clone());
-                        if error.kind() == QueryExecutionErrorKind::Cancelled {
+                        if is_terminal_cancellation(&error) {
                             let _ = result.settle_cancellation();
                         } else {
                             let _ = result.fail();
@@ -1355,6 +1358,21 @@ fn failed_query_result_delivery(message: impl Into<String>) -> QueryExecutionErr
     QueryExecutionError::new(QueryExecutionErrorKind::Failed, message.into())
 }
 
+fn is_terminal_cancellation(error: &QueryExecutionError) -> bool {
+    matches!(
+        error.kind(),
+        QueryExecutionErrorKind::Cancelled | QueryExecutionErrorKind::DeadlineExceeded
+    )
+}
+
+fn normalize_terminal_cancellation(error: QueryExecutionError) -> QueryExecutionError {
+    if error.kind() == QueryExecutionErrorKind::DeadlineExceeded {
+        QueryExecutionError::new(QueryExecutionErrorKind::DeadlineExceeded, "query timed out")
+    } else {
+        error
+    }
+}
+
 fn cancelled_query_result_delivery(reason: QueryCancellationReason) -> QueryExecutionError {
     let message = match reason {
         QueryCancellationReason::DeadlineExceeded { timeout_ms } => {
@@ -1629,6 +1647,18 @@ mod streaming_result_tests {
         });
         assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
         assert_eq!(error.to_string(), "query timed out after 1000 ms");
+    }
+
+    #[test]
+    fn actor_deadline_terminal_is_settled_as_a_mysql_timeout() {
+        let error = normalize_terminal_cancellation(QueryExecutionError::new(
+            QueryExecutionErrorKind::DeadlineExceeded,
+            "logical execution deadline expired before success EOF",
+        ));
+
+        assert!(is_terminal_cancellation(&error));
+        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
+        assert_eq!(error.to_string(), "query timed out");
     }
 
     #[test]
