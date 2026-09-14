@@ -67,15 +67,10 @@ pub(super) fn execute(
     if matches!(refresh.work, PreparedMvRefreshWork::NoOp) {
         return Ok(MvStatementResult::Ok);
     }
-    let target = novarocks_sql::planning::mv::SqlMvTarget {
-        catalog: refresh.finalize.target.catalog.clone(),
-        database: refresh.finalize.target.database.clone(),
-        name: refresh.finalize.target.name.clone(),
-    };
-    let _runtime_publication = dependencies
-        .readiness
-        .begin_publication(&target, refresh.attempt.publication_id)
-        .map_err(repository_error)?;
+    let product_target = product_target(&refresh.finalize.target)?;
+    let _runtime_publication = product
+        .begin_refresh_publication(&product_target, &refresh.attempt)
+        .map_err(product_error)?;
     let catalog = refresh
         .finalize
         .target
@@ -573,6 +568,7 @@ fn product_error(error: MvProductError) -> MvApplicationError {
         MvProductErrorKind::KnownCommittedFinalizeFailed => {
             MvApplicationErrorKind::KnownCommittedFinalizeFailed
         }
+        MvProductErrorKind::Conflict => MvApplicationErrorKind::AlreadyActive,
         MvProductErrorKind::Unavailable => MvApplicationErrorKind::Unavailable,
         MvProductErrorKind::InvalidRequest => MvApplicationErrorKind::InvalidRequest,
         MvProductErrorKind::CommitUnknown => MvApplicationErrorKind::CommitUnknown,
@@ -1070,5 +1066,15 @@ mod tests {
             MvApplicationErrorKind::KnownCommittedFinalizeFailed
         );
         assert!(error.message().contains("projector store unavailable"));
+    }
+
+    #[test]
+    fn product_refresh_publication_conflict_is_already_active() {
+        let error = product_error(MvProductError::new(
+            MvProductErrorKind::Conflict,
+            "an MV publication is already active for this target",
+        ));
+
+        assert_eq!(error.kind(), MvApplicationErrorKind::AlreadyActive);
     }
 }

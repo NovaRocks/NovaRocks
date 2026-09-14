@@ -34,7 +34,8 @@ use crate::product::{
     MvCommand, MvCreateCommand, MvOperationContext, MvProductError, MvProductErrorKind,
     MvProductResult, MvRefreshAttemptIdentity, MvTarget,
 };
-use crate::readiness::MvDropReadiness;
+use crate::readiness::{MvDropReadiness, MvReadinessService, MvRuntimePublicationLease};
+use crate::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use crate::scheduler::{MvRefreshScheduler, MvSchedulerConfig};
 
 /// The one process-local MV owner for activity admission and background-worker
@@ -45,6 +46,7 @@ pub struct MvProductService {
     background: MvBackgroundRuntimeOwner,
     scheduler_config: MvSchedulerConfig,
     scheduler: Mutex<MvRefreshScheduler>,
+    readiness: Option<MvReadinessService>,
 }
 
 impl Default for MvProductService {
@@ -63,7 +65,21 @@ impl MvProductService {
             background: MvBackgroundRuntimeOwner::default(),
             scheduler: Mutex::new(MvRefreshScheduler::new(scheduler_config.clone())),
             scheduler_config,
+            readiness: None,
         }
+    }
+
+    /// Construct the process product with its product-owned readiness runtime.
+    /// Unit-only products may omit this dependency, but a serving composition
+    /// must use this constructor so refresh publication admission cannot be
+    /// started by an outer adapter.
+    pub fn new_with_readiness(
+        scheduler_config: MvSchedulerConfig,
+        readiness: MvReadinessService,
+    ) -> Self {
+        let mut service = Self::new(scheduler_config);
+        service.readiness = Some(readiness);
+        service
     }
 
     pub fn scheduler_tick_interval_ms(&self) -> u64 {
@@ -89,6 +105,25 @@ impl MvProductService {
     /// cannot mint a second identity for the same product transition.
     pub fn reserve_refresh_attempt(&self) -> MvRefreshAttemptIdentity {
         MvRefreshAttemptIdentity::reserve()
+    }
+
+    /// Begin the product-owned process publication lifetime before any
+    /// provider effect. The returned lease releases the exact target and
+    /// publication identity when the refresh transition unwinds.
+    pub fn begin_refresh_publication(
+        &self,
+        target: &MvTarget,
+        attempt: &MvRefreshAttemptIdentity,
+    ) -> Result<MvRuntimePublicationLease, MvProductError> {
+        let readiness = self.readiness.as_ref().ok_or_else(|| {
+            MvProductError::new(
+                MvProductErrorKind::Unavailable,
+                "MV product has no configured readiness runtime",
+            )
+        })?;
+        readiness
+            .begin_publication(target.clone(), attempt.publication_id)
+            .map_err(readiness_error)
     }
 
     /// Finalize a refresh only after its external publication is known
@@ -243,9 +278,21 @@ fn known_committed_finalize_failure(failure: MvProviderFailure) -> MvProductErro
     )
 }
 
+fn readiness_error(error: MvRepositoryError) -> MvProductError {
+    let kind = match error.kind() {
+        MvRepositoryErrorKind::InvalidRequest => MvProductErrorKind::InvalidRequest,
+        MvRepositoryErrorKind::NotFound => MvProductErrorKind::TargetReplaced,
+        MvRepositoryErrorKind::Conflict => MvProductErrorKind::Conflict,
+        MvRepositoryErrorKind::Corruption => MvProductErrorKind::Corruption,
+        MvRepositoryErrorKind::Unavailable => MvProductErrorKind::Unavailable,
+        MvRepositoryErrorKind::CommitUnknown => MvProductErrorKind::CommitUnknown,
+    };
+    MvProductError::new(kind, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::MvProductService;
     use crate::activity::{CanonicalMvTarget, MvActivityGateError, MvActivityOwner};
@@ -263,18 +310,20 @@ mod tests {
         MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvProviderFailureKind,
         MvRefreshProjectionPort,
     };
+    use crate::process_runtime::ProcessRuntime;
     use crate::product::{
         MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition,
         MvProductErrorKind, MvProductResult, MvTarget,
     };
-    use crate::readiness::MvDropReadiness;
+    use crate::readiness::{MvDropReadiness, MvReadinessService};
     use crate::repository::InitialMvRefreshConfiguration;
     use crate::scheduler::MvSchedulerConfig;
+    use crate::test_repository::InMemoryMvRepository;
     use bytes::Bytes;
     use novarocks_query_application::persisted_query_definition::{
         PersistedQueryDefinition, PersistedQueryDialect,
     };
-    use novarocks_spi::connector::ConnectorTableObjectId;
+    use novarocks_spi::connector::{ConnectorTableObjectId, LakePublicationId};
     use novarocks_sql::planning::mv::ApplyKeySource;
     use uuid::Uuid;
 
@@ -584,6 +633,31 @@ mod tests {
 
         assert!(matches!(result, MvProductResult::Acknowledged));
         assert_eq!(effects.events(), ["project_known_committed"]);
+    }
+
+    #[test]
+    fn product_owns_refresh_publication_admission_and_lease_release() {
+        let readiness = MvReadinessService::new(
+            Arc::new(InMemoryMvRepository::default()),
+            Arc::<ProcessRuntime<MvTarget, LakePublicationId>>::default(),
+        );
+        let service = MvProductService::new_with_readiness(MvSchedulerConfig::default(), readiness);
+        let target = MvTarget::from_parts(Some("iceberg"), "db", "mv");
+        let first = service.reserve_refresh_attempt();
+        let lease = service
+            .begin_refresh_publication(&target, &first)
+            .expect("product begins the first publication");
+        let second = service.reserve_refresh_attempt();
+
+        let Err(error) = service.begin_refresh_publication(&target, &second) else {
+            panic!("a concurrent publication must be rejected");
+        };
+        assert_eq!(error.kind(), MvProductErrorKind::Conflict);
+
+        drop(lease);
+        service
+            .begin_refresh_publication(&target, &second)
+            .expect("dropping the product lease releases the target");
     }
 
     #[test]

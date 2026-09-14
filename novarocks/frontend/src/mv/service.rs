@@ -102,8 +102,11 @@ impl FrontendMvService {
                 provider_activation: Arc::clone(&provider_activation),
                 readiness: Arc::clone(&readiness),
             },
-            readiness,
-            product_service: Arc::new(MvProductService::new(scheduler_config)),
+            readiness: Arc::clone(&readiness),
+            product_service: Arc::new(MvProductService::new_with_readiness(
+                scheduler_config,
+                readiness.product_readiness_service(),
+            )),
             maintenance_config,
             table_maintenance_service,
             execution_role,

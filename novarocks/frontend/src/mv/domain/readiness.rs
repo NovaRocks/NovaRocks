@@ -15,7 +15,6 @@ use novarocks_mv_application::activity::CanonicalMvTarget;
 use novarocks_mv_application::process_runtime::ProcessRuntime;
 use novarocks_mv_application::readiness::{
     MvCandidateReader as ProductCandidateReader, MvDropReadiness, MvReadinessService,
-    MvRuntimePublicationLease,
 };
 use uuid::Uuid;
 
@@ -77,6 +76,13 @@ impl MvReadinessPort {
     /// process-local readiness or refresh authority.
     pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
         MvCandidateReader::new(self.service.candidate_reader(), self.handle.clone())
+    }
+
+    /// Supply the serving MV product with the same product-owned readiness
+    /// runtime. This bridge retains synchronous read adapters only; it does
+    /// not retain refresh publication admission.
+    pub(crate) fn product_readiness_service(&self) -> MvReadinessService {
+        self.service.clone()
     }
 
     /// Drives one durable MV operation from a synchronous caller. Confined to
@@ -198,15 +204,6 @@ impl MvReadinessPort {
             self.service
                 .delete_after_provider_drop(operation_id, &canonical_mv_target(target)),
         )
-    }
-
-    pub(crate) fn begin_publication(
-        &self,
-        target: &MvTarget,
-        publication_id: novarocks_spi::connector::LakePublicationId,
-    ) -> Result<MvRuntimePublicationLease, MvRepositoryError> {
-        self.service
-            .begin_publication(canonical_mv_target(target), publication_id)
     }
 
     /// Reject the test/harness-only whole-family Accelerator wipe while this

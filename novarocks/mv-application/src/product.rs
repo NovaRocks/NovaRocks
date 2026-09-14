@@ -158,6 +158,7 @@ pub enum MvProductResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvProductErrorKind {
     InvalidRequest,
+    Conflict,
     Unavailable,
     ProviderKnownUncommitted,
     CommitUnknown,

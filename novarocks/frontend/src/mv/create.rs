@@ -235,6 +235,7 @@ fn product_error(error: MvProductError) -> MvApplicationError {
             MvApplicationErrorKind::KnownCommittedFinalizeFailed
         }
         MvProductErrorKind::InvalidRequest
+        | MvProductErrorKind::Conflict
         | MvProductErrorKind::Unavailable
         | MvProductErrorKind::ProviderKnownUncommitted
         | MvProductErrorKind::CommitUnknown

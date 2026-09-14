@@ -32,6 +32,7 @@ use crate::repository::{
     MvRepositoryError, MvRepositoryErrorKind, ReplaceMvProjectionRequest,
 };
 
+#[derive(Clone)]
 pub struct MvReadinessService {
     repository: Arc<dyn MvRepository>,
     runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
