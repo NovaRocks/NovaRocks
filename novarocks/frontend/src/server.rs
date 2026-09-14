@@ -287,7 +287,7 @@ async fn build_frontend_role_products(
     let logical_read_launcher = host.build_logical_read_launcher();
     let topology = host.backend_topology_port();
     let role = host.execution_role();
-    let mv_repository = host.mv_repository_for_role_product_construction();
+    let mv_repository = host.take_mv_repository_for_role_product_construction()?;
     let view_service: Arc<dyn novarocks_query_application::view::ViewService> =
         Arc::new(novarocks_query_application::view::QueryViewService::new());
     let dml_service = Arc::new(crate::dml::DmlService::new());
@@ -319,7 +319,7 @@ async fn build_frontend_role_products(
     // Frontend adapters receive only its already-created readiness service.
     let mv_product_service = Arc::new(MvProductService::new_with_readiness_runtime(
         host.mv_scheduler_config(),
-        Arc::clone(&mv_repository),
+        mv_repository,
         Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
     ));
     let mv_readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(

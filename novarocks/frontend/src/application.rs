@@ -1446,18 +1446,18 @@ impl FrontendApplicationHost {
         Ok(())
     }
 
-    /// Borrows the repository only while Server is constructing the immutable
-    /// role-product graph. The final product owner is transferred separately
-    /// after every fallible constructor has succeeded, so Host still owns
-    /// startup rollback.
-    pub(crate) fn mv_repository_for_role_product_construction(
-        &self,
-    ) -> Arc<dyn novarocks_mv_application::repository::MvRepository> {
-        Arc::clone(
-            self.mv_repository
-                .as_ref()
-                .expect("frontend MV repository is installed before host open returns"),
-        )
+    /// Transfers the repository to the immutable MV product graph. Before
+    /// this point Host owns it for startup rollback; afterwards no Host path
+    /// retains a parallel MV repository capability.
+    pub(crate) fn take_mv_repository_for_role_product_construction(
+        &mut self,
+    ) -> Result<Arc<dyn novarocks_mv_application::repository::MvRepository>, FrontendApplicationError>
+    {
+        self.mv_repository.take().ok_or_else(|| {
+            FrontendApplicationError::server(
+                "frontend MV repository was already transferred or was never installed",
+            )
+        })
     }
 
     pub(crate) fn mv_scheduler_config(&self) -> MvSchedulerConfig {
