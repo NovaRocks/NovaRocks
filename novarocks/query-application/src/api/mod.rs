@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod backend_topology;
 mod candidate;
 mod command;
 mod execution;
@@ -22,6 +23,7 @@ mod native;
 pub(crate) mod result;
 mod topology;
 
+pub use backend_topology::*;
 pub use candidate::*;
 pub use command::*;
 pub use execution::*;
