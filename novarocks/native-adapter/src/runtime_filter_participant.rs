@@ -23,11 +23,14 @@
 //! by this participant.
 
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(debug_assertions)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_execution::runtime_filter::{
-    RuntimeFilterContractViolation, RuntimeFilterContractViolationKind, RuntimeFilterSessionRef,
+    RuntimeFilterChannelId, RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
+    RuntimeFilterSessionRef,
 };
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryTerminationReason};
 use novarocks_types::UniqueId;
@@ -134,6 +137,86 @@ pub struct RuntimeFilterParticipant {
     state: Arc<WorkerRuntimeFilterParticipant>,
     outbound: Arc<BackendParticipantOutbound>,
     close_hook: RuntimeFilterParticipantCloseHook,
+    #[cfg(debug_assertions)]
+    accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous,
+}
+
+/// Runner-only synchronization for the Accepted-after-ACK-drop scenario.
+///
+/// The receiver must remain installed until the sender's exact retry reaches
+/// its ordinary dedupe owner.  This lives on the participant rather than in a
+/// registry or a transport fallback, so release builds and all non-faulted
+/// attempts retain their normal release/no-op behavior.
+#[cfg(debug_assertions)]
+struct AcceptedContributionRetryRendezvous {
+    state: Mutex<AcceptedContributionRetryRendezvousState>,
+    changed: Condvar,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum AcceptedContributionRetryRendezvousState {
+    Idle,
+    Armed {
+        channel_id: RuntimeFilterChannelId,
+        route: BackendNativeContributionRouteIdentity,
+    },
+    DuplicateObserved,
+}
+
+#[cfg(debug_assertions)]
+impl AcceptedContributionRetryRendezvous {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AcceptedContributionRetryRendezvousState::Idle),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn arm(
+        &self,
+        channel_id: RuntimeFilterChannelId,
+        route: BackendNativeContributionRouteIdentity,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        *state = AcceptedContributionRetryRendezvousState::Armed { channel_id, route };
+    }
+
+    fn observe_duplicate(
+        &self,
+        kind: BackendEnvelopeKind,
+        channel_id: RuntimeFilterChannelId,
+        route: BackendNativeRouteIdentity,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let AcceptedContributionRetryRendezvousState::Armed {
+            channel_id: armed_channel_id,
+            route: armed_route,
+        } = *state
+        else {
+            return;
+        };
+        if kind == BackendEnvelopeKind::Contribution
+            && channel_id == armed_channel_id
+            && route == BackendNativeRouteIdentity::Contribution(armed_route)
+        {
+            *state = AcceptedContributionRetryRendezvousState::DuplicateObserved;
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait_for_duplicate(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while matches!(
+            *state,
+            AcceptedContributionRetryRendezvousState::Armed { .. }
+        ) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
 }
 
 pub type RuntimeFilterParticipantCloseHook = Arc<
@@ -167,6 +250,8 @@ impl RuntimeFilterParticipant {
             state,
             outbound,
             close_hook: Arc::new(|_, _| Ok(())),
+            #[cfg(debug_assertions)]
+            accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
         }))
     }
 
@@ -206,7 +291,10 @@ impl RuntimeFilterParticipant {
         {
             return rejected(QUERY_UNAVAILABLE_REJECTION);
         }
-        match envelope.kind() {
+        let kind = envelope.kind();
+        let channel_id = envelope.channel_id();
+        let route = *envelope.route_identity();
+        let result = match kind {
             BackendEnvelopeKind::Contribution | BackendEnvelopeKind::ProducerClosed => {
                 self.dispatch_producer_envelope(envelope)
             }
@@ -217,7 +305,35 @@ impl RuntimeFilterParticipant {
             | BackendEnvelopeKind::Unavailable
             | BackendEnvelopeKind::CompletedWithoutArtifact
             | BackendEnvelopeKind::DegradedLogical => self.dispatch_delivery_envelope(envelope),
+        };
+        #[cfg(debug_assertions)]
+        if result.status()
+            == novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Duplicate
+        {
+            self.accepted_contribution_retry_rendezvous
+                .observe_duplicate(kind, channel_id, route);
         }
+        result
+    }
+
+    /// Arms the system-test-only receiver rendezvous after this participant
+    /// has accepted the contribution whose unary response is being dropped.
+    #[cfg(debug_assertions)]
+    pub fn arm_accepted_contribution_retry_rendezvous(
+        &self,
+        channel_id: RuntimeFilterChannelId,
+        route: BackendNativeContributionRouteIdentity,
+    ) {
+        self.accepted_contribution_retry_rendezvous
+            .arm(channel_id, route);
+    }
+
+    /// Blocks only a debug-faulted participant's release until its exact
+    /// duplicate retry arrives.  The ordinary participant never waits here.
+    #[cfg(debug_assertions)]
+    pub fn wait_for_accepted_contribution_retry_rendezvous(&self) {
+        self.accepted_contribution_retry_rendezvous
+            .wait_for_duplicate();
     }
 
     fn dispatch_delivery_envelope(
@@ -354,6 +470,8 @@ impl RuntimeFilterParticipant {
             state: Arc::clone(&self.state),
             outbound: Arc::clone(&self.outbound),
             close_hook,
+            #[cfg(debug_assertions)]
+            accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
         })
     }
 }

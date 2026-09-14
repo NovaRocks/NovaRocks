@@ -41,9 +41,12 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::task_execution::NativeQueryContextHost;
+#[cfg(debug_assertions)]
+use novarocks_execution::runtime_filter::RuntimeFilterChannelId;
 use novarocks_native_adapter::runtime_filter_participant::RuntimeFilterParticipant;
 use novarocks_native_adapter::runtime_filter_rpc::{
-    BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
+    BackendNativeContributionRouteIdentity, BackendNativeRuntimeFilterEnvelope,
+    BackendRuntimeFilterEnvelopeIngress,
 };
 use novarocks_worker::runtime_filter::domain::{BackendIngressResult, BackendParticipantIdentity};
 
@@ -159,6 +162,30 @@ impl BackendRuntimeFilterEnvelopeIngress for CompositeRuntimeFilterEnvelopeIngre
                 );
                 rejected(CONFLICTING_OWNERS_REJECTION)
             }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn arm_accepted_contribution_retry_rendezvous(
+        &self,
+        identity: BackendParticipantIdentity,
+        channel_id: RuntimeFilterChannelId,
+        route: BackendNativeContributionRouteIdentity,
+    ) -> Result<(), String> {
+        let mut claimants: Vec<(&'static str, Arc<RuntimeFilterParticipant>)> = Vec::new();
+        for authority in &self.authorities {
+            if let Some(participant) = authority.claim_participant(identity) {
+                claimants.push((authority.authority_name(), participant));
+            }
+        }
+        match claimants.len() {
+            0 => Err(NO_OWNER_REJECTION.to_string()),
+            1 => {
+                let (_, participant) = claimants.pop().expect("one claimant");
+                participant.arm_accepted_contribution_retry_rendezvous(channel_id, route);
+                Ok(())
+            }
+            _ => Err(CONFLICTING_OWNERS_REJECTION.to_string()),
         }
     }
 }

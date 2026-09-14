@@ -39,6 +39,20 @@ use novarocks_worker::runtime_filter::domain::{
 /// only receives a wire-valid envelope and reports its exact ACK disposition.
 pub trait BackendRuntimeFilterEnvelopeIngress: Send + Sync {
     fn accept(&self, envelope: BackendNativeRuntimeFilterEnvelope) -> BackendIngressResult;
+
+    /// Arms a debug-only rendezvous on the exact participant that just
+    /// accepted a Contribution whose response will be dropped. The normal
+    /// production protocol has no such hold: it exists only so the system
+    /// scenario can prove the exact retry reaches a still-live receiver.
+    #[cfg(debug_assertions)]
+    fn arm_accepted_contribution_retry_rendezvous(
+        &self,
+        _participant: BackendParticipantIdentity,
+        _channel_id: RuntimeFilterChannelId,
+        _route: BackendNativeContributionRouteIdentity,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Runtime-filter coordinates as they exist on the native wire before a
@@ -472,7 +486,15 @@ pub fn handle_runtime_filter_envelope(
 
     let acked_route_identity = Some(route_identity);
     let result = ingress.accept(envelope);
-    if drop_accepted_contribution_response(&result, kind, query_id, deployment_epoch)? {
+    if drop_accepted_contribution_response(
+        ingress.as_ref(),
+        &result,
+        kind,
+        query_id,
+        deployment_epoch,
+        RuntimeFilterChannelId::new(channel_id),
+        domain_route_identity,
+    )? {
         return Err(tonic::Status::deadline_exceeded(
             "runner-owned runtime-filter contribution response dropped after Accepted",
         ));
@@ -512,10 +534,13 @@ pub fn handle_runtime_filter_envelope(
     reason = "The native transport adapter returns tonic status directly."
 )]
 fn drop_accepted_contribution_response(
+    ingress: &dyn BackendRuntimeFilterEnvelopeIngress,
     result: &BackendIngressResult,
     kind: BackendEnvelopeKind,
     query_id: UniqueId,
     deployment_epoch: u64,
+    channel_id: RuntimeFilterChannelId,
+    route: BackendNativeRouteIdentity,
 ) -> Result<bool, tonic::Status> {
     if kind != BackendEnvelopeKind::Contribution || result.status() != BackendAcceptStatus::Accepted
     {
@@ -531,7 +556,20 @@ fn drop_accepted_contribution_response(
         execution_id,
     )
     .map_err(tonic::Status::failed_precondition)?;
-    Ok(scope.is_some())
+    let Some(_) = scope else {
+        return Ok(false);
+    };
+    ingress
+        .arm_accepted_contribution_retry_rendezvous(
+            BackendParticipantIdentity::new(query_id, deployment_epoch),
+            channel_id,
+            match route {
+                BackendNativeRouteIdentity::Contribution(route) => route,
+                _ => unreachable!("only contribution routes reach the ACK-drop rendezvous"),
+            },
+        )
+        .map_err(tonic::Status::failed_precondition)?;
+    Ok(true)
 }
 
 #[cfg(debug_assertions)]
@@ -560,10 +598,13 @@ fn runtime_filter_fault_execution_id(
 
 #[cfg(not(debug_assertions))]
 fn drop_accepted_contribution_response(
+    _ingress: &dyn BackendRuntimeFilterEnvelopeIngress,
     _result: &BackendIngressResult,
     _kind: BackendEnvelopeKind,
     _query_id: UniqueId,
     _deployment_epoch: u64,
+    _channel_id: RuntimeFilterChannelId,
+    _route: BackendNativeRouteIdentity,
 ) -> Result<bool, tonic::Status> {
     Ok(false)
 }
@@ -794,7 +835,7 @@ mod tests {
     use super::{
         BackendNativeContributionRouteIdentity, BackendNativeRouteIdentity,
         BackendNativeRuntimeFilterEnvelope as RuntimeFilterEnvelope,
-        BackendRuntimeFilterEnvelopeIngress as RuntimeFilterEnvelopeIngress,
+        BackendRuntimeFilterEnvelopeIngress as RuntimeFilterEnvelopeIngress, decode_route_identity,
         decode_runtime_filter_envelope_response, drop_accepted_contribution_response,
         encode_runtime_filter_envelope, handle_runtime_filter_envelope,
     };
@@ -1291,9 +1332,18 @@ mod tests {
                 RuntimeFilterEnvelopeKind::Artifact,
             ),
         ] {
+            let ingress = RecordingIngress::new(RuntimeFilterIngressResult::accepted());
             assert!(
-                !drop_accepted_contribution_response(&result, kind, query_id, 14)
-                    .expect("ineligible runtime-filter response cannot claim a fault"),
+                !drop_accepted_contribution_response(
+                    &ingress,
+                    &result,
+                    kind,
+                    query_id,
+                    14,
+                    ChannelId::new(13),
+                    decode_route_identity(&contribution_route()).expect("valid contribution route"),
+                )
+                .expect("ineligible runtime-filter response cannot claim a fault"),
                 "only accepted Contribution responses may consume the fault token"
             );
         }

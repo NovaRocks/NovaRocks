@@ -311,6 +311,27 @@ impl NativeQueryContextHost {
         facts.participant.clone()
     }
 
+    #[cfg(debug_assertions)]
+    fn wait_for_accepted_contribution_retry_rendezvous(&self, context: QueryContextRef) {
+        let participant = {
+            let contexts = self
+                .contexts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(installed) = contexts.get(context) else {
+                return;
+            };
+            let facts = installed
+                .facts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            facts.participant.clone()
+        };
+        if let Some(participant) = participant {
+            participant.wait_for_accepted_contribution_retry_rendezvous();
+        }
+    }
+
     /// The participant this host installed for the exact attempt.
     ///
     /// This is the read side a peer backend reaches: a runtime-filter envelope
@@ -750,6 +771,8 @@ impl QueryContextHost for NativeQueryContextHost {
     }
 
     fn release(&self, context: QueryContextRef) -> ReleasedContextEvidence {
+        #[cfg(debug_assertions)]
+        self.wait_for_accepted_contribution_retry_rendezvous(context);
         let installed = {
             let mut contexts = self
                 .contexts
