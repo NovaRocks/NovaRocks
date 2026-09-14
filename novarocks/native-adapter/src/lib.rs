@@ -58,6 +58,7 @@ pub mod native_server;
 pub use native_server::NativeRpcServerHandle;
 pub mod query_options;
 pub mod runtime_filter_feedback;
+pub mod runtime_filter_ingress;
 pub mod runtime_filter_install;
 pub mod runtime_filter_membership;
 pub mod runtime_filter_participant;

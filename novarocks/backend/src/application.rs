@@ -17,7 +17,7 @@ use novarocks_worker::{
     WorkerResultRetainedLimits,
 };
 
-use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
+use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress_for_context_host;
 use crate::task_execution::RegistryTaskExecutionIngress;
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{
@@ -634,7 +634,9 @@ impl BackendApplicationHost {
         // through the one that installed it, and every intent's participant is
         // installed by the query-context host.
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
-            native_runtime_filter_envelope_ingress(Arc::clone(&services.query_context_host));
+            native_runtime_filter_envelope_ingress_for_context_host(Arc::clone(
+                &services.query_context_host,
+            ));
         let admission_epoch: Arc<dyn WorkerAdmissionEpochAuthority> =
             services.task_execution_registry.clone();
         let mut grpc_server = match NativeRpcServerHandle::start(
@@ -978,7 +980,7 @@ mod tests {
     /// simply waits out its whole wait cap and then scans unfiltered.
     #[test]
     fn the_composed_runtime_filter_ingress_reaches_a_task_protocol_participant() {
-        use super::native_runtime_filter_envelope_ingress;
+        use super::native_runtime_filter_envelope_ingress_for_context_host;
         use novarocks_execution_contract::CredentialUpdate;
         use novarocks_execution_contract::task_execution::domain::{
             CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
@@ -1066,8 +1068,9 @@ mod tests {
             ))
             .expect("establishing a query context with a participant is legal");
 
-        let ingress =
-            native_runtime_filter_envelope_ingress(Arc::clone(&services.query_context_host));
+        let ingress = native_runtime_filter_envelope_ingress_for_context_host(Arc::clone(
+            &services.query_context_host,
+        ));
         let reason = ingress
             .accept(envelope)
             .rejection_reason()
