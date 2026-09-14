@@ -6000,55 +6000,7 @@ struct IcebergDropEffects<'a> {
     connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
 }
 
-impl IcebergDropEffects<'_> {
-    fn unsupported() -> novarocks_mv_application::ports::MvProviderFailure {
-        novarocks_mv_application::ports::MvProviderFailure::new(
-            novarocks_mv_application::ports::MvProviderFailureKind::InvalidRequest,
-            "Iceberg DROP adapter received an unsupported MV product operation",
-        )
-    }
-}
-
-impl novarocks_mv_application::ports::MvProviderPort for IcebergDropEffects<'_> {
-    fn create_target(
-        &self,
-        _operation: novarocks_mv_application::product::MvOperationContext,
-        _command: &novarocks_mv_application::product::MvCommand,
-    ) -> Result<
-        novarocks_mv_application::product::MvCreatedTarget,
-        novarocks_mv_application::ports::MvProviderFailure,
-    > {
-        Err(Self::unsupported())
-    }
-
-    fn inspect_created_target(
-        &self,
-        _operation: novarocks_mv_application::product::MvOperationContext,
-        _target: &novarocks_mv_application::product::MvCreatedTarget,
-    ) -> Result<
-        novarocks_mv_application::product::MvPreparedDefinition,
-        novarocks_mv_application::ports::MvProviderFailure,
-    > {
-        Err(Self::unsupported())
-    }
-
-    fn sync_target_descriptor(
-        &self,
-        _operation: novarocks_mv_application::product::MvOperationContext,
-        _target: &novarocks_mv_application::product::MvCreatedTarget,
-        _definition: &novarocks_mv_application::product::MvPreparedDefinition,
-    ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
-        Err(Self::unsupported())
-    }
-
-    fn project_created_target(
-        &self,
-        _operation: novarocks_mv_application::product::MvOperationContext,
-        _target: &novarocks_mv_application::product::MvCreatedTarget,
-    ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
-        Err(Self::unsupported())
-    }
-
+impl novarocks_mv_application::ports::MvDropProviderPort for IcebergDropEffects<'_> {
     fn drop_target(
         &self,
         _operation: novarocks_mv_application::product::MvOperationContext,
@@ -6082,15 +6034,7 @@ impl novarocks_mv_application::ports::MvProviderPort for IcebergDropEffects<'_> 
     }
 }
 
-impl novarocks_mv_application::ports::MvCatalogRegistrationPort for IcebergDropEffects<'_> {
-    fn register_target(
-        &self,
-        _operation: novarocks_mv_application::product::MvOperationContext,
-        _target: &novarocks_mv_application::product::MvCreatedTarget,
-    ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
-        Err(Self::unsupported())
-    }
-
+impl novarocks_mv_application::ports::MvDropCatalogRegistrationPort for IcebergDropEffects<'_> {
     fn unregister_target(
         &self,
         _operation: novarocks_mv_application::product::MvOperationContext,

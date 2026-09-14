@@ -22,7 +22,7 @@ use crate::mv::domain::application::{
     MvEngineError, MvEngineErrorKind, MvRequestContext, MvStatementResult, PreparedMvCreate,
 };
 use novarocks_mv_application::ports::{
-    MvCatalogRegistrationPort, MvProviderFailure, MvProviderFailureKind, MvProviderPort,
+    MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvProviderFailure, MvProviderFailureKind,
 };
 use novarocks_mv_application::product::{
     MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition,
@@ -113,7 +113,7 @@ impl FrontendCreateAdapter<'_> {
     }
 }
 
-impl MvProviderPort for FrontendCreateAdapter<'_> {
+impl MvCreateProviderPort for FrontendCreateAdapter<'_> {
     fn create_target(
         &self,
         operation: MvOperationContext,
@@ -174,7 +174,7 @@ impl MvProviderPort for FrontendCreateAdapter<'_> {
             .map_err(provider_failure)
     }
 
-    fn drop_target(
+    fn cleanup_created_target(
         &self,
         _operation: MvOperationContext,
         target: &ProductMvTarget,
@@ -189,7 +189,7 @@ impl MvProviderPort for FrontendCreateAdapter<'_> {
     }
 }
 
-impl MvCatalogRegistrationPort for FrontendCreateAdapter<'_> {
+impl MvCreateCatalogRegistrationPort for FrontendCreateAdapter<'_> {
     fn register_target(
         &self,
         _operation: MvOperationContext,
@@ -199,17 +199,6 @@ impl MvCatalogRegistrationPort for FrontendCreateAdapter<'_> {
         self.engine
             .register_target(&target)
             .map_err(provider_failure)
-    }
-
-    fn unregister_target(
-        &self,
-        _operation: MvOperationContext,
-        _target: &ProductMvTarget,
-    ) -> Result<(), MvProviderFailure> {
-        Err(MvProviderFailure::new(
-            MvProviderFailureKind::InvalidRequest,
-            "MV CREATE adapter cannot unregister a target",
-        ))
     }
 }
 

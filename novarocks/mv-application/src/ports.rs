@@ -80,10 +80,10 @@ impl fmt::Display for MvProviderFailure {
 
 impl std::error::Error for MvProviderFailure {}
 
-/// Connector, query-runtime, and catalog behavior is injected one operation
-/// at a time.  The port deliberately does not expose a registry, a role
-/// aggregate, or a frontend-owned service.
-pub trait MvProviderPort: Send + Sync {
+/// Provider effects required by the product-owned CREATE transition. The port
+/// deliberately exposes neither a registry nor a different MV command, so a
+/// CREATE adapter cannot become a general provider host.
+pub trait MvCreateProviderPort: Send + Sync {
     fn create_target(
         &self,
         operation: MvOperationContext,
@@ -109,6 +109,17 @@ pub trait MvProviderPort: Send + Sync {
         target: &MvCreatedTarget,
     ) -> Result<(), MvProviderFailure>;
 
+    /// Compensate only the target created by this CREATE transition after
+    /// inspection proves that no durable product definition can be finalized.
+    fn cleanup_created_target(
+        &self,
+        operation: MvOperationContext,
+        target: &MvTarget,
+    ) -> Result<(), MvProviderFailure>;
+}
+
+/// Provider effect required by the product-owned DROP transition.
+pub trait MvDropProviderPort: Send + Sync {
     fn drop_target(
         &self,
         operation: MvOperationContext,
@@ -139,13 +150,17 @@ pub trait MvTopologyPort: Send + Sync {
     fn backend_count(&self) -> Result<usize, MvProviderFailure>;
 }
 
-pub trait MvCatalogRegistrationPort: Send + Sync {
+/// Catalog-registration effect required by CREATE after product projection.
+pub trait MvCreateCatalogRegistrationPort: Send + Sync {
     fn register_target(
         &self,
         operation: MvOperationContext,
         target: &MvCreatedTarget,
     ) -> Result<(), MvProviderFailure>;
+}
 
+/// Catalog-registration effect required by DROP after exact projection deletion.
+pub trait MvDropCatalogRegistrationPort: Send + Sync {
     fn unregister_target(
         &self,
         operation: MvOperationContext,

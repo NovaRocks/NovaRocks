@@ -23,7 +23,8 @@ use crate::activity::{
     MvActivityAdmissionError, MvActivityGate, MvActivityLease, MvActivityOwner, MvActivityTicket,
 };
 use crate::ports::{
-    MvCatalogRegistrationPort, MvDropProjectionPort, MvProviderFailure, MvProviderPort,
+    MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvDropCatalogRegistrationPort,
+    MvDropProjectionPort, MvDropProviderPort, MvProviderFailure,
 };
 use crate::process_runtime::{
     MvBackgroundRuntimeLifecycleError, MvBackgroundRuntimeOwner, MvBackgroundRuntimeStart,
@@ -52,8 +53,8 @@ impl MvProductService {
         &self,
         operation: MvOperationContext,
         create: MvCreateCommand,
-        provider: &dyn MvProviderPort,
-        catalog_registration: &dyn MvCatalogRegistrationPort,
+        provider: &dyn MvCreateProviderPort,
+        catalog_registration: &dyn MvCreateCatalogRegistrationPort,
     ) -> Result<MvProductResult, MvProductError> {
         let command = MvCommand::Create(create);
         let target = match &command {
@@ -94,8 +95,8 @@ impl MvProductService {
         target: MvTarget,
         if_exists: bool,
         projection: &dyn MvDropProjectionPort,
-        provider: &dyn MvProviderPort,
-        catalog_registration: &dyn MvCatalogRegistrationPort,
+        provider: &dyn MvDropProviderPort,
+        catalog_registration: &dyn MvDropCatalogRegistrationPort,
     ) -> Result<MvProductResult, MvProductError> {
         match projection
             .prepare_drop(operation, &target, if_exists)
@@ -165,12 +166,12 @@ impl MvProductService {
 
 fn cleanup_after_inspection_failure(
     operation: MvOperationContext,
-    provider: &dyn MvProviderPort,
+    provider: &dyn MvCreateProviderPort,
     target: MvTarget,
     primary: MvProviderFailure,
 ) -> MvProductError {
     let primary = primary.into_product_error();
-    match provider.drop_target(operation, &target) {
+    match provider.cleanup_created_target(operation, &target) {
         Ok(()) => primary,
         Err(cleanup) => MvProductError::new(
             primary.kind(),
@@ -202,8 +203,8 @@ mod tests {
         semantic::MvRefreshDesiredConfiguration,
     };
     use crate::ports::{
-        MvCatalogRegistrationPort, MvDropProjectionPort, MvProviderFailure, MvProviderFailureKind,
-        MvProviderPort,
+        MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvDropCatalogRegistrationPort,
+        MvDropProjectionPort, MvDropProviderPort, MvProviderFailure, MvProviderFailureKind,
     };
     use crate::product::{
         MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition,
@@ -237,7 +238,7 @@ mod tests {
         }
     }
 
-    impl MvProviderPort for CreateEffects {
+    impl MvCreateProviderPort for CreateEffects {
         fn create_target(
             &self,
             _operation: MvOperationContext,
@@ -298,6 +299,28 @@ mod tests {
             Ok(())
         }
 
+        fn cleanup_created_target(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvTarget,
+        ) -> Result<(), MvProviderFailure> {
+            self.record("drop");
+            Ok(())
+        }
+    }
+
+    impl MvCreateCatalogRegistrationPort for CreateEffects {
+        fn register_target(
+            &self,
+            _operation: MvOperationContext,
+            _target: &MvCreatedTarget,
+        ) -> Result<(), MvProviderFailure> {
+            self.record("register");
+            Ok(())
+        }
+    }
+
+    impl MvDropProviderPort for CreateEffects {
         fn drop_target(
             &self,
             _operation: MvOperationContext,
@@ -308,16 +331,7 @@ mod tests {
         }
     }
 
-    impl MvCatalogRegistrationPort for CreateEffects {
-        fn register_target(
-            &self,
-            _operation: MvOperationContext,
-            _target: &MvCreatedTarget,
-        ) -> Result<(), MvProviderFailure> {
-            self.record("register");
-            Ok(())
-        }
-
+    impl MvDropCatalogRegistrationPort for CreateEffects {
         fn unregister_target(
             &self,
             _operation: MvOperationContext,
