@@ -46,12 +46,12 @@ use novarocks_worker::typed_connector_runtime::{
     TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
 };
 
-use super::super::context::NativePlanDecodeContext;
 use super::super::node::DecodedNode;
 use super::common::{
     ConnectorVariantPathTransform, lower_scan_predicate, parse_scan_limit,
     validate_variant_path_read_slots,
 };
+use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
 use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
 
 /// Lower one `ScanSource.typed_connector_read` into an execution scan node.

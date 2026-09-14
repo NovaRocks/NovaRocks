@@ -20,9 +20,9 @@
 mod common;
 mod typed;
 
-use super::context::NativePlanDecodeContext;
 use super::node::DecodedNode;
 use novarocks_execution::exec::expr::ExprArena;
+use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_scan_output::decode_scan_output_columns;
 use novarocks_native_adapter::fragment_variant_path::parse_native_scan_variant_path_columns;

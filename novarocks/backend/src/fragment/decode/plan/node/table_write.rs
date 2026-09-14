@@ -71,12 +71,12 @@ const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 
 use super::DecodedNode;
 use super::aggregate::decode_resolved_aggregate_signature;
-use crate::fragment::decode::plan::context::NativePlanDecodeContext;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_native_adapter::connector_write_data_plane::{
     NativeConnectorWriteObservationPort, QueryScopedTableWriteAggregateGuard,
     RoleBoundCommitFragmentEncoder, RootCommitFragmentCarrierValidator,
 };
+use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;

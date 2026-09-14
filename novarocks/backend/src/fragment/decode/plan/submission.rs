@@ -35,9 +35,9 @@ use novarocks_native_adapter::fragment_validation::{
     validate_fragment_expressions, validate_node_required_fields,
 };
 
-use super::context::NativePlanDecodeContext;
 use super::node::decode_node_with_runtime_filters;
 use super::runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
+use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_instance::NativeFragmentInstanceInput;
 use novarocks_native_adapter::fragment_layout::decode_exchange_contracts;

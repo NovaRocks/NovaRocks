@@ -4029,6 +4029,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-failpoint",
+ "novarocks-functions",
  "novarocks-memory",
  "novarocks-native-trust",
  "novarocks-plan-codec",

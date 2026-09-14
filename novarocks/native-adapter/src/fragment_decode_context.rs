@@ -22,22 +22,22 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::fragment_instance::decode_scan_range_params;
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::runtime::exchange::ExchangeKey;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use novarocks_execution::runtime::fragment::ExchangeInputAssignment;
 use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentInstanceId};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_functions::EngineFunctionCatalog;
-#[cfg(test)]
-use novarocks_native_adapter::fragment_instance::decode_scan_range_params;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_spi::connector::ConnectorCancellation;
 use novarocks_types::QueryId;
 use novarocks_worker::TypedScanRuntime;
 
-use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
+use crate::fragment_error::NativeFragmentLeafDecodeError;
 
 /// All non-wire dependencies required while lowering one native fragment.
 ///
@@ -48,7 +48,7 @@ use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
     dead_code,
     reason = "Retained for target-specific native integration and regression coverage."
 )]
-pub(crate) struct NativePlanDecodeContext {
+pub struct NativePlanDecodeContext {
     exchange_inputs: ExchangeInputAssignments,
     raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
     captured_scan_ranges: RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
@@ -87,7 +87,7 @@ impl Default for NativePlanDecodeContext {
 )]
 impl NativePlanDecodeContext {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         exchange_inputs: ExchangeInputAssignments,
         raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
         query_options: QueryOptions,
@@ -110,43 +110,43 @@ impl NativePlanDecodeContext {
         }
     }
 
-    pub(crate) fn with_typed_scan_runtime(mut self, runtime: Option<TypedScanRuntime>) -> Self {
+    pub fn with_typed_scan_runtime(mut self, runtime: Option<TypedScanRuntime>) -> Self {
         self.typed_scan_runtime = runtime;
         self
     }
 
-    pub(crate) fn with_function_catalog(mut self, catalog: Arc<EngineFunctionCatalog>) -> Self {
+    pub fn with_function_catalog(mut self, catalog: Arc<EngineFunctionCatalog>) -> Self {
         self.function_catalog = Some(catalog);
         self
     }
 
-    pub(crate) fn function_catalog(&self) -> Option<&EngineFunctionCatalog> {
+    pub fn function_catalog(&self) -> Option<&EngineFunctionCatalog> {
         self.function_catalog.as_deref()
     }
 
-    pub(crate) fn typed_scan_runtime(&self) -> Option<&TypedScanRuntime> {
+    pub fn typed_scan_runtime(&self) -> Option<&TypedScanRuntime> {
         self.typed_scan_runtime.as_ref()
     }
 
-    pub(crate) fn capture_scan_ranges(&self, node_id: i32, ranges: BoundScanRanges) {
+    pub fn capture_scan_ranges(&self, node_id: i32, ranges: BoundScanRanges) {
         self.captured_scan_ranges
             .borrow_mut()
             .insert(FragmentNodeId::new(node_id), ranges);
     }
 
-    pub(crate) fn take_captured_scan_ranges(&self) -> BTreeMap<FragmentNodeId, BoundScanRanges> {
+    pub fn take_captured_scan_ranges(&self) -> BTreeMap<FragmentNodeId, BoundScanRanges> {
         std::mem::take(&mut self.captured_scan_ranges.borrow_mut())
     }
 
-    #[cfg(test)]
-    pub(crate) fn captured_ranges_for_test(&self, node_id: i32) -> Option<BoundScanRanges> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn captured_ranges_for_test(&self, node_id: i32) -> Option<BoundScanRanges> {
         self.captured_scan_ranges
             .borrow()
             .get(&FragmentNodeId::new(node_id))
             .cloned()
     }
 
-    pub(crate) fn scan_ranges(
+    pub fn scan_ranges(
         &self,
         node_id: i32,
     ) -> Result<&[ScanRangeParams], NativeFragmentLeafDecodeError> {
@@ -162,22 +162,22 @@ impl NativePlanDecodeContext {
             })
     }
 
-    pub(crate) fn query_options(&self) -> Option<&QueryOptions> {
+    pub fn query_options(&self) -> Option<&QueryOptions> {
         self.query_options.as_ref()
     }
-    pub(crate) fn query_id(&self) -> Option<QueryId> {
+    pub fn query_id(&self) -> Option<QueryId> {
         self.query_id
     }
 
-    pub(crate) fn exchange_wait(&self) -> Duration {
+    pub fn exchange_wait(&self) -> Duration {
         self.exchange_wait
     }
 
-    pub(crate) fn fragment_instance_id(&self) -> FragmentInstanceId {
+    pub fn fragment_instance_id(&self) -> FragmentInstanceId {
         self.fragment_instance_id
     }
 
-    pub(crate) fn connector_cancellation(
+    pub fn connector_cancellation(
         &self,
     ) -> Result<Arc<dyn ConnectorCancellation>, NativeFragmentLeafDecodeError> {
         self.connector_cancellation.clone().ok_or_else(|| {
@@ -189,7 +189,7 @@ impl NativePlanDecodeContext {
         })
     }
 
-    pub(crate) fn exchange_input(
+    pub fn exchange_input(
         &self,
         node_id: i32,
     ) -> Result<(ExchangeKey, usize), NativeFragmentLeafDecodeError> {
@@ -214,8 +214,8 @@ impl NativePlanDecodeContext {
         ))
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_exchange_sender_count(mut self, key: ExchangeKey, count: usize) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_exchange_sender_count(mut self, key: ExchangeKey, count: usize) -> Self {
         let count = std::num::NonZeroUsize::new(count).expect("test sender count must be positive");
         self.fragment_instance_id = FragmentInstanceId::new(novarocks_types::UniqueId::new(
             key.finst_id_hi,
@@ -228,8 +228,8 @@ impl NativePlanDecodeContext {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_connector_cancellation(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_connector_cancellation(
         mut self,
         cancellation: Arc<dyn ConnectorCancellation>,
     ) -> Self {
@@ -237,26 +237,26 @@ impl NativePlanDecodeContext {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_query_id(mut self, query_id: QueryId) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_query_id(mut self, query_id: QueryId) -> Self {
         self.query_id = Some(query_id);
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_fragment_instance_id(mut self, id: novarocks_types::UniqueId) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_fragment_instance_id(mut self, id: novarocks_types::UniqueId) -> Self {
         self.fragment_instance_id = FragmentInstanceId::new(id);
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_query_options(mut self, query_options: Option<QueryOptions>) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_query_options(mut self, query_options: Option<QueryOptions>) -> Self {
         self.query_options = query_options;
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_scan_ranges(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_scan_ranges(
         mut self,
         node_id: i32,
         ranges: Vec<novarocks_proto_models::novarocks::ScanRangeParams>,

@@ -4,7 +4,6 @@
 //! wire traversal. It builds protocol-neutral execution-domain values and
 //! never installs lifecycle or runtime state.
 
-pub(crate) mod context;
 pub(crate) mod node;
 pub(crate) mod runtime_filter_binding;
 pub(crate) mod scan;
