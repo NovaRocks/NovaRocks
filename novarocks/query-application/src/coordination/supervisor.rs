@@ -340,16 +340,16 @@ impl QueryExecutionDriver for BoundedQueryExecutionDriver {
             Ok(()) => Box::pin(async move {
                 tokio::select! {
                     biased;
-                    _ = cancellation.cancelled() => Err(QueryExecutionError::new(
-                        QueryExecutionErrorKind::Cancelled,
-                        "logical execution start was cancelled before its start verdict",
-                    )),
                     result = response => result.unwrap_or_else(|_| {
                         Err(QueryExecutionError::new(
                             QueryExecutionErrorKind::Failed,
                             "logical execution supervisor closed without a start verdict",
                         ))
                     }),
+                    _ = cancellation.cancelled() => Err(QueryExecutionError::new(
+                        QueryExecutionErrorKind::Cancelled,
+                        "logical execution start was cancelled before its start verdict",
+                    )),
                 }
             }),
             Err(mpsc::error::TrySendError::Full(command)) => rejected_start(
@@ -755,12 +755,15 @@ async fn run_logical_execution(
         }
         Ok(Err(failure)) => {
             let error = failure.into_failure().error().clone();
+            // Initialization failure may cancel the root while the actor starts
+            // converging. Publish the native verdict first so that derived
+            // cancellation cannot replace the direct start failure.
+            let _ = reply.send(Err(error));
             let actor_result = actor
                 .initialization_failed(initial)
                 .await
                 .map(|_| ())
                 .map_err(actor_error);
-            let _ = reply.send(Err(error));
             converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
             drop(dormant);
             let retire_result = retire_logical(&registry, registration).await;
@@ -768,12 +771,14 @@ async fn run_logical_execution(
         }
         Err(()) => {
             let error = native_future_panicked("Native attempt activation panicked");
+            // As above, the direct activation verdict precedes any derived
+            // cancellation emitted while the installed actor converges.
+            let _ = reply.send(Err(error.clone()));
             let actor_result = actor
                 .initialization_failed(initial)
                 .await
                 .map(|_| ())
                 .map_err(actor_error);
-            let _ = reply.send(Err(error.clone()));
             converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
             drop(dormant);
             let retire_result = retire_logical(&registry, registration).await;
