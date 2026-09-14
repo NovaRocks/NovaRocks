@@ -285,31 +285,32 @@ pub fn alter_mv_with_ports(
         db,
         &stmt.name_parts,
     )?;
-    let (refresh_policy, refresh_paused, refresh_interval_ms) = match &stmt.action {
+    let current_refresh =
+        novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration::new(
+            definition.refresh_policy.clone(),
+            definition.refresh_paused,
+            definition.refresh_interval_ms,
+            definition.max_staleness_ms,
+        )
+        .map_err(|error| format!("stored Iceberg MV refresh configuration is invalid: {error}"))?;
+    let refresh = match &stmt.action {
         MvAlterAction::SetRefresh(policy) => {
             let (policy, interval_ms) = stored_refresh_policy(policy);
-            (policy, definition.refresh_paused, interval_ms)
+            current_refresh.with_policy(policy, interval_ms)
         }
-        MvAlterAction::PauseRefresh => (
-            definition.refresh_policy.clone(),
-            true,
-            definition.refresh_interval_ms,
-        ),
-        MvAlterAction::ResumeRefresh => (
-            definition.refresh_policy.clone(),
-            false,
-            definition.refresh_interval_ms,
-        ),
+        MvAlterAction::PauseRefresh => current_refresh.with_paused(true),
+        MvAlterAction::ResumeRefresh => current_refresh.with_paused(false),
         MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
             unreachable!("repartition and properties returned before metadata update")
         }
-    };
+    }
+    .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))?;
     crate::mv::domain::iceberg_refresh::sync_iceberg_mv_descriptor_with_ports(
         ports,
         &definition,
-        &refresh_policy,
-        refresh_paused,
-        refresh_interval_ms,
+        &refresh.policy,
+        refresh.paused,
+        refresh.interval_ms,
         None,
         connector_context,
     )

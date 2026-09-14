@@ -79,6 +79,27 @@ impl MvRefreshDesiredConfiguration {
         }
         Ok(())
     }
+
+    /// Apply a SQL-lowered refresh-policy replacement while retaining the
+    /// product-owned pause and staleness facts.
+    pub fn with_policy(
+        &self,
+        policy: MvDesiredRefreshPolicy,
+        interval_ms: Option<i64>,
+    ) -> Result<Self, String> {
+        Self::new(policy, self.paused, interval_ms, self.max_staleness_ms)
+    }
+
+    /// Apply the product-owned pause transition without letting an adapter
+    /// rebuild or default any other durable refresh fact.
+    pub fn with_paused(&self, paused: bool) -> Result<Self, String> {
+        Self::new(
+            self.policy.clone(),
+            paused,
+            self.interval_ms,
+            self.max_staleness_ms,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,6 +277,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("max_staleness_ms must be positive"));
+    }
+
+    #[test]
+    fn refresh_transitions_preserve_unmodified_durable_facts() {
+        let current = MvRefreshDesiredConfiguration::new(
+            MvDesiredRefreshPolicy::AsyncOnChange,
+            false,
+            None,
+            Some(60_000),
+        )
+        .expect("valid current configuration");
+        let paused = current.with_paused(true).expect("pause transition");
+        assert!(paused.paused);
+        assert_eq!(paused.policy, MvDesiredRefreshPolicy::AsyncOnChange);
+        assert_eq!(paused.max_staleness_ms, Some(60_000));
+
+        let interval = paused
+            .with_policy(MvDesiredRefreshPolicy::AsyncInterval, Some(5_000))
+            .expect("policy transition");
+        assert!(interval.paused);
+        assert_eq!(interval.interval_ms, Some(5_000));
+        assert_eq!(interval.max_staleness_ms, Some(60_000));
     }
 
     #[test]
