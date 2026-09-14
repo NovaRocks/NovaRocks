@@ -28,6 +28,9 @@ bytes.workspace = true
 hyper.workspace = true
 hyper-util = { workspace = true, features = ["tokio"] }
 prost.workspace = true
+once_cell.workspace = true
+prometheus.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync"] }
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport"] }

@@ -183,7 +183,9 @@ impl FragmentResultSession for NativeFragmentResultSession {
             .finish()
             .map(|publication| {
                 if publishes_terminal(publication) {
-                    crate::metrics::record_fragment_result_terminal("finished");
+                    novarocks_native_adapter::backend_metrics::record_fragment_result_terminal(
+                        "finished",
+                    );
                 }
             })
             .map_err(|error| {
@@ -197,7 +199,7 @@ impl FragmentResultSession for NativeFragmentResultSession {
 
     fn abort(&self, reason: ResultAbort) {
         if publishes_terminal(self.handle.abort(reason)) {
-            crate::metrics::record_fragment_result_terminal("aborted");
+            novarocks_native_adapter::backend_metrics::record_fragment_result_terminal("aborted");
         }
     }
 }

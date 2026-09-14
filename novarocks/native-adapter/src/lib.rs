@@ -19,6 +19,7 @@
 
 pub mod backend_announce;
 pub mod backend_heartbeat;
+pub mod backend_metrics;
 pub mod backend_readiness;
 pub mod catalog_prune_rpc;
 pub mod connector_blocking_io;

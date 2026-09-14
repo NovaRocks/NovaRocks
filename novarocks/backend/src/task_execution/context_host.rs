@@ -477,11 +477,11 @@ impl NativeQueryContextHost {
     /// the manager holds the numbers and nothing else observes them.
     fn publish_catalog_lease_metrics(&self) {
         let snapshot = self.catalog_manager.lease_snapshot();
-        crate::metrics::publish_backend_query_execution_resource(
+        novarocks_native_adapter::backend_metrics::publish_backend_query_execution_resource(
             "catalog_query_leases",
             snapshot.query_leases,
         );
-        crate::metrics::publish_backend_query_execution_resource(
+        novarocks_native_adapter::backend_metrics::publish_backend_query_execution_resource(
             "catalog_handle_leases",
             snapshot.handle_leases,
         );

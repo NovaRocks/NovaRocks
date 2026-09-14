@@ -188,7 +188,9 @@ impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValida
             .accepted_entries
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        crate::metrics::publish_connector_write_root_prepared_set_peak(bytes, entries);
+        novarocks_native_adapter::backend_metrics::publish_connector_write_root_prepared_set_peak(
+            bytes, entries,
+        );
         tracing::debug!(
             target: WRITE_EVENT_TARGET,
             role = "be",
@@ -328,7 +330,9 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
             .to_string();
         match self.inner.open_writer(request).await {
             Ok(writer) => {
-                crate::metrics::record_connector_write_writer_open("opened");
+                novarocks_native_adapter::backend_metrics::record_connector_write_writer_open(
+                    "opened",
+                );
                 tracing::info!(
                     target: WRITE_EVENT_TARGET,
                     role = "be",
@@ -353,7 +357,9 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
                 }))
             }
             Err(error) => {
-                crate::metrics::record_connector_write_writer_open("failed");
+                novarocks_native_adapter::backend_metrics::record_connector_write_writer_open(
+                    "failed",
+                );
                 tracing::warn!(
                     target: WRITE_EVENT_TARGET,
                     role = "be",
@@ -399,7 +405,9 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
         match self.inner.finish().await {
             Ok(fragments) => {
                 let produced = fragments.len() as u64;
-                crate::metrics::record_connector_write_writer_finished(self.rows, produced);
+                novarocks_native_adapter::backend_metrics::record_connector_write_writer_finished(
+                    self.rows, produced,
+                );
                 tracing::info!(
                     target: WRITE_EVENT_TARGET,
                     role = "be",
@@ -443,7 +451,7 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
         } else {
             "failed"
         };
-        crate::metrics::record_connector_write_writer_abort(outcome);
+        novarocks_native_adapter::backend_metrics::record_connector_write_writer_abort(outcome);
         tracing::info!(
             target: WRITE_EVENT_TARGET,
             role = "be",
@@ -478,7 +486,7 @@ async fn writer_append_holdpoint(
     ) else {
         return;
     };
-    crate::metrics::record_connector_write_debug_fault("append_hold");
+    novarocks_native_adapter::backend_metrics::record_connector_write_debug_fault("append_hold");
     tracing::info!(
         target: WRITE_EVENT_TARGET,
         role = "be",

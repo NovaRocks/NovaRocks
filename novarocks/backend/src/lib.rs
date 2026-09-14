@@ -2,7 +2,6 @@
 pub mod application;
 pub(crate) mod connector;
 mod fragment;
-mod metrics;
 pub(crate) mod rpc;
 mod runtime;
 pub(crate) mod runtime_filter;

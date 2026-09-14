@@ -17,19 +17,19 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use novarocks_native_adapter::management_http::RoleMetricsRenderer;
+use crate::management_http::RoleMetricsRenderer;
 use once_cell::sync::Lazy;
 use prometheus::{Encoder, IntCounter, IntGaugeVec, Opts, Registry, TextEncoder};
 
 /// Explicitly-owned Backend metric registry.  It is intentionally separate
 /// from Prometheus' process-global registry so an all-in-one process cannot
 /// leak a foreign role's metric families through the BE management endpoint.
-pub(crate) struct BackendMetricsRegistry {
+pub struct BackendMetricsRegistry {
     registry: Registry,
 }
 
 impl BackendMetricsRegistry {
-    pub(crate) fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, String> {
         let registry = Registry::new();
         let collectors = [
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone())
@@ -202,19 +202,19 @@ static BACKEND_NATIVE_TLS_FAILURE_LOG_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
 /// One driver attempted to open its own connector writer. `outcome` is a
 /// closed vocabulary: `opened` or `failed`.
-pub(crate) fn record_connector_write_writer_open(outcome: &'static str) {
+pub fn record_connector_write_writer_open(outcome: &'static str) {
     BACKEND_CONNECTOR_WRITE_WRITER_OPENS
         .with_label_values(&[outcome])
         .inc();
 }
 
-pub(crate) fn record_task_execution_task_created() {
+pub fn record_task_execution_task_created() {
     BACKEND_TASK_EXECUTION_TASKS_CREATED.inc();
 }
 
 /// One connector writer finished: it accepted `rows` rows and produced
 /// `fragments` commit fragments.
-pub(crate) fn record_connector_write_writer_finished(rows: u64, fragments: u64) {
+pub fn record_connector_write_writer_finished(rows: u64, fragments: u64) {
     BACKEND_CONNECTOR_WRITE_WRITER_TOTALS
         .with_label_values(&["rows"])
         .inc_by(rows);
@@ -223,20 +223,20 @@ pub(crate) fn record_connector_write_writer_finished(rows: u64, fragments: u64) 
         .inc_by(fragments);
 }
 
-pub(crate) fn record_connector_write_writer_abort(outcome: &'static str) {
+pub fn record_connector_write_writer_abort(outcome: &'static str) {
     BACKEND_CONNECTOR_WRITE_WRITER_ABORTS
         .with_label_values(&[outcome])
         .inc();
 }
 
 #[cfg(debug_assertions)]
-pub(crate) fn record_connector_write_debug_fault(kind: &'static str) {
+pub fn record_connector_write_debug_fault(kind: &'static str) {
     BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS
         .with_label_values(&[kind])
         .inc();
 }
 
-pub(crate) fn record_fragment_result_terminal(terminal: &'static str) {
+pub fn record_fragment_result_terminal(terminal: &'static str) {
     BACKEND_FRAGMENT_RESULT_TERMINALS
         .with_label_values(&[terminal])
         .inc();
@@ -245,7 +245,7 @@ pub(crate) fn record_fragment_result_terminal(terminal: &'static str) {
 /// Publish the prepared write set a root aggregation has accepted so far. The
 /// gauge keeps the process-wide high-water mark, so a later, smaller write
 /// never erases the peak an operator needs in order to size the budgets.
-pub(crate) fn publish_connector_write_root_prepared_set_peak(bytes: u64, entries: u64) {
+pub fn publish_connector_write_root_prepared_set_peak(bytes: u64, entries: u64) {
     for (dimension, value, peak) in [
         ("bytes", bytes, &BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK_BYTES),
         (
@@ -270,7 +270,7 @@ fn publish_monotonic_peak(peak: &AtomicU64, gauge: &prometheus::IntGauge, value:
     }
 }
 
-pub(crate) fn record_backend_native_authentication_failure() {
+pub fn record_backend_native_authentication_failure() {
     BACKEND_NATIVE_AUTHENTICATION_FAILURES
         .with_label_values(&["authentication"])
         .inc();
@@ -286,7 +286,7 @@ pub(crate) fn record_backend_native_authentication_failure() {
     }
 }
 
-pub(crate) fn record_backend_native_tls_handshake_failure() {
+pub fn record_backend_native_tls_handshake_failure() {
     BACKEND_NATIVE_TLS_FAILURES
         .with_label_values(&["handshake", "transport_configuration"])
         .inc();

@@ -17,7 +17,6 @@ use novarocks_worker::{
 };
 
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
-use crate::metrics::BackendMetricsRegistry;
 use crate::rpc::server::BackendRpcService;
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
 use crate::task_execution::{RegistryTaskExecutionIngress, backend_task_execution_ports};
@@ -35,6 +34,7 @@ use novarocks_execution_contract::task_execution::operation::{
 };
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
+use novarocks_native_adapter::backend_metrics::BackendMetricsRegistry;
 use novarocks_native_adapter::management_http::MetricsHttpServer;
 use novarocks_native_adapter::{
     BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
@@ -655,8 +655,8 @@ impl BackendApplicationHost {
             native_transport.incoming_adapter(),
             "backend",
             "native-backend-grpc",
-            crate::metrics::record_backend_native_authentication_failure,
-            crate::metrics::record_backend_native_tls_handshake_failure,
+            novarocks_native_adapter::backend_metrics::record_backend_native_authentication_failure,
+            novarocks_native_adapter::backend_metrics::record_backend_native_tls_handshake_failure,
         ) {
             Ok(server) => server,
             Err(error) => {

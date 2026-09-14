@@ -49,7 +49,7 @@ impl TaskResultLifecycle for BackendTaskExecutionPorts {
 
 impl TaskExecutionMetrics for BackendTaskExecutionPorts {
     fn record_task_created(&self) {
-        crate::metrics::record_task_execution_task_created();
+        novarocks_native_adapter::backend_metrics::record_task_execution_task_created();
     }
 }
 
