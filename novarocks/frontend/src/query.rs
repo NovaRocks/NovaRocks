@@ -155,6 +155,125 @@ impl TypedCommandRoute {
 }
 
 impl CoreCommandRoute for TypedCommandRoute {
+    fn execute_product(
+        &self,
+        command: &ProductSqlCommand,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<StatementResult, String> {
+        command_context
+            .scope()
+            .check()
+            .map_err(|error| format!("semantic command scope is no longer active: {error}"))?;
+        match command {
+            ProductSqlCommand::Statistics(command) => self.statistics.execute_command(
+                command,
+                context.session().current_catalog(),
+                context.session().current_database(),
+                Some(context.execution()),
+            ),
+            ProductSqlCommand::Catalog(
+                novarocks_sql::semantic::CatalogSqlCommand::DropDatabase { name, .. },
+            ) if context.session().current_catalog().is_none() && name.parts.len() == 1 => {
+                self.view.drop_database(DEFAULT_CATALOG, &name.parts[0])?;
+                Ok(StatementResult::Ok)
+            }
+            ProductSqlCommand::Catalog(
+                novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command),
+            ) => self.catalog.execute_table_command(
+                command,
+                context.session().current_catalog(),
+                context.session().current_database(),
+                command_context.connector_context(),
+            ),
+            ProductSqlCommand::Catalog(
+                novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command),
+            ) if matches!(
+                &command.action,
+                novarocks_sql::semantic::command::IcebergTableSqlAction::Reference(_)
+            ) =>
+            {
+                self.iceberg_ref.execute_command(
+                    command,
+                    context.session().current_database(),
+                    command_context.connector_context(),
+                )
+            }
+            ProductSqlCommand::Catalog(
+                novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command),
+            ) => self.catalog.execute_iceberg_command(
+                command,
+                context.session().current_catalog(),
+                context.session().current_database(),
+                command_context.connector_context(),
+            ),
+            ProductSqlCommand::Catalog(command) => self.catalog.execute_command(
+                command,
+                context.session().current_catalog(),
+                context.session().current_database(),
+                command_context.connector_context(),
+            ),
+            ProductSqlCommand::Maintenance(
+                novarocks_sql::semantic::MaintenanceSqlCommand::ShowOptimize(command),
+            ) => self.maintenance_read.execute_command(
+                command,
+                context.session().current_catalog(),
+                context.session().current_database(),
+            ),
+            ProductSqlCommand::Maintenance(command) => self.maintenance.execute_command(
+                command,
+                context.session().current_catalog(),
+                context.session().current_database(),
+                context.execution(),
+                command_context.connector_context(),
+            ),
+        }
+    }
+
+    fn execute_special(
+        &self,
+        statement: &ParsedStatement,
+        context: &RequestContext,
+        command_context: &CommandContext,
+    ) -> Result<Option<StatementResult>, String> {
+        command_context
+            .scope()
+            .check()
+            .map_err(|error| format!("special command scope is no longer active: {error}"))?;
+        match statement {
+            ParsedStatement::ShowBackends(_) => self
+                .backend
+                .show_backends(context.execution().role())
+                .map(StatementResult::Query)
+                .map(Some),
+            ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
+                statement,
+            )) => self.mv_call.try_execute_typed_call(
+                statement,
+                context.session().current_database(),
+                command_context.connector_context(),
+            ),
+            ParsedStatement::MaterializedView(statement) => self
+                .mv
+                .execute(
+                    &MaterializedViewCommand::new(statement.clone()),
+                    context,
+                    command_context,
+                )
+                .map(Some),
+            ParsedStatement::View(statement) => self
+                .view
+                .execute(
+                    statement,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    command_context.connector_context(),
+                )
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
     fn execute_typed(
         &self,
         statement: &ParsedStatement,
@@ -1319,8 +1438,16 @@ impl FrontendQuerySession {
                     validate_table_statement_admission(table_statement, &sql)
                         .map_err(RoutedExecutionError::User)
                         .and_then(|()| {
+                            let command = lower_product_sql_command(&statement)
+                                .map_err(RoutedExecutionError::Engine)?
+                                .ok_or_else(|| {
+                                    RoutedExecutionError::Engine(
+                                        "table parser admission did not produce a product command"
+                                            .to_string(),
+                                    )
+                                })?;
                             command_executor
-                                .execute_typed(&statement, &context, &command_context)
+                                .execute_product(&command, &context, &command_context)
                                 .map_err(RoutedExecutionError::Engine)
                         })
                 } else if let ParsedStatement::Catalog(
@@ -1357,14 +1484,41 @@ impl FrontendQuerySession {
                                     .map(StatementResult::Query)
                                     .map_err(RoutedExecutionError::Engine)
                             }),
-                        Err(_) => command_executor
-                            .execute_typed(&statement, &context, &command_context)
-                            .map_err(RoutedExecutionError::Engine),
+                        Err(_) => (|| -> Result<StatementResult, RoutedExecutionError> {
+                            let command = lower_product_sql_command(&statement)
+                                .map_err(RoutedExecutionError::Engine)?
+                                .ok_or_else(|| {
+                                    RoutedExecutionError::Engine(
+                                        "Iceberg parser admission did not produce a product command"
+                                            .to_string(),
+                                    )
+                                })?;
+                            command_executor
+                                .execute_product(&command, &context, &command_context)
+                                .map_err(RoutedExecutionError::Engine)
+                        })(),
                     }
                 } else {
-                    command_executor
-                        .execute_typed(&statement, &context, &command_context)
-                        .map_err(RoutedExecutionError::Engine)
+                    (|| -> Result<StatementResult, RoutedExecutionError> {
+                        if let Some(result) = command_executor
+                            .execute_special(&statement, &context, &command_context)
+                            .map_err(RoutedExecutionError::Engine)?
+                        {
+                            Ok(result)
+                        } else {
+                            let command = lower_product_sql_command(&statement)
+                                .map_err(RoutedExecutionError::Engine)?
+                                .ok_or_else(|| {
+                                    RoutedExecutionError::Engine(
+                                    "typed statement has no declared product or specialized owner"
+                                        .to_string(),
+                                )
+                                })?;
+                            command_executor
+                                .execute_product(&command, &context, &command_context)
+                                .map_err(RoutedExecutionError::Engine)
+                        }
+                    })()
                 }
             };
             (result, execution_owner)

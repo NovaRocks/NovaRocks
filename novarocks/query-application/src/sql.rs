@@ -66,6 +66,28 @@ pub mod user_variable;
 /// statement. Implementations remain role-local adapters: the port transfers
 /// only immutable admitted context and the governed command context.
 pub trait CoreCommandRoute: Send + Sync {
+    /// Executes a closed product command after Query Application has performed
+    /// the one parser-AST-to-semantic lowering step.
+    fn execute_product(
+        &self,
+        _command: &ProductSqlCommand,
+        _context: &RequestContext,
+        _command_context: &CommandContext,
+    ) -> Result<QuerySessionOutput, String> {
+        Err("semantic product command route is unavailable".to_string())
+    }
+
+    /// Executes a deliberately specialized parser-owned family such as MV.
+    /// Product commands must not use this fallback.
+    fn execute_special(
+        &self,
+        _statement: &Statement,
+        _context: &RequestContext,
+        _command_context: &CommandContext,
+    ) -> Result<Option<QuerySessionOutput>, String> {
+        Ok(None)
+    }
+
     fn execute_typed(
         &self,
         _statement: &Statement,
