@@ -870,11 +870,10 @@ impl QueryInitOptions {
         let mut backend_indices = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
         for target in &live_backends {
-            target.process_id().map_err(protocol_contract_error)?;
-            let backend_compatibility_id = target
-                .descriptor()
-                .native_compatibility_id()
-                .map_err(protocol_contract_error)?;
+            target
+                .process_id()
+                .map_err(|error| contract_error(error.to_string()))?;
+            let backend_compatibility_id = target.descriptor().native_compatibility_id();
             if backend_compatibility_id != native_compatibility_id {
                 return Err(contract_error(format!(
                     "query initialization live snapshot contains backend {} from another compatibility island",
@@ -887,7 +886,9 @@ impl QueryInitOptions {
                     target.backend_idx()
                 )));
             }
-            let endpoint = target.endpoint().map_err(protocol_contract_error)?;
+            let endpoint = target
+                .endpoint()
+                .map_err(|error| contract_error(error.to_string()))?;
             if !endpoints.insert(endpoint.clone()) {
                 return Err(contract_error(format!(
                     "query initialization live snapshot repeats endpoint {}",
@@ -1012,9 +1013,9 @@ mod tests {
     use super::{AttemptCredentialLeaseCollector, QueryCatalogLease, QueryInitOptions};
     use crate::common::backend_topology::LiveBackendTarget;
     use crate::query_execution::contract::ResolvedQueryOptions;
+    use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId, QueryOptions};
-    use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_proto_models::novarocks;
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
@@ -1255,10 +1256,9 @@ mod tests {
         let resolved = ResolvedQueryOptions::from_upstream(None);
         let other_island = LiveBackendTarget::new(
             0,
-            BackendProcessDescriptor::new(
+            BackendProcessDescriptor::try_new(
                 BackendProcessId::new_v7(),
-                novarocks_proto_codec::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19040)
-                    .expect("valid endpoint"),
+                RuntimeEndpoint::new("127.0.0.1", 19040).expect("valid endpoint"),
                 "test-deployment",
                 "different-build",
                 novarocks_types::NativeCompatibilityId::new([0x72; 32]),

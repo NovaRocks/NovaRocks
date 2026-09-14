@@ -873,14 +873,7 @@ fn validate_backend_snapshot(
                 "attempt manifest frozen endpoint snapshot has invalid endpoint: {error}"
             ))
         })?;
-        let native_compatibility_id = target
-            .descriptor()
-            .native_compatibility_id()
-            .map_err(|error| {
-                contract_error(format!(
-                    "attempt manifest frozen endpoint snapshot has invalid compatibility identity: {error}"
-                ))
-            })?;
+        let native_compatibility_id = target.descriptor().native_compatibility_id();
         let backend = BoundManifestBackend {
             target: target.clone(),
             backend_idx: target.backend_idx(),
@@ -1252,9 +1245,8 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroUsize};
 
     use novarocks_execution::task_execution::AdmissionEpochCapability;
+    use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_execution_contract::{ExchangeEdgeId, QueryContextRef, TaskIdentity};
-    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-    use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_sql::planning::query_execution::{SealedPreparationPlan, SealedScanIdentity};
     use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
     use novarocks_types::identity::{
@@ -1389,9 +1381,9 @@ mod tests {
         port: u16,
         epoch: u8,
     ) -> LiveBackendTarget {
-        let descriptor = BackendProcessDescriptor::new(
+        let descriptor = BackendProcessDescriptor::try_new(
             process,
-            QueryControlEndpoint::new("127.0.0.1", port).expect("valid endpoint"),
+            RuntimeEndpoint::new("127.0.0.1", i32::from(port)).expect("valid endpoint"),
             "test-deployment",
             "test-build",
             NativeCompatibilityId::new([0x71; 32]),

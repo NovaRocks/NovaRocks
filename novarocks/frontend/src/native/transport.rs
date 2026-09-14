@@ -330,7 +330,10 @@ pub(crate) fn heartbeat(
                         .field("admission_epoch_capability"),
                 )
                 .map_err(|error| error.to_string())?;
-                Ok((descriptor, reported_state, capability))
+                descriptor
+                    .to_contract()
+                    .map(|descriptor| (descriptor, reported_state, capability))
+                    .map_err(|error| error.to_string())
             }) {
             Ok((descriptor, reported_state, admission_epoch_capability)) => HeartbeatOutcome::Ok {
                 descriptor,

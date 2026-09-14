@@ -6,13 +6,14 @@
 
 use crate::lifecycle::QueryControlEndpoint;
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_execution_contract::{
+    BackendProcessDescriptor as ContractBackendProcessDescriptor, RuntimeEndpoint,
+};
 use novarocks_proto_models::novarocks;
 use novarocks_types::{
     BackendProcessId as DomainBackendProcessId, BackendProcessIdentityError, NativeCompatibilityId,
 };
 
-const MAX_DEPLOYMENT_ID_BYTES: usize = 256;
-const MAX_BUILD_IDENTITY_BYTES: usize = 256;
 const MAX_SAFE_DETAIL_BYTES: usize = 512;
 
 /// Validated generated backend process identity.
@@ -44,8 +45,8 @@ impl BackendProcessId {
     }
 }
 
-/// The generated enum is the sole advertised backend state representation.
-pub use novarocks::BackendReportedState;
+/// Transport-neutral backend state validated from a generated representation.
+pub use novarocks_execution_contract::BackendReportedState;
 
 /// Validated generated backend process descriptor.
 #[derive(Clone, Debug, PartialEq)]
@@ -61,19 +62,31 @@ impl BackendProcessDescriptor {
         build_identity: impl Into<String>,
         native_compatibility_id: NativeCompatibilityId,
     ) -> Result<Self, ProtocolError> {
-        Self::parse(novarocks::BackendProcessDescriptor {
-            process_id: Some(BackendProcessId::from_domain(process_id).raw),
-            endpoint: Some(endpoint.as_proto().clone()),
-            deployment_id: deployment_id.into(),
-            build_identity: build_identity.into(),
-            native_compatibility_id: Some(novarocks::NativeCompatibilityId {
-                value: native_compatibility_id.as_bytes().to_vec(),
-            }),
+        let endpoint =
+            RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port())).map_err(|error| {
+                invalid(
+                    FieldPath::root("backend_process_descriptor").field("endpoint"),
+                    format!("backend process endpoint is invalid: {error}"),
+                )
+            })?;
+        ContractBackendProcessDescriptor::try_new(
+            process_id,
+            endpoint,
+            deployment_id,
+            build_identity,
+            native_compatibility_id,
+        )
+        .map(Self::from_contract)
+        .map_err(|error| {
+            invalid(
+                FieldPath::root("backend_process_descriptor"),
+                error.to_string(),
+            )
         })
     }
 
     pub fn parse(raw: novarocks::BackendProcessDescriptor) -> Result<Self, ProtocolError> {
-        required_process_id(
+        let process_id = required_process_id(
             &raw.process_id,
             FieldPath::root("backend_process_descriptor").field("process_id"),
         )?;
@@ -83,29 +96,81 @@ impl BackendProcessDescriptor {
                 "backend process endpoint is required",
             )
         })?;
-        QueryControlEndpoint::parse(endpoint).map_err(|error| {
+        let endpoint = QueryControlEndpoint::parse(endpoint).map_err(|error| {
             prefix_path(
                 FieldPath::root("backend_process_descriptor").field("endpoint"),
                 error,
             )
         })?;
-        bounded_text(
-            &raw.deployment_id,
-            MAX_DEPLOYMENT_ID_BYTES,
-            FieldPath::root("backend_process_descriptor").field("deployment_id"),
-            "deployment id",
-        )?;
-        bounded_text(
-            &raw.build_identity,
-            MAX_BUILD_IDENTITY_BYTES,
-            FieldPath::root("backend_process_descriptor").field("build_identity"),
-            "build identity",
-        )?;
-        required_native_compatibility_id(
+        let native_compatibility_id = required_native_compatibility_id(
             &raw.native_compatibility_id,
             FieldPath::root("backend_process_descriptor").field("native_compatibility_id"),
         )?;
-        Ok(Self { raw })
+        let endpoint =
+            RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port())).map_err(|error| {
+                invalid(
+                    FieldPath::root("backend_process_descriptor").field("endpoint"),
+                    format!("backend process endpoint is invalid: {error}"),
+                )
+            })?;
+        ContractBackendProcessDescriptor::try_new(
+            process_id,
+            endpoint,
+            raw.deployment_id,
+            raw.build_identity,
+            native_compatibility_id,
+        )
+        .map(Self::from_contract)
+        .map_err(|error| {
+            invalid(
+                FieldPath::root("backend_process_descriptor"),
+                error.to_string(),
+            )
+        })
+    }
+
+    pub fn from_contract(descriptor: ContractBackendProcessDescriptor) -> Self {
+        Self {
+            raw: novarocks::BackendProcessDescriptor {
+                process_id: Some(BackendProcessId::from_domain(descriptor.process_id()).raw),
+                endpoint: Some(
+                    QueryControlEndpoint::new(
+                        descriptor.endpoint().host(),
+                        descriptor.endpoint().port() as u16,
+                    )
+                    .expect("contract endpoint retains a valid u16 port")
+                    .as_proto()
+                    .clone(),
+                ),
+                deployment_id: descriptor.deployment_id().to_string(),
+                build_identity: descriptor.build_identity().to_string(),
+                native_compatibility_id: Some(novarocks::NativeCompatibilityId {
+                    value: descriptor.native_compatibility_id().as_bytes().to_vec(),
+                }),
+            },
+        }
+    }
+
+    pub fn to_contract(&self) -> Result<ContractBackendProcessDescriptor, ProtocolError> {
+        Self::parse(self.raw.clone()).map(|descriptor| {
+            let process_id = descriptor
+                .process_id()
+                .expect("validated backend process descriptor retains its process id");
+            let endpoint = descriptor
+                .endpoint()
+                .expect("validated backend process descriptor retains its endpoint");
+            ContractBackendProcessDescriptor::try_new(
+                process_id,
+                RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
+                    .expect("validated backend process descriptor retains a runtime endpoint"),
+                descriptor.deployment_id(),
+                descriptor.build_identity(),
+                descriptor
+                    .native_compatibility_id()
+                    .expect("validated backend process descriptor retains compatibility"),
+            )
+            .expect("validated backend process descriptor retains contract invariants")
+        })
     }
 
     pub const fn as_proto(&self) -> &novarocks::BackendProcessDescriptor {
@@ -158,7 +223,7 @@ impl BackendAnnounceRequest {
     ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::AnnounceBackendRequest {
             descriptor: Some(descriptor.as_proto().clone()),
-            reported_state: reported_state as i32,
+            reported_state: reported_state_to_proto(reported_state),
         })
     }
 
@@ -322,12 +387,20 @@ impl BackendAnnounceResult {
 }
 
 pub fn parse_reported_state(raw: i32) -> Result<BackendReportedState, ProtocolError> {
-    match BackendReportedState::try_from(raw) {
-        Ok(state @ (BackendReportedState::Running | BackendReportedState::Draining)) => Ok(state),
-        Ok(BackendReportedState::Unspecified) | Err(_) => Err(invalid(
+    match novarocks::BackendReportedState::try_from(raw) {
+        Ok(novarocks::BackendReportedState::Running) => Ok(BackendReportedState::Running),
+        Ok(novarocks::BackendReportedState::Draining) => Ok(BackendReportedState::Draining),
+        Ok(novarocks::BackendReportedState::Unspecified) | Err(_) => Err(invalid(
             FieldPath::root("backend_reported_state"),
             "backend reported state must be running or draining",
         )),
+    }
+}
+
+fn reported_state_to_proto(state: BackendReportedState) -> i32 {
+    match state {
+        BackendReportedState::Running => novarocks::BackendReportedState::Running as i32,
+        BackendReportedState::Draining => novarocks::BackendReportedState::Draining as i32,
     }
 }
 

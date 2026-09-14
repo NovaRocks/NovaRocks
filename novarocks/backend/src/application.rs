@@ -4,10 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 use novarocks_memory::MemoryAuthority;
 use novarocks_native_trust::NativeTrust;
-use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
@@ -591,15 +590,18 @@ impl BackendApplicationHost {
             catalog_manager_config,
             &execution_role_binding_factories,
         )?;
-        let process_descriptor = BackendProcessDescriptor::new(
+        let process_descriptor = BackendProcessDescriptor::try_new(
             services.backend_process_id,
-            QueryControlEndpoint::new(advertise_endpoint.host.clone(), advertise_endpoint.port)
-                .map_err(|error| {
-                    BackendApplicationError::new(
-                        BackendApplicationErrorKind::Configuration,
-                        format!("resolve backend process endpoint: {error}"),
-                    )
-                })?,
+            RuntimeEndpoint::new(
+                advertise_endpoint.host.clone(),
+                i32::from(advertise_endpoint.port),
+            )
+            .map_err(|error| {
+                BackendApplicationError::new(
+                    BackendApplicationErrorKind::Configuration,
+                    format!("resolve backend process endpoint: {error}"),
+                )
+            })?,
             native_trust.deployment_id().as_str(),
             novarocks_version::native_build_identity(),
             native_compatibility_id,
@@ -1110,7 +1112,13 @@ mod tests {
         let mut missing_auth = NovaRocksGrpcClient::new(connect_live_channel(grpc_port).await);
         let error = missing_auth
             .heartbeat(HeartbeatRequest {
-                expected_process_id: host.process_descriptor().as_proto().process_id.clone(),
+                expected_process_id: Some(
+                    novarocks_proto_codec::membership::BackendProcessId::from_domain(
+                        host.process_descriptor().process_id(),
+                    )
+                    .as_proto()
+                    .clone(),
+                ),
             })
             .await
             .expect_err("Native RPC without JWT must fail before domain validation");
@@ -1127,7 +1135,13 @@ mod tests {
         );
         let heartbeat = authenticated
             .heartbeat(HeartbeatRequest {
-                expected_process_id: host.process_descriptor().as_proto().process_id.clone(),
+                expected_process_id: Some(
+                    novarocks_proto_codec::membership::BackendProcessId::from_domain(
+                        host.process_descriptor().process_id(),
+                    )
+                    .as_proto()
+                    .clone(),
+                ),
             })
             .await
             .expect("authenticated heartbeat succeeds")
@@ -1150,7 +1164,13 @@ mod tests {
         let result: Result<tonic::Response<HeartbeatResponse>, tonic::Status> = grpc
             .unary(
                 tonic::Request::new(HeartbeatRequest {
-                    expected_process_id: host.process_descriptor().as_proto().process_id.clone(),
+                    expected_process_id: Some(
+                        novarocks_proto_codec::membership::BackendProcessId::from_domain(
+                            host.process_descriptor().process_id(),
+                        )
+                        .as_proto()
+                        .clone(),
+                    ),
                 }),
                 "/novarocks.NovaRocksGrpc/Unknown"
                     .parse()

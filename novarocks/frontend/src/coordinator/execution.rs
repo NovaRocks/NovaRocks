@@ -2534,8 +2534,9 @@ mod tests {
         AbortCause, CancelReason, MaxWait, SafeDetail, TaskFailure, TaskFailureCategory,
         TaskIdentity, TaskState, TerminationDetail,
     };
-    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-    use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
+    use novarocks_execution_contract::{
+        BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
+    };
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };
@@ -2912,9 +2913,9 @@ mod tests {
         }
     }
     fn descriptor(process_id: BackendProcessId, endpoint: SocketAddr) -> BackendProcessDescriptor {
-        BackendProcessDescriptor::new(
+        BackendProcessDescriptor::try_new(
             process_id,
-            QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
+            RuntimeEndpoint::new(endpoint.ip().to_string(), i32::from(endpoint.port()))
                 .expect("test endpoint"),
             "test-deployment",
             native_build_identity(),
@@ -2929,7 +2930,7 @@ mod tests {
         now_ms: i64,
     ) {
         topology.record_heartbeat_success(
-            descriptor.process_id().expect("descriptor process id"),
+            descriptor.process_id(),
             descriptor.clone(),
             BackendReportedState::Running,
             2,
@@ -3214,7 +3215,7 @@ mod tests {
             replanned[0].targets()[0]
                 .process_id()
                 .expect("replacement process id"),
-            replacement.process_id().expect("replacement process id"),
+            replacement.process_id(),
         );
     }
 
@@ -3299,7 +3300,7 @@ mod tests {
             replanned[0].targets()[0]
                 .process_id()
                 .expect("replacement process id"),
-            replacement.process_id().expect("replacement process id"),
+            replacement.process_id(),
         );
     }
 

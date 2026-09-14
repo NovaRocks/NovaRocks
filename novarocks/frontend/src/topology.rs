@@ -27,9 +27,10 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
-use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
+use novarocks_execution_contract::{
+    BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
+};
 use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, NativeEndpoint};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -449,13 +450,8 @@ impl ClusterBackendService {
         descriptor: BackendProcessDescriptor,
         reported_state: BackendReportedState,
     ) -> Result<(), String> {
-        if reported_state == BackendReportedState::Unspecified {
-            return Err("announced backend state must be running or draining".to_string());
-        }
         let endpoint = descriptor_runtime_endpoint(&descriptor)?;
-        let process_id = descriptor
-            .process_id()
-            .map_err(|error| format!("invalid announced backend process id: {error}"))?;
+        let process_id = descriptor.process_id();
         self.refresh_expired_announce_leases(std::time::Instant::now());
         let mut state = self
             .state
@@ -470,7 +466,7 @@ impl ClusterBackendService {
         }
         if old
             .as_ref()
-            .is_some_and(|facts| facts.descriptor.as_proto() != descriptor.as_proto())
+            .is_some_and(|facts| facts.descriptor != descriptor)
         {
             return Err(format!(
                 "announced backend process {process_id} changed its immutable descriptor"
@@ -478,7 +474,7 @@ impl ClusterBackendService {
         }
         let same_descriptor = old
             .as_ref()
-            .is_some_and(|facts| facts.descriptor.as_proto() == descriptor.as_proto());
+            .is_some_and(|facts| facts.descriptor == descriptor);
         let endpoint_owned = state.endpoint_owners.get(&endpoint) == Some(&process_id);
         let facts = state
             .processes
@@ -706,21 +702,18 @@ impl ClusterBackendService {
             record_backend_heartbeat("unknown_process");
             return;
         };
-        let exact = descriptor.as_proto() == announced.descriptor.as_proto();
+        let exact = descriptor == announced.descriptor;
         let compatibility = if !exact {
             Compatibility::Incompatible("heartbeat descriptor does not match announce".to_string())
         } else {
-            match descriptor.native_compatibility_id() {
-                Ok(observed) if observed == self.native_compatibility_id => {
-                    Compatibility::Compatible
-                }
-                Ok(observed) => Compatibility::OtherIsland {
+            let observed = descriptor.native_compatibility_id();
+            if observed == self.native_compatibility_id {
+                Compatibility::Compatible
+            } else {
+                Compatibility::OtherIsland {
                     local: self.native_compatibility_id,
                     observed,
-                },
-                Err(error) => Compatibility::Incompatible(format!(
-                    "backend compatibility identity is invalid: {error}"
-                )),
+                }
             }
         };
         let Ok(endpoint) = descriptor_runtime_endpoint(&announced.descriptor) else {
@@ -1018,10 +1011,7 @@ impl BackendTopologyCommandPort for ClusterBackendService {
         ];
         let mut columns = vec![Vec::new(); names.len()];
         for (process_id, facts) in &state.processes {
-            let endpoint = facts
-                .descriptor
-                .endpoint()
-                .map_err(|error| format!("invalid registered endpoint: {error}"))?;
+            let endpoint = facts.descriptor.endpoint();
             columns[0].push(process_id.to_string());
             columns[1].push(format!("{}:{}", endpoint.host(), endpoint.port()));
             columns[2].push(facts.announce_lease_valid.to_string());
@@ -1034,13 +1024,7 @@ impl BackendTopologyCommandPort for ClusterBackendService {
             columns[9].push(facts.last_announce_ms.to_string());
             columns[10].push(facts.last_heartbeat_ms.to_string());
             columns[11].push(facts.descriptor.build_identity().to_string());
-            columns[12].push(
-                facts
-                    .descriptor
-                    .native_compatibility_id()
-                    .map_err(|error| format!("invalid registered compatibility identity: {error}"))?
-                    .to_string(),
-            );
+            columns[12].push(facts.descriptor.native_compatibility_id().to_string());
             columns[13].push(diagnostic_status(facts));
             columns[14].push(
                 facts
@@ -1149,11 +1133,7 @@ fn diagnostic_status(facts: &BackendFacts) -> String {
 fn descriptor_runtime_endpoint(
     descriptor: &BackendProcessDescriptor,
 ) -> Result<RuntimeEndpoint, String> {
-    let endpoint = descriptor
-        .endpoint()
-        .map_err(|error| format!("announced backend endpoint is invalid: {error}"))?;
-    RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
-        .map_err(|error| format!("announced backend endpoint is invalid: {error}"))
+    Ok(descriptor.endpoint().clone())
 }
 fn live_targets(state: &TopologyState) -> Vec<LiveBackendTarget> {
     state
@@ -1185,7 +1165,6 @@ fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
         match facts.reported_state {
             BackendReportedState::Running => metrics.reported_running += 1,
             BackendReportedState::Draining => metrics.reported_draining += 1,
-            BackendReportedState::Unspecified => {}
         }
         match facts.compatibility {
             Compatibility::Compatible => metrics.compatibility_compatible += 1,
@@ -1265,8 +1244,9 @@ mod tests {
         BackendProcessObservation, BackendProcessObservationPort, BackendTopologyPort,
     };
     use novarocks_execution::task_execution::AdmissionEpochCapability;
-    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-    use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
+    use novarocks_execution_contract::{
+        BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
+    };
     use novarocks_query_application::api::BackendTopologyCommandPort;
     use novarocks_types::BackendProcessId;
     use novarocks_version::native_build_identity;
@@ -1285,9 +1265,9 @@ mod tests {
         build_identity: impl Into<String>,
         native_compatibility_id: novarocks_types::NativeCompatibilityId,
     ) -> BackendProcessDescriptor {
-        BackendProcessDescriptor::new(
+        BackendProcessDescriptor::try_new(
             BackendProcessId::new_v7(),
-            QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port()).unwrap(),
+            RuntimeEndpoint::new(endpoint.ip().to_string(), i32::from(endpoint.port())).unwrap(),
             "test",
             build_identity,
             native_compatibility_id,
@@ -1296,7 +1276,7 @@ mod tests {
     }
     fn verify(service: &ClusterBackendService, descriptor: &BackendProcessDescriptor) {
         service.record_heartbeat_success(
-            descriptor.process_id().unwrap(),
+            descriptor.process_id(),
             descriptor.clone(),
             BackendReportedState::Running,
             2,
@@ -1363,7 +1343,7 @@ mod tests {
             AdmissionEpochCapability::try_from_bytes([0x62; 16]).expect("nonzero next epoch");
 
         service.record_heartbeat_success(
-            descriptor.process_id().unwrap(),
+            descriptor.process_id(),
             descriptor,
             BackendReportedState::Running,
             2,
@@ -1436,7 +1416,7 @@ mod tests {
         assert!(snapshot.revision() > revision);
         assert_eq!(
             snapshot.targets()[0].process_id().unwrap(),
-            descriptor.process_id().unwrap()
+            descriptor.process_id()
         );
     }
     #[test]
@@ -1456,14 +1436,14 @@ mod tests {
             service.snapshot().unwrap().targets()[0]
                 .process_id()
                 .unwrap(),
-            old.process_id().unwrap()
+            old.process_id()
         );
         verify(&service, &new);
         assert_eq!(
             service.snapshot().unwrap().targets()[0]
                 .process_id()
                 .unwrap(),
-            new.process_id().unwrap()
+            new.process_id()
         );
     }
 
@@ -1472,7 +1452,7 @@ mod tests {
         let service = ClusterBackendService::new_transient_for_test(1);
         let endpoint = "127.0.0.1:9070".parse().unwrap();
         let old = descriptor(endpoint);
-        let old_process = old.process_id().unwrap();
+        let old_process = old.process_id();
         let runtime_endpoint = super::descriptor_runtime_endpoint(&old).unwrap();
         service
             .record_announce(old.clone(), BackendReportedState::Running)
@@ -1494,7 +1474,7 @@ mod tests {
         );
 
         let replacement = descriptor(endpoint);
-        let replacement_process = replacement.process_id().unwrap();
+        let replacement_process = replacement.process_id();
         service
             .record_announce(replacement.clone(), BackendReportedState::Running)
             .unwrap();
@@ -1530,17 +1510,13 @@ mod tests {
             before.targets()[0]
                 .process_id()
                 .expect("lower endpoint process"),
-            lower_endpoint
-                .process_id()
-                .expect("lower endpoint descriptor")
+            lower_endpoint.process_id()
         );
         assert_eq!(
             before.targets()[1]
                 .process_id()
                 .expect("higher endpoint process"),
-            higher_endpoint
-                .process_id()
-                .expect("higher endpoint descriptor")
+            higher_endpoint.process_id()
         );
 
         let replacement = descriptor("127.0.0.1:9071".parse().unwrap());
@@ -1556,15 +1532,13 @@ mod tests {
             after.targets()[0]
                 .process_id()
                 .expect("lower endpoint process"),
-            lower_endpoint
-                .process_id()
-                .expect("lower endpoint descriptor")
+            lower_endpoint.process_id()
         );
         assert_eq!(
             after.targets()[1]
                 .process_id()
                 .expect("replacement process"),
-            replacement.process_id().expect("replacement descriptor")
+            replacement.process_id()
         );
     }
 
@@ -1592,8 +1566,8 @@ mod tests {
                 captured_generation,
                 current_generation,
                 ..
-            }) if captured_generation == old.process_id().unwrap()
-                && current_generation == replacement.process_id().unwrap()
+            }) if captured_generation == old.process_id()
+                && current_generation == replacement.process_id()
         ));
     }
     #[test]
@@ -1604,7 +1578,7 @@ mod tests {
             .record_announce(descriptor.clone(), BackendReportedState::Running)
             .unwrap();
         verify(&service, &descriptor);
-        assert!(service.record_heartbeat_failure(descriptor.process_id().unwrap()));
+        assert!(service.record_heartbeat_failure(descriptor.process_id()));
         assert!(service.snapshot().unwrap().targets().is_empty());
     }
 
@@ -1639,7 +1613,7 @@ mod tests {
             .record_announce(descriptor.clone(), BackendReportedState::Draining)
             .unwrap();
         service.record_heartbeat_success(
-            descriptor.process_id().unwrap(),
+            descriptor.process_id(),
             descriptor,
             BackendReportedState::Running,
             2,
@@ -1781,7 +1755,7 @@ mod tests {
 
         // The replaced process's first refused heartbeat. Under two retries
         // this does not yet retire it, which is the ambiguous window.
-        let retired = announced[0].process_id().expect("retired process id");
+        let retired = announced[0].process_id();
         service.record_heartbeat_failure_with_error(retired, REFUSED_RETIRED_HEARTBEAT);
         let during = barrier_rows(&service);
         let retired_row = during
@@ -1832,11 +1806,8 @@ mod tests {
             "no backend the barrier counts may carry a status detail"
         );
         assert!(
-            live.iter().any(|row| row.process_id
-                == replacement
-                    .process_id()
-                    .expect("replacement process id")
-                    .to_string()),
+            live.iter()
+                .any(|row| row.process_id == replacement.process_id().to_string()),
             "the replacement is one of the counted backends"
         );
         let retired_row = after

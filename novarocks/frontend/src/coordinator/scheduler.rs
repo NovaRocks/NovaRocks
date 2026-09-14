@@ -25,13 +25,11 @@ use crate::query_execution::artifact::{
     SchedulingStreamKind, ValidatedFragmentSchedule,
 };
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+#[cfg(test)]
+use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 #[cfg(debug_assertions)]
 use novarocks_failpoint::{QueryLifecycleFaultKind, arm_path, configured_root};
-#[cfg(test)]
-use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-#[cfg(test)]
-use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use novarocks_types::BackendProcessId;
 
@@ -47,9 +45,9 @@ impl FrontendBackendSnapshot {
             .into_iter()
             .map(|(backend_idx, endpoint)| {
                 let endpoint =
-                    QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
+                    RuntimeEndpoint::new(endpoint.ip().to_string(), i32::from(endpoint.port()))
                         .map_err(|error| contract_error(error.to_string()))?;
-                let descriptor = BackendProcessDescriptor::new(
+                let descriptor = BackendProcessDescriptor::try_new(
                     BackendProcessId::new_v7(),
                     endpoint,
                     "scheduler-test",

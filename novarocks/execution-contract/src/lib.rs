@@ -27,6 +27,7 @@ pub mod descriptor;
 pub mod domain;
 pub mod identity;
 pub mod lease;
+pub mod membership;
 pub mod operation;
 pub mod status;
 pub mod transition;
@@ -48,6 +49,9 @@ pub mod task_execution {
     pub mod lease {
         pub use crate::lease::*;
     }
+    pub mod membership {
+        pub use crate::membership::*;
+    }
     pub mod operation {
         pub use crate::operation::*;
     }
@@ -64,6 +68,7 @@ pub use descriptor::*;
 pub use domain::*;
 pub use identity::*;
 pub use lease::*;
+pub use membership::*;
 pub use operation::*;
 pub use status::*;
 pub use transition::*;

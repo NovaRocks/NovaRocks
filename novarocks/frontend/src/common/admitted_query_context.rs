@@ -265,8 +265,7 @@ impl<'a> QueryPreparationContext<'a> {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-    use novarocks_proto_codec::membership::BackendProcessDescriptor;
+    use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_types::BackendProcessId;
 
     use super::*;
@@ -278,11 +277,11 @@ mod tests {
             .map(|backend_idx| {
                 LiveBackendTarget::new(
                     backend_idx,
-                    BackendProcessDescriptor::new(
+                    BackendProcessDescriptor::try_new(
                         BackendProcessId::new_v7(),
-                        QueryControlEndpoint::new(
+                        RuntimeEndpoint::new(
                             "127.0.0.1",
-                            9030_u16 + u16::try_from(backend_idx).expect("fixture backend index"),
+                            9030 + i32::try_from(backend_idx).expect("fixture backend index"),
                         )
                         .expect("valid loopback endpoint"),
                         "test-deployment",
@@ -307,9 +306,9 @@ mod tests {
             9,
             vec![LiveBackendTarget::new(
                 7,
-                BackendProcessDescriptor::new(
+                BackendProcessDescriptor::try_new(
                     BackendProcessId::new_v7(),
-                    QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid loopback endpoint"),
+                    RuntimeEndpoint::new("127.0.0.1", 9030).expect("valid loopback endpoint"),
                     "test-deployment",
                     "test-build",
                     novarocks_types::NativeCompatibilityId::new([0x71; 32]),

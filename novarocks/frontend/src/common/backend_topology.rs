@@ -22,9 +22,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
-use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
+use novarocks_execution_contract::{
+    BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
+};
 use novarocks_types::BackendProcessId;
 
 /// Frontend-owned topology and backend-management boundary consumed by core.
@@ -302,28 +303,19 @@ impl LiveBackendTarget {
         self.admission_epoch_capability
     }
 
-    pub fn process_id(&self) -> Result<BackendProcessId, novarocks_proto_codec::ProtocolError> {
-        self.descriptor.process_id()
+    pub const fn process_id(&self) -> Result<BackendProcessId, BackendTopologyError> {
+        Ok(self.descriptor.process_id())
     }
 
-    pub fn endpoint(&self) -> Result<RuntimeEndpoint, novarocks_proto_codec::ProtocolError> {
-        let endpoint = self.descriptor.endpoint()?;
-        RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port())).map_err(|error| {
-            novarocks_proto_codec::ProtocolError::new(
-                novarocks_proto_codec::FieldPath::root("backend_process_descriptor")
-                    .field("endpoint")
-                    .field("host"),
-                novarocks_proto_codec::ProtocolErrorKind::InvalidValue,
-                format!("backend endpoint is invalid for native transport: {error}"),
-            )
-        })
+    pub fn endpoint(&self) -> Result<RuntimeEndpoint, BackendTopologyError> {
+        Ok(self.descriptor.endpoint().clone())
     }
 }
 
 impl PartialEq for LiveBackendTarget {
     fn eq(&self, other: &Self) -> bool {
         self.backend_idx == other.backend_idx
-            && self.descriptor.as_proto() == other.descriptor.as_proto()
+            && self.descriptor == other.descriptor
             && self.admission_epoch_capability == other.admission_epoch_capability
     }
 }
@@ -452,8 +444,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::{BackendTopologyError, BackendTopologySnapshot, LiveBackendTarget};
-    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-    use novarocks_proto_codec::membership::BackendProcessDescriptor;
+    use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_types::BackendProcessId;
 
     fn admission_epoch() -> novarocks_execution::task_execution::AdmissionEpochCapability {
@@ -462,9 +453,9 @@ mod tests {
     }
 
     fn descriptor(endpoint: SocketAddr) -> BackendProcessDescriptor {
-        BackendProcessDescriptor::new(
+        BackendProcessDescriptor::try_new(
             BackendProcessId::new_v7(),
-            QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
+            RuntimeEndpoint::new(endpoint.ip().to_string(), i32::from(endpoint.port()))
                 .expect("valid endpoint"),
             "test-deployment",
             "test-build",

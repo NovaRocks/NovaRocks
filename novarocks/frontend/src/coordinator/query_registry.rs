@@ -1699,9 +1699,10 @@ mod tests {
     use super::*;
 
     use novarocks_execution::task_execution::AdmissionEpochCapability;
-    use novarocks_execution_contract::QueryContextConvergenceVersion;
-    use novarocks_proto_codec::lifecycle::{AttemptId, QueryControlEndpoint};
-    use novarocks_proto_codec::membership::BackendProcessDescriptor;
+    use novarocks_execution_contract::{
+        BackendProcessDescriptor, QueryContextConvergenceVersion, RuntimeEndpoint,
+    };
+    use novarocks_proto_codec::lifecycle::AttemptId;
     use novarocks_types::{FrontendProcessId, NativeCompatibilityId};
 
     fn execution(query_id: QueryId, attempt: u64) -> QueryExecutionId {
@@ -1735,9 +1736,9 @@ mod tests {
     }
 
     fn live_target(ordinal: usize, process_id: BackendProcessId) -> LiveBackendTarget {
-        let descriptor = BackendProcessDescriptor::new(
+        let descriptor = BackendProcessDescriptor::try_new(
             process_id,
-            QueryControlEndpoint::new("127.0.0.1", 19000 + ordinal as u16)
+            RuntimeEndpoint::new("127.0.0.1", 19000 + ordinal as i32)
                 .expect("query control endpoint"),
             "test-deployment",
             "test-build",

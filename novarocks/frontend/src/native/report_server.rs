@@ -623,7 +623,10 @@ impl NovaRocksGrpc for FrontendReportService {
     ) -> Result<tonic::Response<proto::AnnounceBackendResponse>, tonic::Status> {
         let announce = BackendAnnounceRequest::parse(request.into_inner())
             .map_err(status_from_contract_error)?;
-        let descriptor = announce.descriptor().map_err(status_from_contract_error)?;
+        let descriptor = announce
+            .descriptor()
+            .and_then(|descriptor| descriptor.to_contract())
+            .map_err(status_from_contract_error)?;
         let result = if descriptor.deployment_id() != self.deployment_id {
             BackendAnnounceResult::rejected(
                 BackendAnnounceRejectionReason::DeploymentMismatch,

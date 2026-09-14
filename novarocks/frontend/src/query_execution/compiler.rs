@@ -1254,8 +1254,7 @@ fn test_request_context_with_role(
 ) -> crate::common::admitted_query_context::RequestContext {
     use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
     use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
-    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-    use novarocks_proto_codec::membership::BackendProcessDescriptor;
+    use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_query_application::request_session::RequestSessionContext;
     use novarocks_types::BackendProcessId;
@@ -1276,10 +1275,9 @@ fn test_request_context_with_role(
                 0,
                 vec![LiveBackendTarget::new(
                     0,
-                    BackendProcessDescriptor::new(
+                    BackendProcessDescriptor::try_new(
                         BackendProcessId::new_v7(),
-                        QueryControlEndpoint::new("127.0.0.1", 9030)
-                            .expect("valid loopback endpoint"),
+                        RuntimeEndpoint::new("127.0.0.1", 9030).expect("valid loopback endpoint"),
                         "test-deployment",
                         "test-build",
                         novarocks_types::NativeCompatibilityId::new([0x71; 32]),

@@ -19,6 +19,7 @@ prost-reflect.workspace = true
 sha2.workspace = true
 novarocks-types.workspace = true
 novarocks-proto-models.workspace = true
+novarocks-execution-contract.workspace = true
 novarocks-spi.workspace = true
 
 [dev-dependencies]

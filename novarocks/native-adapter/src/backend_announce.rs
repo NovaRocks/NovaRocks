@@ -25,9 +25,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use novarocks_proto_codec::membership::{
-    BackendAnnounceRequest, BackendAnnounceResult, BackendProcessDescriptor, BackendReportedState,
-};
+use novarocks_execution_contract::{BackendProcessDescriptor, BackendReportedState};
+use novarocks_proto_codec::membership::{BackendAnnounceRequest, BackendAnnounceResult};
 use novarocks_types::NativeEndpoint;
 use novarocks_worker::WorkerDrainState;
 
@@ -80,9 +79,13 @@ impl BackendAnnounceSupervisor {
                     } else {
                         BackendReportedState::Running
                     };
-                    let request =
-                        BackendAnnounceRequest::new(thread_descriptor.clone(), reported_state)
-                            .expect("backend process descriptor remains validated");
+                    let request = BackendAnnounceRequest::new(
+                        novarocks_proto_codec::membership::BackendProcessDescriptor::from_contract(
+                            thread_descriptor.clone(),
+                        ),
+                        reported_state,
+                    )
+                    .expect("backend process descriptor remains validated");
                     let next_delay = announce_once(
                         &client,
                         request,
@@ -119,9 +122,13 @@ impl BackendAnnounceSupervisor {
             self.data_runtime.clone(),
             self.frontend_endpoint.clone(),
         );
-        let request =
-            BackendAnnounceRequest::new(self.descriptor.clone(), BackendReportedState::Draining)
-                .expect("backend process descriptor remains validated");
+        let request = BackendAnnounceRequest::new(
+            novarocks_proto_codec::membership::BackendProcessDescriptor::from_contract(
+                self.descriptor.clone(),
+            ),
+            BackendReportedState::Draining,
+        )
+        .expect("backend process descriptor remains validated");
         match announce_request(&client, request) {
             Ok(BackendAnnounceResult::Accepted { .. }) => {}
             Ok(BackendAnnounceResult::Rejected {

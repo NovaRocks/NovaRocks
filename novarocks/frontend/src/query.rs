@@ -2254,12 +2254,11 @@ mod tests {
 
     fn eligible_topology(revision: u64) -> BackendTopologySnapshot {
         use novarocks_execution::task_execution::AdmissionEpochCapability;
-        use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-        use novarocks_proto_codec::membership::BackendProcessDescriptor;
+        use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 
-        let descriptor = BackendProcessDescriptor::new(
+        let descriptor = BackendProcessDescriptor::try_new(
             novarocks_types::BackendProcessId::new_v7(),
-            QueryControlEndpoint::new("127.0.0.1", 9030).expect("test endpoint"),
+            RuntimeEndpoint::new("127.0.0.1", 9030).expect("test endpoint"),
             "test-deployment",
             "test-build",
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),

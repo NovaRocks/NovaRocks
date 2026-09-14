@@ -23,7 +23,8 @@
 
 use std::sync::Arc;
 
-use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendProcessId};
+use novarocks_execution_contract::BackendProcessDescriptor;
+use novarocks_proto_codec::membership::BackendProcessId;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_types::BackendProcessId as DomainBackendProcessId;
 use novarocks_worker::{WorkerAdmissionEpochAuthority, WorkerDrainState};
@@ -43,9 +44,7 @@ impl BackendHeartbeatResponder {
         drain: Arc<WorkerDrainState>,
         admission_epoch: Arc<dyn WorkerAdmissionEpochAuthority>,
     ) -> Self {
-        let process_id = descriptor
-            .process_id()
-            .expect("validated backend process descriptor retains its process id");
+        let process_id = descriptor.process_id();
         Self {
             process_id,
             descriptor,
@@ -75,7 +74,13 @@ impl BackendHeartbeatResponder {
             .unwrap_or(1);
         Ok(proto::HeartbeatResponse {
             num_cores,
-            descriptor: Some(self.descriptor.as_proto().clone()),
+            descriptor: Some(
+                novarocks_proto_codec::membership::BackendProcessDescriptor::from_contract(
+                    self.descriptor.clone(),
+                )
+                .as_proto()
+                .clone(),
+            ),
             reported_state: if self.drain.is_draining() {
                 proto::BackendReportedState::Draining as i32
             } else {
@@ -97,8 +102,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::BackendHeartbeatResponder;
-    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-    use novarocks_proto_codec::membership::BackendProcessDescriptor;
+    use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_proto_models::novarocks as proto;
     use novarocks_types::{BackendProcessId, NativeCompatibilityId};
     use novarocks_worker::{
@@ -115,9 +119,9 @@ mod tests {
 
     fn responder(drain: Arc<WorkerDrainState>) -> (BackendHeartbeatResponder, BackendProcessId) {
         let process_id = BackendProcessId::new_v7();
-        let descriptor = BackendProcessDescriptor::new(
+        let descriptor = BackendProcessDescriptor::try_new(
             process_id,
-            QueryControlEndpoint::new("be-0.internal", 9090).expect("endpoint"),
+            RuntimeEndpoint::new("be-0.internal", 9090).expect("endpoint"),
             "warehouse-a",
             "build-identity",
             NativeCompatibilityId::new([7; 32]),
