@@ -66,8 +66,7 @@ use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact,
-    MvIncrementalWritePreparer, MvIncrementalWriteRequest, MvRefreshPublicationBase,
-    MvRefreshPublicationIntent, MvRefreshPublicationTechnique, PreparedMvFirstRefreshWrite,
+    MvIncrementalWritePreparer, MvIncrementalWriteRequest, PreparedMvFirstRefreshWrite,
     PreparedMvIncrementalWrite,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::{
@@ -76,6 +75,9 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 };
 use novarocks_mv_application::persistence::schema::{
     MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+};
+use novarocks_mv_application::publication::{
+    MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };
 use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorInstanceId, ConnectorManagedDescriptorProperties,

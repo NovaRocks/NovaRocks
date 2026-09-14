@@ -24,7 +24,6 @@ use crate::mv::domain::application::{
     MvApplicationError, MvApplicationErrorKind, MvStatementResult,
 };
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::query_execution::mv_assembly::refresh_artifact::MvRefreshCommittedFacts;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
@@ -38,6 +37,7 @@ use novarocks_mv_application::ports::{
 use novarocks_mv_application::product::{
     MvProductError, MvProductErrorKind, MvProductResult, MvTarget as ProductMvTarget,
 };
+use novarocks_mv_application::publication::{MvRefreshCommittedFacts, MvRefreshPublicationIntent};
 use novarocks_mv_application::service::MvProductService;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
@@ -285,7 +285,7 @@ fn create_data_staging_branch(
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt: &MvRefreshAttemptIdentity,
     finalize: &novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
-    intent: &crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
+    intent: &MvRefreshPublicationIntent,
     context: ConnectorRequestContext,
 ) -> Result<(), MvApplicationError> {
     if finalize.target_table_uuid.is_empty() {
@@ -378,7 +378,7 @@ fn execute_metadata_only(
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt: MvRefreshAttemptIdentity,
     finalize: novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
-    intent: crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
+    intent: MvRefreshPublicationIntent,
     context: ConnectorRequestContext,
     staging_branch_exists: bool,
 ) -> Result<MvStatementResult, MvApplicationError> {
@@ -781,13 +781,13 @@ mod tests {
     };
 
     use super::*;
-    use crate::query_execution::mv_assembly::refresh_artifact::{
-        MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
-    };
     use crate::query_execution::outcome::ConnectorWriteSessionCompletion;
     use crate::query_execution::write_barrier::WriteCommitBarrier;
     use crate::query_execution::write_result::DecodedPreparedWriteSet;
     use crate::query_execution::write_session::tests as write_session_tests;
+    use novarocks_mv_application::publication::{
+        MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
+    };
 
     fn committed_version(snapshot_id: i64) -> ConnectorCommittedVersion {
         ConnectorCommittedVersion::try_new(

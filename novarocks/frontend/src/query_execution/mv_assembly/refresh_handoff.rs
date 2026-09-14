@@ -20,9 +20,8 @@
 pub use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_spi::connector::{ConnectorProviderBindingKey, ConnectorWriteOperationId};
 
-use super::refresh_artifact::{
-    MvRefreshPublicationIntent, PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite,
-};
+use super::refresh_artifact::{PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite};
+use novarocks_mv_application::publication::MvRefreshPublicationIntent;
 use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 
 use crate::mv::domain::lifecycle::RefreshError;

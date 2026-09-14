@@ -30,6 +30,7 @@ pub mod persistence;
 pub mod ports;
 pub mod process_runtime;
 pub mod product;
+pub mod publication;
 pub mod readiness;
 pub mod repository;
 mod repository_metrics;

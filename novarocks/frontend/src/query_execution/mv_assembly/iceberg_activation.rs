@@ -34,14 +34,16 @@ use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::storage_observation::MvLakePublishedProjection;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
-    MvIncrementalWriteRequest, MvRefreshCommittedFacts, MvRefreshPublicationIntent,
-    MvRefreshPublicationTechnique, MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
+    MvIncrementalWriteRequest, MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact,
 };
 use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
+};
+use novarocks_mv_application::publication::{
+    MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
