@@ -82,7 +82,6 @@ impl QueryLifecycleErrorSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryLifecycleStructuredAssertion {
     pub error_source: Option<QueryLifecycleErrorSource>,
-    pub metric_deltas: Vec<QueryLifecycleMetricDeltaExpectation>,
     /// Runtime Filter facts are asserted from the typed query-terminal
     /// projection supplied by the cluster harness, never from profile text.
     pub runtime_filter_availability: Option<RuntimeFilterAvailabilityExpectation>,
@@ -207,12 +206,6 @@ impl RuntimeFilterTotalMetric {
 pub struct RuntimeFilterTotalAtLeastExpectation {
     pub metric: RuntimeFilterTotalMetric,
     pub value: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryLifecycleMetricDeltaExpectation {
-    pub metric: String,
-    pub delta: i64,
 }
 
 #[derive(Debug, Clone)]

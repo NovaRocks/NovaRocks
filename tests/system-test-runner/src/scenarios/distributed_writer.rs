@@ -488,33 +488,6 @@ fn assert_commit_never_invoked(
     Ok(post_commit)
 }
 
-/// Wait until the frontend holds no live query lifecycle attempt.
-///
-/// The backend resource oracle proves the writers, the root's buffers and the
-/// catalog leases were released. This proves the other end: the frontend's own
-/// attempt -- and with it the write session that is the only thing allowed to
-/// commit -- is gone too. Both halves are needed before "the write left nothing
-/// behind" is a statement about the cluster rather than about one role.
-fn await_frontend_attempts_drained(context: &mut ScenarioContext, operation: &str) -> Result<()> {
-    let deadline = context.deadline();
-    loop {
-        let latest = context
-            .handle()
-            .frontend_query_lifecycle_active_attempts()
-            .with_context(|| format!("read FE active attempts after {operation}"))?;
-        if latest == 0.0 {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "the frontend still holds {latest} live query lifecycle attempt(s) after \
-                 {operation}"
-            );
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// The degree of parallelism a write fragment runs at on this host.
 ///
 /// `SET pipeline_dop` is accepted by the session but does not reach a write
@@ -785,7 +758,6 @@ impl Scenario for DistributedWriterDataflow {
         // cluster, and every heavy per-query resource -- catalog leases held
         // by writer bindings, fragment controls holding root buffers, and
         // native query contexts -- must be back at the pre-write baseline.
-        await_frontend_attempts_drained(context, "the distributed writer dataflow")?;
         await_resource_convergence(context, &baseline, "distributed writer dataflow")?;
         Ok(())
     }
@@ -1136,7 +1108,6 @@ impl Scenario for DistributedStatisticsDataflow {
             wide_root,
         );
 
-        await_frontend_attempts_drained(context, "the native statistics dataflow")?;
         await_resource_convergence(context, &baseline, "native statistics dataflow")?;
         Ok(())
     }
@@ -1602,7 +1573,6 @@ impl Scenario for DistributedWriterOverwrite {
             bail!("distributed overwrite read back {total:?}; expected Some({SEED_SUM})");
         }
 
-        await_frontend_attempts_drained(context, "the distributed writer overwrite")?;
         await_resource_convergence(context, &baseline, "distributed writer overwrite")?;
         Ok(())
     }
@@ -1918,7 +1888,6 @@ impl Scenario for DistributedWriterRowLevel {
             bail!("MERGE left {merged:?}");
         }
 
-        await_frontend_attempts_drained(context, "the distributed row-level writes")?;
         await_resource_convergence(context, &baseline, "distributed row-level writes")?;
         Ok(())
     }
@@ -2386,7 +2355,6 @@ impl Scenario for DistributedWriterFaults {
             bail!("post-fault write left {rows} rows; expected {SEED_ROWS}");
         }
 
-        await_frontend_attempts_drained(context, "the distributed writer fault matrix")?;
         await_resource_convergence(context, &baseline, "distributed writer faults")?;
         Ok(())
     }

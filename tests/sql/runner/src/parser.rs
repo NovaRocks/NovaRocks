@@ -224,30 +224,6 @@ fn parse_kill_be_after_be_log_directive(raw: &str) -> anyhow::Result<KillBeAfter
     })
 }
 
-fn parse_lifecycle_metric_delta(raw: &str) -> anyhow::Result<QueryLifecycleMetricDeltaExpectation> {
-    let (metric, delta) = raw.split_once(',').ok_or_else(|| {
-        anyhow::anyhow!(
-            "@expect_lifecycle_metric_delta requires <metric>,<signed_delta>; received {raw:?}"
-        )
-    })?;
-    let metric = metric.trim();
-    if metric.is_empty()
-        || !metric
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        bail!("invalid lifecycle metric name {metric:?}");
-    }
-    let delta = delta
-        .trim()
-        .parse::<i64>()
-        .with_context(|| format!("invalid lifecycle metric delta {:?}", delta.trim()))?;
-    Ok(QueryLifecycleMetricDeltaExpectation {
-        metric: metric.to_string(),
-        delta,
-    })
-}
-
 fn parse_runtime_filter_total_at_least(
     raw: &str,
 ) -> anyhow::Result<RuntimeFilterTotalAtLeastExpectation> {
@@ -279,7 +255,6 @@ fn structured_assertion_mut(meta: &mut QueryMeta) -> &mut QueryLifecycleStructur
     meta.query_lifecycle_structured_assertion
         .get_or_insert_with(|| QueryLifecycleStructuredAssertion {
             error_source: None,
-            metric_deltas: Vec::new(),
             runtime_filter_availability: None,
             runtime_filter_details: Vec::new(),
             runtime_filter_totals_at_least: Vec::new(),
@@ -507,11 +482,6 @@ fn parse_meta_with_sql_error_descriptors(
                 })?;
                 structured_assertion_mut(&mut meta).error_source = Some(source);
             }
-            "expect_lifecycle_metric_delta" => {
-                structured_assertion_mut(&mut meta)
-                    .metric_deltas
-                    .push(parse_lifecycle_metric_delta(&raw_value)?);
-            }
             "expect_runtime_filter_available" => {
                 let availability = RuntimeFilterAvailabilityExpectation::parse(&raw_value)
                     .ok_or_else(|| {
@@ -692,11 +662,6 @@ fn merge_lifecycle_structured_assertion(
             .error_source
             .clone()
             .or_else(|| base.error_source.clone()),
-        metric_deltas: if override_meta.metric_deltas.is_empty() {
-            base.metric_deltas.clone()
-        } else {
-            override_meta.metric_deltas.clone()
-        },
         runtime_filter_availability: override_meta
             .runtime_filter_availability
             .or(base.runtime_filter_availability),
@@ -1934,7 +1899,6 @@ mod opt5_directive_tests {
         let lines = vec![
             "-- @query_lifecycle_fault=runtime-filter-contribution-ack-drop,2".to_string(),
             "-- @expect_lifecycle_error_source=backend-attestation".to_string(),
-            "-- @expect_lifecycle_metric_delta=terminal_retained,1".to_string(),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse RFO-8R2 directives");
@@ -1958,13 +1922,6 @@ mod opt5_directive_tests {
         assert_eq!(
             assertion.error_source,
             Some(QueryLifecycleErrorSource::BackendAttestation)
-        );
-        assert_eq!(
-            assertion.metric_deltas,
-            vec![QueryLifecycleMetricDeltaExpectation {
-                metric: "terminal_retained".to_string(),
-                delta: 1,
-            }]
         );
     }
 

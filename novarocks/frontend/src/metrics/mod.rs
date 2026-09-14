@@ -30,9 +30,7 @@ use novarocks_query_application::serving_admission::FrontendServingState;
 pub(crate) mod dml_publication;
 mod http;
 mod management;
-pub mod process_query_counters;
 pub(crate) use http::{LateBoundQueryLifecycleConvergenceReader, MetricsHttpServer};
-pub use process_query_counters::FrontendProcessQueryCountersSnapshot;
 
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::with_opts(Opts::new(
@@ -182,47 +180,6 @@ static PRE_READY_REPLAN_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     ))
     .expect("register novarocks_pre_ready_replan_seconds")
 });
-static FRONTEND_QUERY_LIFECYCLE_ATTEMPTS: Lazy<IntGauge> = Lazy::new(|| {
-    IntGauge::with_opts(Opts::new(
-        "novarocks_frontend_query_lifecycle_active_attempts",
-        "Number of frontend-owned query lifecycle attempts.",
-    ))
-    .expect("register novarocks_frontend_query_lifecycle_active_attempts")
-});
-
-static FRONTEND_QUERY_LIFECYCLE_INIT: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        Opts::new(
-            "novarocks_frontend_query_lifecycle_init_total",
-            "Cumulative frontend query initialization outcomes.",
-        ),
-        &["outcome"],
-    )
-    .expect("register novarocks_frontend_query_lifecycle_init_total")
-});
-
-static FRONTEND_QUERY_LIFECYCLE_CONTROL: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        Opts::new(
-            "novarocks_frontend_query_lifecycle_control_total",
-            "Cumulative frontend query control outcomes.",
-        ),
-        &["outcome"],
-    )
-    .expect("register novarocks_frontend_query_lifecycle_control_total")
-});
-
-static FRONTEND_QUERY_LIFECYCLE_LATENCY: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        Opts::new(
-            "novarocks_frontend_query_lifecycle_latency_micros",
-            "Cumulative frontend query lifecycle latency and sample counts.",
-        ),
-        &["phase", "measure"],
-    )
-    .expect("register novarocks_frontend_query_lifecycle_latency_micros")
-});
-
 /// Bounded, role-local Native transport rejections. The label names the FE
 /// listener family and never contains a caller, endpoint, token, or error.
 static NATIVE_TRUST_TRANSPORT_REJECTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -395,10 +352,6 @@ impl FrontendMetricsRegistry {
             Box::new(PRE_READY_EFFECT_GATE_TOTAL.clone()),
             Box::new(WAITING_FOR_BACKEND_SECONDS.clone()),
             Box::new(PRE_READY_REPLAN_SECONDS.clone()),
-            Box::new(FRONTEND_QUERY_LIFECYCLE_ATTEMPTS.clone()),
-            Box::new(FRONTEND_QUERY_LIFECYCLE_INIT.clone()),
-            Box::new(FRONTEND_QUERY_LIFECYCLE_CONTROL.clone()),
-            Box::new(FRONTEND_QUERY_LIFECYCLE_LATENCY.clone()),
             Box::new(NATIVE_TRUST_TRANSPORT_REJECTIONS.clone()),
             Box::new(FRONTEND_SERVING_STATE.clone()),
             Box::new(FRONTEND_BASE_READY.clone()),
@@ -621,73 +574,6 @@ pub(crate) fn publish_backend_topology_metrics(
         }
     }
 }
-pub fn publish_frontend_process_query_counters(snapshot: FrontendProcessQueryCountersSnapshot) {
-    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS).set(snapshot.active_attempts as i64);
-    for (outcome, count) in [
-        ("applied", snapshot.init_applied),
-        ("already_applied", snapshot.init_idempotent),
-        ("failed", snapshot.init_failed),
-        ("uncertain_cleanup", snapshot.init_uncertain_cleanup),
-        ("manifest_conflict", snapshot.manifest_conflicts),
-    ] {
-        FRONTEND_QUERY_LIFECYCLE_INIT
-            .with_label_values(&[outcome])
-            .set(count as i64);
-    }
-    for (outcome, count) in [
-        ("control_ready", snapshot.control_ready),
-        ("attach_failed", snapshot.attach_failed),
-        ("heartbeat_timeout", snapshot.heartbeat_timeouts),
-        ("coordinator_lost", snapshot.coordinator_lost),
-        ("local_failure", snapshot.local_failures),
-        ("backend_epoch_mismatch", snapshot.backend_epoch_mismatches),
-        ("cleanup_failure", snapshot.cleanup_failures),
-        (
-            "terminal_locally_drained",
-            snapshot.terminal_locally_drained,
-        ),
-        (
-            "terminal_snapshot_accepted",
-            snapshot.terminal_snapshots_accepted,
-        ),
-        (
-            "terminal_snapshot_idempotent",
-            snapshot.terminal_snapshots_idempotent,
-        ),
-        (
-            "terminal_snapshot_conflict",
-            snapshot.terminal_snapshot_conflicts,
-        ),
-        (
-            "terminal_finalize_failure",
-            snapshot.terminal_finalize_failures,
-        ),
-    ] {
-        FRONTEND_QUERY_LIFECYCLE_CONTROL
-            .with_label_values(&[outcome])
-            .set(count as i64);
-    }
-    for (phase, total, samples) in [
-        (
-            "init",
-            snapshot.init_latency_micros_total,
-            snapshot.init_latency_samples,
-        ),
-        (
-            "attach",
-            snapshot.attach_latency_micros_total,
-            snapshot.attach_latency_samples,
-        ),
-    ] {
-        FRONTEND_QUERY_LIFECYCLE_LATENCY
-            .with_label_values(&[phase, "total"])
-            .set(total as i64);
-        FRONTEND_QUERY_LIFECYCLE_LATENCY
-            .with_label_values(&[phase, "samples"])
-            .set(samples as i64);
-    }
-}
-
 /// Renders only the collectors explicitly registered by the Frontend host.
 pub(crate) fn render_metrics(registry: &FrontendMetricsRegistry) -> Result<String, String> {
     refresh_frontend_gauges();
@@ -774,10 +660,6 @@ fn refresh_frontend_gauges() {
     Lazy::force(&PRE_READY_EFFECT_GATE_TOTAL);
     Lazy::force(&WAITING_FOR_BACKEND_SECONDS);
     Lazy::force(&PRE_READY_REPLAN_SECONDS);
-    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS);
-    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
-    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
-    Lazy::force(&FRONTEND_QUERY_LIFECYCLE_LATENCY);
     Lazy::force(&FRONTEND_ISLAND_READY);
     Lazy::force(&FRONTEND_COMPATIBLE_ELIGIBLE_BACKENDS);
     dml_publication::ensure_label_families();
@@ -811,39 +693,6 @@ fn ensure_frontend_metric_label_families() {
     }
     for outcome in ["permitted", "rejected"] {
         let _ = PRE_READY_EFFECT_GATE_TOTAL.get_metric_with_label_values(&[outcome]);
-    }
-    for outcome in [
-        "applied",
-        "already_applied",
-        "failed",
-        "uncertain_cleanup",
-        "manifest_conflict",
-    ] {
-        let _ = FRONTEND_QUERY_LIFECYCLE_INIT.get_metric_with_label_values(&[outcome]);
-    }
-    for outcome in [
-        "control_ready",
-        "attach_failed",
-        "heartbeat_timeout",
-        "coordinator_lost",
-        "local_failure",
-        "backend_epoch_mismatch",
-        "cleanup_failure",
-        "terminal_locally_drained",
-        "terminal_snapshot_accepted",
-        "terminal_snapshot_idempotent",
-        "terminal_snapshot_conflict",
-        "terminal_finalize_failure",
-    ] {
-        let _ = FRONTEND_QUERY_LIFECYCLE_CONTROL.get_metric_with_label_values(&[outcome]);
-    }
-    for (phase, measure) in [
-        ("init", "total"),
-        ("init", "samples"),
-        ("attach", "total"),
-        ("attach", "samples"),
-    ] {
-        let _ = FRONTEND_QUERY_LIFECYCLE_LATENCY.get_metric_with_label_values(&[phase, measure]);
     }
 }
 #[cfg(test)]
@@ -961,90 +810,6 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 == Some("novarocks_fragment_scheduled_total")
         }));
-    }
-
-    #[test]
-    fn frontend_process_query_counters_publish_structured_snapshot() {
-        publish_frontend_process_query_counters(FrontendProcessQueryCountersSnapshot {
-            active_attempts: 2,
-            init_applied: 3,
-            init_idempotent: 4,
-            init_failed: 5,
-            init_uncertain_cleanup: 6,
-            manifest_conflicts: 7,
-            init_latency_micros_total: 8,
-            init_latency_samples: 9,
-            control_ready: 10,
-            attach_failed: 11,
-            attach_latency_micros_total: 12,
-            attach_latency_samples: 13,
-            heartbeat_timeouts: 14,
-            coordinator_lost: 15,
-            local_failures: 16,
-            backend_epoch_mismatches: 17,
-            cleanup_failures: 18,
-            terminal_locally_drained: 19,
-            terminal_snapshots_accepted: 20,
-            terminal_snapshots_idempotent: 21,
-            terminal_snapshot_conflicts: 22,
-            terminal_finalize_failures: 23,
-        });
-
-        let registry = frontend_registry();
-        let body =
-            render_metrics(registry.as_ref()).expect("render frontend query lifecycle metrics");
-        assert!(
-            body.contains("novarocks_frontend_query_lifecycle_active_attempts 2"),
-            "{body}"
-        );
-        assert!(
-            body.contains(
-                "novarocks_frontend_query_lifecycle_control_total{outcome=\"terminal_snapshot_accepted\"} 20"
-            ),
-            "{body}"
-        );
-        assert!(
-            body.contains(
-                "novarocks_frontend_query_lifecycle_init_total{outcome=\"already_applied\"} 4"
-            ),
-            "{body}"
-        );
-        assert!(
-            body.contains(
-                "novarocks_frontend_query_lifecycle_control_total{outcome=\"heartbeat_timeout\"} 14"
-            ),
-            "{body}"
-        );
-        assert!(
-            body.contains(
-                "novarocks_frontend_query_lifecycle_latency_micros{measure=\"samples\",phase=\"attach\"} 13"
-            ),
-            "{body}"
-        );
-        assert!(
-            body.contains(
-                "novarocks_frontend_query_lifecycle_control_total{outcome=\"local_failure\"} 16"
-            ),
-            "{body}"
-        );
-        assert!(
-            body.contains(
-                "novarocks_frontend_query_lifecycle_control_total{outcome=\"cleanup_failure\"} 18"
-            ),
-            "{body}"
-        );
-        assert!(
-            body.contains(
-                "novarocks_frontend_query_lifecycle_init_total{outcome=\"uncertain_cleanup\"} 6"
-            ),
-            "{body}"
-        );
-        assert!(
-            body.contains(
-                "novarocks_frontend_query_lifecycle_control_total{outcome=\"backend_epoch_mismatch\"} 17"
-            ),
-            "{body}"
-        );
     }
 
     #[test]

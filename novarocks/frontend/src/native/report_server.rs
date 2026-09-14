@@ -1,6 +1,5 @@
 //! Frontend-owned report-only native endpoint.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -41,9 +40,6 @@ struct LifecycleConvergenceDebugSnapshot {
     query_attempt_id: u64,
     error_source: Option<&'static str>,
     runtime_filter: RuntimeFilterTerminalRollupDebug,
-    /// This endpoint intentionally exposes only query-scoped immutable
-    /// terminal evidence. Process metrics are not an acceptable substitute.
-    metrics: BTreeMap<String, i64>,
 }
 
 #[derive(serde::Serialize)]
@@ -262,7 +258,6 @@ fn lifecycle_convergence_debug_snapshot(
         query_attempt_id: snapshot.execution_id.attempt_id().get(),
         error_source,
         runtime_filter: runtime_filter_terminal_rollup_debug(snapshot.runtime_filter),
-        metrics: lifecycle_metric_map(snapshot.metrics),
     }
 }
 
@@ -542,50 +537,6 @@ fn runtime_filter_available_totals_debug(
     }
 }
 
-fn lifecycle_metric_map(
-    metrics: crate::metrics::FrontendProcessQueryCountersSnapshot,
-) -> BTreeMap<String, i64> {
-    [
-        ("active_attempts", metrics.active_attempts as i64),
-        ("init_applied", metrics.init_applied as i64),
-        ("init_idempotent", metrics.init_idempotent as i64),
-        ("init_failed", metrics.init_failed as i64),
-        ("control_ready", metrics.control_ready as i64),
-        ("attach_failed", metrics.attach_failed as i64),
-        ("heartbeat_timeouts", metrics.heartbeat_timeouts as i64),
-        ("coordinator_lost", metrics.coordinator_lost as i64),
-        ("local_failures", metrics.local_failures as i64),
-        (
-            "backend_epoch_mismatches",
-            metrics.backend_epoch_mismatches as i64,
-        ),
-        ("cleanup_failures", metrics.cleanup_failures as i64),
-        (
-            "terminal_locally_drained",
-            metrics.terminal_locally_drained as i64,
-        ),
-        (
-            "terminal_snapshots_accepted",
-            metrics.terminal_snapshots_accepted as i64,
-        ),
-        (
-            "terminal_snapshots_idempotent",
-            metrics.terminal_snapshots_idempotent as i64,
-        ),
-        (
-            "terminal_snapshot_conflicts",
-            metrics.terminal_snapshot_conflicts as i64,
-        ),
-        (
-            "terminal_finalize_failures",
-            metrics.terminal_finalize_failures as i64,
-        ),
-    ]
-    .into_iter()
-    .map(|(name, value)| (name.to_string(), value))
-    .collect()
-}
-
 #[derive(Clone)]
 struct FrontendReportService {
     membership: Arc<ClusterBackendService>,
@@ -752,7 +703,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::{FrontendReportServerHandle, lifecycle_convergence_debug_snapshot};
-    use crate::metrics::FrontendProcessQueryCountersSnapshot;
     use crate::query_execution::lifecycle_diagnostics::{
         QueryLifecycleConvergenceReader, RuntimeFilterTerminalRollupSnapshot,
         RuntimeFilterTerminalRollupUnavailable,
@@ -807,7 +757,6 @@ mod tests {
             error_source: None,
             primary_error: None,
             runtime_filter,
-            metrics: FrontendProcessQueryCountersSnapshot::default(),
         }
     }
 
@@ -935,7 +884,6 @@ mod tests {
             value["runtime_filter"]["totals"]["consumers"]["output_rows"],
             7
         );
-        assert_eq!(value["metrics"]["active_attempts"], 0);
     }
 
     #[test]

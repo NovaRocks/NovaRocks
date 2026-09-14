@@ -1592,7 +1592,6 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
                     error_source: None,
                     primary_error: None,
                     runtime_filter,
-                    metrics: crate::metrics::FrontendProcessQueryCountersSnapshot::default(),
                 },
             );
             convergence

@@ -17,7 +17,6 @@
 
 use std::sync::Mutex;
 
-use crate::metrics::FrontendProcessQueryCountersSnapshot;
 use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
 use novarocks_types::QueryExecutionId;
 
@@ -41,7 +40,6 @@ pub(crate) struct QueryLifecycleConvergenceSnapshot {
     /// of participant contributions. The unavailable variant records why no
     /// such set existed for this attempt.
     pub(crate) runtime_filter: RuntimeFilterTerminalRollupSnapshot,
-    pub(crate) metrics: FrontendProcessQueryCountersSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,7 +97,6 @@ mod tests {
         QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
         RuntimeFilterTerminalRollupUnavailable,
     };
-    use crate::metrics::FrontendProcessQueryCountersSnapshot;
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 
     #[test]
@@ -123,7 +120,6 @@ mod tests {
                 runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                     RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
                 ),
-                metrics: FrontendProcessQueryCountersSnapshot::default(),
             });
         }
 

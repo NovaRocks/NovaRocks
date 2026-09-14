@@ -1502,7 +1502,6 @@ fn verify_runtime_filter_structured_assertion(
 
 fn verify_lifecycle_structured_assertion(
     meta: &QueryMeta,
-    before: Option<&novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>,
     after: &novarocks_cluster_harness::QueryLifecycleStructuredSnapshot,
 ) -> Result<()> {
     let Some(assertion) = meta.query_lifecycle_structured_assertion.as_ref() else {
@@ -1527,40 +1526,6 @@ fn verify_lifecycle_structured_assertion(
                 after.error_source,
                 after.execution_id
             );
-        }
-    }
-    if !assertion.metric_deltas.is_empty() {
-        let before = before
-            .context("structured lifecycle metric delta assertion requires a pre-step snapshot")?;
-        for expected in &assertion.metric_deltas {
-            let previous = before.metrics.get(&expected.metric).with_context(|| {
-                format!(
-                    "pre-step structured lifecycle metric {} is missing",
-                    expected.metric
-                )
-            })?;
-            let current = after.metrics.get(&expected.metric).with_context(|| {
-                format!(
-                    "post-step structured lifecycle metric {} is missing",
-                    expected.metric
-                )
-            })?;
-            let actual = current.checked_sub(*previous).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "structured lifecycle metric {} overflowed while computing delta: before={previous}, after={current}",
-                    expected.metric
-                )
-            })?;
-            if actual != expected.delta {
-                bail!(
-                    "structured lifecycle metric delta mismatch for {}: expected {}, actual {} (before={}, after={})",
-                    expected.metric,
-                    expected.delta,
-                    actual,
-                    previous,
-                    current
-                );
-            }
         }
     }
     verify_runtime_filter_structured_assertion(assertion, after)?;
@@ -3446,11 +3411,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 let after = after.context(
                     "structured lifecycle assertion snapshot disappeared after the step",
                 )?;
-                verify_lifecycle_structured_assertion(
-                    &step.meta,
-                    structured_lifecycle_baseline.as_ref(),
-                    &after,
-                )
+                verify_lifecycle_structured_assertion(&step.meta, &after)
             });
             match assertion_result {
                 Ok(()) => {
@@ -3983,7 +3944,6 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "terminal_snapshot_conflict_be_index",
         "query_lifecycle_fault",
         "expect_lifecycle_error_source",
-        "expect_lifecycle_metric_delta",
         // Structured runtime-filter assertions read the same debug projection
         // as the lifecycle fault assertions, even when the query itself has no
         // injected fault.
@@ -5480,11 +5440,9 @@ mod tests {
                     harness::RuntimeFilterTerminalTotalsUnavailable::ParticipantTelemetryUnavailable,
                 ),
             },
-            metrics: BTreeMap::new(),
         };
         let delivered = QueryLifecycleStructuredAssertion {
             error_source: None,
-            metric_deltas: Vec::new(),
             runtime_filter_availability: None,
             runtime_filter_details: vec![RuntimeFilterDetailExpectation::DeliveredConsumer],
             runtime_filter_totals_at_least: Vec::new(),

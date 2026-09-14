@@ -584,25 +584,7 @@ fn await_mixed_setup_convergence(
         .await_query_execution_resource_convergence(resource_baseline, deadline)
         .with_context(|| format!("mixed window {window_index} setup resource convergence"))?;
 
-    loop {
-        let active = context
-            .handle()
-            .frontend_query_lifecycle_active_attempts()
-            .with_context(|| {
-                format!("read FE active attempts before mixed window {window_index}")
-            })?;
-        if active == 0.0 {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("mixed window {window_index} setup retained {active} frontend query attempt(s)");
-        }
-        thread::sleep(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(20)),
-        );
-    }
+    Ok(())
 }
 
 enum MixedSample {

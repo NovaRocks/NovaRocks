@@ -64,8 +64,8 @@ use super::task_round::{
     AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
 };
 use crate::metrics::{
-    FrontendProcessQueryCountersSnapshot, observe_pre_ready_replan, observe_waiting_for_backend,
-    record_pre_ready_effect_gate, record_pre_ready_replan,
+    observe_pre_ready_replan, observe_waiting_for_backend, record_pre_ready_effect_gate,
+    record_pre_ready_replan,
 };
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
@@ -1791,12 +1791,6 @@ impl FrontendDistributedQueryCoordinator {
     /// contexts instead of releasing them, so it has no sealed contribution to
     /// publish at all.
     ///
-    /// `metrics` carries the process-scoped frontend query counters. The task
-    /// protocol has no producer for that set -- the retired lifecycle chain was
-    /// its only one -- so the rollup reports the default rather than inventing
-    /// a value it does not own. See
-    /// [`crate::metrics::process_query_counters`] for what retiring the set
-    /// would take.
     fn publish_task_round_convergence(
         &self,
         execution_id: QueryExecutionId,
@@ -1827,7 +1821,6 @@ impl FrontendDistributedQueryCoordinator {
                 error_source: None,
                 primary_error: None,
                 runtime_filter,
-                metrics: FrontendProcessQueryCountersSnapshot::default(),
             });
     }
 
