@@ -33,6 +33,7 @@ use std::time::Duration;
 
 const REQUIRED_BACKENDS: usize = 3;
 const ACK_DROP_FAULT_KIND: &str = "runtime-filter-contribution-ack-drop";
+const ACK_DROP_RENDEZVOUS_FAULT_KIND: &str = "runtime-filter-contribution-ack-drop-rendezvous";
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE: &str = "native_query_active_fragments";
 
@@ -217,7 +218,7 @@ fn run_accepted_after_ack_drop(context: &mut ScenarioContext) -> Result<()> {
     let before_execution_id = candidate_snapshot.execution_id.clone();
     let baseline = resource_snapshot(context)?;
     let created_baseline = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
-    arm_all_backends(context, ACK_DROP_FAULT_KIND)?;
+    arm_all_backends(context, ACK_DROP_RENDEZVOUS_FAULT_KIND)?;
     context.action(
         "armed one Accepted-after-ACK-drop Runtime Filter fault for every native participant",
     );
@@ -235,7 +236,13 @@ fn run_accepted_after_ack_drop(context: &mut ScenarioContext) -> Result<()> {
             "held Runtime Filter retry query terminated before publishing its connection id",
         )?;
     context.action("started a held Runtime Filter retry query through public MySQL");
-    await_ack_drop_while_query_active(context, &baseline, &created_baseline, &target.done)?;
+    await_ack_drop_while_query_active(
+        context,
+        ACK_DROP_RENDEZVOUS_FAULT_KIND,
+        &baseline,
+        &created_baseline,
+        &target.done,
+    )?;
     context.action(
         "observed the Accepted ACK-drop token consumed while the Runtime Filter query remained active",
     );
@@ -324,7 +331,13 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
         .recv_timeout(context.remaining("receive Runtime Filter query connection id")?)
         .context("Runtime Filter query terminated before publishing its connection id")?;
     context.action("started an in-flight native Runtime Filter query through public MySQL");
-    await_ack_drop_while_query_active(context, &baseline, &created_baseline, &target.done)?;
+    await_ack_drop_while_query_active(
+        context,
+        ACK_DROP_FAULT_KIND,
+        &baseline,
+        &created_baseline,
+        &target.done,
+    )?;
     context.action(
         "observed a receiver-Accepted Runtime Filter contribution while the EES task query remained active",
     );
@@ -1011,6 +1024,7 @@ fn await_backends_advanced(
 
 fn await_ack_drop_while_query_active<T: std::fmt::Debug>(
     context: &mut ScenarioContext,
+    fault_kind: &str,
     baseline: &QueryExecutionResourceSnapshot,
     created_baseline: &[usize],
     done: &mpsc::Receiver<std::result::Result<Vec<T>, mysql::Error>>,
@@ -1018,10 +1032,10 @@ fn await_ack_drop_while_query_active<T: std::fmt::Debug>(
     let fault_root = context.runtime_dir().join("query-lifecycle-faults");
     let backend_count = context.handle().be_count();
     let arms = (0..backend_count)
-        .map(|backend| fault_root.join(format!("be-{backend}.{ACK_DROP_FAULT_KIND}.arm")))
+        .map(|backend| fault_root.join(format!("be-{backend}.{fault_kind}.arm")))
         .collect::<Vec<_>>();
     let triggers = (0..backend_count)
-        .map(|backend| fault_root.join(format!("be-{backend}.{ACK_DROP_FAULT_KIND}.trigger")))
+        .map(|backend| fault_root.join(format!("be-{backend}.{fault_kind}.trigger")))
         .collect::<Vec<_>>();
     let mut latest = None;
     loop {

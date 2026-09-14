@@ -550,25 +550,36 @@ fn drop_accepted_contribution_response(
         return Ok(false);
     };
     let execution_id = runtime_filter_fault_execution_id(query_id, deployment_epoch)?;
-    let scope = novarocks_failpoint::claim_matching_receiver_agnostic_fault(
+    let (_scope, rendezvous) = if let Some(scope) = novarocks_failpoint::claim_matching_receiver_agnostic_fault(
         &root,
-        novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
+        novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous,
         execution_id,
     )
-    .map_err(tonic::Status::failed_precondition)?;
-    let Some(_) = scope else {
-        return Ok(false);
-    };
-    ingress
-        .arm_accepted_contribution_retry_rendezvous(
-            BackendParticipantIdentity::new(query_id, deployment_epoch),
-            channel_id,
-            match route {
-                BackendNativeRouteIdentity::Contribution(route) => route,
-                _ => unreachable!("only contribution routes reach the ACK-drop rendezvous"),
-            },
+    .map_err(tonic::Status::failed_precondition)? {
+        (scope, true)
+    } else {
+        let Some(scope) = novarocks_failpoint::claim_matching_receiver_agnostic_fault(
+            &root,
+            novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
+            execution_id,
         )
-        .map_err(tonic::Status::failed_precondition)?;
+        .map_err(tonic::Status::failed_precondition)? else {
+            return Ok(false);
+        };
+        (scope, false)
+    };
+    if rendezvous {
+        ingress
+            .arm_accepted_contribution_retry_rendezvous(
+                BackendParticipantIdentity::new(query_id, deployment_epoch),
+                channel_id,
+                match route {
+                    BackendNativeRouteIdentity::Contribution(route) => route,
+                    _ => unreachable!("only contribution routes reach the ACK-drop rendezvous"),
+                },
+            )
+            .map_err(tonic::Status::failed_precondition)?;
+    }
     Ok(true)
 }
 

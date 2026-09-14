@@ -41,6 +41,11 @@ pub enum QueryLifecycleFaultKind {
     TerminalAckDrop,
     TerminalSnapshotConflict,
     RuntimeFilterContributionAckDrop,
+    /// Drops an accepted Runtime Filter contribution response and asks the
+    /// receiver to hold only until that exact retry reaches its ordinary
+    /// dedupe owner. This runner-only fault is distinct from the generic
+    /// ACK-drop probe because cancellation scenarios do not promise a retry.
+    RuntimeFilterContributionAckDropRendezvous,
     RuntimeFilterFeedbackContractDigestCorrupt,
     RuntimeFilterFeedbackUnavailable,
     TaskUpdateTerminalAckDrop,
@@ -153,10 +158,11 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::TerminalAckDrop,
         Self::TerminalSnapshotConflict,
         Self::RuntimeFilterContributionAckDrop,
+        Self::RuntimeFilterContributionAckDropRendezvous,
         Self::RuntimeFilterFeedbackContractDigestCorrupt,
         Self::RuntimeFilterFeedbackUnavailable,
         Self::TaskUpdateTerminalAckDrop,
@@ -185,6 +191,9 @@ impl QueryLifecycleFaultKind {
             Self::TerminalAckDrop => "terminal-ack-drop",
             Self::TerminalSnapshotConflict => "terminal-snapshot-conflict",
             Self::RuntimeFilterContributionAckDrop => "runtime-filter-contribution-ack-drop",
+            Self::RuntimeFilterContributionAckDropRendezvous => {
+                "runtime-filter-contribution-ack-drop-rendezvous"
+            }
             Self::RuntimeFilterFeedbackContractDigestCorrupt => {
                 "runtime-filter-feedback-contract-digest-corrupt"
             }
@@ -229,8 +238,9 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 22] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 23] = [
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
+    QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
     QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
@@ -736,17 +746,21 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 24);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 25);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 22);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 23);
         assert_eq!(
             parse_runner_rfo_kind("runtime-filter-contribution-ack-drop"),
             Some(QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("runtime-filter-contribution-ack-drop-rendezvous"),
+            Some(QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous)
         );
         assert_eq!(
             parse_runner_rfo_kind("task-update-terminal-ack-drop"),
