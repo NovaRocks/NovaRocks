@@ -33,7 +33,6 @@ pub mod maintenance;
 pub(crate) mod metadata_consistency;
 pub mod model;
 pub(crate) mod partition;
-pub(crate) mod projector;
 pub mod readiness;
 pub(crate) mod ref_flow;
 pub mod refresh;

@@ -316,10 +316,7 @@ async fn build_frontend_role_products(
         Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
         tokio::runtime::Handle::current(),
     ));
-    let mv_candidate_reader = crate::mv::domain::readiness::MvCandidateReader::new(
-        Arc::clone(&mv_repository),
-        tokio::runtime::Handle::current(),
-    );
+    let mv_candidate_reader = mv_readiness.candidate_reader();
     let mv_activation = core_capabilities::mv_refresh_provider_activation(
         core_capabilities::MvRefreshProviderActivationPorts::new(
             Arc::clone(&function_catalog),

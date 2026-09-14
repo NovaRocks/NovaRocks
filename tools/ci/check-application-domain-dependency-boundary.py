@@ -197,8 +197,8 @@ def main():
     arguments = parser.parse_args()
     metadata = load_metadata(arguments)
 
-    verify_forbidden_closure(metadata, WORKER, WORKER_FORBIDDEN)
     verify_forbidden_closure(metadata, EXECUTION, EXECUTION_FORBIDDEN)
+    verify_forbidden_closure(metadata, WORKER, WORKER_FORBIDDEN)
     verify_forbidden_closure(metadata, WORKLOAD, WORKLOAD_FORBIDDEN)
     if CATALOG in package_names(metadata):
         verify_forbidden_closure(metadata, CATALOG, CATALOG_FORBIDDEN)
