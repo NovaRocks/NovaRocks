@@ -301,8 +301,14 @@ impl CoreCommandRoute for TypedCommandRoute {
                 )
             }
             ParsedStatement::Table(statement) => {
-                self.catalog.execute_table_typed(
-                    statement,
+                let Some(ProductSqlCommand::Catalog(
+                    novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command),
+                )) = lower_product_sql_command(&ParsedStatement::Table(statement.clone()))?
+                else {
+                    return Err("table parser admission did not produce CREATE TABLE".to_string());
+                };
+                self.catalog.execute_table_command(
+                    &command,
                     context.session().current_catalog(),
                     context.session().current_database(),
                     command_context.connector_context(),

@@ -37,6 +37,9 @@ use novarocks_spi::connector::{
     CreatePolicy, DropPolicy,
 };
 use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
+use novarocks_sql::semantic::command::{
+    CommandLiteral, CreateTableSqlCommand, TablePartitionSqlCommand,
+};
 use novarocks_sql::semantic::{
     ColumnAggregation, DefaultLiteral, IcebergPartitionFieldExpr, ObjectName, TableColumnDef,
     TableKeyDesc, TableKeyKind,
@@ -308,6 +311,124 @@ pub(crate) fn execute_typed_create_table_statement(
         current_database,
         connector_context,
     )
+}
+
+/// Lowers a Query-Application `CREATE TABLE` command to the catalog product
+/// request. The input is a closed semantic value, so source syntax cannot
+/// cross this application boundary or be reconstructed here.
+pub(crate) fn lower_semantic_create_table_statement(
+    statement: &CreateTableSqlCommand,
+) -> Result<CatalogCreateTableRequest, String> {
+    if statement.temporary || statement.external {
+        return Err("CREATE TABLE does not support TEMPORARY or EXTERNAL tables".to_string());
+    }
+    if let Some(engine) = &statement.engine
+        && !engine.eq_ignore_ascii_case("iceberg")
+    {
+        return Err(format!("CREATE TABLE does not support ENGINE = {engine}"));
+    }
+    if statement.like.is_some() {
+        return Err("CREATE TABLE LIKE must use the semantic LIKE executor".to_string());
+    }
+    if !statement.order_by.is_empty() {
+        return Err("CREATE TABLE does not support ORDER BY".to_string());
+    }
+    let partition_fields = match &statement.partition {
+        None => Vec::new(),
+        Some(TablePartitionSqlCommand::Transform(partition)) => partition.clone(),
+        Some(TablePartitionSqlCommand::UnsupportedLegacyRange { .. }) => {
+            return Err(
+                "CREATE TABLE does not support legacy RANGE partition definitions".to_string(),
+            );
+        }
+    };
+    let mut properties = statement
+        .properties
+        .iter()
+        .map(|property| {
+            Ok((
+                semantic_table_property_text(&property.key)?,
+                semantic_table_property_text(&property.value)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if let Some(comment) = &statement.comment {
+        properties.push((
+            "comment".to_string(),
+            semantic_table_property_text(comment)?,
+        ));
+    }
+    Ok(CatalogCreateTableRequest {
+        name: statement.name.clone(),
+        kind: CatalogCreateTableKind::Iceberg {
+            columns: statement
+                .columns
+                .iter()
+                .map(|column| {
+                    Ok(TableColumnDef {
+                        name: column.name.clone(),
+                        nullable: column.nullable.unwrap_or(true),
+                        aggregation: column.aggregation,
+                        default: column
+                            .default
+                            .as_ref()
+                            .map(|value| lower_semantic_default_literal(value, &column.data_type))
+                            .transpose()?,
+                        data_type: column.data_type.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            key_desc: statement.key.clone(),
+            bucket_count: statement
+                .distribution
+                .as_ref()
+                .and_then(|value| value.buckets)
+                .map(|value| {
+                    u32::try_from(value)
+                        .map_err(|_| "distribution bucket count exceeds u32".to_string())
+                })
+                .transpose()?,
+            distribution_columns: statement
+                .distribution
+                .as_ref()
+                .map(|value| value.columns.clone())
+                .unwrap_or_default(),
+            partition_fields,
+            properties,
+        },
+        if_not_exists: statement.if_not_exists,
+    })
+}
+
+fn semantic_table_property_text(literal: &CommandLiteral) -> Result<String, String> {
+    match literal {
+        CommandLiteral::Null => Err("table properties do not support NULL values".to_string()),
+        CommandLiteral::Bool(value) => Ok(value.to_string()),
+        CommandLiteral::Number(value) | CommandLiteral::String(value) => Ok(value.clone()),
+        CommandLiteral::Binary(value) => Ok(format!("0x{}", hex::encode(value))),
+    }
+}
+
+fn lower_semantic_default_literal(
+    literal: &CommandLiteral,
+    data_type: &SqlType,
+) -> Result<DefaultLiteral, String> {
+    let lowered = match literal {
+        CommandLiteral::Null => DefaultLiteral::Null,
+        CommandLiteral::Bool(value) => DefaultLiteral::Bool(*value),
+        CommandLiteral::Number(value) => lower_typed_numeric_default(value, data_type)?,
+        CommandLiteral::String(value) => lower_typed_string_default(value, data_type)?,
+        CommandLiteral::Binary(value) => {
+            if !matches!(data_type, SqlType::Binary) {
+                return Err(format!(
+                    "hex DEFAULT not supported for column type {data_type:?}"
+                ));
+            }
+            DefaultLiteral::Binary(value.clone())
+        }
+    };
+    validate_typed_default_literal(&lowered, data_type)?;
+    Ok(lowered)
 }
 
 fn lower_typed_table_column(column: &TypedColumnDefinition) -> Result<TableColumnDef, String> {
@@ -1881,6 +2002,72 @@ mod tests {
                 ("format-version".to_string(), "2".to_string()),
                 ("comment".to_string(), "order table".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn semantic_create_table_lowering_matches_typed_catalog_request() {
+        let sql = "CREATE TABLE IF NOT EXISTS ice.db.orders (id BIGINT DEFAULT 3, amount DECIMAL(10,2) DEFAULT '12.30', payload BINARY DEFAULT X'CAFE') DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 8 PARTITION BY (month(id)) PROPERTIES ('format-version' = '2') COMMENT 'orders'";
+        let typed = typed_create_table(sql);
+        let statement = novarocks_query_application::sql::parse_single_statement(sql)
+            .expect("parse semantic CREATE TABLE");
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Catalog(
+            novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command),
+        )) = novarocks_query_application::sql::lower_product_sql_command(&statement)
+            .expect("lower semantic CREATE TABLE")
+        else {
+            panic!("expected semantic CREATE TABLE");
+        };
+
+        assert_eq!(
+            super::lower_semantic_create_table_statement(&command)
+                .expect("lower semantic catalog request"),
+            super::CatalogCreateTableRequest {
+                name: novarocks_sql::semantic::ObjectName {
+                    parts: typed
+                        .name
+                        .parts
+                        .iter()
+                        .map(|part| part.value.clone())
+                        .collect(),
+                },
+                kind: super::CatalogCreateTableKind::Iceberg {
+                    columns: typed
+                        .columns
+                        .iter()
+                        .map(super::lower_typed_table_column)
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("lower typed columns"),
+                    key_desc: typed
+                        .key
+                        .as_ref()
+                        .map(super::lower_typed_table_key)
+                        .transpose()
+                        .expect("lower typed key"),
+                    bucket_count: Some(8),
+                    distribution_columns: vec!["id".to_string()],
+                    partition_fields: typed
+                        .partition
+                        .as_ref()
+                        .and_then(|partition| match partition {
+                            novarocks_parser::ast::TablePartition::Transform(partition) => {
+                                Some(
+                                    partition
+                                        .expressions
+                                        .iter()
+                                        .map(super::lower_typed_table_partition_transform)
+                                        .collect::<Result<Vec<_>, _>>(),
+                                )
+                            }
+                            _ => None,
+                        })
+                        .expect("typed transform partition")
+                        .expect("lower typed partition"),
+                    properties: super::lower_typed_table_properties(&typed)
+                        .expect("lower typed properties"),
+                },
+                if_not_exists: true,
+            }
         );
     }
 

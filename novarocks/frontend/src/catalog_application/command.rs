@@ -34,7 +34,7 @@ use crate::catalog_application::statement::{
     CatalogDropContext, CatalogMutationContext, execute_create_database_statement,
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement,
-    execute_typed_create_table_statement,
+    lower_semantic_create_table_statement,
 };
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
@@ -42,6 +42,7 @@ use novarocks_query_application::api::build_utf8_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::literal::arrow_data_type_to_sql_type;
+use novarocks_sql::semantic::command::CreateTableSqlCommand;
 use novarocks_sql::semantic::command::{
     CatalogCreateCommand as SemanticCatalogCreateCommand, CommandLiteral,
 };
@@ -183,36 +184,32 @@ impl CatalogCommandExecutor {
         }
     }
 
-    /// Execute parser-owned table DDL without reparsing the SQL source.
-    pub fn execute_table_typed(
+    /// Executes an admitted semantic `CREATE TABLE` command.
+    pub fn execute_table_command(
         &self,
-        statement: &novarocks_parser::ast::TableStatement,
+        command: &CreateTableSqlCommand,
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
-        match statement {
-            novarocks_parser::ast::TableStatement::Create(statement) => {
-                if let Some(source) = &statement.like {
-                    return execute_create_table_like(
-                        self,
-                        typed_object_name(&statement.name),
-                        typed_object_name(source),
-                        statement.if_not_exists,
-                        current_catalog,
-                        current_database,
-                        connector_context,
-                    );
-                }
-                execute_typed_create_table_statement(
-                    self,
-                    statement,
-                    current_catalog,
-                    current_database,
-                    connector_context,
-                )
-            }
+        if let Some(source) = &command.like {
+            return execute_create_table_like(
+                self,
+                command.name.clone(),
+                source.clone(),
+                command.if_not_exists,
+                current_catalog,
+                current_database,
+                connector_context,
+            );
         }
+        execute_create_table_statement(
+            self,
+            lower_semantic_create_table_statement(command)?,
+            current_catalog,
+            current_database,
+            connector_context,
+        )
     }
 
     /// Executes an admitted Iceberg `ALTER TABLE` syntax node without a SQL
