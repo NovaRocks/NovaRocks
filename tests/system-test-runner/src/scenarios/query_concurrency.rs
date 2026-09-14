@@ -156,6 +156,7 @@ struct ActiveWorkloads {
 #[derive(Debug, Deserialize)]
 struct Governance {
     root_responsibilities: usize,
+    preparation: usize,
     execution: usize,
     waiting_records: usize,
     peak_waiting_records: usize,
@@ -165,6 +166,8 @@ struct Governance {
     held_bytes: u64,
     peak_held_bytes: u64,
     result_credit_held_bytes: u64,
+    control_ready: usize,
+    control_inflight: usize,
 }
 
 struct TierWindow {
@@ -194,15 +197,32 @@ fn run_tier(
         observed.execution, observed.waiting_records, observed.peak_waiting_records, observed.peak_held_bytes
     ));
     let outcomes = runtime.block_on(read_timeout_outcomes(readers))?;
-    for outcome in outcomes {
+    let mut terminal_failures = Vec::new();
+    for (index, (_connection, outcome)) in outcomes.iter().enumerate() {
         match outcome {
             Ok(error)
                 if error.contains("timed out")
                     || error.contains("timeout")
                     || error.contains("deadline") => {}
-            Ok(error) => bail!("tier {tier} returned a non-timeout terminal response: {error}"),
-            Err(error) => return Err(error).context(format!("read tier {tier} timeout response")),
+            Ok(error) => terminal_failures.push(format!(
+                "client {index} returned a non-timeout terminal response: {error}"
+            )),
+            Err(error) => terminal_failures.push(format!(
+                "client {index} failed to read its timeout response: {error}"
+            )),
         }
+    }
+    if !terminal_failures.is_empty() {
+        // Retain every client socket until this diagnostic read. Dropping the
+        // sockets first would turn an absent deadline terminal into a client
+        // disconnect and conceal the FE owner state that must be investigated.
+        let state = frontend_state(context)
+            .map(|state| format!("{state:?}"))
+            .unwrap_or_else(|error| format!("unavailable: {error:#}"));
+        bail!(
+            "tier {tier} did not deliver deadline terminals: {}; FE workload state: {state}",
+            terminal_failures.join("; ")
+        );
     }
     // The raw readers run continuously while these roots are live. Once all
     // of them have observed the expected deadline terminal, governance still
@@ -229,7 +249,7 @@ async fn start_held_query_readers(
     port: u16,
     timeout: Duration,
     tier: usize,
-) -> Result<Vec<JoinHandle<Result<String>>>> {
+) -> Result<Vec<JoinHandle<(AsyncMysqlStream, Result<String>)>>> {
     let mut connects = JoinSet::new();
     for _ in 0..tier {
         let user = user.clone();
@@ -259,8 +279,12 @@ async fn start_held_query_readers(
             let gate = Arc::clone(&gate);
             tokio::spawn(async move {
                 gate.wait().await;
-                connection.send_query(HELD_QUERY).await?;
-                connection.read_timeout_query_error().await
+                let outcome = async {
+                    connection.send_query(HELD_QUERY).await?;
+                    connection.read_timeout_query_error().await
+                }
+                .await;
+                (connection, outcome)
             })
         })
         .collect();
@@ -273,8 +297,8 @@ async fn start_held_query_readers(
 }
 
 async fn read_timeout_outcomes(
-    reads: Vec<JoinHandle<Result<String>>>,
-) -> Result<Vec<Result<String>>> {
+    reads: Vec<JoinHandle<(AsyncMysqlStream, Result<String>)>>,
+) -> Result<Vec<(AsyncMysqlStream, Result<String>)>> {
     let mut outcomes = Vec::with_capacity(reads.len());
     for read in reads {
         outcomes.push(

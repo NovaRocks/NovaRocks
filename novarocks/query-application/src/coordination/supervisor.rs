@@ -321,6 +321,15 @@ impl QueryExecutionDriver for BoundedQueryExecutionDriver {
         if *self.shutdown.borrow() {
             return rejected_start(owner, "logical execution supervisor is shutting down");
         }
+        let cancellation = match owner.scope().cancellation() {
+            Ok(cancellation) => cancellation,
+            Err(_) => {
+                return rejected_start(
+                    owner,
+                    "logical execution start lost its cancellation authority",
+                );
+            }
+        };
         let (reply, response) = oneshot::channel();
         let command = StartCommand {
             request,
@@ -329,12 +338,19 @@ impl QueryExecutionDriver for BoundedQueryExecutionDriver {
         };
         match self.starts.try_send(command) {
             Ok(()) => Box::pin(async move {
-                response.await.unwrap_or_else(|_| {
-                    Err(QueryExecutionError::new(
-                        QueryExecutionErrorKind::Failed,
-                        "logical execution supervisor closed without a start verdict",
-                    ))
-                })
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(QueryExecutionError::new(
+                        QueryExecutionErrorKind::Cancelled,
+                        "logical execution start was cancelled before its start verdict",
+                    )),
+                    result = response => result.unwrap_or_else(|_| {
+                        Err(QueryExecutionError::new(
+                            QueryExecutionErrorKind::Failed,
+                            "logical execution supervisor closed without a start verdict",
+                        ))
+                    }),
+                }
             }),
             Err(mpsc::error::TrySendError::Full(command)) => rejected_start(
                 command.owner,
@@ -1953,6 +1969,35 @@ mod tests {
                 ResultByteLimit::new(1 << 12).unwrap(),
             ),
         )
+    }
+
+    #[tokio::test]
+    async fn accepted_start_returns_on_cancellation_before_supervisor_verdict() {
+        let (starts, mut start_rx) = mpsc::channel(NonZeroUsize::new(1).unwrap().get());
+        let (_shutdown, shutdown) = watch::channel(false);
+        let client = QueryExecutionClient::new(BoundedQueryExecutionDriver { starts, shutdown });
+        let (_control, root) = governance();
+        let requester = root.owner.cancellation_requester();
+        let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
+        let command = start_rx
+            .recv()
+            .await
+            .expect("accepted start reaches the supervisor queue");
+
+        requester
+            .request(CancellationReason::DeadlineExceeded)
+            .expect("active root accepts deadline cancellation");
+        let error = match tokio::time::timeout(Duration::from_secs(1), start)
+            .await
+            .expect("accepted start returns after cancellation")
+        {
+            Ok(_) => panic!("cancellation wins before a start verdict"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+
+        command.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
     }
 
     fn supervisor_resources() -> LocalResourceAuthority {
