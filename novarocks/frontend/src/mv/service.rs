@@ -38,10 +38,9 @@ use novarocks_mv_application::{
     maintenance::{
         MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     },
-    process_runtime::{
-        MvBackgroundRuntime, MvBackgroundRuntimeOwner, MvBackgroundStop, MvBackgroundTasks,
-    },
+    process_runtime::{MvBackgroundRuntime, MvBackgroundStop, MvBackgroundTasks},
     scheduler::MvSchedulerConfig,
+    service::MvProductService,
 };
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::BackendTopologyService;
@@ -63,8 +62,7 @@ use super::{
 pub struct FrontendMvService {
     readiness: Arc<MvReadinessPort>,
     refresh: refresh::FrontendMvRefreshDependencies,
-    activity_gate: MvActivityGate,
-    background: MvBackgroundRuntimeOwner,
+    product_service: MvProductService,
     scheduler_config: MvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
@@ -106,8 +104,7 @@ impl FrontendMvService {
                 readiness: Arc::clone(&readiness),
             },
             readiness,
-            activity_gate: MvActivityGate::new(),
-            background: MvBackgroundRuntimeOwner::default(),
+            product_service: MvProductService::default(),
             scheduler_config,
             maintenance_config,
             table_maintenance_service,
@@ -127,20 +124,26 @@ impl FrontendMvService {
         &self,
         deadline: Instant,
     ) -> Result<(), String> {
-        self.activity_gate.begin_stopping();
-        self.background.shutdown_until(deadline).await
+        self.product_service.begin_stopping();
+        self.product_service
+            .shutdown_background_workers_until(deadline)
+            .await
     }
 
     pub(crate) fn request_background_stop_for_process_exit(&self) {
-        self.activity_gate.begin_stopping();
-        self.background.request_stop_for_process_exit();
+        self.product_service.begin_stopping();
+        self.product_service
+            .request_background_stop_for_process_exit();
     }
 
     pub(crate) fn start_background_workers(
         &self,
         bindings: MvBackgroundBindings,
     ) -> Result<(), MvBackgroundEngineError> {
-        let reservation = self.background.begin_start().map_err(lifecycle_error)?;
+        let reservation = self
+            .product_service
+            .begin_background_start()
+            .map_err(lifecycle_error)?;
         let dependencies = self.refresh.clone();
         let topology = self.topology.clone();
         let table_maintenance_service = Arc::clone(&self.table_maintenance_service);
@@ -154,7 +157,7 @@ impl FrontendMvService {
             maintenance_config: self.maintenance_config.clone(),
             table_maintenance_engine: bindings.table_maintenance_engine,
             table_maintenance_service,
-            activity_gate: self.activity_gate.clone(),
+            activity_gate: self.product_service.activity_gate(),
             root_admission: self.root_admission.clone(),
             optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
             attempt_timeout: self.attempt_timeout,
@@ -243,7 +246,7 @@ impl FrontendMvService {
         owner: MvActivityOwner,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvActivityLease, MvApplicationError> {
-        self.activity_gate
+        self.product_service
             .acquire_foreground(canonical_mv_target(target), owner, || {
                 execution.cancellation().is_cancelled()
             })

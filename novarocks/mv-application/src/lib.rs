@@ -35,6 +35,7 @@ pub mod repository;
 mod repository_metrics;
 pub mod scheduler;
 pub mod scheduler_runtime;
+pub mod service;
 pub mod state_family;
 pub mod state_store_repository;
 #[doc(hidden)]
