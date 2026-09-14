@@ -33,6 +33,29 @@ use novarocks_spi::connector::read_stack::ConnectorReadDynamicFilter;
 use novarocks_worker::runtime_filter::typed_scan::{
     TypedScanFilterBindings, typed_scan_dynamic_filter,
 };
+use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
+
+struct NativeTypedScanLiveDynamicFilterFactory {
+    wire_scan: ConnectorTableScanSource,
+    scan: DecodedConnectorReadScan,
+}
+
+impl TypedScanLiveDynamicFilterFactory for NativeTypedScanLiveDynamicFilterFactory {
+    fn build(
+        &self,
+        session: Option<&RuntimeFilterSessionRef>,
+        contracts: &BTreeMap<u32, RuntimeFilterConsumerContract>,
+    ) -> Result<Arc<ConnectorReadDynamicFilter>, RuntimeFilterContractViolation> {
+        scan_dynamic_filter_spi(&self.wire_scan, &self.scan, session, contracts)
+    }
+}
+
+pub fn typed_scan_live_dynamic_filter_factory(
+    wire_scan: ConnectorTableScanSource,
+    scan: DecodedConnectorReadScan,
+) -> Arc<dyn TypedScanLiveDynamicFilterFactory> {
+    Arc::new(NativeTypedScanLiveDynamicFilterFactory { wire_scan, scan })
+}
 
 pub fn scan_dynamic_filter_spi(
     wire_scan: &ConnectorTableScanSource,

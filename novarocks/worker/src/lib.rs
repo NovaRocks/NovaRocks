@@ -61,6 +61,7 @@ mod task_registry_config;
 mod task_registry_entry;
 #[cfg(test)]
 mod task_registry_tests;
+pub mod typed_scan_filter;
 
 /// Worker-owned runtime-filter artifacts and local resource contracts.
 pub mod runtime_filter {

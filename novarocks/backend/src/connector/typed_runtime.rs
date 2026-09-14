@@ -60,7 +60,6 @@ use novarocks_execution::exec::node::scan::{
 use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
-use novarocks_native_adapter::runtime_filter_typed_scan::scan_dynamic_filter_spi;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::read_stack::{
     CompleteAllDynamicFilter, ConnectorReadColumnHandle, ConnectorReadDynamicFilter,
@@ -69,6 +68,7 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_types::SlotId;
 use novarocks_worker::connector_batch_transform::ConnectorBatchTransform;
+use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 
 /// How long a driver parks on an empty, non-terminal split queue before it
 /// re-checks cancellation, the deadline, and the terminal latch.
@@ -123,6 +123,7 @@ struct TypedConnectorScanShared {
     /// does not hold its admission permit while its plan is decoded, and the
     /// lifecycle refuses a session without one.
     runtime_filter: RuntimeFilterSessionResolver,
+    live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
     /// This fragment's runtime-filter consumer contracts, by the filter id the
     /// scan carrier binds. Empty when the scan consumes no runtime filter.
     runtime_filter_contracts: BTreeMap<u32, RuntimeFilterConsumerContract>,
@@ -264,6 +265,7 @@ impl TypedConnectorScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         runtime_filter: RuntimeFilterSessionResolver,
+        live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
     ) -> Self {
         let dynamic_filter = complete_all_scan_dynamic_filter(&wire_scan, &scan);
         Self {
@@ -273,6 +275,7 @@ impl TypedConnectorScanSource {
                 provider,
                 session,
                 runtime_filter,
+                live_dynamic_filter_factory,
                 runtime_filter_contracts: BTreeMap::new(),
                 request,
                 plan_node_id,
@@ -348,14 +351,11 @@ impl TypedConnectorScanSource {
             return Ok(None);
         }
         let session = (self.shared.runtime_filter)()?;
-        scan_dynamic_filter_spi(
-            &self.shared.wire_scan,
-            &self.shared.scan,
-            session.as_ref(),
-            &self.shared.runtime_filter_contracts,
-        )
-        .map(Some)
-        .map_err(|error| format!("create typed scan live runtime filter: {error}"))
+        self.shared
+            .live_dynamic_filter_factory
+            .build(session.as_ref(), &self.shared.runtime_filter_contracts)
+            .map(Some)
+            .map_err(|error| format!("create typed scan live runtime filter: {error}"))
     }
 
     fn with_substituted_filter(&self, dynamic_filter: Arc<ConnectorReadDynamicFilter>) -> Self {
@@ -366,6 +366,7 @@ impl TypedConnectorScanSource {
                 provider: Arc::clone(&self.shared.provider),
                 session: self.shared.session.clone(),
                 runtime_filter: Arc::clone(&self.shared.runtime_filter),
+                live_dynamic_filter_factory: Arc::clone(&self.shared.live_dynamic_filter_factory),
                 runtime_filter_contracts: self.shared.runtime_filter_contracts.clone(),
                 request: self.shared.request.clone(),
                 plan_node_id: self.shared.plan_node_id,
@@ -1665,6 +1666,13 @@ mod tests {
         Arc::new(|| Ok(None))
     }
 
+    fn live_dynamic_filter_factory() -> Arc<dyn TypedScanLiveDynamicFilterFactory> {
+        novarocks_native_adapter::runtime_filter_typed_scan::typed_scan_live_dynamic_filter_factory(
+            scan_source(),
+            test_support::decoded_scan(),
+        )
+    }
+
     fn int_page(values: Vec<i64>) -> SourcePage {
         let positions = values.len();
         let column: ArrayRef = Arc::new(Int64Array::from(values));
@@ -1724,6 +1732,7 @@ mod tests {
             NODE,
             vec![SlotId::new(1)],
             no_runtime_filter(),
+            live_dynamic_filter_factory(),
         )
     }
 
@@ -2106,6 +2115,7 @@ mod tests {
             NODE,
             vec![SlotId::new(1)],
             no_runtime_filter(),
+            live_dynamic_filter_factory(),
         )
         .with_backend_dynamic_filter(Arc::new(CompleteAllDynamicFilter::new(covered)));
         let op = bind(&source);

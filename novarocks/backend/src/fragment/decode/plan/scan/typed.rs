@@ -145,6 +145,11 @@ pub(super) fn lower_typed_connector_scan(
                 .provider_factory()
                 .create_page_source_provider(&inputs.request, inputs.reader_policy)
                 .map_err(provider_refusal)?;
+            let live_dynamic_filter_factory =
+                novarocks_native_adapter::runtime_filter_typed_scan::typed_scan_live_dynamic_filter_factory(
+                    scan_source.clone(),
+                    decoded_scan.clone(),
+                );
             let source = TypedConnectorScanSource::new(
                 scan_source,
                 decoded_scan,
@@ -155,6 +160,7 @@ pub(super) fn lower_typed_connector_scan(
                 node.node_id,
                 read_slot_ids,
                 inputs.runtime_filter,
+                live_dynamic_filter_factory,
             );
             match output_materialization {
                 Some(transform) => Arc::new(
