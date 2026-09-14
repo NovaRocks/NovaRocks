@@ -1,4 +1,3 @@
-// Backend recursive plan traversal coverage for adapter-owned window lowering.
 #[expect(
     clippy::items_after_test_module,
     reason = "Focused decode tests remain adjacent to their helpers."

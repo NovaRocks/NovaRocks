@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-dispatch regression coverage for Adapter-owned Unpivot projection.
+//! Native Unpivot decoder integration coverage.
 
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema};

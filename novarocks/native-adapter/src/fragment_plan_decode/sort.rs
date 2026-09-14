@@ -1,4 +1,4 @@
-//! Backend-dispatch regression coverage for Adapter-owned Sort projection.
+//! Native sort decoder integration coverage.
 
 #[cfg(test)]
 mod tests {

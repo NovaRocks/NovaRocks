@@ -1,4 +1,5 @@
-// Backend recursive plan traversal coverage for adapter-owned aggregate lowering.
+//! Native aggregate decoder integration coverage.
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;

@@ -44,6 +44,20 @@ mod window_tests;
 use novarocks_execution::runtime_filter as execution;
 use std::collections::BTreeMap;
 
+use crate::fragment_decode_context::NativePlanDecodeContext;
+use crate::fragment_error::NativeFragmentDecodeError;
+use crate::fragment_expression::decode_expr_for_slot_layout;
+use crate::fragment_plan_node::{
+    NativeLoweredPlanNode, apply_distributed_limit, lower_assert_one_row_node,
+    lower_change_event_expand_node, lower_filter_node, lower_generate_series_node,
+    lower_limit_node, lower_nest_loop_join_node, lower_project_node, lower_redistribute_node,
+    lower_repeat_node, lower_set_op_node, lower_sort_node, lower_table_function_node,
+    lower_topn_node, lower_unpivot_node, lower_values_node, validate_distributed_node_children,
+};
+use crate::fragment_runtime_filter_binding::{
+    DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
+    NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
+};
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::ExprArena;
@@ -57,20 +71,6 @@ use novarocks_execution::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
-use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
-use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
-use novarocks_native_adapter::fragment_plan_node::{
-    NativeLoweredPlanNode, apply_distributed_limit, lower_assert_one_row_node,
-    lower_change_event_expand_node, lower_filter_node, lower_generate_series_node,
-    lower_limit_node, lower_nest_loop_join_node, lower_project_node, lower_redistribute_node,
-    lower_repeat_node, lower_set_op_node, lower_sort_node, lower_table_function_node,
-    lower_topn_node, lower_unpivot_node, lower_values_node, validate_distributed_node_children,
-};
-use novarocks_native_adapter::fragment_runtime_filter_binding::{
-    DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
-    NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
-};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
@@ -170,7 +170,7 @@ fn decode_node_inner(
             ctx,
         ),
         plan::distributed_node::Payload::Exchange(exchange) => {
-            novarocks_native_adapter::fragment_exchange_receiver::lower_exchange_receiver(
+            crate::fragment_exchange_receiver::lower_exchange_receiver(
                 node,
                 exchange,
                 path.clone().field("payload").field("exchange"),
@@ -423,7 +423,7 @@ fn attach_leaf_consumers(
 
 fn validate_scan_domain_target(
     binding: &DecodedRuntimeFilterBinding,
-    target: &novarocks_native_adapter::fragment_runtime_filter_binding::DecodedRuntimeFilterScanDomainTarget,
+    target: &crate::fragment_runtime_filter_binding::DecodedRuntimeFilterScanDomainTarget,
     path: FieldPath,
 ) -> Result<(), NativeFragmentDecodeError> {
     use novarocks_proto_models::expr::expr::Kind;
@@ -1380,18 +1380,16 @@ fn lower_physical_node(
         plan::plan_node::Kind::AssertOneRow(assert) => {
             lower_assert_one_row_node(node, assert, path.clone().field("assert_one_row"), children)
         }
-        plan::plan_node::Kind::Scan(scan) => {
-            novarocks_native_adapter::fragment_typed_connector_scan::lower_scan_node(
-                node,
-                physical,
-                scan,
-                path.clone().field("scan"),
-                ctx,
-                arena,
-            )
-        }
+        plan::plan_node::Kind::Scan(scan) => crate::fragment_typed_connector_scan::lower_scan_node(
+            node,
+            physical,
+            scan,
+            path.clone().field("scan"),
+            ctx,
+            arena,
+        ),
         plan::plan_node::Kind::HashAggregate(aggregate) => {
-            novarocks_native_adapter::fragment_aggregate::lower_hash_aggregate_node(
+            crate::fragment_aggregate::lower_hash_aggregate_node(
                 node,
                 physical,
                 aggregate,
@@ -1402,18 +1400,16 @@ fn lower_physical_node(
                 ctx,
             )
         }
-        plan::plan_node::Kind::HashJoin(join) => {
-            novarocks_native_adapter::fragment_hash_join::lower_hash_join_node(
-                node,
-                physical,
-                join,
-                path.clone().field("hash_join"),
-                node_path.clone(),
-                physical_output_path.clone(),
-                children,
-                arena,
-            )
-        }
+        plan::plan_node::Kind::HashJoin(join) => crate::fragment_hash_join::lower_hash_join_node(
+            node,
+            physical,
+            join,
+            path.clone().field("hash_join"),
+            node_path.clone(),
+            physical_output_path.clone(),
+            children,
+            arena,
+        ),
         plan::plan_node::Kind::NestLoopJoin(join) => lower_nest_loop_join_node(
             node,
             physical,
@@ -1424,18 +1420,16 @@ fn lower_physical_node(
             children,
             arena,
         ),
-        plan::plan_node::Kind::Window(window) => {
-            novarocks_native_adapter::fragment_window::lower_window_node(
-                node,
-                physical,
-                window,
-                path.clone().field("window"),
-                physical_output_path.clone(),
-                children,
-                arena,
-                ctx,
-            )
-        }
+        plan::plan_node::Kind::Window(window) => crate::fragment_window::lower_window_node(
+            node,
+            physical,
+            window,
+            path.clone().field("window"),
+            physical_output_path.clone(),
+            children,
+            arena,
+            ctx,
+        ),
         plan::plan_node::Kind::Repeat(repeat) => {
             lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
         }

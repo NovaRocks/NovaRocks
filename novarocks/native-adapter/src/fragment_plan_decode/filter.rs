@@ -15,17 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-dispatch regression coverage for Adapter-owned TopN projection.
+//! Native filter-node decoding.
 
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
 
+    use super::super::DecodedNode;
     use super::super::{NativePlanDecodeContext, decode_node};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
+    use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")
@@ -53,23 +55,15 @@ mod tests {
         }
     }
 
-    fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
+    fn bool_literal(value: bool) -> expr::Expr {
         expr::Expr {
-            r#type: Some(type_desc(&data_type)),
-            nullable: true,
-            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
-                column_id,
-                qualifier: None,
-                column: None,
+            r#type: Some(type_desc(&DataType::Boolean)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::BoolValue(value)),
+                }),
             })),
-        }
-    }
-
-    fn sort_item(column_id: u32) -> expr::SortItem {
-        expr::SortItem {
-            expr: Some(column_ref(column_id, DataType::Int64)),
-            asc: true,
-            nulls_first: false,
         }
     }
 
@@ -109,51 +103,39 @@ mod tests {
         )
     }
 
-    fn lower(node: &plan::DistributedNode) -> super::super::DecodedNode {
+    fn lower(node: &plan::DistributedNode) -> DecodedNode {
         let mut arena = ExprArena::default();
         decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
     }
 
     #[test]
-    fn lowers_partial_split_topn() {
-        let topn = physical_node(
-            30,
-            plan::plan_node::Kind::Topn(plan::TopNNode {
-                items: vec![sort_item(1)],
-                limit: Some(3),
-                offset: Some(0),
-                phase: plan::TopNPhase::TopnPhasePartial as i32,
-                is_split: true,
+    fn lowers_filter_limit_shape() {
+        let filter = physical_node(
+            20,
+            plan::plan_node::Kind::Filter(plan::FilterNode {
+                predicate: Some(bool_literal(true)),
             }),
             Vec::new(),
             vec![one_col_values_node(10)],
         );
-        let lowered = lower(&topn);
-        let ExecNodeKind::Sort(topn) = lowered.node.kind else {
-            panic!("expected split TopN as Sort");
-        };
-        assert!(topn.use_top_n);
-        assert_eq!(topn.limit, Some(3));
-        assert_eq!(topn.offset, 0);
-    }
+        let limit = physical_node(
+            30,
+            plan::plan_node::Kind::Limit(plan::LimitNode {
+                limit: Some(5),
+                offset: Some(1),
+            }),
+            Vec::new(),
+            vec![filter],
+        );
 
-    #[test]
-    fn rejects_final_split_topn_physical_node() {
-        let topn = physical_node(
-            30,
-            plan::plan_node::Kind::Topn(plan::TopNNode {
-                items: vec![sort_item(1)],
-                limit: Some(3),
-                offset: Some(0),
-                phase: plan::TopNPhase::TopnPhaseFinal as i32,
-                is_split: true,
-            }),
-            Vec::new(),
-            vec![one_col_values_node(10)],
-        );
-        let mut arena = ExprArena::default();
-        let err = decode_node(&topn, &mut arena, &NativePlanDecodeContext::default()).unwrap_err();
-        assert!(err.contains("TopNNode final split"));
-        assert!(err.contains("ExchangeReceiver TopNSplit"));
+        let lowered = lower(&limit);
+        let ExecNodeKind::Limit(limit) = lowered.node.kind else {
+            panic!("expected Limit");
+        };
+        assert_eq!(limit.node_id, 30);
+        assert_eq!(limit.limit, Some(5));
+        assert_eq!(limit.offset, 1);
+        assert!(matches!(limit.input.kind, ExecNodeKind::Filter(_)));
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
     }
 }

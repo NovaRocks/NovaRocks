@@ -1,4 +1,4 @@
-//! Backend-dispatch regression coverage for Adapter-owned table functions.
+//! Native table-function decoder integration coverage.
 
 #[cfg(test)]
 mod tests {

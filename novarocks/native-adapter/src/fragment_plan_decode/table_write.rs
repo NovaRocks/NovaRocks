@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fragment decoding of the two dataflow write nodes.
+//! Native decoding of the two dataflow write nodes.
 //!
 //! A `TableWriter` is an ordinary unary processor: it names one exact
 //! query-leased catalog runtime, one query-local logical write target, and the
@@ -70,17 +70,17 @@ const MAX_WRITE_UNPIVOT_MAPPINGS: usize = 4_096;
 const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 
 use super::DecodedNode;
-use novarocks_execution::exec::chunk::SlotLayout as Layout;
-use novarocks_native_adapter::connector_write_data_plane::{
+use crate::connector_write_data_plane::{
     NativeConnectorWriteObservationPort, QueryScopedTableWriteAggregateGuard,
     RoleBoundCommitFragmentEncoder, RootCommitFragmentCarrierValidator,
 };
-use novarocks_native_adapter::fragment_aggregate::decode_resolved_aggregate_signature;
-use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
-use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
-use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
-use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
-use novarocks_native_adapter::fragment_plan_node::decode_unpivot_constant;
+use crate::fragment_aggregate::decode_resolved_aggregate_signature;
+use crate::fragment_decode_context::NativePlanDecodeContext;
+use crate::fragment_error::NativeFragmentDecodeError;
+use crate::fragment_expression::decode_expr_for_slot_layout;
+use crate::fragment_layout::decode_fragment_output_layout;
+use crate::fragment_plan_node::decode_unpivot_constant;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_worker::connector_write_runtime::ObservedConnectorWriteExecution;
 
 fn decode_writer_multiplex_schema(
@@ -855,7 +855,7 @@ pub(super) fn lower_table_writer_node(
         execution_id,
         node_id,
         Arc::new(NativeConnectorWriteObservationPort),
-        novarocks_native_adapter::debug_environment::debug_emit_connector_writer_marker(),
+        crate::debug_environment::debug_emit_connector_writer_marker(),
     ));
     let fragment_encoder = Arc::new(RoleBoundCommitFragmentEncoder::new(
         binding.fragment_encoder(),
@@ -1168,13 +1168,13 @@ mod tests {
     };
     use super::super::{DecodedNode, NativePlanDecodeContext, decode_node};
     use super::decode_writer_multiplex_schema;
-    use novarocks_native_adapter::connector_write_test_support::{
+    use crate::connector_write_test_support::{
         RecordingWriteExecution, TEST_WRITE_CATALOG, finish_node, iceberg_writer_handle,
         table_writer_payload, test_request_context, test_write_adapter, test_write_binding,
         test_write_catalog_handle, test_write_scan_runtime, wire_catalog_handle,
         writer_multiplex_schema, writer_node,
     };
-    use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+    use crate::fragment_error::NativeFragmentDecodeError;
 
     const CHILD_COLUMN_ID: u32 = 1;
 
@@ -1232,7 +1232,7 @@ mod tests {
                     sink_io_max_blocking_threads: 1,
                 },
                 test_execution_function_set(),
-                novarocks_native_adapter::backend_test_support::test_memory_authority(),
+                crate::backend_test_support::test_memory_authority(),
             )
             .expect("writer execution runtime"),
         );
@@ -1257,9 +1257,7 @@ mod tests {
                 fragment_instance_id(),
                 execution,
             )))
-            .with_connector_cancellation(
-                novarocks_native_adapter::connector_write_test_support::never_cancelled(),
-            )
+            .with_connector_cancellation(crate::connector_write_test_support::never_cancelled())
             .with_fragment_instance_id(fragment_instance_id())
             .with_function_catalog(Arc::new(
                 novarocks_sql::compiler::build_builtin_engine_function_catalog()

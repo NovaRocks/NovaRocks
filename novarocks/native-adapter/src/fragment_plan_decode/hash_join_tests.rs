@@ -1,4 +1,5 @@
-// Backend recursive plan traversal coverage for adapter-owned hash-join lowering.
+//! Native hash-join decoder integration coverage.
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;

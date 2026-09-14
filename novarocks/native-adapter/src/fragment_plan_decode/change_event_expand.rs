@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-dispatch regression coverage for Adapter-owned change-event expansion.
+//! Native change-event expansion decoder integration coverage.
 
 #[cfg(test)]
 mod tests {

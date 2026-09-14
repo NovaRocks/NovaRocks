@@ -31,21 +31,19 @@ use novarocks_proto_codec::lifecycle::decode_query_execution_id;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_types::{QueryExecutionId, QueryId, UniqueId};
 
-use novarocks_native_adapter::fragment_ingress_error::NativeFragmentIngressError;
+use crate::fragment_ingress_error::NativeFragmentIngressError;
 
-use super::plan::submission::decode_fragment_submission;
-use novarocks_native_adapter::fragment_instance::{
-    decode_instance_params, decode_instance_params_with_query_options,
-};
+use crate::fragment_instance::{decode_instance_params, decode_instance_params_with_query_options};
+use crate::fragment_plan_decode_submission::decode_fragment_submission;
 
-pub(crate) struct NativeFragmentRequest {
+pub struct NativeFragmentRequest {
     execution_id: QueryExecutionId,
     submission: FragmentSubmission,
     backend_num: i32,
 }
 
 #[cfg(test)]
-pub(crate) fn decode_native_query_execution_id(
+pub fn decode_native_query_execution_id(
     execution_id: &proto::QueryExecutionId,
 ) -> Result<QueryExecutionId, NativeFragmentIngressError> {
     decode_query_execution_id(execution_id).map_err(NativeFragmentIngressError::new)
@@ -77,7 +75,7 @@ impl NativeFragmentRequest {
         )
     }
 
-    pub(crate) fn try_decode_with_runtime(
+    pub fn try_decode_with_runtime(
         execution_id: QueryExecutionId,
         fragment: plan::PlanFragment,
         instance_params: proto::InstanceParams,
@@ -119,7 +117,7 @@ impl NativeFragmentRequest {
     /// Only `query_options` feeds plan lowering and the resulting submission;
     /// the copy in `instance_params` remains a redundant wire witness.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_decode_with_context_options(
+    pub fn try_decode_with_context_options(
         execution_id: QueryExecutionId,
         fragment: plan::PlanFragment,
         instance_params: proto::InstanceParams,
@@ -156,49 +154,47 @@ impl NativeFragmentRequest {
         })
     }
 
-    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
+    pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
     }
-    pub(crate) const fn query_id(&self) -> QueryId {
+    pub const fn query_id(&self) -> QueryId {
         self.submission.instance().query_id()
     }
-    pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
+    pub const fn fragment_instance_id(&self) -> UniqueId {
         self.submission.instance().fragment_instance_id().get()
     }
-    pub(crate) const fn backend_num(&self) -> i32 {
+    pub const fn backend_num(&self) -> i32 {
         self.backend_num
     }
-    pub(crate) fn enable_profile(&self) -> bool {
+    pub fn enable_profile(&self) -> bool {
         self.query_options().enable_profile()
     }
-    pub(crate) fn runtime_profile_report_interval_seconds(&self) -> Option<i64> {
+    pub fn runtime_profile_report_interval_seconds(&self) -> Option<i64> {
         self.query_options().runtime_profile_report_interval()
     }
-    pub(crate) fn query_expire_durations(&self) -> (Duration, Duration) {
+    pub fn query_expire_durations(&self) -> (Duration, Duration) {
         novarocks_execution::runtime::query_options::query_expire_durations(Some(
             self.query_options(),
         ))
     }
-    pub(crate) fn exec_mem_limit(&self) -> Option<i64> {
+    pub fn exec_mem_limit(&self) -> Option<i64> {
         self.query_options().exec_mem_limit()
     }
-    pub(crate) fn has_runtime_filter_bindings(&self) -> bool {
+    pub fn has_runtime_filter_bindings(&self) -> bool {
         self.submission.program().runtime_filters().has_bindings()
     }
-    pub(crate) fn uses_result_sink(&self) -> bool {
+    pub fn uses_result_sink(&self) -> bool {
         self.submission.program().sink().kind()
             == novarocks_execution::exec::fragment::program::FragmentSinkKind::Result
     }
-    pub(crate) fn root_plan_node_id(&self) -> i32 {
+    pub fn root_plan_node_id(&self) -> i32 {
         self.submission.program().root_plan_node_id().get()
     }
-    pub(crate) fn into_submission(self) -> FragmentSubmission {
+    pub fn into_submission(self) -> FragmentSubmission {
         self.submission
     }
 
-    pub(crate) fn query_options(
-        &self,
-    ) -> &novarocks_execution::runtime::query_options::QueryOptions {
+    pub fn query_options(&self) -> &novarocks_execution::runtime::query_options::QueryOptions {
         self.submission.instance().runtime_options().query_options()
     }
 }

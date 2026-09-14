@@ -31,19 +31,17 @@ use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorCancellation;
 
-use novarocks_native_adapter::fragment_validation::{
-    validate_fragment_expressions, validate_node_required_fields,
-};
+use crate::fragment_validation::{validate_fragment_expressions, validate_node_required_fields};
 
-use super::node::decode_node_with_runtime_filters;
-use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
-use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
-use novarocks_native_adapter::fragment_instance::NativeFragmentInstanceInput;
-use novarocks_native_adapter::fragment_layout::decode_exchange_contracts;
-use novarocks_native_adapter::fragment_runtime_filter::decode_runtime_filter_contract;
-use novarocks_native_adapter::fragment_runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
-use novarocks_native_adapter::fragment_sink::decode_fragment_sink_program;
-use novarocks_native_adapter::fragment_submission::{
+use crate::fragment_decode_context::NativePlanDecodeContext;
+use crate::fragment_error::NativeFragmentDecodeError;
+use crate::fragment_instance::NativeFragmentInstanceInput;
+use crate::fragment_layout::decode_exchange_contracts;
+use crate::fragment_plan_decode::decode_node_with_runtime_filters;
+use crate::fragment_runtime_filter::decode_runtime_filter_contract;
+use crate::fragment_runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
+use crate::fragment_sink::decode_fragment_sink_program;
+use crate::fragment_submission::{
     decode_fragment_sink_assignment, decode_scan_source_contracts, require_root, require_sink,
     validate_scan_range_nodes,
 };
@@ -168,8 +166,8 @@ mod tests {
     use novarocks_types::UniqueId;
 
     use super::{DecodedNativeFragment, NativeFragmentDecodeError, decode_fragment_submission};
-    use crate::fragment::decode::request::NativeFragmentRequest;
-    use novarocks_native_adapter::fragment_instance::decode_instance_params;
+    use crate::fragment_instance::decode_instance_params;
+    use crate::fragment_request::NativeFragmentRequest;
     use novarocks_plan_codec::encode_native_type as encode_type;
 
     struct NeverCancelled;
@@ -272,10 +270,8 @@ mod tests {
     fn decode_request(
         fragment: plan::PlanFragment,
         params: proto::InstanceParams,
-    ) -> Result<
-        NativeFragmentRequest,
-        novarocks_native_adapter::fragment_ingress_error::NativeFragmentIngressError,
-    > {
+    ) -> Result<NativeFragmentRequest, crate::fragment_ingress_error::NativeFragmentIngressError>
+    {
         let query_id = params.query_id.as_ref().expect("test query id");
         NativeFragmentRequest::try_decode(
             QueryExecutionId::new(
@@ -302,10 +298,10 @@ mod tests {
     fn expect_request_error(
         result: Result<
             NativeFragmentRequest,
-            novarocks_native_adapter::fragment_ingress_error::NativeFragmentIngressError,
+            crate::fragment_ingress_error::NativeFragmentIngressError,
         >,
         message: &str,
-    ) -> novarocks_native_adapter::fragment_ingress_error::NativeFragmentIngressError {
+    ) -> crate::fragment_ingress_error::NativeFragmentIngressError {
         match result {
             Ok(_) => panic!("{message}"),
             Err(error) => error,

@@ -1,4 +1,4 @@
-//! Backend-dispatch regression coverage for Adapter-owned nested-loop joins.
+//! Native nested-loop decoder integration coverage.
 
 #[cfg(test)]
 mod tests {

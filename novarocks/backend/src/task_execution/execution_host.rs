@@ -87,7 +87,7 @@ use novarocks_types::{QueryExecutionId, UniqueId};
 use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInboundCapabilities};
 use tracing::debug;
 
-use crate::fragment::decode::request::NativeFragmentRequest;
+use novarocks_native_adapter::fragment_request::NativeFragmentRequest;
 use novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_native_adapter::task_shared_facts::fragment_plan;
