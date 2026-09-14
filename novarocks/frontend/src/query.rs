@@ -308,6 +308,40 @@ impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
     }
 }
 
+/// Builds the role-local product adapters at Frontend role composition.
+///
+/// Query Application owns the closed command router and selects a consumer
+/// after semantic lowering. This factory stays at the outer role boundary so
+/// the query session receives an already-composed router rather than choosing
+/// or constructing product adapters itself.
+pub(crate) fn product_command_router(
+    catalog: CatalogCommandExecutor,
+    view: ViewCommandExecutor,
+    iceberg_ref: IcebergRefCommandExecutor,
+    statistics: StatisticsCommandExecutor,
+    maintenance: MaintenanceCommandExecutor,
+    maintenance_read: MaintenanceReadCommandExecutor,
+    executor: QueryBlockingExecutor,
+) -> ProductCommandRouter {
+    ProductCommandRouter::new(
+        Arc::new(FrontendCatalogCommandConsumer {
+            catalog,
+            view,
+            iceberg_ref,
+            executor: executor.clone(),
+        }),
+        Arc::new(FrontendStatisticsCommandConsumer {
+            statistics,
+            executor: executor.clone(),
+        }),
+        Arc::new(FrontendMaintenanceCommandConsumer {
+            maintenance,
+            maintenance_read,
+            executor,
+        }),
+    )
+}
+
 #[derive(Clone)]
 struct TypedCommandRoute {
     backend: BackendCommandExecutor,
@@ -592,15 +626,11 @@ impl FrontendQueryService {
     pub(crate) fn new(
         session_catalog_resolver: SessionCatalogService,
         query_compiler: FrontendQueryCompiler,
-        catalog_command_executor: CatalogCommandExecutor,
-        statistics_command_executor: StatisticsCommandExecutor,
+        product_command_router: ProductCommandRouter,
         backend_command_executor: BackendCommandExecutor,
         view_command_executor: ViewCommandExecutor,
-        iceberg_ref_command_executor: IcebergRefCommandExecutor,
         mv_command_consumer: Arc<dyn MaterializedViewCommandConsumer>,
         mv_command_executor: MvCommandExecutor,
-        maintenance_command_executor: MaintenanceCommandExecutor,
-        maintenance_read_command_executor: MaintenanceReadCommandExecutor,
         query_control: QueryControlService,
         client_connection_control: Arc<dyn ClientConnectionControlPort>,
         query_execution: QueryExecutionService,
@@ -622,23 +652,6 @@ impl FrontendQueryService {
         lake_publication_runtime_policy: LakePublicationRuntimePolicy,
         serving_admission: FrontendServingAdmission,
     ) -> Self {
-        let product_command_router = ProductCommandRouter::new(
-            Arc::new(FrontendCatalogCommandConsumer {
-                catalog: catalog_command_executor,
-                view: view_command_executor.clone(),
-                iceberg_ref: iceberg_ref_command_executor,
-                executor: query_blocking_executor.clone(),
-            }),
-            Arc::new(FrontendStatisticsCommandConsumer {
-                statistics: statistics_command_executor,
-                executor: query_blocking_executor.clone(),
-            }),
-            Arc::new(FrontendMaintenanceCommandConsumer {
-                maintenance: maintenance_command_executor,
-                maintenance_read: maintenance_read_command_executor,
-                executor: query_blocking_executor.clone(),
-            }),
-        );
         Self {
             session_catalog_resolver,
             query_compiler,

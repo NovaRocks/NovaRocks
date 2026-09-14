@@ -555,6 +555,15 @@ fn build_frontend_query_session_factory_from_role_products(
         core_capabilities::maintenance_command_executor(maintenance_ports);
     let maintenance_read_command_executor =
         core_capabilities::maintenance_read_command_executor(maintenance_service);
+    let product_command_router = crate::query::product_command_router(
+        catalog_command_executor,
+        view_command_executor.clone(),
+        iceberg_ref_command_executor.clone(),
+        statistics_command_executor,
+        maintenance_command_executor,
+        maintenance_read_command_executor,
+        host.query_blocking_executor(),
+    );
     let dml_engines = core_capabilities::dml_engines(core_capabilities::DmlEnginePorts::new(
         function_catalog,
         Arc::clone(&catalog_service),
@@ -569,15 +578,11 @@ fn build_frontend_query_session_factory_from_role_products(
     let query_service = Arc::new(crate::query::FrontendQueryService::new(
         session_catalog_resolver,
         query_compiler,
-        catalog_command_executor,
-        statistics_command_executor,
+        product_command_router,
         backend_command_executor,
         view_command_executor,
-        iceberg_ref_command_executor,
         mv_command_consumer,
         mv_command_executor,
-        maintenance_command_executor,
-        maintenance_read_command_executor,
         products.query_control.clone(),
         client_connection_control,
         query_execution,
