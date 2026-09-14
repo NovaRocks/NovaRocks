@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Closed capability for typed Iceberg branch and tag mutations.
+//! Closed capability for semantic Iceberg branch and tag mutations.
 
 use std::sync::Arc;
 
@@ -41,9 +41,9 @@ impl IcebergRefCommandExecutor {
         }
     }
 
-    pub fn execute(
+    pub fn execute_command(
         &self,
-        statement: &novarocks_parser::ast::AlterIcebergTable,
+        statement: &novarocks_sql::semantic::command::AlterIcebergTableSqlCommand,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
