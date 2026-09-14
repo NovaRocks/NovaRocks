@@ -21,23 +21,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use crate::fragment_error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
-use novarocks_native_adapter::fragment_error::{
-    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
-};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 
-use novarocks_native_adapter::runtime_filter_membership::{
-    MembershipContractDecodeError, decode_membership_contract,
-};
+use crate::runtime_filter_membership::{MembershipContractDecodeError, decode_membership_contract};
 
 /// Backend-local producer attachment target decoded from the native fragment
 /// binding table. It is translated into the corresponding neutral execution
 /// constructor at the physical node boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProducerBindingTarget {
+pub enum ProducerBindingTarget {
     JoinBuildKey { ordinal: usize },
     AggregateTopNKey { ordinal: usize, limit: NonZeroU32 },
 }
@@ -47,24 +43,24 @@ pub(crate) enum ProducerBindingTarget {
     dead_code,
     reason = "Retained for target-specific native integration and regression coverage."
 )]
-pub(crate) struct DecodedRuntimeFilterBinding {
-    pub(crate) binding_id: u32,
-    pub(crate) channel_id: u32,
-    pub(crate) node_id: i32,
-    pub(crate) apply_point: DecodedApplyPoint,
-    pub(crate) expression: expr::Expr,
-    pub(crate) expression_path: FieldPath,
-    pub(crate) role: DecodedBindingRole,
+pub struct DecodedRuntimeFilterBinding {
+    pub binding_id: u32,
+    pub channel_id: u32,
+    pub node_id: i32,
+    pub apply_point: DecodedApplyPoint,
+    pub expression: expr::Expr,
+    pub expression_path: FieldPath,
+    pub role: DecodedBindingRole,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DecodedApplyPoint {
+pub enum DecodedApplyPoint {
     NodeInput,
     NodeOutput,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DecodedBindingRole {
+pub enum DecodedBindingRole {
     Producer {
         contract: execution::RuntimeFilterProducerContract,
         target: ProducerBindingTarget,
@@ -76,7 +72,7 @@ pub(crate) enum DecodedBindingRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DecodedConsumerBindingTarget {
+pub enum DecodedConsumerBindingTarget {
     DirectInput {
         input_ordinal: usize,
     },
@@ -94,9 +90,9 @@ pub(crate) enum DecodedConsumerBindingTarget {
 /// `ColumnHandle`.  This target carries only the exact type contract the
 /// consumer expression was frozen against.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DecodedRuntimeFilterScanDomainTarget {
-    pub(crate) data_type: DataType,
-    pub(crate) nullable: bool,
+pub struct DecodedRuntimeFilterScanDomainTarget {
+    pub data_type: DataType,
+    pub nullable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,7 +125,7 @@ enum WireArtifactCapability {
     EmptyDomain,
 }
 
-pub(crate) struct NativeRuntimeFilterDecodeLedger {
+pub struct NativeRuntimeFilterDecodeLedger {
     fragment_id: u32,
     records: BTreeMap<u32, DecodedRuntimeFilterBinding>,
     consumed: BTreeMap<u32, ()>,
@@ -140,7 +136,7 @@ pub(crate) struct NativeRuntimeFilterDecodeLedger {
     reason = "Retained for target-specific native integration and regression coverage."
 )]
 impl NativeRuntimeFilterDecodeLedger {
-    pub(crate) fn decode(
+    pub fn decode(
         enclosing_fragment_id: u32,
         table: Option<&plan::RuntimeFilterBindingTable>,
     ) -> Result<Self, NativeFragmentDecodeError> {
@@ -236,7 +232,7 @@ impl NativeRuntimeFilterDecodeLedger {
         Ok(record)
     }
 
-    pub(super) fn peek_attached(
+    pub fn peek_attached(
         &self,
         binding_ids: &[u32],
         node_id: i32,
@@ -269,7 +265,7 @@ impl NativeRuntimeFilterDecodeLedger {
         Ok(())
     }
 
-    pub(super) fn commit_consumed_many(
+    pub fn commit_consumed_many(
         &mut self,
         binding_ids: &[u32],
     ) -> Result<(), NativeFragmentLeafDecodeError> {
@@ -292,7 +288,7 @@ impl NativeRuntimeFilterDecodeLedger {
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> Result<(), NativeFragmentDecodeError> {
+    pub fn finish(self) -> Result<(), NativeFragmentDecodeError> {
         self.finish_impl().map_err(|error| {
             error.into_native(FieldPath::root("plan_fragment").field("runtime_filter_bindings"))
         })
@@ -345,11 +341,8 @@ fn decode_binding(
             "runtime-filter binding requires expression",
         )
     })?;
-    novarocks_native_adapter::fragment_expression::validate_proto_expr_shape_at(
-        &expression,
-        expression_path.clone(),
-    )
-    .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))?;
+    crate::fragment_expression::validate_proto_expr_shape_at(&expression, expression_path.clone())
+        .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))?;
     let expression_type = novarocks_plan_codec::native_type::decode_type(
         expression.r#type.as_ref().expect("checked"),
     )

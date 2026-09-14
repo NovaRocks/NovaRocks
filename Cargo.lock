@@ -4045,6 +4045,7 @@ dependencies = [
  "prost 0.13.5",
  "protoc-bin-vendored",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tonic",

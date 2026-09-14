@@ -5,6 +5,5 @@
 //! never installs lifecycle or runtime state.
 
 pub(crate) mod node;
-pub(crate) mod runtime_filter_binding;
 pub(crate) mod scan;
 pub(crate) mod submission;

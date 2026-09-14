@@ -42,10 +42,6 @@ mod window;
 use novarocks_execution::runtime_filter as execution;
 use std::collections::BTreeMap;
 
-use crate::fragment::decode::plan::runtime_filter_binding::{
-    DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
-    NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
-};
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::ExprArena;
@@ -68,6 +64,10 @@ use novarocks_native_adapter::fragment_plan_node::{
     lower_limit_node, lower_nest_loop_join_node, lower_project_node, lower_redistribute_node,
     lower_repeat_node, lower_set_op_node, lower_sort_node, lower_table_function_node,
     lower_topn_node, lower_unpivot_node, lower_values_node, validate_distributed_node_children,
+};
+use novarocks_native_adapter::fragment_runtime_filter_binding::{
+    DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
+    NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -419,7 +419,7 @@ fn attach_leaf_consumers(
 
 fn validate_scan_domain_target(
     binding: &DecodedRuntimeFilterBinding,
-    target: &crate::fragment::decode::plan::runtime_filter_binding::DecodedRuntimeFilterScanDomainTarget,
+    target: &novarocks_native_adapter::fragment_runtime_filter_binding::DecodedRuntimeFilterScanDomainTarget,
     path: FieldPath,
 ) -> Result<(), NativeFragmentDecodeError> {
     use novarocks_proto_models::expr::expr::Kind;

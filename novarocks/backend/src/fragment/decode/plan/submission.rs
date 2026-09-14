@@ -36,12 +36,12 @@ use novarocks_native_adapter::fragment_validation::{
 };
 
 use super::node::decode_node_with_runtime_filters;
-use super::runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
 use novarocks_native_adapter::fragment_decode_context::NativePlanDecodeContext;
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_instance::NativeFragmentInstanceInput;
 use novarocks_native_adapter::fragment_layout::decode_exchange_contracts;
 use novarocks_native_adapter::fragment_runtime_filter::decode_runtime_filter_contract;
+use novarocks_native_adapter::fragment_runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
 use novarocks_native_adapter::fragment_sink::decode_fragment_sink_program;
 use novarocks_native_adapter::fragment_submission::{
     decode_fragment_sink_assignment, decode_scan_source_contracts, require_root, require_sink,
