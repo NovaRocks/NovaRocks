@@ -707,8 +707,6 @@ impl FrontendLogicalExecutionRuntimeConfig {
 
 #[derive(Clone)]
 pub struct FrontendExecutionConfig {
-    advertised_report_host: String,
-    configured_report_port: u16,
     runtime_filter_worker_count: NonZeroUsize,
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
@@ -763,16 +761,12 @@ pub struct FrontendExecutionConfig {
 
 impl FrontendExecutionConfig {
     pub fn new(
-        advertised_report_host: impl Into<String>,
-        configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         logical_runtime: FrontendLogicalExecutionRuntimeConfig,
     ) -> Self {
         Self {
-            advertised_report_host: advertised_report_host.into(),
-            configured_report_port,
             runtime_filter_worker_count,
             native_compatibility_id,
             function_catalog,
@@ -830,15 +824,11 @@ impl FrontendExecutionConfig {
     /// In-process test convenience with deterministic local governance bounds.
     #[doc(hidden)]
     pub fn new_for_test(
-        advertised_report_host: impl Into<String>,
-        configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     ) -> Self {
         Self::new(
-            advertised_report_host,
-            configured_report_port,
             runtime_filter_worker_count,
             native_compatibility_id,
             function_catalog,
@@ -2066,8 +2056,6 @@ mod tests {
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                0,
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 std::sync::Arc::new(

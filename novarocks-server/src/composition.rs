@@ -521,8 +521,6 @@ pub fn compose_frontend_role_config(
         abort_capacity,
     );
     let mut execution = FrontendExecutionConfig::new(
-        native_trust.advertised_endpoint().host().to_string(),
-        native_trust.advertised_endpoint().port(),
         runtime_filter_worker_count,
         native_compatibility_id,
         function_catalog,

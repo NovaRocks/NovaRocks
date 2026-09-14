@@ -54,8 +54,6 @@ fn test_native_trust() -> Arc<NativeTrust> {
 
 fn execution_config() -> FrontendExecutionConfig {
     FrontendExecutionConfig::new_for_test(
-        "127.0.0.1",
-        19090,
         std::num::NonZeroUsize::new(1).unwrap(),
         novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         std::sync::Arc::new(

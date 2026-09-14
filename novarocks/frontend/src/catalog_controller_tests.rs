@@ -641,8 +641,6 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
             None,
             &registry,
             FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                19090,
                 std::num::NonZeroUsize::new(1).expect("one worker"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 std::sync::Arc::new(

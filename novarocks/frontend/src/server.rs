@@ -1355,8 +1355,6 @@ mod tests {
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
@@ -1471,8 +1469,6 @@ mod tests {
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                0,
                 std::num::NonZeroUsize::new(1).unwrap(),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
@@ -1520,8 +1516,6 @@ mod tests {
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
@@ -1576,8 +1570,6 @@ mod tests {
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
@@ -1688,8 +1680,6 @@ mod tests {
             Some(test_state_store_input("server-bounded-shutdown-owner")),
             &registry,
             FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                0,
                 NonZeroUsize::new(1).unwrap(),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
@@ -1738,8 +1728,6 @@ mod tests {
             Some(test_state_store_input("server-drain-closes-root-admission")),
             &registry,
             FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                0,
                 NonZeroUsize::new(1).unwrap(),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),

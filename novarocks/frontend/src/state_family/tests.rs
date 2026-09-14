@@ -236,8 +236,6 @@ async fn open_application(input: StateStoreHostInput) -> FrontendApplicationHost
         Some(input),
         &registry,
         FrontendExecutionConfig::new_for_test(
-            "127.0.0.1",
-            19310,
             std::num::NonZeroUsize::new(1).unwrap(),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             std::sync::Arc::new(
