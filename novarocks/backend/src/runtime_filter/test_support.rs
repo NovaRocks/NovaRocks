@@ -15,9 +15,7 @@ use novarocks_worker::runtime_filter::domain::BackendParticipantIdentity;
 /// decided" from "nobody was asked".
 pub(crate) fn participant_for_test()
 -> std::sync::Arc<novarocks_native_adapter::runtime_filter_participant::RuntimeFilterParticipant> {
-    use super::participant::{
-        BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
-    };
+    use novarocks_native_adapter::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
 
     let contribution = novarocks_proto_codec::lifecycle::RuntimeFilterContribution::parse(
         novarocks_proto_models::novarocks::RuntimeFilterContribution {
@@ -45,7 +43,7 @@ pub(crate) fn participant_for_test()
             &contribution,
         )
         .expect("a channel-less contribution decodes");
-    BackendRuntimeFilterParticipantFactory::new(
+    NativeRuntimeFilterParticipantFactory::new(
         novarocks_native_adapter::backend_test_support::test_backend_data_runtime(),
     )
     .install(participant_execution_id(), decoded)

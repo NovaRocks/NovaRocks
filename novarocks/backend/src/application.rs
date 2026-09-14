@@ -37,6 +37,7 @@ use novarocks_native_adapter::backend_metrics::BackendMetricsRegistry;
 use novarocks_native_adapter::backend_rpc_service::BackendRpcService;
 use novarocks_native_adapter::fragment_result_writer::native_result_writer;
 use novarocks_native_adapter::management_http::MetricsHttpServer;
+use novarocks_native_adapter::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
 use novarocks_native_adapter::task_execution_observation::backend_task_execution_ports;
 use novarocks_native_adapter::{
     BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
@@ -387,14 +388,13 @@ fn compose_backend_application_services(
     .publish_resource_snapshot();
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
+    let runtime_filter_factory = NativeRuntimeFilterParticipantFactory::new(data_runtime.clone());
     let context_host = Arc::new(crate::task_execution::NativeQueryContextHost::new(
         Arc::clone(&catalog_manager),
         Arc::clone(&execution_role_binding_factories),
-        Arc::new(
-            crate::runtime_filter::participant::BackendRuntimeFilterParticipantFactory::new(
-                data_runtime.clone(),
-            ),
-        ),
+        Arc::new(move |execution_id, contribution| {
+            runtime_filter_factory.install(execution_id, contribution)
+        }),
         data_runtime.clone(),
     ));
     let inbound_capabilities = novarocks_worker::TaskInboundCapabilities::new();

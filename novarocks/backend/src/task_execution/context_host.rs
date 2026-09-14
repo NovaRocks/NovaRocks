@@ -69,7 +69,6 @@ use novarocks_types::QueryExecutionId;
 use tracing::error;
 
 use super::execution_host::QueryContextOptions;
-use crate::runtime_filter::participant::RuntimeFilterParticipantFactory;
 use novarocks_native_adapter::{
     BackendDataRuntime,
     runtime_filter_feedback::TaskRuntimeFilterFeedbackEgress,
@@ -92,6 +91,13 @@ use novarocks_worker::{
     QueryContextHost, ReleasedContextEvidence, SharedFactsRequest, TaskStatusReporter,
 };
 use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
+
+type RuntimeFilterParticipantInstaller = dyn Fn(
+        QueryExecutionId,
+        DecodedRuntimeFilterContribution,
+    ) -> Result<Arc<RuntimeFilterParticipant>, RuntimeFilterContractError>
+    + Send
+    + Sync;
 
 /// The mutable half of one context's installed facts.
 ///
@@ -217,7 +223,7 @@ impl HostContexts {
 pub struct NativeQueryContextHost {
     catalog_manager: Arc<CatalogManager<ConnectorExecutionRoleBinding>>,
     execution_role_binding_factories: Arc<ConnectorExecutionRoleBindingFactorySet>,
-    runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
+    runtime_filter_installer: Arc<RuntimeFilterParticipantInstaller>,
     catalog_install_runtime: BackendDataRuntime,
     contexts: Mutex<HostContexts>,
 }
@@ -239,18 +245,18 @@ impl fmt::Debug for NativeQueryContextHost {
 }
 
 impl NativeQueryContextHost {
-    /// Crate-private because it names the backend-private runtime-filter
-    /// participant factory: only this process's own composition can build one.
+    /// Crate-private because only this process's composition can install a
+    /// Native runtime-filter participant around a Worker participant.
     pub(crate) fn new(
         catalog_manager: Arc<CatalogManager<ConnectorExecutionRoleBinding>>,
         execution_role_binding_factories: Arc<ConnectorExecutionRoleBindingFactorySet>,
-        runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
+        runtime_filter_installer: Arc<RuntimeFilterParticipantInstaller>,
         catalog_install_runtime: BackendDataRuntime,
     ) -> Self {
         Self {
             catalog_manager,
             execution_role_binding_factories,
-            runtime_filter_factory,
+            runtime_filter_installer,
             catalog_install_runtime,
             contexts: Mutex::new(HostContexts::default()),
         }
@@ -528,9 +534,7 @@ impl NativeQueryContextHost {
         }
 
         if let Some(decoded) = decoded_contribution(execution_id, contribution)? {
-            let participant = self
-                .runtime_filter_factory
-                .install(execution_id, decoded)
+            let participant = (self.runtime_filter_installer)(execution_id, decoded)
                 .map_err(runtime_filter_rejection)?;
             self.adopt_participant(context, installed, participant)?;
         }
@@ -851,10 +855,9 @@ impl QueryContextHost for NativeQueryContextHost {
                         return Err(sealed_participant());
                     }
                 }
-                let participant = self
-                    .runtime_filter_factory
-                    .install(context.query_execution_id(), decoded)
-                    .map_err(runtime_filter_rejection)?;
+                let participant =
+                    (self.runtime_filter_installer)(context.query_execution_id(), decoded)
+                        .map_err(runtime_filter_rejection)?;
                 self.adopt_participant(context, &installed, participant)
             }
             QueryContextDomainUpdate::Credential(update) => {
@@ -1220,14 +1223,13 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
 
-    use crate::runtime_filter::participant::{
-        BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
-    };
     use crate::task_execution::execution_host::TaskQueryContextFacts;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_native_adapter::backend_test_support::test_backend_data_runtime;
     use novarocks_native_adapter::runtime_filter_install::DecodedRuntimeFilterContribution;
-    use novarocks_native_adapter::runtime_filter_participant::RuntimeFilterParticipant;
+    use novarocks_native_adapter::runtime_filter_participant::{
+        NativeRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
+    };
     use novarocks_native_adapter::task_shared_facts::release_runtime_filter_telemetry;
     use novarocks_worker::QueryContextHost;
     use novarocks_worker::{
@@ -1401,7 +1403,7 @@ mod tests {
         }
     }
 
-    impl RuntimeFilterParticipantFactory for RecordingFilterFactory {
+    impl RecordingFilterFactory {
         fn install(
             &self,
             execution_id: QueryExecutionId,
@@ -1409,7 +1411,7 @@ mod tests {
         ) -> Result<Arc<RuntimeFilterParticipant>, RuntimeFilterContractError> {
             self.ledger.installs.fetch_add(1, Ordering::SeqCst);
             let participant =
-                BackendRuntimeFilterParticipantFactory::new(test_backend_data_runtime())
+                NativeRuntimeFilterParticipantFactory::new(test_backend_data_runtime())
                     .install(execution_id, contribution)?;
             let ledger = Arc::clone(&self.ledger);
             Ok(
@@ -1522,10 +1524,13 @@ mod tests {
                 ])
                 .expect("legal factory set"),
             );
+            let filter_installer = Arc::clone(&filter_factory);
             let host = Arc::new(NativeQueryContextHost::new(
                 Arc::clone(&catalog_manager),
                 factories,
-                Arc::clone(&filter_factory) as Arc<dyn RuntimeFilterParticipantFactory>,
+                Arc::new(move |execution_id, contribution| {
+                    filter_installer.install(execution_id, contribution)
+                }),
                 test_backend_data_runtime(),
             ));
             Self {
