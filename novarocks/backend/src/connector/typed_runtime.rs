@@ -42,7 +42,7 @@
 //! compiles with no provider crate in the dependency graph.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use novarocks_execution::connector::{
@@ -63,13 +63,16 @@ use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::read_stack::CompleteAllDynamicFilter;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadDynamicFilter, ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider,
-    ConnectorSession, PageSourceFileMetrics,
+    ConnectorSession,
 };
 use novarocks_types::SlotId;
 use novarocks_worker::RuntimeFilterSessionResolver;
 use novarocks_worker::TypedConnectorReadDescriptor;
 use novarocks_worker::connector_batch_transform::ConnectorBatchTransform;
 use novarocks_worker::read_attempt::ReceivedReadSplit;
+use novarocks_worker::typed_page_source::{
+    RegisteredPageSource, TypedConnectorReaderMarker, TypedPageSourceGroup,
+};
 use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 
 /// How long a driver parks on an empty, non-terminal split queue before it
@@ -185,47 +188,6 @@ fn emit_page_source_marker(
         None => println!("{marker} plan_node={plan_node_id}"),
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
-}
-
-/// Test-only identity attached to one live typed connector page source.
-///
-/// The stable `UNIT_READER` event names predate the typed read stack, but the
-/// evidence contract is unchanged: OPEN means provider-owned read state is
-/// live on this backend and CLOSE means that state was released. Keeping the
-/// marker on the execution-owned page-source wrapper also guarantees terminal
-/// cleanup emits CLOSE exactly once, without adding a provider-specific hook.
-#[derive(Clone)]
-struct TypedConnectorReaderMarker {
-    provider_id: String,
-    instance_id: String,
-    catalog_version: String,
-    scheduled_split_sequence_id: u64,
-}
-
-impl TypedConnectorReaderMarker {
-    fn for_split(split: &ReceivedReadSplit, enabled: bool) -> Option<Self> {
-        if !enabled {
-            return None;
-        }
-        let binding = split.split().binding();
-        Some(Self {
-            provider_id: binding.descriptor().provider_id.as_str().to_string(),
-            instance_id: binding.descriptor().instance_id.as_str().to_string(),
-            catalog_version: hex::encode(binding.catalog_handle().version().as_bytes()),
-            scheduled_split_sequence_id: split.sequence_id(),
-        })
-    }
-
-    fn emit(&self, event: &str) {
-        println!(
-            "NOVAROCKS_CONNECTOR_UNIT_READER_{event} provider={} instance={} catalog_version={} scheduled_split_sequence_id={}",
-            self.provider_id,
-            self.instance_id,
-            self.catalog_version,
-            self.scheduled_split_sequence_id,
-        );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
 }
 
 /// A physical source for one typed connector scan node of one task attempt.
@@ -737,303 +699,6 @@ impl SplitWaiter {
     }
 }
 
-/// Fragment-local ownership of the page sources one typed scan opened.
-///
-/// Terminal scan lifecycle closes them explicitly; adapter `Drop` is only a
-/// final safety net. This mirrors the opaque connector reader group so both
-/// paths have one termination discipline.
-#[derive(Default)]
-struct TypedPageSourceGroup {
-    state: Mutex<TypedPageSourceGroupState>,
-}
-
-#[derive(Default)]
-struct TypedPageSourceGroupState {
-    phase: TypedPageSourcePhase,
-    next_id: usize,
-    open: BTreeMap<usize, SharedPageSource>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum TypedPageSourcePhase {
-    #[default]
-    Open,
-    Terminating,
-    Closed,
-}
-
-/// One adapter slot. `None` once closed, which is what makes closing
-/// idempotent no matter who wins the race.
-struct TypedPageSourceSlot {
-    adapter: Option<ConnectorPageAdapter>,
-    marker: Option<TypedConnectorReaderMarker>,
-    profile: Option<RuntimeProfile>,
-    last_file_metrics: PageSourceFileMetrics,
-}
-
-type SharedPageSource = Arc<Mutex<TypedPageSourceSlot>>;
-
-impl TypedPageSourceGroup {
-    fn register(
-        self: &Arc<Self>,
-        adapter: ConnectorPageAdapter,
-        marker: Option<TypedConnectorReaderMarker>,
-        profile: Option<RuntimeProfile>,
-    ) -> Result<RegisteredPageSource, String> {
-        let slot: SharedPageSource = Arc::new(Mutex::new(TypedPageSourceSlot {
-            adapter: Some(adapter),
-            marker: marker.clone(),
-            profile,
-            last_file_metrics: PageSourceFileMetrics::default(),
-        }));
-        let id = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| "typed connector page source group lock poisoned".to_string())?;
-            if state.phase != TypedPageSourcePhase::Open {
-                return Err(format!(
-                    "typed connector page source group is {:?}",
-                    state.phase
-                ));
-            }
-            let id = state.next_id;
-            state.next_id = state.next_id.saturating_add(1);
-            state.open.insert(id, Arc::clone(&slot));
-            id
-        };
-        if let Some(marker) = marker.as_ref() {
-            marker.emit("OPEN");
-        }
-        Ok(RegisteredPageSource {
-            slot,
-            group: Arc::downgrade(self),
-            id,
-        })
-    }
-
-    fn unregister(&self, id: usize) {
-        if let Ok(mut state) = self.state.lock() {
-            state.open.remove(&id);
-        }
-    }
-
-    fn is_terminal(&self) -> bool {
-        self.state
-            .lock()
-            .map(|state| state.phase != TypedPageSourcePhase::Open)
-            .unwrap_or(true)
-    }
-
-    /// Close every open page source exactly once and refuse any new one.
-    fn terminate(&self) -> Result<(), String> {
-        let open = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| "typed connector page source group lock poisoned".to_string())?;
-            if state.phase != TypedPageSourcePhase::Open {
-                return Ok(());
-            }
-            state.phase = TypedPageSourcePhase::Terminating;
-            std::mem::take(&mut state.open)
-                .into_values()
-                .collect::<Vec<_>>()
-        };
-        let mut cleanup_errors = Vec::new();
-        for slot in open {
-            if let Err(error) = close_slot(&slot) {
-                cleanup_errors.push(error);
-            }
-        }
-        match self.state.lock() {
-            Ok(mut state) => state.phase = TypedPageSourcePhase::Closed,
-            Err(_) => {
-                cleanup_errors.push("typed connector page source group lock poisoned".to_string());
-            }
-        }
-        if cleanup_errors.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "typed connector page source cleanup failed: {}",
-                cleanup_errors.join("; ")
-            ))
-        }
-    }
-}
-
-/// Close one slot's adapter if it is still open. Idempotent.
-fn close_slot(slot: &SharedPageSource) -> Result<(), String> {
-    let mut guard = slot
-        .lock()
-        .map_err(|_| "typed connector page source lock poisoned".to_string())?;
-    let Some(adapter) = guard.adapter.as_mut() else {
-        return Ok(());
-    };
-    let result = adapter.close().map_err(|error| error.to_string());
-    let metrics = adapter.metrics().file;
-    let profile = guard.profile.clone();
-    flush_page_source_file_metrics(profile.as_ref(), &mut guard.last_file_metrics, metrics);
-    // Dropped only after its own `close` ran, so the source is closed exactly
-    // once whether termination or the driver got here first.
-    guard.adapter = None;
-    if let Some(marker) = guard.marker.as_ref() {
-        marker.emit("CLOSE");
-    }
-    result
-}
-
-fn flush_page_source_file_metrics(
-    profile: Option<&RuntimeProfile>,
-    last: &mut PageSourceFileMetrics,
-    snapshot: PageSourceFileMetrics,
-) {
-    let delta = snapshot.saturating_delta_since(*last);
-    *last = snapshot;
-    let Some(profile) = profile else {
-        return;
-    };
-    for (name, unit, value) in [
-        (
-            "ConnectorFileBytesRead",
-            ProfileUnit::Bytes,
-            delta.bytes_read,
-        ),
-        (
-            "ConnectorFileReadRequests",
-            ProfileUnit::Unit,
-            delta.read_requests,
-        ),
-        (
-            "ConnectorFileRowsDecoded",
-            ProfileUnit::Unit,
-            delta.rows_decoded,
-        ),
-        (
-            "ConnectorFileBatchesDelivered",
-            ProfileUnit::Unit,
-            delta.batches_delivered,
-        ),
-        (
-            "ConnectorFileCacheHits",
-            ProfileUnit::Unit,
-            delta.cache_hits,
-        ),
-        (
-            "ConnectorFileCacheMisses",
-            ProfileUnit::Unit,
-            delta.cache_misses,
-        ),
-        ("ConnectorFileIoTime", ProfileUnit::TimeNs, delta.io_time_ns),
-        (
-            "ConnectorFileDecodeTime",
-            ProfileUnit::TimeNs,
-            delta.decode_time_ns,
-        ),
-        (
-            "ConnectorFileRowGroupsRead",
-            ProfileUnit::Unit,
-            delta.row_groups_read,
-        ),
-        (
-            "ConnectorFileRowGroupsPruned",
-            ProfileUnit::Unit,
-            delta.row_groups_pruned,
-        ),
-        (
-            "ConnectorFileDelayedMaterializationRanges",
-            ProfileUnit::Unit,
-            delta.delayed_materialization_ranges,
-        ),
-        (
-            "ConnectorFilePageIndexAttempts",
-            ProfileUnit::Unit,
-            delta.page_index_attempts,
-        ),
-        (
-            "ConnectorFilePageIndexFallbacks",
-            ProfileUnit::Unit,
-            delta.page_index_fallbacks,
-        ),
-        (
-            "ConnectorFilePageIndexRowsConsidered",
-            ProfileUnit::Unit,
-            delta.page_index_rows_considered,
-        ),
-        (
-            "ConnectorFilePageIndexRowsPruned",
-            ProfileUnit::Unit,
-            delta.page_index_rows_pruned,
-        ),
-    ] {
-        if value > 0 {
-            profile.counter_add(name, unit, value.min(i64::MAX as u64) as i64);
-        }
-    }
-}
-
-/// A page source owned by the group and read by exactly one driver.
-struct RegisteredPageSource {
-    slot: SharedPageSource,
-    group: Weak<TypedPageSourceGroup>,
-    id: usize,
-}
-
-impl RegisteredPageSource {
-    fn pull(&self) -> Result<PageConversion, String> {
-        let mut guard = self
-            .slot
-            .lock()
-            .map_err(|_| "typed connector page source lock poisoned".to_string())?;
-        let result = match guard.adapter.as_mut() {
-            // A source terminal cleanup already closed is finished, not idle:
-            // the driver must not ask the provider for another page.
-            None => return Ok(PageConversion::Finished),
-            Some(adapter) => adapter.pull().map_err(|error| error.to_string()),
-        };
-        let metrics = guard
-            .adapter
-            .as_ref()
-            .expect("typed page source remains installed after pull")
-            .metrics()
-            .file;
-        let profile = guard.profile.clone();
-        flush_page_source_file_metrics(profile.as_ref(), &mut guard.last_file_metrics, metrics);
-        result
-    }
-
-    fn is_blocked(&self) -> bool {
-        self.slot
-            .lock()
-            .ok()
-            .and_then(|guard| {
-                guard
-                    .adapter
-                    .as_ref()
-                    .map(ConnectorPageAdapter::source_is_blocked)
-            })
-            .unwrap_or(false)
-    }
-
-    fn close(self) -> Result<(), String> {
-        let result = close_slot(&self.slot);
-        if let Some(group) = self.group.upgrade() {
-            group.unregister(self.id);
-        }
-        result
-    }
-}
-
-impl Drop for RegisteredPageSource {
-    fn drop(&mut self) {
-        let _ = close_slot(&self.slot);
-        if let Some(group) = self.group.upgrade() {
-            group.unregister(self.id);
-        }
-    }
-}
-
 /// Wire fixtures shared by this module's tests and the typed scan decoder's.
 ///
 /// They live here because the carrier they build is this module's input; the
@@ -1441,6 +1106,9 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    use novarocks_spi::connector::read_stack::PageSourceFileMetrics;
+    use novarocks_worker::typed_page_source::flush_page_source_file_metrics;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;
 
