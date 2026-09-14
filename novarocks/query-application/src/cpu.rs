@@ -182,17 +182,30 @@ impl QueryCpuExecutor {
             return Err(QueryCpuRunError::Cancelled(reason));
         }
         let worker_cancellation = cancellation.clone();
-        let run = self.run(move || (!worker_cancellation.is_cancelled()).then(work));
-        tokio::pin!(run);
+        let submit = self.handle.submit(ResultDecodeJob::new(move || {
+            Box::new((!worker_cancellation.is_cancelled()).then(work)) as CpuResult
+        }));
+        tokio::pin!(submit);
+        let receipt = tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => return Err(QueryCpuRunError::Cancelled(reason)),
+            result = &mut submit => result
+                .map_err(|_| QueryCpuRunError::Executor("query CPU executor closed before admitting work".to_owned()))?,
+        };
+        let complete = receipt.complete();
+        tokio::pin!(complete);
         tokio::select! {
             biased;
             reason = cancellation.cancelled() => Err(QueryCpuRunError::Cancelled(reason)),
-            result = &mut run => match result {
-                Ok(Some(value)) => Ok(value),
-                Ok(None) => Err(QueryCpuRunError::Cancelled(
+            result = &mut complete => match result {
+                Ok(value) => value
+                    .downcast::<Option<T>>()
+                    .map(|value| *value)
+                    .map_err(|_| QueryCpuRunError::Executor("query CPU worker returned an invalid result type".to_owned()))
+                    .and_then(|value| value.ok_or_else(|| QueryCpuRunError::Cancelled(
                     cancellation.reason().expect("cancelled CPU work retains its reason"),
-                )),
-                Err(error) => Err(QueryCpuRunError::Executor(error)),
+                ))),
+                Err(error) => Err(QueryCpuRunError::Executor(format!("query CPU worker failed: {error}"))),
             },
         }
     }
@@ -406,6 +419,87 @@ mod tests {
         .await
         .expect("CPU queue did not drain");
         assert_eq!(ran.load(Ordering::SeqCst), 0);
+        drop(executor);
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shut down CPU workers");
+    }
+
+    #[tokio::test]
+    async fn cancelled_cpu_work_waiting_for_full_queue_returns_without_admission() {
+        let mut owner = executor(1, 1);
+        let executor = owner.executor();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let running_gate = Arc::clone(&gate);
+        let running = tokio::spawn({
+            let executor = executor.clone();
+            async move {
+                executor
+                    .run(move || {
+                        let (lock, ready) = &*running_gate;
+                        let mut open = lock.lock().expect("gate lock");
+                        while !*open {
+                            open = ready.wait(open).expect("gate wait");
+                        }
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.handle.snapshot().running != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("CPU worker did not start");
+
+        let queued = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.run(|| ()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.handle.snapshot().queued != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("CPU queue did not become full");
+
+        let cancellation = QueryCancellationSource::new();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let waiting = tokio::spawn({
+            let executor = executor.clone();
+            let ran = Arc::clone(&ran);
+            let cancellation = cancellation.view();
+            async move {
+                executor
+                    .run_cancellable(cancellation, move || {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(executor.handle.snapshot().queued, 1);
+
+        assert_eq!(
+            cancellation.request(QueryCancellationReason::DeadlineExceeded { timeout_ms: 50 }),
+            crate::cancellation::QueryCancellationRequestResult::Requested
+        );
+        assert_eq!(
+            waiting.await.expect("waiting task"),
+            Err(QueryCpuRunError::Cancelled(
+                QueryCancellationReason::DeadlineExceeded { timeout_ms: 50 }
+            ))
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+
+        let (lock, ready) = &*gate;
+        *lock.lock().expect("gate lock") = true;
+        ready.notify_all();
+        running.await.expect("running task").expect("CPU work");
+        queued.await.expect("queued task").expect("queued CPU work");
         drop(executor);
         owner
             .shutdown_until(Instant::now() + Duration::from_secs(1))
