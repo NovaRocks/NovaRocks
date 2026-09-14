@@ -186,7 +186,7 @@ pub(crate) trait PreReadyRetryBoundary {
 pub(crate) trait PreparedDistributedAttemptFactory: Send + PreReadyRetryBoundary {
     fn instantiate(
         &mut self,
-        topology: crate::common::backend_topology::BackendTopologySnapshot,
+        topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<PreparedDistributedAttempt, crate::query_execution::contract::DistributedQueryError>;
 }
 
@@ -230,7 +230,7 @@ impl PreparedDistributedAttempt {
 pub(crate) trait PreparedDistributedRequestFactory: Send + PreReadyRetryBoundary {
     fn replan(
         &mut self,
-        topology: crate::common::backend_topology::BackendTopologySnapshot,
+        topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<
         crate::query_execution::contract::DistributedQueryRequest,
         crate::query_execution::contract::DistributedQueryError,

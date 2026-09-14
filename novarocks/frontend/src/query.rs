@@ -22,8 +22,6 @@ use std::time::{Duration, Instant};
 
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
-use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
-use crate::common::backend_topology::{BackendTopologyService, BackendTopologySnapshot};
 use crate::dml::DmlService;
 use crate::mv::command::MvCommandExecutor;
 use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
@@ -49,10 +47,12 @@ use novarocks_parser::{
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
+use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::{
     BackendCommandExecutor, CommandContext, ExecutionOutput, QueryExecutionError,
     QueryExecutionErrorKind, ResultDelivery,
 };
+use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
 use novarocks_query_application::api::{
     QueryResult, ResultField as QueryResultColumn, build_string_query_result,
 };
@@ -1899,8 +1899,6 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::common::admitted_query_context::QueryExecutionContext;
-    use crate::common::backend_topology::BackendTopologySnapshot;
     use crate::query_execution::dml::delete::{
         DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport, PrepareDeleteRequest,
         PreparedDelete,
@@ -1918,6 +1916,8 @@ mod tests {
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
+    use novarocks_query_application::admitted_query_context::QueryExecutionContext;
+    use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_query_application::api::ResultField;
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_query_application::sql::{SqlBatchCursor, split_sql_statements};
@@ -2202,10 +2202,10 @@ mod tests {
         }
     }
 
-    impl crate::common::backend_topology::BackendTopologyPort for ChangingTopology {
+    impl novarocks_query_application::api::BackendTopologyPort for ChangingTopology {
         fn snapshot(
             &self,
-        ) -> Result<BackendTopologySnapshot, crate::common::backend_topology::BackendTopologyError>
+        ) -> Result<BackendTopologySnapshot, novarocks_query_application::api::BackendTopologyError>
         {
             Ok(self.snapshot.lock().expect("test topology lock").clone())
         }
@@ -2217,14 +2217,14 @@ mod tests {
         fn validate_snapshot(
             &self,
             expected: &BackendTopologySnapshot,
-        ) -> Result<(), crate::common::backend_topology::BackendTopologyValidationError> {
+        ) -> Result<(), novarocks_query_application::api::BackendTopologyValidationError> {
             if &self.snapshot().map_err(
-                crate::common::backend_topology::BackendTopologyValidationError::Unavailable,
+                novarocks_query_application::api::BackendTopologyValidationError::Unavailable,
             )? == expected
             {
                 Ok(())
             } else {
-                Err(crate::common::backend_topology::BackendTopologyValidationError::ContentChangedWithoutRevision {
+                Err(novarocks_query_application::api::BackendTopologyValidationError::ContentChangedWithoutRevision {
                     revision: expected.revision(),
                 })
             }
@@ -2234,7 +2234,7 @@ mod tests {
             &self,
             _revision: u64,
             _deadline: Instant,
-        ) -> Result<BackendTopologySnapshot, crate::common::backend_topology::BackendTopologyError>
+        ) -> Result<BackendTopologySnapshot, novarocks_query_application::api::BackendTopologyError>
         {
             unreachable!("governed planning uses the event-driven subscription")
         }
@@ -2256,7 +2256,7 @@ mod tests {
         .expect("test descriptor");
         BackendTopologySnapshot::try_new(
             revision,
-            vec![crate::common::backend_topology::LiveBackendTarget::new(
+            vec![novarocks_query_application::api::LiveBackendTarget::new(
                 0,
                 descriptor,
                 AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("test admission epoch"),

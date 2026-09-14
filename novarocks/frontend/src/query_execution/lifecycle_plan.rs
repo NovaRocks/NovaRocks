@@ -19,7 +19,6 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::common::backend_topology::LiveBackendTarget;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, ResolvedQueryOptions,
 };
@@ -31,6 +30,7 @@ use novarocks_proto_codec::lifecycle::{
 use novarocks_proto_codec::lifecycle::{
     encode_credential_lease_descriptor, encode_credential_lease_secret_envelope,
 };
+use novarocks_query_application::api::LiveBackendTarget;
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
     CatalogStorageAccessDomainInput, ConnectorControlPlanningLease, ConnectorError,
@@ -1011,12 +1011,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::{AttemptCredentialLeaseCollector, QueryCatalogLease, QueryInitOptions};
-    use crate::common::backend_topology::LiveBackendTarget;
     use crate::query_execution::contract::ResolvedQueryOptions;
     use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId, QueryOptions};
     use novarocks_proto_models::novarocks;
+    use novarocks_query_application::api::LiveBackendTarget;
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,

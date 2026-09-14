@@ -29,13 +29,13 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteReceipt, MvLakePackageObservation,
 };
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::post_compile::NativeFragmentEncodingInput;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 /// Exact Core-retained inputs for one Frontend-owned MV native assembly.
 ///

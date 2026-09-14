@@ -21,12 +21,12 @@ mod command;
 mod iceberg;
 mod shaping;
 
-use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::insert::{
     IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, PrepareIcebergInsert,
     ResolveInsertTarget, ResolvedInsertTarget,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::RequestContext;
 use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
 
 use crate::dml::error::DmlError;

@@ -18,7 +18,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use crate::common::backend_topology::LiveBackendTarget;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
@@ -27,6 +26,7 @@ use novarocks_execution_contract::task_execution::context_convergence::{
 };
 use novarocks_execution_contract::task_execution::identity::QueryContextRef;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_query_application::api::LiveBackendTarget;
 use novarocks_query_application::coordination::{
     AttemptConvergenceFacts, AttemptDisposition, LogicalConclusion,
 };

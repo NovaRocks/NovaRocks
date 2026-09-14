@@ -49,7 +49,7 @@ impl MaintenanceCommandExecutor {
         statement: &novarocks_parser::ast::MaintenanceStatement,
         current_catalog: Option<&str>,
         current_database: &str,
-        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let lowered = crate::table_maintenance::lower_typed_maintenance_statement(

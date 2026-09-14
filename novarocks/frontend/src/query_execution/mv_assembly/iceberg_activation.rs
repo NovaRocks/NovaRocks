@@ -29,7 +29,6 @@ use novarocks_spi::connector::{
     ConnectorWriteInputRequest, ConnectorWriteLease,
 };
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::application::MvIncrementalWriteMode;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::storage_observation::MvLakePublishedProjection;
@@ -44,6 +43,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
 };
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 /// Core-side provider adapter installed into the frontend composition.
 ///

@@ -15,10 +15,10 @@ use novarocks_proto_codec::catalog::PruneCatalogsRequest;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::common::backend_topology::BackendTopologyService;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::{CatalogPruneDispatchOutcome, prune_catalogs};
 use novarocks_catalog_application::CatalogApplicationService;
+use novarocks_query_application::api::BackendTopologyService;
 
 #[derive(Clone, Debug)]
 pub struct CatalogPruneConfig {

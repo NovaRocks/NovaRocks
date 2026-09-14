@@ -36,14 +36,16 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::common::backend_topology::{
-    BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
-    BackendTopologyMetricsSnapshot, BackendTopologyPort, BackendTopologySnapshot,
-    BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
-    publish_backend_topology_metrics,
+    BackendTopologyMetricsSnapshot, publish_backend_topology_metrics,
 };
 use crate::metrics::{record_backend_announce, record_backend_heartbeat};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::heartbeat as native_heartbeat;
+use novarocks_query_application::api::{
+    BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+    BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome,
+    LiveBackendTarget,
+};
 use novarocks_query_application::api::{
     BackendTopologyCommandPort, QueryResult, build_utf8_query_result,
 };
@@ -1240,14 +1242,14 @@ fn revision_members(
 #[cfg(test)]
 mod tests {
     use super::{BackendIslandSnapshotReader, ClusterBackendService};
-    use crate::common::backend_topology::{
-        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyPort,
-    };
     use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_execution_contract::{
         BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
     };
     use novarocks_query_application::api::BackendTopologyCommandPort;
+    use novarocks_query_application::api::{
+        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyPort,
+    };
     use novarocks_types::BackendProcessId;
     use novarocks_version::native_build_identity;
     use std::net::SocketAddr;
@@ -1561,7 +1563,7 @@ mod tests {
 
         assert!(matches!(
             service.validate_snapshot(&captured),
-            Err(crate::common::backend_topology::BackendTopologyValidationError::GenerationChanged {
+            Err(novarocks_query_application::api::BackendTopologyValidationError::GenerationChanged {
                 backend_idx: 0,
                 captured_generation,
                 current_generation,

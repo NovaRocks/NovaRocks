@@ -23,9 +23,9 @@ pub(crate) mod standard;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 /// One parser-owned DELETE variant admitted by the typed statement router.
 ///

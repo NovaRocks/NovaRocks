@@ -20,12 +20,12 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::delete::{
     DeleteCommit, DeleteEngine, DeleteStatement, DeleteWriteReport, PrepareDeleteRequest,
     PreparedDelete,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::RequestContext;
 use novarocks_spi::connector::LakePublicationId;
 
 use crate::dml::error::DmlError;

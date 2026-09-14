@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend adapters for the query-application-owned view service.
+//! Frontend-owned adapters for the query-application-owned view service.
 
 pub(crate) mod command;
 pub mod engine;
-
-pub use novarocks_query_application::view::{
-    QueryViewService, ViewRequestContext, ViewService, ViewStatementResult,
-};

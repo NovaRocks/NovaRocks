@@ -28,13 +28,13 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::write_session::ConnectorWriteSession;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_query_application::api::QueryResult;
 use novarocks_sql::literal::literal_from_batch;
 use novarocks_sql::planning::dml::{
@@ -1542,7 +1542,7 @@ fn build_update_mor_change_stream_write_plan(
     target_columns: &[novarocks_types::schema::ColumnDef],
     target_ref: &str,
     new_sequence_number: i64,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &ConnectorWriteSession,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -4147,7 +4147,7 @@ fn build_merge_mor_change_stream_write_plan(
     insert_columns: Option<&[MergeInsertColumn]>,
     target_ref: &str,
     new_sequence_number: i64,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &ConnectorWriteSession,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -5799,13 +5799,15 @@ mod tests {
             target: iceberg_target(),
             // No plan: this executor models a stage that never dispatched.
             planned: Mutex::new(None),
-            execution: crate::common::admitted_query_context::QueryExecutionContext::new(
-                novarocks_types::ClusterRole::Fe,
-                crate::common::backend_topology::BackendTopologySnapshot::empty(3),
-                None,
-                novarocks_query_application::cancellation::QueryCancellationSource::new().view(),
-                novarocks_sql::compiler::SessionOptimizerSettings::default(),
-            ),
+            execution:
+                novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
+                    novarocks_types::ClusterRole::Fe,
+                    novarocks_query_application::api::BackendTopologySnapshot::empty(3),
+                    None,
+                    novarocks_query_application::cancellation::QueryCancellationSource::new()
+                        .view(),
+                    novarocks_sql::compiler::SessionOptimizerSettings::default(),
+                ),
             connector_context: connector_context_for_test(),
             write_session: session,
         })

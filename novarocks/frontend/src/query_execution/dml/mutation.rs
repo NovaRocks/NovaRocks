@@ -25,12 +25,12 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use novarocks_parser::Span;
 use novarocks_parser::ast::{
     DmlStatement, MergeClause, MergeMatchedAction, MutationSource, ObjectName as ParsedObjectName,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::LakePublicationId;
 use novarocks_sql::semantic::ObjectName;
 

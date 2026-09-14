@@ -53,7 +53,6 @@ use novarocks_types::NativeCompatibilityId;
 use novarocks_workload_control::WorkOwner;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
-use crate::common::backend_topology::{BackendProcessObservationService, BackendTopologyService};
 use crate::coordinator::task_round::{AttemptPumps, install_attempt_pumps};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
@@ -89,6 +88,7 @@ use crate::task_execution::intent::{
 use crate::task_execution::manifest_round::{ManifestAssembledRound, ManifestAttemptCompletion};
 use crate::task_execution::sources::AttemptEstablishFacts;
 use crate::task_execution::status_intake::{NotifyWake, StatusIntakeWake};
+use novarocks_query_application::api::{BackendProcessObservationService, BackendTopologyService};
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 
 /// One logical execution's Abort port. Every physical attempt installs one
@@ -209,7 +209,7 @@ struct ReplacementCandidate {
     topology_revision: u64,
     targets: BTreeMap<
         novarocks_types::BackendProcessId,
-        crate::common::backend_topology::LiveBackendTarget,
+        novarocks_query_application::api::LiveBackendTarget,
     >,
 }
 
@@ -258,7 +258,7 @@ impl LogicalReplacementQualificationPort {
     fn register_candidate(
         &self,
         execution: novarocks_types::QueryExecutionId,
-        snapshot: &crate::common::backend_topology::BackendTopologySnapshot,
+        snapshot: &novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<(), NativeAttemptPreparationError> {
         let mut targets = BTreeMap::new();
         for target in snapshot.targets() {
@@ -424,16 +424,16 @@ async fn wait_for_failed_context_isolation(
 
 fn failed_context_allows_successor(
     observation: &Result<
-        crate::common::backend_topology::BackendProcessObservation,
-        crate::common::backend_topology::BackendTopologyError,
+        novarocks_query_application::api::BackendProcessObservation,
+        novarocks_query_application::api::BackendTopologyError,
     >,
     worker_closed: bool,
 ) -> bool {
     match observation {
-        Ok(crate::common::backend_topology::BackendProcessObservation::Current) => worker_closed,
+        Ok(novarocks_query_application::api::BackendProcessObservation::Current) => worker_closed,
         Ok(
-            crate::common::backend_topology::BackendProcessObservation::Unobservable
-            | crate::common::backend_topology::BackendProcessObservation::Replaced { .. },
+            novarocks_query_application::api::BackendProcessObservation::Unobservable
+            | novarocks_query_application::api::BackendProcessObservation::Replaced { .. },
         )
         | Err(_) => true,
     }
@@ -1017,7 +1017,7 @@ pub(crate) trait FrontendDormantAttemptFactory: std::fmt::Debug + Send + 'static
     fn register_candidate(
         &mut self,
         _execution: novarocks_types::QueryExecutionId,
-        _snapshot: &crate::common::backend_topology::BackendTopologySnapshot,
+        _snapshot: &novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<(), NativeAttemptPreparationError> {
         Ok(())
     }
@@ -1132,7 +1132,7 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
     fn register_candidate(
         &mut self,
         execution: novarocks_types::QueryExecutionId,
-        snapshot: &crate::common::backend_topology::BackendTopologySnapshot,
+        snapshot: &novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<(), NativeAttemptPreparationError> {
         self.replacements.register_candidate(execution, snapshot)
     }
@@ -1996,7 +1996,7 @@ where
 #[cfg(debug_assertions)]
 fn bind_query_lifecycle_fault_scopes(
     execution_id: novarocks_types::QueryExecutionId,
-    snapshot: &crate::common::backend_topology::BackendTopologySnapshot,
+    snapshot: &novarocks_query_application::api::BackendTopologySnapshot,
 ) -> Result<(), String> {
     use novarocks_failpoint::{QueryLifecycleFaultKind, bind_armed_fault};
 
@@ -2042,7 +2042,7 @@ fn bind_query_lifecycle_fault_scopes(
 #[cfg(not(debug_assertions))]
 fn bind_query_lifecycle_fault_scopes(
     _execution_id: novarocks_types::QueryExecutionId,
-    _snapshot: &crate::common::backend_topology::BackendTopologySnapshot,
+    _snapshot: &novarocks_query_application::api::BackendTopologySnapshot,
 ) -> Result<(), String> {
     Ok(())
 }
@@ -2091,11 +2091,11 @@ mod tests {
         attempt_runtime_failure, failed_context_allows_successor,
         wait_for_failed_context_isolation,
     };
-    use crate::common::backend_topology::{
+    use crate::query_execution::artifact::ManifestBoundNativeAttemptInputs;
+    use novarocks_query_application::api::{
         BackendProcessObservation, BackendProcessObservationPort, BackendProcessObservationService,
         BackendTopologyError,
     };
-    use crate::query_execution::artifact::ManifestBoundNativeAttemptInputs;
 
     #[derive(Debug)]
     struct CapturedInputs {

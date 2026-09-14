@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::common::admitted_query_context::QueryExecutionContext;
-use crate::common::backend_topology::BackendTopologySnapshot;
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
     DistributedQueryIntent, DistributedQueryRequest,
@@ -26,6 +24,8 @@ use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFacto
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::statistics::{StatisticsExecutionMode, StatisticsExecutionPolicy};
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
+use novarocks_query_application::api::BackendTopologySnapshot;
 use novarocks_query_application::cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };

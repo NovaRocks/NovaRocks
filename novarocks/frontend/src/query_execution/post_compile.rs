@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::completion::{PreparedQueryCompletion, PreparedQueryOperation};
 use crate::query_execution::preparation::{PreparedFragmentHandoff, PreparedFragmentSet};
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_sql::compiler::{SqlPlanCostFacts, SqlPlanCostUnknownReason, SqlPlanCostValue};
 use novarocks_sql::plan_read::DistributedPlan;
 use novarocks_sql::planning::query_execution::SealedPreparationPlan;

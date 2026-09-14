@@ -15,5 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod admitted_query_context;
 pub mod backend_topology;

@@ -1615,8 +1615,8 @@ impl FrontendApplicationHost {
         let topology = Arc::clone(self.topology());
         let config = self.query_runtime;
         let native_runtime = FrontendNativeLogicalExecutionRuntime::new(
-            Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
-            topology as crate::common::backend_topology::BackendProcessObservationService,
+            Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
+            topology as novarocks_query_application::api::BackendProcessObservationService,
             self.data_runtime.clone(),
             self.result_decode_runtime(),
             config.native_compatibility_id,
@@ -1714,8 +1714,10 @@ impl FrontendApplicationHost {
     }
 
     /// Frontend composition-time topology leaf used by FE-owned services.
-    pub fn backend_topology_port(&self) -> crate::common::backend_topology::BackendTopologyService {
-        Arc::clone(self.topology()) as crate::common::backend_topology::BackendTopologyService
+    pub fn backend_topology_port(
+        &self,
+    ) -> novarocks_query_application::api::BackendTopologyService {
+        Arc::clone(self.topology()) as novarocks_query_application::api::BackendTopologyService
     }
 
     /// Frontend composition-time read-only backend command leaf.

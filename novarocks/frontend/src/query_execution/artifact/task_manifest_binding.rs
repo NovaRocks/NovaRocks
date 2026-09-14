@@ -33,8 +33,8 @@ use novarocks_sql::planning::query_execution::{SealedPreparationPlanId, SealedSc
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId, StageId};
 use novarocks_types::{NativeCompatibilityId, UniqueId};
 
-use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
 
 use super::{
     PreparedDistributedNativeTemplate, RequestBoundNativeTemplate, derive_fragment_instance_id,
@@ -1261,7 +1261,7 @@ mod tests {
         validate_edges, validate_frozen_unit_cover, validate_native_template_plan_seal,
         validate_scan_assignments, validate_schedule_execution, validate_task_identity,
     };
-    use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
+    use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
 
     fn execution() -> QueryExecutionId {
         QueryExecutionId::new(

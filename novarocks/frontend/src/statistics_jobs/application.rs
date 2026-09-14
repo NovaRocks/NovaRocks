@@ -496,7 +496,9 @@ pub trait StatisticsApplicationPort: Send + Sync {
     fn execute(
         &self,
         command: StatisticsApplicationCommand,
-        execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+        execution: Option<
+            &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        >,
     ) -> Result<StatisticsApplicationResult, StatisticsApplicationError>;
 }
 
@@ -507,7 +509,9 @@ impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {
     fn execute(
         &self,
         _command: StatisticsApplicationCommand,
-        _execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+        _execution: Option<
+            &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        >,
     ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
         Err(StatisticsApplicationError::new(
             "unified statistics application service is not installed",

@@ -21,7 +21,6 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::artifact::{
     PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
 };
@@ -34,6 +33,7 @@ use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_query_application::preparation::FrozenExecutionDescription;
 use novarocks_types::BackendProcessId;
@@ -223,7 +223,7 @@ pub enum DistributedQueryIntent {
 /// capabilities.
 pub struct DistributedQueryRequest {
     payload: DistributedQueryPayload,
-    topology: crate::common::backend_topology::BackendTopologySnapshot,
+    topology: novarocks_query_application::api::BackendTopologySnapshot,
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     completion: QueryOutcomeFactory,
@@ -309,7 +309,7 @@ impl DistributedQueryRequest {
         &self.cancellation
     }
 
-    pub fn topology(&self) -> &crate::common::backend_topology::BackendTopologySnapshot {
+    pub fn topology(&self) -> &novarocks_query_application::api::BackendTopologySnapshot {
         &self.topology
     }
 
@@ -373,7 +373,7 @@ pub struct DistributedQueryRequestParts {
     pub description: Arc<FrozenExecutionDescription>,
     pub artifacts: PreparedDistributedQuery,
     pub options: Arc<ResolvedQueryOptions>,
-    pub topology: crate::common::backend_topology::BackendTopologySnapshot,
+    pub topology: novarocks_query_application::api::BackendTopologySnapshot,
     pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,

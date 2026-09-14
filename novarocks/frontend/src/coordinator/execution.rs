@@ -24,9 +24,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::common::backend_topology::{
-    BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
-};
 use crate::native::fragment_transport::{
     FinalTaskInfoRead, FragmentDispatcher, NativeTaskResultTransport, RootResultOutcome,
     TaskReadGrace, TaskResultTransport,
@@ -51,6 +48,9 @@ use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAI
 use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::task_execution::sources::AttemptEstablishFacts;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
+use novarocks_query_application::api::{
+    BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
+};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, TaskId};
 use novarocks_types::{
@@ -308,7 +308,7 @@ fn production_backend_services(
 }
 
 pub struct FrontendDistributedQueryCoordinator {
-    backend_topology: crate::common::backend_topology::BackendTopologyService,
+    backend_topology: novarocks_query_application::api::BackendTopologyService,
     #[cfg(test)]
     backend_services: Option<BackendServicesSource>,
     runtime_filter_worker_count: NonZeroUsize,
@@ -343,7 +343,7 @@ impl FrontendDistributedQueryCoordinator {
         coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
         transport_budget: novarocks_task_codec::TransportBudget,
         result_fetch_byte_limit: ResultByteLimit,
-        backend_topology: crate::common::backend_topology::BackendTopologyService,
+        backend_topology: novarocks_query_application::api::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
         lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     ) -> Result<Self, DistributedQueryError> {
@@ -412,7 +412,7 @@ impl FrontendDistributedQueryCoordinator {
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
-        backend_topology: crate::common::backend_topology::BackendTopologyService,
+        backend_topology: novarocks_query_application::api::BackendTopologyService,
     ) -> Self {
         Self {
             coordination_budgets:
@@ -480,7 +480,7 @@ impl FrontendDistributedQueryCoordinator {
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
-        backend_topology: crate::common::backend_topology::BackendTopologyService,
+        backend_topology: novarocks_query_application::api::BackendTopologyService,
     ) -> Self {
         Self {
             coordination_budgets:
@@ -2506,9 +2506,6 @@ mod tests {
         fail_closed_one_shot_topology_retry, pre_ready_topology_validation_error,
         statistics_all_success_failure_message,
     };
-    use crate::common::backend_topology::{
-        BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
-    };
     use crate::connector::{
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
     };
@@ -2536,6 +2533,9 @@ mod tests {
     };
     use novarocks_execution_contract::{
         BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
+    };
+    use novarocks_query_application::api::{
+        BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
     };
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
@@ -2866,13 +2866,13 @@ mod tests {
         control_ready_closures: Arc<AtomicUsize>,
         stage_or_start_closures: Arc<AtomicUsize>,
         replanned_topologies:
-            Arc<Mutex<Vec<crate::common::backend_topology::BackendTopologySnapshot>>>,
+            Arc<Mutex<Vec<novarocks_query_application::api::BackendTopologySnapshot>>>,
     }
 
     impl PreparedDistributedAttemptFactory for RecordingRetryFactory {
         fn instantiate(
             &mut self,
-            topology: crate::common::backend_topology::BackendTopologySnapshot,
+            topology: novarocks_query_application::api::BackendTopologySnapshot,
         ) -> Result<PreparedDistributedAttempt, DistributedQueryError> {
             self.replanned_topologies
                 .lock()
@@ -2888,7 +2888,7 @@ mod tests {
     impl PreparedDistributedRequestFactory for RecordingRetryFactory {
         fn replan(
             &mut self,
-            topology: crate::common::backend_topology::BackendTopologySnapshot,
+            topology: novarocks_query_application::api::BackendTopologySnapshot,
         ) -> Result<DistributedQueryRequest, DistributedQueryError> {
             self.replanned_topologies
                 .lock()
@@ -2943,7 +2943,7 @@ mod tests {
     }
 
     fn fresh_result_request(
-        topology: crate::common::backend_topology::BackendTopologySnapshot,
+        topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<DistributedQueryRequest, DistributedQueryError> {
         let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
             .expect("sealed result fixture");
@@ -2976,16 +2976,17 @@ mod tests {
             )
             .expect("native fragment fixture");
         let cancellation = QueryCancellationSource::new();
-        let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
-            ClusterRole::Fe,
-            topology,
-            // Short on purpose. These fixtures point at endpoints nothing
-            // listens on, so an attempt that reaches the task substrate ends
-            // at its own deadline; the budget only has to outlast preparation.
-            Some(Instant::now() + Duration::from_secs(1)),
-            cancellation.view(),
-            novarocks_sql::compiler::SessionOptimizerSettings::default(),
-        );
+        let execution =
+            novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
+                ClusterRole::Fe,
+                topology,
+                // Short on purpose. These fixtures point at endpoints nothing
+                // listens on, so an attempt that reaches the task substrate ends
+                // at its own deadline; the budget only has to outlast preparation.
+                Some(Instant::now() + Duration::from_secs(1)),
+                cancellation.view(),
+                novarocks_sql::compiler::SessionOptimizerSettings::default(),
+            );
         build_distributed_query_request_with_execution(
             encoding,
             native,
@@ -3165,7 +3166,7 @@ mod tests {
                 Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
                 Arc::new(()),
-                Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+                Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
             );
         // The membership owner replaces the captured process. Published before
         // the attempt starts because that is the only ordering a test can pin;
@@ -3263,7 +3264,7 @@ mod tests {
                 Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
                 Arc::new(()),
-                Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+                Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
             );
         topology
             .record_announce(replacement.clone(), BackendReportedState::Running)
@@ -3342,7 +3343,7 @@ mod tests {
             Arc::new(FailingAfterStartDispatcher),
             NonZeroUsize::new(1).expect("nonzero workers"),
             Arc::new(()),
-            Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+            Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
         );
         let control_ready_closures = Arc::new(AtomicUsize::new(0));
         let stage_or_start_closures = Arc::new(AtomicUsize::new(0));

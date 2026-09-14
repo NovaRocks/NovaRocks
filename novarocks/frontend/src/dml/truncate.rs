@@ -27,7 +27,6 @@ use novarocks_spi::connector::{
     LakePublicationTerminal,
 };
 
-use crate::common::admitted_query_context::RequestContext;
 use crate::dml::attempt::{
     DmlPublicationAdjudication, DmlPublicationAdjudicationOutcome, DmlPublicationAttempt,
     DmlPublicationFinalization,
@@ -38,6 +37,7 @@ use crate::query_execution::dml::truncate::{
     PlanTruncateRequest, PreparedTruncate, TruncateCommand, TruncateEngine, TruncateFailure,
     TruncateFinalization, TruncateOutcome, TruncatePlanError, TruncatePlanFacts,
 };
+use novarocks_query_application::admitted_query_context::RequestContext;
 
 impl DmlService {
     /// Executes an admitted TRUNCATE as one non-durable statement attempt.
@@ -209,12 +209,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
-    use crate::common::backend_topology::BackendTopologySnapshot;
     use crate::query_execution::dml::truncate::{
         PreparedTruncate, TruncateEffect, TruncateEvidence, TruncateFailureKind,
         TruncatePlanSummary, TruncatePrepared, TruncateReceipt,
     };
+    use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
+    use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_spi::connector::LakePublicationDisposition;
     use novarocks_types::ClusterRole;

@@ -138,7 +138,9 @@ impl StatisticsCommandExecutor {
         statement: &StatisticsStatement,
         current_catalog: Option<&str>,
         current_database: &str,
-        execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+        execution: Option<
+            &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        >,
     ) -> Result<StatementResult, String> {
         let command = match statement {
             StatisticsStatement::AnalyzeTable(statement) => {
@@ -242,7 +244,9 @@ mod tests {
         fn execute(
             &self,
             command: StatisticsApplicationCommand,
-            _execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+            _execution: Option<
+                &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+            >,
         ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
             self.commands
                 .lock()

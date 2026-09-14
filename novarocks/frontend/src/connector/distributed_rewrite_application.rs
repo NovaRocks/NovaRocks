@@ -33,7 +33,7 @@ use novarocks_spi::connector::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::common::admitted_query_context::QueryExecutionContext;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DistributedRewriteIntent {

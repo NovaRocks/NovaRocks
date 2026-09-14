@@ -256,7 +256,9 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
     fn execute(
         &self,
         command: application::StatisticsApplicationCommand,
-        execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+        execution: Option<
+            &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        >,
     ) -> Result<application::StatisticsApplicationResult, application::StatisticsApplicationError>
     {
         let connector_context = match (&command, execution) {
@@ -288,7 +290,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
 }
 
 fn statistics_connector_context(
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     require_deadline: bool,
 ) -> Result<
     novarocks_spi::connector::ConnectorRequestContext,

@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Field;
 
 use crate::catalog_application::resolver::TargetBackend;
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::connector::backend::ResolvedTable;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
@@ -38,6 +37,7 @@ use crate::query_execution::write_transaction::{
     IcebergWriteValidationPolicy,
 };
 use novarocks_parser::ast::{Query, Statement};
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
     ConnectorPreReadyWritePlanningRequest, ConnectorTableHandle, ConnectorWriteActivationIntent,
     ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
@@ -632,7 +632,7 @@ struct FrozenIcebergWriteSemanticBinding {
 impl FrozenIcebergWriteSemanticBinding {
     fn prepare_replanned_native_assembly(
         &self,
-        topology: crate::common::backend_topology::BackendTopologySnapshot,
+        topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<
         crate::query_execution::compiler::PreparedDmlWriteAssembly,
         crate::dml::error::DmlExecutionError,
@@ -675,7 +675,7 @@ impl FrozenIcebergWriteSemanticBinding {
 
     fn execution_for_topology(
         &self,
-        topology: crate::common::backend_topology::BackendTopologySnapshot,
+        topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<QueryExecutionContext, crate::dml::error::DmlExecutionError> {
         let first = self.execution.as_ref().ok_or_else(|| {
             crate::dml::error::DmlExecutionError::from(
@@ -687,7 +687,7 @@ impl FrozenIcebergWriteSemanticBinding {
 
     fn execution_from_first_round(
         first: &QueryExecutionContext,
-        topology: crate::common::backend_topology::BackendTopologySnapshot,
+        topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> QueryExecutionContext {
         QueryExecutionContext::new(
             first.role(),
@@ -733,7 +733,7 @@ impl crate::query_execution::completion::PreparedDistributedRequestFactory
 {
     fn replan(
         &mut self,
-        topology: crate::common::backend_topology::BackendTopologySnapshot,
+        topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<
         crate::query_execution::contract::DistributedQueryRequest,
         crate::query_execution::contract::DistributedQueryError,
@@ -1353,7 +1353,7 @@ mod tests {
     use novarocks_parser::{ast, printer};
     use std::time::{Duration, Instant};
 
-    use crate::common::backend_topology::BackendTopologySnapshot;
+    use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };

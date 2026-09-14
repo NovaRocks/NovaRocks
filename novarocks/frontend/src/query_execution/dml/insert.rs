@@ -28,12 +28,12 @@ use std::sync::{Arc, Mutex};
 use novarocks_types::schema::ColumnDef;
 
 use crate::catalog_application::resolver::TargetBackend;
-use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use crate::connector::backend::ResolvedTable;
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_parser::ast::{Insert, Query};
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::{QueryExecutionContext, RequestContext};
 use novarocks_spi::connector::{ConnectorWriteOperationId, LakePublicationId};
 use novarocks_sql::semantic::{Literal, ObjectName};
 
@@ -633,9 +633,9 @@ fn insert_value_to_literal(value: &InsertValue) -> Literal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
-    use crate::common::backend_topology::BackendTopologySnapshot;
     use crate::query_execution::outcome::QueryExecutionResult;
+    use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
+    use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_query_application::api::QueryResult;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,

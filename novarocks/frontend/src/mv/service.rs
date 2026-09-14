@@ -22,8 +22,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::background::{MvBackgroundBindings, MvBackgroundEngine};
-use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
-use crate::common::backend_topology::BackendTopologyService;
 use crate::mv::domain::application::{
     MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
     MvStatementResult,
@@ -45,6 +43,8 @@ use novarocks_mv_application::{
     },
     scheduler::MvSchedulerConfig,
 };
+use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
+use novarocks_query_application::api::BackendTopologyService;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 use novarocks_sql::compiler::SessionOptimizerSettings;
 
@@ -184,7 +184,7 @@ impl FrontendMvService {
         &self,
         refresh_plan: PreparedMvRefresh,
         connector_context: ConnectorRequestContext,
-        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
         refresh::execute(&self.refresh, refresh_plan, connector_context, execution)
     }
@@ -196,7 +196,7 @@ impl FrontendMvService {
         target: novarocks_sql::planning::mv::SqlMvTarget,
         owner: MvActivityOwner,
         connector_context: ConnectorRequestContext,
-        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
         let _gate_lease = self.acquire_activity_lease(&target, owner, execution)?;
         let attempt = self.reserve_refresh_attempt();
@@ -228,7 +228,7 @@ impl FrontendMvService {
         &self,
         target: &novarocks_sql::planning::mv::SqlMvTarget,
         owner: MvActivityOwner,
-        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         action: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         let _gate_lease = self
@@ -241,7 +241,7 @@ impl FrontendMvService {
         &self,
         target: &novarocks_sql::planning::mv::SqlMvTarget,
         owner: MvActivityOwner,
-        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvActivityLease, MvApplicationError> {
         self.activity_gate
             .acquire_foreground(canonical_mv_target(target), owner, || {

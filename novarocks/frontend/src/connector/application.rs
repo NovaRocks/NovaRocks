@@ -264,7 +264,7 @@ pub fn connector_request_context_for_deadline(
 /// admission deadline use the bounded connector fallback.
 pub fn connector_request_context_for_execution(
     query_options: Option<&QueryOptions>,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
 ) -> Result<ConnectorRequestContext, String> {
     let cancellation: Arc<dyn ConnectorCancellation> = Arc::new(QueryConnectorCancellation {
         cancellation: execution.cancellation().clone(),
@@ -322,8 +322,8 @@ mod request_context_tests {
         FrontendConnectorResourceLedger, connector_request_context_for_execution,
         query_expire_duration,
     };
-    use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
-    use crate::common::backend_topology::BackendTopologySnapshot;
+    use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
+    use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };

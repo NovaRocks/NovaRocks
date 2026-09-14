@@ -19,13 +19,13 @@
 
 use std::sync::Arc;
 
-use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::mutation::{
     MutationAbort, MutationCommit, MutationEngine, MutationNativeFragmentEncoder,
     MutationStageOutcome, MutationStatementKind, PrepareMutationRequest, PreparedMutation,
 };
 use novarocks_parser::ast::{DmlStatement, MergeClause, MutationSource};
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::RequestContext;
 
 use crate::dml::error::DmlError;
 use crate::dml::runner::{

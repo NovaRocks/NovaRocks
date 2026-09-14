@@ -34,12 +34,12 @@ use novarocks_statistics_application::{
     StatisticsFailure, StatisticsJob, StatisticsPublicationFact, StatisticsPublicationOutcome,
 };
 
-use crate::common::backend_topology::BackendTopologyService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::statistics_jobs::application::{
     StatisticsApplicationError, StatisticsAttemptRequest, StatisticsColumnIntent,
     rebind_table_object,
 };
+use novarocks_query_application::api::BackendTopologyService;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorMutationOperationId, ConnectorRequestContext,
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
@@ -416,13 +416,14 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                     .backend_topology
                     .snapshot()
                     .map_err(|error| Self::failure(error.to_string()))?;
-                let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
-                    self.ports.execution_role,
-                    topology,
-                    Some(deadline),
-                    cancellation,
-                    novarocks_sql::compiler::SessionOptimizerSettings::default(),
-                );
+                let execution =
+                    novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
+                        self.ports.execution_role,
+                        topology,
+                        Some(deadline),
+                        cancellation,
+                        novarocks_sql::compiler::SessionOptimizerSettings::default(),
+                    );
                 let relation =
                     crate::query_execution::statistics::StatisticsRelationIdentity::try_new(
                         request.connector_instance_id.as_str(),

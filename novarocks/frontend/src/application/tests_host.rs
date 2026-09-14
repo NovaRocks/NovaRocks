@@ -323,7 +323,7 @@ async fn shared_test_provider_allows_multiple_live_hosts() {
 
 #[test]
 fn local_view_service_does_not_restore_state_across_process_instances() {
-    let host = crate::view::QueryViewService::new();
+    let host = novarocks_query_application::view::QueryViewService::new();
     execute_view_statement(
         &host,
         &SessionViewEngine,
@@ -340,7 +340,7 @@ fn local_view_service_does_not_restore_state_across_process_instances() {
     );
     // A local view is process runtime state: it ends with the process instance
     // that defined it. Durable views live in an external catalog.
-    let reopened = crate::view::QueryViewService::new();
+    let reopened = novarocks_query_application::view::QueryViewService::new();
     let mut query = parse_query("SELECT * FROM local_view");
     reopened
         .rewrite_query(&SessionViewEngine, &mut query, view_context())

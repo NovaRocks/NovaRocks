@@ -43,9 +43,6 @@ use super::round::{AcknowledgementObserver, StatusSubscriptions, TaskRound, Turn
 use super::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
 use super::split_transport::SplitDeliveryBridge;
 use super::status_intake::{NotifyWake, StatusIntake, StatusIntakeWake};
-use crate::common::backend_topology::{
-    BackendProcessObservation, BackendProcessObservationService,
-};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::task_transport::{
     AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskStatusSubscriber,
@@ -54,6 +51,9 @@ use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmi
 use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::query_execution::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
+};
+use novarocks_query_application::api::{
+    BackendProcessObservation, BackendProcessObservationService,
 };
 
 const STATUS_INTAKE_CAPACITY: usize = 4096;

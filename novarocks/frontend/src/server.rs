@@ -58,7 +58,7 @@ type ShutdownSignal = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Clone)]
 struct FrontendBackgroundMaintenanceAttemptFactory {
     role: novarocks_types::ClusterRole,
-    topology: crate::common::backend_topology::BackendTopologyService,
+    topology: novarocks_query_application::api::BackendTopologyService,
     runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
 }
 
@@ -141,10 +141,10 @@ struct FrontendRoleProducts {
     query_control: novarocks_query_application::session_control::QueryControlService,
     query_execution: crate::query_execution::service::QueryExecutionService,
     logical_read_launcher: Arc<dyn crate::query_execution::logical_read::LogicalReadLauncher>,
-    topology: crate::common::backend_topology::BackendTopologyService,
+    topology: novarocks_query_application::api::BackendTopologyService,
     role: novarocks_types::ClusterRole,
     mv_repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
-    view_service: Arc<dyn crate::view::ViewService>,
+    view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     dml_service: Arc<crate::dml::DmlService>,
     statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,
     maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService>,
@@ -284,8 +284,8 @@ async fn build_frontend_role_products(
     let topology = host.backend_topology_port();
     let role = host.execution_role();
     let mv_repository = host.mv_repository_for_role_product_construction();
-    let view_service: Arc<dyn crate::view::ViewService> =
-        Arc::new(crate::view::QueryViewService::new());
+    let view_service: Arc<dyn novarocks_query_application::view::ViewService> =
+        Arc::new(novarocks_query_application::view::QueryViewService::new());
     let dml_service = Arc::new(crate::dml::DmlService::new());
     let maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService> =
         Arc::new(

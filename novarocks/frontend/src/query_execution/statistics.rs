@@ -249,7 +249,7 @@ impl StatisticsRelationIdentity {
 pub struct PreparedStatisticsCollectionRequest {
     encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput,
     program: StatisticsCollectionProgram,
-    execution: crate::common::admitted_query_context::QueryExecutionContext,
+    execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
 }
 
 impl PreparedStatisticsCollectionRequest {
@@ -297,7 +297,7 @@ impl<'a> StatisticsPlanningServices<'a> {
 
 pub fn prepare_statistics_collection_request(
     services: StatisticsPlanningServices<'_>,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     context: ConnectorRequestContext,
     identity: &StatisticsRelationIdentity,
     program: StatisticsCollectionProgram,

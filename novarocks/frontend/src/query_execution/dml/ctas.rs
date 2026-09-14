@@ -42,7 +42,6 @@ use novarocks_spi::connector::{
 };
 use novarocks_user_error::UserError;
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_parser::ast::{
     CreateTableAsSelect, Literal, LiteralKind, PartitionTransform, Query, TablePartition,
@@ -50,6 +49,7 @@ use novarocks_parser::ast::{
 };
 use novarocks_parser::printer;
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_sql::semantic::ObjectName;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

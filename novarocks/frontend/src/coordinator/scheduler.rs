@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::net::SocketAddr;
 
-use crate::common::backend_topology::LiveBackendTarget;
 use crate::query_execution::artifact::{
     BackendPlacement, FragmentId, FragmentScheduleDraft, FragmentSchedulingView,
     SchedulingStreamKind, ValidatedFragmentSchedule,
@@ -30,6 +29,7 @@ use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 #[cfg(debug_assertions)]
 use novarocks_failpoint::{QueryLifecycleFaultKind, arm_path, configured_root};
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_query_application::api::LiveBackendTarget;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use novarocks_types::BackendProcessId;
 

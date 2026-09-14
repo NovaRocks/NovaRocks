@@ -30,7 +30,6 @@ use tokio::runtime::Handle;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::{command as catalog_command, iceberg_ref_command};
-use crate::common::backend_topology::BackendTopologyService;
 use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::readiness::MvCandidateReader;
@@ -43,10 +42,11 @@ use crate::query_execution::maintenance::{
     TableMaintenanceEngine, TableMaintenanceService,
 };
 use crate::query_execution::service::QueryExecutionService;
-use crate::view::ViewService;
 use novarocks_catalog_application::CatalogApplicationPort;
+use novarocks_query_application::api::BackendTopologyService;
 use novarocks_query_application::api::{BackendCommandExecutor, BackendTopologyCommandPort};
 use novarocks_query_application::system_catalog::SystemCatalog;
+use novarocks_query_application::view::ViewService;
 use novarocks_spi::connector::MvStorageObservationPort;
 
 use crate::mv::{FrontendMvService, command as mv_command};
@@ -756,7 +756,7 @@ pub fn background_maintenance_attempt(
         .checked_add(max_attempt_duration)
         .ok_or_else(|| "automatic maintenance deadline overflow".to_string())?;
     let cancellation = novarocks_query_application::cancellation::QueryCancellationSource::new();
-    let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
+    let execution = novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
         role,
         topology,
         Some(deadline),

@@ -15,14 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend composition facade for Query Application topology contracts.
-
-pub use novarocks_query_application::api::{
-    BackendProcessObservation, BackendProcessObservationPort, BackendProcessObservationService,
-    BackendTopologyError, BackendTopologyPort, BackendTopologyService, BackendTopologySnapshot,
-    BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
-};
-
 /// Frontend-owned values rendered by the process metrics surface.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BackendTopologyMetricsSnapshot {

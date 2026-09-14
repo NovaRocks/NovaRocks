@@ -25,9 +25,6 @@ use crate::catalog_application::query_materializer::{
     build_catalog_service_provider,
     build_catalog_service_provider_with_bindings_and_query_local_overlays,
 };
-use crate::common::admitted_query_context::{
-    QueryExecutionContext, RequestContext, StatementAdmissionContext,
-};
 use crate::connector::connector_planning_context_for_query;
 use crate::mv::domain::readiness::{MvCandidateReader, MvReadinessPort};
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
@@ -50,10 +47,13 @@ use crate::query_execution::planning::time_travel::{
     TimeTravelRewriteError, has_time_travel_refs, rewrite_time_travel_refs,
 };
 use crate::query_execution::post_compile::PostCompileIntent;
-use crate::view::ViewRequestContext;
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::admitted_query_context::{
+    QueryExecutionContext, RequestContext, StatementAdmissionContext,
+};
 use novarocks_query_application::statement_effect::StatementEffectTracker;
+use novarocks_query_application::view::ViewRequestContext;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
@@ -195,7 +195,7 @@ struct FrontendDistributedAttemptFactory {
 impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
     fn instantiate(
         &mut self,
-        topology: crate::common::backend_topology::BackendTopologySnapshot,
+        topology: novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<PreparedDistributedAttempt, DistributedQueryError> {
         let execution = self.statement.for_topology(topology);
         let request = self

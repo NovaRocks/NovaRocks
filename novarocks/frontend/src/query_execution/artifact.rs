@@ -47,7 +47,6 @@ use arrow::datatypes::Field;
 use novarocks_spi::connector::{CatalogHandle, CatalogProperties};
 use sha2::{Digest, Sha256};
 
-use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
 use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::{QueryCatalogLease, QueryInitOptions};
@@ -65,6 +64,7 @@ use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_models::novarocks;
 use novarocks_proto_models::plan::RuntimeFilterBindingTable;
+use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
 use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
 #[cfg(test)]

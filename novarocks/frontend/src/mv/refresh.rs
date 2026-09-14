@@ -20,7 +20,6 @@ use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::time::{Duration, Instant};
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::application::{
     MvApplicationError, MvApplicationErrorKind, MvStatementResult,
 };
@@ -33,6 +32,7 @@ use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
 };
 use crate::query_execution::service::QueryExecutionService;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorControlRegistry, ConnectorInstanceId,
     ConnectorMutationOperationId, ConnectorMvMetadataOnlyBaseFact,

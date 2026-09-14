@@ -23,7 +23,6 @@ use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::application::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
 };
@@ -40,6 +39,7 @@ use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::write_session::ConnectorWriteSession;
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RewriteMergeRefreshEvidence {

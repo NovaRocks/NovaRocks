@@ -8,7 +8,6 @@ use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-use crate::common::backend_topology::HeartbeatOutcome;
 use crate::metrics::observe_backend_heartbeat_rtt;
 use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
@@ -25,6 +24,7 @@ use novarocks_proto_models::common::UniqueId as ProtoUniqueId;
 use novarocks_proto_models::novarocks::{
     FetchResultRequest, fetch_result_response::Status as FetchStatus,
 };
+use novarocks_query_application::api::HeartbeatOutcome;
 use novarocks_types::{BackendProcessId, NativeEndpoint, UniqueId};
 
 use super::data_runtime::FrontendDataRuntime;

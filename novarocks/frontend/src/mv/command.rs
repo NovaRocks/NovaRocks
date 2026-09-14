@@ -17,7 +17,6 @@
 
 //! Closed typed executor for Iceberg MV statements.
 
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::application::{
     MvAlterAction, MvAlterStatement, MvApplicationService, MvCreateDistribution,
     MvCreatePartitionField, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement,
@@ -33,6 +32,7 @@ use novarocks_parser::ast::{
     MaterializedViewRefreshPolicy as TypedRefreshPolicy, MaterializedViewStatement,
     ObjectName as TypedObjectName,
 };
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_query_application::api::build_string_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;

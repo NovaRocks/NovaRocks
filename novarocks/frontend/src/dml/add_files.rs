@@ -26,7 +26,6 @@ use novarocks_spi::connector::{
     LakePublicationTerminal,
 };
 
-use crate::common::admitted_query_context::RequestContext;
 use crate::dml::attempt::{
     DmlPublicationAdjudication, DmlPublicationAdjudicationOutcome, DmlPublicationAttempt,
     DmlPublicationFinalization,
@@ -37,6 +36,7 @@ use crate::query_execution::dml::add_files::{
     AddFilesCommand, AddFilesEngine, AddFilesFailure, AddFilesFinalization, AddFilesOutcome,
     AddFilesPlanError, AddFilesPlanFacts, PlanAddFilesRequest, PreparedAddFiles,
 };
+use novarocks_query_application::admitted_query_context::RequestContext;
 
 impl DmlService {
     /// Executes an admitted ADD FILES statement as one non-durable attempt.

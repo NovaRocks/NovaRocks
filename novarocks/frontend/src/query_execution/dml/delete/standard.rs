@@ -34,7 +34,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::resolver::{TargetBackend, resolve_existing_table_target};
-use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::dml::delete::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
@@ -49,6 +48,7 @@ use novarocks_parser::ast::{
     BinaryOperator, Delete, Expr, FunctionCall, IsPredicate, LiteralKind,
     ObjectName as ParserObjectName, Query, Statement, UnaryOperator,
 };
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
 use novarocks_sql::planning::dml::{DmlWriteSinkMode, IcebergRefSuffix, split_ref_suffix};
