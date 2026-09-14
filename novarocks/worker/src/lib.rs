@@ -41,6 +41,7 @@ mod lease;
 mod lifecycle;
 mod observation;
 mod operation;
+pub mod query_context;
 mod receipt;
 mod reliable_transport;
 pub mod result_batch;

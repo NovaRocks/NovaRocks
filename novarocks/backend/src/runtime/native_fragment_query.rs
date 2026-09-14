@@ -27,9 +27,6 @@ use std::time::Duration;
 
 use novarocks_spi::connector::ConnectorCancellation;
 
-use crate::runtime::query_context::{
-    QueryContextManager, QueryExecutionKey, query_context_manager,
-};
 use crate::runtime::sink_commit::BackendSinkCommitPort;
 use novarocks_execution::exec::node::scan::ScanOp;
 use novarocks_execution::exec::operators::scan::ScanDispatchState;
@@ -44,6 +41,9 @@ use novarocks_memory::{LimitDimension, MemoryAuthority};
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
+use novarocks_worker::query_context::{
+    QueryContextManager, QueryExecutionKey, query_context_manager,
+};
 
 #[derive(Clone)]
 pub struct NativeFragmentQueryRuntime {
@@ -303,13 +303,71 @@ impl NativeFragmentAdmissionResources {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::NativeFragmentQueryRuntime;
-    use crate::runtime::query_context::QueryContextManager;
+    use novarocks_execution::exec::expr::agg::{
+        ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
+    };
+    use novarocks_execution::runtime::execution_runtime::{
+        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+    };
+    use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
+    use novarocks_execution::runtime::runtime_state::RuntimeState;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::{QueryId, UniqueId};
-    use std::sync::Arc;
+    use novarocks_worker::query_context::QueryContextManager;
+
+    fn execution_runtime() -> Arc<ExecutionRuntime> {
+        let config = ExecutionRuntimeConfig {
+            driver_threads: 1,
+            scan_threads: 1,
+            scan_queue_capacity: 1,
+            spill_io_threads: 1,
+            spill_io_queue_capacity: 1,
+            spill_storage: ExecutionSpillStorageConfig::default(),
+            exchange_wait_ms: 1,
+            exchange_io_threads: 1,
+            exchange_io_max_inflight_bytes: 1,
+            exchange_max_transmit_batched_bytes: 1,
+            operator_buffer_chunks: 1,
+            local_exchange_buffer_mem_limit_per_driver: 1,
+            local_exchange_max_buffered_rows: -1,
+            connector_io_tasks_per_scan_operator: 1,
+            scan_submit_fail_max: 1,
+            scan_submit_fail_timeout_ms: 1,
+            runtime_filter_scan_wait_time_ms_override: None,
+            runtime_filter_wait_timeout_ms_override: None,
+            sink_io_worker_threads: 1,
+            sink_io_max_blocking_threads: 1,
+        };
+        let mut builder = ExecutionFunctionSetBuilder::new();
+        novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+            .expect("builtin function metadata");
+        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+            &mut builder,
+        )
+        .expect("builtin aggregate implementations");
+        let function_set: Arc<SealedExecutionFunctionSet> =
+            Arc::new(builder.seal().expect("builtin execution function set"));
+        Arc::new(
+            ExecutionRuntime::new(
+                config,
+                function_set,
+                crate::application::test_memory_authority(),
+            )
+            .expect("execution runtime"),
+        )
+    }
+
+    fn process_root_children_labelled(label: &str) -> Vec<Arc<MemTracker>> {
+        mem_tracker::process_mem_tracker()
+            .children()
+            .into_iter()
+            .filter(|child| child.label() == label)
+            .collect()
+    }
 
     #[test]
     fn native_admission_installs_one_query_memory_limit() {
@@ -465,5 +523,59 @@ mod tests {
             .request_grant(4096)
             .expect("the account policy must still have its whole limit available");
         admitted.query_mem_tracker().release(8192);
+    }
+
+    #[test]
+    fn worker_query_tracker_and_execution_fallback_share_parent_and_label() {
+        let query_id = QueryId::new(0x6d65_6d31, 0x6d65_6d32);
+        let label = mem_tracker::query_tracker_label(query_id.high(), query_id.low());
+        assert!(
+            process_root_children_labelled(&label).is_empty(),
+            "the test query id must be unique to this test"
+        );
+
+        let manager = QueryContextManager::new_for_test();
+        let runtime = NativeFragmentQueryRuntime {
+            manager,
+            memory_authority: crate::application::test_memory_authority(),
+        };
+        let execution_id =
+            QueryExecutionId::new(query_id, AttemptId::new(1).expect("nonzero attempt"))
+                .expect("valid execution id");
+        let admitted = runtime
+            .prepare_admission_execution(
+                execution_id,
+                UniqueId::new(0x6d65_6d33, 1),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .expect("worker query context admission");
+        let from_context = admitted.query_mem_tracker();
+        assert_eq!(from_context.label(), label);
+        let after_context = process_root_children_labelled(&label);
+        assert_eq!(after_context.len(), 1);
+        assert!(Arc::ptr_eq(&after_context[0], &from_context));
+
+        let _state = RuntimeState::new(
+            None,
+            None,
+            Some(query_id),
+            Some(UniqueId::new(0x6d65_6d33, 0x6d65_6d34)),
+            None,
+            None,
+            None,
+            None,
+            Some(execution_runtime()),
+            None,
+        );
+        let after_state = process_root_children_labelled(&label);
+        assert_eq!(after_state.len(), 2);
+        assert!(
+            after_state
+                .iter()
+                .any(|child| Arc::ptr_eq(child, &from_context))
+        );
     }
 }

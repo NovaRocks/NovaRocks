@@ -4486,6 +4486,7 @@ dependencies = [
  "bytes",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-memory",
  "novarocks-spi",
  "novarocks-types",
  "sha2",

@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use novarocks_execution::exec::node::scan::IncrementalScanRange;
 use novarocks_execution::exec::node::scan::ScanOp;
 use novarocks_execution::exec::operators::scan::dispatch::ScanDispatchState;
@@ -37,14 +36,14 @@ enum QueryExecutionGeneration {
 
 #[allow(
     dead_code,
-    reason = "Legacy query-context callers retain the first native attempt outside the lifecycle-aware backend target."
+    reason = "Legacy query-context callers retain the first native attempt outside the lifecycle-aware worker runtime."
 )]
 fn legacy_native_attempt() -> NonZeroU64 {
     NonZeroU64::new(1).expect("one is a nonzero native attempt")
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct QueryExecutionKey {
+pub struct QueryExecutionKey {
     query_id: QueryId,
     generation: QueryExecutionGeneration,
 }
@@ -63,18 +62,18 @@ impl QueryExecutionKey {
         }
     }
 
-    pub(crate) const fn native_attempt(query_id: QueryId, attempt: NonZeroU64) -> Self {
+    pub const fn native_attempt(query_id: QueryId, attempt: NonZeroU64) -> Self {
         Self {
             query_id,
             generation: QueryExecutionGeneration::Native(attempt),
         }
     }
 
-    pub(crate) const fn query_id(self) -> QueryId {
+    pub const fn query_id(self) -> QueryId {
         self.query_id
     }
 
-    pub(crate) const fn native_attempt_id(self) -> Option<NonZeroU64> {
+    pub const fn native_attempt_id(self) -> Option<NonZeroU64> {
         match self.generation {
             QueryExecutionGeneration::Native(attempt) => Some(attempt),
         }
@@ -146,13 +145,12 @@ mod query_cleanup_lease_tests {
 
 #[allow(
     dead_code,
-    reason = "Query context fields are consumed by native execution integrations outside the backend lib test configuration."
+    reason = "Query context fields are consumed by native execution integrations outside the worker test configuration."
 )]
 pub(crate) struct QueryContext {
     #[allow(dead_code)]
     pub(crate) query_id: QueryId,
     execution_generation: QueryContextGeneration,
-    pub(crate) desc_snapshot: Option<Arc<DescriptorSnapshot>>,
     pub(crate) num_fragments: usize,
     pub(crate) num_active_fragments: usize,
     pub(crate) total_fragments: Option<usize>,
@@ -180,7 +178,7 @@ struct RuntimeFilterQueryCancellationAction;
 
 #[allow(
     dead_code,
-    reason = "Query context helpers are consumed by native execution integrations outside the backend lib test configuration."
+    reason = "Query context helpers are consumed by native execution integrations outside the worker test configuration."
 )]
 impl QueryContext {
     pub(crate) fn new(
@@ -212,7 +210,6 @@ impl QueryContext {
         Self {
             query_id,
             execution_generation,
-            desc_snapshot: None,
             num_fragments: 0,
             num_active_fragments: 0,
             total_fragments: None,
@@ -323,7 +320,7 @@ struct QueryContextManagerInner {
     incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
 }
 
-pub(crate) struct QueryContextManager {
+pub struct QueryContextManager {
     inner: Mutex<QueryContextManagerInner>,
     stopped: AtomicBool,
 }
@@ -337,7 +334,7 @@ pub struct NativeQueryExecutionResourceSnapshot {
 
 #[allow(
     dead_code,
-    reason = "Fragment cancellation results are retained for native execution integrations outside the backend lib test configuration."
+    reason = "Fragment cancellation results are retained for native worker integrations outside the worker test configuration."
 )]
 pub(crate) struct FinstCancelResult {
     pub(crate) query_id: Option<QueryId>,
@@ -346,7 +343,7 @@ pub(crate) struct FinstCancelResult {
 
 #[allow(
     dead_code,
-    reason = "Query-context manager APIs are consumed by native execution integrations outside the backend lib test configuration."
+    reason = "Query-context manager APIs are consumed by native worker integrations outside the worker test configuration."
 )]
 impl QueryContextManager {
     pub fn native_execution_resource_snapshot(&self) -> NativeQueryExecutionResourceSnapshot {
@@ -382,8 +379,8 @@ impl QueryContextManager {
         manager
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_test() -> Arc<Self> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_test() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(QueryContextManagerInner::default()),
             stopped: AtomicBool::new(false),
@@ -550,7 +547,7 @@ impl QueryContextManager {
     /// authority would make "one authority per process" true by accident of
     /// that singleton rather than by composition, and would hand every caller
     /// a way to reach capacity without being given it.
-    pub(crate) fn ensure_query_account(
+    pub fn ensure_query_account(
         &self,
         query_id: QueryId,
         authority: &Arc<MemoryAuthority>,
@@ -575,7 +572,7 @@ impl QueryContextManager {
         Ok(account)
     }
 
-    pub(crate) fn ensure_native_context_execution(
+    pub fn ensure_native_context_execution(
         &self,
         execution: QueryExecutionKey,
         return_error_if_not_exist: bool,
@@ -596,7 +593,7 @@ impl QueryContextManager {
         )
     }
 
-    pub(crate) fn get_or_register_native_execution(
+    pub fn get_or_register_native_execution(
         &self,
         execution: QueryExecutionKey,
         return_error_if_not_exist: bool,
@@ -740,7 +737,7 @@ impl QueryContextManager {
             .map(|ctx| ctx.mem_tracker())
     }
 
-    pub(crate) fn query_mem_tracker_execution(
+    pub fn query_mem_tracker_execution(
         &self,
         execution: QueryExecutionKey,
     ) -> Option<Arc<MemTracker>> {
@@ -753,16 +750,7 @@ impl QueryContextManager {
             .map(QueryContext::mem_tracker)
     }
 
-    pub(crate) fn descriptor_snapshot(&self, query_id: QueryId) -> Option<Arc<DescriptorSnapshot>> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.desc_snapshot.clone())
-    }
-
-    pub(crate) fn register_incremental_scan_node(
+    pub fn register_incremental_scan_node(
         &self,
         finst_id: UniqueId,
         node_id: i32,
@@ -888,7 +876,7 @@ impl QueryContextManager {
             .insert(finst_id, port);
     }
 
-    pub(crate) fn register_native_finst_execution(
+    pub fn register_native_finst_execution(
         &self,
         finst_id: UniqueId,
         execution: QueryExecutionKey,
@@ -1009,7 +997,7 @@ impl QueryContextManager {
         true
     }
 
-    pub(crate) fn rollback_pre_ready_native_fragment_execution(
+    pub fn rollback_pre_ready_native_fragment_execution(
         &self,
         execution: QueryExecutionKey,
         finst_id: UniqueId,
@@ -1049,11 +1037,7 @@ impl QueryContextManager {
         true
     }
 
-    pub(crate) fn unregister_finst_execution(
-        &self,
-        finst_id: UniqueId,
-        execution: QueryExecutionKey,
-    ) {
+    pub fn unregister_finst_execution(&self, finst_id: UniqueId, execution: QueryExecutionKey) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         if guard.finst_to_query.get(&finst_id) != Some(&execution) {
             return;
@@ -1324,7 +1308,7 @@ impl QueryContextManager {
         self.finish_fragment_internal(query_id)
     }
 
-    pub(crate) fn finish_fragment_execution(&self, execution: QueryExecutionKey) {
+    pub fn finish_fragment_execution(&self, execution: QueryExecutionKey) {
         self.finish_fragment_internal_execution(execution.query_id(), Some(execution))
     }
 
@@ -1403,7 +1387,7 @@ mod fragment_cancellation_boundary_tests {
 
 static QUERY_CONTEXT_MANAGER: OnceLock<Arc<QueryContextManager>> = OnceLock::new();
 
-pub(crate) fn query_context_manager() -> Arc<QueryContextManager> {
+pub fn query_context_manager() -> Arc<QueryContextManager> {
     QUERY_CONTEXT_MANAGER
         .get_or_init(QueryContextManager::new)
         .clone()
@@ -1583,127 +1567,6 @@ mod incremental_scan_domain_tests {
             manager
                 .pending_incremental_scan_ranges_for_test(finst_id, 42)
                 .is_empty()
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use novarocks_execution::exec::expr::agg::{
-        ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
-    };
-    use novarocks_execution::runtime::execution_runtime::{
-        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
-    };
-    use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
-    use novarocks_execution::runtime::runtime_state::RuntimeState;
-    use novarocks_types::UniqueId;
-
-    use super::{QueryContext, QueryId};
-
-    fn execution_runtime() -> Arc<ExecutionRuntime> {
-        let config = ExecutionRuntimeConfig {
-            driver_threads: 1,
-            scan_threads: 1,
-            scan_queue_capacity: 1,
-            spill_io_threads: 1,
-            spill_io_queue_capacity: 1,
-            spill_storage: ExecutionSpillStorageConfig::default(),
-            exchange_wait_ms: 1,
-            exchange_io_threads: 1,
-            exchange_io_max_inflight_bytes: 1,
-            exchange_max_transmit_batched_bytes: 1,
-            operator_buffer_chunks: 1,
-            local_exchange_buffer_mem_limit_per_driver: 1,
-            local_exchange_max_buffered_rows: -1,
-            connector_io_tasks_per_scan_operator: 1,
-            scan_submit_fail_max: 1,
-            scan_submit_fail_timeout_ms: 1,
-            runtime_filter_scan_wait_time_ms_override: None,
-            runtime_filter_wait_timeout_ms_override: None,
-            sink_io_worker_threads: 1,
-            sink_io_max_blocking_threads: 1,
-        };
-        let mut builder = ExecutionFunctionSetBuilder::new();
-        novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
-            .expect("builtin function metadata");
-        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
-            &mut builder,
-        )
-        .expect("builtin aggregate implementations");
-        let function_set: Arc<SealedExecutionFunctionSet> =
-            Arc::new(builder.seal().expect("builtin execution function set"));
-        Arc::new(
-            ExecutionRuntime::new(
-                config,
-                function_set,
-                crate::application::test_memory_authority(),
-            )
-            .expect("execution runtime"),
-        )
-    }
-
-    fn process_root_children_labelled(label: &str) -> Vec<Arc<MemTracker>> {
-        mem_tracker::process_mem_tracker()
-            .children()
-            .into_iter()
-            .filter(|child| child.label() == label)
-            .collect()
-    }
-
-    /// One query has exactly one parent and one name, whichever owner mints its
-    /// tracker. Before this held, the Backend query-context path hung off the
-    /// process root while the Execution RuntimeState path hung off a separate
-    /// `"execution"` root, so the same query produced two subtrees whose
-    /// charges never met.
-    #[test]
-    fn both_query_tracker_paths_agree_on_one_parent_and_one_label() {
-        let query_id = QueryId::new(0x6d65_6d31, 0x6d65_6d32);
-        let label = mem_tracker::query_tracker_label(query_id.high(), query_id.low());
-        assert!(
-            process_root_children_labelled(&label).is_empty(),
-            "the test query id must be unique to this test"
-        );
-
-        // Path 1: the Backend query-context owner.
-        let context = QueryContext::new(query_id, Duration::from_secs(5), Duration::from_secs(5));
-        let from_context = context.mem_tracker();
-        assert_eq!(from_context.label(), label);
-        let after_context = process_root_children_labelled(&label);
-        assert_eq!(after_context.len(), 1);
-        assert!(
-            Arc::ptr_eq(&after_context[0], &from_context),
-            "the query-context tracker must be a direct child of the process root"
-        );
-
-        // Path 2: the Execution RuntimeState synthesis, which production only
-        // reaches when no fragment tracker was supplied.
-        let _state = RuntimeState::new(
-            None,
-            None,
-            Some(query_id),
-            Some(UniqueId::new(0x6d65_6d33, 0x6d65_6d34)),
-            None,
-            None,
-            None,
-            None,
-            Some(execution_runtime()),
-            None,
-        );
-        let after_state = process_root_children_labelled(&label);
-        assert_eq!(
-            after_state.len(),
-            2,
-            "the RuntimeState path must mint its query tracker under the same process root, under the same label"
-        );
-        assert!(
-            after_state
-                .iter()
-                .any(|child| Arc::ptr_eq(child, &from_context)),
-            "the query-context tracker must still be the process root's child"
         );
     }
 }
