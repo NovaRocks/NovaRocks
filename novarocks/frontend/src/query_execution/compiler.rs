@@ -30,13 +30,14 @@ use novarocks_query_application::api::QueryResult;
 use novarocks_query_application::api::build_string_query_result;
 #[cfg(test)]
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+#[cfg(test)]
+use novarocks_sql::planning::catalog::TableLookupMode;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
 #[cfg(test)]
 use crate::mv::domain::repository::MvRepository;
-pub use novarocks_sql::planning::catalog::TableLookupMode;
 use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};

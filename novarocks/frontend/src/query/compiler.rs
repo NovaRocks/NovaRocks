@@ -29,7 +29,7 @@ use crate::connector::connector_planning_context_for_query;
 use crate::mv::domain::readiness::{MvCandidateReader, MvReadinessPort};
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use crate::query_execution::compiler::{
-    TableLookupMode, freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
+    freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
     query_statistics_snapshot,
 };
 use crate::query_execution::completion::{
@@ -60,6 +60,7 @@ use novarocks_sql::compiler::{
     ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent,
     SqlCompiler, SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
 };
+use novarocks_sql::planning::catalog::TableLookupMode;
 
 /// Preserves SQL analyze-domain facts until the session still has the original
 /// SQL source required to render a user location.
