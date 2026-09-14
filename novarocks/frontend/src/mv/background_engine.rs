@@ -29,10 +29,10 @@ use crate::mv::domain::refresh::{
     definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::{
-    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
-    PreparedMvRefresh,
+    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
 };
 use novarocks_mv_application::dependency::iceberg_mv_dependency_ref;
+use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,

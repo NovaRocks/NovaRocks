@@ -25,7 +25,7 @@ use crate::mv::domain::application::{
 };
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::mv_assembly::refresh_handoff::{
-    MvRefreshAttemptIdentity, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
+    PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use crate::query_execution::mv_native_write::{
     MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
@@ -35,7 +35,8 @@ use novarocks_mv_application::ports::{
     MvProviderFailure, MvProviderFailureKind, MvRefreshProjectionPort,
 };
 use novarocks_mv_application::product::{
-    MvProductError, MvProductErrorKind, MvProductResult, MvTarget as ProductMvTarget,
+    MvProductError, MvProductErrorKind, MvProductResult, MvRefreshAttemptIdentity,
+    MvTarget as ProductMvTarget,
 };
 use novarocks_mv_application::publication::{
     MvRefreshCommittedFacts, MvRefreshPublicationFinalizationFacts, MvRefreshPublicationIntent,

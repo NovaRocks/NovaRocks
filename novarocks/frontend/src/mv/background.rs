@@ -21,10 +21,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::query_execution::maintenance::TableMaintenanceEngine;
-use crate::query_execution::mv_assembly::refresh_handoff::{
-    MvRefreshAttemptIdentity, PreparedMvRefresh,
-};
+use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefresh;
 use novarocks_mv_application::maintenance::{MvBackgroundEngineError, MvMaintenanceFacts};
+use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_table_maintenance::MaintenanceTarget;

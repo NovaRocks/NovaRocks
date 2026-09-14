@@ -17,7 +17,7 @@
 
 //! Frontend refresh-lifecycle handoff assembled from Core SQL facts.
 
-pub use novarocks_mv_application::product::MvRefreshAttemptIdentity;
+use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_spi::connector::{ConnectorProviderBindingKey, ConnectorWriteOperationId};
 
 use super::refresh_artifact::{PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite};

@@ -70,12 +70,13 @@ use crate::query_execution::mv_assembly::refresh_artifact::{
     PreparedMvIncrementalWrite,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::{
-    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
-    PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
+    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
+    PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use novarocks_mv_application::persistence::schema::{
     MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
 };
+use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_mv_application::publication::{
     MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };
