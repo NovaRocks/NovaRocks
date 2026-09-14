@@ -156,37 +156,28 @@ impl fmt::Display for CommandError {
 
 impl Error for CommandError {}
 
-/// Complete, source-spanless catalog command admitted by Query Application.
-pub type CatalogCommand = CatalogSqlCommand;
-
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
     fn execute(
         &self,
-        command: CatalogCommand,
+        command: CatalogSqlCommand,
         request_context: RequestContext,
         command_context: CommandContext,
     ) -> CommandFuture;
 }
-
-/// Complete, source-spanless statistics command admitted by Query Application.
-pub type StatisticsCommand = StatisticsSqlCommand;
 
 pub trait StatisticsCommandConsumer: Send + Sync + 'static {
     fn execute(
         &self,
-        command: StatisticsCommand,
+        command: StatisticsSqlCommand,
         request_context: RequestContext,
         command_context: CommandContext,
     ) -> CommandFuture;
 }
 
-/// Complete, source-spanless maintenance command admitted by Query Application.
-pub type MaintenanceCommand = MaintenanceSqlCommand;
-
 pub trait MaintenanceCommandConsumer: Send + Sync + 'static {
     fn execute(
         &self,
-        command: MaintenanceCommand,
+        command: MaintenanceSqlCommand,
         request_context: RequestContext,
         command_context: CommandContext,
     ) -> CommandFuture;
