@@ -28,6 +28,7 @@ use crate::capabilities as core_capabilities;
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
+use novarocks_mv_application::service::MvProductService;
 use novarocks_mysql_adapter::{MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings};
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::cancellation::QueryCancellationReason;
@@ -333,6 +334,12 @@ async fn build_frontend_role_products(
             Arc::clone(&mv_storage_observation),
         ),
     );
+    // The role composition root owns construction of the MV process product;
+    // FrontendMvService only adapts product commands to role-local capabilities.
+    let mv_product_service = Arc::new(MvProductService::new_with_readiness(
+        host.mv_scheduler_config(),
+        mv_readiness.product_readiness_service(),
+    ));
     let mv_service = Arc::new(crate::mv::FrontendMvService::with_refresh_dependencies(
         Arc::clone(&mv_readiness),
         query_execution.clone(),
@@ -340,7 +347,7 @@ async fn build_frontend_role_products(
         mv_activation,
         role,
         topology.clone(),
-        host.mv_scheduler_config(),
+        mv_product_service,
         host.mv_maintenance_config(),
         Arc::clone(&maintenance_service),
         host.optimizer_query_mem_limit_bytes(),

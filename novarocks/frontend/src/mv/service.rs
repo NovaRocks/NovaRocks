@@ -36,7 +36,6 @@ use novarocks_mv_application::{
         MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     },
     process_runtime::{MvBackgroundRuntime, MvBackgroundStop, MvBackgroundTasks},
-    scheduler::MvSchedulerConfig,
     service::MvProductService,
 };
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
@@ -85,7 +84,7 @@ impl FrontendMvService {
         >,
         execution_role: novarocks_types::ClusterRole,
         topology: BackendTopologyService,
-        scheduler_config: MvSchedulerConfig,
+        product_service: Arc<MvProductService>,
         maintenance_config: MaintenanceCoordinatorConfig,
         table_maintenance_service: Arc<dyn TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
@@ -100,10 +99,7 @@ impl FrontendMvService {
                 readiness: Arc::clone(&readiness),
             },
             readiness: Arc::clone(&readiness),
-            product_service: Arc::new(MvProductService::new_with_readiness(
-                scheduler_config,
-                readiness.product_readiness_service(),
-            )),
+            product_service,
             maintenance_config,
             table_maintenance_service,
             execution_role,
