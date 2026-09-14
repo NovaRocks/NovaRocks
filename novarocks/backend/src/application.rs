@@ -380,9 +380,9 @@ fn compose_backend_application_services(
             )
         },
     )?);
-    crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global(Arc::clone(
-        &memory_authority,
-    ))
+    novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime::global(
+        Arc::clone(&memory_authority),
+    )
     .publish_resource_snapshot();
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
@@ -410,9 +410,9 @@ fn compose_backend_application_services(
         task_execution_registry_config.max_active_tasks_per_backend,
     );
     let execution_host = Arc::new(crate::task_execution::NativeTaskExecutionHost::new(
-        crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global(Arc::clone(
-            &memory_authority,
-        )),
+        novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime::global(
+            Arc::clone(&memory_authority),
+        ),
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::TaskQueryContextFacts>,
         Arc::clone(&inbound_capabilities),
         novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(

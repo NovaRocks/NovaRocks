@@ -93,8 +93,7 @@ use crate::fragment::decode::plan::context::{
 };
 use crate::fragment::decode::request::NativeFragmentRequest;
 use crate::fragment::ingress::{ReceivedReadSplit, TypedReadAttemptContext};
-use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-
+use novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_native_adapter::task_shared_facts::fragment_plan;
 use novarocks_worker::{HostRejection, RunnableTask, TaskExecutionHost, TaskStatusReporter};
@@ -1412,7 +1411,7 @@ mod tests {
         ExchangeRouteQuery, NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority,
     };
 
-    use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
+    use novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime;
     use novarocks_worker::ProcessMonotonicClock;
     use novarocks_worker::{
         HostRejection, METRIC_PUBLISH_MIN_INTERVAL, RunnableTask, StatusAdvance, TaskExecutionHost,

@@ -15,6 +15,7 @@ test-support = ["dep:novarocks-secret"]
 novarocks-native-trust.workspace = true
 novarocks-execution.workspace = true
 novarocks-execution-contract.workspace = true
+novarocks-memory.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 novarocks-plan-codec.workspace = true
 novarocks-proto-codec.workspace = true
