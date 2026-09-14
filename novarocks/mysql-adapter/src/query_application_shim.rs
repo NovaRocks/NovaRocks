@@ -376,17 +376,40 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                     .await;
             }
         };
-        match session
+        let (statement, terminal) = match session
             .init_database(&crate::normalize_init_database_schema(schema))
             .await
         {
-            Ok(()) => writer.ok().await,
+            Ok(statement) => statement.into_parts(),
             Err(error) => {
                 writer
                     .error(crate::mysql_error_kind(&error), error.message().as_bytes())
+                    .await?;
+                return Ok(());
+            }
+        };
+        let outcome = match statement {
+            StatementResult::Ok => writer.ok().await,
+            StatementResult::GovernedCompletion(result) => {
+                crate::write_governed_init_ok(result.into_protocol(), writer).await
+            }
+            StatementResult::GovernedError(result) => {
+                let (error, protocol) = result.into_parts();
+                crate::write_governed_init_error(error, protocol, writer).await
+            }
+            StatementResult::Query(_)
+            | StatementResult::GovernedQuery(_)
+            | StatementResult::StreamingQuery(_) => {
+                writer
+                    .error(
+                        ErrorKind::ER_UNKNOWN_ERROR,
+                        b"COM_INIT_DB returned a non-terminal query result",
+                    )
                     .await
             }
-        }
+        };
+        terminal.complete();
+        outcome
     }
 
     async fn on_query<'a>(

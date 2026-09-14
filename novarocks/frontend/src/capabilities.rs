@@ -524,6 +524,7 @@ pub struct SessionCatalogPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
 }
 
 impl SessionCatalogPorts {
@@ -531,11 +532,13 @@ impl SessionCatalogPorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
     ) -> Self {
         Self {
             catalog_service,
             catalog_application,
             connector_control,
+            connector_blocking_io,
         }
     }
 }
@@ -548,6 +551,7 @@ pub fn session_catalog_resolver(
             ports.catalog_service,
             ports.catalog_application,
             ports.connector_control,
+            ports.connector_blocking_io,
         ),
     )
 }

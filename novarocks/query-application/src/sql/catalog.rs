@@ -19,18 +19,27 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use novarocks_spi::connector::ConnectorRequestContext;
+
 use crate::session_error::QueryServiceError;
 
 /// Read-only Catalog and connector facts required to resolve `USE` and
 /// `SET CATALOG`. This port carries neither a command executor nor a
 /// connector binding, so session admission cannot acquire mutation authority.
+#[async_trait]
 pub trait SessionCatalogPort: Send + Sync + 'static {
     fn database_exists(&self, database_name: &str) -> Result<bool, QueryServiceError>;
 
     fn require_external_catalog_ready(&self, catalog_name: &str) -> Result<(), QueryServiceError>;
 
-    fn external_namespace_exists(
+    /// Resolves one external namespace under the exact connector request
+    /// admitted by the session statement. The role-local adapter owns any
+    /// bounded blocking provider edge; this port never creates a detached
+    /// request with default cancellation.
+    async fn external_namespace_exists(
         &self,
+        request: ConnectorRequestContext,
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, QueryServiceError>;

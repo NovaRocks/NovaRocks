@@ -28,6 +28,7 @@ use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
+use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_query_application::api::BackendTopologyService;
@@ -484,6 +485,7 @@ pub struct SessionCatalogResolver {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    connector_blocking_io: ConnectorBlockingIoSupervisor,
 }
 
 impl SessionCatalogResolver {
@@ -491,15 +493,18 @@ impl SessionCatalogResolver {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        connector_blocking_io: ConnectorBlockingIoSupervisor,
     ) -> Self {
         Self {
             catalog_service,
             catalog_application,
             connector_control,
+            connector_blocking_io,
         }
     }
 }
 
+#[async_trait::async_trait]
 impl SessionCatalogPort for SessionCatalogResolver {
     fn database_exists(&self, database_name: &str) -> Result<bool, QueryServiceError> {
         self.catalog_service
@@ -544,23 +549,30 @@ impl SessionCatalogPort for SessionCatalogResolver {
             })
     }
 
-    fn external_namespace_exists(
+    async fn external_namespace_exists(
         &self,
+        request: novarocks_spi::connector::ConnectorRequestContext,
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, QueryServiceError> {
-        let context = crate::connector::connector_request_context(
-            None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
-        .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))?;
-        crate::connector::metadata_namespace_exists(
-            self.connector_control.as_ref(),
-            context,
-            catalog_name,
-            namespace_name,
-        )
-        .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
+        let connector_control = Arc::clone(&self.connector_control);
+        let catalog_name = catalog_name.to_owned();
+        let namespace_name = namespace_name.to_owned();
+        self.connector_blocking_io
+            .spawn_ordinary(move || {
+                crate::connector::metadata_namespace_exists(
+                    connector_control.as_ref(),
+                    request,
+                    &catalog_name,
+                    &namespace_name,
+                )
+            })
+            .finish()
+            .await
+            .map_err(|error| {
+                QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string())
+            })?
+            .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
     }
 }
 
@@ -568,6 +580,7 @@ impl SessionCatalogPort for SessionCatalogResolver {
 mod session_catalog_tests {
     use std::sync::Arc;
 
+    use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
     use novarocks_query_application::session_error::QueryServiceErrorKind;
     use novarocks_query_application::sql::catalog::SessionCatalogPort;
     use novarocks_types::naming::DEFAULT_DATABASE;
@@ -579,11 +592,15 @@ mod session_catalog_tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
+            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
+                tokio::runtime::Handle::current(),
+                ConnectorBlockingIoBudget::default(),
+            ),
         )
     }
 
-    #[test]
-    fn local_database_lookup_uses_the_query_catalog_snapshot() {
+    #[tokio::test]
+    async fn local_database_lookup_uses_the_query_catalog_snapshot() {
         let resolver = resolver_without_catalog_application();
 
         assert!(
@@ -593,8 +610,8 @@ mod session_catalog_tests {
         );
     }
 
-    #[test]
-    fn external_catalog_admission_fails_closed_without_its_frontend_owner() {
+    #[tokio::test]
+    async fn external_catalog_admission_fails_closed_without_its_frontend_owner() {
         let resolver = resolver_without_catalog_application();
 
         let error = resolver

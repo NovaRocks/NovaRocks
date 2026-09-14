@@ -88,7 +88,11 @@ impl QuerySessionOpenRequest {
 /// Application-owned client session consumed by a protocol adapter.
 #[async_trait]
 pub trait QuerySession: Send + Sync + 'static {
-    async fn init_database(&self, schema: &str) -> Result<(), QueryServiceError>;
+    /// Handles a COM_INIT_DB request. Like COM_QUERY, the result retains its
+    /// governed statement owner until the protocol adapter has written the
+    /// terminal packet.
+    async fn init_database(&self, schema: &str)
+    -> Result<QuerySessionStatement, QueryServiceError>;
 
     /// Executes one protocol-framed SQL fragment. Query Application validates
     /// it as exactly one statement; protocol adapters use this for negotiated

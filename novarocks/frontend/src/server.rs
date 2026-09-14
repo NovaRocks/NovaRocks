@@ -506,6 +506,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
+            host.connector_blocking_io_supervisor(),
         ));
     let catalog_command_executor =
         core_capabilities::catalog_command_executor(core_capabilities::CatalogCommandPorts::new(
@@ -594,7 +595,6 @@ fn build_frontend_query_session_factory_from_role_products(
         dml_engines.truncate,
         host.query_cpu_executor(),
         host.query_blocking_executor(),
-        host.connector_blocking_io_supervisor(),
         host.optimizer_query_mem_limit_bytes(),
         host.lake_publication_runtime_policy(),
         host.serving_lifecycle().admission(),

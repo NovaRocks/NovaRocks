@@ -23,7 +23,7 @@ use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::protocol_delivery::GovernedProtocolOwner;
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_query_application::session_error::QueryServiceError;
-use opensrv_mysql::{ErrorKind, OkResponse, QueryResultWriter};
+use opensrv_mysql::{ErrorKind, InitWriter, OkResponse, QueryResultWriter};
 use tokio::io::AsyncWrite;
 
 use crate::{error_kind_for_domain_code, error_kind_for_query_service_error};
@@ -108,6 +108,62 @@ pub async fn write_governed_terminal_ok_one<'writer, W: AsyncWrite + Unpin>(
                 .await
                 .map(|_| crate::governed_result_writer::MysqlStatementWriteOutcome::Terminated)
         }
+    }
+}
+
+/// Writes a COM_INIT_DB OK response and settles its governed statement owner.
+pub async fn write_governed_init_ok<W: AsyncWrite + Unpin>(
+    mut protocol: GovernedProtocolOwner,
+    writer: InitWriter<'_, W>,
+) -> io::Result<()> {
+    match protocol.seal_success_visibility() {
+        GovernedStatementVisibilitySealOutcome::Sealed => match writer.ok().await {
+            Ok(()) => {
+                let _ = protocol.complete();
+                Ok(())
+            }
+            Err(error) => {
+                let _ = protocol.client_disconnected();
+                Err(error)
+            }
+        },
+        GovernedStatementVisibilitySealOutcome::Cancelled(_) => {
+            let _ = protocol.settle_cancellation();
+            writer
+                .error(
+                    ErrorKind::ER_QUERY_INTERRUPTED,
+                    b"query cancelled before terminal OK",
+                )
+                .await
+        }
+        GovernedStatementVisibilitySealOutcome::Stale => {
+            let _ = protocol.fail();
+            writer
+                .error(
+                    ErrorKind::ER_UNKNOWN_ERROR,
+                    b"governed statement became stale before terminal OK",
+                )
+                .await
+        }
+    }
+}
+
+/// Writes a COM_INIT_DB error response and settles its governed statement owner.
+pub async fn write_governed_init_error<W: AsyncWrite + Unpin>(
+    error: QueryServiceError,
+    mut protocol: GovernedProtocolOwner,
+    writer: InitWriter<'_, W>,
+) -> io::Result<()> {
+    if cancellation_overrides_typed_error(protocol.cancellation().reason()) {
+        let _ = protocol.settle_cancellation();
+        writer
+            .error(ErrorKind::ER_QUERY_INTERRUPTED, b"query cancelled")
+            .await
+    } else {
+        let _ = protocol.fail();
+        writer
+            .error(mysql_error_kind(&error), error.message().as_bytes())
+            .await
     }
 }
 

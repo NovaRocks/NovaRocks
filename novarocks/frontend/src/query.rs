@@ -42,7 +42,6 @@ use crate::query_execution::maintenance::command::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use crate::statistics::command::StatisticsCommandExecutor;
-use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::view::command::ViewCommandExecutor;
 use async_trait::async_trait;
 use novarocks_parser::{
@@ -581,7 +580,6 @@ pub struct FrontendQueryService {
     truncate_engine: Arc<dyn TruncateEngine>,
     query_cpu_executor: QueryCpuExecutor,
     query_blocking_executor: QueryBlockingExecutor,
-    connector_blocking_io: ConnectorBlockingIoSupervisor,
     /// Cost budget frozen from `[runtime]` and handed to statement admission
     /// whenever the session did not set one itself.
     optimizer_query_mem_limit_bytes: u64,
@@ -620,7 +618,6 @@ impl FrontendQueryService {
         truncate_engine: Arc<dyn TruncateEngine>,
         query_cpu_executor: QueryCpuExecutor,
         query_blocking_executor: QueryBlockingExecutor,
-        connector_blocking_io: ConnectorBlockingIoSupervisor,
         optimizer_query_mem_limit_bytes: u64,
         lake_publication_runtime_policy: LakePublicationRuntimePolicy,
         serving_admission: FrontendServingAdmission,
@@ -669,7 +666,6 @@ impl FrontendQueryService {
             truncate_engine,
             query_cpu_executor,
             query_blocking_executor,
-            connector_blocking_io,
             optimizer_query_mem_limit_bytes,
             lake_publication_runtime_policy,
             serving_admission,
@@ -843,7 +839,14 @@ impl FrontendQuerySession {
                     || statement.database.value.clone(),
                     |catalog| format!("{}.{}", catalog.value, statement.database.value),
                 );
-                if let Err(error) = self.init_database(&schema).await {
+                let cancellation = QueryCancellationView::governed(
+                    governed.cancellation().clone(),
+                    governed.timeout_ms(),
+                );
+                if let Err(error) = self
+                    .init_database_with_cancellation(&schema, cancellation)
+                    .await
+                {
                     return Ok(self.governed_typed_error(error, governed));
                 }
                 Ok(StatementResult::Ok)
@@ -954,6 +957,32 @@ impl FrontendQuerySession {
             &self.service.query_control,
             self.service.client_connection_control.as_ref(),
         )
+    }
+
+    async fn init_database_with_cancellation(
+        &self,
+        schema: &str,
+        cancellation: QueryCancellationView,
+    ) -> Result<(), QueryServiceError> {
+        let current_catalog = self
+            .state
+            .lock()
+            .map_err(poisoned_state)?
+            .current_catalog()
+            .map(ToOwned::to_owned);
+        let connector_context =
+            crate::connector::connector_request_context_for_query(None, cancellation)
+                .map_err(internal_error)?;
+        let context = resolve_database_context(
+            &self.service.session_catalog_resolver,
+            current_catalog.as_deref(),
+            schema,
+            connector_context,
+        )
+        .await?;
+        let mut state = self.state.lock().map_err(poisoned_state)?;
+        state.set_resolved_database_context(context.catalog, context.database);
+        Ok(())
     }
 
     async fn prepare_governed_query_operation(
@@ -1850,23 +1879,50 @@ fn execute_prepared_query(
 
 #[async_trait]
 impl QuerySession for FrontendQuerySession {
-    async fn init_database(&self, schema: &str) -> Result<(), QueryServiceError> {
-        let current_catalog = self
-            .state
-            .lock()
-            .map_err(poisoned_state)?
-            .current_catalog()
-            .map(ToOwned::to_owned);
-        let context = resolve_database_context(
-            &self.service.session_catalog_resolver,
-            current_catalog.as_deref(),
-            schema,
-            &self.service.connector_blocking_io,
-        )
-        .await?;
-        let mut state = self.state.lock().map_err(poisoned_state)?;
-        state.set_resolved_database_context(context.catalog, context.database);
-        Ok(())
+    async fn init_database(
+        &self,
+        schema: &str,
+    ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
+    {
+        let token = self.token()?;
+        let mut statement = self
+            .service
+            .query_control
+            .begin_governed_statement(
+                token,
+                &self.service.workload_root_admission,
+                WorkClass::Management,
+                None,
+                None,
+            )
+            .map_err(|error| self.governed_statement_begin_error(error))?;
+        let cancellation = QueryCancellationView::governed(
+            statement.cancellation().clone(),
+            statement.timeout_ms(),
+        );
+        match self
+            .init_database_with_cancellation(schema, cancellation)
+            .await
+        {
+            Ok(()) => {
+                statement.complete_execution();
+                Ok(
+                    novarocks_query_application::session::QuerySessionStatement::output_owned(
+                        StatementResult::GovernedCompletion(
+                            GovernedCompletionStatementResult::new(
+                                self.service.workload_resources.clone(),
+                                statement,
+                            ),
+                        ),
+                    ),
+                )
+            }
+            Err(error) => Ok(
+                novarocks_query_application::session::QuerySessionStatement::output_owned(
+                    self.governed_typed_error(error, statement),
+                ),
+            ),
+        }
     }
 
     async fn execute_batch(
@@ -1946,7 +2002,7 @@ async fn resolve_database_context(
     resolver: &SessionCatalogService,
     current_catalog: Option<&str>,
     schema: &str,
-    connector_blocking_io: &ConnectorBlockingIoSupervisor,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<DatabaseContext, QueryServiceError> {
     let parts = schema
         .split('.')
@@ -1958,13 +2014,9 @@ async fn resolve_database_context(
                 .map_err(|error| internal_error(error.to_string()))?;
             match current_catalog {
                 Some(catalog) => {
-                    if external_namespace_exists(
-                        resolver,
-                        connector_blocking_io,
-                        catalog.to_string(),
-                        database.clone(),
-                    )
-                    .await?
+                    if resolver
+                        .external_namespace_exists(connector_context, catalog, &database)
+                        .await?
                     {
                         Ok(DatabaseContext {
                             catalog: Some(catalog.to_string()),
@@ -1998,13 +2050,9 @@ async fn resolve_database_context(
                 .map_err(|error| internal_error(error.to_string()))?;
             match catalog {
                 Some(catalog) => {
-                    if external_namespace_exists(
-                        resolver,
-                        connector_blocking_io,
-                        catalog.clone(),
-                        database.clone(),
-                    )
-                    .await?
+                    if resolver
+                        .external_namespace_exists(connector_context, &catalog, &database)
+                        .await?
                     {
                         Ok(DatabaseContext {
                             catalog: Some(catalog),
@@ -2037,20 +2085,6 @@ async fn resolve_database_context(
             format!("unknown database `{schema}`; expected `<database>` or `<catalog>.<database>`"),
         )),
     }
-}
-
-async fn external_namespace_exists(
-    resolver: &SessionCatalogService,
-    connector_blocking_io: &ConnectorBlockingIoSupervisor,
-    catalog: String,
-    database: String,
-) -> Result<bool, QueryServiceError> {
-    let resolver = resolver.clone();
-    connector_blocking_io
-        .spawn_ordinary(move || resolver.external_namespace_exists(&catalog, &database))
-        .finish()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?
 }
 
 fn poisoned_state<T>(_error: std::sync::PoisonError<T>) -> QueryServiceError {
