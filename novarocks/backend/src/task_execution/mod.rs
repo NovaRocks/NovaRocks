@@ -43,11 +43,9 @@
 
 mod context_host;
 mod execution_host;
-pub(crate) mod ingress;
 
 #[cfg(test)]
 mod tests;
 
 pub(crate) use context_host::NativeQueryContextHost;
 pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
-pub(crate) use ingress::RegistryTaskExecutionIngress;

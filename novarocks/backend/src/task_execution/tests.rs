@@ -66,8 +66,8 @@ use novarocks_worker::{
     RunnableTask, SharedFactsRequest, TaskExecutionHost, WorkerMonotonicClock,
 };
 
-use super::ingress::RegistryTaskExecutionIngress;
 use novarocks_native_adapter::task_protocol::TaskExecutionIngress;
+use novarocks_native_adapter::task_protocol_ingress::RegistryTaskExecutionIngress;
 use novarocks_native_adapter::task_shared_facts::sealed_runtime_filter_evidence;
 use novarocks_worker::OperationReceipt;
 use novarocks_worker::TaskExecutionRegistry;

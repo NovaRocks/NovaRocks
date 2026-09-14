@@ -18,7 +18,6 @@ use novarocks_worker::{
 };
 
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress_for_context_host;
-use crate::task_execution::RegistryTaskExecutionIngress;
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
@@ -39,6 +38,7 @@ use novarocks_native_adapter::fragment_result_writer::native_result_writer;
 use novarocks_native_adapter::management_http::MetricsHttpServer;
 use novarocks_native_adapter::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
 use novarocks_native_adapter::task_execution_observation::backend_task_execution_ports;
+use novarocks_native_adapter::task_protocol_ingress::RegistryTaskExecutionIngress;
 use novarocks_native_adapter::{
     BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
     backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,

@@ -60,25 +60,25 @@ use novarocks_task_codec::operation::{
 use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
 
-use novarocks_native_adapter::task_protocol::{
+use crate::task_protocol::{
     TaskExecutionIngress, TaskObservationReader, TaskOperationBatchApplier,
     TaskOperationReceiptAck as ReceiptAck, TaskResultRead, TaskResultReadError,
     TaskResultReadRequest, TaskResultReader, TaskStatusEventStream, TaskStatusSubscriptionReader,
     apply_task_operations, encode_operation_receipt, fetch_task_dynamic_filters, fetch_task_result,
     get_final_task_info, host_rejection_status, subscribe_task_status,
 };
-use novarocks_native_adapter::task_protocol_fault as fault;
+use crate::task_protocol_fault as fault;
 use novarocks_worker::{RootResultRoute, StatusAdvance, TaskExecutionRegistry};
 
 /// The wire adapter of one backend's task protocol owner.
-pub(crate) struct RegistryTaskExecutionIngress {
+pub struct RegistryTaskExecutionIngress {
     registry: Arc<TaskExecutionRegistry>,
     native_compatibility_id: NativeCompatibilityId,
     native_transport_confidentiality: ConfidentialTransport,
 }
 
 impl RegistryTaskExecutionIngress {
-    pub(crate) fn new(
+    pub fn new(
         registry: Arc<TaskExecutionRegistry>,
         native_compatibility_id: NativeCompatibilityId,
         native_transport_confidentiality: ConfidentialTransport,
@@ -252,10 +252,8 @@ impl RegistryTaskExecutionIngress {
                 // this evidence.
                 let evidence = self.registry.released_context_evidence(request.context());
                 let runtime_filter =
-                    novarocks_native_adapter::task_shared_facts::release_runtime_filter_telemetry(
-                        &evidence,
-                    )
-                    .map_err(host_rejection_status)?;
+                    crate::task_shared_facts::release_runtime_filter_telemetry(&evidence)
+                        .map_err(host_rejection_status)?;
                 encode_operation_receipt(&receipt, |ack| {
                     let mut encoded = encode_release_ack(
                         ack.context(),
@@ -278,7 +276,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
         &self,
         request: TaskResultReadRequest,
     ) -> Result<TaskResultRead, TaskResultReadError> {
-        use novarocks_native_adapter::task_result_diagnostics::emit_task_fetch_marker;
+        use crate::task_result_diagnostics::emit_task_fetch_marker;
         use novarocks_worker::result_buffer::{
             TryFetchTypedResult, replays_task_terminal_ack, wait_fetch_task_typed,
         };
@@ -626,8 +624,7 @@ mod tests {
                 Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
                 Arc::new(AcceptingContextHost),
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
-                novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
-                ),
+                crate::task_execution_observation::backend_task_execution_ports(),
             );
             Self {
                 ingress: RegistryTaskExecutionIngress::new(
