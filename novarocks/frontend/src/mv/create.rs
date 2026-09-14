@@ -18,8 +18,9 @@
 //! Frontend SQL/provider adapter for product-owned MV CREATE.
 
 use crate::mv::domain::application::{
-    CreatedMvTarget, MvApplicationError, MvApplicationErrorKind, MvCreateStatement, MvEngine,
-    MvEngineError, MvEngineErrorKind, MvRequestContext, PreparedMvCreate,
+    CreatedMvTarget, MvApplicationError, MvApplicationErrorKind, MvCreateProviderAdapter,
+    MvCreateProviderError, MvCreateProviderErrorKind, MvCreateStatement, MvRequestContext,
+    PreparedMvCreate,
 };
 use novarocks_mv_application::ports::{
     MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvProviderFailure, MvProviderFailureKind,
@@ -34,7 +35,7 @@ use uuid::Uuid;
 
 pub(super) fn handle_create(
     product: &MvProductService,
-    engine: &dyn MvEngine,
+    engine: &dyn MvCreateProviderAdapter,
     statement: &MvCreateStatement,
     context: MvRequestContext<'_>,
 ) -> Result<(), MvApplicationError> {
@@ -79,7 +80,7 @@ pub(super) fn handle_create(
 /// This is intentionally per operation: it captures a parser-admitted,
 /// provider-specific preparation, but exposes only the product's narrow ports.
 struct FrontendCreateAdapter<'a> {
-    engine: &'a dyn MvEngine,
+    engine: &'a dyn MvCreateProviderAdapter,
     plan: &'a PreparedMvCreate,
 }
 
@@ -213,19 +214,19 @@ fn product_target(target: &SqlMvTarget) -> Result<ProductMvTarget, MvApplication
     })
 }
 
-fn provider_failure(error: MvEngineError) -> MvProviderFailure {
+fn provider_failure(error: MvCreateProviderError) -> MvProviderFailure {
     let kind = match error.kind() {
-        MvEngineErrorKind::InvalidRequest | MvEngineErrorKind::Analysis => {
+        MvCreateProviderErrorKind::InvalidRequest | MvCreateProviderErrorKind::Analysis => {
             MvProviderFailureKind::InvalidRequest
         }
-        MvEngineErrorKind::TargetOperation
-        | MvEngineErrorKind::DescriptorSync
-        | MvEngineErrorKind::CatalogRegistration => MvProviderFailureKind::Unavailable,
+        MvCreateProviderErrorKind::TargetOperation
+        | MvCreateProviderErrorKind::DescriptorSync
+        | MvCreateProviderErrorKind::CatalogRegistration => MvProviderFailureKind::Unavailable,
     };
     MvProviderFailure::new(kind, error.to_string())
 }
 
-fn engine_error(error: MvEngineError) -> MvApplicationError {
+fn engine_error(error: MvCreateProviderError) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
 }
 

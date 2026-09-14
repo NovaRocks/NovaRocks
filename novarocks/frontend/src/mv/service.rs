@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::background::{MvBackgroundBindings, MvBackgroundEngine};
-use crate::mv::domain::application::{MvApplicationError, MvEngine, MvRequestContext};
+use crate::mv::domain::application::{
+    MvApplicationError, MvCreateProviderAdapter, MvRequestContext,
+};
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenanceService};
 use crate::query_execution::mv_assembly::refresh_handoff::{
@@ -166,7 +168,7 @@ impl FrontendMvProductAdapter {
 impl FrontendMvProductAdapter {
     pub(crate) fn execute_create(
         &self,
-        engine: &dyn MvEngine,
+        engine: &dyn MvCreateProviderAdapter,
         statement: &crate::mv::domain::application::MvCreateStatement,
         context: MvRequestContext<'_>,
     ) -> Result<(), MvApplicationError> {

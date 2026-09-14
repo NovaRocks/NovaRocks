@@ -38,9 +38,9 @@ use crate::mv::domain::analysis_adapter::{
 };
 use crate::mv::domain::application::MvCreateProjectionSeed;
 use crate::mv::domain::application::{
-    CreatedMvTarget, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvEngine,
-    MvEngineError, MvEngineErrorKind, MvRefreshRequest, PrepareMvCreateRequest, PreparedMvCreate,
-    PreparedMvDefinition,
+    CreatedMvTarget, MvCreateProviderAdapter, MvCreateProviderError, MvCreateProviderErrorKind,
+    MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest,
+    PrepareMvCreateRequest, PreparedMvCreate, PreparedMvDefinition,
 };
 use crate::mv::domain::lifecycle::{
     BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan,
@@ -252,7 +252,7 @@ impl IcebergMvRefreshSource for IcebergMvCorePorts {
 /// Core adapter used by the frontend-owned MV application service. It keeps
 /// explicit connector/analyzer ports in core while exposing CREATE as
 /// auditable, side-effect-sized primitives.
-pub(crate) struct StandaloneMvEngine {
+pub(crate) struct IcebergMvCreateProviderAdapter {
     ports: IcebergMvCorePorts,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     preparations: Mutex<HashMap<String, Arc<IcebergMvCreatePreparation>>>,
@@ -278,7 +278,7 @@ struct IcebergMvCreatePreparation {
     created_target_observation: Mutex<Option<MvTargetCreationObservation>>,
 }
 
-impl StandaloneMvEngine {
+impl IcebergMvCreateProviderAdapter {
     pub(crate) fn new_with_ports(
         ports: IcebergMvCorePorts,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -302,38 +302,38 @@ impl StandaloneMvEngine {
     fn preparation(
         &self,
         plan: &PreparedMvCreate,
-    ) -> Result<Arc<IcebergMvCreatePreparation>, MvEngineError> {
+    ) -> Result<Arc<IcebergMvCreatePreparation>, MvCreateProviderError> {
         self.preparation_for_target(&plan.target)
     }
 
     fn preparation_for_target(
         &self,
         target: &MvTarget,
-    ) -> Result<Arc<IcebergMvCreatePreparation>, MvEngineError> {
+    ) -> Result<Arc<IcebergMvCreatePreparation>, MvCreateProviderError> {
         self.preparations
             .lock()
             .map_err(|error| {
-                MvEngineError::new(
-                    MvEngineErrorKind::TargetOperation,
+                MvCreateProviderError::new(
+                    MvCreateProviderErrorKind::TargetOperation,
                     format!("MV CREATE preparation lock poisoned: {error}"),
                 )
             })?
             .get(&Self::preparation_key(target))
             .cloned()
             .ok_or_else(|| {
-                MvEngineError::new(
-                    MvEngineErrorKind::InvalidRequest,
+                MvCreateProviderError::new(
+                    MvCreateProviderErrorKind::InvalidRequest,
                     "MV CREATE plan was not prepared by this engine",
                 )
             })
     }
 }
 
-impl MvEngine for StandaloneMvEngine {
+impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
     fn prepare_create(
         &self,
         request: PrepareMvCreateRequest<'_>,
-    ) -> Result<PreparedMvCreate, MvEngineError> {
+    ) -> Result<PreparedMvCreate, MvCreateProviderError> {
         let prepared = prepare_iceberg_mv_create_with_ports(
             &self.ports,
             request.context.current_catalog,
@@ -373,8 +373,8 @@ impl MvEngine for StandaloneMvEngine {
         self.preparations
             .lock()
             .map_err(|error| {
-                MvEngineError::new(
-                    MvEngineErrorKind::TargetOperation,
+                MvCreateProviderError::new(
+                    MvCreateProviderErrorKind::TargetOperation,
                     format!("MV CREATE preparation lock poisoned: {error}"),
                 )
             })?
@@ -386,7 +386,7 @@ impl MvEngine for StandaloneMvEngine {
         &self,
         plan: &PreparedMvCreate,
         operation_id: uuid::Uuid,
-    ) -> Result<CreatedMvTarget, MvEngineError> {
+    ) -> Result<CreatedMvTarget, MvCreateProviderError> {
         let prepared = self.preparation(plan)?;
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
@@ -557,7 +557,7 @@ impl MvEngine for StandaloneMvEngine {
         &self,
         plan: &PreparedMvCreate,
         _target: &CreatedMvTarget,
-    ) -> Result<PreparedMvDefinition, MvEngineError> {
+    ) -> Result<PreparedMvDefinition, MvCreateProviderError> {
         let prepared = self.preparation(plan)?;
         let target_observation = prepared
             .created_target_observation
@@ -580,8 +580,8 @@ impl MvEngine for StandaloneMvEngine {
         )
         .map_err(engine_target_error)?;
         if actual_apply_key_field_id != prepared.expected_apply_key_field_id {
-            return Err(MvEngineError::new(
-                MvEngineErrorKind::TargetOperation,
+            return Err(MvCreateProviderError::new(
+                MvCreateProviderErrorKind::TargetOperation,
                 format!(
                     "Iceberg MV target apply-key field id mismatch: expected {}, got {actual_apply_key_field_id}",
                     prepared.expected_apply_key_field_id
@@ -645,7 +645,7 @@ impl MvEngine for StandaloneMvEngine {
         &self,
         target: &CreatedMvTarget,
         descriptor: &MvDescriptorV3,
-    ) -> Result<(), MvEngineError> {
+    ) -> Result<(), MvCreateProviderError> {
         // Reached from the MV engine trait, which carries no request context.
         // Use the same bounded, non-cancellable context other context-free
         // connector paths use.
@@ -653,24 +653,28 @@ impl MvEngine for StandaloneMvEngine {
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
-        .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))?;
+        .map_err(|error| {
+            MvCreateProviderError::new(MvCreateProviderErrorKind::DescriptorSync, error)
+        })?;
         persist_iceberg_mv_descriptor_with_ports(
             &self.ports,
             target,
             descriptor,
             &connector_context,
         )
-        .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))
+        .map_err(|error| {
+            MvCreateProviderError::new(MvCreateProviderErrorKind::DescriptorSync, error)
+        })
     }
 
     fn project_created_target(
         &self,
         target: &CreatedMvTarget,
         operation_id: uuid::Uuid,
-    ) -> Result<(), MvEngineError> {
+    ) -> Result<(), MvCreateProviderError> {
         let catalog = target.target.catalog.as_deref().ok_or_else(|| {
-            MvEngineError::new(
-                MvEngineErrorKind::DescriptorSync,
+            MvCreateProviderError::new(
+                MvCreateProviderErrorKind::DescriptorSync,
                 "MV target has no catalog",
             )
         })?;
@@ -709,16 +713,19 @@ impl MvEngine for StandaloneMvEngine {
             .readiness
             .project_observed(operation_id, &package)
             .map_err(|error| {
-                MvEngineError::new(MvEngineErrorKind::DescriptorSync, error.to_string())
+                MvCreateProviderError::new(
+                    MvCreateProviderErrorKind::DescriptorSync,
+                    error.to_string(),
+                )
             })
     }
 
-    fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError> {
+    fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError> {
         let preparation_key = Self::preparation_key(&target.target);
         let target = IcebergMvTarget {
             catalog: target.target.catalog.clone().ok_or_else(|| {
-                MvEngineError::new(
-                    MvEngineErrorKind::CatalogRegistration,
+                MvCreateProviderError::new(
+                    MvCreateProviderErrorKind::CatalogRegistration,
                     "Iceberg MV target has no catalog",
                 )
             })?,
@@ -727,18 +734,20 @@ impl MvEngine for StandaloneMvEngine {
         };
         #[cfg(test)]
         if let Some(error) = take_catalog_registration_failure_for_test() {
-            return Err(MvEngineError::new(
-                MvEngineErrorKind::CatalogRegistration,
+            return Err(MvCreateProviderError::new(
+                MvCreateProviderErrorKind::CatalogRegistration,
                 error,
             ));
         }
         register_iceberg_mv_target_in_catalog(self.ports.connector_control.as_ref(), &target)
-            .map_err(|error| MvEngineError::new(MvEngineErrorKind::CatalogRegistration, error))?;
+            .map_err(|error| {
+                MvCreateProviderError::new(MvCreateProviderErrorKind::CatalogRegistration, error)
+            })?;
         self.preparations
             .lock()
             .map_err(|error| {
-                MvEngineError::new(
-                    MvEngineErrorKind::CatalogRegistration,
+                MvCreateProviderError::new(
+                    MvCreateProviderErrorKind::CatalogRegistration,
                     format!("MV CREATE preparation lock poisoned: {error}"),
                 )
             })?
@@ -746,7 +755,7 @@ impl MvEngine for StandaloneMvEngine {
         Ok(())
     }
 
-    fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError> {
+    fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError> {
         let prepared = self.preparation_for_target(&target.target)?;
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
@@ -770,8 +779,8 @@ impl MvEngine for StandaloneMvEngine {
         self.preparations
             .lock()
             .map_err(|error| {
-                MvEngineError::new(
-                    MvEngineErrorKind::TargetOperation,
+                MvCreateProviderError::new(
+                    MvCreateProviderErrorKind::TargetOperation,
                     format!("MV CREATE preparation lock poisoned: {error}"),
                 )
             })?
@@ -780,12 +789,12 @@ impl MvEngine for StandaloneMvEngine {
     }
 }
 
-fn engine_prepare_error(error: String) -> MvEngineError {
-    MvEngineError::new(MvEngineErrorKind::Analysis, error)
+fn engine_prepare_error(error: String) -> MvCreateProviderError {
+    MvCreateProviderError::new(MvCreateProviderErrorKind::Analysis, error)
 }
 
-fn engine_target_error(error: String) -> MvEngineError {
-    MvEngineError::new(MvEngineErrorKind::TargetOperation, error)
+fn engine_target_error(error: String) -> MvCreateProviderError {
+    MvCreateProviderError::new(MvCreateProviderErrorKind::TargetOperation, error)
 }
 
 /// Converts a typed external-mutation outcome into the CREATE target boundary.
@@ -797,7 +806,7 @@ fn engine_target_error(error: String) -> MvEngineError {
 fn require_known_committed_target_mutation(
     resolution: crate::connector::mutation::ResolvedCatalogMutation,
     operation: &str,
-) -> Result<crate::connector::mutation::CompletedCatalogMutation, MvEngineError> {
+) -> Result<crate::connector::mutation::CompletedCatalogMutation, MvCreateProviderError> {
     match resolution {
         crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
             if let novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) =

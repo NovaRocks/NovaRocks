@@ -313,7 +313,7 @@ impl fmt::Display for MvApplicationError {
 impl std::error::Error for MvApplicationError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MvEngineErrorKind {
+pub enum MvCreateProviderErrorKind {
     InvalidRequest,
     Analysis,
     TargetOperation,
@@ -322,20 +322,20 @@ pub enum MvEngineErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvEngineError {
-    kind: MvEngineErrorKind,
+pub struct MvCreateProviderError {
+    kind: MvCreateProviderErrorKind,
     message: String,
 }
 
-impl MvEngineError {
-    pub fn new(kind: MvEngineErrorKind, message: impl Into<String>) -> Self {
+impl MvCreateProviderError {
+    pub fn new(kind: MvCreateProviderErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
         }
     }
 
-    pub fn kind(&self) -> MvEngineErrorKind {
+    pub fn kind(&self) -> MvCreateProviderErrorKind {
         self.kind
     }
 
@@ -344,13 +344,13 @@ impl MvEngineError {
     }
 }
 
-impl fmt::Display for MvEngineError {
+impl fmt::Display for MvCreateProviderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
     }
 }
 
-impl std::error::Error for MvEngineError {}
+impl std::error::Error for MvCreateProviderError {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PrepareMvCreateRequest<'a> {
@@ -396,37 +396,37 @@ pub struct PreparedMvDefinition {
     pub descriptor: MvDescriptorV3,
 }
 
-pub trait MvEngine: Send + Sync {
+pub trait MvCreateProviderAdapter: Send + Sync {
     fn prepare_create(
         &self,
         request: PrepareMvCreateRequest<'_>,
-    ) -> Result<PreparedMvCreate, MvEngineError>;
+    ) -> Result<PreparedMvCreate, MvCreateProviderError>;
 
     fn create_target(
         &self,
         plan: &PreparedMvCreate,
         operation_id: Uuid,
-    ) -> Result<CreatedMvTarget, MvEngineError>;
+    ) -> Result<CreatedMvTarget, MvCreateProviderError>;
 
     fn inspect_created_target(
         &self,
         plan: &PreparedMvCreate,
         target: &CreatedMvTarget,
-    ) -> Result<PreparedMvDefinition, MvEngineError>;
+    ) -> Result<PreparedMvDefinition, MvCreateProviderError>;
 
     fn sync_target_descriptor(
         &self,
         target: &CreatedMvTarget,
         descriptor: &MvDescriptorV3,
-    ) -> Result<(), MvEngineError>;
+    ) -> Result<(), MvCreateProviderError>;
 
     fn project_created_target(
         &self,
         target: &CreatedMvTarget,
         operation_id: Uuid,
-    ) -> Result<(), MvEngineError>;
+    ) -> Result<(), MvCreateProviderError>;
 
-    fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError>;
+    fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError>;
 
-    fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError>;
+    fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError>;
 }

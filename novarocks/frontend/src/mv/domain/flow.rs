@@ -152,7 +152,7 @@ pub fn create_mv_with_ports(
     if storage_engine_for_create(stmt)? != MvStorageEngine::Iceberg {
         return Err("materialized view backend must be Iceberg".to_string());
     }
-    let engine = crate::mv::domain::iceberg_refresh::StandaloneMvEngine::new_with_ports(
+    let engine = crate::mv::domain::iceberg_refresh::IcebergMvCreateProviderAdapter::new_with_ports(
         ports.clone(),
         connector_context.clone(),
     );
