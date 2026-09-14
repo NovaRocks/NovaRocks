@@ -1810,7 +1810,7 @@ mod tests {
             novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(data_runtime),
             novarocks_native_adapter::fragment_result_writer::test_native_result_writer(),
             Arc::new(UnavailableExchangeReceiverPort),
-            Arc::new(crate::runtime::sink_commit::BackendSinkCommitPort),
+            Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
             test_execution_runtime(),
             completion_supervisor,
         )

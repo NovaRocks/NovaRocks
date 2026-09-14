@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-owned final sink-report aggregation for native fragments.
+//! Worker-owned final sink-report aggregation for native fragments.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -48,7 +48,7 @@ pub(crate) struct TabletFailInfo {
     pub(crate) backend_id: i64,
 }
 
-/// Runtime facts collected by Backend fragment sinks before the registry
+/// Runtime facts collected by Worker fragment sinks before the registry
 /// projects them into the Protocol terminal snapshot.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SinkCommitReportSnapshot {
@@ -58,42 +58,39 @@ pub(crate) struct SinkCommitReportSnapshot {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct BackendSinkCommitPort;
+pub struct WorkerSinkCommitPort;
 
-impl FragmentCommitPort for BackendSinkCommitPort {
+impl FragmentCommitPort for WorkerSinkCommitPort {
     fn acquire(
         &self,
         fragment_instance_id: UniqueId,
     ) -> Result<Box<dyn FragmentCommitLease>, String> {
-        acquire_backend_sink_commit_lease(
-            fragment_instance_id,
-            WriteCommitEvidenceLimits::default(),
-        )
+        acquire_worker_sink_commit_lease(fragment_instance_id, WriteCommitEvidenceLimits::default())
     }
 }
 
-/// Configured Backend adapter used by production fragment composition.
+/// Configured Worker adapter used by production fragment composition.
 #[derive(Debug)]
-pub(crate) struct ConfiguredBackendSinkCommitPort {
+pub struct ConfiguredWorkerSinkCommitPort {
     evidence_limits: WriteCommitEvidenceLimits,
 }
 
-impl ConfiguredBackendSinkCommitPort {
-    pub(crate) fn new(evidence_limits: WriteCommitEvidenceLimits) -> Self {
+impl ConfiguredWorkerSinkCommitPort {
+    pub fn new(evidence_limits: WriteCommitEvidenceLimits) -> Self {
         Self { evidence_limits }
     }
 }
 
-impl FragmentCommitPort for ConfiguredBackendSinkCommitPort {
+impl FragmentCommitPort for ConfiguredWorkerSinkCommitPort {
     fn acquire(
         &self,
         fragment_instance_id: UniqueId,
     ) -> Result<Box<dyn FragmentCommitLease>, String> {
-        acquire_backend_sink_commit_lease(fragment_instance_id, self.evidence_limits)
+        acquire_worker_sink_commit_lease(fragment_instance_id, self.evidence_limits)
     }
 }
 
-fn acquire_backend_sink_commit_lease(
+fn acquire_worker_sink_commit_lease(
     fragment_instance_id: UniqueId,
     evidence_limits: WriteCommitEvidenceLimits,
 ) -> Result<Box<dyn FragmentCommitLease>, String> {
@@ -105,18 +102,18 @@ fn acquire_backend_sink_commit_lease(
             "sink commit already registered for fragment instance {fragment_instance_id}"
         ));
     }
-    Ok(Box::new(BackendSinkCommitLease {
+    Ok(Box::new(WorkerSinkCommitLease {
         fragment_instance_id,
         active: true,
     }))
 }
 
-struct BackendSinkCommitLease {
+struct WorkerSinkCommitLease {
     fragment_instance_id: UniqueId,
     active: bool,
 }
 
-impl BackendSinkCommitLease {
+impl WorkerSinkCommitLease {
     fn snapshot(&self) -> FragmentCommitReport {
         let snapshot = report_snapshot(self.fragment_instance_id);
         FragmentCommitReport {
@@ -145,7 +142,7 @@ impl BackendSinkCommitLease {
     }
 }
 
-impl FragmentCommitLease for BackendSinkCommitLease {
+impl FragmentCommitLease for WorkerSinkCommitLease {
     fn add_load_stats(&mut self, stats: FragmentSinkLoadStats) {
         add_load_stats(
             self.fragment_instance_id,
@@ -198,7 +195,7 @@ impl FragmentCommitLease for BackendSinkCommitLease {
     }
 }
 
-impl Drop for BackendSinkCommitLease {
+impl Drop for WorkerSinkCommitLease {
     fn drop(&mut self) {
         if self.active {
             unregister(self.fragment_instance_id);

@@ -47,6 +47,7 @@ mod reliable_transport;
 pub mod result_batch;
 pub mod result_buffer;
 mod runtime_filter_error;
+pub mod sink_commit;
 mod status;
 mod task_completion;
 mod task_creation_gate;

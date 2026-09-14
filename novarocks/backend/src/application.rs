@@ -10,6 +10,7 @@ use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
+use novarocks_worker::sink_commit::ConfiguredWorkerSinkCommitPort;
 use novarocks_worker::{
     CatalogManager, CatalogManagerConfig, ConnectorExecutionRoleBindingFactorySet,
     WorkerAdmissionEpochAuthority, WorkerDeadlineSupervisor, WorkerDrainState,
@@ -419,11 +420,9 @@ fn compose_backend_application_services(
         ),
         native_result_writer(result_retained_budget, result_retained_limits.per_root()),
         Arc::clone(&exchange_receiver_port),
-        Arc::new(
-            crate::runtime::sink_commit::ConfiguredBackendSinkCommitPort::new(
-                write_commit_evidence_limits,
-            ),
-        ),
+        Arc::new(ConfiguredWorkerSinkCommitPort::new(
+            write_commit_evidence_limits,
+        )),
         Arc::clone(&execution_runtime),
         Arc::clone(&task_completion_supervisor),
     ));

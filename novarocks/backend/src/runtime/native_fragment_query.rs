@@ -27,7 +27,6 @@ use std::time::Duration;
 
 use novarocks_spi::connector::ConnectorCancellation;
 
-use crate::runtime::sink_commit::BackendSinkCommitPort;
 use novarocks_execution::exec::node::scan::ScanOp;
 use novarocks_execution::exec::operators::scan::ScanDispatchState;
 use novarocks_execution::runtime::fragment::FragmentPrepareContext;
@@ -44,6 +43,7 @@ use novarocks_types::UniqueId;
 use novarocks_worker::query_context::{
     QueryContextManager, QueryExecutionKey, query_context_manager,
 };
+use novarocks_worker::sink_commit::WorkerSinkCommitPort;
 
 #[derive(Clone)]
 pub struct NativeFragmentQueryRuntime {
@@ -294,7 +294,7 @@ impl NativeFragmentAdmissionResources {
             event_sink,
         )
         .with_scan_registration_port(self.scan_registration)
-        .with_fragment_commit_port(Arc::new(BackendSinkCommitPort))
+        .with_fragment_commit_port(Arc::new(WorkerSinkCommitPort))
         .with_debug_exec_node_output(
             novarocks_native_adapter::debug_environment::debug_exec_node_output(),
         )
