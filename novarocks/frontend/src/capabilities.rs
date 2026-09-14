@@ -246,22 +246,15 @@ pub struct CatalogCommandPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-    #[allow(
-        dead_code,
-        reason = "The frozen catalog-command port keeps the view-service dependency explicit."
-    )]
-    view_service: Arc<dyn ViewService>,
 }
 
 impl CatalogCommandPorts {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-        view_service: Arc<dyn ViewService>,
     ) -> Self {
         Self {
             catalog_service,
@@ -269,7 +262,6 @@ impl CatalogCommandPorts {
             connector_control,
             mv_readiness,
             mv_storage_observation,
-            view_service,
         }
     }
 }
@@ -429,15 +421,9 @@ pub struct MvCommandPorts {
     readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     refresh_service: Arc<FrontendMvProductAdapter>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
-    #[allow(
-        dead_code,
-        reason = "The frozen MV-command port keeps query execution available for the boundary."
-    )]
-    query_execution: QueryExecutionService,
 }
 
 impl MvCommandPorts {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -445,7 +431,6 @@ impl MvCommandPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         refresh_service: Arc<FrontendMvProductAdapter>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
-        query_execution: QueryExecutionService,
     ) -> Self {
         Self {
             functions,
@@ -455,7 +440,6 @@ impl MvCommandPorts {
             readiness: refresh_service.readiness_port(),
             refresh_service,
             storage_observation,
-            query_execution,
         }
     }
 }

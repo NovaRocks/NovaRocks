@@ -515,7 +515,6 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&connector_control),
             Arc::clone(&mv_readiness),
             Arc::clone(&mv_storage_observation),
-            view_service,
         ));
     let statistics_command_executor =
         core_capabilities::statistics_command_executor(statistics_application);
@@ -544,7 +543,6 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&connector_control),
             mv_service,
             Arc::clone(&mv_storage_observation),
-            query_execution.clone(),
         ));
     let mv_command_consumer: Arc<
         dyn novarocks_query_application::api::MaterializedViewCommandConsumer,
