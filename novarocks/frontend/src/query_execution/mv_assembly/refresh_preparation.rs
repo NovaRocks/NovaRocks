@@ -38,9 +38,6 @@ use crate::mv::domain::iceberg_refresh::{
     plan_iceberg_mv_refresh_with_connector_context,
 };
 use crate::mv::domain::lifecycle::RefreshError;
-use crate::mv::domain::persistence::schema::{
-    MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
-};
 use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
 use crate::mv::domain::refresh::definition::{
     load_iceberg_mv_definition_by_target, mv_definition_fingerprint, parse_mv_select_query,
@@ -76,6 +73,9 @@ use crate::query_execution::mv_assembly::refresh_artifact::{
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
+};
+use novarocks_mv_application::persistence::schema::{
+    MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
 };
 use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorInstanceId, ConnectorManagedDescriptorProperties,
@@ -1011,7 +1011,7 @@ pub(crate) fn select_retained_target_handle(
 fn frontend_refresh_publication_intent(
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
-    definition: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+    definition: &novarocks_mv_application::persistence::definition::StoredMvDefinition,
     select_sql: &str,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
 ) -> Result<MvRefreshPublicationIntent, String> {
@@ -1163,9 +1163,9 @@ fn expected_target_snapshot(contract: &RefreshPlanContract) -> Option<i64> {
 }
 
 fn managed_descriptor_properties(
-    definition: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+    definition: &novarocks_mv_application::persistence::definition::StoredMvDefinition,
 ) -> Result<ConnectorManagedDescriptorProperties, String> {
-    use crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP;
+    use novarocks_mv_application::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP;
 
     ConnectorManagedDescriptorProperties::try_new(vec![(
         Arc::from(MV_DESCRIPTOR_HASH_PROP),
@@ -1175,7 +1175,7 @@ fn managed_descriptor_properties(
 }
 
 fn managed_descriptor_properties_from_descriptor(
-    descriptor: &crate::mv::domain::persistence::descriptor::MvDescriptorV3,
+    descriptor: &novarocks_mv_application::persistence::descriptor::MvDescriptorV3,
 ) -> Result<ConnectorManagedDescriptorProperties, String> {
     let mut entries = descriptor.to_storage_properties()?;
     entries.sort_by(|left, right| left.0.cmp(&right.0));

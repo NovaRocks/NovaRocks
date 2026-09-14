@@ -29,12 +29,12 @@ use novarocks_state_store_api::VersionToken;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::mv::domain::persistence::definition::{
+use crate::persistence::definition::{
     CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
     StoredMvDefinition,
 };
-pub use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use crate::mv::domain::persistence::dependency::StoredMvDependency;
+pub use crate::persistence::dependency::CreateMvDependencyRequest;
+use crate::persistence::dependency::StoredMvDependency;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,11 +218,11 @@ pub trait MvRepository: Send + Sync {
 
     async fn list_downstream_dependencies(
         &self,
-        upstream: &crate::mv::domain::dependency::model::MvDependencyObjectRef,
+        upstream: &crate::dependency::MvDependencyObjectRef,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError>;
 
     async fn ensure_no_downstream_dependencies(
         &self,
-        upstream: &crate::mv::domain::dependency::model::MvDependencyObjectRef,
+        upstream: &crate::dependency::MvDependencyObjectRef,
     ) -> Result<(), MvRepositoryError>;
 }

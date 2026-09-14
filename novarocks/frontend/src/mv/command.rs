@@ -285,7 +285,7 @@ impl MvCommandExecutor {
             "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
                 .to_string()
         })?;
-        let requested_object = crate::mv::domain::dependency::model::iceberg_mv_dependency_ref(
+        let requested_object = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
             target_catalog,
             &target.database,
             &target.name,

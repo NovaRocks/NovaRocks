@@ -114,7 +114,7 @@ fn reject_quarantined_mv_targets(
             Ok(_) => {}
             Err(error)
                 if error.kind()
-                    == crate::mv::domain::repository::MvRepositoryErrorKind::Unavailable =>
+                    == novarocks_mv_application::repository::MvRepositoryErrorKind::Unavailable =>
             {
                 return Err(FrontendQueryCompilerError::Engine(format!(
                     "unknown table: {}.{}",

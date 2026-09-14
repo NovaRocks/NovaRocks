@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv::domain::dependency::model::{MvDependencyObjectRef, MvDependencyStorageEngine};
+use novarocks_mv_application::dependency::{MvDependencyObjectRef, MvDependencyStorageEngine};
 
 fn object_in_iceberg_scope(
     object: &MvDependencyObjectRef,
@@ -118,7 +118,7 @@ pub(crate) fn validate_no_external_dependents_for_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::dependency::model::{
+    use novarocks_mv_application::dependency::{
         iceberg_mv_dependency_ref, iceberg_table_object_ref, starrocks_mv_dependency_ref,
         starrocks_table_object_ref,
     };

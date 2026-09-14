@@ -53,11 +53,11 @@ use std::sync::{Arc, atomic::AtomicBool};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 
-use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvLakePublishedProjection,
 };
+use novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration;
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
 use novarocks_query_application::api::{
     QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
@@ -137,15 +137,15 @@ struct MvRebuildEquivalenceSnapshot {
         novarocks_query_application::persisted_query_definition::PersistedQueryDefinition,
     base_table_refs: Vec<String>,
     primary_key_columns: Vec<String>,
-    schema_contract: crate::mv::domain::persistence::schema::MvSchemaContract,
-    partition_spec: Option<crate::mv::domain::persistence::schema::MvPartitionContract>,
+    schema_contract: novarocks_mv_application::persistence::schema::MvSchemaContract,
+    partition_spec: Option<novarocks_mv_application::persistence::schema::MvPartitionContract>,
     refresh: MvRefreshDesiredConfiguration,
     created_at_ms: i64,
     publication: MvLakePublishedProjection,
 }
 
 fn equivalence_snapshot(
-    definition: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+    definition: &novarocks_mv_application::persistence::definition::StoredMvDefinition,
     package: &MvLakePackageObservation,
 ) -> Result<MvRebuildEquivalenceSnapshot, String> {
     let schema_contract = definition.schema_contract.clone().ok_or_else(|| {

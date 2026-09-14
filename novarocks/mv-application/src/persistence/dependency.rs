@@ -17,10 +17,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::mv::domain::dependency::model::{
+use crate::dependency::{
     MvDependencyObjectRef, iceberg_mv_dependency_ref, starrocks_mv_dependency_ref,
 };
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
+use crate::persistence::definition::StoredMvDefinition;
 
 pub(crate) const MV_ACCELERATOR_DEPENDENCY_SUBJECT: &str = "mv.accelerator_dependency";
 
@@ -37,7 +37,7 @@ pub struct CreateMvDependencyRequest {
     pub created_at_ms: i64,
 }
 
-pub(crate) fn stored_definition_dependency_ref(
+pub fn stored_definition_dependency_ref(
     definition: &StoredMvDefinition,
     starrocks_name: Option<(&str, &str)>,
 ) -> Result<MvDependencyObjectRef, String> {

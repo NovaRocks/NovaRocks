@@ -11,9 +11,9 @@
 
 use crate::mv::domain::lake_rebuild::dependency_requests_from_descriptor;
 use crate::mv::domain::lake_rebuild::{RebuiltMvDefinition, rebuild_mv_definition_from_lake};
-use crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision;
-use crate::mv::domain::repository::MvProjectionRequest;
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
+use novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision;
+use novarocks_mv_application::repository::MvProjectionRequest;
 
 pub(crate) fn projection_from_lake(
     package: &MvLakePackageObservation,

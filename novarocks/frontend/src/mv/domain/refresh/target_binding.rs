@@ -45,8 +45,8 @@ use novarocks_spi::connector::{
 
 use novarocks_types::naming::TableIdentity;
 
-use crate::mv::domain::persistence::schema::MvPartitionContract;
 use crate::mv::domain::storage_observation::MvRefreshTargetObservation;
+use novarocks_mv_application::persistence::schema::MvPartitionContract;
 
 /// One MV target, resolved once against a single provider generation.
 ///

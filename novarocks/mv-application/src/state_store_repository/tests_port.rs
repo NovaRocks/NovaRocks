@@ -17,10 +17,10 @@
 
 use super::tests_definition;
 
-use crate::mv::domain::repository::{
+use crate::repository::{
     DeleteMvProjectionRequest, MvRepository, MvRepositoryErrorKind, ReplaceMvProjectionRequest,
 };
-use crate::mv::domain::test_repository::InMemoryMvRepository;
+use crate::test_repository::InMemoryMvRepository;
 
 #[tokio::test]
 async fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_delete() {

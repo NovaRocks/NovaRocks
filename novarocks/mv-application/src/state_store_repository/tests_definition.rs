@@ -16,48 +16,40 @@
 // under the License.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use super::StateStoreMvRepository;
-use crate::mv::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
-use crate::mv::domain::persistence::definition::{
+use crate::dependency::{MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine};
+use crate::persistence::definition::{
     CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
 };
-use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use crate::mv::domain::repository::{
+use crate::persistence::dependency::CreateMvDependencyRequest;
+use crate::repository::{
     DeleteMvProjectionRequest, InitialMvRefreshConfiguration, MvProjectionRequest,
     MvPublishedProjection, MvPublishedWaterline, MvRepository, MvRepositoryErrorKind,
     ReplaceMvProjectionRequest,
 };
-use crate::state_store::testing as state_store_fixture;
 use bytes::Bytes;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
-use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
-use novarocks_state_store_runtime::{StateStoreHost, StateStoreRunPolicy};
+use novarocks_state_store_api::{CommitOutcome, Key, Precondition, StateStore, Value};
+use novarocks_state_store_runtime::StateStoreRunPolicy;
+use novarocks_state_store_testkit::testing::InMemoryStateStore;
 
-pub(crate) async fn repository() -> (StateStoreHost, Arc<StateStoreMvRepository>) {
-    let registry = state_store_fixture::persistent_registry();
-    let host = StateStoreHost::open(
-        &registry,
-        state_store_fixture::persistent_input(format!(
-            "mv-accelerator-test-{}",
-            uuid::Uuid::now_v7()
-        )),
-        Instant::now() + Duration::from_secs(5),
+pub(crate) async fn repository() -> (Arc<InMemoryStateStore>, Arc<StateStoreMvRepository>) {
+    let store = Arc::new(InMemoryStateStore::new(format!(
+        "mv-accelerator-test-{}",
+        uuid::Uuid::now_v7()
+    )));
+    let repository = StateStoreMvRepository::open(
+        Arc::clone(&store) as Arc<dyn novarocks_state_store_api::StateStore>,
+        StateStoreRunPolicy::default(),
     )
     .await
-    .expect("open SQLite StateStore host");
-    let store = host.state_store().expect("host exposes StateStore");
-    let repository = StateStoreMvRepository::open(store, StateStoreRunPolicy::default())
-        .await
-        .expect("open MV Accelerator repository");
-    (host, repository)
+    .expect("open in-memory MV Accelerator repository");
+    (store, repository)
 }
 
 pub(crate) fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
@@ -134,8 +126,8 @@ pub(crate) fn projection_request(
 }
 
 #[tokio::test]
-async fn sqlite_reopen_retains_the_exact_lake_source_projection() {
-    let (host, repository) = repository().await;
+async fn reopening_the_repository_retains_the_exact_lake_source_projection() {
+    let (store, repository) = repository().await;
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
@@ -146,7 +138,7 @@ async fn sqlite_reopen_retains_the_exact_lake_source_projection() {
     drop(repository);
 
     let reopened = StateStoreMvRepository::open(
-        host.state_store().expect("reopen StateStore"),
+        store as Arc<dyn novarocks_state_store_api::StateStore>,
         StateStoreRunPolicy::default(),
     )
     .await
@@ -337,8 +329,7 @@ async fn whole_family_wipe_allows_internal_id_reallocation() {
 
 #[tokio::test]
 async fn whole_family_wipe_removes_an_unknown_current_record_without_decoding_it() {
-    let (host, repository) = repository().await;
-    let store = host.state_store().expect("StateStore");
+    let (store, repository) = repository().await;
     let key = Key::try_from(Bytes::from_static(
         b"novarocks/frontend/mv/accelerator/v1/unknown/future-record",
     ))

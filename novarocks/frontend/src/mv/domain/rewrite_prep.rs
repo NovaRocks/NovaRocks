@@ -76,7 +76,7 @@ where
 fn freeze_mv_rewrite_definition(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
-    definition: crate::mv::domain::persistence::definition::StoredMvDefinition,
+    definition: novarocks_mv_application::persistence::definition::StoredMvDefinition,
 ) -> Result<SqlMvRewriteDefinitionFacts, String> {
     let selection =
         freeze_mv_rewrite_selection(connector_control, storage_observation, &definition);
@@ -110,7 +110,7 @@ fn freeze_mv_rewrite_definition(
 fn freeze_mv_rewrite_selection(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
-    definition: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+    definition: &novarocks_mv_application::persistence::definition::StoredMvDefinition,
 ) -> Result<SqlMvRewriteSelectionFacts, String> {
     let (Some(catalog), Some(namespace), Some(table)) = (
         definition.target_catalog.as_deref(),

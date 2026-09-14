@@ -630,9 +630,9 @@ fn reserve_refresh_attempt() -> MvRefreshAttemptIdentity {
 }
 
 fn repository_disposition(
-    error: crate::mv::domain::repository::MvRepositoryError,
+    error: novarocks_mv_application::repository::MvRepositoryError,
 ) -> ScheduledRefreshDisposition {
-    use crate::mv::domain::repository::MvRepositoryErrorKind;
+    use novarocks_mv_application::repository::MvRepositoryErrorKind;
     match error.kind() {
         MvRepositoryErrorKind::Conflict => ScheduledRefreshDisposition::AlreadyActive,
         MvRepositoryErrorKind::NotFound => ScheduledRefreshDisposition::TargetGone,

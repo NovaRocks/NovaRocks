@@ -19,7 +19,7 @@
 use novarocks_sql::planning::mv::ApplyKeySource;
 
 use crate::mv::domain::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
-use crate::mv::domain::persistence::schema::{
+use novarocks_mv_application::persistence::schema::{
     ExpressionKind, MvPartitionTransformContract, MvSchemaContract,
 };
 
@@ -152,13 +152,13 @@ fn connector_transform_matches_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::schema::{
+    use bytes::Bytes;
+    use novarocks_mv_application::persistence::schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
         HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
-    use bytes::Bytes;
 
     fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
         novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))

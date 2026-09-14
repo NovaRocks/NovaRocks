@@ -17,7 +17,7 @@
 
 use super::tests_definition;
 
-use crate::mv::domain::repository::{MvRepository, ReplaceMvProjectionRequest};
+use crate::repository::{MvRepository, ReplaceMvProjectionRequest};
 
 #[tokio::test]
 async fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {

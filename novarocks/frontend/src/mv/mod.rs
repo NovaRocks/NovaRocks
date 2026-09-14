@@ -24,7 +24,6 @@ pub mod domain;
 pub(crate) mod maintenance_worker;
 // Installed by the composition root so the frontend owns startup ordering.
 mod refresh;
-pub mod repository;
 pub mod scheduler;
 mod service;
 #[allow(dead_code)]

@@ -17,9 +17,9 @@
 
 use novarocks_sql::planning::mv::ApplyKeySource;
 
-use crate::mv::domain::persistence::schema::MvSchemaContract;
 use crate::mv::domain::refresh::apply_key::ApplyKeyValueType;
 use crate::mv::domain::refresh::snapshot::BaseSnapshotPolicy;
+use novarocks_mv_application::persistence::schema::MvSchemaContract;
 
 /// What a NotDerivable partition derivation outcome means for the refresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,12 +125,12 @@ fn apply_key_source_to_refresh_identity(source: ApplyKeySource) -> RefreshIdenti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::schema::{
+    use bytes::Bytes;
+    use novarocks_mv_application::persistence::schema::{
         AggregateStateContract, BaseContract, BaseSchemaSnapshot, BranchIdColumnContract,
         BranchUnionContract, HiddenApplyKeyContract, JoinContract, JoinContractKind,
         OutputContract, TargetContract,
     };
-    use bytes::Bytes;
     use novarocks_sql::planning::mv::{
         MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
         SqlMvApplyKeySourceFacts,

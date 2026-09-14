@@ -17,13 +17,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::super::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
-use super::super::super::domain::persistence::definition::{
-    MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
-};
-use super::super::super::domain::repository::MvTargetLookup;
 use super::super::catalog::schema_catalog;
 use super::super::key::{
     MvKeyKind, decode_key, dependency_by_downstream_key, dependency_by_upstream_key,
@@ -33,6 +26,11 @@ use super::{
     DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_record, encode_projection,
     encode_record,
 };
+use crate::dependency::{MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine};
+use crate::persistence::definition::{
+    MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
+};
+use crate::repository::MvTargetLookup;
 use bytes::Bytes;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,

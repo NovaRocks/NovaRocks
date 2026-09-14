@@ -43,7 +43,9 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
-use crate::mv::domain::persistence::{descriptor::MvDescriptorV3, schema::MvPartitionContract};
+use novarocks_mv_application::persistence::{
+    descriptor::MvDescriptorV3, schema::MvPartitionContract,
+};
 
 const MAX_MV_SCHEMA_VALIDATION_FIELDS: usize = 4_096;
 const MAX_MV_SCHEMA_VALIDATION_PARTITION_FIELDS: usize = 4_096;
@@ -1115,15 +1117,17 @@ pub(crate) fn lake_package_from_spi(
     })?;
     let properties = HashMap::from([
         (
-            crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP.to_string(),
+            novarocks_mv_application::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP
+                .to_string(),
             descriptor_projection.package_id().to_string(),
         ),
         (
-            crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP.to_string(),
+            novarocks_mv_application::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP.to_string(),
             content_hash.to_string(),
         ),
         (
-            crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP.to_string(),
+            novarocks_mv_application::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP
+                .to_string(),
             descriptor_projection.inline_descriptor().to_string(),
         ),
     ]);
@@ -1276,7 +1280,7 @@ fn durable_partition_from_spi(
             .iter()
             .map(|field| {
                 Ok(
-                    crate::mv::domain::persistence::schema::MvPartitionFieldContract {
+                    novarocks_mv_application::persistence::schema::MvPartitionFieldContract {
                         partition_field_id: field.partition_field_id(),
                         partition_field_name: field.partition_field_name().to_string(),
                         source_target_field_id: field.source_target_field_id(),
@@ -1312,8 +1316,11 @@ fn schema_validation_partition_from_spi(
 
 fn durable_partition_transform_from_spi(
     transform: &SpiObservedPartitionTransform,
-) -> Result<crate::mv::domain::persistence::schema::MvPartitionTransformContract, ConnectorError> {
-    use crate::mv::domain::persistence::schema::MvPartitionTransformContract as Durable;
+) -> Result<
+    novarocks_mv_application::persistence::schema::MvPartitionTransformContract,
+    ConnectorError,
+> {
+    use novarocks_mv_application::persistence::schema::MvPartitionTransformContract as Durable;
     Ok(match transform {
         SpiObservedPartitionTransform::Identity => Durable::Identity,
         SpiObservedPartitionTransform::Year => Durable::Year,
@@ -1624,12 +1631,12 @@ fn validate_partition_contract(
             ));
         }
         match &field.transform {
-            crate::mv::domain::persistence::schema::MvPartitionTransformContract::Bucket {
+            novarocks_mv_application::persistence::schema::MvPartitionTransformContract::Bucket {
                 num_buckets,
             } if *num_buckets == 0 => {
                 return corrupt("created MV target partition contract has zero buckets");
             }
-            crate::mv::domain::persistence::schema::MvPartitionTransformContract::Truncate {
+            novarocks_mv_application::persistence::schema::MvPartitionTransformContract::Truncate {
                 width,
             } if *width == 0 => {
                 return corrupt("created MV target partition contract has zero truncate width");
@@ -1781,7 +1788,7 @@ mod tests {
         MvPublishedRefreshTechnique, MvRefreshBaseObservation, MvRefreshTargetObservation,
         MvSchemaValidationObservation, MvTargetCreationObservation,
     };
-    use crate::mv::domain::persistence::{
+    use novarocks_mv_application::persistence::{
         definition::MvDesiredRefreshPolicy,
         descriptor::{DescriptorDependency, MvDescriptorV3},
         schema::{
@@ -2200,14 +2207,14 @@ mod tests {
         let inline = properties
             .iter()
             .find(|(key, _)| {
-                key == crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP
+                key == novarocks_mv_application::persistence::descriptor::MV_DESCRIPTOR_INLINE_PROP
             })
             .map(|(_, value)| value.clone())
             .unwrap();
         let hash = properties
             .iter()
             .find(|(key, _)| {
-                key == crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP
+                key == novarocks_mv_application::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP
             })
             .map(|(_, value)| value.clone());
         let projection = SpiLakeDescriptorProjection::try_new(

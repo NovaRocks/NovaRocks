@@ -29,20 +29,20 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::AtomicBool};
 
-use crate::mv::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
 use crate::mv::domain::model::MvStorageEngine;
-use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
-use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use crate::mv::domain::persistence::descriptor::DescriptorDependency;
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::repository::{
-    InitialMvRefreshConfiguration, MvPublishedProjection, MvPublishedWaterline,
-};
 use crate::mv::domain::storage_observation::{
     MvLakeCatalogDiscovery, MvLakePackageObservation, MvLakePackageOutcome, MvLakePublication,
     MvLakePublishedProjection, discover_mv_lake_packages,
+};
+use novarocks_mv_application::dependency::{
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+};
+use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
+use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
+use novarocks_mv_application::persistence::descriptor::DescriptorDependency;
+use novarocks_mv_application::repository::{
+    InitialMvRefreshConfiguration, MvPublishedProjection, MvPublishedWaterline,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_types::naming::TableIdentity;
@@ -512,7 +512,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing_verified(
 }
 
 fn stored_definition_matches_rebuilt_request(
-    stored: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+    stored: &novarocks_mv_application::persistence::definition::StoredMvDefinition,
     rebuilt: &CreateMvDefinitionRequest,
 ) -> bool {
     stored.query_definition == rebuilt.query_definition
@@ -575,23 +575,23 @@ fn parse_dependency_storage_engine(value: &str) -> Result<MvDependencyStorageEng
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy;
-    use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
-    use crate::mv::domain::persistence::schema::{
+    use crate::mv::domain::readiness::MvReadinessPort;
+    use crate::mv::domain::storage_observation::{
+        MvLakePackageObservation, MvLakePublication, MvLakeTargetSnapshot, MvPublishedBaseFact,
+        MvPublishedLakeFacts, MvPublishedRefreshTechnique,
+    };
+    use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
+    use novarocks_mv_application::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
+    use novarocks_mv_application::persistence::schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
         HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
-    use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
-    use crate::mv::domain::readiness::MvReadinessPort;
-    use crate::mv::domain::repository::MvRepository;
-    use crate::mv::domain::storage_observation::{
-        MvLakePackageObservation, MvLakePublication, MvLakeTargetSnapshot, MvPublishedBaseFact,
-        MvPublishedLakeFacts, MvPublishedRefreshTechnique,
-    };
-    use crate::mv::domain::test_repository::InMemoryMvRepository;
+    use novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration;
     use novarocks_mv_application::process_runtime::ProcessRuntime;
+    use novarocks_mv_application::repository::MvRepository;
+    use novarocks_mv_application::test_repository::InMemoryMvRepository;
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableObjectId,
     };

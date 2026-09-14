@@ -33,7 +33,6 @@ use crate::catalog_application::{command as catalog_command, iceberg_ref_command
 use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::readiness::MvCandidateReader;
-use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
 use crate::query_execution::kernels as domain;
 use crate::query_execution::maintenance::command as maintenance_command;
@@ -43,6 +42,7 @@ use crate::query_execution::maintenance::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_catalog_application::CatalogApplicationPort;
+use novarocks_mv_application::repository::MvRepository;
 use novarocks_query_application::api::BackendTopologyService;
 use novarocks_query_application::api::{BackendCommandExecutor, BackendTopologyCommandPort};
 use novarocks_query_application::system_catalog::SystemCatalog;

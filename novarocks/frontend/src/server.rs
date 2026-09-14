@@ -143,7 +143,7 @@ struct FrontendRoleProducts {
     logical_read_launcher: Arc<dyn crate::query_execution::logical_read::LogicalReadLauncher>,
     topology: novarocks_query_application::api::BackendTopologyService,
     role: novarocks_types::ClusterRole,
-    mv_repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
+    mv_repository: Arc<dyn novarocks_mv_application::repository::MvRepository>,
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     dml_service: Arc<crate::dml::DmlService>,
     statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,

@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::mv::domain::dependency::model::iceberg_mv_dependency_ref;
 use crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::lifecycle::{RefreshError, RefreshErrorKind};
@@ -33,6 +32,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
     PreparedMvRefresh,
 };
+use novarocks_mv_application::dependency::iceberg_mv_dependency_ref;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -95,7 +95,7 @@ impl StandaloneMvBackgroundEngine {
         &self,
         target: &MvTarget,
     ) -> Result<
-        crate::mv::domain::persistence::definition::StoredMvDefinition,
+        novarocks_mv_application::persistence::definition::StoredMvDefinition,
         MvBackgroundEngineError,
     > {
         let projection = self
@@ -277,9 +277,9 @@ fn preparation_error(error: RefreshError) -> MvBackgroundEngineError {
 }
 
 fn repository_error(
-    error: crate::mv::domain::repository::MvRepositoryError,
+    error: novarocks_mv_application::repository::MvRepositoryError,
 ) -> MvBackgroundEngineError {
-    use crate::mv::domain::repository::MvRepositoryErrorKind;
+    use novarocks_mv_application::repository::MvRepositoryErrorKind;
 
     let kind = match error.kind() {
         MvRepositoryErrorKind::NotFound => MvBackgroundEngineErrorKind::TargetGone,

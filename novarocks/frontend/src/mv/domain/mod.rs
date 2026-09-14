@@ -33,14 +33,12 @@ pub mod maintenance;
 pub(crate) mod metadata_consistency;
 pub mod model;
 pub(crate) mod partition;
-pub mod persistence;
 pub(crate) mod projector;
 pub mod readiness;
 pub(crate) mod ref_flow;
 pub mod refresh;
 pub mod refresh_io;
 pub mod refresh_pin_adapter;
-pub mod repository;
 pub mod rewrite;
 pub mod rewrite_prep;
 pub(crate) mod schema_validation;
@@ -52,5 +50,3 @@ pub use flow::{
 };
 pub use iceberg_refresh::IcebergMvCorePorts;
 pub use stateless_rebuild::{PROCEDURE_NAME, execute_typed_novarocks_imv_stateless_rebuild};
-#[doc(hidden)]
-pub mod test_repository;

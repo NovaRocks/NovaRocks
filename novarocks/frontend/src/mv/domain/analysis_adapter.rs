@@ -23,8 +23,10 @@ use crate::mv::domain::analysis::{MvAnalysis, prepare_mv_select_for_catalog_prov
 use crate::mv::domain::application::MvShowStatement;
 use crate::mv::domain::lifecycle::MvListRow;
 use crate::mv::domain::model::MvStorageEngine;
-use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
 use crate::mv::domain::readiness::MvReadinessPort;
+use novarocks_mv_application::persistence::definition::{
+    MvDesiredRefreshPolicy, StoredMvDefinition,
+};
 use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
 
 /// Lightweight projection of the iceberg base table that
@@ -198,7 +200,7 @@ fn refresh_status_for_mv(mv: &StoredMvDefinition) -> String {
 /// repository boundary.
 fn dependency_display_for_mv_with_readiness(
     readiness: &MvReadinessPort,
-    projection: &crate::mv::domain::repository::LoadedMvProjection,
+    projection: &novarocks_mv_application::repository::LoadedMvProjection,
 ) -> Result<String, String> {
     let dependencies = readiness
         .list_ready_dependencies_by_downstream(projection)

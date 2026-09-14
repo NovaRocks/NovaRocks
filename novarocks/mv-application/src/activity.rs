@@ -30,24 +30,7 @@ use novarocks_query_application::cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
 
-/// A stable, provider-neutral identity whose input has already passed
-/// SQL/catalog canonicalization. Quoted identifiers intentionally stay exact.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct CanonicalMvTarget {
-    catalog: Option<String>,
-    database: String,
-    name: String,
-}
-
-impl CanonicalMvTarget {
-    pub fn from_parts(catalog: Option<&str>, database: &str, name: &str) -> Self {
-        Self {
-            catalog: catalog.map(str::to_owned),
-            database: database.to_owned(),
-            name: name.to_owned(),
-        }
-    }
-}
+pub use crate::product::MvTarget as CanonicalMvTarget;
 
 /// The application path currently holding, or waiting to hold, an MV gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

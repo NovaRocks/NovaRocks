@@ -3977,11 +3977,25 @@ dependencies = [
 name = "novarocks-mv-application"
 version = "0.1.0"
 dependencies = [
+ "apache-avro",
+ "async-trait",
+ "bytes",
+ "futures",
+ "hex",
  "novarocks-query-application",
+ "novarocks-spi",
+ "novarocks-sql",
+ "novarocks-state-store-api",
  "novarocks-state-store-runtime",
+ "novarocks-state-store-testkit",
  "novarocks-table-maintenance",
+ "novarocks-types",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

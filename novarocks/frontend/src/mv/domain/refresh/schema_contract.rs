@@ -17,14 +17,14 @@
 
 //! Refresh-time schema-contract validation over explicit observation leaves.
 
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
-use crate::mv::domain::persistence::schema::MvSchemaContract;
 use crate::mv::domain::refresh::observation::observe_schema_validation_for_table;
 use crate::mv::domain::refresh::target::IcebergMvTarget;
 use crate::mv::domain::schema_validation::{
     ContractDecision, JoinContractDecision, validate_join_schema_contract, validate_schema_contract,
 };
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::schema::MvSchemaContract;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
 use novarocks_types::naming::TableIdentity;

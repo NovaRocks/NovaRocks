@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
+use crate::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_state_store_api::Key;
 use novarocks_types::naming::normalize_identifier;
 
-use crate::mv::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
+use crate::dependency::{MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine};
 const DEPENDENCY_SEPARATOR: char = '|';
 const MAX_MV_KEY_BYTES: usize = 512;
 

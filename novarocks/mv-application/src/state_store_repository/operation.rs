@@ -22,8 +22,8 @@
 //! budget belong to the runner and its policy; this module only decides what
 //! each storage outcome means to an MV caller.
 
-use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
-use crate::state_store::metrics::StateStoreMetrics;
+use crate::repository::{MvRepositoryError, MvRepositoryErrorKind};
+use crate::repository_metrics::MvRepositoryMetrics;
 use novarocks_state_store_api::{StateStore, StateStoreError, StateStoreErrorKind};
 use novarocks_state_store_runtime::{RunFailure, StateStoreRunPolicy, run_side_effect_free};
 
@@ -84,7 +84,7 @@ pub(crate) fn run_failure(error: RunFailure) -> MvRepositoryError {
 
 pub(crate) async fn run<T, F>(
     store: &dyn StateStore,
-    metrics: &StateStoreMetrics,
+    metrics: &MvRepositoryMetrics,
     policy: StateStoreRunPolicy,
     purpose: &str,
     mut operation: F,

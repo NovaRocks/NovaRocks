@@ -35,7 +35,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_types::naming::TableIdentity;
 

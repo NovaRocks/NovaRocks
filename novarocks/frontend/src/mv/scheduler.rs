@@ -24,10 +24,12 @@
 use std::collections::BTreeMap;
 
 use super::background::MvBackgroundEngine;
-use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
-use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::repository::{
+use novarocks_mv_application::persistence::definition::{
+    MvDesiredRefreshPolicy, StoredMvDefinition,
+};
+use novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration;
+use novarocks_mv_application::repository::{
     MvPublishedProjection, MvPublishedWaterline, MvRepositoryError,
 };
 use novarocks_mv_application::{
@@ -152,7 +154,7 @@ pub(crate) trait ScheduledRefreshRunner: Send + Sync {
 pub(crate) struct FrontendMvScheduler {
     runtime: MvRefreshProductRuntime<
         i64,
-        crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision,
+        novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision,
         ScheduledRefreshRequest,
     >,
 }
@@ -453,7 +455,7 @@ mod tests {
             max_staleness_ms: None,
             created_at_ms: 1,
             source_revision:
-                crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision {
+                novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision {
                     target_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
                         Bytes::from_static(b"scheduler-test-target"),
                     )

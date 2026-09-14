@@ -44,20 +44,10 @@ use crate::mv::domain::application::{
 };
 #[cfg(test)]
 use crate::mv::domain::application::{MvIncrementalJoinMode, MvIncrementalWriteMode};
-use crate::mv::domain::dependency::model::{MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::mv::domain::lifecycle::{
     BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
 use crate::mv::domain::model::{MvStorageEngine, RefreshMode};
-use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
-use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
-use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
-use crate::mv::domain::persistence::schema as mv_schema;
-use crate::mv::domain::persistence::schema::{
-    APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
-};
-use crate::mv::domain::persistence::semantic::{MvDesiredSemantics, MvRefreshDesiredConfiguration};
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
 use crate::mv::domain::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
@@ -97,7 +87,6 @@ use crate::mv::domain::refresh::target_apply::{
     join_apply_key_table_column,
 };
 use crate::mv::domain::refresh_io::acquire_mv_refresh_lock;
-use crate::mv::domain::repository::MvRepository;
 use crate::mv::domain::schema_validation::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, validate_branch_id_field,
 };
@@ -109,6 +98,21 @@ use crate::mv::domain::storage_observation::{
     observe_lake_package,
 };
 use novarocks_catalog_application::CatalogApplicationPort;
+use novarocks_mv_application::dependency::{MvDependencyObjectType, MvDependencyStorageEngine};
+use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
+use novarocks_mv_application::persistence::definition::{
+    MvDesiredRefreshPolicy, StoredMvDefinition,
+};
+use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
+use novarocks_mv_application::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
+use novarocks_mv_application::persistence::schema as mv_schema;
+use novarocks_mv_application::persistence::schema::{
+    APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
+};
+use novarocks_mv_application::persistence::semantic::{
+    MvDesiredSemantics, MvRefreshDesiredConfiguration,
+};
+use novarocks_mv_application::repository::MvRepository;
 use novarocks_parser::{Span, ast};
 use novarocks_query_application::engine_error::EngineError;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
@@ -827,7 +831,7 @@ fn require_known_committed_target_mutation(
 
 fn initial_refresh_configuration_for_create(
     policy: &crate::mv::domain::application::MvCreateRefreshPolicy,
-) -> crate::mv::domain::repository::InitialMvRefreshConfiguration {
+) -> novarocks_mv_application::repository::InitialMvRefreshConfiguration {
     let (policy, interval_ms) = match policy {
         crate::mv::domain::application::MvCreateRefreshPolicy::Manual => {
             (MvDesiredRefreshPolicy::Manual, None)
@@ -839,7 +843,7 @@ fn initial_refresh_configuration_for_create(
             (MvDesiredRefreshPolicy::AsyncInterval, Some(*interval_ms))
         }
     };
-    crate::mv::domain::repository::InitialMvRefreshConfiguration {
+    novarocks_mv_application::repository::InitialMvRefreshConfiguration {
         policy,
         paused: false,
         interval_ms,
@@ -992,7 +996,7 @@ fn prepare_iceberg_mv_create_with_ports(
             &analysis.resolved_refs,
             created_at_ms,
         )?;
-    let dependency_target = crate::mv::domain::dependency::model::iceberg_mv_dependency_ref(
+    let dependency_target = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
         &target.catalog,
         &target.namespace,
         &target.table,
@@ -5989,7 +5993,7 @@ fn preflight_iceberg_mv_drop_with_readiness(
     };
     crate::mv::domain::dependency_resolver::ensure_no_downstream_dependencies_with_readiness(
         readiness,
-        &crate::mv::domain::dependency::model::iceberg_mv_dependency_ref(
+        &novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
             &target.catalog,
             &target.namespace,
             &target.table,

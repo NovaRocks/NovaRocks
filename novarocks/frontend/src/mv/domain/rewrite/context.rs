@@ -28,10 +28,10 @@ use std::sync::Arc;
 use arrow::datatypes::Field;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
-use crate::mv::domain::persistence::schema as mv_schema;
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use mv_schema::MvSchemaContract;
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::schema as mv_schema;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::compiler::{
@@ -994,7 +994,6 @@ fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, 
 pub(crate) mod tests_support {
     use std::sync::Arc;
 
-    use crate::mv::domain::persistence::definition::StoredMvDefinition;
     use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
     use mv_schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
@@ -1002,6 +1001,7 @@ pub(crate) mod tests_support {
         MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
         TargetContract, TargetVisibleColumn,
     };
+    use novarocks_mv_application::persistence::definition::StoredMvDefinition;
     use novarocks_query_application::persisted_query_definition::{
         PersistedQueryDefinition, PersistedQueryDialect,
     };
@@ -1164,7 +1164,7 @@ pub(crate) mod tests_support {
             max_staleness_ms: None,
             created_at_ms: 0,
             source_revision:
-                crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision {
+                novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision {
                     target_object_id: object_id("target-object"),
                     descriptor_content_hash: "test-descriptor".to_string(),
                     current_target_snapshot_id: Some(99),

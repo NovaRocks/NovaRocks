@@ -691,24 +691,26 @@ fn invalid(message: impl Into<String>) -> MvApplicationError {
 fn unavailable(message: impl Into<String>) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::Unavailable, message)
 }
-fn repository_error(error: crate::mv::domain::repository::MvRepositoryError) -> MvApplicationError {
+fn repository_error(
+    error: novarocks_mv_application::repository::MvRepositoryError,
+) -> MvApplicationError {
     let kind = match error.kind() {
-        crate::mv::domain::repository::MvRepositoryErrorKind::Conflict => {
+        novarocks_mv_application::repository::MvRepositoryErrorKind::Conflict => {
             MvApplicationErrorKind::AlreadyActive
         }
-        crate::mv::domain::repository::MvRepositoryErrorKind::NotFound => {
+        novarocks_mv_application::repository::MvRepositoryErrorKind::NotFound => {
             MvApplicationErrorKind::TargetGone
         }
-        crate::mv::domain::repository::MvRepositoryErrorKind::Corruption => {
+        novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption => {
             MvApplicationErrorKind::Corruption
         }
-        crate::mv::domain::repository::MvRepositoryErrorKind::CommitUnknown => {
+        novarocks_mv_application::repository::MvRepositoryErrorKind::CommitUnknown => {
             MvApplicationErrorKind::CommitUnknown
         }
-        crate::mv::domain::repository::MvRepositoryErrorKind::Unavailable => {
+        novarocks_mv_application::repository::MvRepositoryErrorKind::Unavailable => {
             MvApplicationErrorKind::Unavailable
         }
-        crate::mv::domain::repository::MvRepositoryErrorKind::InvalidRequest => {
+        novarocks_mv_application::repository::MvRepositoryErrorKind::InvalidRequest => {
             MvApplicationErrorKind::Repository
         }
     };
@@ -720,7 +722,7 @@ fn repository_error(error: crate::mv::domain::repository::MvRepositoryError) -> 
 /// provider outcome became unknown. Keep the known-committed fact visible to
 /// recovery even when the projector's own CAS/read path is unavailable.
 fn known_committed_projection_error(
-    error: crate::mv::domain::repository::MvRepositoryError,
+    error: novarocks_mv_application::repository::MvRepositoryError,
 ) -> MvApplicationError {
     MvApplicationError::new(
         MvApplicationErrorKind::KnownCommittedFinalizeFailed,
@@ -988,8 +990,8 @@ mod tests {
     #[test]
     fn known_committed_publication_keeps_its_fact_when_projection_fails() {
         let error = known_committed_projection_error(
-            crate::mv::domain::repository::MvRepositoryError::new(
-                crate::mv::domain::repository::MvRepositoryErrorKind::Unavailable,
+            novarocks_mv_application::repository::MvRepositoryError::new(
+                novarocks_mv_application::repository::MvRepositoryErrorKind::Unavailable,
                 "projector store unavailable",
             ),
         );

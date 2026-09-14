@@ -18,21 +18,21 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
+use crate::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value};
 use bytes::Bytes;
-use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{Key, Value};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::mv::domain::persistence::definition::{
+use crate::persistence::definition::{
     MV_ACCELERATOR_PROJECTION_SUBJECT, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
     StoredMvDefinition,
 };
-use crate::mv::domain::persistence::dependency::MV_ACCELERATOR_DEPENDENCY_SUBJECT;
-use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
+use crate::persistence::dependency::MV_ACCELERATOR_DEPENDENCY_SUBJECT;
+use crate::persistence::schema::{MvPartitionContract, MvSchemaContract};
 use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 
 use super::catalog::schema_catalog;

@@ -30,7 +30,7 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableResolution,
 };
 
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotInfo {
@@ -190,7 +190,7 @@ pub fn collect_table_stats_with_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::definition::{
+    use novarocks_mv_application::persistence::definition::{
         MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
     };
     use novarocks_query_application::persisted_query_definition::{

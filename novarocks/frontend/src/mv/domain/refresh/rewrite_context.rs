@@ -20,10 +20,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, load_iceberg_mv_target_binding};
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorChangeWindow, ConnectorChangeWindowAdmission, ConnectorControlRegistry,

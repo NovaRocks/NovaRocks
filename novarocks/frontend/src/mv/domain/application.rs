@@ -21,10 +21,10 @@ use std::fmt;
 
 use uuid::Uuid;
 
-use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
-use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use crate::mv::domain::persistence::descriptor::MvDescriptorV3;
-use crate::mv::domain::repository::InitialMvRefreshConfiguration;
+use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
+use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
+use novarocks_mv_application::persistence::descriptor::MvDescriptorV3;
+use novarocks_mv_application::repository::InitialMvRefreshConfiguration;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
 };

@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::mv::domain::dependency::model::{MvDependencyObjectRef, MvDependencyObjectType};
+use novarocks_mv_application::dependency::{MvDependencyObjectRef, MvDependencyObjectType};
 
 pub(crate) fn validate_no_cycle_for_edges(
     new_target: &MvDependencyObjectRef,
@@ -114,7 +114,7 @@ pub(crate) fn topological_upstream_order_for_edges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::dependency::model::iceberg_mv_dependency_ref;
+    use novarocks_mv_application::dependency::iceberg_mv_dependency_ref;
 
     #[test]
     fn dependency_cycle_detector_rejects_new_back_edge() {

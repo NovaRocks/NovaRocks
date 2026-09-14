@@ -15,26 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Connector-neutral materialized-view application mechanics.
-//!
-//! This crate owns only current-process product mechanics: candidate isolation
-//! and target/publication runtime state. Provider lake packages, SQL rewrite
-//! proofs, query bindings, and physical execution stay at their respective
-//! boundaries.
+//! MV-owned StateStore retry accounting.
 
-pub mod activity;
-pub mod candidate;
-pub mod dependency;
-pub mod maintenance;
-pub mod persistence;
-pub mod ports;
-pub mod process_runtime;
-pub mod product;
-pub mod repository;
-mod repository_metrics;
-pub mod scheduler;
-pub mod scheduler_runtime;
-pub mod state_family;
-pub mod state_store_repository;
-#[doc(hidden)]
-pub mod test_repository;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, Default)]
+pub(crate) struct MvRepositoryMetrics {
+    retries: AtomicU64,
+    saturated_retries: AtomicU64,
+    deadlines: AtomicU64,
+    unresolved: AtomicU64,
+}
+
+impl novarocks_state_store_runtime::StateStoreRunMetrics for MvRepositoryMetrics {
+    fn record_retry(&self) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_saturated_retry(&self) {
+        self.saturated_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_deadline(&self) {
+        self.deadlines.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_unresolved(&self) {
+        self.unresolved.fetch_add(1, Ordering::Relaxed);
+    }
+}

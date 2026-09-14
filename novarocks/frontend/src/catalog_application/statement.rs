@@ -852,13 +852,13 @@ pub(crate) fn execute_drop_table_statement(
         Err(err) => return Err(err),
     };
     let dependency_ref = if target.provider_id.as_str() == "iceberg" {
-        crate::mv::domain::dependency::model::iceberg_table_object_ref(
+        novarocks_mv_application::dependency::iceberg_table_object_ref(
             &target.catalog,
             &target.namespace,
             &target.table,
         )
     } else {
-        crate::mv::domain::dependency::model::external_table_object_ref(
+        novarocks_mv_application::dependency::external_table_object_ref(
             &target.catalog,
             &target.namespace,
             &target.table,
@@ -1000,7 +1000,7 @@ fn ensure_no_iceberg_mv_targets_in_scope(
         .map(|projection| &projection.definition)
         .filter(|definition| definition.storage_engine.eq_ignore_ascii_case("iceberg"))
         .map(|definition| {
-            crate::mv::domain::persistence::dependency::stored_definition_dependency_ref(
+            novarocks_mv_application::persistence::dependency::stored_definition_dependency_ref(
                 definition, None,
             )
         })
@@ -1024,10 +1024,11 @@ fn ensure_no_external_iceberg_dependents(
     let mut edges = Vec::with_capacity(projections.len());
     for projection in projections {
         let definition = projection.definition.clone();
-        let target = crate::mv::domain::persistence::dependency::stored_definition_dependency_ref(
-            &definition,
-            None,
-        )?;
+        let target =
+            novarocks_mv_application::persistence::dependency::stored_definition_dependency_ref(
+                &definition,
+                None,
+            )?;
         let upstreams = context
             .mv_readiness()
             .list_ready_dependencies_by_downstream(&projection)

@@ -58,7 +58,7 @@ impl MvDependencyObjectRef {
     }
 }
 
-pub(crate) fn iceberg_table_dependency_ref(base: &TableIdentity) -> MvDependencyObjectRef {
+pub fn iceberg_table_dependency_ref(base: &TableIdentity) -> MvDependencyObjectRef {
     MvDependencyObjectRef {
         catalog: Some(base.catalog.clone()),
         database_or_namespace: base.namespace.clone(),
@@ -83,7 +83,7 @@ pub fn iceberg_mv_dependency_ref(
     }
 }
 
-pub(crate) fn starrocks_mv_dependency_ref(database: &str, table: &str) -> MvDependencyObjectRef {
+pub fn starrocks_mv_dependency_ref(database: &str, table: &str) -> MvDependencyObjectRef {
     MvDependencyObjectRef {
         catalog: None,
         database_or_namespace: database.to_string(),
@@ -93,7 +93,7 @@ pub(crate) fn starrocks_mv_dependency_ref(database: &str, table: &str) -> MvDepe
     }
 }
 
-pub(crate) fn iceberg_table_object_ref(
+pub fn iceberg_table_object_ref(
     catalog: &str,
     namespace: &str,
     table: &str,
@@ -107,7 +107,7 @@ pub(crate) fn iceberg_table_object_ref(
     }
 }
 
-pub(crate) fn external_table_object_ref(
+pub fn external_table_object_ref(
     catalog: &str,
     namespace: &str,
     table: &str,
@@ -127,7 +127,7 @@ pub(crate) fn external_table_object_ref(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-pub(crate) fn starrocks_table_object_ref(database: &str, table: &str) -> MvDependencyObjectRef {
+pub fn starrocks_table_object_ref(database: &str, table: &str) -> MvDependencyObjectRef {
     MvDependencyObjectRef {
         catalog: None,
         database_or_namespace: database.to_string(),

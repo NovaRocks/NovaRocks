@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv::domain::persistence::schema::MvSchemaContract;
 use crate::mv::domain::storage_observation::MvPublishedBaseFact;
+use novarocks_mv_application::persistence::schema::MvSchemaContract;
 
 /// Assert the lake descriptor's schema contract matches the store's contract.
 /// Fail-loud: the descriptor is the authoritative home (W2); a missing or
@@ -82,12 +82,12 @@ pub(crate) fn ensure_summary_watermark_matches_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::schema::{
+    use bytes::Bytes;
+    use novarocks_mv_application::persistence::schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
         HiddenApplyKeyContract, OutputColumnLineage, OutputContract, TargetContract,
         TargetVisibleColumn,
     };
-    use bytes::Bytes;
     use novarocks_sql::planning::mv::{
         MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME, SqlMvApplyKeySourceFacts,
     };

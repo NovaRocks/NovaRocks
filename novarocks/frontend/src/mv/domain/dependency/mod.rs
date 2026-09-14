@@ -16,6 +16,5 @@
 // under the License.
 
 pub(crate) mod graph;
-pub mod model;
 pub mod refresh;
 pub(crate) mod scope;

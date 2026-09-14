@@ -39,15 +39,15 @@ use novarocks_state_store_api::{
 };
 use uuid::Uuid;
 
-use crate::mv::domain::dependency::model::MvDependencyObjectRef;
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
-use crate::mv::domain::persistence::dependency::{CreateMvDependencyRequest, StoredMvDependency};
-use crate::mv::domain::repository::{
+use crate::dependency::MvDependencyObjectRef;
+use crate::persistence::definition::StoredMvDefinition;
+use crate::persistence::dependency::{CreateMvDependencyRequest, StoredMvDependency};
+use crate::repository::{
     DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
     MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
     ReplaceMvProjectionRequest,
 };
-use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
+use crate::repository_metrics::MvRepositoryMetrics;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 
@@ -66,7 +66,7 @@ use self::key::{
 pub struct StateStoreMvRepository {
     store: Arc<dyn StateStore>,
     run_policy: StateStoreRunPolicy,
-    runner_metrics: StateStoreMetrics,
+    runner_metrics: MvRepositoryMetrics,
 }
 
 impl StateStoreMvRepository {
@@ -82,7 +82,7 @@ impl StateStoreMvRepository {
         run_policy: StateStoreRunPolicy,
     ) -> Result<Arc<Self>, MvRepositoryError> {
         Ok(Arc::new(Self {
-            runner_metrics: StateStoreMetrics::new(StateStoreConsumer::MV_ACCELERATOR),
+            runner_metrics: MvRepositoryMetrics::default(),
             store,
             run_policy,
         }))
@@ -503,7 +503,7 @@ async fn scan_write_prefix(
 
 /// How the current Accelerator names a catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MvCatalogReference {
+pub enum MvCatalogReference {
     /// A current MV writes its projection into this catalog.
     Target,
     /// A current MV reads an upstream object out of this catalog.
@@ -511,7 +511,7 @@ pub(crate) enum MvCatalogReference {
 }
 
 impl MvCatalogReference {
-    pub(crate) const fn describe(self) -> &'static str {
+    pub const fn describe(self) -> &'static str {
         match self {
             Self::Target => "a materialized view target",
             Self::UpstreamDependency => "materialized view upstream dependencies",
@@ -534,7 +534,7 @@ impl MvCatalogReference {
 /// only advertised a tool that does not exist.  The caller therefore treats
 /// this as an observation, not a fence; see
 /// `CatalogAttachmentRepository::observe_materialized_view_references`.
-pub(crate) async fn observe_catalog_references(
+pub async fn observe_catalog_references(
     store: &dyn StateStore,
     catalog: &str,
     page_size: usize,

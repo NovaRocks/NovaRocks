@@ -28,9 +28,11 @@ use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
 use crate::mv::domain::model::MvStorageEngine;
-use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
+use novarocks_mv_application::persistence::definition::{
+    MvDesiredRefreshPolicy, StoredMvDefinition,
+};
 use novarocks_parser::ast::Visit;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
@@ -95,9 +97,9 @@ fn stored_refresh_policy(policy: &MvCreateRefreshPolicy) -> (MvDesiredRefreshPol
 )]
 pub(crate) fn initial_refresh_configuration_for_create(
     policy: &MvCreateRefreshPolicy,
-) -> crate::mv::domain::repository::InitialMvRefreshConfiguration {
+) -> novarocks_mv_application::repository::InitialMvRefreshConfiguration {
     let (policy, interval_ms) = stored_refresh_policy(policy);
-    crate::mv::domain::repository::InitialMvRefreshConfiguration {
+    novarocks_mv_application::repository::InitialMvRefreshConfiguration {
         policy,
         paused: false,
         interval_ms,

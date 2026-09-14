@@ -24,10 +24,10 @@ use bytes::Bytes;
 use novarocks_state_store_api::VersionToken;
 use uuid::Uuid;
 
-use super::dependency::model::MvDependencyObjectRef;
-use super::persistence::definition::StoredMvDefinition;
-use super::persistence::dependency::StoredMvDependency;
-use super::repository::{
+use crate::dependency::MvDependencyObjectRef;
+use crate::persistence::definition::StoredMvDefinition;
+use crate::persistence::dependency::StoredMvDependency;
+use crate::repository::{
     DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
     MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
     ReplaceMvProjectionRequest,

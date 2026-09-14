@@ -17,7 +17,7 @@
 
 use crate::mv::domain::model::{AffectedTargetPartitions, MvPartitionKey};
 use crate::mv::domain::partition::mapping::map_connector_partition_to_mv_key;
-use crate::mv::domain::persistence::schema::MvSchemaContract;
+use novarocks_mv_application::persistence::schema::MvSchemaContract;
 
 pub(crate) struct AffectedPartitionPlanInput<'a> {
     pub schema_contract: &'a MvSchemaContract,
@@ -85,17 +85,17 @@ mod tests {
     use crate::mv::domain::model::{
         AffectedTargetPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
     };
-    use crate::mv::domain::persistence::schema::{
-        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
-        HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
-        MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
-        TargetContract, TargetVisibleColumn,
-    };
     use crate::mv::domain::storage_observation::{
         MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
         MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
     };
     use bytes::Bytes;
+    use novarocks_mv_application::persistence::schema::{
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+        HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+        MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
+        TargetContract, TargetVisibleColumn,
+    };
     use novarocks_spi::connector::{
         ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
         ConnectorChangePartitionValue, ConnectorChangeWindowPartitionImpact,

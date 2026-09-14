@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Lake-authoritative MV values and Accelerator projection vocabulary.
+
 pub mod definition;
 pub mod dependency;
 pub mod descriptor;

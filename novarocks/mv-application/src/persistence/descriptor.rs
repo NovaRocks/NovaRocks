@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::mv::domain::persistence::schema::MvSchemaContract;
-use crate::mv::domain::persistence::semantic::{MvDesiredSemantics, MvRefreshDesiredConfiguration};
+use crate::persistence::schema::MvSchemaContract;
+use crate::persistence::semantic::{MvDesiredSemantics, MvRefreshDesiredConfiguration};
 use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 
 pub const MV_DESCRIPTOR_V3_VERSION: u16 = 3;
@@ -235,7 +235,7 @@ mod tests {
     use super::*;
 
     fn sample_schema_contract() -> MvSchemaContract {
-        use crate::mv::domain::persistence::schema::{
+        use crate::persistence::schema::{
             BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
             HiddenApplyKeyContract, OutputColumnLineage, OutputContract, TargetContract,
             TargetVisibleColumn,
@@ -319,7 +319,7 @@ mod tests {
                 vec!["id".to_string()],
                 sample_schema_contract(),
                 MvRefreshDesiredConfiguration::new(
-                    crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy::AsyncInterval,
+                    crate::persistence::definition::MvDesiredRefreshPolicy::AsyncInterval,
                     true,
                     Some(60_000),
                     Some(300_000),

@@ -23,9 +23,9 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy;
-use crate::mv::domain::persistence::descriptor::DescriptorDependency;
-use crate::mv::domain::persistence::schema::MvSchemaContract;
+use crate::persistence::definition::MvDesiredRefreshPolicy;
+use crate::persistence::descriptor::DescriptorDependency;
+use crate::persistence::schema::MvSchemaContract;
 use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 use novarocks_types::naming::normalize_identifier;
 

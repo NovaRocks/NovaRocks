@@ -59,7 +59,6 @@ use crate::catalog_application::MvCatalogReferenceReader;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::coordinator::FrontendDistributedQueryCoordinator;
-use crate::mv::repository::StateStoreMvRepository;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
 use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
@@ -78,6 +77,7 @@ use novarocks_catalog_application::{
     CatalogApplicationService, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
     CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode, CatalogMaterializationConfig,
 };
+use novarocks_mv_application::state_store_repository::StateStoreMvRepository;
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 
@@ -610,7 +610,7 @@ pub struct FrontendApplicationHost {
     /// Meets the attempt contract's host obligation to return abandoned
     /// attempts; see `state_store::sweeper`.
     abandoned_attempt_sweeper: Option<Arc<crate::state_store::AbandonedAttemptSweeper>>,
-    mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
+    mv_repository: Option<Arc<dyn novarocks_mv_application::repository::MvRepository>>,
     state_store_host: Option<StateStoreHost>,
     query_runtime: FrontendQueryRuntimeConfig,
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
@@ -1323,7 +1323,7 @@ impl FrontendApplicationHost {
         match host.state_store() {
             Some(store) => match StateStoreMvRepository::open(store, host.run_policy()).await {
                 Ok(repository) => {
-                    let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
+                    let repository: Arc<dyn novarocks_mv_application::repository::MvRepository> =
                         repository;
                     host.mv_repository = Some(repository);
                 }
@@ -1452,7 +1452,7 @@ impl FrontendApplicationHost {
     /// startup rollback.
     pub(crate) fn mv_repository_for_role_product_construction(
         &self,
-    ) -> Arc<dyn crate::mv::domain::repository::MvRepository> {
+    ) -> Arc<dyn novarocks_mv_application::repository::MvRepository> {
         Arc::clone(
             self.mv_repository
                 .as_ref()
@@ -1466,7 +1466,7 @@ impl FrontendApplicationHost {
     /// converged and been dropped.
     pub(crate) fn take_mv_repository(
         &mut self,
-    ) -> Result<Arc<dyn crate::mv::domain::repository::MvRepository>, FrontendApplicationError>
+    ) -> Result<Arc<dyn novarocks_mv_application::repository::MvRepository>, FrontendApplicationError>
     {
         self.mv_repository.take().ok_or_else(|| {
             FrontendApplicationError::server(

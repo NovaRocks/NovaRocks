@@ -37,12 +37,6 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
-use crate::mv::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
-use crate::mv::domain::repository::MvRepository;
-use crate::mv::repository::StateStoreMvRepository;
-use crate::mv::repository::key::{dependency_by_upstream_key, target_lookup_key};
 use crate::state_store::testing as state_store_fixture;
 use bytes::Bytes;
 use novarocks_catalog_application::ConnectorControlHost;
@@ -51,7 +45,15 @@ use novarocks_catalog_application::{
     CatalogApplicationService, CatalogCreateCommand, CatalogDesiredStateSource, CatalogDropCommand,
 };
 use novarocks_catalog_application::{CatalogAttachmentRepository, CatalogAttachmentVersioned};
+use novarocks_mv_application::dependency::{
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+};
+use novarocks_mv_application::repository::MvRepository;
 use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
+use novarocks_mv_application::state_store_repository::StateStoreMvRepository;
+use novarocks_mv_application::state_store_repository::key::{
+    dependency_by_upstream_key, target_lookup_key,
+};
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlResolver, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,

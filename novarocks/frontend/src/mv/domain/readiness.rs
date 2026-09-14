@@ -18,15 +18,15 @@ use novarocks_mv_application::{
 use uuid::Uuid;
 
 use crate::mv::activity::canonical_mv_target;
-use crate::mv::domain::dependency::model::MvDependencyObjectRef;
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
-use crate::mv::domain::persistence::dependency::StoredMvDependency;
 use crate::mv::domain::projector::MvAcceleratorProjector;
-use crate::mv::domain::repository::{
+use crate::mv::domain::storage_observation::MvLakePackageObservation;
+use novarocks_mv_application::dependency::MvDependencyObjectRef;
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::dependency::StoredMvDependency;
+use novarocks_mv_application::repository::{
     DeleteMvProjectionRequest, LoadedMvProjection, MvRepository, MvRepositoryError,
     MvRepositoryErrorKind,
 };
-use crate::mv::domain::storage_observation::MvLakePackageObservation;
 use novarocks_spi::connector::LakePublicationId;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 

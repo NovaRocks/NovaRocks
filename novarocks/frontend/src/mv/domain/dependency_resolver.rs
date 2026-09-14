@@ -17,19 +17,19 @@
 
 use crate::mv::domain::analysis::ResolvedTableRef;
 use crate::mv::domain::dependency::graph::validate_no_cycle_for_edges;
-use crate::mv::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, iceberg_mv_dependency_ref,
-    iceberg_table_dependency_ref,
-};
 use crate::mv::domain::dependency::scope::{
     validate_no_external_dependents_for_scope, validate_no_iceberg_mv_targets_in_scope,
 };
-#[cfg(test)]
-use crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy;
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
-use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use crate::mv::domain::persistence::dependency::stored_definition_dependency_ref;
 use crate::mv::domain::readiness::MvReadinessPort;
+use novarocks_mv_application::dependency::{
+    MvDependencyObjectRef, MvDependencyObjectType, iceberg_mv_dependency_ref,
+    iceberg_table_dependency_ref,
+};
+#[cfg(test)]
+use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
+use novarocks_mv_application::persistence::dependency::stored_definition_dependency_ref;
 use novarocks_types::naming::TableIdentity;
 
 #[derive(Debug)]
@@ -216,8 +216,8 @@ fn stored_definition_dependency_ref_for_iceberg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::dependency::model::iceberg_mv_dependency_ref;
     use crate::mv::domain::dependency::scope as dependency_scope;
+    use novarocks_mv_application::dependency::iceberg_mv_dependency_ref;
     use novarocks_query_application::persisted_query_definition::{
         PersistedQueryDefinition, PersistedQueryDialect,
     };
@@ -256,7 +256,7 @@ mod tests {
             max_staleness_ms: None,
             created_at_ms: 0,
             source_revision:
-                crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision {
+                novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision {
                     target_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
                         bytes::Bytes::from_static(b"dependency-test-target"),
                     )
@@ -303,7 +303,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_internal_mv_base_table_is_rejected() {
-        let repository = crate::mv::domain::test_repository::InMemoryMvRepository::default();
+        let repository = novarocks_mv_application::test_repository::InMemoryMvRepository::default();
         let readiness = MvReadinessPort::new(
             std::sync::Arc::new(repository),
             std::sync::Arc::new(

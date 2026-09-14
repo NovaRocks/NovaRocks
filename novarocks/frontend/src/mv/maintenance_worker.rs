@@ -36,12 +36,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::background::MvBackgroundEngine;
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::repository::MvRepositoryError;
 use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, TableMaintenanceEngine, TableMaintenanceService,
 };
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::repository::MvRepositoryError;
 use novarocks_mv_application::{
     activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner},
     maintenance::{

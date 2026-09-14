@@ -16,13 +16,13 @@
 // under the License.
 
 use crate::mv::domain::dependency::graph::topological_upstream_order_for_edges;
-use crate::mv::domain::dependency::model::{
+use crate::mv::domain::model::MvStorageEngine;
+use crate::mv::domain::readiness::MvReadinessPort;
+use novarocks_mv_application::dependency::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use crate::mv::domain::model::MvStorageEngine;
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
-use crate::mv::domain::persistence::dependency::stored_definition_dependency_ref;
-use crate::mv::domain::readiness::MvReadinessPort;
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::dependency::stored_definition_dependency_ref;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,7 +125,7 @@ fn stored_definition_dependency_ref_for_iceberg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::dependency::model::{
+    use novarocks_mv_application::dependency::{
         MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
         iceberg_mv_dependency_ref, iceberg_table_object_ref, starrocks_mv_dependency_ref,
     };

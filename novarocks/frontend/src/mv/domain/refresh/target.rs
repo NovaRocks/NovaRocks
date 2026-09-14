@@ -18,10 +18,10 @@
 //! Iceberg MV target identity and statement-name resolution.
 
 use crate::mv::domain::analysis::resolve_mv_name;
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::refresh::target_binding::{
     MvTargetBinding, load_mv_target_binding_with_ports, load_mv_target_binding_with_ports_typed,
 };
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorError, ConnectorRequestContext};
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;

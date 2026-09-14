@@ -20,7 +20,6 @@
 use crate::mv::domain::analysis::{
     canonicalize_iceberg_mv_select_query, rebind::rewrite_select_sql_for_rebind,
 };
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
 use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use crate::mv::domain::refresh::snapshot::BaseSnapshotPolicy;
@@ -31,6 +30,7 @@ use crate::mv::domain::schema_validation::{
 use crate::mv::domain::storage_observation::{
     MvRefreshBaseObservation, MvSchemaValidationObservation,
 };
+use novarocks_mv_application::persistence::definition::StoredMvDefinition;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,

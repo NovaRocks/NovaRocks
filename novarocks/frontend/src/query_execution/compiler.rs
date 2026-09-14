@@ -37,7 +37,7 @@ use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
 #[cfg(test)]
-use crate::mv::domain::repository::MvRepository;
+use novarocks_mv_application::repository::MvRepository;
 use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
@@ -932,7 +932,7 @@ pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
     reason = "Shared test fixture provides the in-memory MV repository to external frontend tests."
 )]
 pub(crate) fn test_mv_repository() -> Arc<dyn MvRepository> {
-    Arc::new(crate::mv::domain::test_repository::InMemoryMvRepository::default())
+    Arc::new(novarocks_mv_application::test_repository::InMemoryMvRepository::default())
 }
 
 #[cfg(test)]

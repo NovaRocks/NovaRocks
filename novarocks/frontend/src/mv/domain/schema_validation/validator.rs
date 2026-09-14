@@ -37,12 +37,12 @@ use super::model::{
     SchemaEvolutionError,
 };
 use crate::mv::domain::analysis::rebind::RebindColumn;
-use crate::mv::domain::persistence::schema::{
-    BaseContract, BranchIdColumnContract, MvPartitionTransformContract, MvSchemaContract,
-};
 use crate::mv::domain::storage_observation::{
     MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
     MvSchemaValidationPartitionTransform,
+};
+use novarocks_mv_application::persistence::schema::{
+    BaseContract, BranchIdColumnContract, MvPartitionTransformContract, MvSchemaContract,
 };
 
 pub(crate) fn validate_schema_contract(
@@ -612,7 +612,9 @@ fn check_aggregate_state_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::schema::{
+    use crate::mv::domain::storage_observation::MvSchemaValidationPartitionField;
+    use bytes::Bytes;
+    use novarocks_mv_application::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, JoinContract, JoinContractKind,
@@ -620,8 +622,6 @@ mod tests {
         MvPartitionTransformContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
         TargetContract, TargetVisibleColumn,
     };
-    use crate::mv::domain::storage_observation::MvSchemaValidationPartitionField;
-    use bytes::Bytes;
     use novarocks_spi::connector::ConnectorTableObjectId;
     use novarocks_sql::planning::mv::{
         MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,

@@ -58,7 +58,7 @@ impl CatalogReferenceReader for MvCatalogReferenceReader {
         page_size: usize,
     ) -> BoxFuture<'a, Result<Option<&'static str>, String>> {
         Box::pin(async move {
-            crate::mv::repository::observe_catalog_references(
+            novarocks_mv_application::state_store_repository::observe_catalog_references(
                 store,
                 instance_id.as_str(),
                 page_size,
