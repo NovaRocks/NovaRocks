@@ -121,6 +121,14 @@ pub(super) fn lower_typed_connector_scan(
             error.to_string(),
         )
     })?;
+    let descriptor = novarocks_worker::TypedConnectorReadDescriptor::new(
+        decoded_scan.relation().table().clone(),
+        decoded_scan.assignments().to_vec(),
+        novarocks_native_adapter::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
+            &scan_source,
+            &decoded_scan,
+        ),
+    );
     ctx.typed_scan_runtime()
         .expect("typed runtime was resolved above")
         .register_read_execution(node.node_id, execution.clone())
@@ -151,8 +159,7 @@ pub(super) fn lower_typed_connector_scan(
                     decoded_scan.clone(),
                 );
             let source = TypedConnectorScanSource::new(
-                scan_source,
-                decoded_scan,
+                descriptor,
                 page_source_provider,
                 inputs.session,
                 inputs.request,
@@ -179,7 +186,7 @@ pub(super) fn lower_typed_connector_scan(
                 .create_system_table_provider(&inputs.request)
                 .map_err(provider_refusal)?;
             let source = TypedConnectorSystemTableScanSource::new(
-                decoded_scan,
+                descriptor,
                 system_table_provider,
                 inputs.session,
                 inputs.request,

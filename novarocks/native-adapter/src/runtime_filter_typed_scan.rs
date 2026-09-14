@@ -22,14 +22,16 @@
 //! Worker-owned filter bindings; all subscription and bounds semantics live in
 //! `novarocks-worker`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use novarocks_execution::runtime_filter::{
     RuntimeFilterConsumerContract, RuntimeFilterContractViolation, RuntimeFilterSessionRef,
 };
 use novarocks_proto_codec::connector_read::{ConnectorTableScanSource, DecodedConnectorReadScan};
-use novarocks_spi::connector::read_stack::ConnectorReadDynamicFilter;
+use novarocks_spi::connector::read_stack::{
+    CompleteAllDynamicFilter, ConnectorReadColumnHandle, ConnectorReadDynamicFilter,
+};
 use novarocks_worker::runtime_filter::typed_scan::{
     TypedScanFilterBindings, typed_scan_dynamic_filter,
 };
@@ -55,6 +57,26 @@ pub fn typed_scan_live_dynamic_filter_factory(
     scan: DecodedConnectorReadScan,
 ) -> Arc<dyn TypedScanLiveDynamicFilterFactory> {
     Arc::new(NativeTypedScanLiveDynamicFilterFactory { wire_scan, scan })
+}
+
+/// Projects the carrier's dynamic-filter variable names onto decoded SPI
+/// columns for a scan that receives no live runtime-filter feedback.
+pub fn complete_all_scan_dynamic_filter(
+    wire_scan: &ConnectorTableScanSource,
+    scan: &DecodedConnectorReadScan,
+) -> Arc<ConnectorReadDynamicFilter> {
+    let filtered_variables: BTreeSet<&str> = wire_scan
+        .dynamic_filters()
+        .iter()
+        .map(|binding| binding.variable())
+        .collect();
+    let covered: BTreeSet<ConnectorReadColumnHandle> = scan
+        .assignments()
+        .iter()
+        .filter(|assignment| filtered_variables.contains(assignment.variable()))
+        .map(|assignment| assignment.column().clone())
+        .collect();
+    Arc::new(CompleteAllDynamicFilter::new(covered))
 }
 
 pub fn scan_dynamic_filter_spi(

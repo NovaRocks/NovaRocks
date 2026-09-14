@@ -27,7 +27,6 @@
 //!
 //! Key exported interfaces:
 //! - Types: `TypedConnectorScanSource`, `TypedConnectorScanOp`.
-//! - Functions: `complete_all_scan_dynamic_filter`.
 //!
 //! Current limitations:
 //! - The scan produces no morsel of its own yet. `build_morsels` is empty with
@@ -42,7 +41,7 @@
 //! objects only. It never matches a provider variant and never downcasts, so it
 //! compiles with no provider crate in the dependency graph.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -60,13 +59,15 @@ use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
 use novarocks_spi::connector::ConnectorRequestContext;
+#[cfg(test)]
+use novarocks_spi::connector::read_stack::CompleteAllDynamicFilter;
 use novarocks_spi::connector::read_stack::{
-    CompleteAllDynamicFilter, ConnectorReadColumnHandle, ConnectorReadDynamicFilter,
-    ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider, ConnectorSession,
-    PageSourceFileMetrics,
+    ConnectorReadDynamicFilter, ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider,
+    ConnectorSession, PageSourceFileMetrics,
 };
 use novarocks_types::SlotId;
 use novarocks_worker::RuntimeFilterSessionResolver;
+use novarocks_worker::TypedConnectorReadDescriptor;
 use novarocks_worker::connector_batch_transform::ConnectorBatchTransform;
 use novarocks_worker::read_attempt::ReceivedReadSplit;
 use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
@@ -86,37 +87,12 @@ const SPLIT_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// turning "nothing right now" into end of stream.
 const BLOCKED_PAGE_SOURCE_BACKOFF: Duration = Duration::from_millis(1);
 
-/// The truthful dynamic filter for a scan that has no runtime feedback.
-///
-/// It covers exactly the columns the scan's dynamic-filter bindings name, and
-/// reports an unconstrained, complete, non-awaitable predicate. A blocked or
-/// awaitable filter here would fabricate feedback that no one produces.
-pub fn complete_all_scan_dynamic_filter(
-    wire_scan: &novarocks_proto_codec::connector_read::ConnectorTableScanSource,
-    scan: &novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
-) -> Arc<ConnectorReadDynamicFilter> {
-    let filtered_variables: BTreeSet<&str> = wire_scan
-        .dynamic_filters()
-        .iter()
-        .map(|binding| binding.variable())
-        .collect();
-    let covered: BTreeSet<ConnectorReadColumnHandle> = scan
-        .assignments()
-        .iter()
-        .filter(|assignment| filtered_variables.contains(assignment.variable()))
-        .map(|assignment| assignment.column().clone())
-        .collect();
-    Arc::new(CompleteAllDynamicFilter::new(covered))
-}
-
 /// Everything one typed scan needs, shared by the source, the op, and every
 /// iterator the op hands out.
 struct TypedConnectorScanShared {
-    /// Retained only for the live runtime-filter bridge.  It is the frozen
-    /// carrier that names runtime-filter bindings; the actual relation,
-    /// columns, and splits below remain SPI values.
-    wire_scan: novarocks_proto_codec::connector_read::ConnectorTableScanSource,
-    scan: novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
+    /// Immutable SPI facts decoded at the native edge. It names the relation,
+    /// assignments, and initial complete filter without retaining a carrier.
+    descriptor: TypedConnectorReadDescriptor,
     provider: Arc<dyn ConnectorReadPageSourceProvider>,
     session: ConnectorSession,
     /// Resolves the attempt's runtime-filter session at the moment it is
@@ -263,8 +239,7 @@ pub struct TypedConnectorScanSource {
 
 impl TypedConnectorScanSource {
     pub(crate) fn new(
-        wire_scan: novarocks_proto_codec::connector_read::ConnectorTableScanSource,
-        scan: novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
+        descriptor: TypedConnectorReadDescriptor,
         provider: Arc<dyn ConnectorReadPageSourceProvider>,
         session: ConnectorSession,
         request: ConnectorRequestContext,
@@ -275,11 +250,10 @@ impl TypedConnectorScanSource {
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
     ) -> Self {
-        let dynamic_filter = complete_all_scan_dynamic_filter(&wire_scan, &scan);
         Self {
             shared: Arc::new(TypedConnectorScanShared {
-                wire_scan,
-                scan,
+                dynamic_filter: descriptor.complete_dynamic_filter(),
+                descriptor,
                 provider,
                 session,
                 runtime_filter,
@@ -289,7 +263,6 @@ impl TypedConnectorScanSource {
                 request,
                 plan_node_id,
                 slot_ids,
-                dynamic_filter,
                 output_materialization: None,
             }),
             queues,
@@ -370,8 +343,7 @@ impl TypedConnectorScanSource {
     fn with_substituted_filter(&self, dynamic_filter: Arc<ConnectorReadDynamicFilter>) -> Self {
         Self {
             shared: Arc::new(TypedConnectorScanShared {
-                wire_scan: self.shared.wire_scan.clone(),
-                scan: self.shared.scan.clone(),
+                descriptor: self.shared.descriptor.clone(),
                 provider: Arc::clone(&self.shared.provider),
                 session: self.shared.session.clone(),
                 runtime_filter: Arc::clone(&self.shared.runtime_filter),
@@ -591,10 +563,10 @@ impl TypedConnectorSplitIter {
             .provider
             .create_page_source(
                 &self.shared.session,
-                self.shared.scan.relation().table(),
+                self.shared.descriptor.table(),
                 split.split(),
                 split.sequence_id(),
-                self.shared.scan.assignments(),
+                self.shared.descriptor.assignments(),
                 &self.shared.dynamic_filter,
             )
             .map_err(|error| {
@@ -1468,6 +1440,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;
 
@@ -1676,6 +1649,19 @@ mod tests {
         Arc::new(|| Ok(None))
     }
 
+    fn descriptor() -> TypedConnectorReadDescriptor {
+        let wire_scan = scan_source();
+        let decoded_scan = test_support::decoded_scan();
+        TypedConnectorReadDescriptor::new(
+            decoded_scan.relation().table().clone(),
+            decoded_scan.assignments().to_vec(),
+            novarocks_native_adapter::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
+                &wire_scan,
+                &decoded_scan,
+            ),
+        )
+    }
+
     fn live_dynamic_filter_factory() -> Arc<dyn TypedScanLiveDynamicFilterFactory> {
         novarocks_native_adapter::runtime_filter_typed_scan::typed_scan_live_dynamic_filter_factory(
             scan_source(),
@@ -1728,8 +1714,7 @@ mod tests {
         cancellation: Arc<dyn ConnectorCancellation>,
     ) -> TypedConnectorScanSource {
         TypedConnectorScanSource::new(
-            scan_source(),
-            test_support::decoded_scan(),
+            descriptor(),
             provider,
             session(),
             request(cancellation),
@@ -1814,7 +1799,7 @@ mod tests {
         provider: Arc<ScriptedSystemTables>,
     ) -> TypedConnectorSystemTableScanSource {
         TypedConnectorSystemTableScanSource::new(
-            test_support::decoded_scan(),
+            descriptor(),
             provider,
             session(),
             request(Arc::new(NeverCancelled)),
@@ -2113,8 +2098,7 @@ mod tests {
             .column()
             .clone()]);
         let source = TypedConnectorScanSource::new(
-            scan_source(),
-            test_support::decoded_scan(),
+            descriptor(),
             provider,
             session(),
             request(Arc::new(NeverCancelled)),
@@ -2153,7 +2137,11 @@ mod tests {
         }];
         let scan = ConnectorTableScanSource::parse(proto, FieldPath::root("scan"))
             .expect("valid typed scan source");
-        let filter = complete_all_scan_dynamic_filter(&scan, &test_support::decoded_scan());
+        let filter =
+            novarocks_native_adapter::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
+                &scan,
+                &test_support::decoded_scan(),
+            );
         assert_eq!(filter.columns_covered().len(), 1);
         // Truthful and unconstrained: never blocked, never awaitable.
         assert!(filter.current_predicate().is_all());
@@ -2163,9 +2151,12 @@ mod tests {
 
         // A scan with no binding covers nothing at all.
         assert!(
-            complete_all_scan_dynamic_filter(&scan_source(), &test_support::decoded_scan())
-                .columns_covered()
-                .is_empty()
+            novarocks_native_adapter::runtime_filter_typed_scan::complete_all_scan_dynamic_filter(
+                &scan_source(),
+                &test_support::decoded_scan(),
+            )
+            .columns_covered()
+            .is_empty()
         );
     }
 }
@@ -2190,7 +2181,7 @@ pub struct TypedConnectorSystemTableScanSource {
 }
 
 struct TypedSystemTableScanShared {
-    scan: novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
+    descriptor: TypedConnectorReadDescriptor,
     provider: Arc<dyn ConnectorReadSystemTableProvider>,
     session: ConnectorSession,
     request: ConnectorRequestContext,
@@ -2226,7 +2217,7 @@ impl TypedSystemTableScanShared {
 
 impl TypedConnectorSystemTableScanSource {
     pub fn new(
-        scan: novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
+        descriptor: TypedConnectorReadDescriptor,
         provider: Arc<dyn ConnectorReadSystemTableProvider>,
         session: ConnectorSession,
         request: ConnectorRequestContext,
@@ -2236,7 +2227,7 @@ impl TypedConnectorSystemTableScanSource {
     ) -> Self {
         Self {
             shared: Arc::new(TypedSystemTableScanShared {
-                scan,
+                descriptor,
                 provider,
                 session,
                 request,
@@ -2366,8 +2357,8 @@ impl TypedSystemTableIter {
             .provider
             .create_system_page_source(
                 &self.shared.session,
-                self.shared.scan.relation().table(),
-                self.shared.scan.assignments(),
+                self.shared.descriptor.table(),
+                self.shared.descriptor.assignments(),
             )
             .map_err(|error| format!("create typed system relation page source: {error}"))?;
         let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);

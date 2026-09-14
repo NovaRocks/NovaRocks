@@ -23,7 +23,10 @@ use std::sync::{Arc, OnceLock};
 use novarocks_execution::connector::TaskAttemptSplitQueues;
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_spi::connector::read_stack::ConnectorSession;
+use novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment;
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadDynamicFilter, ConnectorReadTableHandle, ConnectorSession,
+};
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
     ConnectorExecutionWriteBinding, ConnectorRequestResources, ConnectorResourceCheckpoint,
@@ -47,6 +50,45 @@ pub type CatalogReadExecutionResolver =
 /// runtime.
 pub type CatalogWriteExecutionResolver =
     Arc<dyn Fn(&CatalogHandle) -> Result<ConnectorExecutionWriteBinding, String> + Send + Sync>;
+
+/// The SPI-only facts a typed reader retains after native carrier decoding.
+///
+/// The protocol adapter constructs this value after it has validated and
+/// decoded the carrier. Worker execution deliberately receives neither a DTO
+/// nor a protocol decoder, so a reader cannot reinterpret or revalidate wire
+/// semantics after admission.
+#[derive(Clone)]
+pub struct TypedConnectorReadDescriptor {
+    table: ConnectorReadTableHandle,
+    assignments: Vec<ConnectorReadAssignment>,
+    complete_dynamic_filter: Arc<ConnectorReadDynamicFilter>,
+}
+
+impl TypedConnectorReadDescriptor {
+    pub fn new(
+        table: ConnectorReadTableHandle,
+        assignments: Vec<ConnectorReadAssignment>,
+        complete_dynamic_filter: Arc<ConnectorReadDynamicFilter>,
+    ) -> Self {
+        Self {
+            table,
+            assignments,
+            complete_dynamic_filter,
+        }
+    }
+
+    pub const fn table(&self) -> &ConnectorReadTableHandle {
+        &self.table
+    }
+
+    pub fn assignments(&self) -> &[ConnectorReadAssignment] {
+        &self.assignments
+    }
+
+    pub fn complete_dynamic_filter(&self) -> Arc<ConnectorReadDynamicFilter> {
+        Arc::clone(&self.complete_dynamic_filter)
+    }
+}
 
 /// Adapts connector reservations to the exact fragment tracker installed by
 /// task admission. Decode may construct the runtime before admission, but no

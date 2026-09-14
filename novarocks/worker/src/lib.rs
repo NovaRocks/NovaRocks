@@ -152,7 +152,7 @@ pub use task_registry::{DeadlineSweep, RegistryCounters, TaskExecutionRegistry};
 pub use task_registry_config::TaskExecutionRegistryConfig;
 pub use typed_scan_runtime::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,
-    TypedScanRuntime,
+    TypedConnectorReadDescriptor, TypedScanRuntime,
 };
 
 /// Positive, ordered joint retained-result limits owned by one worker process.
