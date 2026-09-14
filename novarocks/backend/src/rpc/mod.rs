@@ -4,6 +4,5 @@
 //! Domain adapters remain owned by fragment, query lifecycle, runtime filter,
 //! and connector.
 
-pub(crate) mod data_plane;
 pub(crate) mod runtime;
 pub(crate) mod server;

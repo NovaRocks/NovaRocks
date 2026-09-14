@@ -52,6 +52,7 @@ pub mod runtime_filter_transport;
 pub mod runtime_filter_typed_scan;
 pub mod task_protocol;
 pub mod task_protocol_fault;
+pub mod task_result_diagnostics;
 pub mod task_shared_facts;
 
 pub mod generated {

@@ -14,7 +14,7 @@ fn emit_typed_fetch_marker(
     eos: bool,
     payload_bytes: usize,
 ) {
-    if novarocks_native_adapter::debug_environment::debug_emit_grpc_fragment_marker()
+    if crate::debug_environment::debug_emit_grpc_fragment_marker()
         && should_emit_typed_fetch_marker(status, packet_seq, eos)
     {
         println!(
@@ -26,7 +26,7 @@ fn emit_typed_fetch_marker(
 
 /// Emits the role-local task-result diagnostic after the result owner has
 /// settled the read, while Native Adapter owns the wire response itself.
-pub(crate) fn emit_task_fetch_marker(
+pub fn emit_task_fetch_marker(
     identity: TaskIdentity,
     status: proto::novarocks::fetch_result_response::Status,
     packet_seq: i64,
