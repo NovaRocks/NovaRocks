@@ -19,6 +19,7 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
+use mysql::{Row, Value};
 use novarocks_cluster_harness::{
     NativeTrustFixture, QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot,
     RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
@@ -783,14 +784,110 @@ fn create_ncp5_pruning_tables(
             tables.catalog, tables.database, tables.probe
         ))
         .context("analyze NCP-5 probe table")?;
+    wait_for_statistics_job_success(
+        context,
+        control,
+        &tables.catalog,
+        &tables.database,
+        &tables.probe,
+    )?;
     control
         .query_drop(format!(
             "ANALYZE TABLE {}.{}.{}",
             tables.catalog, tables.database, tables.build
         ))
         .context("analyze NCP-5 build table")?;
+    wait_for_statistics_job_success(
+        context,
+        control,
+        &tables.catalog,
+        &tables.database,
+        &tables.build,
+    )?;
     context.action("created three disjoint Iceberg probe ranges for NCP-5 whole-file pruning");
     Ok(tables)
+}
+
+/// `ANALYZE` acknowledges job submission, not its native collection attempt.
+///
+/// NCP-5 arms a one-shot lifecycle fault after fixture construction.  Waiting
+/// for the exact table's business conclusion keeps a background statistics
+/// attempt from consuming that arm after setup has returned.
+fn wait_for_statistics_job_success(
+    context: &mut ScenarioContext,
+    control: &mut mysql::Conn,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<()> {
+    loop {
+        let rows: Vec<Row> = control
+            .query("SHOW ANALYZE JOBS")
+            .context("observe submitted NCP-5 ANALYZE job")?;
+        let mut matches = Vec::new();
+        for row in rows {
+            if analyze_job_field(&row, "catalog")?.as_deref() == Some(catalog)
+                && analyze_job_field(&row, "namespace")?.as_deref() == Some(namespace)
+                && analyze_job_field(&row, "table")?.as_deref() == Some(table)
+            {
+                matches.push(row);
+            }
+        }
+        let Some(job) = matches.pop() else {
+            context.remaining("wait for submitted NCP-5 ANALYZE job to become observable")?;
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        if !matches.is_empty() {
+            bail!(
+                "multiple ANALYZE jobs matched {catalog}.{namespace}.{table}; exact job identity is ambiguous"
+            );
+        }
+        let job_id = analyze_job_field(&job, "job_id")?
+            .filter(|value| !value.is_empty())
+            .context("NCP-5 ANALYZE job observation has no job_id")?;
+        let state = analyze_job_field(&job, "state")?
+            .filter(|value| !value.is_empty())
+            .context("NCP-5 ANALYZE job observation has no state")?;
+        match state.as_str() {
+            "SUCCEEDED" => return Ok(()),
+            "SUBMITTED" | "PREPARING" | "COLLECTING" | "PUBLISHING" => {
+                context.remaining(&format!(
+                    "wait for NCP-5 ANALYZE job {job_id} to reach its business conclusion"
+                ))?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let detail = analyze_job_field(&job, "error_message")?.unwrap_or_default();
+                bail!(
+                    "NCP-5 ANALYZE job {job_id} for {catalog}.{namespace}.{table} reached {state}: {detail}"
+                );
+            }
+        }
+    }
+}
+
+fn analyze_job_field(row: &Row, name: &str) -> Result<Option<String>> {
+    let index = row
+        .columns_ref()
+        .iter()
+        .position(|column| column.name_str().eq_ignore_ascii_case(name))
+        .with_context(|| format!("NCP-5 ANALYZE job observation omitted column {name}"))?;
+    match row
+        .as_ref(index)
+        .context("NCP-5 ANALYZE job observation value is missing")?
+    {
+        Value::NULL => Ok(None),
+        Value::Bytes(bytes) => Ok(Some(
+            String::from_utf8(bytes.clone())
+                .context("NCP-5 ANALYZE job observation is not UTF-8")?,
+        )),
+        Value::Int(value) => Ok(Some(value.to_string())),
+        Value::UInt(value) => Ok(Some(value.to_string())),
+        Value::Float(value) => Ok(Some(value.to_string())),
+        Value::Double(value) => Ok(Some(value.to_string())),
+        _ => bail!("NCP-5 ANALYZE job observation column {name} has an unsupported value type"),
+    }
 }
 
 fn create_hadoop_catalog(control: &mut mysql::Conn, catalog: &str, warehouse: &Path) -> Result<()> {
