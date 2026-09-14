@@ -19,9 +19,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use novarocks_parser::ast::MaterializedViewStatement;
 use novarocks_spi::connector::ConnectorRequestContext;
+use novarocks_sql::semantic::{CatalogSqlCommand, MaintenanceSqlCommand, StatisticsSqlCommand};
 use novarocks_workload_control::WorkScope;
 
-use super::ObjectPath;
 use crate::admitted_query_context::RequestContext;
 use crate::protocol_delivery::QuerySessionOutput;
 
@@ -55,31 +55,6 @@ impl CommandContext {
 
     pub fn connector_context(&self) -> &ConnectorRequestContext {
         &self.connector_context
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandProperty {
-    name: Arc<str>,
-    value: Arc<str>,
-}
-
-impl CommandProperty {
-    pub fn try_new(name: impl Into<Arc<str>>, value: impl Into<Arc<str>>) -> Option<Self> {
-        let name = name.into();
-        let value = value.into();
-        if name.is_empty() || value.len() > 64 * 1024 {
-            return None;
-        }
-        Some(Self { name, value })
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn value(&self) -> &str {
-        &self.value
     }
 }
 
@@ -167,151 +142,22 @@ impl fmt::Display for CommandError {
 
 impl Error for CommandError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum CatalogCommandKind {
-    CreateCatalog,
-    DropCatalog,
-    CreateNamespace,
-    DropNamespace,
-    CreateTable,
-    DropTable,
-    AlterTable,
-    AlterReference,
-}
-
-pub struct CatalogCommand {
-    kind: CatalogCommandKind,
-    target: ObjectPath,
-    if_exists: bool,
-    properties: Arc<[CommandProperty]>,
-}
-
-impl CatalogCommand {
-    #[allow(dead_code)]
-    pub(crate) fn new(
-        kind: CatalogCommandKind,
-        target: ObjectPath,
-        if_exists: bool,
-        properties: Vec<CommandProperty>,
-    ) -> Self {
-        Self {
-            kind,
-            target,
-            if_exists,
-            properties: properties.into(),
-        }
-    }
-
-    pub const fn kind(&self) -> CatalogCommandKind {
-        self.kind
-    }
-    pub const fn target(&self) -> &ObjectPath {
-        &self.target
-    }
-    pub const fn if_exists(&self) -> bool {
-        self.if_exists
-    }
-    pub fn properties(&self) -> &[CommandProperty] {
-        &self.properties
-    }
-}
+/// Complete, source-spanless catalog command admitted by Query Application.
+pub type CatalogCommand = CatalogSqlCommand;
 
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
     fn execute(&self, command: CatalogCommand, context: CommandContext) -> CommandFuture;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum StatisticsCommandKind {
-    Analyze,
-    ShowAnalyzeJobs,
-    CancelAnalyze,
-    ShowTableStatistics,
-}
-
-pub struct StatisticsCommand {
-    kind: StatisticsCommandKind,
-    target: Option<ObjectPath>,
-    columns: Arc<[Arc<str>]>,
-    job_id: Option<[u8; 16]>,
-}
-
-impl StatisticsCommand {
-    #[allow(dead_code)]
-    pub(crate) fn new(
-        kind: StatisticsCommandKind,
-        target: Option<ObjectPath>,
-        columns: Vec<Arc<str>>,
-        job_id: Option<[u8; 16]>,
-    ) -> Self {
-        Self {
-            kind,
-            target,
-            columns: columns.into(),
-            job_id,
-        }
-    }
-
-    pub const fn kind(&self) -> StatisticsCommandKind {
-        self.kind
-    }
-    pub const fn target(&self) -> Option<&ObjectPath> {
-        self.target.as_ref()
-    }
-    pub fn columns(&self) -> &[Arc<str>] {
-        &self.columns
-    }
-    pub const fn job_id(&self) -> Option<[u8; 16]> {
-        self.job_id
-    }
-}
+/// Complete, source-spanless statistics command admitted by Query Application.
+pub type StatisticsCommand = StatisticsSqlCommand;
 
 pub trait StatisticsCommandConsumer: Send + Sync + 'static {
     fn execute(&self, command: StatisticsCommand, context: CommandContext) -> CommandFuture;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum MaintenanceCommandKind {
-    Optimize,
-    RewriteDataFiles,
-    RewriteManifests,
-    RemoveOrphanFiles,
-    ExpireSnapshots,
-    ShowOptimize,
-}
-
-pub struct MaintenanceCommand {
-    kind: MaintenanceCommandKind,
-    target: ObjectPath,
-    properties: Arc<[CommandProperty]>,
-}
-
-impl MaintenanceCommand {
-    #[allow(dead_code)]
-    pub(crate) fn new(
-        kind: MaintenanceCommandKind,
-        target: ObjectPath,
-        properties: Vec<CommandProperty>,
-    ) -> Self {
-        Self {
-            kind,
-            target,
-            properties: properties.into(),
-        }
-    }
-
-    pub const fn kind(&self) -> MaintenanceCommandKind {
-        self.kind
-    }
-    pub const fn target(&self) -> &ObjectPath {
-        &self.target
-    }
-    pub fn properties(&self) -> &[CommandProperty] {
-        &self.properties
-    }
-}
+/// Complete, source-spanless maintenance command admitted by Query Application.
+pub type MaintenanceCommand = MaintenanceSqlCommand;
 
 pub trait MaintenanceCommandConsumer: Send + Sync + 'static {
     fn execute(&self, command: MaintenanceCommand, context: CommandContext) -> CommandFuture;
