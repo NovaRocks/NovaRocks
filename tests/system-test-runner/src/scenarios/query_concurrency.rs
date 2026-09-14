@@ -170,6 +170,24 @@ struct Governance {
     control_inflight: usize,
 }
 
+impl FrontendState {
+    fn diagnostic(&self) -> String {
+        let workload = &self.workload;
+        let governance = &workload.governance;
+        format!(
+            "active_statement={} roots={} preparation={} execution={} waiting={} held_bytes={} control_ready={} control_inflight={}",
+            workload.active.statement,
+            governance.root_responsibilities,
+            governance.preparation,
+            governance.execution,
+            governance.waiting_records,
+            governance.held_bytes,
+            governance.control_ready,
+            governance.control_inflight,
+        )
+    }
+}
+
 struct TierWindow {
     tier: usize,
     start_millis: u128,
@@ -217,7 +235,7 @@ fn run_tier(
         // sockets first would turn an absent deadline terminal into a client
         // disconnect and conceal the FE owner state that must be investigated.
         let state = frontend_state(context)
-            .map(|state| format!("{state:?}"))
+            .map(|state| state.diagnostic())
             .unwrap_or_else(|error| format!("unavailable: {error:#}"));
         bail!(
             "tier {tier} did not deliver deadline terminals: {}; FE workload state: {state}",
