@@ -502,23 +502,6 @@ pub trait StatisticsApplicationPort: Send + Sync {
     ) -> Result<StatisticsApplicationResult, StatisticsApplicationError>;
 }
 
-/// A frontend composition with no statistics application authority fails closed.
-pub struct UnavailableStatisticsApplicationPort;
-
-impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {
-    fn execute(
-        &self,
-        _command: StatisticsApplicationCommand,
-        _execution: Option<
-            &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-        >,
-    ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
-        Err(StatisticsApplicationError::new(
-            "unified statistics application service is not installed",
-        ))
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsApplicationError {
     message: String,
