@@ -17,7 +17,7 @@
 
 //! Query-application ownership of parser-admitted SQL statement shape.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use novarocks_parser::{ParserError, ast::Statement};
 use novarocks_sql::semantic::command::{
@@ -36,7 +36,10 @@ use novarocks_sql::semantic::{
 use novarocks_types::schema::SqlType;
 
 use crate::admitted_query_context::RequestContext;
-use crate::api::CommandContext;
+use crate::api::{
+    CatalogCommandConsumer, CommandContext, CommandFuture, MaintenanceCommandConsumer,
+    StatisticsCommandConsumer,
+};
 use crate::protocol_delivery::QuerySessionOutput;
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
@@ -66,17 +69,6 @@ pub mod user_variable;
 /// statement. Implementations remain role-local adapters: the port transfers
 /// only immutable admitted context and the governed command context.
 pub trait CoreCommandRoute: Send + Sync {
-    /// Executes a closed product command after Query Application has performed
-    /// the one parser-AST-to-semantic lowering step.
-    fn execute_product(
-        &self,
-        _command: &ProductSqlCommand,
-        _context: &RequestContext,
-        _command_context: &CommandContext,
-    ) -> Result<QuerySessionOutput, String> {
-        Err("semantic product command route is unavailable".to_string())
-    }
-
     /// Executes the role-gated `SHOW BACKENDS` command.
     fn execute_show_backends(
         &self,
@@ -118,6 +110,54 @@ pub trait CoreCommandRoute: Send + Sync {
         _command_context: &CommandContext,
     ) -> Result<QuerySessionOutput, String> {
         Err("view command route is unavailable".to_string())
+    }
+}
+
+/// Query Application's only dispatcher for closed product command values.
+///
+/// Each consumer is injected by role composition and receives the complete
+/// immutable request and governed command contexts. Parser ASTs cannot cross
+/// this boundary.
+#[derive(Clone)]
+pub struct ProductCommandRouter {
+    catalog: Arc<dyn CatalogCommandConsumer>,
+    statistics: Arc<dyn StatisticsCommandConsumer>,
+    maintenance: Arc<dyn MaintenanceCommandConsumer>,
+}
+
+impl ProductCommandRouter {
+    pub fn new(
+        catalog: Arc<dyn CatalogCommandConsumer>,
+        statistics: Arc<dyn StatisticsCommandConsumer>,
+        maintenance: Arc<dyn MaintenanceCommandConsumer>,
+    ) -> Self {
+        Self {
+            catalog,
+            statistics,
+            maintenance,
+        }
+    }
+
+    pub fn execute(
+        &self,
+        command: ProductSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> CommandFuture {
+        match command {
+            ProductSqlCommand::Catalog(command) => {
+                self.catalog
+                    .execute(command, request_context, command_context)
+            }
+            ProductSqlCommand::Statistics(command) => {
+                self.statistics
+                    .execute(command, request_context, command_context)
+            }
+            ProductSqlCommand::Maintenance(command) => {
+                self.maintenance
+                    .execute(command, request_context, command_context)
+            }
+        }
     }
 }
 

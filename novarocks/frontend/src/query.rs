@@ -53,8 +53,10 @@ use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::{
-    BackendCommandExecutor, CommandContext, ExecutionOutput, MaterializedViewCommand,
+    BackendCommandExecutor, CatalogCommandConsumer, CommandContext, CommandError, CommandErrorKind,
+    CommandFuture, ExecutionOutput, MaintenanceCommandConsumer, MaterializedViewCommand,
     MaterializedViewCommandConsumer, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
+    StatisticsCommandConsumer,
 };
 use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
 use novarocks_query_application::api::{
@@ -102,7 +104,9 @@ use novarocks_query_application::sql::{
     CoreCommandRoute, parse_single_statement, query_service_parse_error,
     strip_leading_line_comments,
 };
-use novarocks_query_application::sql::{ProductSqlCommand, lower_product_sql_command};
+use novarocks_query_application::sql::{
+    ProductCommandRouter, ProductSqlCommand, lower_product_sql_command,
+};
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
 use novarocks_user_error::UserError;
@@ -116,125 +120,220 @@ pub(crate) mod compiler;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
+fn command_error(kind: CommandErrorKind, error: impl Into<String>) -> CommandError {
+    CommandError::new(kind, error.into())
+}
+
+fn execute_product_command_edge<F>(
+    executor: QueryBlockingExecutor,
+    request_context: RequestContext,
+    command_context: CommandContext,
+    call: F,
+) -> CommandFuture
+where
+    F: FnOnce(&RequestContext, &CommandContext) -> Result<StatementResult, String> + Send + 'static,
+{
+    Box::pin(async move {
+        if request_context.execution().cancellation().is_cancelled() {
+            return Err(command_error(
+                CommandErrorKind::Cancelled,
+                "product command was cancelled before synchronous admission",
+            ));
+        }
+        command_context.scope().check().map_err(|error| {
+            command_error(
+                CommandErrorKind::Cancelled,
+                format!("product command scope is no longer active: {error}"),
+            )
+        })?;
+        let cancellation = request_context.execution().cancellation().clone();
+        let scope = command_context.scope().clone();
+        let statement_token = command_context.statement_token();
+        executor
+            .execute(move || {
+                let _diagnostic_scope =
+                    crate::preparation_diagnostics::enter_statement(statement_token);
+                if cancellation.is_cancelled() {
+                    return Err(command_error(
+                        CommandErrorKind::Cancelled,
+                        "product command was cancelled before synchronous execution began",
+                    ));
+                }
+                scope.check().map_err(|error| {
+                    command_error(
+                        CommandErrorKind::Cancelled,
+                        format!("product command scope is no longer active: {error}"),
+                    )
+                })?;
+                call(&request_context, &command_context)
+                    .map_err(|error| command_error(CommandErrorKind::Failed, error))
+            })
+            .await
+            .map_err(|error| command_error(CommandErrorKind::Failed, error))?
+    })
+}
+
 #[derive(Clone)]
-struct TypedCommandRoute {
+struct FrontendCatalogCommandConsumer {
     catalog: CatalogCommandExecutor,
-    statistics: StatisticsCommandExecutor,
-    backend: BackendCommandExecutor,
     view: ViewCommandExecutor,
     iceberg_ref: IcebergRefCommandExecutor,
-    mv: Arc<dyn MaterializedViewCommandConsumer>,
-    mv_call: MvCommandExecutor,
+    executor: QueryBlockingExecutor,
+}
+
+impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
+    fn execute(
+        &self,
+        command: novarocks_sql::semantic::CatalogSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> CommandFuture {
+        let catalog = self.catalog.clone();
+        let view = self.view.clone();
+        let iceberg_ref = self.iceberg_ref.clone();
+        execute_product_command_edge(
+            self.executor.clone(),
+            request_context,
+            command_context,
+            move |context, command_context| match command {
+                novarocks_sql::semantic::CatalogSqlCommand::DropDatabase { name, .. }
+                    if context.session().current_catalog().is_none() && name.parts.len() == 1 =>
+                {
+                    view.drop_database(DEFAULT_CATALOG, &name.parts[0])?;
+                    Ok(StatementResult::Ok)
+                }
+                novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command) => catalog
+                    .execute_table_command(
+                        &command,
+                        context.session().current_catalog(),
+                        context.session().current_database(),
+                        command_context.connector_context(),
+                    ),
+                novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command)
+                    if matches!(
+                        &command.action,
+                        novarocks_sql::semantic::command::IcebergTableSqlAction::Reference(_)
+                    ) =>
+                {
+                    iceberg_ref.execute_command(
+                        &command,
+                        context.session().current_database(),
+                        command_context.connector_context(),
+                    )
+                }
+                novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command) => catalog
+                    .execute_iceberg_command(
+                        &command,
+                        context.session().current_catalog(),
+                        context.session().current_database(),
+                        command_context.connector_context(),
+                    ),
+                command => catalog.execute_command(
+                    &command,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    command_context.connector_context(),
+                ),
+            },
+        )
+    }
+}
+
+#[derive(Clone)]
+struct FrontendStatisticsCommandConsumer {
+    statistics: StatisticsCommandExecutor,
+    executor: QueryBlockingExecutor,
+}
+
+impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
+    fn execute(
+        &self,
+        command: novarocks_sql::semantic::StatisticsSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> CommandFuture {
+        let statistics = self.statistics.clone();
+        execute_product_command_edge(
+            self.executor.clone(),
+            request_context,
+            command_context,
+            move |context, _command_context| {
+                statistics.execute_command(
+                    &command,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    Some(context.execution()),
+                )
+            },
+        )
+    }
+}
+
+#[derive(Clone)]
+struct FrontendMaintenanceCommandConsumer {
     maintenance: MaintenanceCommandExecutor,
     maintenance_read: MaintenanceReadCommandExecutor,
+    executor: QueryBlockingExecutor,
+}
+
+impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
+    fn execute(
+        &self,
+        command: novarocks_sql::semantic::MaintenanceSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> CommandFuture {
+        let maintenance = self.maintenance.clone();
+        let maintenance_read = self.maintenance_read.clone();
+        execute_product_command_edge(
+            self.executor.clone(),
+            request_context,
+            command_context,
+            move |context, command_context| match command {
+                novarocks_sql::semantic::MaintenanceSqlCommand::ShowOptimize(command) => {
+                    maintenance_read.execute_command(
+                        &command,
+                        context.session().current_catalog(),
+                        context.session().current_database(),
+                    )
+                }
+                command => maintenance.execute_command(
+                    &command,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    context.execution(),
+                    command_context.connector_context(),
+                ),
+            },
+        )
+    }
+}
+
+#[derive(Clone)]
+struct TypedCommandRoute {
+    backend: BackendCommandExecutor,
+    view: ViewCommandExecutor,
+    mv: Arc<dyn MaterializedViewCommandConsumer>,
+    mv_call: MvCommandExecutor,
 }
 
 impl TypedCommandRoute {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The command router constructor keeps each typed command owner explicit."
-    )]
     fn new(
-        catalog: CatalogCommandExecutor,
-        statistics: StatisticsCommandExecutor,
         backend: BackendCommandExecutor,
         view: ViewCommandExecutor,
-        iceberg_ref: IcebergRefCommandExecutor,
         mv: Arc<dyn MaterializedViewCommandConsumer>,
         mv_call: MvCommandExecutor,
-        maintenance: MaintenanceCommandExecutor,
-        maintenance_read: MaintenanceReadCommandExecutor,
     ) -> Self {
         Self {
-            catalog,
-            statistics,
             backend,
             view,
-            iceberg_ref,
             mv,
             mv_call,
-            maintenance,
-            maintenance_read,
         }
     }
 }
 
 impl CoreCommandRoute for TypedCommandRoute {
-    fn execute_product(
-        &self,
-        command: &ProductSqlCommand,
-        context: &RequestContext,
-        command_context: &CommandContext,
-    ) -> Result<StatementResult, String> {
-        command_context
-            .scope()
-            .check()
-            .map_err(|error| format!("semantic command scope is no longer active: {error}"))?;
-        match command {
-            ProductSqlCommand::Statistics(command) => self.statistics.execute_command(
-                command,
-                context.session().current_catalog(),
-                context.session().current_database(),
-                Some(context.execution()),
-            ),
-            ProductSqlCommand::Catalog(
-                novarocks_sql::semantic::CatalogSqlCommand::DropDatabase { name, .. },
-            ) if context.session().current_catalog().is_none() && name.parts.len() == 1 => {
-                self.view.drop_database(DEFAULT_CATALOG, &name.parts[0])?;
-                Ok(StatementResult::Ok)
-            }
-            ProductSqlCommand::Catalog(
-                novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command),
-            ) => self.catalog.execute_table_command(
-                command,
-                context.session().current_catalog(),
-                context.session().current_database(),
-                command_context.connector_context(),
-            ),
-            ProductSqlCommand::Catalog(
-                novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command),
-            ) if matches!(
-                &command.action,
-                novarocks_sql::semantic::command::IcebergTableSqlAction::Reference(_)
-            ) =>
-            {
-                self.iceberg_ref.execute_command(
-                    command,
-                    context.session().current_database(),
-                    command_context.connector_context(),
-                )
-            }
-            ProductSqlCommand::Catalog(
-                novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command),
-            ) => self.catalog.execute_iceberg_command(
-                command,
-                context.session().current_catalog(),
-                context.session().current_database(),
-                command_context.connector_context(),
-            ),
-            ProductSqlCommand::Catalog(command) => self.catalog.execute_command(
-                command,
-                context.session().current_catalog(),
-                context.session().current_database(),
-                command_context.connector_context(),
-            ),
-            ProductSqlCommand::Maintenance(
-                novarocks_sql::semantic::MaintenanceSqlCommand::ShowOptimize(command),
-            ) => self.maintenance_read.execute_command(
-                command,
-                context.session().current_catalog(),
-                context.session().current_database(),
-            ),
-            ProductSqlCommand::Maintenance(command) => self.maintenance.execute_command(
-                command,
-                context.session().current_catalog(),
-                context.session().current_database(),
-                context.execution(),
-                command_context.connector_context(),
-            ),
-        }
-    }
-
     fn execute_show_backends(
         &self,
         context: &RequestContext,
@@ -392,15 +491,16 @@ fn execute_typed_dml_statement(
 /// Compilation and protocol delivery must not be captured here. Keeping this
 /// edge to one adapter-owned command call makes its queueing, cancellation, and
 /// statement-owner handoff explicit.
-async fn execute_synchronous_statement<F>(
+async fn execute_synchronous_stage<T, F>(
     executor: QueryBlockingExecutor,
     cancellation: QueryCancellationView,
     diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
     call: F,
-) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
+) -> Result<(Result<T, RoutedExecutionError>, WorkOwner), String>
 where
-    F: FnOnce() -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RoutedExecutionError> + Send + 'static,
 {
     executor
         .execute(move || {
@@ -419,6 +519,40 @@ where
         .await
 }
 
+async fn execute_synchronous_statement<F>(
+    executor: QueryBlockingExecutor,
+    cancellation: QueryCancellationView,
+    diagnostic_statement: StatementToken,
+    execution_owner: WorkOwner,
+    call: F,
+) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
+where
+    F: FnOnce() -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
+{
+    execute_synchronous_stage(
+        executor,
+        cancellation,
+        diagnostic_statement,
+        execution_owner,
+        call,
+    )
+    .await
+}
+
+async fn execute_product_statement(
+    router: ProductCommandRouter,
+    command: ProductSqlCommand,
+    request_context: RequestContext,
+    command_context: CommandContext,
+    execution_owner: WorkOwner,
+) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String> {
+    let result = router
+        .execute(command, request_context, command_context)
+        .await
+        .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
+    Ok((result, execution_owner))
+}
+
 fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
     build_string_query_result("status", vec![format!("Added {file_count} file(s)")])
 }
@@ -429,6 +563,7 @@ pub struct FrontendQueryService {
     session_catalog_resolver: SessionCatalogService,
     query_compiler: FrontendQueryCompiler,
     command_executor: Arc<dyn CoreCommandRoute>,
+    product_command_router: ProductCommandRouter,
     query_control: QueryControlService,
     client_connection_control: Arc<dyn ClientConnectionControlPort>,
     query_execution: QueryExecutionService,
@@ -490,20 +625,33 @@ impl FrontendQueryService {
         lake_publication_runtime_policy: LakePublicationRuntimePolicy,
         serving_admission: FrontendServingAdmission,
     ) -> Self {
+        let product_command_router = ProductCommandRouter::new(
+            Arc::new(FrontendCatalogCommandConsumer {
+                catalog: catalog_command_executor,
+                view: view_command_executor.clone(),
+                iceberg_ref: iceberg_ref_command_executor,
+                executor: query_blocking_executor.clone(),
+            }),
+            Arc::new(FrontendStatisticsCommandConsumer {
+                statistics: statistics_command_executor,
+                executor: query_blocking_executor.clone(),
+            }),
+            Arc::new(FrontendMaintenanceCommandConsumer {
+                maintenance: maintenance_command_executor,
+                maintenance_read: maintenance_read_command_executor,
+                executor: query_blocking_executor.clone(),
+            }),
+        );
         Self {
             session_catalog_resolver,
             query_compiler,
             command_executor: Arc::new(TypedCommandRoute::new(
-                catalog_command_executor,
-                statistics_command_executor,
                 backend_command_executor,
                 view_command_executor,
-                iceberg_ref_command_executor,
                 mv_command_consumer,
                 mv_command_executor,
-                maintenance_command_executor,
-                maintenance_read_command_executor,
             )),
+            product_command_router,
             query_control,
             client_connection_control,
             query_execution,
@@ -1233,6 +1381,7 @@ impl FrontendQuerySession {
         ));
         let compiler = self.service.query_compiler.clone();
         let command_executor = Arc::clone(&self.service.command_executor);
+        let product_command_router = self.service.product_command_router.clone();
         let query_execution = self.service.query_execution.clone();
         let dml = Arc::clone(&self.service.dml);
         let insert_engine = Arc::clone(&self.service.insert_engine);
@@ -1257,8 +1406,12 @@ impl FrontendQuerySession {
                 return Ok(self.governed_typed_error(internal_error(error), statement));
             }
         };
-        let command_context = CommandContext::new(statement.scope().clone(), connector_context);
         let diagnostic_statement = statement.token();
+        let command_context = CommandContext::new(
+            statement.scope().clone(),
+            connector_context,
+            diagnostic_statement,
+        );
         let execution_owner = statement
             .take_execution_owner()
             .expect("governed typed statement transfers its execution owner exactly once");
@@ -1324,30 +1477,35 @@ impl FrontendQuerySession {
                     )
                 },
             )),
-            ParsedStatement::Table(table_statement) => Box::pin(execute_synchronous_statement(
-                synchronous_command_executor,
-                worker_cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || {
-                    validate_table_statement_admission(&table_statement, &sql)
-                        .map_err(RoutedExecutionError::User)
-                        .and_then(|()| {
-                            let command =
-                                lower_product_sql_command(&ParsedStatement::Table(table_statement))
-                                    .map_err(RoutedExecutionError::Engine)?
-                                    .ok_or_else(|| {
-                                        RoutedExecutionError::Engine(
-                                    "table parser admission did not produce a product command"
-                                        .to_string(),
-                                )
-                                    })?;
-                            command_executor
-                                .execute_product(&command, &context, &command_context)
-                                .map_err(RoutedExecutionError::Engine)
+            ParsedStatement::Table(table_statement) => Box::pin(async move {
+                let command = validate_table_statement_admission(&table_statement, &sql)
+                    .map_err(RoutedExecutionError::User)
+                    .and_then(|()| {
+                        lower_product_sql_command(&ParsedStatement::Table(table_statement))
+                            .map_err(RoutedExecutionError::Engine)
+                    })
+                    .and_then(|command| {
+                        command.ok_or_else(|| {
+                            RoutedExecutionError::Engine(
+                                "table parser admission did not produce a product command"
+                                    .to_string(),
+                            )
                         })
-                },
-            )),
+                    });
+                match command {
+                    Ok(command) => {
+                        execute_product_statement(
+                            product_command_router,
+                            command,
+                            context,
+                            command_context,
+                            execution_owner,
+                        )
+                        .await
+                    }
+                    Err(error) => Ok((Err(error), execution_owner)),
+                }
+            }),
             ParsedStatement::Catalog(novarocks_parser::ast::CatalogStatement::TruncateTable(
                 statement,
             )) => Box::pin(execute_synchronous_statement(
@@ -1370,44 +1528,62 @@ impl FrontendQuerySession {
             )),
             ParsedStatement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(
                 statement,
-            )) => Box::pin(execute_synchronous_statement(
-                synchronous_command_executor,
-                worker_cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || match crate::query_execution::dml::add_files::command_from_typed_statement(
+            )) => Box::pin(async move {
+                match crate::query_execution::dml::add_files::command_from_typed_statement(
                     &statement,
                 ) {
-                    Ok(command) => dml
-                        .execute_add_files(
-                            add_files_engine.as_ref(),
-                            command,
-                            &context,
-                            Some(&query_options),
+                    Ok(command) => {
+                        execute_synchronous_statement(
+                            synchronous_command_executor,
+                            worker_cancellation,
+                            diagnostic_statement,
+                            execution_owner,
+                            move || {
+                                dml.execute_add_files(
+                                    add_files_engine.as_ref(),
+                                    command,
+                                    &context,
+                                    Some(&query_options),
+                                )
+                                .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                                .and_then(|count| {
+                                    add_files_status(count)
+                                        .map(StatementResult::Query)
+                                        .map_err(RoutedExecutionError::Engine)
+                                })
+                            },
                         )
-                        .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                        .and_then(|count| {
-                            add_files_status(count)
-                                .map(StatementResult::Query)
-                                .map_err(RoutedExecutionError::Engine)
-                        }),
-                    Err(_) => lower_product_sql_command(&ParsedStatement::Iceberg(
-                        novarocks_parser::ast::IcebergStatement::AlterTable(statement),
-                    ))
-                    .map_err(RoutedExecutionError::Engine)?
-                    .ok_or_else(|| {
-                        RoutedExecutionError::Engine(
-                            "Iceberg parser admission did not produce a product command"
-                                .to_string(),
-                        )
-                    })
-                    .and_then(|command| {
-                        command_executor
-                            .execute_product(&command, &context, &command_context)
-                            .map_err(RoutedExecutionError::Engine)
-                    }),
-                },
-            )),
+                        .await
+                    }
+                    Err(_) => {
+                        let command = lower_product_sql_command(&ParsedStatement::Iceberg(
+                            novarocks_parser::ast::IcebergStatement::AlterTable(statement),
+                        ))
+                        .map_err(RoutedExecutionError::Engine)
+                        .and_then(|command| {
+                            command.ok_or_else(|| {
+                                RoutedExecutionError::Engine(
+                                    "Iceberg parser admission did not produce a product command"
+                                        .to_string(),
+                                )
+                            })
+                        });
+                        match command {
+                            Ok(command) => {
+                                execute_product_statement(
+                                    product_command_router,
+                                    command,
+                                    context,
+                                    command_context,
+                                    execution_owner,
+                                )
+                                .await
+                            }
+                            Err(error) => Ok((Err(error), execution_owner)),
+                        }
+                    }
+                }
+            }),
             ParsedStatement::ShowBackends(_) => Box::pin(execute_synchronous_statement(
                 synchronous_command_executor,
                 worker_cancellation,
@@ -1421,36 +1597,58 @@ impl FrontendQuerySession {
             )),
             ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
                 statement,
-            )) => Box::pin(execute_synchronous_statement(
-                synchronous_command_executor,
-                worker_cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || {
-                    if let Some(result) = command_executor
-                        .execute_maintenance_call(&statement, &context, &command_context)
-                        .map_err(RoutedExecutionError::Engine)?
-                    {
-                        Ok(result)
-                    } else {
-                        lower_product_sql_command(&ParsedStatement::Maintenance(
+            )) => Box::pin(async move {
+                let special_statement = statement.clone();
+                let special_context = context.clone();
+                let special_command_context = command_context.clone();
+                let (special_result, execution_owner) = execute_synchronous_stage(
+                    synchronous_command_executor,
+                    worker_cancellation,
+                    diagnostic_statement,
+                    execution_owner,
+                    move || {
+                        command_executor
+                            .execute_maintenance_call(
+                                &special_statement,
+                                &special_context,
+                                &special_command_context,
+                            )
+                            .map_err(RoutedExecutionError::Engine)
+                    },
+                )
+                .await?;
+                match special_result {
+                    Err(error) => Ok((Err(error), execution_owner)),
+                    Ok(Some(result)) => Ok((Ok(result), execution_owner)),
+                    Ok(None) => {
+                        let command = lower_product_sql_command(&ParsedStatement::Maintenance(
                             novarocks_parser::ast::MaintenanceStatement::Call(statement),
                         ))
-                        .map_err(RoutedExecutionError::Engine)?
-                        .ok_or_else(|| {
-                            RoutedExecutionError::Engine(
-                                "typed statement has no declared product or specialized owner"
-                                    .to_string(),
-                            )
-                        })
+                        .map_err(RoutedExecutionError::Engine)
                         .and_then(|command| {
-                            command_executor
-                                .execute_product(&command, &context, &command_context)
-                                .map_err(RoutedExecutionError::Engine)
-                        })
+                            command.ok_or_else(|| {
+                                RoutedExecutionError::Engine(
+                                    "typed statement has no declared product or specialized owner"
+                                        .to_string(),
+                                )
+                            })
+                        });
+                        match command {
+                            Ok(command) => {
+                                execute_product_statement(
+                                    product_command_router,
+                                    command,
+                                    context,
+                                    command_context,
+                                    execution_owner,
+                                )
+                                .await
+                            }
+                            Err(error) => Ok((Err(error), execution_owner)),
+                        }
                     }
-                },
-            )),
+                }
+            }),
             ParsedStatement::MaterializedView(statement) => {
                 Box::pin(execute_synchronous_statement(
                     synchronous_command_executor,
@@ -1475,26 +1673,30 @@ impl FrontendQuerySession {
                         .map_err(RoutedExecutionError::Engine)
                 },
             )),
-            other_statement => Box::pin(execute_synchronous_statement(
-                synchronous_command_executor,
-                worker_cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || {
-                    lower_product_sql_command(&other_statement)
-                        .map_err(RoutedExecutionError::Engine)?
-                        .ok_or_else(|| {
+            other_statement => Box::pin(async move {
+                let command = lower_product_sql_command(&other_statement)
+                    .map_err(RoutedExecutionError::Engine)
+                    .and_then(|command| {
+                        command.ok_or_else(|| {
                             RoutedExecutionError::Engine(
                                 "typed statement has no declared product owner".to_string(),
                             )
                         })
-                        .and_then(|command| {
-                            command_executor
-                                .execute_product(&command, &context, &command_context)
-                                .map_err(RoutedExecutionError::Engine)
-                        })
-                },
-            )),
+                    });
+                match command {
+                    Ok(command) => {
+                        execute_product_statement(
+                            product_command_router,
+                            command,
+                            context,
+                            command_context,
+                            execution_owner,
+                        )
+                        .await
+                    }
+                    Err(error) => Ok((Err(error), execution_owner)),
+                }
+            }),
         };
         let (result, execution_owner) = if let Some(timeout_duration) = timeout_duration {
             match tokio::time::timeout(timeout_duration, &mut worker).await {

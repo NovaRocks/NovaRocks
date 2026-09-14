@@ -24,9 +24,10 @@ use novarocks_workload_control::WorkScope;
 
 use crate::admitted_query_context::RequestContext;
 use crate::protocol_delivery::QuerySessionOutput;
+use crate::session_control::StatementToken;
 
 pub type CommandFuture =
-    Pin<Box<dyn Future<Output = Result<CommandOutput, CommandError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<QuerySessionOutput, CommandError>> + Send + 'static>>;
 
 /// Governed command context transferred from the SQL application to a product.
 ///
@@ -36,16 +37,23 @@ pub type CommandFuture =
 /// The connector context is frozen at the same admission boundary, so a
 /// consumer cannot rebuild provider requests with a default deadline or a
 /// detached cancellation source.
+#[derive(Clone)]
 pub struct CommandContext {
     scope: WorkScope,
     connector_context: ConnectorRequestContext,
+    statement_token: StatementToken,
 }
 
 impl CommandContext {
-    pub fn new(scope: WorkScope, connector_context: ConnectorRequestContext) -> Self {
+    pub fn new(
+        scope: WorkScope,
+        connector_context: ConnectorRequestContext,
+        statement_token: StatementToken,
+    ) -> Self {
         Self {
             scope,
             connector_context,
+            statement_token,
         }
     }
 
@@ -55,6 +63,12 @@ impl CommandContext {
 
     pub fn connector_context(&self) -> &ConnectorRequestContext {
         &self.connector_context
+    }
+
+    /// Immutable identity used only to bind role-local diagnostic observation
+    /// to the admitted statement. It is not a completion or release handle.
+    pub const fn statement_token(&self) -> StatementToken {
+        self.statement_token
     }
 }
 
@@ -146,21 +160,36 @@ impl Error for CommandError {}
 pub type CatalogCommand = CatalogSqlCommand;
 
 pub trait CatalogCommandConsumer: Send + Sync + 'static {
-    fn execute(&self, command: CatalogCommand, context: CommandContext) -> CommandFuture;
+    fn execute(
+        &self,
+        command: CatalogCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> CommandFuture;
 }
 
 /// Complete, source-spanless statistics command admitted by Query Application.
 pub type StatisticsCommand = StatisticsSqlCommand;
 
 pub trait StatisticsCommandConsumer: Send + Sync + 'static {
-    fn execute(&self, command: StatisticsCommand, context: CommandContext) -> CommandFuture;
+    fn execute(
+        &self,
+        command: StatisticsCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> CommandFuture;
 }
 
 /// Complete, source-spanless maintenance command admitted by Query Application.
 pub type MaintenanceCommand = MaintenanceSqlCommand;
 
 pub trait MaintenanceCommandConsumer: Send + Sync + 'static {
-    fn execute(&self, command: MaintenanceCommand, context: CommandContext) -> CommandFuture;
+    fn execute(
+        &self,
+        command: MaintenanceCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> CommandFuture;
 }
 
 pub struct MaterializedViewCommand {
@@ -204,6 +233,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::session_control::{SessionToken, StatementToken};
 
     struct NeverCancelled;
 
@@ -244,11 +274,14 @@ mod tests {
             4_096,
         )
         .unwrap();
-        let context = CommandContext::new(expected_scope.clone(), connector_context);
+        let statement_token = StatementToken::new(SessionToken::new(7, 11), 13);
+        let context =
+            CommandContext::new(expected_scope.clone(), connector_context, statement_token);
 
         assert_eq!(context.scope().id(), expected_scope.id());
         assert!(context.scope().check().is_ok());
         assert!(!context.connector_context().cancellation().is_cancelled());
+        assert_eq!(context.statement_token(), statement_token);
     }
 
     #[test]
