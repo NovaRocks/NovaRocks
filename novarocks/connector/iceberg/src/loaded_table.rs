@@ -881,6 +881,19 @@ impl IcebergAttemptTableAccess {
         &self.metadata
     }
 
+    /// Non-secret identity of the frozen metadata view used to scope one
+    /// attempt-local physical-table cache entry.
+    ///
+    /// The location is already an immutable fact of the frozen table access;
+    /// it does not carry an access capability or a credential. Two references
+    /// to one table may share request-local FileIO only when they name this
+    /// same frozen metadata view and request-local reacquisition result.
+    pub(crate) fn request_cache_identity(&self) -> String {
+        self.metadata_location
+            .clone()
+            .unwrap_or_else(|| self.metadata.location().to_owned())
+    }
+
     pub(crate) fn validate_table_access(
         &self,
         seed: &IcebergVendedCredentialLeaseSeed,

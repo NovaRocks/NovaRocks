@@ -55,12 +55,6 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
 
-fn connector_context_for_single_scan(context: &ConnectorRequestContext) -> ConnectorRequestContext {
-    context
-        .clone()
-        .with_request_scope(ConnectorRequestScope::new())
-}
-
 /// Credential material stays under its planning collector until every split
 /// source of this exact attempt is open.
 pub(crate) enum RoundCredentialLeaseSource {
@@ -361,7 +355,11 @@ impl SerialAttemptInitialization for ProductionInitializationState {
             recipe: ProductionSourceRecipe {
                 source,
                 session: self.session.clone(),
-                connector_context: connector_context_for_single_scan(&self.connector_context),
+                // Every source belongs to this same admitted attempt. Preserve
+                // its request scope so provider-private capability caches can
+                // coalesce repeated frozen-table access without crossing an
+                // attempt boundary.
+                connector_context: self.connector_context.clone(),
                 blocking_io: self.blocking_io.clone(),
             },
         }))
@@ -995,7 +993,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancellation_closes_accepted_source_before_late_source_returns() {
+    async fn cancellation_closes_accepted_source_without_dropping_the_shared_attempt_scope() {
         let supervisor = supervisor();
         let execution_id = execution_id(1);
         let cancellation = QueryCancellationSource::new();
@@ -1003,32 +1001,27 @@ mod tests {
         let (release_source_two, source_two_released) = mpsc::channel();
         let (source_one_closed, observe_source_one_closed) = mpsc::channel();
         let (source_two_closed, observe_source_two_closed) = mpsc::channel();
-        let (source_one_scope_dropped, observe_source_one_scope_dropped) = mpsc::channel();
-        let (source_two_scope_dropped, observe_source_two_scope_dropped) = mpsc::channel();
+        let (scope_dropped, observe_scope_dropped) = mpsc::channel();
         let mut state = fixture(
             execution_id,
             vec![identity(execution_id, 7), identity(execution_id, 8)],
             supervisor.clone(),
             source_one_closed,
         );
-        let base_context = connector_context();
-        let source_one_context = connector_context_for_single_scan(&base_context);
-        source_one_context.request_scope_extension_or_insert_with(|| ScopeDropCanary {
-            dropped: Some(source_one_scope_dropped),
+        let attempt_context = connector_context();
+        attempt_context.request_scope_extension_or_insert_with(|| ScopeDropCanary {
+            dropped: Some(scope_dropped),
         });
         state.recipes[0]
             .as_mut()
             .expect("first fixture recipe")
-            .connector_context = Some(source_one_context);
+            .connector_context = Some(attempt_context.clone());
         let source_two = state.recipes[1].as_mut().expect("second fixture recipe");
-        let source_two_context = connector_context_for_single_scan(&base_context);
-        source_two_context.request_scope_extension_or_insert_with(|| ScopeDropCanary {
-            dropped: Some(source_two_scope_dropped),
-        });
         source_two.started = Some(source_two_started);
         source_two.release = Some(source_two_released);
-        source_two.connector_context = Some(source_two_context);
+        source_two.connector_context = Some(attempt_context.clone());
         source_two.cleanup.closed = Some(source_two_closed);
+        drop(attempt_context);
         let actor = tokio::spawn(drive_attempt_initialization(
             supervisor,
             lifecycle(&cancellation),
@@ -1048,27 +1041,23 @@ mod tests {
         observe_source_one_closed
             .recv_timeout(Duration::from_secs(2))
             .expect("accepted first source closes before the second returns");
-        observe_source_one_scope_dropped
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the accepted first source does not retain the second source request scope");
+        assert!(
+            observe_scope_dropped.try_recv().is_err(),
+            "the late source retains the shared attempt request scope"
+        );
         assert!(
             observe_source_two_closed.try_recv().is_err(),
             "blocked second source cannot close before its provider returns"
         );
-        assert!(
-            observe_source_two_scope_dropped.try_recv().is_err(),
-            "blocked second source retains only its own request scope until its provider returns"
-        );
-
         release_source_two
             .send(())
             .expect("release second source-open call");
         observe_source_two_closed
             .recv_timeout(Duration::from_secs(2))
             .expect("late second source closes independently");
-        observe_source_two_scope_dropped
+        observe_scope_dropped
             .recv_timeout(Duration::from_secs(2))
-            .expect("late second source releases its own request scope after provider return");
+            .expect("the shared attempt scope releases after the late provider return");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -41,6 +41,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadColumnBinding, ProviderReadFilterApplication, ProviderReadLimitApplication,
@@ -645,22 +646,92 @@ struct IcebergAttemptAccessReacquirer {
     access: IcebergAttemptTableAccess,
 }
 
+/// One frozen table view under one catalog generation.
+///
+/// This key deliberately contains no request identity: the surrounding
+/// `ConnectorRequestScope` is minted for exactly one admitted attempt. The
+/// frozen metadata location prevents two time-separated table views with the
+/// same SQL name from sharing one request-local reacquisition result.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct AttemptReacquiredTableKey {
+    catalog: novarocks_spi::connector::CatalogHandle,
+    table: SchemaTableName,
+    metadata_identity: String,
+}
+
+/// Provider-private capability cache for one admitted attempt.
+///
+/// Attempt initialization opens sources serially. Keeping the cache in the
+/// shared request scope makes repeated frozen scans reuse one current
+/// capability without allowing that capability to cross an attempt boundary.
+#[derive(Default)]
+struct AttemptReacquiredTableCache {
+    tables: Mutex<BTreeMap<AttemptReacquiredTableKey, IcebergPhysicalTable>>,
+}
+
+impl AttemptReacquiredTableCache {
+    fn get_or_reacquire(
+        &self,
+        key: AttemptReacquiredTableKey,
+        reacquire: impl FnOnce() -> Result<IcebergPhysicalTable, ConnectorError>,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        if let Some(table) = self
+            .tables
+            .lock()
+            .expect("attempt Iceberg table cache lock")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(table);
+        }
+        let table = reacquire()?;
+        self.tables
+            .lock()
+            .expect("attempt Iceberg table cache lock")
+            .insert(key, table.clone());
+        Ok(table)
+    }
+}
+
 impl ConnectorReadAttemptAccessReacquirer for IcebergAttemptAccessReacquirer {
     fn for_attempt(
         &self,
         request: &novarocks_spi::connector::ConnectorAttemptContext,
     ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
         let request = request.request();
-        let physical = self
-            .template
-            .runtime
-            .reacquire_table_access_for_request(
-                self.name.schema_name(),
-                self.name.table_name(),
-                &self.access,
-                request,
-            )
-            .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
+        // The enclosing SPI source checks this before dispatching us. Repeat
+        // it here because a cache hit must retain the same cancellation and
+        // deadline boundary as a provider reacquisition.
+        if request.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "reacquire Iceberg table access was cancelled",
+            ));
+        }
+        if Instant::now() >= request.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "reacquire Iceberg table access deadline elapsed",
+            ));
+        }
+        let cache =
+            request.request_scope_extension_or_insert_with(AttemptReacquiredTableCache::default);
+        let key = AttemptReacquiredTableKey {
+            catalog: self.template.catalog_handle.clone(),
+            table: self.name.clone(),
+            metadata_identity: self.access.request_cache_identity(),
+        };
+        let physical = cache.get_or_reacquire(key, || {
+            self.template
+                .runtime
+                .reacquire_table_access_for_request(
+                    self.name.schema_name(),
+                    self.name.table_name(),
+                    &self.access,
+                    request,
+                )
+                .map_err(|(kind, message)| ConnectorError::new(kind, message))
+        })?;
         let boundary = Arc::new(self.template.for_request_with_pinned_table(
             request.clone(),
             self.name.clone(),
@@ -2634,7 +2705,7 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod attempt_access_tests {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Weak};
     use std::time::{Duration, Instant};
 
@@ -2811,6 +2882,36 @@ mod attempt_access_tests {
         let new_resources = TrackedAttemptResources::new();
         let attempt = request_context(&new_resources);
         let marker = attempt.request_scope_extension_or_insert_with(|| AttemptScopeMarker(7));
+        let cache =
+            attempt.request_scope_extension_or_insert_with(AttemptReacquiredTableCache::default);
+        let key = AttemptReacquiredTableKey {
+            catalog: template.catalog_handle.clone(),
+            table: name.clone(),
+            metadata_identity: access.request_cache_identity(),
+        };
+        let calls = AtomicUsize::new(0);
+        let _first_cached = cache
+            .get_or_reacquire(key.clone(), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(physical.clone())
+            })
+            .expect("first frozen table is reacquired");
+        let second_cached = cache
+            .get_or_reacquire(key, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(physical.clone())
+            })
+            .expect("identical frozen table reuses request capability");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one attempt must reacquire an identical frozen table once"
+        );
+        assert_eq!(
+            second_cached.table.metadata_location(),
+            Some("s3://warehouse/data/table/metadata/v1.json"),
+            "the cached capability stays pinned to the frozen metadata view"
+        );
         let wrong_identity = metadata_context
             .reacquire_table_access_for_request("db", "other", &access, &attempt)
             .expect_err("static recipe must remain bound to its exact table identity");
@@ -2851,6 +2952,9 @@ mod attempt_access_tests {
 
         drop(pinned);
         drop(boundary);
+        drop(second_cached);
+        drop(_first_cached);
+        drop(cache);
         drop(physical);
         drop(old_attempt);
         drop(old_marker);
