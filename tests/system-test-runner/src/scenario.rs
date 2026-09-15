@@ -91,7 +91,7 @@ pub struct ScenarioContext {
     scenario_root: PathBuf,
     deadline: Instant,
     actions: Vec<String>,
-    counter_observations: Vec<ScenarioCounterObservation>,
+    phase_observations: Vec<ScenarioPhaseObservation>,
     binary: PathBuf,
     compatible_binary: Option<PathBuf>,
     other_island_binary: Option<PathBuf>,
@@ -128,9 +128,10 @@ struct ScenarioEvidence<'a> {
     cargo_lock_sha256: String,
     platform: ScenarioPlatformIdentity,
     actions: &'a [String],
-    /// Fixed-name, numeric phase observations. The API accepts only static
-    /// labels, which keeps scenario evidence secret-free by construction.
-    counter_observations: &'a [ScenarioCounterObservation],
+    /// Fixed-name phase observations. The API accepts only static labels and
+    /// numeric identities, which keeps scenario evidence secret-free by
+    /// construction.
+    phase_observations: &'a [ScenarioPhaseObservation],
     runtime_dir: String,
     primary_binary: String,
     base_config_path: String,
@@ -160,8 +161,14 @@ pub enum ScenarioEvidenceOutcome {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ScenarioCounterObservation {
+pub struct ScenarioPhaseObservation {
     phase: &'static str,
+    phase_sequence: u64,
+    logical_read_ordinal: u64,
+    attempt_ordinal: u64,
+    capability_path: &'static str,
+    provider_call_sequence: u64,
+    outcome: &'static str,
     counters: BTreeMap<&'static str, u64>,
 }
 
@@ -186,7 +193,7 @@ impl ScenarioContext {
             scenario_root,
             deadline: Instant::now() + timeout,
             actions: Vec::new(),
-            counter_observations: Vec::new(),
+            phase_observations: Vec::new(),
             binary,
             compatible_binary,
             other_island_binary,
@@ -267,26 +274,42 @@ impl ScenarioContext {
         &self.actions
     }
 
-    /// Adds a bounded, fixed-label counter snapshot to durable scenario
+    /// Adds a bounded, fixed-label phase observation to durable scenario
     /// evidence. Dynamic text belongs in immediate diagnostics, never here.
-    pub fn record_counter_observation(
+    pub fn record_phase_observation(
         &mut self,
         phase: &'static str,
+        phase_sequence: u64,
+        logical_read_ordinal: u64,
+        attempt_ordinal: u64,
+        capability_path: &'static str,
+        provider_call_sequence: u64,
+        outcome: &'static str,
         counters: BTreeMap<&'static str, u64>,
     ) -> Result<()> {
-        if phase.is_empty() || phase.len() > 96 {
-            bail!("scenario counter observation phase must be 1..=96 bytes");
+        for label in [phase, capability_path, outcome] {
+            if label.is_empty() || label.len() > 96 {
+                bail!("scenario phase observation labels must be 1..=96 bytes");
+            }
         }
         if counters.is_empty()
             || counters.len() > 16
             || counters.keys().any(|key| key.is_empty() || key.len() > 96)
         {
             bail!(
-                "scenario counter observation must contain 1..=16 fixed labels of at most 96 bytes"
+                "scenario phase observation must contain 1..=16 fixed counter labels of at most 96 bytes"
             );
         }
-        self.counter_observations
-            .push(ScenarioCounterObservation { phase, counters });
+        self.phase_observations.push(ScenarioPhaseObservation {
+            phase,
+            phase_sequence,
+            logical_read_ordinal,
+            attempt_ordinal,
+            capability_path,
+            provider_call_sequence,
+            outcome,
+            counters,
+        });
         Ok(())
     }
 
@@ -379,7 +402,7 @@ impl ScenarioContext {
             cargo_lock_sha256: sha256_file(&repository.join("Cargo.lock"))?,
             platform: scenario_platform_identity()?,
             actions: &self.actions,
-            counter_observations: &self.counter_observations,
+            phase_observations: &self.phase_observations,
             runtime_dir: self.runtime_dir().display().to_string(),
             primary_binary: self.primary_binary().display().to_string(),
             base_config_path: self.base_config_path().display().to_string(),

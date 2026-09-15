@@ -1470,8 +1470,14 @@ impl Scenario for VendedRestRefreshPem {
             0,
             "planning metadata-load phase",
         )?;
-        context.record_counter_observation(
+        context.record_phase_observation(
             "planning_metadata_load",
+            1,
+            1,
+            1,
+            "frontend-metadata",
+            0,
+            "response-held",
             BTreeMap::from([
                 ("http_table_loads", 1),
                 ("http_refreshes", 0),
@@ -1492,8 +1498,14 @@ impl Scenario for VendedRestRefreshPem {
             0,
             "attempt credential-acquisition phase",
         )?;
-        context.record_counter_observation(
+        context.record_phase_observation(
             "attempt_credential_acquisition",
+            2,
+            1,
+            1,
+            "attempt-vended-access",
+            0,
+            "response-held",
             BTreeMap::from([
                 ("attempt_credential_acquisition", 1),
                 ("http_table_loads", 2),
@@ -1525,8 +1537,14 @@ impl Scenario for VendedRestRefreshPem {
             1,
             "credential rotation refresh phase",
         )?;
-        context.record_counter_observation(
+        context.record_phase_observation(
             "rotation_refresh",
+            3,
+            1,
+            1,
+            "provider-vended-refresh",
+            1,
+            "response-held",
             BTreeMap::from([
                 ("attempt_credential_acquisition", 1),
                 ("http_refreshes", 1),
