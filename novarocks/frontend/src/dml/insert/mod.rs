@@ -23,7 +23,7 @@ mod shaping;
 
 use crate::query_execution::dml::insert::{
     IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, PrepareIcebergInsert,
-    ResolveInsertTarget, ResolvedInsertTarget,
+    PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::RequestContext;
@@ -46,8 +46,16 @@ enum InsertTargetRef {
     Tag(String),
 }
 
+/// A prepared INSERT whose native execution and provider publication have not begun.
+///
+/// The retained provider handle is exact to the admitted statement. Dropping
+/// it before the dispatch edge cannot create an external write.
+pub(crate) struct PreparedInsertAttempt {
+    prepared: PreparedIcebergInsert,
+}
+
 impl DmlService {
-    /// Execute one SQLP-5 typed INSERT through the frontend application owner.
+    /// Prepare one SQLP-5 typed INSERT without beginning native execution.
     ///
     /// Statement-family routing is complete before this boundary. `source`
     /// exists solely for diagnostic locations derived from AST spans; it must
@@ -57,14 +65,14 @@ impl DmlService {
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
     )]
-    pub fn try_execute_insert(
+    pub(crate) fn prepare_insert(
         &self,
         engine: &dyn InsertEngine,
         statement: &novarocks_parser::ast::Insert,
         source: &str,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<(), DmlError> {
+    ) -> Result<PreparedInsertAttempt, DmlError> {
         let mut command = convert_insert_command(statement)
             .map_err(|error| insert_admit_error(source, statement.span, error))?;
         let (target, target_ref) = split_target_ref(&command.target)
@@ -83,7 +91,7 @@ impl DmlService {
             .map_err(DmlError::executor)?;
         validate_target(&target_ref)
             .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
-        self.execute_iceberg_source(
+        self.prepare_iceberg_source(
             engine,
             resolved,
             &command.columns,
@@ -93,9 +101,7 @@ impl DmlService {
             &target_ref,
             context,
             query_options,
-        )?;
-
-        Ok(())
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -103,7 +109,7 @@ impl DmlService {
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
     )]
-    fn execute_iceberg_source(
+    fn prepare_iceberg_source(
         &self,
         engine: &dyn InsertEngine,
         target: ResolvedInsertTarget,
@@ -114,7 +120,7 @@ impl DmlService {
         target_ref: &InsertTargetRef,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<(), DmlError> {
+    ) -> Result<PreparedInsertAttempt, DmlError> {
         let publication_id = LakePublicationId::new_v7();
         let (source, prepared_insert_columns) = match source {
             InsertCommandSource::Values(rows) => (
@@ -153,8 +159,22 @@ impl DmlService {
                 execution: context.execution().clone(),
             })
             .map_err(DmlError::executor)?;
-        let spec = write_transaction_spec(&prepared);
-        let executor = IcebergInsertWriteExecutor::new(engine, &prepared);
+        Ok(PreparedInsertAttempt { prepared })
+    }
+
+    /// Crosses the statement's one-shot native execution and publication edge.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
+    pub(crate) fn execute_prepared_insert(
+        &self,
+        engine: &dyn InsertEngine,
+        prepared: PreparedInsertAttempt,
+    ) -> Result<(), DmlError> {
+        let _ = self;
+        let spec = write_transaction_spec(&prepared.prepared);
+        let executor = IcebergInsertWriteExecutor::new(engine, &prepared.prepared);
         StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
             .run(spec)
             .map(|_| ())

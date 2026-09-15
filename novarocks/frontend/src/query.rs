@@ -561,13 +561,16 @@ fn execute_typed_dml_statement(
     use novarocks_parser::ast::DmlStatement;
 
     match statement {
-        DmlStatement::Insert(statement) => dml_statement_result(dml.try_execute_insert(
-            insert_engine,
-            statement,
-            source,
-            context,
-            Some(query_options),
-        )),
+        DmlStatement::Insert(statement) => dml_statement_result(
+            dml.prepare_insert(
+                insert_engine,
+                statement,
+                source,
+                context,
+                Some(query_options),
+            )
+            .and_then(|prepared| dml.execute_prepared_insert(insert_engine, prepared)),
+        ),
         DmlStatement::Delete(statement) => dml_statement_result(
             dml.prepare_delete(
                 delete_engine,
@@ -1683,6 +1686,34 @@ impl FrontendQuerySession {
                     },
                 ))
             }
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Insert(statement)) => {
+                let prepare_dml = Arc::clone(&dml);
+                let execute_dml = dml;
+                let prepare_engine = Arc::clone(&insert_engine);
+                let execute_engine = insert_engine;
+                let prepare_context = context.clone();
+                let prepare_options = query_options.clone();
+                Box::pin(execute_prepared_dml_statement(
+                    synchronous_command_executor,
+                    worker_cancellation,
+                    diagnostic_statement,
+                    execution_owner,
+                    move || {
+                        dml_result(prepare_dml.prepare_insert(
+                            prepare_engine.as_ref(),
+                            &statement,
+                            &sql,
+                            &prepare_context,
+                            Some(&prepare_options),
+                        ))
+                    },
+                    move |prepared| {
+                        dml_statement_result(
+                            execute_dml.execute_prepared_insert(execute_engine.as_ref(), prepared),
+                        )
+                    },
+                ))
+            }
             ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::AddEqualityDelete(
                 statement,
             )) => {
@@ -2599,8 +2630,8 @@ mod tests {
         PreparedDelete,
     };
     use crate::query_execution::dml::insert::{
-        IcebergPreparedInsert, IcebergWriteReport, PrepareIcebergInsert, PreparedIcebergInsert,
-        ResolveInsertTarget, ResolvedInsertTarget,
+        IcebergInsertOperation, IcebergPreparedInsert, IcebergWriteReport, PrepareIcebergInsert,
+        PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
     };
     use crate::query_execution::dml::mutation::{
         MutationEngine, MutationOperation, MutationPrepared, MutationStageOutcome,
@@ -3219,6 +3250,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingInsertEngine {
         resolve_contexts: Mutex<Vec<QueryExecutionContext>>,
+        preparations: AtomicUsize,
+        native_encoding_requests: AtomicUsize,
+    }
+
+    struct TestInsertPrepared;
+
+    impl IcebergPreparedInsert for TestInsertPrepared {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     impl InsertEngine for RecordingInsertEngine {
@@ -3251,9 +3292,36 @@ mod tests {
 
         fn prepare_iceberg_write(
             &self,
-            _request: PrepareIcebergInsert,
+            request: PrepareIcebergInsert,
         ) -> Result<PreparedIcebergInsert, String> {
-            Err("unexpected Iceberg INSERT".to_string())
+            self.preparations.fetch_add(1, Ordering::SeqCst);
+            Ok(PreparedIcebergInsert {
+                operation: IcebergInsertOperation {
+                    publication_id: request.publication_id,
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: "t".to_string(),
+                    target_ref: request.target_ref,
+                    attempt_id: "test-insert".to_string(),
+                    is_overwrite: false,
+                    base_snapshot_id: None,
+                },
+                handle: Arc::new(TestInsertPrepared),
+                sql_source: request.sql_source,
+            })
+        }
+
+        fn iceberg_write_native_encoding<'a>(
+            &self,
+            _prepared: &'a dyn IcebergPreparedInsert,
+        ) -> Result<
+            crate::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding<'a>,
+            crate::dml::error::DmlExecutionError,
+        > {
+            self.native_encoding_requests.fetch_add(1, Ordering::SeqCst);
+            Err(crate::dml::error::DmlExecutionError::from(
+                "recording INSERT stops at the native dispatch edge".to_string(),
+            ))
         }
 
         fn run_iceberg_write(
@@ -3310,7 +3378,8 @@ mod tests {
         let parsed = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
         match parsed.as_slice() {
             [Statement::Dml(DmlStatement::Insert(statement))] => dml
-                .try_execute_insert(insert_engine, statement, sql, context, Some(&query_options))
+                .prepare_insert(insert_engine, statement, sql, context, Some(&query_options))
+                .and_then(|prepared| dml.execute_prepared_insert(insert_engine, prepared))
                 .map(|()| StatementResult::Ok)
                 .map_err(|error| error.to_string()),
             [Statement::Dml(DmlStatement::Delete(statement))] => dml
@@ -3481,6 +3550,37 @@ mod tests {
             )
             .expect("preparation is inert");
         assert_eq!(engine.executions.lock().unwrap().len(), 1);
+        assert_eq!(engine.native_encoding_requests.load(Ordering::SeqCst), 0);
+
+        drop(prepared);
+        assert_eq!(engine.native_encoding_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_insert_can_drop_before_native_dispatch() {
+        let engine = RecordingInsertEngine::default();
+        let dml = DmlService::new();
+        let cancellation = QueryCancellationSource::new();
+        let context =
+            router_test_context(87, Instant::now() + Duration::from_secs(30), &cancellation);
+        let parsed = novarocks_parser::parse("INSERT INTO t VALUES (1)").expect("INSERT parses");
+        let statement = match &parsed[0] {
+            novarocks_parser::ast::Statement::Dml(novarocks_parser::ast::DmlStatement::Insert(
+                statement,
+            )) => statement,
+            _ => panic!("expected typed INSERT"),
+        };
+
+        let prepared = dml
+            .prepare_insert(
+                &engine,
+                statement,
+                "INSERT INTO t VALUES (1)",
+                &context,
+                Some(&default_query_options()),
+            )
+            .expect("preparation is inert");
+        assert_eq!(engine.preparations.load(Ordering::SeqCst), 1);
         assert_eq!(engine.native_encoding_requests.load(Ordering::SeqCst), 0);
 
         drop(prepared);
