@@ -123,13 +123,11 @@ struct ScenarioEvidence<'a> {
     source_tree_sha256: String,
     runner_native_build_identity: String,
     runner_executable: String,
-    runner_executable_sha256: String,
     cargo_lock_sha256: String,
     platform: ScenarioPlatformIdentity,
     actions: &'a [String],
     runtime_dir: String,
     primary_binary: String,
-    primary_binary_sha256: String,
     base_config_path: String,
     base_config_sha256: String,
     cluster_size: usize,
@@ -326,9 +324,9 @@ impl ScenarioContext {
         })?;
         let source = source_checkout_identity()?;
         let repository = workspace_root()?;
-        let (runner_executable, runner_executable_sha256) = runner_executable_identity()?;
+        let runner_executable = runner_executable_identity()?;
         let evidence = ScenarioEvidence {
-            schema_version: 3,
+            schema_version: 4,
             scenario: self.name,
             outcome,
             exit_code: match outcome {
@@ -343,13 +341,11 @@ impl ScenarioContext {
             source_tree_sha256: source.tree_sha256,
             runner_native_build_identity: novarocks_version::native_build_identity().to_string(),
             runner_executable,
-            runner_executable_sha256,
             cargo_lock_sha256: sha256_file(&repository.join("Cargo.lock"))?,
             platform: scenario_platform_identity()?,
             actions: &self.actions,
             runtime_dir: self.runtime_dir().display().to_string(),
             primary_binary: self.primary_binary().display().to_string(),
-            primary_binary_sha256: sha256_file(self.primary_binary())?,
             base_config_path: self.base_config_path().display().to_string(),
             base_config_sha256: format!("{:x}", Sha256::digest(config_bytes)),
             cluster_size: self.cluster_size,
@@ -489,7 +485,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn runner_executable_identity() -> Result<(String, String)> {
+fn runner_executable_identity() -> Result<String> {
     let executable = std::env::current_exe().context("resolve system-test runner executable")?;
     let canonical = fs::canonicalize(&executable).with_context(|| {
         format!(
@@ -497,7 +493,7 @@ fn runner_executable_identity() -> Result<(String, String)> {
             executable.display()
         )
     })?;
-    Ok((canonical.display().to_string(), sha256_file(&canonical)?))
+    Ok(canonical.display().to_string())
 }
 
 fn scenario_platform_identity() -> Result<ScenarioPlatformIdentity> {

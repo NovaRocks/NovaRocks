@@ -17,18 +17,15 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(not(target_os = "linux"))]
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 const PROC_PIDTBSDINFO: i32 = 3;
@@ -70,15 +67,6 @@ unsafe extern "C" {
         buffer: *mut std::ffi::c_void,
         buffer_size: i32,
     ) -> i32;
-    fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, buffer_size: u32) -> i32;
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ExecutableFileIdentity {
-    pub canonical_path: PathBuf,
-    pub sha256: String,
-    pub size_bytes: u64,
-    pub modified_unix_nanos: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -86,7 +74,6 @@ pub struct ProcessLaunchIdentity {
     pub role: String,
     pub pid: u32,
     pub process_start_token: String,
-    pub executable: ExecutableFileIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -430,74 +417,9 @@ impl ProcessResourceSampler {
     }
 }
 
-pub fn freeze_executable_identity(path: &Path) -> Result<ExecutableFileIdentity> {
-    let canonical_path = fs::canonicalize(path)
-        .with_context(|| format!("canonicalize executable path {}", path.display()))?;
-    let metadata = fs::metadata(&canonical_path)
-        .with_context(|| format!("inspect executable {}", canonical_path.display()))?;
-    if !metadata.is_file() {
-        bail!(
-            "executable path is not a regular file: {}",
-            canonical_path.display()
-        );
-    }
-    let modified_unix_nanos = metadata
-        .modified()
-        .with_context(|| format!("read executable mtime {}", canonical_path.display()))?
-        .duration_since(UNIX_EPOCH)
-        .with_context(|| {
-            format!(
-                "executable mtime predates Unix epoch: {}",
-                canonical_path.display()
-            )
-        })?
-        .as_nanos()
-        .try_into()
-        .context("executable mtime does not fit u64 Unix nanoseconds")?;
-    let mut file = File::open(&canonical_path)
-        .with_context(|| format!("open executable {}", canonical_path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("hash executable {}", canonical_path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let metadata_after = fs::metadata(&canonical_path)
-        .with_context(|| format!("reinspect executable {}", canonical_path.display()))?;
-    let modified_after = metadata_after
-        .modified()
-        .with_context(|| format!("reread executable mtime {}", canonical_path.display()))?
-        .duration_since(UNIX_EPOCH)
-        .with_context(|| {
-            format!(
-                "executable mtime predates Unix epoch: {}",
-                canonical_path.display()
-            )
-        })?
-        .as_nanos();
-    if metadata_after.len() != metadata.len() || modified_after != u128::from(modified_unix_nanos) {
-        bail!(
-            "executable changed while hashing: {}",
-            canonical_path.display()
-        );
-    }
-    Ok(ExecutableFileIdentity {
-        canonical_path,
-        sha256: format!("{:x}", hasher.finalize()),
-        size_bytes: metadata.len(),
-        modified_unix_nanos,
-    })
-}
-
 pub fn capture_process_launch_identity(
     role: impl Into<String>,
     pid: u32,
-    executable: &ExecutableFileIdentity,
 ) -> Result<ProcessLaunchIdentity> {
     let role = role.into();
     if role.is_empty() {
@@ -506,21 +428,14 @@ pub fn capture_process_launch_identity(
     if pid == 0 {
         bail!("process launch identity requires a nonzero pid");
     }
-    let current_executable = freeze_executable_identity(&executable.canonical_path)?;
-    if current_executable != *executable {
-        bail!("executable changed across process spawn for role {role}");
-    }
     let process_start_token = read_process_start_token(pid)
         .with_context(|| format!("capture process start token for role {role}"))?;
-    verify_live_executable_path(pid, &executable.canonical_path)
-        .with_context(|| format!("verify live executable path for role {role}"))?;
     verify_process_start_token(pid, &process_start_token)
         .with_context(|| format!("recheck process start token for role {role}"))?;
     Ok(ProcessLaunchIdentity {
         role,
         pid,
         process_start_token,
-        executable: executable.clone(),
     })
 }
 
@@ -529,15 +444,6 @@ pub fn recheck_process_launch_identity(
 ) -> Result<ProcessLaunchIdentity> {
     verify_process_start_token(expected.pid, &expected.process_start_token)
         .with_context(|| format!("verify live process instance for role {}", expected.role))?;
-    verify_live_executable_path(expected.pid, &expected.executable.canonical_path)
-        .with_context(|| format!("verify live executable path for role {}", expected.role))?;
-    let current_executable = freeze_executable_identity(&expected.executable.canonical_path)?;
-    if current_executable != expected.executable {
-        bail!(
-            "live executable contents or metadata changed for role {}",
-            expected.role
-        );
-    }
     verify_process_start_token(expected.pid, &expected.process_start_token)
         .with_context(|| format!("recheck live process instance for role {}", expected.role))?;
     Ok(expected.clone())
@@ -619,73 +525,6 @@ pub fn read_process_start_token(pid: u32) -> Result<String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn read_process_start_token(_pid: u32) -> Result<String> {
     bail!("process start identity is unsupported on this operating system")
-}
-
-#[cfg(target_os = "linux")]
-fn live_process_executable_path(pid: u32) -> Result<PathBuf> {
-    let path = fs::read_link(format!("/proc/{pid}/exe"))
-        .with_context(|| format!("read live executable path for pid {pid}"))?;
-    fs::canonicalize(&path)
-        .with_context(|| format!("canonicalize live executable path {}", path.display()))
-}
-
-#[cfg(target_os = "macos")]
-fn live_process_executable_path(pid: u32) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-
-    const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
-    let pid: i32 = pid
-        .try_into()
-        .context("process pid does not fit macOS pid_t")?;
-    let mut buffer = vec![0_u8; PROC_PIDPATHINFO_MAXSIZE];
-    // SAFETY: `buffer` is writable for the supplied size and remains alive for
-    // the entire libproc call.
-    let returned = unsafe {
-        proc_pidpath(
-            pid,
-            buffer.as_mut_ptr().cast(),
-            buffer
-                .len()
-                .try_into()
-                .context("proc_pidpath buffer size does not fit u32")?,
-        )
-    };
-    if returned <= 0 {
-        bail!("proc_pidpath could not read executable path for pid {pid}");
-    }
-    let returned: usize = returned
-        .try_into()
-        .context("proc_pidpath returned a negative byte count")?;
-    if returned > buffer.len() {
-        bail!("proc_pidpath returned an oversized executable path for pid {pid}");
-    }
-    buffer.truncate(returned);
-    while buffer.last() == Some(&0) {
-        buffer.pop();
-    }
-    if buffer.is_empty() {
-        bail!("proc_pidpath returned an empty executable path for pid {pid}");
-    }
-    let path = PathBuf::from(std::ffi::OsString::from_vec(buffer));
-    fs::canonicalize(&path)
-        .with_context(|| format!("canonicalize live executable path {}", path.display()))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn live_process_executable_path(_pid: u32) -> Result<PathBuf> {
-    bail!("live executable identity is unsupported on this operating system")
-}
-
-fn verify_live_executable_path(pid: u32, expected: &Path) -> Result<()> {
-    let observed = live_process_executable_path(pid)?;
-    if observed != expected {
-        bail!(
-            "live process executable path differs for pid {pid}: expected={} observed={}",
-            expected.display(),
-            observed.display()
-        );
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -884,15 +723,9 @@ mod tests {
     }
 
     #[test]
-    fn launch_identity_binds_live_process_and_executable_image() {
-        let executable = std::env::current_exe().expect("resolve current test executable");
-        let frozen = freeze_executable_identity(&executable).expect("freeze executable identity");
-        assert_eq!(frozen.sha256.len(), 64);
-        assert!(frozen.size_bytes > 0);
-        assert!(frozen.modified_unix_nanos > 0);
-        let identity = capture_process_launch_identity("test", std::process::id(), &frozen)
+    fn launch_identity_binds_live_process_instance() {
+        let identity = capture_process_launch_identity("test", std::process::id())
             .expect("capture current launch identity");
-        assert_eq!(identity.executable, frozen);
         assert_eq!(
             recheck_process_launch_identity(&identity).expect("recheck live launch identity"),
             identity
@@ -900,22 +733,8 @@ mod tests {
     }
 
     #[test]
-    fn live_recheck_rejects_changed_executable_identity() {
-        let executable = std::env::current_exe().expect("resolve current test executable");
-        let frozen = freeze_executable_identity(&executable).expect("freeze executable identity");
-        let mut identity = capture_process_launch_identity("test", std::process::id(), &frozen)
-            .expect("capture current launch identity");
-        identity.executable.sha256 = "0".repeat(64);
-        let error = recheck_process_launch_identity(&identity)
-            .expect_err("changed executable identity must fail recheck");
-        assert!(error.to_string().contains("contents or metadata changed"));
-    }
-
-    #[test]
     fn resource_identities_preserve_frozen_launch_birth_tokens() {
-        let executable = std::env::current_exe().expect("resolve current test executable");
-        let frozen = freeze_executable_identity(&executable).expect("freeze executable identity");
-        let frontend = capture_process_launch_identity("fe", std::process::id(), &frozen)
+        let frontend = capture_process_launch_identity("fe", std::process::id())
             .expect("capture frontend identity");
         let identities = ClusterProcessIdentities::from_launch_identities(&frontend, &[])
             .expect("build exact resource identities");

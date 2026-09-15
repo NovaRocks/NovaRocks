@@ -3311,15 +3311,8 @@ impl CrossProcessServerHandle {
         }
     }
 
-    /// Exact executable paths used to launch the FE and BEs, in backend launch
-    /// order. Provenance collectors hash these paths instead of assuming that
-    /// every role used the runner's primary binary selection.
-    pub fn process_binary_paths(&self) -> (&Path, &[PathBuf]) {
-        (&self.fe_binary, &self.be_binaries)
-    }
-
-    /// Frozen operating-system and executable identities for the currently
-    /// launched FE and BEs, in backend launch order.
+    /// Operating-system identities for the currently launched FE and BEs, in
+    /// backend launch order.
     pub fn process_launch_identities(
         &self,
     ) -> (
@@ -3341,8 +3334,7 @@ impl CrossProcessServerHandle {
     }
 
     /// Revalidates that every role still refers to the same live OS process
-    /// instance and the same executable path, contents, size, and mtime that
-    /// were frozen around spawn.
+    /// instance captured at launch.
     pub fn recheck_live_process_launch_identities(
         &self,
     ) -> Result<Vec<process_resources::ProcessLaunchIdentity>> {
@@ -4232,8 +4224,6 @@ impl ServerHandle for CrossProcessServerHandle {
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("missing binary for cross-process BE[{index}]"))?
             .clone();
-        let executable_identity = process_resources::freeze_executable_identity(&binary)
-            .with_context(|| format!("freeze BE[{index}] executable before restart"))?;
         let mut command =
             build_novarocks_command_with_profile(&binary, "be", &config_path, self.launch_profile);
         command.env(
@@ -4270,9 +4260,8 @@ impl ServerHandle for CrossProcessServerHandle {
         let launch_identity = process_resources::capture_process_launch_identity(
             format!("be-{index}"),
             be_process.pid(),
-            &executable_identity,
         )
-        .with_context(|| format!("freeze BE[{index}] process identity after restart"))?;
+        .with_context(|| format!("capture BE[{index}] process identity after restart"))?;
         println!(
             "restarted cross-process BE[{index}] pid={} config={}",
             be_process.pid(),
@@ -4396,8 +4385,6 @@ impl ServerHandle for CrossProcessServerHandle {
             .context("preserve cross-process FE log before restart")?;
         self.fe_log_history.push_str(&prior_log);
         let marker = "NOVAROCKS_READY mysql_port=";
-        let executable_identity = process_resources::freeze_executable_identity(&self.fe_binary)
-            .context("freeze FE executable before restart")?;
         let mut command = build_novarocks_command_with_profile(
             &self.fe_binary,
             "fe",
@@ -4428,12 +4415,9 @@ impl ServerHandle for CrossProcessServerHandle {
             )
             .map_err(|error| map_novarocks_process_error(&self.fe_binary, "fe", marker, error))
             .context("restart cross-process FE")?;
-        self.fe_launch_identity = process_resources::capture_process_launch_identity(
-            "fe",
-            self.fe_process.pid(),
-            &executable_identity,
-        )
-        .context("freeze FE process identity after restart")?;
+        self.fe_launch_identity =
+            process_resources::capture_process_launch_identity("fe", self.fe_process.pid())
+                .context("capture FE process identity after restart")?;
         println!(
             "restarted cross-process FE pid={} config={}",
             self.fe_process.pid(),
@@ -4660,8 +4644,6 @@ fn spawn_novarocks_process(
         child_environment,
         launch_profile,
     } = launch;
-    let executable_identity = process_resources::freeze_executable_identity(binary)
-        .with_context(|| format!("freeze {identity_role} executable before spawn"))?;
     let mut command =
         build_novarocks_command_with_profile(binary, role, config_path, launch_profile);
     if let Some(trigger_path) = fragment_failure_trigger {
@@ -4696,12 +4678,11 @@ fn spawn_novarocks_process(
     );
     match result {
         Ok(process) => {
-            let identity = process_resources::capture_process_launch_identity(
-                identity_role,
-                process.pid(),
-                &executable_identity,
-            )
-            .with_context(|| format!("freeze {identity_role} process identity after spawn"))?;
+            let identity =
+                process_resources::capture_process_launch_identity(identity_role, process.pid())
+                    .with_context(|| {
+                        format!("capture {identity_role} process identity after spawn")
+                    })?;
             Ok((process, identity))
         }
         Err(error) => Err(map_novarocks_process_error(binary, role, marker, error)),

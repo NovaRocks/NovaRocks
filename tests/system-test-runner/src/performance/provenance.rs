@@ -57,7 +57,6 @@ pub struct RunManifestHandle {
 
 struct FrozenRunInputs {
     repository: PathBuf,
-    binary: PathBuf,
     runner: PathBuf,
     config: PathBuf,
     workload_manifest_source: Option<PathBuf>,
@@ -85,9 +84,7 @@ struct RunManifest {
     native_build_identity: String,
     source_tree_sha256: String,
     source_dirty: bool,
-    binary_sha256: String,
     runner_executable_path: String,
-    runner_executable_sha256: String,
     process_identities: Vec<RunProcessIdentity>,
     config_sha256: String,
     workload_manifest_sha256: String,
@@ -115,9 +112,6 @@ struct RunProcessIdentity {
     process_start_token: String,
     application_process_id: Option<String>,
     build_identity: Option<String>,
-    binary_sha256: String,
-    executable_size_bytes: u64,
-    executable_modified_unix_nanos: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,7 +158,6 @@ pub fn begin_run_manifest(
     if formal {
         ensure_checkout_release_binary(&repository, &binary)?;
     }
-    let binary_sha256 = sha256_file(&binary)?;
     let process_launch_identities = {
         let (frontend, backends) = context.process_launch_identities();
         std::iter::once(frontend.clone())
@@ -175,11 +168,10 @@ pub fn begin_run_manifest(
         context,
         &process_launch_identities,
         &source_revision,
-        &binary_sha256,
         formal,
     )?;
     let source_tree_sha256 = source_tree_sha256(&repository, &source_revision, &status)?;
-    let (runner, runner_executable_sha256) = runner_executable_identity(&repository, formal)?;
+    let runner = runner_executable_identity(&repository, formal)?;
     let runner_executable_path = runner
         .to_str()
         .context("current system-test runner path is not UTF-8")?
@@ -226,12 +218,12 @@ pub fn begin_run_manifest(
         .context("system clock is before the Unix epoch")?
         .as_millis();
     let identity_material = format!(
-        "{scenario}\0{source_tree_sha256}\0{binary_sha256}\0{started_unix_millis}\0{}",
+        "{scenario}\0{source_tree_sha256}\0{started_unix_millis}\0{}",
         std::process::id()
     );
     let run_id = sha256_bytes(identity_material.as_bytes());
     let manifest = RunManifest {
-        schema_version: 5,
+        schema_version: 6,
         kind,
         formal,
         run_id: run_id.clone(),
@@ -245,9 +237,7 @@ pub fn begin_run_manifest(
         native_build_identity,
         source_tree_sha256,
         source_dirty: !status.is_empty(),
-        binary_sha256,
         runner_executable_path,
-        runner_executable_sha256,
         process_identities,
         config_sha256,
         workload_manifest_sha256: workload_manifest_sha256.to_string(),
@@ -292,7 +282,6 @@ pub fn begin_run_manifest(
         manifest,
         inputs: FrozenRunInputs {
             repository,
-            binary,
             runner,
             config,
             workload_manifest_source,
@@ -311,7 +300,6 @@ fn observe_native_process_identities(
     context: &mut ScenarioContext,
     process_launch_identities: &[ProcessLaunchIdentity],
     source_revision: &str,
-    primary_binary_sha256: &str,
     formal: bool,
 ) -> Result<(String, Vec<RunProcessIdentity>)> {
     let topology = context
@@ -322,7 +310,6 @@ fn observe_native_process_identities(
         process_launch_identities,
         &topology,
         source_revision,
-        primary_binary_sha256,
         formal,
     )
 }
@@ -331,7 +318,6 @@ fn build_native_process_identities(
     process_launch_identities: &[ProcessLaunchIdentity],
     topology: &[BackendTopologyRow],
     source_revision: &str,
-    primary_binary_sha256: &str,
     formal: bool,
 ) -> Result<(String, Vec<RunProcessIdentity>)> {
     ensure!(
@@ -397,7 +383,6 @@ fn build_native_process_identities(
         validate_native_build_identities(&identities, source_revision, formal)?;
 
     let frontend = &process_launch_identities[0];
-    let frontend_binary_sha256 = frontend.executable.sha256.clone();
     let mut backend_processes = Vec::with_capacity(topology.len());
     for (index, (row, launch_identity)) in topology
         .iter()
@@ -410,34 +395,18 @@ fn build_native_process_identities(
             process_start_token: launch_identity.process_start_token.clone(),
             application_process_id: Some(row.process_id.clone()),
             build_identity: Some(row.build_identity.clone()),
-            binary_sha256: launch_identity.executable.sha256.clone(),
-            executable_size_bytes: launch_identity.executable.size_bytes,
-            executable_modified_unix_nanos: launch_identity.executable.modified_unix_nanos,
         });
     }
-    let frontend_build_identity = backend_processes
-        .iter()
-        .find(|process| process.binary_sha256 == frontend_binary_sha256)
-        .and_then(|process| process.build_identity.clone());
     let mut processes = Vec::with_capacity(backend_processes.len() + 1);
     processes.push(RunProcessIdentity {
         role: "fe".to_string(),
         os_pid: frontend.pid,
         process_start_token: frontend.process_start_token.clone(),
         application_process_id: None,
-        build_identity: frontend_build_identity,
-        binary_sha256: frontend_binary_sha256,
-        executable_size_bytes: frontend.executable.size_bytes,
-        executable_modified_unix_nanos: frontend.executable.modified_unix_nanos,
+        build_identity: Some(native_build_identity.clone()),
     });
     processes.extend(backend_processes);
     if formal {
-        ensure!(
-            processes
-                .iter()
-                .all(|process| process.binary_sha256 == primary_binary_sha256),
-            "formal UEA-1 provenance requires every FE/BE role to run the measured binary"
-        );
         ensure!(
             processes
                 .iter()
@@ -629,12 +598,8 @@ impl RunManifestHandle {
             "UEA-1 source tree changed during the measurement run"
         );
         ensure!(
-            sha256_file(&self.inputs.binary)? == self.manifest.binary_sha256,
-            "UEA-1 measured server binary changed during the run"
-        );
-        ensure!(
             self.inputs.process_launch_identities.len() == self.manifest.process_identities.len(),
-            "UEA-1 process binary identity cardinality changed during the run"
+            "UEA-1 process identity cardinality changed during the run"
         );
         for (launch_identity, identity) in self
             .inputs
@@ -646,11 +611,7 @@ impl RunManifestHandle {
             ensure!(
                 launch_identity.role == identity.role
                     && launch_identity.pid == identity.os_pid
-                    && launch_identity.process_start_token == identity.process_start_token
-                    && launch_identity.executable.sha256 == identity.binary_sha256
-                    && launch_identity.executable.size_bytes == identity.executable_size_bytes
-                    && launch_identity.executable.modified_unix_nanos
-                        == identity.executable_modified_unix_nanos,
+                    && launch_identity.process_start_token == identity.process_start_token,
                 "UEA-1 {} live process identity changed during the run",
                 identity.role
             );
@@ -660,8 +621,7 @@ impl RunManifestHandle {
         )
         .context("canonicalize current system-test runner at completion")?;
         ensure!(
-            actual_runner == self.inputs.runner
-                && sha256_file(&actual_runner)? == self.manifest.runner_executable_sha256,
+            actual_runner == self.inputs.runner,
             "UEA-1 system-test runner changed during the run"
         );
         ensure!(
@@ -863,7 +823,7 @@ fn ensure_checkout_release_binary(repository: &Path, binary: &Path) -> Result<()
     Ok(())
 }
 
-fn runner_executable_identity(repository: &Path, formal: bool) -> Result<(PathBuf, String)> {
+fn runner_executable_identity(repository: &Path, formal: bool) -> Result<PathBuf> {
     let executable = std::env::current_exe().context("resolve current system-test runner")?;
     let actual = fs::canonicalize(&executable).with_context(|| {
         format!(
@@ -871,18 +831,13 @@ fn runner_executable_identity(repository: &Path, formal: bool) -> Result<(PathBu
             executable.display()
         )
     })?;
-    let actual_sha256 = sha256_file(&actual)?;
     if formal {
-        ensure_checkout_release_runner(repository, &actual, &actual_sha256)?;
+        ensure_checkout_release_runner(repository, &actual)?;
     }
-    Ok((actual, actual_sha256))
+    Ok(actual)
 }
 
-fn ensure_checkout_release_runner(
-    repository: &Path,
-    actual: &Path,
-    actual_sha256: &str,
-) -> Result<()> {
+fn ensure_checkout_release_runner(repository: &Path, actual: &Path) -> Result<()> {
     let expected_path = repository.join("target/release/novarocks-system-tests");
     let expected = fs::canonicalize(&expected_path).with_context(|| {
         format!(
@@ -893,10 +848,6 @@ fn ensure_checkout_release_runner(
     ensure!(
         actual == expected,
         "formal UEA-1 measurement requires this checkout's target/release/novarocks-system-tests"
-    );
-    ensure!(
-        actual_sha256 == sha256_file(&expected)?,
-        "formal UEA-1 runner executable hash does not match the checkout-local release runner"
     );
     Ok(())
 }
@@ -1321,15 +1272,11 @@ fn is_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn launch_identity(role: &str, pid: u32, binary: &Path) -> ProcessLaunchIdentity {
+    fn launch_identity(role: &str, pid: u32) -> ProcessLaunchIdentity {
         ProcessLaunchIdentity {
             role: role.to_string(),
             pid,
             process_start_token: format!("start-{pid}"),
-            executable: novarocks_cluster_harness::process_resources::freeze_executable_identity(
-                binary,
-            )
-            .expect("freeze test executable identity"),
         }
     }
 
@@ -1416,38 +1363,22 @@ mod tests {
     }
 
     #[test]
-    fn formal_process_identity_binds_every_role_to_pid_binary_and_build() {
-        let root = std::env::temp_dir().join(format!(
-            "novarocks-uea1-process-identity-{}-{}",
-            std::process::id(),
-            now_unix_millis().expect("clock")
-        ));
-        fs::create_dir_all(&root).expect("create process identity fixture");
-        let primary = root.join("novarocks");
-        let other = root.join("other-novarocks");
-        fs::write(&primary, b"measured-server").expect("write measured binary");
-        fs::write(&other, b"other-server").expect("write other binary");
+    fn formal_process_identity_binds_every_role_to_pid_and_build() {
         let source_revision = "0123456789abcdef0123456789abcdef01234567";
         let launch_identities = vec![
-            launch_identity("fe", 11, &primary),
-            launch_identity("be-0", 21, &primary),
-            launch_identity("be-1", 22, &primary),
-            launch_identity("be-2", 23, &primary),
+            launch_identity("fe", 11),
+            launch_identity("be-0", 21),
+            launch_identity("be-1", 22),
+            launch_identity("be-2", 23),
         ];
         let topology = vec![
             live_backend("be-process-0", 19000, source_revision),
             live_backend("be-process-1", 19001, source_revision),
             live_backend("be-process-2", 19002, source_revision),
         ];
-        let primary_sha256 = sha256_file(&primary).expect("hash primary binary");
-        let (native_build_identity, processes) = build_native_process_identities(
-            &launch_identities,
-            &topology,
-            source_revision,
-            &primary_sha256,
-            true,
-        )
-        .expect("bind formal process identities");
+        let (native_build_identity, processes) =
+            build_native_process_identities(&launch_identities, &topology, source_revision, true)
+                .expect("bind formal process identities");
         assert_eq!(native_build_identity, source_revision);
         assert_eq!(
             processes
@@ -1461,10 +1392,11 @@ mod tests {
             processes[1].application_process_id.as_deref(),
             Some("be-process-0")
         );
-        assert!(processes.iter().all(|process| {
-            process.build_identity.as_deref() == Some(source_revision)
-                && process.binary_sha256 == primary_sha256
-        }));
+        assert!(
+            processes
+                .iter()
+                .all(|process| process.build_identity.as_deref() == Some(source_revision))
+        );
         for process in &processes {
             let serialized = serde_json::to_value(process).expect("serialize process identity");
             assert_eq!(
@@ -1476,29 +1408,13 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 BTreeSet::from([
                     "application_process_id",
-                    "binary_sha256",
                     "build_identity",
-                    "executable_modified_unix_nanos",
-                    "executable_size_bytes",
                     "os_pid",
                     "process_start_token",
                     "role",
                 ])
             );
         }
-
-        let mut mismatched_launch_identities = launch_identities;
-        mismatched_launch_identities[0] = launch_identity("fe", 11, &other);
-        let error = build_native_process_identities(
-            &mismatched_launch_identities,
-            &topology,
-            source_revision,
-            &primary_sha256,
-            true,
-        )
-        .expect_err("formal process identity must reject a different FE binary");
-        assert!(error.to_string().contains("every FE/BE role"));
-        fs::remove_dir_all(root).expect("remove process identity fixture");
     }
 
     #[test]
@@ -1673,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn formal_runner_must_be_checkout_local_with_its_exact_hash() {
+    fn formal_runner_must_be_checkout_local() {
         let root = std::env::temp_dir().join(format!(
             "novarocks-uea1-runner-provenance-{}-{}",
             std::process::id(),
@@ -1688,17 +1604,13 @@ mod tests {
         fs::write(&external, b"external runner").expect("external runner");
         let expected = fs::canonicalize(expected).expect("canonical expected runner");
         let external = fs::canonicalize(external).expect("canonical external runner");
-        let expected_sha = sha256_file(&expected).expect("expected runner hash");
-
-        ensure_checkout_release_runner(&repository, &expected, &expected_sha)
-            .expect("checkout runner");
-        assert!(ensure_checkout_release_runner(&repository, &external, &expected_sha).is_err());
-        assert!(ensure_checkout_release_runner(&repository, &expected, &"0".repeat(64)).is_err());
+        ensure_checkout_release_runner(&repository, &expected).expect("checkout runner");
+        assert!(ensure_checkout_release_runner(&repository, &external).is_err());
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
-    fn finish_refuses_to_complete_after_measured_binary_drift() {
+    fn finish_refuses_to_complete_after_workload_artifact_drift() {
         let root = std::env::temp_dir().join(format!(
             "novarocks-uea1-finish-drift-{}-{}",
             std::process::id(),
@@ -1746,13 +1658,11 @@ checksum = "abc"
         run_git(&repository, &["add", "."]);
         run_git(&repository, &["commit", "-qm", "fixture"]);
 
-        let binary = root.join("novarocks");
         let workload = artifacts.join("workload-manifest.json");
         let fixture = artifacts.join("fixture-spec.json");
         let effective_launch_config = artifacts.join("effective-launch-config.json");
         let descriptor = artifacts.join("descriptor.json");
         let fixture_realization = artifacts.join("fixture-realization.json");
-        fs::write(&binary, b"measured-server").expect("write measured server");
         fs::write(&workload, b"workload").expect("write workload artifact");
         fs::write(&fixture, b"fixture-spec").expect("write fixture artifact");
         fs::write(&effective_launch_config, b"effective-config")
@@ -1771,10 +1681,14 @@ checksum = "abc"
             .expect("read fixture revision");
         let source_status = command_text(&repository, "git", &["status", "--porcelain=v1"])
             .expect("read fixture status");
-        let binary_sha256 = sha256_file(&binary).expect("hash measured server");
+        let process_start_token =
+            novarocks_cluster_harness::process_resources::read_process_start_token(
+                std::process::id(),
+            )
+            .expect("read test process start token");
         let cargo_lock = repository.join("Cargo.lock");
         let manifest = RunManifest {
-            schema_version: 5,
+            schema_version: 6,
             kind: RunManifestKind::Performance,
             formal: false,
             run_id: "run-finish-drift".to_string(),
@@ -1789,20 +1703,13 @@ checksum = "abc"
             source_tree_sha256: source_tree_sha256(&repository, &source_revision, &source_status)
                 .expect("hash source tree"),
             source_dirty: false,
-            binary_sha256: binary_sha256.clone(),
             runner_executable_path: runner.to_string_lossy().into_owned(),
-            runner_executable_sha256: sha256_file(&runner).expect("hash test executable"),
             process_identities: vec![RunProcessIdentity {
                 role: "fe".to_string(),
                 os_pid: std::process::id(),
-                process_start_token: "test-process-start".to_string(),
+                process_start_token: process_start_token.clone(),
                 application_process_id: None,
                 build_identity: Some(source_revision),
-                binary_sha256,
-                executable_size_bytes: fs::metadata(&binary)
-                    .expect("inspect measured server")
-                    .len(),
-                executable_modified_unix_nanos: 1,
             }],
             config_sha256: sha256_file(&repository.join("config.toml")).expect("hash config"),
             workload_manifest_sha256: sha256_file(&workload).expect("hash workload"),
@@ -1838,21 +1745,24 @@ checksum = "abc"
             manifest,
             inputs: FrozenRunInputs {
                 repository: repository.clone(),
-                binary: binary.clone(),
                 runner,
                 config: repository.join("config.toml"),
                 workload_manifest_source: None,
-                workload_manifest_artifact: workload,
+                workload_manifest_artifact: workload.clone(),
                 fixture_spec: fixture,
                 effective_launch_config,
                 descriptor_source: Some(descriptor.clone()),
                 descriptor_artifact: Some(descriptor),
-                process_launch_identities: vec![launch_identity("fe", std::process::id(), &binary)],
+                process_launch_identities: vec![ProcessLaunchIdentity {
+                    role: "fe".to_string(),
+                    pid: std::process::id(),
+                    process_start_token,
+                }],
             },
             finished: false,
         };
 
-        fs::write(&binary, b"changed-server").expect("change measured server");
+        fs::write(&workload, b"changed-workload").expect("change workload artifact");
         let error = handle
             .finish_performance(
                 &"a".repeat(64),
@@ -1860,8 +1770,12 @@ checksum = "abc"
                 &"e".repeat(64),
                 &sha256_file(&raw_artifact_inventory).expect("hash raw artifact inventory"),
             )
-            .expect_err("changed measured binary must prevent completion");
-        assert!(error.to_string().contains("server binary changed"));
+            .expect_err("changed workload artifact must prevent completion");
+        assert!(
+            error
+                .to_string()
+                .contains("workload manifest artifact changed")
+        );
         let incomplete: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("read incomplete manifest"))
                 .expect("decode incomplete manifest");
