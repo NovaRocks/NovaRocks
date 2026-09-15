@@ -213,9 +213,24 @@ impl CredentialResidualJobHandle {
                 outcome,
             });
             drop(state);
+            emit_terminal_marker(outcome);
             inner.changed.notify_waiters();
         });
     }
+}
+
+/// Emit the secret-free residual outcome only in debug test processes.
+///
+/// The marker is produced after the retained blocking job has actually exited
+/// and released its admission, rather than when terminal handling merely
+/// transfers ownership to this process-runtime owner.
+fn emit_terminal_marker(outcome: CredentialResidualJobOutcome) {
+    if !(cfg!(debug_assertions)
+        && std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER").is_some())
+    {
+        return;
+    }
+    eprintln!("NOVAROCKS_CREDENTIAL_RESIDUAL_JOB_TERMINAL outcome={outcome:?}");
 }
 
 #[cfg(test)]

@@ -1403,6 +1403,14 @@ impl Scenario for VendedRestRefreshPem {
 
         let mut config = connector_launch_config();
         configure_vended_metadata_access(&mut config, metadata_identity);
+        // The residual provider outcome is a debug-only FE marker. It is
+        // emitted only after the retained job returns and releases its
+        // admission, which lets this scenario prove that terminalization did
+        // not leave an unbounded provider job behind.
+        config.child_environment.fe.insert(
+            "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER".to_string(),
+            "1".to_string(),
+        );
         config.native_trust_fixture = NativeTrustFixture::pem_ip();
         Ok(config)
     }
@@ -1606,10 +1614,97 @@ impl Scenario for VendedRestRefreshPem {
             "wait for post-refresh vended reader close after cancellation",
         )?;
         assert_no_reader_open_after_abort(&reader_logs)?;
+
+        // A second, independent attempt proves the terminal fence at the one
+        // place it matters: a provider request already entered, then the
+        // attempt terminated before its retryable response was released.
+        // The fixture holds the first response after recording it, so this is
+        // a causal ordering, not a delay-based race.
+        self.arm_refresh_holds(&[VendedRefreshBehavior::FailUnavailable])?;
+        let residual_log_before = context
+            .handle()
+            .fe_log_contents()
+            .context("capture FE log before terminal vended provider witness")?;
+        context.action("start a second vended read whose first refresh response is held retryable");
+        let terminal_target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        let terminal_connection_id = terminal_target
+            .ready
+            .recv_timeout(context.remaining("receive terminal vended read connection id")?)
+            .context("terminal vended read ended before publishing its connection id")?;
+        wait_for_in_flight_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe the terminal-fence vended read on every Backend",
+        )?;
+        self.wait_for_held_refresh(
+            0,
+            context.remaining("observe retryable terminal-fence refresh response")?,
+        )?;
+        let terminal_refresh_audit = self.vended_proxy_audit()?;
+        ensure!(
+            terminal_refresh_audit.refreshes == settled_audit.refreshes.saturating_add(1),
+            "terminal-fence witness must enter exactly one first provider request before cancellation; settled={settled_audit:?}, observed={terminal_refresh_audit:?}"
+        );
+
+        context.action(format!(
+            "cancel the held provider attempt through KILL QUERY {terminal_connection_id}"
+        ));
+        control
+            .query_drop(format!("KILL QUERY {terminal_connection_id}"))
+            .context("cancel terminal-fence vended reader")?;
+        assert_cancelled_query(
+            &terminal_target.done,
+            context.remaining("await terminal-fence vended read cancellation")?,
+        )?;
+        // The cancellation has become client-visible. Releasing the fixture
+        // now makes its first request fail retryably after the attempt fence
+        // closed; a second provider request would be observable in the audit.
+        self.release_held_refresh(0)?;
+        assert_target_connection_remains_usable(
+            &terminal_target,
+            context.remaining("verify terminal-fence KILL QUERY connection behavior")?,
+        )?;
+        assert_idle_query(&mut control, terminal_connection_id)?;
+        release_connector_read(&terminal_target)?;
+        terminal_target
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("terminal-fence vended reader thread panicked"))??;
+        wait_for_fe_marker_since(
+            context,
+            &residual_log_before,
+            "NOVAROCKS_CREDENTIAL_RESIDUAL_JOB_TERMINAL outcome=FencedAfterProviderCall",
+            "observe residual provider completion after the terminal retry fence",
+        )?;
+        let terminal_audit = self.vended_proxy_audit()?;
+        ensure!(
+            terminal_audit.table_loads == terminal_refresh_audit.table_loads
+                && terminal_audit.refreshes == terminal_refresh_audit.refreshes
+                && terminal_audit.refresh_failures
+                    == terminal_refresh_audit.refresh_failures.saturating_add(1)
+                && terminal_audit.issued_key_ids == terminal_refresh_audit.issued_key_ids,
+            "terminal-fence witness issued a provider request after its retryable first response; first={terminal_refresh_audit:?}, observed={terminal_audit:?}"
+        );
+        let terminal_reader_logs = wait_for_balanced_reader_lifecycle(
+            context,
+            "wait for terminal-fence vended reader close after cancellation",
+        )?;
+        // The global abort-order oracle was already checked for the first
+        // attempt above. This second attempt begins after that abort, so its
+        // independent lifecycle proof is the per-Backend open/close balance;
+        // applying the global helper again would misattribute this legitimate
+        // later reader to the earlier attempt.
+        ensure!(
+            terminal_reader_logs.iter().all(|log| {
+                let (opens, closes) = reader_counts(log);
+                opens > 0 && opens == closes
+            }),
+            "terminal-fence vended readers did not converge to balanced open/close state"
+        );
         let audit = self.vended_proxy_audit()?;
-        if audit != settled_audit {
+        if audit != terminal_audit {
             bail!(
-                "vended refresh audit changed unexpectedly after cancellation; settled={settled_audit:?}, observed={audit:?}"
+                "vended refresh audit changed unexpectedly after cancellation; settled={terminal_audit:?}, observed={audit:?}"
             );
         }
         await_resource_convergence(context, &baseline, "short-TTL vended credential refresh")?;
@@ -3436,6 +3531,28 @@ fn wait_for_backend_logs(
             .with_context(|| format!("read BE logs while waiting to {operation}"))?;
         if predicate(&logs) {
             return Ok(logs);
+        }
+        let remaining = context.remaining(operation)?;
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
+fn wait_for_fe_marker_since(
+    context: &mut ScenarioContext,
+    previous: &str,
+    marker: &str,
+    operation: &str,
+) -> Result<()> {
+    loop {
+        let log = context
+            .handle()
+            .fe_log_contents()
+            .with_context(|| format!("read FE log while waiting to {operation}"))?;
+        if log
+            .get(previous.len()..)
+            .is_some_and(|added| added.contains(marker))
+        {
+            return Ok(());
         }
         let remaining = context.remaining(operation)?;
         thread::sleep(remaining.min(Duration::from_millis(50)));
