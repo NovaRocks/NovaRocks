@@ -392,6 +392,7 @@ fn carrier_error(target: WriteTargetOrdinal, detail: String) -> ConnectorError {
         ),
     )
 }
+#[cfg(debug_assertions)]
 fn writer_failpoint(
     execution_id: QueryExecutionId,
     node_id: i32,

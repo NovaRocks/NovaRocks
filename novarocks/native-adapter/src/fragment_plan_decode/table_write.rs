@@ -70,9 +70,11 @@ const MAX_WRITE_UNPIVOT_MAPPINGS: usize = 4_096;
 const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 
 use super::DecodedNode;
+#[cfg(debug_assertions)]
+use crate::connector_write_data_plane::QueryScopedTableWriteAggregateGuard;
 use crate::connector_write_data_plane::{
-    NativeConnectorWriteObservationPort, QueryScopedTableWriteAggregateGuard,
-    RoleBoundCommitFragmentEncoder, RootCommitFragmentCarrierValidator,
+    NativeConnectorWriteObservationPort, RoleBoundCommitFragmentEncoder,
+    RootCommitFragmentCarrierValidator,
 };
 use crate::fragment_aggregate::decode_resolved_aggregate_signature;
 use crate::fragment_decode_context::NativePlanDecodeContext;
