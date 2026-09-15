@@ -436,7 +436,7 @@ struct Nid2Fence {
 /// half is `RemoteTask::on_create_ack` reporting `CreateSettlement::FailedClosed`
 /// and `QueryTaskExecution::acknowledge_task` turning it into
 /// `TaskExecutionError::OperationFailed`
-/// (`novarocks/frontend/src/task_execution/execution.rs`).
+/// (`novarocks/frontend-application/src/task_execution/execution.rs`).
 ///
 /// What is preserved verbatim is the "after apply" half, which is the whole
 /// reason this case can fail: the task is admitted and running on that backend,
@@ -533,7 +533,7 @@ impl Scenario for Nid2CreateReceiptForeignTask {
 /// The surviving observation channel is `SubscribeTaskStatus`. It names no
 /// participant of its own, so the forgeable fact is the backend process inside
 /// the event's `TaskIdentity`, and the fence is `observe_event`
-/// (`novarocks/frontend/src/native/task_transport.rs`) comparing it against the
+/// (`novarocks/frontend-application/src/native/task_transport.rs`) comparing it against the
 /// subscription's own query context.
 ///
 /// The verdict is genuinely different, and this case now asserts the new one

@@ -577,7 +577,7 @@ fn run_ncp5_feedback_unavailable(context: &mut ScenarioContext) -> Result<()> {
 /// The publisher-authorization half of the old assertion is not lost, only
 /// moved to where it can still be provoked:
 /// `the_task_carrier_is_authorized_by_the_process_that_ran_the_producing_task`
-/// in `novarocks/frontend/src/runtime_filter/feedback.rs` drives an undeclared
+/// in `novarocks/frontend-application/src/runtime_filter/feedback.rs` drives an undeclared
 /// process straight into `admit_task_feedback` and asserts both the
 /// "publisher is not authorized" refusal and an untouched winner.
 fn run_nid2_foreign_attempt_rejection(context: &mut ScenarioContext) -> Result<()> {

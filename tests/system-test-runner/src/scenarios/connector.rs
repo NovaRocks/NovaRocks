@@ -610,7 +610,7 @@ impl Scenario for CatalogReadyLifecycle {
         // withholds the interrupt until the statement generation is released,
         // so that the probe below can reuse this connection
         // (`cancellation_requires_statement_fence` in
-        // `novarocks/frontend/src/query.rs`). By this line the abort has
+        // `novarocks/frontend-application/src/query.rs`). By this line the abort has
         // already reached every installing Backend, so anything other than a
         // prompt 1317 is the frontend failing to report an interrupt it owes,
         // never the expectation being wrong.

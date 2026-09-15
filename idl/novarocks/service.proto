@@ -32,8 +32,8 @@ import "filter.proto";
 import "plan.proto";
 
 // FE<->BE control + data-plane RPC surface. One service, all cluster-internal
-// traffic. Server: novarocks/backend/src/rpc/server.rs. Clients: the frontend
-// adapters under novarocks/frontend/src/native/. A query becomes work on a
+// traffic. Server: novarocks/native-adapter/src/native_server.rs. Clients: the
+// Frontend Application native task transport. A query becomes work on a
 // backend only through ApplyTaskOperations, and a task's terminal is its own
 // status, read back through SubscribeTaskStatus and GetFinalTaskInfo.
 service NovaRocksGrpc {
@@ -193,7 +193,7 @@ message CredentialLeaseSecretEnvelope {
 // It is kept because it is still the vocabulary the backend's own
 // runtime-filter participant close path is driven by, from the task protocol's
 // query-context host -- see `close` / `prepare_terminal_capture` in
-// novarocks/backend/src/runtime_filter/participant.rs.
+// novarocks/native-adapter/src/backend_task_execution/context_host.rs.
 enum QueryTerminationReason {
   QUERY_TERMINATION_REASON_UNSPECIFIED = 0;
   QUERY_TERMINATION_COORDINATOR_ABORT = 1;

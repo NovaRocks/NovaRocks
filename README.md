@@ -369,7 +369,7 @@ Use targeted package tests while iterating on a native crate:
 
 ```bash
 cargo test -p novarocks
-cargo test -p novarocks-backend
+cargo test -p novarocks-native-adapter
 cargo test -p novarocks-server
 ```
 

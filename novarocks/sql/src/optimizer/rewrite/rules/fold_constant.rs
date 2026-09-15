@@ -138,7 +138,7 @@ fn is_environment_sensitive_function(name: &str) -> bool {
 ///
 /// Hard constraint, not an optimization heuristic: a folded literal has to
 /// survive the FE -> BE plan encoding. The authoritative decode arms live in
-/// `novarocks/backend/src/fragment/decode/expression/literal.rs` (`lower_literal_value`
+/// `novarocks/native-adapter/src/fragment_expression/literal.rs` (`lower_literal_at`
 /// / `lower_int_literal` / `lower_decimal_literal`) — the wire literal message
 /// has no timestamp variant and no composite variant, so folding an expression
 /// whose output type is `Timestamp(..)`, a list, a struct, a map, or any other

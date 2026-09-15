@@ -29,7 +29,7 @@
 //! `ParticipantTerminalOutcome` at all -- its per-domain receipts and
 //! termination latch replace the retired terminal-evidence funnel (ADR-0135),
 //! and `publish_task_round_convergence` in
-//! `novarocks/frontend/src/coordinator/execution.rs` deliberately publishes an
+//! `novarocks/frontend-application/src/coordinator/execution.rs` deliberately publishes an
 //! empty outcome list rather than inventing proofs this protocol never made.
 //! `NOVAROCKS_QUERY_INIT_APPLIED` was emitted only by the retired protocol's
 //! backend query-lifecycle registry, which no longer exists.

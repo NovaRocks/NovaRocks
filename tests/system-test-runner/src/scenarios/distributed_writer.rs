@@ -1918,7 +1918,7 @@ impl Scenario for DistributedWriterRowLevel {
 /// assert the opposite of the design.
 ///
 /// The state it described also cannot reach the commit barrier any more. In
-/// `novarocks/frontend/src/coordinator/execution.rs` the task round's drain
+/// `novarocks/frontend-application/src/coordinator/execution.rs` the task round's drain
 /// loop keeps turning past its `client_visible_completion` gate while any
 /// declared writer or the root finish task has not published `FINISHED`, and
 /// a latched failure cause breaks that loop with an error propagated before
