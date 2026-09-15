@@ -18,7 +18,7 @@
 //! View application ports and core engine adapter.
 //!
 //! The public traits and DTOs are the dependency-inversion boundary used by
-//! `novarocks-frontend`: core exposes only the engine capabilities required by
+//! the Frontend role application: core exposes only the engine capabilities required by
 //! view DDL and rewrite, without leaking the retired Core application facade, connector
 //! backends, or parser-internal column definitions.
 

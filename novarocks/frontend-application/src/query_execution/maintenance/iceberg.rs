@@ -18,7 +18,7 @@
 //! Connector-facing table-maintenance execution.
 //!
 //! SQL parsing, application dispatch, and result encoding belong to
-//! `novarocks-frontend`. Catalog, snapshot, file and commit truth belongs to
+//! the Frontend role application. Catalog, snapshot, file and commit truth belongs to
 //! the Connector; this module only routes maintenance intents to it and shapes
 //! the neutral outcome the frontend reports.
 

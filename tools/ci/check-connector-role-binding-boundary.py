@@ -32,10 +32,11 @@ from pathlib import Path
 
 RETIRED_BINDING = "novarocks-connector-binding"
 SPI = "novarocks-spi"
-FRONTEND = "novarocks-frontend"
 NATIVE_ADAPTER = "novarocks-native-adapter"
+FRONTEND_APPLICATION = "novarocks-frontend-application"
+SERVER = "novarocks-server"
 LEGACY_PATHS = (
-    "novarocks/frontend/src/connector/typed_control_registry.rs",
+    "novarocks/frontend-application/src/connector/typed_control_registry.rs",
 )
 STARROCKS_PROVIDER_FACTORY = "novarocks/connector/starrocks/src/role_binding.rs"
 SERVER_STARROCKS_FACTORY_ADAPTER = "novarocks-server/src/connector_role_binding.rs"
@@ -120,7 +121,7 @@ def normal_closure(metadata, root_name):
 def verify_metadata(metadata):
     if any(entry["name"] == RETIRED_BINDING for entry in metadata["packages"]):
         fail(f"retired package must be absent: {RETIRED_BINDING}")
-    for role in (FRONTEND, NATIVE_ADAPTER):
+    for role in (FRONTEND_APPLICATION, NATIVE_ADAPTER):
         if SPI not in normal_direct_dependencies(package(metadata, role)):
             fail(f"{role} must directly declare a normal dependency on {SPI}")
 
@@ -135,7 +136,7 @@ def verify_source(source_root):
     for relative in LEGACY_PATHS:
         if (source_root / relative).exists():
             fail(f"legacy parallel registry must be removed: {relative}")
-    for relative_root in ("novarocks/frontend/src", "novarocks/backend/src"):
+    for relative_root in ("novarocks-server/src", "novarocks/native-adapter/src"):
         root = source_root / relative_root
         if not root.exists():
             continue

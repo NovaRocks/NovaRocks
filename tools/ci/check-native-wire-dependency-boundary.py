@@ -37,8 +37,8 @@ TASK_CODEC = "novarocks-task-codec"
 EXECUTION_CONTRACT = "novarocks-execution-contract"
 SPI = "novarocks-spi"
 TYPES = "novarocks-types"
-FRONTEND = "novarocks-frontend"
 NATIVE_ADAPTER = "novarocks-native-adapter"
+FRONTEND_APPLICATION = "novarocks-frontend-application"
 SERVER = "novarocks-server"
 FAILPOINT = "novarocks-failpoint"
 STARROCKS = "novarocks-connector-starrocks"
@@ -61,7 +61,7 @@ FORBIDDEN_CODEC_CLOSURE = {
     "tonic",
     "novarocks-connector-starrocks",
     "novarocks-execution",
-    "novarocks-frontend",
+    "novarocks-frontend-application",
     "novarocks-server",
     "novarocks-sql",
     "novarocks-state-store-foundationdb",
@@ -71,7 +71,7 @@ FORBIDDEN_CODEC_CLOSURE = {
 
 FORBIDDEN_EXECUTION_CONTRACT_CLOSURE = WIRE_PACKAGES | {
     "novarocks-execution",
-    "novarocks-frontend",
+    "novarocks-frontend-application",
     "novarocks-server",
     "novarocks-sql",
 }
@@ -93,7 +93,7 @@ LOWER_LAYER_ROOTS = {
     "novarocks-state-store-sqlite",
 }
 
-STARROCKS_FORBIDDEN_CLOSURE = {FRONTEND, NATIVE_ADAPTER, SERVER}
+STARROCKS_FORBIDDEN_CLOSURE = {FRONTEND_APPLICATION, NATIVE_ADAPTER, SERVER}
 
 
 def fail(message):
@@ -264,7 +264,7 @@ def verify_execution_contract(metadata):
 
 
 def verify_role_direct_dependencies(metadata):
-    for role in (FRONTEND, NATIVE_ADAPTER):
+    for role in (FRONTEND_APPLICATION, NATIVE_ADAPTER):
         direct = normal_dependency_names(package_by_name(metadata, role), include_optional=False)
         missing = sorted(ROLE_DIRECT_REQUIREMENTS - direct)
         if missing:

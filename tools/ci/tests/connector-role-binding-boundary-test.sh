@@ -25,8 +25,8 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 metadata="$tmpdir/metadata.json"
 source_root="$tmpdir/source"
-mkdir -p "$source_root/novarocks/frontend/src/connector" \
-  "$source_root/novarocks/backend/src/connector" \
+mkdir -p "$source_root/novarocks/frontend-application/src/connector" \
+  "$source_root/novarocks/native-adapter/src/connector" \
   "$source_root/novarocks/spi/src/connector/binding" \
   "$source_root/novarocks/spi/src/connector/provider" \
   "$source_root/novarocks/connector/starrocks/src" \

@@ -120,7 +120,7 @@ novarocks-state-store-testkit = { path = "../testkit" }'
     'novarocks-secret = { path = "../secret" }'
 
   # A production consumer that legitimately uses the testkit for tests only.
-  write_package "$fixture_root" frontend novarocks-frontend \
+  write_package "$fixture_root" frontend novarocks-frontend-application \
     '[dev-dependencies]
 novarocks-state-store-testkit = { path = "../testkit" }'
   append_dependency "$fixture_root" frontend \
@@ -207,8 +207,8 @@ normal_testkit_root="$(new_mutation normal-testkit)"
 append_dependency "$normal_testkit_root" frontend \
   'novarocks-state-store-testkit = { path = "../testkit" }'
 assert_rejected "$normal_testkit_root" \
-  "novarocks-frontend declares novarocks-state-store-testkit as a normal dependency" \
-  "resolved normal dependency edges point at novarocks-state-store-testkit from: novarocks-frontend"
+  "novarocks-frontend-application declares novarocks-state-store-testkit as a normal dependency" \
+  "resolved normal dependency edges point at novarocks-state-store-testkit from: novarocks-frontend-application"
 
 # --- reject: testkit reached transitively by a provider -------------------
 transitive_testkit_root="$(new_mutation transitive-testkit)"
@@ -232,9 +232,9 @@ assert_rejected "$api_testkit_root" \
 # --- reject: transitive application owner ---------------------------------
 transitive_frontend_root="$(new_mutation transitive-frontend)"
 append_dependency "$transitive_frontend_root" neutral-lib \
-  'novarocks-frontend = { path = "../frontend" }'
+  'novarocks-frontend-application = { path = "../frontend" }'
 assert_rejected "$transitive_frontend_root" \
-  "novarocks-state-store-mysql normal dependency closure contains a forbidden application/execution owner: novarocks-frontend"
+  "novarocks-state-store-mysql normal dependency closure contains a forbidden application/execution owner: novarocks-frontend-application"
 
 # --- reject: an internal crate no capability rule names -------------------
 # The neutral allow-list is the backstop for internal crates nobody enumerated.

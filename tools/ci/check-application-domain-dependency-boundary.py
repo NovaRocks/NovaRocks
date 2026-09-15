@@ -38,7 +38,8 @@ PRODUCTS = {
     "novarocks-statistics-application",
     "novarocks-table-maintenance",
 }
-ROLE_IMPLEMENTATIONS = {"novarocks-frontend"}
+RETIRED_ROLE_PACKAGES = {"novarocks-backend", "novarocks-frontend"}
+ROLE_IMPLEMENTATIONS = {"novarocks-frontend-application"}
 ADAPTERS = {"novarocks-native-adapter", "novarocks-mysql-adapter"}
 WIRE = {
     "novarocks-proto-models",
@@ -117,6 +118,12 @@ def verify_forbidden_closure(metadata, root, forbidden):
         fail(f"{root} normal dependency closure contains forbidden domains: " + ", ".join(found))
 
 
+def verify_retired_role_packages(metadata):
+    present = sorted(package_names(metadata) & RETIRED_ROLE_PACKAGES)
+    if present:
+        fail("retired role packages remain in Cargo metadata: " + ", ".join(present))
+
+
 def verify_products(metadata):
     available = package_names(metadata)
     for product in sorted(PRODUCTS & available):
@@ -155,8 +162,7 @@ def verify_native_adapter(metadata):
     if WORKER not in closure:
         fail(f"{NATIVE_ADAPTER} normal dependency closure must contain {WORKER}")
     forbidden = sorted(
-        closure
-        & (PRODUCTS | ROLE_IMPLEMENTATIONS | {QUERY, "novarocks-server"})
+        closure & (PRODUCTS | ROLE_IMPLEMENTATIONS | {QUERY, "novarocks-server"})
     )
     if forbidden:
         fail(
@@ -197,6 +203,7 @@ def main():
     arguments = parser.parse_args()
     metadata = load_metadata(arguments)
 
+    verify_retired_role_packages(metadata)
     verify_forbidden_closure(metadata, EXECUTION, EXECUTION_FORBIDDEN)
     verify_forbidden_closure(metadata, WORKER, WORKER_FORBIDDEN)
     verify_forbidden_closure(metadata, WORKLOAD, WORKLOAD_FORBIDDEN)

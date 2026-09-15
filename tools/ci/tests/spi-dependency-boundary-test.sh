@@ -55,7 +55,7 @@ write_fixture() {
   # Arrow is deliberately part of the accepted baseline: Connector contracts
   # own the columnar vocabulary. Tokio is deliberately absent: the
   # state-store-conformance owner that used to justify it is gone.
-  for dependency in arrow async-trait bytes novarocks-frontend novarocks-secret \
+  for dependency in arrow async-trait bytes novarocks-frontend-application novarocks-secret \
       novarocks-state-store-api novarocks-types serde sha2 tokio tracing url uuid; do
     write_dependency_package "$fixture_root" "$dependency"
   done
@@ -161,9 +161,9 @@ assert_rejected "$transitive_state_store_root" \
 # --- reject: a transitive application owner -------------------------------
 transitive_frontend_root="$(new_mutation transitive-frontend)"
 append_dependency "$transitive_frontend_root/deps/bytes/Cargo.toml" \
-  'novarocks-frontend = { path = "../novarocks-frontend" }'
+  'novarocks-frontend-application = { path = "../novarocks-frontend-application" }'
 assert_rejected "$transitive_frontend_root" \
-  "novarocks-spi normal dependency closure contains a forbidden application/execution owner: novarocks-frontend"
+  "novarocks-spi normal dependency closure contains a forbidden application/execution owner: novarocks-frontend-application"
 
 # --- reject: an internal crate no capability rule names -------------------
 # The neutral allow-list is the backstop that keeps the original "default

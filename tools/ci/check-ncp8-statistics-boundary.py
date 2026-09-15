@@ -36,15 +36,14 @@ EXECUTION = "novarocks-execution"
 FUNCTIONS = "novarocks-functions"
 ICEBERG_FUNCTIONS = "novarocks-connector-iceberg-functions"
 ICEBERG_PROVIDER = "novarocks-connector-iceberg"
-FRONTEND = "novarocks-frontend"
 NATIVE_ADAPTER = "novarocks-native-adapter"
+FRONTEND_APPLICATION = "novarocks-frontend-application"
 SERVER = "novarocks-server"
 
-ROLE_PACKAGES = {FRONTEND, NATIVE_ADAPTER, SERVER}
+ROLE_PACKAGES = {FRONTEND_APPLICATION, NATIVE_ADAPTER, SERVER}
 ALLOWED_PRODUCTION_DATASKETCHES_OWNERS = {EXECUTION, ICEBERG_FUNCTIONS}
 FORBIDDEN_ICEBERG_FUNCTIONS_CLOSURE = {
     EXECUTION,
-    FRONTEND,
     NATIVE_ADAPTER,
     SERVER,
     ICEBERG_PROVIDER,

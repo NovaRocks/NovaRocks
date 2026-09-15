@@ -35,7 +35,7 @@ write_package() {
 write_fixture() {
   local root="$1"
   mkdir -p "$root"
-  for package in novarocks-connector-iceberg novarocks-server novarocks-frontend novarocks-state-store-sqlite novarocks-fs novarocks-spi; do
+  for package in novarocks-connector-iceberg novarocks-server novarocks-frontend-application novarocks-state-store-sqlite novarocks-fs novarocks-spi; do
     write_package "$root" "$package"
   done
   cat >"$root/Cargo.toml" <<'EOF'
@@ -43,7 +43,7 @@ write_fixture() {
 members = [
   "novarocks-connector-iceberg",
   "novarocks-server",
-  "novarocks-frontend",
+  "novarocks-frontend-application",
   "novarocks-state-store-sqlite",
   "novarocks-fs",
   "novarocks-spi",
@@ -88,11 +88,11 @@ assert_rejected "$forbidden" "provider closure contains forbidden packages: nova
 
 role="$tmpdir/role"
 cp -R "$valid" "$role"
-cat >>"$role/novarocks-frontend/Cargo.toml" <<'EOF'
+cat >>"$role/novarocks-frontend-application/Cargo.toml" <<'EOF'
 
 [dependencies]
 novarocks-connector-iceberg = { path = "../novarocks-connector-iceberg" }
 EOF
-assert_rejected "$role" "novarocks-frontend must not directly depend on novarocks-connector-iceberg"
+assert_rejected "$role" "novarocks-frontend-application must not directly depend on novarocks-connector-iceberg"
 
 echo "iceberg-provider-dependency-boundary-test: PASS"

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Table-maintenance application ports shared with `novarocks-frontend`.
+//! Table-maintenance application ports shared with the Frontend role application.
 //!
 //! This dependency-inversion boundary exposes only the typed engine
 //! capabilities and application results needed by the frontend owner. It does

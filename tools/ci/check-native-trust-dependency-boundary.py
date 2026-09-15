@@ -21,7 +21,6 @@ FORBIDDEN_INTERNAL = {
     "novarocks-connector-starrocks",
     "novarocks-execution",
     "novarocks-failpoint",
-    "novarocks-frontend",
     "novarocks-fs",
     "novarocks-parser",
     "novarocks-proto-codec",

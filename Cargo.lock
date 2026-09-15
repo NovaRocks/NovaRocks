@@ -3826,7 +3826,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-frontend"
+name = "novarocks-frontend-application"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4137,7 +4137,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-failpoint",
- "novarocks-frontend",
+ "novarocks-frontend-application",
  "novarocks-fs",
  "novarocks-functions",
  "novarocks-memory",

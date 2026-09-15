@@ -118,7 +118,7 @@ write_fixture() {
   fi
 
   # A legal application consumer of the adapter.
-  write_package "$fixture_root" frontend novarocks-frontend
+  write_package "$fixture_root" frontend novarocks-frontend-application
   if [ "$with_adapter" = yes ]; then
     append_dependency "$fixture_root" frontend \
       'novarocks-memory-arrow = { path = "../memory-arrow" }'
@@ -232,7 +232,7 @@ retired_pairing_root="$(new_mutation retired-pairing)"
 append_dependency "$retired_pairing_root" frontend \
   'novarocks-connector-starrocks = { path = "../starrocks" }'
 assert_rejected "$retired_pairing_root" \
-  "novarocks-frontend reaches both novarocks-memory-arrow and the retired novarocks-connector-starrocks"
+  "novarocks-frontend-application reaches both novarocks-memory-arrow and the retired novarocks-connector-starrocks"
 
 # --- reject: case 7, the storage contract acquires a memory crate ---------
 echo "asserting: novarocks-state-store-api gaining a normal dependency on the memory core is rejected"

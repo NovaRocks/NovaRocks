@@ -18,7 +18,7 @@
 //! Provider-side maintenance fact collection.
 //!
 //! Automatic maintenance policy, worker lifecycle, signaling, and retry
-//! ownership live in `novarocks-frontend`. Core retains only the metadata
+//! ownership live in the Frontend role application. Core retains only the metadata
 //! adapter needed to bind provider-neutral facts to that owner.
 
 pub mod stats;
