@@ -39,10 +39,10 @@ under the License.
 
 maintenance 的三层职责是固定的：
 
-- `novarocks-frontend` 的 `TableMaintenanceService` 是 application owner，负责 SQL
-  路由、异步 optimize job repository/worker 与生命周期。
-- core 通过 consumer-owned `TableMaintenanceEngine` port 提供 target resolve 与执行能力，
-  不再拥有第二套 maintenance job service。
+- `novarocks-frontend-application` 的 `FrontendTableMaintenanceService` 是 application
+  owner，负责 SQL 路由、异步 optimize job repository/worker 与生命周期。
+- Frontend Application 通过 consumer-owned `TableMaintenanceEngine` port 提供 target
+  resolve 与执行能力，不再拥有第二套 maintenance job service。
 - Iceberg connector 仍是 catalog、snapshot/file、rewrite/expire/orphan、commit、cache
   invalidation 与 MV target snapshot adopt 的唯一执行 truth。
 
@@ -76,8 +76,8 @@ SHOW ALTER TABLE OPTIMIZE
   LIMIT 10;
 ```
 
-`ALTER TABLE ... OPTIMIZE` 在 job 成功写入 StateStore 后返回，rewrite 在 frontend worker
-中异步执行。调用方必须轮询 `SHOW ALTER TABLE OPTIMIZE`，并以 `FINISHED` 或 `FAILED`
+`ALTER TABLE ... OPTIMIZE` 在 job 成功写入 StateStore 后返回，rewrite 由 Frontend
+Application 的 maintenance worker 异步执行。调用方必须轮询 `SHOW ALTER TABLE OPTIMIZE`，并以 `FINISHED` 或 `FAILED`
 作为终态。Spark-style `CALL ...rewrite_data_files(...)` 则保持同步，并直接返回 action
 结果。
 
@@ -89,7 +89,8 @@ SHOW ALTER TABLE OPTIMIZE
 - 写出新 manifest，老文件由 EXPIRE SNAPSHOTS 路径回收
 - V3 row-lineage 表保留现有 `_row_id` 与 `_last_updated_sequence_number`，rewrite 不分配新 row ID
 
-实现入口：`novarocks/core/src/connector/iceberg/compact.rs`。
+实现入口：`novarocks/frontend-application/src/table_maintenance/{mod,worker}.rs` 与
+`novarocks/connector/iceberg/src/commit/rewrite_data_files.rs`。
 
 ## ❌ OPTIMIZE 增量
 
@@ -127,7 +128,8 @@ ALTER TABLE orders EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00' RETAIN LAST
 
 ### 入口
 
-`novarocks/core/src/connector/iceberg/commit/expire_snapshots.rs`
+`novarocks/connector/iceberg/src/catalog_control/metadata_maintenance.rs` 与
+`novarocks/connector/iceberg/src/commit/snapshot_lifecycle_helpers/expire_snapshots.rs`
 
 ## ✅ REMOVE ORPHAN FILES
 
@@ -151,7 +153,7 @@ ALTER TABLE orders REMOVE ORPHAN FILES OLDER THAN '2026-04-01 00:00:00';
 
 ### 入口
 
-`novarocks/core/src/connector/iceberg/commit/remove_orphan_files.rs`
+`novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance.rs`
 
 ## ✅ REWRITE MANIFESTS
 
@@ -175,7 +177,8 @@ ALTER TABLE orders REWRITE MANIFESTS;
 
 ### 入口
 
-`novarocks/core/src/connector/iceberg/commit/rewrite_manifests.rs`
+`novarocks/connector/iceberg/src/catalog_control/metadata_maintenance.rs` 与
+`novarocks/connector/iceberg/src/commit/snapshot_lifecycle_helpers/rewrite_manifests.rs`
 
 ## ✅ REWRITE POSITION DELETE FILES
 
@@ -191,7 +194,7 @@ CALL iceberg_catalog.system.rewrite_position_delete_files(
 `where`、`target-file-size-bytes` 或 V2 Parquet position delete → V3 DV 的格式升级。
 
 实现入口：
-`novarocks/core/src/connector/iceberg/commit/rewrite_position_delete_files.rs`。
+`novarocks/connector/iceberg/src/distributed_rewrite.rs`。
 
 ## ❌ REWRITE DATA FILES BY SORT ORDER
 

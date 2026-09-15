@@ -19,7 +19,7 @@ under the License.
 
 # 物化视图与 IVM（NovaRocks 差异化）
 
-> NovaRocks 的差异化卖点是"以查询为主力优化点的 Iceberg 引擎"，**MV + IVM 是这条路线的核心**。读路径已经覆盖到 MERGE / UPDATE 增量刷新；最大单点缺口仍是 **MV 自动 query rewrite**。
+> NovaRocks 的差异化卖点是"以查询为主力优化点的 Iceberg 引擎"，**MV + IVM 是这条路线的核心**。读路径已经覆盖到 MERGE / UPDATE 增量刷新；MV 自动 rewrite 已支持受限的 Iceberg 聚合/投影/过滤形状，但仍不是任意 SQL 的通用改写器。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
@@ -38,7 +38,7 @@ under the License.
 | IVM —— MERGE INTO（COW + MOR） | ✅ | PR #78 |
 | 投影 / 过滤 MV | ✅ | |
 | 聚合 MV：SUM / COUNT / AVG / MIN / MAX | ✅ | |
-| **MV 自动 query rewrite** | ❌ | NovaRocks 差异化最关键的单点 |
+| **MV 自动 query rewrite** | ✅（受限） | Iceberg MV 的可证明聚合/投影/过滤形状；由 session 与 `MvRewrite` rule 双重开关控制 |
 | MV freshness contract / staleness budget | ❌ | |
 | 多基表 JOIN 的 IVM | ❌ | |
 | Window 函数 MV | ❌ | |
@@ -82,27 +82,26 @@ GROUP BY date_trunc('day', ts), user_id;
 
 聚合 MV 在基表 INSERT / DELETE / UPDATE / MERGE 后做"组合 / 反组合"运算更新，不需要重算。AVG 通过保持 sum + count 实现增量；MIN / MAX 通过额外维护辅助状态实现。
 
-## ❌ MV 自动 query rewrite
+## ✅ MV 自动 query rewrite（受限）
 
-> NovaRocks 路线图上"以查询为主力优化点"立得住与否的最大单点。
-
-Spec / 业界实践：用户写 SQL 不显式引用 MV，optimizer 基于 MV 定义判定能否改写、改写到哪条 MV、改写后的 cost 是否更低。Spark 的 MV、Snowflake 的 MV、Materialize 的 view 都依赖这一步。
-
-NovaRocks 当前**只支持显式引用 MV**：
+用户可以在 session 中显式开启 rewrite。optimizer 只在候选 MV、精确 base/target
+binding、输出语义和成本都能证明时才选择 MV；无法证明时保留 base-table 计划，不会以
+最新 snapshot、模糊候选或空结果替代原查询。`EXPLAIN` 会在命中时包含
+`rewritten with mv: <name>`。
 
 ```sql
--- ✅ 显式引用
-SELECT * FROM orders_daily WHERE day >= '2026-05-01';
+SET enable_materialized_view_rewrite = true;
+EXPLAIN SELECT region, SUM(amount) FROM orders GROUP BY region;
+-- 命中时包含：rewritten with mv: agg_mv
 
--- ❌ 改写后命中（暂不可用）
-SELECT date_trunc('day', ts) AS day, user_id, SUM(amount)
-  FROM ice.demo.orders
- WHERE ts >= '2026-05-01'
- GROUP BY date_trunc('day', ts), user_id;
--- 当前 optimizer 不会自动改写到 orders_daily
+-- 可独立关闭优化规则，关闭后必须回到 base-table plan。
+SET disable_optimizer_rules = 'MvRewrite';
 ```
 
-**TODO**：核心改写规则（aggregate / projection / filter / join）+ MV 选择 cost model + freshness 校验（见下条）。
+当前已覆盖的具体形状以 `tests/sql/correctness/mv-rewrite/` 为准。跨 catalog、任意
+join/window/DISTINCT/子查询，以及 freshness/staleness budget 均不因该受限 rewrite 而
+获得支持。分布式执行时，选中的 MV target 在 dispatch 前冻结；后续刷新发布新 target
+不能改写在途查询已证明的读取绑定。
 
 ## ❌ MV freshness contract / staleness budget
 
