@@ -205,46 +205,9 @@ pub struct IcebergTypedBoundary {
     /// and the later lazy split source.  It keeps the request-bound FileIO
     /// capability process-local while ensuring split enumeration does not
     /// reopen REST metadata after the attempt's credential manifest is sealed.
-    request_pinned_physical_tables: Option<Arc<RequestPinnedIcebergTables>>,
+    request_pinned_physical_tables:
+        Option<Arc<Mutex<HashMap<SchemaTableName, IcebergPhysicalTable>>>>,
     split_source_options: IcebergSplitSourceOptions,
-}
-
-/// Physical-table views pinned by one admitted request.
-///
-/// The surrounding request scope is already attempt-local. The catalog handle
-/// remains part of the key because a single query can scan identically named
-/// tables from multiple Iceberg catalogs without sharing provider state.
-#[derive(Default)]
-struct RequestPinnedIcebergTables {
-    tables: Mutex<
-        HashMap<(novarocks_spi::connector::CatalogHandle, SchemaTableName), IcebergPhysicalTable>,
-    >,
-}
-
-impl RequestPinnedIcebergTables {
-    fn get(
-        &self,
-        catalog: &novarocks_spi::connector::CatalogHandle,
-        table: &SchemaTableName,
-    ) -> Option<IcebergPhysicalTable> {
-        self.tables
-            .lock()
-            .expect("request-pinned Iceberg table cache lock")
-            .get(&(catalog.clone(), table.clone()))
-            .cloned()
-    }
-
-    fn insert(
-        &self,
-        catalog: novarocks_spi::connector::CatalogHandle,
-        table: SchemaTableName,
-        physical: IcebergPhysicalTable,
-    ) {
-        self.tables
-            .lock()
-            .expect("request-pinned Iceberg table cache lock")
-            .insert((catalog, table), physical);
-    }
 }
 
 impl IcebergTypedBoundary {
@@ -276,8 +239,6 @@ impl IcebergTypedBoundary {
     /// context is a process-local capability, never a session property, table
     /// handle, codec payload, or wire value.
     fn for_request(&self, request_context: ConnectorRequestContext) -> Self {
-        let tables = request_context
-            .request_scope_extension_or_insert_with(RequestPinnedIcebergTables::default);
         Self {
             descriptor: self.descriptor.clone(),
             incarnation: self.incarnation,
@@ -285,7 +246,7 @@ impl IcebergTypedBoundary {
             transaction: self.transaction.clone(),
             runtime: Arc::clone(&self.runtime),
             request_context: Some(request_context),
-            request_pinned_physical_tables: Some(tables),
+            request_pinned_physical_tables: Some(Arc::new(Mutex::new(HashMap::new()))),
             split_source_options: self.split_source_options,
         }
     }
@@ -296,8 +257,7 @@ impl IcebergTypedBoundary {
         name: SchemaTableName,
         table: IcebergPhysicalTable,
     ) -> Self {
-        let tables = Arc::new(RequestPinnedIcebergTables::default());
-        tables.insert(self.catalog_handle.clone(), name, table);
+        let tables = Arc::new(Mutex::new(HashMap::from([(name, table)])));
         Self {
             descriptor: self.descriptor.clone(),
             incarnation: self.incarnation,
@@ -317,7 +277,10 @@ impl IcebergTypedBoundary {
         self.request_pinned_physical_tables
             .as_ref()
             .ok_or_else(|| invalid("Iceberg attempt access requires request-bound table state"))?
-            .get(&self.catalog_handle, name)
+            .lock()
+            .expect("request-pinned Iceberg table cache lock")
+            .get(name)
+            .cloned()
             .ok_or_else(|| {
                 invalid("Iceberg attempt access was sealed before the exact table was frozen")
             })
@@ -381,7 +344,12 @@ impl IcebergTypedBoundary {
     ) -> Result<IcebergPhysicalTable, ConnectorError> {
         match (&self.request_context, &self.request_pinned_physical_tables) {
             (Some(context), Some(tables)) => {
-                if let Some(table) = tables.get(&self.catalog_handle, name) {
+                if let Some(table) = tables
+                    .lock()
+                    .expect("request-pinned Iceberg table cache lock")
+                    .get(name)
+                    .cloned()
+                {
                     return Ok(table);
                 }
                 let table = self
@@ -392,7 +360,10 @@ impl IcebergTypedBoundary {
                         context,
                     )
                     .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
-                tables.insert(self.catalog_handle.clone(), name.clone(), table.clone());
+                tables
+                    .lock()
+                    .expect("request-pinned Iceberg table cache lock")
+                    .insert(name.clone(), table.clone());
                 Ok(table)
             }
             (Some(_), None) => Err(ConnectorError::new(
@@ -2890,22 +2861,6 @@ mod attempt_access_tests {
             Arc::clone(&metadata_context),
         );
         let name = SchemaTableName::try_new("db", "t").expect("table name");
-        let planning_resources = TrackedAttemptResources::new();
-        let planning_context = request_context(&planning_resources);
-        let first_planning_boundary = template.for_request(planning_context.clone());
-        let second_planning_boundary = template.for_request(planning_context);
-        assert!(Arc::ptr_eq(
-            first_planning_boundary
-                .request_pinned_physical_tables
-                .as_ref()
-                .expect("first request-bound table cache"),
-            second_planning_boundary
-                .request_pinned_physical_tables
-                .as_ref()
-                .expect("second request-bound table cache")
-        ));
-        drop(first_planning_boundary);
-        drop(second_planning_boundary);
         let old_resources = TrackedAttemptResources::new();
         let old_resources_weak: Weak<TrackedAttemptResources> = Arc::downgrade(&old_resources);
         let old_attempt = request_context(&old_resources);
