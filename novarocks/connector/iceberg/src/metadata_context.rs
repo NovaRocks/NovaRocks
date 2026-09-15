@@ -37,7 +37,7 @@ use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::loaded_table::{
     IcebergAttemptTableAccess, IcebergPhysicalTable, IcebergRestLoadTableVendedS3LeaseRefresher,
     IcebergRestVendedS3LeaseRefresher, IcebergVendedCredentialLeaseSeed,
-    IcebergVendedS3RenewalCapability, parse_vended_access_delegation,
+    IcebergVendedS3RenewalCapability,
 };
 use crate::resources::IcebergMetadataResources;
 
@@ -271,9 +271,9 @@ impl IcebergMetadataContext {
     /// Reacquire one attempt's vended storage capability for an immutable
     /// table binding.
     ///
-    /// `load_table` is used only as an authorization endpoint. The returned
-    /// table must name the same UUID, but its metadata location and snapshot
-    /// are ignored; the result is rebuilt from `frozen` with this attempt's
+    /// `load_table` acquires this attempt's vended lease. The returned table
+    /// must name the same UUID, but its metadata location and snapshot are
+    /// ignored; the result is rebuilt from `frozen` with this attempt's
     /// request-local resolver.
     pub(crate) fn reacquire_table_access_for_request(
         &self,
@@ -326,73 +326,6 @@ impl IcebergMetadataContext {
                     ),
                 )
             })?;
-        let rest_catalog = self
-            .novarocks_catalog
-            .vended_credential_refresh_catalog()
-            .ok_or_else(|| {
-                (
-                    ConnectorErrorKind::Unsupported,
-                    format!(
-                        "reacquire Iceberg table {namespace}.{table}: vended access has no REST catalog owner"
-                    ),
-                )
-            })?;
-        if let IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope) = capability {
-            let catalog = Arc::clone(&rest_catalog);
-            let endpoint = scope.endpoint().to_string();
-            let delegation = self
-                .resources
-                .catalog_runtime()
-                .block_on(async move {
-                    catalog
-                        .load_credentials_with_access_delegation(&endpoint)
-                        .await
-                })
-                .map_err(unavailable)?
-                .map_err(|error| {
-                    (
-                        ConnectorErrorKind::Unavailable,
-                        format!("reacquire Iceberg table {namespace}.{table} credentials: {error}"),
-                    )
-                })?;
-            let seed = parse_vended_access_delegation(&delegation)
-                .map_err(|error| (error.kind(), error.to_string()))?
-                .into_vended_lease_seed()
-                .ok_or_else(|| {
-                    (
-                        ConnectorErrorKind::Unsupported,
-                        format!(
-                            "reacquire Iceberg table {namespace}.{table}: credentials endpoint returned static access"
-                        ),
-                    )
-                })?;
-            frozen
-                .validate_table_access(&seed)
-                .map_err(|error| (error.kind(), error.to_string()))?;
-            let attempt_scope = scope
-                .reacquired_for_seed(&seed)
-                .map_err(|error| (error.kind(), error.to_string()))?;
-            let contribution = seed
-                .into_vended_s3_credential_lease_contribution()
-                .and_then(|contribution| {
-                    contribution.with_refresher(Arc::new(IcebergRestVendedS3LeaseRefresher::new(
-                        rest_catalog,
-                        self.resources.catalog_runtime().clone(),
-                        attempt_scope,
-                    )))
-                })
-                .map_err(|error| (error.kind(), error.to_string()))?;
-            collection
-                .offer_vended_s3_credential_lease(contribution)
-                .map_err(|error| (error.kind(), error.to_string()))?;
-            let request_binding = self
-                .resources
-                .planning_binding()
-                .for_request(request_context.clone());
-            return frozen
-                .reacquired_request_scoped(request_binding)
-                .map_err(|error| (error.kind(), error.to_string()));
-        }
         let target =
             crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
         let owner = Arc::clone(self.novarocks_catalog());
@@ -420,11 +353,41 @@ impl IcebergMetadataContext {
         let observed = materialization
             .materialize_for_request(metadata_binding)
             .map_err(|error| (error.kind(), error.to_string()))?;
-        frozen
-            .validate_attempt_reacquisition(&observed, &seed)
-            .map_err(|error| (error.kind(), error.to_string()))?;
-        let contribution =
-            self.vended_attempt_contribution(seed, ident, frozen.metadata().uuid())?;
+        let contribution = match capability {
+            IcebergVendedS3RenewalCapability::CredentialsEndpoint(_) => {
+                let attempt_scope = frozen
+                    .validate_credentials_endpoint_attempt_acquisition(&observed, &seed)
+                    .map_err(|error| (error.kind(), error.to_string()))?;
+                let catalog = self
+                    .novarocks_catalog
+                    .vended_credential_refresh_catalog()
+                    .ok_or_else(|| {
+                        (
+                            ConnectorErrorKind::Unsupported,
+                            format!(
+                                "reacquire Iceberg table {namespace}.{table}: vended access has no REST catalog owner"
+                            ),
+                        )
+                    })?;
+                seed.into_vended_s3_credential_lease_contribution()
+                    .and_then(|contribution| {
+                        contribution.with_refresher(Arc::new(
+                            IcebergRestVendedS3LeaseRefresher::new(
+                                catalog,
+                                self.resources.catalog_runtime().clone(),
+                                attempt_scope,
+                            ),
+                        ))
+                    })
+                    .map_err(|error| (error.kind(), error.to_string()))?
+            }
+            IcebergVendedS3RenewalCapability::LoadTableDelegation(_) => {
+                frozen
+                    .validate_attempt_reacquisition(&observed, &seed)
+                    .map_err(|error| (error.kind(), error.to_string()))?;
+                self.vended_attempt_contribution(seed, ident, frozen.metadata().uuid())?
+            }
+        };
         collection
             .offer_vended_s3_credential_lease(contribution)
             .map_err(|error| {

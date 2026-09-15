@@ -1038,6 +1038,32 @@ impl IcebergAttemptTableAccess {
         }
         self.validate_table_access(delegation)
     }
+
+    /// Validate an attempt's initial credentials-endpoint acquisition.
+    ///
+    /// The catalog response supplies this attempt's secret lease, while the
+    /// frozen metadata remains the only execution metadata authority. A
+    /// later response may widen the credential prefixes, but it must retain
+    /// the original endpoint and cover every frozen resource.
+    pub(crate) fn validate_credentials_endpoint_attempt_acquisition(
+        &self,
+        observed: &crate::iceberg::table::Table,
+        delegation: &IcebergVendedCredentialLeaseSeed,
+    ) -> Result<IcebergVendedS3RefreshScope, ConnectorError> {
+        if observed.metadata().uuid() != self.metadata.uuid() {
+            return Err(invalid(
+                "vended REST credentials acquisition returned a different table UUID",
+            ));
+        }
+        let Some(IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope)) = self.renewal()
+        else {
+            return Err(invalid(
+                "frozen table requires load-table delegation attempt access",
+            ));
+        };
+        self.validate_table_access(delegation)?;
+        scope.reacquired_for_seed(delegation)
+    }
 }
 
 impl Debug for IcebergPhysicalTable {
@@ -1566,6 +1592,32 @@ mod tests {
         assert!(
             replacement_scope
                 .reacquired_for_seed(&seed(vec![changed_endpoint]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn credentials_endpoint_attempt_acquisition_keeps_frozen_metadata() {
+        let initial = seed(vec![input("s3://warehouse/data/", 600, "initial")]);
+        let frozen = physical_table("s3://warehouse/data/table/metadata/v1.json")
+            .with_attempt_access(initial.renewal_capability());
+        let observed =
+            table_with_metadata_location(&frozen, "s3://warehouse/data/table/metadata/v2.json");
+        let access = super::IcebergAttemptTableAccess::freeze(frozen);
+        let replacement = seed(vec![input("s3://warehouse/", 900, "replacement")]);
+
+        let scope = access
+            .validate_credentials_endpoint_attempt_acquisition(&observed, &replacement)
+            .expect("the current attempt may acquire a broader lease for frozen metadata");
+        assert!(scope.matches_seed(&replacement));
+
+        let different_table = physical_table("s3://warehouse/data/table/metadata/v3.json");
+        assert!(
+            access
+                .validate_credentials_endpoint_attempt_acquisition(
+                    &different_table.table,
+                    &replacement
+                )
                 .is_err()
         );
     }
