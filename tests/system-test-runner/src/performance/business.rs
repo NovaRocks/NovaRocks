@@ -284,10 +284,13 @@ pub(super) fn prepare_window(
             let initial_state = if job.kind == BusinessKind::MvRefresh {
                 connection.query_drop(format!("SET CATALOG {}", job.catalog))?;
                 connection.query_drop(format!("USE {}", job.namespace))?;
-                connection.query_drop(format!(
+                let create_mv = format!(
                     "CREATE MATERIALIZED VIEW {} DISTRIBUTED BY HASH(v) BUCKETS 3 AS SELECT v FROM {}",
                     job.table, job.source,
-                ))?;
+                );
+                connection
+                    .query_drop(&create_mv)
+                    .with_context(|| format!("create mixed MV fixture with `{create_mv}`"))?;
                 cleanup.push(format!(
                     "DROP MATERIALIZED VIEW {}.{}",
                     job.namespace, job.table
