@@ -38,9 +38,8 @@ use novarocks_types::schema::SqlType;
 use crate::admitted_query_context::RequestContext;
 use crate::api::{
     CatalogCommandConsumer, CommandContext, CommandFuture, MaintenanceCommandConsumer,
-    StatisticsCommandConsumer,
+    OptionalCommandFuture, StatisticsCommandConsumer,
 };
-use crate::protocol_delivery::QuerySessionOutput;
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
 /// SQL batch admission and test-only stable error injection.
@@ -77,8 +76,13 @@ pub trait SpecializedStatementRoute: Send + Sync {
         &self,
         _context: &RequestContext,
         _command_context: &CommandContext,
-    ) -> Result<QuerySessionOutput, String> {
-        Err("SHOW BACKENDS command route is unavailable".to_string())
+    ) -> CommandFuture {
+        Box::pin(async {
+            Err(crate::api::CommandError::new(
+                crate::api::CommandErrorKind::Unsupported,
+                "SHOW BACKENDS command route is unavailable",
+            ))
+        })
     }
 
     /// Executes the test-only stateless-rebuild procedure when it owns this
@@ -89,8 +93,8 @@ pub trait SpecializedStatementRoute: Send + Sync {
         _statement: &novarocks_parser::ast::CallStatement,
         _context: &RequestContext,
         _command_context: &CommandContext,
-    ) -> Result<Option<QuerySessionOutput>, String> {
-        Ok(None)
+    ) -> OptionalCommandFuture {
+        Box::pin(async { Ok(None) })
     }
 
     /// Executes the deliberately specialized, complete MV parser input.
@@ -100,8 +104,13 @@ pub trait SpecializedStatementRoute: Send + Sync {
         _statement: &novarocks_parser::ast::MaterializedViewStatement,
         _context: &RequestContext,
         _command_context: &CommandContext,
-    ) -> Result<QuerySessionOutput, String> {
-        Err("materialized view command route is unavailable".to_string())
+    ) -> CommandFuture {
+        Box::pin(async {
+            Err(crate::api::CommandError::new(
+                crate::api::CommandErrorKind::Unsupported,
+                "materialized view command route is unavailable",
+            ))
+        })
     }
 
     /// Executes the query-owned View family, which is outside the product
@@ -111,8 +120,13 @@ pub trait SpecializedStatementRoute: Send + Sync {
         _statement: &novarocks_parser::ast::ViewStatement,
         _context: &RequestContext,
         _command_context: &CommandContext,
-    ) -> Result<QuerySessionOutput, String> {
-        Err("view command route is unavailable".to_string())
+    ) -> CommandFuture {
+        Box::pin(async {
+            Err(crate::api::CommandError::new(
+                crate::api::CommandErrorKind::Unsupported,
+                "view command route is unavailable",
+            ))
+        })
     }
 }
 

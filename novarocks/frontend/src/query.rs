@@ -54,8 +54,8 @@ use novarocks_query_application::admitted_query_context::{RequestAdmission, Requ
 use novarocks_query_application::api::{
     BackendCommandExecutor, CatalogCommandConsumer, CommandContext, CommandError, CommandErrorKind,
     CommandFuture, ExecutionOutput, MaintenanceCommandConsumer, MaterializedViewCommand,
-    MaterializedViewCommandConsumer, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
-    StatisticsCommandConsumer,
+    MaterializedViewCommandConsumer, OptionalCommandFuture, QueryExecutionError,
+    QueryExecutionErrorKind, ResultDelivery, StatisticsCommandConsumer,
 };
 use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
 use novarocks_query_application::api::{
@@ -169,6 +169,57 @@ where
                     command_error(
                         CommandErrorKind::Cancelled,
                         format!("product command scope is no longer active: {error}"),
+                    )
+                })?;
+                call(&request_context, &command_context)
+                    .map_err(|error| command_error(CommandErrorKind::Failed, error))
+            })
+            .await
+            .map_err(|error| command_error(CommandErrorKind::Failed, error))?
+    })
+}
+
+fn execute_optional_product_command_edge<F>(
+    executor: QueryBlockingExecutor,
+    request_context: RequestContext,
+    command_context: CommandContext,
+    call: F,
+) -> OptionalCommandFuture
+where
+    F: FnOnce(&RequestContext, &CommandContext) -> Result<Option<StatementResult>, String>
+        + Send
+        + 'static,
+{
+    Box::pin(async move {
+        if request_context.execution().cancellation().is_cancelled() {
+            return Err(command_error(
+                CommandErrorKind::Cancelled,
+                "specialized command was cancelled before synchronous admission",
+            ));
+        }
+        command_context.scope().check().map_err(|error| {
+            command_error(
+                CommandErrorKind::Cancelled,
+                format!("specialized command scope is no longer active: {error}"),
+            )
+        })?;
+        let cancellation = request_context.execution().cancellation().clone();
+        let scope = command_context.scope().clone();
+        let statement_token = command_context.statement_token();
+        executor
+            .execute(move || {
+                let _diagnostic_scope =
+                    crate::preparation_diagnostics::enter_statement(statement_token);
+                if cancellation.is_cancelled() {
+                    return Err(command_error(
+                        CommandErrorKind::Cancelled,
+                        "specialized command was cancelled before synchronous execution began",
+                    ));
+                }
+                scope.check().map_err(|error| {
+                    command_error(
+                        CommandErrorKind::Cancelled,
+                        format!("specialized command scope is no longer active: {error}"),
                     )
                 })?;
                 call(&request_context, &command_context)
@@ -355,6 +406,7 @@ struct TypedCommandRoute {
     view: ViewCommandExecutor,
     mv: Arc<dyn MaterializedViewCommandConsumer>,
     mv_call: MvCommandExecutor,
+    executor: QueryBlockingExecutor,
 }
 
 impl TypedCommandRoute {
@@ -363,12 +415,14 @@ impl TypedCommandRoute {
         view: ViewCommandExecutor,
         mv: Arc<dyn MaterializedViewCommandConsumer>,
         mv_call: MvCommandExecutor,
+        executor: QueryBlockingExecutor,
     ) -> Self {
         Self {
             backend,
             view,
             mv,
             mv_call,
+            executor,
         }
     }
 }
@@ -378,14 +432,18 @@ impl SpecializedStatementRoute for TypedCommandRoute {
         &self,
         context: &RequestContext,
         command_context: &CommandContext,
-    ) -> Result<StatementResult, String> {
-        command_context
-            .scope()
-            .check()
-            .map_err(|error| format!("SHOW BACKENDS command scope is no longer active: {error}"))?;
-        self.backend
-            .show_backends(context.execution().role())
-            .map(StatementResult::Query)
+    ) -> CommandFuture {
+        let backend = self.backend.clone();
+        execute_product_command_edge(
+            self.executor.clone(),
+            context.clone(),
+            command_context.clone(),
+            move |context, _command_context| {
+                backend
+                    .show_backends(context.execution().role())
+                    .map(StatementResult::Query)
+            },
+        )
     }
 
     fn execute_maintenance_call(
@@ -393,15 +451,20 @@ impl SpecializedStatementRoute for TypedCommandRoute {
         statement: &novarocks_parser::ast::CallStatement,
         context: &RequestContext,
         command_context: &CommandContext,
-    ) -> Result<Option<StatementResult>, String> {
-        command_context
-            .scope()
-            .check()
-            .map_err(|error| format!("CALL command scope is no longer active: {error}"))?;
-        self.mv_call.try_execute_typed_call(
-            statement,
-            context.session().current_database(),
-            command_context.connector_context(),
+    ) -> OptionalCommandFuture {
+        let mv_call = self.mv_call.clone();
+        let statement = statement.clone();
+        execute_optional_product_command_edge(
+            self.executor.clone(),
+            context.clone(),
+            command_context.clone(),
+            move |context, command_context| {
+                mv_call.try_execute_typed_call(
+                    &statement,
+                    context.session().current_database(),
+                    command_context.connector_context(),
+                )
+            },
         )
     }
 
@@ -410,14 +473,17 @@ impl SpecializedStatementRoute for TypedCommandRoute {
         statement: &novarocks_parser::ast::MaterializedViewStatement,
         context: &RequestContext,
         command_context: &CommandContext,
-    ) -> Result<StatementResult, String> {
-        command_context.scope().check().map_err(|error| {
-            format!("materialized view command scope is no longer active: {error}")
-        })?;
-        self.mv.execute(
-            &MaterializedViewCommand::new(statement.clone()),
-            context,
-            command_context,
+    ) -> CommandFuture {
+        let mv = Arc::clone(&self.mv);
+        let statement = statement.clone();
+        execute_product_command_edge(
+            self.executor.clone(),
+            context.clone(),
+            command_context.clone(),
+            move |context, command_context| {
+                let command = MaterializedViewCommand::new(statement);
+                mv.execute(&command, context, command_context)
+            },
         )
     }
 
@@ -426,16 +492,21 @@ impl SpecializedStatementRoute for TypedCommandRoute {
         statement: &novarocks_parser::ast::ViewStatement,
         context: &RequestContext,
         command_context: &CommandContext,
-    ) -> Result<StatementResult, String> {
-        command_context
-            .scope()
-            .check()
-            .map_err(|error| format!("view command scope is no longer active: {error}"))?;
-        self.view.execute(
-            statement,
-            context.session().current_catalog(),
-            context.session().current_database(),
-            command_context.connector_context(),
+    ) -> CommandFuture {
+        let view = self.view.clone();
+        let statement = statement.clone();
+        execute_product_command_edge(
+            self.executor.clone(),
+            context.clone(),
+            command_context.clone(),
+            move |context, command_context| {
+                view.execute(
+                    &statement,
+                    context.session().current_catalog(),
+                    context.session().current_database(),
+                    command_context.connector_context(),
+                )
+            },
         )
     }
 }
@@ -667,6 +738,7 @@ impl FrontendQueryService {
                 view_command_executor,
                 mv_command_consumer,
                 mv_command_executor,
+                query_blocking_executor.clone(),
             )),
             product_command_router,
             query_control,
@@ -1656,39 +1728,20 @@ impl FrontendQuerySession {
                     }
                 }
             }),
-            ParsedStatement::ShowBackends(_) => Box::pin(execute_synchronous_statement(
-                synchronous_command_executor,
-                worker_cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || {
-                    command_executor
-                        .execute_show_backends(&context, &command_context)
-                        .map_err(RoutedExecutionError::Engine)
-                },
-            )),
+            ParsedStatement::ShowBackends(_) => Box::pin(async move {
+                let result = command_executor
+                    .execute_show_backends(&context, &command_context)
+                    .await
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
+                Ok((result, execution_owner))
+            }),
             ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
                 statement,
             )) => Box::pin(async move {
-                let special_statement = statement.clone();
-                let special_context = context.clone();
-                let special_command_context = command_context.clone();
-                let (special_result, execution_owner) = execute_synchronous_stage(
-                    synchronous_command_executor,
-                    worker_cancellation,
-                    diagnostic_statement,
-                    execution_owner,
-                    move || {
-                        command_executor
-                            .execute_maintenance_call(
-                                &special_statement,
-                                &special_context,
-                                &special_command_context,
-                            )
-                            .map_err(RoutedExecutionError::Engine)
-                    },
-                )
-                .await?;
+                let special_result = command_executor
+                    .execute_maintenance_call(&statement, &context, &command_context)
+                    .await
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
                 match special_result {
                     Err(error) => Ok((Err(error), execution_owner)),
                     Ok(Some(result)) => Ok((Ok(result), execution_owner)),
@@ -1721,30 +1774,20 @@ impl FrontendQuerySession {
                     }
                 }
             }),
-            ParsedStatement::MaterializedView(statement) => {
-                Box::pin(execute_synchronous_statement(
-                    synchronous_command_executor,
-                    worker_cancellation,
-                    diagnostic_statement,
-                    execution_owner,
-                    move || {
-                        command_executor
-                            .execute_materialized_view(&statement, &context, &command_context)
-                            .map_err(RoutedExecutionError::Engine)
-                    },
-                ))
-            }
-            ParsedStatement::View(statement) => Box::pin(execute_synchronous_statement(
-                synchronous_command_executor,
-                worker_cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || {
-                    command_executor
-                        .execute_view(&statement, &context, &command_context)
-                        .map_err(RoutedExecutionError::Engine)
-                },
-            )),
+            ParsedStatement::MaterializedView(statement) => Box::pin(async move {
+                let result = command_executor
+                    .execute_materialized_view(&statement, &context, &command_context)
+                    .await
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
+                Ok((result, execution_owner))
+            }),
+            ParsedStatement::View(statement) => Box::pin(async move {
+                let result = command_executor
+                    .execute_view(&statement, &context, &command_context)
+                    .await
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
+                Ok((result, execution_owner))
+            }),
             other_statement => Box::pin(async move {
                 let command = lower_product_sql_command(&other_statement)
                     .map_err(RoutedExecutionError::Engine)

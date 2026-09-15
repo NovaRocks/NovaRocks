@@ -29,6 +29,14 @@ use crate::session_control::StatementToken;
 pub type CommandFuture =
     Pin<Box<dyn Future<Output = Result<QuerySessionOutput, CommandError>> + Send + 'static>>;
 
+/// An explicit specialized route may decline its exact parser-admitted
+/// shape, allowing SQL to continue with the closed product-command router.
+/// It is intentionally separate from [`CommandFuture`]: `None` is routing
+/// control flow, never a protocol result.
+pub type OptionalCommandFuture = Pin<
+    Box<dyn Future<Output = Result<Option<QuerySessionOutput>, CommandError>> + Send + 'static>,
+>;
+
 /// Governed command context transferred from the SQL application to a product.
 ///
 /// A command consumer can attribute work to the statement and observe its
