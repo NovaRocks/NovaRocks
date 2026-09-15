@@ -37,6 +37,14 @@ use crate::dml::service::DmlService;
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 use novarocks_spi::connector::LakePublicationFamily;
 
+/// A prepared DELETE whose provider write has not begun.
+///
+/// The retained handle is exact to one statement and may be dropped before
+/// dispatch. No publication attempt exists until the write edge is admitted.
+pub(crate) struct PreparedDeleteAttempt {
+    prepared: PreparedDelete,
+}
+
 struct DeleteWriteExecutor<'a> {
     engine: &'a dyn DeleteEngine,
     prepared: &'a PreparedDelete,
@@ -132,20 +140,21 @@ fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
 }
 
 impl DmlService {
-    /// Executes a parser-owned DELETE variant. `source` is carried only for
-    /// AST-span slices during preparation; it is never reparsed here.
+    /// Prepares a parser-owned DELETE variant without beginning its write.
+    /// `source` is carried only for AST-span slices during preparation; it is
+    /// never reparsed here.
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
     )]
-    pub fn execute_delete(
+    pub(crate) fn prepare_delete(
         &self,
         engine: &dyn DeleteEngine,
         statement: DeleteStatement<'_>,
         source: &str,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<(), DmlError> {
+    ) -> Result<PreparedDeleteAttempt, DmlError> {
         if let DeleteStatement::Predicate(delete) = statement
             && delete.selection.is_none()
         {
@@ -169,11 +178,25 @@ impl DmlService {
                 execution: context.execution().clone(),
             })
             .map_err(DmlError::executor)?;
+        Ok(PreparedDeleteAttempt { prepared })
+    }
+
+    /// Crosses the statement's one-shot DELETE write boundary.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
+    pub(crate) fn execute_prepared_delete(
+        &self,
+        engine: &dyn DeleteEngine,
+        prepared: PreparedDeleteAttempt,
+    ) -> Result<(), DmlError> {
+        let _ = self;
         let executor = DeleteWriteExecutor {
             engine,
-            prepared: &prepared,
+            prepared: &prepared.prepared,
         };
-        let spec = write_transaction_spec(&prepared);
+        let spec = write_transaction_spec(&prepared.prepared);
         StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::DataMutation)
             .run(spec)?;
         Ok(())

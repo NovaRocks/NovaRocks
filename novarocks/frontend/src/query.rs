@@ -523,7 +523,11 @@ enum RoutedExecutionError {
 fn dml_statement_result(
     result: Result<(), crate::dml::DmlError>,
 ) -> Result<StatementResult, RoutedExecutionError> {
-    result.map(|()| StatementResult::Ok).map_err(|error| {
+    dml_result(result).map(|()| StatementResult::Ok)
+}
+
+fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExecutionError> {
+    result.map_err(|error| {
         if let Some(user_error) = error.user_error().cloned() {
             RoutedExecutionError::User(user_error)
         } else if let Some(engine_error_code) = error.engine_error_code() {
@@ -564,20 +568,26 @@ fn execute_typed_dml_statement(
             context,
             Some(query_options),
         )),
-        DmlStatement::Delete(statement) => dml_statement_result(dml.execute_delete(
-            delete_engine,
-            crate::query_execution::dml::delete::DeleteStatement::Predicate(statement),
-            source,
-            context,
-            Some(query_options),
-        )),
-        DmlStatement::AddEqualityDelete(statement) => dml_statement_result(dml.execute_delete(
-            delete_engine,
-            crate::query_execution::dml::delete::DeleteStatement::Equality(statement),
-            source,
-            context,
-            Some(query_options),
-        )),
+        DmlStatement::Delete(statement) => dml_statement_result(
+            dml.prepare_delete(
+                delete_engine,
+                crate::query_execution::dml::delete::DeleteStatement::Predicate(statement),
+                source,
+                context,
+                Some(query_options),
+            )
+            .and_then(|prepared| dml.execute_prepared_delete(delete_engine, prepared)),
+        ),
+        DmlStatement::AddEqualityDelete(statement) => dml_statement_result(
+            dml.prepare_delete(
+                delete_engine,
+                crate::query_execution::dml::delete::DeleteStatement::Equality(statement),
+                source,
+                context,
+                Some(query_options),
+            )
+            .and_then(|prepared| dml.execute_prepared_delete(delete_engine, prepared)),
+        ),
         DmlStatement::Update(_) | DmlStatement::Merge(_) => {
             dml_statement_result(dml.try_execute_typed_mutation(
                 mutation_engine,
@@ -1642,6 +1652,68 @@ impl FrontendQuerySession {
                 });
                 Ok((result, execution_owner))
             }),
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(statement)) => {
+                let prepare_dml = Arc::clone(&dml);
+                let execute_dml = dml;
+                let prepare_engine = Arc::clone(&delete_engine);
+                let execute_engine = delete_engine;
+                let prepare_context = context.clone();
+                let prepare_options = query_options.clone();
+                Box::pin(execute_prepared_dml_statement(
+                    synchronous_command_executor,
+                    worker_cancellation,
+                    diagnostic_statement,
+                    execution_owner,
+                    move || {
+                        dml_result(prepare_dml.prepare_delete(
+                            prepare_engine.as_ref(),
+                            crate::query_execution::dml::delete::DeleteStatement::Predicate(
+                                &statement,
+                            ),
+                            &sql,
+                            &prepare_context,
+                            Some(&prepare_options),
+                        ))
+                    },
+                    move |prepared| {
+                        dml_statement_result(
+                            execute_dml.execute_prepared_delete(execute_engine.as_ref(), prepared),
+                        )
+                    },
+                ))
+            }
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::AddEqualityDelete(
+                statement,
+            )) => {
+                let prepare_dml = Arc::clone(&dml);
+                let execute_dml = dml;
+                let prepare_engine = Arc::clone(&delete_engine);
+                let execute_engine = delete_engine;
+                let prepare_context = context.clone();
+                let prepare_options = query_options.clone();
+                Box::pin(execute_prepared_dml_statement(
+                    synchronous_command_executor,
+                    worker_cancellation,
+                    diagnostic_statement,
+                    execution_owner,
+                    move || {
+                        dml_result(prepare_dml.prepare_delete(
+                            prepare_engine.as_ref(),
+                            crate::query_execution::dml::delete::DeleteStatement::Equality(
+                                &statement,
+                            ),
+                            &sql,
+                            &prepare_context,
+                            Some(&prepare_options),
+                        ))
+                    },
+                    move |prepared| {
+                        dml_statement_result(
+                            execute_dml.execute_prepared_delete(execute_engine.as_ref(), prepared),
+                        )
+                    },
+                ))
+            }
             ParsedStatement::Dml(statement) => Box::pin(execute_synchronous_statement(
                 synchronous_command_executor,
                 worker_cancellation,
@@ -2979,6 +3051,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingDeleteEngine {
         executions: Mutex<Vec<QueryExecutionContext>>,
+        native_encoding_requests: AtomicUsize,
     }
 
     struct RejectingMutationEngine;
@@ -3037,6 +3110,19 @@ mod tests {
 
         fn run_delete(&self, _prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
             Ok(DeleteWriteReport::NoOp)
+        }
+
+        fn delete_native_encoding<'a>(
+            &self,
+            _prepared: &'a dyn DeletePrepared,
+        ) -> Result<
+            crate::query_execution::dml::delete::DeleteNativeEncoding<'a>,
+            crate::dml::error::DmlExecutionError,
+        > {
+            self.native_encoding_requests.fetch_add(1, Ordering::SeqCst);
+            Err(crate::dml::error::DmlExecutionError::from(
+                "recording DELETE stops at the native dispatch edge".to_string(),
+            ))
         }
 
         fn finalize_delete(&self, _prepared: &dyn DeletePrepared) -> Result<(), String> {
@@ -3144,13 +3230,14 @@ mod tests {
                 .map(|()| StatementResult::Ok)
                 .map_err(|error| error.to_string()),
             [Statement::Dml(DmlStatement::Delete(statement))] => dml
-                .execute_delete(
+                .prepare_delete(
                     delete_engine,
                     crate::query_execution::dml::delete::DeleteStatement::Predicate(statement),
                     sql,
                     context,
                     Some(&query_options),
                 )
+                .and_then(|prepared| dml.execute_prepared_delete(delete_engine, prepared))
                 .map(|()| StatementResult::Ok)
                 .map_err(|error| error.to_string()),
             [Statement::Dml(DmlStatement::Update(_) | DmlStatement::Merge(_))] => mutation_engine
@@ -3282,6 +3369,37 @@ mod tests {
         assert_eq!(executions[0].topology().revision(), 88);
         assert_eq!(executions[0].deadline(), Some(deadline));
         assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_delete_can_drop_before_native_dispatch() {
+        let engine = RecordingDeleteEngine::default();
+        let dml = DmlService::new();
+        let cancellation = QueryCancellationSource::new();
+        let context =
+            router_test_context(89, Instant::now() + Duration::from_secs(30), &cancellation);
+        let parsed = novarocks_parser::parse("DELETE FROM t WHERE a = 1").expect("DELETE parses");
+        let statement = match &parsed[0] {
+            novarocks_parser::ast::Statement::Dml(novarocks_parser::ast::DmlStatement::Delete(
+                statement,
+            )) => statement,
+            _ => panic!("expected typed DELETE"),
+        };
+
+        let prepared = dml
+            .prepare_delete(
+                &engine,
+                crate::query_execution::dml::delete::DeleteStatement::Predicate(statement),
+                "DELETE FROM t WHERE a = 1",
+                &context,
+                Some(&default_query_options()),
+            )
+            .expect("preparation is inert");
+        assert_eq!(engine.executions.lock().unwrap().len(), 1);
+        assert_eq!(engine.native_encoding_requests.load(Ordering::SeqCst), 0);
+
+        drop(prepared);
+        assert_eq!(engine.native_encoding_requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]
