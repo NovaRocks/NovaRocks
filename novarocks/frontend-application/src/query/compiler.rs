@@ -400,6 +400,15 @@ impl FrontendQueryCompiler {
         let connector_context = connector_planning_context.request();
         let query_application_read = matches!(&completion_intent, PostCompileIntent::Result);
         let logical_reservation = if query_application_read {
+            // The Query Application mints the runtime logical execution only
+            // after this frozen description has been handed off. Reserve a
+            // diagnostics-only query identity here so preparation events keep
+            // their statement-to-logical correlation without creating an
+            // attempt or retaining a legacy coordinator owner.
+            self.query
+                .query_execution()
+                .reserve_logical_query()
+                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
             None
         } else {
             Some(
