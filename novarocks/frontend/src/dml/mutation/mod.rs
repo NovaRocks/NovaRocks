@@ -36,6 +36,15 @@ use crate::dml::service::DmlService;
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
 
+/// A prepared UPDATE or MERGE whose native staging has not begun.
+///
+/// The opaque handle remains exact to the admitted statement. Dropping it
+/// before the dispatch edge cannot create a write or publication attempt.
+pub(crate) struct PreparedMutationAttempt {
+    prepared: PreparedMutation,
+    subkind: &'static str,
+}
+
 struct MutationWriteExecutor<'a> {
     engine: &'a dyn MutationEngine,
     prepared: &'a PreparedMutation,
@@ -142,20 +151,20 @@ fn write_transaction_spec(prepared: &PreparedMutation, _subkind: &str) -> WriteT
 }
 
 impl DmlService {
-    /// Executes an UPDATE or MERGE already classified by SQLP-5's typed AST.
+    /// Prepares an UPDATE or MERGE already classified by SQLP-5's typed AST.
     /// The statement family comes from the variant, never from `source` text.
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
     )]
-    pub fn try_execute_typed_mutation(
+    pub(crate) fn prepare_typed_mutation(
         &self,
         engine: &dyn MutationEngine,
         statement: &DmlStatement,
         source: &str,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<(), DmlError> {
+    ) -> Result<PreparedMutationAttempt, DmlError> {
         let (_kind, subkind) = admit_mutation(statement, source)?;
         let publication_id = LakePublicationId::new_v7();
 
@@ -171,13 +180,27 @@ impl DmlService {
                 execution: context.execution().clone(),
             })
             .map_err(DmlError::executor)?;
+        Ok(PreparedMutationAttempt { prepared, subkind })
+    }
+
+    /// Crosses the statement's one-shot native staging and publication edge.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
+    pub(crate) fn execute_prepared_mutation(
+        &self,
+        engine: &dyn MutationEngine,
+        prepared: PreparedMutationAttempt,
+    ) -> Result<(), DmlError> {
+        let _ = self;
         // Preparation is inert; the statement-local attempt owns the later
         // staging and publication boundary without durable DML admission.
         let executor = MutationWriteExecutor {
             engine,
-            prepared: &prepared,
+            prepared: &prepared.prepared,
         };
-        let spec = write_transaction_spec(&prepared, subkind);
+        let spec = write_transaction_spec(&prepared.prepared, prepared.subkind);
         StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::DataMutation)
             .run(spec)?;
         Ok(())

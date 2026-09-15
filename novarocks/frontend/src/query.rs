@@ -588,15 +588,16 @@ fn execute_typed_dml_statement(
             )
             .and_then(|prepared| dml.execute_prepared_delete(delete_engine, prepared)),
         ),
-        DmlStatement::Update(_) | DmlStatement::Merge(_) => {
-            dml_statement_result(dml.try_execute_typed_mutation(
+        DmlStatement::Update(_) | DmlStatement::Merge(_) => dml_statement_result(
+            dml.prepare_typed_mutation(
                 mutation_engine,
                 statement,
                 source,
                 context,
                 Some(query_options),
-            ))
-        }
+            )
+            .and_then(|prepared| dml.execute_prepared_mutation(mutation_engine, prepared)),
+        ),
         DmlStatement::CreateTableAsSelect(statement) => dml_statement_result(dml.try_execute_ctas(
             ctas_engine,
             statement,
@@ -1714,6 +1715,38 @@ impl FrontendQuerySession {
                     },
                 ))
             }
+            ParsedStatement::Dml(
+                statement @ (novarocks_parser::ast::DmlStatement::Update(_)
+                | novarocks_parser::ast::DmlStatement::Merge(_)),
+            ) => {
+                let prepare_dml = Arc::clone(&dml);
+                let execute_dml = dml;
+                let prepare_engine = Arc::clone(&mutation_engine);
+                let execute_engine = mutation_engine;
+                let prepare_context = context.clone();
+                let prepare_options = query_options.clone();
+                Box::pin(execute_prepared_dml_statement(
+                    synchronous_command_executor,
+                    worker_cancellation,
+                    diagnostic_statement,
+                    execution_owner,
+                    move || {
+                        dml_result(prepare_dml.prepare_typed_mutation(
+                            prepare_engine.as_ref(),
+                            &statement,
+                            &sql,
+                            &prepare_context,
+                            Some(&prepare_options),
+                        ))
+                    },
+                    move |prepared| {
+                        dml_statement_result(
+                            execute_dml
+                                .execute_prepared_mutation(execute_engine.as_ref(), prepared),
+                        )
+                    },
+                ))
+            }
             ParsedStatement::Dml(statement) => Box::pin(execute_synchronous_statement(
                 synchronous_command_executor,
                 worker_cancellation,
@@ -2570,8 +2603,8 @@ mod tests {
         ResolveInsertTarget, ResolvedInsertTarget,
     };
     use crate::query_execution::dml::mutation::{
-        MutationEngine, MutationPrepared, MutationStageOutcome, PrepareMutationRequest,
-        PreparedMutation,
+        MutationEngine, MutationOperation, MutationPrepared, MutationStageOutcome,
+        MutationStatementKind, PrepareMutationRequest, PreparedMutation,
     };
     use arrow::{
         array::{Int64Array, StringArray},
@@ -3056,6 +3089,20 @@ mod tests {
 
     struct RejectingMutationEngine;
 
+    #[derive(Default)]
+    struct RecordingMutationEngine {
+        preparations: AtomicUsize,
+        native_stage_requests: AtomicUsize,
+    }
+
+    struct TestMutationPrepared;
+
+    impl MutationPrepared for TestMutationPrepared {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     impl MutationEngine for RejectingMutationEngine {
         fn prepare_mutation(
             &self,
@@ -3073,6 +3120,43 @@ mod tests {
 
         fn finalize_mutation(&self, _prepared: &dyn MutationPrepared) -> Result<(), String> {
             unreachable!("rejected mutation must not finalize")
+        }
+    }
+
+    impl MutationEngine for RecordingMutationEngine {
+        fn prepare_mutation(
+            &self,
+            request: PrepareMutationRequest<'_>,
+        ) -> Result<PreparedMutation, String> {
+            self.preparations.fetch_add(1, Ordering::SeqCst);
+            Ok(PreparedMutation {
+                operation: MutationOperation {
+                    publication_id: request.publication_id,
+                    kind: MutationStatementKind::Update,
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: "t".to_string(),
+                    target_ref: "main".to_string(),
+                    attempt_id: "test-mutation".to_string(),
+                    base_snapshot_id: None,
+                },
+                handle: Arc::new(TestMutationPrepared),
+                sql_source: request.source.to_string(),
+            })
+        }
+
+        fn stage_mutation(
+            &self,
+            _prepared: &dyn MutationPrepared,
+        ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError> {
+            self.native_stage_requests.fetch_add(1, Ordering::SeqCst);
+            Err(crate::dml::error::DmlExecutionError::from(
+                "recording mutation stops at the native dispatch edge".to_string(),
+            ))
+        }
+
+        fn finalize_mutation(&self, _prepared: &dyn MutationPrepared) -> Result<(), String> {
+            unreachable!("recording mutation never reaches finalization")
         }
     }
 
@@ -3243,7 +3327,7 @@ mod tests {
             [Statement::Dml(DmlStatement::Update(_) | DmlStatement::Merge(_))] => mutation_engine
                 .ok_or_else(|| "mutation engine is unavailable".to_string())
                 .and_then(|engine| {
-                    dml.try_execute_typed_mutation(
+                    dml.prepare_typed_mutation(
                         engine,
                         match &parsed[0] {
                             Statement::Dml(statement) => statement,
@@ -3253,6 +3337,7 @@ mod tests {
                         context,
                         Some(&query_options),
                     )
+                    .and_then(|prepared| dml.execute_prepared_mutation(engine, prepared))
                     .map(|()| StatementResult::Ok)
                     .map_err(|error| error.to_string())
                 }),
@@ -3400,6 +3485,38 @@ mod tests {
 
         drop(prepared);
         assert_eq!(engine.native_encoding_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepared_mutation_can_drop_before_native_dispatch() {
+        let engine = RecordingMutationEngine::default();
+        let dml = DmlService::new();
+        let cancellation = QueryCancellationSource::new();
+        let context =
+            router_test_context(90, Instant::now() + Duration::from_secs(30), &cancellation);
+        let parsed =
+            novarocks_parser::parse("UPDATE t SET a = 1 WHERE a = 0").expect("UPDATE parses");
+        let statement = match &parsed[0] {
+            novarocks_parser::ast::Statement::Dml(
+                statement @ novarocks_parser::ast::DmlStatement::Update(_),
+            ) => statement,
+            _ => panic!("expected typed UPDATE"),
+        };
+
+        let prepared = dml
+            .prepare_typed_mutation(
+                &engine,
+                statement,
+                "UPDATE t SET a = 1 WHERE a = 0",
+                &context,
+                Some(&default_query_options()),
+            )
+            .expect("preparation is inert");
+        assert_eq!(engine.preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.native_stage_requests.load(Ordering::SeqCst), 0);
+
+        drop(prepared);
+        assert_eq!(engine.native_stage_requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]
