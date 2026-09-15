@@ -391,6 +391,7 @@ impl QueryCredentialLeaseRefresher for ProviderVendedS3LeaseRefresher {
 fn map_provider_refresh_error(error: ConnectorError) -> QueryCredentialLeaseRefreshError {
     match error.kind() {
         ConnectorErrorKind::DeadlineExceeded => QueryCredentialLeaseRefreshError::DeadlineExhausted,
+        ConnectorErrorKind::Cancelled => QueryCredentialLeaseRefreshError::FencedAfterProviderCall,
         _ => QueryCredentialLeaseRefreshError::retryable(
             "provider vended S3 credential refresh failed",
         ),
@@ -451,6 +452,7 @@ pub(crate) trait QueryCredentialLeaseRefresher: Send + Sync + 'static {
 pub(crate) enum QueryCredentialLeaseRefreshError {
     Retryable(String),
     DeadlineExhausted,
+    FencedAfterProviderCall,
 }
 
 impl QueryCredentialLeaseRefreshError {
@@ -1212,6 +1214,15 @@ mod tests {
             retryable,
             QueryCredentialLeaseRefreshError::Retryable(_)
         ));
+
+        let fenced = map_provider_refresh_error(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Cancelled,
+            "attempt terminal fence",
+        ));
+        assert_eq!(
+            fenced,
+            QueryCredentialLeaseRefreshError::FencedAfterProviderCall
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorVendedS3CredentialLeaseRefresher,
     StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
     VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
-    VendedS3CredentialRefreshCallPolicy,
+    VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -608,6 +608,9 @@ where
             let deadline = tokio::time::Instant::now() + policy.remaining();
             let mut attempts = 0_u8;
             loop {
+                if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
+                    return Err(refresh_dispatch_fenced(operation));
+                }
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     return Err(refresh_deadline_exhausted(operation));
@@ -630,6 +633,9 @@ where
                             return Err(refresh_deadline_exhausted(operation));
                         }
                         tokio::time::sleep(policy.retry_backoff()).await;
+                        if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
+                            return Err(refresh_dispatch_fenced(operation));
+                        }
                     }
                 }
             }
@@ -654,6 +660,13 @@ fn refresh_deadline_exhausted(operation: &'static str) -> ConnectorError {
     ConnectorError::new(
         ConnectorErrorKind::DeadlineExceeded,
         format!("{operation} exhausted its provider-call deadline"),
+    )
+}
+
+fn refresh_dispatch_fenced(operation: &'static str) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Cancelled,
+        format!("{operation} retry dispatch was fenced by its terminated attempt"),
     )
 }
 
@@ -1225,7 +1238,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::num::NonZeroU8;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::time::Duration;
 
     use super::{
@@ -1234,7 +1247,30 @@ mod tests {
         S3_SESSION_TOKEN, S3_SESSION_TOKEN_EXPIRES_AT_MS, parse_vended_s3_credentials_at,
         run_vended_refresh_with_policy,
     };
-    use novarocks_spi::connector::{ConnectorErrorKind, VendedS3CredentialRefreshCallPolicy};
+    use novarocks_spi::connector::{
+        ConnectorErrorKind, VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
+        VendedS3CredentialRefreshDispatchGuard,
+    };
+
+    struct PermittedDispatch;
+
+    impl VendedS3CredentialRefreshDispatchGuard for PermittedDispatch {
+        fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch {
+            VendedS3CredentialRefreshDispatch::Permitted
+        }
+    }
+
+    struct ToggleDispatch(Arc<AtomicBool>);
+
+    impl VendedS3CredentialRefreshDispatchGuard for ToggleDispatch {
+        fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch {
+            if self.0.load(Ordering::SeqCst) {
+                VendedS3CredentialRefreshDispatch::Permitted
+            } else {
+                VendedS3CredentialRefreshDispatch::Fenced
+            }
+        }
+    }
 
     fn input(prefix: &str, expiration: u64, suffix: &str) -> RestCredentialInput {
         RestCredentialInput {
@@ -1343,6 +1379,7 @@ mod tests {
             Duration::from_millis(100),
             NonZeroU8::new(2).expect("nonzero attempts"),
             Duration::from_millis(1),
+            Arc::new(PermittedDispatch),
         )
         .expect("bounded policy");
 
@@ -1372,6 +1409,7 @@ mod tests {
             Duration::from_millis(10),
             NonZeroU8::new(1).expect("nonzero attempts"),
             Duration::ZERO,
+            Arc::new(PermittedDispatch),
         )
         .expect("single-attempt policy permits no retry delay");
 
@@ -1395,6 +1433,7 @@ mod tests {
             Duration::from_millis(100),
             NonZeroU8::new(2).expect("nonzero attempts"),
             Duration::from_millis(1),
+            Arc::new(PermittedDispatch),
         )
         .expect("bounded policy");
 
@@ -1417,6 +1456,48 @@ mod tests {
 
         assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
         assert!(!error.retryable_before_progress());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn vended_refresh_fences_retry_after_the_first_provider_request_returns_retryable() {
+        let (_owner, runtime) = catalog_runtime();
+        let attempts = Arc::new(AtomicU8::new(0));
+        let observed = Arc::clone(&attempts);
+        let permit = Arc::new(AtomicBool::new(true));
+        let revoked = Arc::clone(&permit);
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(100),
+            NonZeroU8::new(2).expect("nonzero attempts"),
+            Duration::from_millis(1),
+            Arc::new(ToggleDispatch(Arc::clone(&permit))),
+        )
+        .expect("bounded policy");
+
+        let error = run_vended_refresh_with_policy::<(), _, _>(
+            &runtime,
+            policy,
+            "test refresh",
+            move || {
+                let observed = Arc::clone(&observed);
+                let revoked = Arc::clone(&revoked);
+                async move {
+                    let call = observed.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        revoked.store(false, Ordering::SeqCst);
+                        Err(crate::iceberg::Error::new(
+                            crate::iceberg::ErrorKind::Unexpected,
+                            "first request is retryable",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .expect_err("a terminal attempt must fence the retry dispatch");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 

@@ -246,6 +246,28 @@ impl VendedS3CredentialLeaseRefresh {
     }
 }
 
+/// Secret-free observation used immediately before a provider refresh dispatch.
+///
+/// This is intentionally a process-local capability rather than a serialized
+/// cancellation token. The provider only learns whether another external
+/// request remains permitted; it cannot obtain an attempt identity, a
+/// credential, or a runtime registry from this port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VendedS3CredentialRefreshDispatch {
+    Permitted,
+    Fenced,
+}
+
+/// Attempt-local authority over provider credential-refresh dispatches.
+///
+/// Providers must check this before every external dispatch, including a
+/// retry after a retryable response. A `Fenced` result means that no new
+/// request may be started; it never claims that an already-issued request was
+/// forcibly cancelled.
+pub trait VendedS3CredentialRefreshDispatchGuard: Send + Sync {
+    fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch;
+}
+
 /// Secret-free, FE-local bound for one provider credential-refresh call.
 ///
 /// The provider starts one monotonic deadline when it receives this policy.
@@ -253,11 +275,24 @@ impl VendedS3CredentialLeaseRefresh {
 /// inside that one budget.  This is deliberately a synchronous call policy:
 /// it does not claim that a caller can forcibly abort an already-issued I/O
 /// operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct VendedS3CredentialRefreshCallPolicy {
     remaining: Duration,
     max_attempts: NonZeroU8,
     retry_backoff: Duration,
+    dispatch_guard: Arc<dyn VendedS3CredentialRefreshDispatchGuard>,
+}
+
+impl std::fmt::Debug for VendedS3CredentialRefreshCallPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VendedS3CredentialRefreshCallPolicy")
+            .field("remaining", &self.remaining)
+            .field("max_attempts", &self.max_attempts)
+            .field("retry_backoff", &self.retry_backoff)
+            .field("dispatch_guard", &"<process-local>")
+            .finish()
+    }
 }
 
 impl VendedS3CredentialRefreshCallPolicy {
@@ -265,6 +300,7 @@ impl VendedS3CredentialRefreshCallPolicy {
         remaining: Duration,
         max_attempts: NonZeroU8,
         retry_backoff: Duration,
+        dispatch_guard: Arc<dyn VendedS3CredentialRefreshDispatchGuard>,
     ) -> Result<Self, ConnectorError> {
         if remaining.is_zero() {
             return Err(invalid("vended S3 credential refresh remaining budget"));
@@ -276,6 +312,7 @@ impl VendedS3CredentialRefreshCallPolicy {
             remaining,
             max_attempts,
             retry_backoff,
+            dispatch_guard,
         })
     }
 
@@ -289,6 +326,12 @@ impl VendedS3CredentialRefreshCallPolicy {
 
     pub const fn retry_backoff(&self) -> Duration {
         self.retry_backoff
+    }
+
+    /// Reads the same attempt-local dispatch authority used by the caller.
+    /// The result must be checked at each actual provider request boundary.
+    pub fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch {
+        self.dispatch_guard.provider_dispatch()
     }
 }
 
@@ -653,6 +696,7 @@ mod tests {
         CredentialLeaseProvider, MAX_CREDENTIAL_LEASE_PREFIXES,
         VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
         VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
+        VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
     };
     use crate::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
@@ -674,6 +718,14 @@ mod tests {
     }
 
     struct ProviderLocalRefresher;
+
+    struct PermittedDispatch;
+
+    impl VendedS3CredentialRefreshDispatchGuard for PermittedDispatch {
+        fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch {
+            VendedS3CredentialRefreshDispatch::Permitted
+        }
+    }
 
     impl ConnectorVendedS3CredentialLeaseRefresher for ProviderLocalRefresher {
         fn refresh_vended_s3_credentials(
@@ -708,6 +760,7 @@ mod tests {
                 Duration::ZERO,
                 NonZeroU8::new(1).expect("nonzero attempts"),
                 Duration::ZERO,
+                Arc::new(PermittedDispatch),
             )
             .is_err()
         );
@@ -716,6 +769,7 @@ mod tests {
                 Duration::from_millis(1),
                 NonZeroU8::new(2).expect("nonzero attempts"),
                 Duration::ZERO,
+                Arc::new(PermittedDispatch),
             )
             .is_err()
         );
@@ -724,6 +778,7 @@ mod tests {
             Duration::from_millis(20),
             NonZeroU8::new(2).expect("nonzero attempts"),
             Duration::from_millis(1),
+            Arc::new(PermittedDispatch),
         )
         .expect("valid bounded policy");
         assert_eq!(policy.max_attempts().get(), 2);

@@ -53,6 +53,7 @@ use novarocks_execution::task_execution::operation::{OperationOutcome, QueryCont
 use novarocks_query_application::coordination::MonotonicInstant;
 use novarocks_spi::connector::{
     CredentialLeaseId as StorageLeaseId, VendedS3CredentialRefreshCallPolicy,
+    VendedS3CredentialRefreshDispatchGuard,
 };
 use novarocks_types::QueryExecutionId;
 
@@ -95,6 +96,9 @@ enum VendOutcome {
     /// The attempt terminal fence closed while this job waited for blocking
     /// admission. No provider request or retry was issued.
     FencedBeforeProviderCall,
+    /// The first request entered, then the attempt ended before a retry could
+    /// start. The provider returned without issuing a second request.
+    FencedAfterProviderCall,
 }
 
 /// One in-flight provider call.
@@ -405,6 +409,9 @@ impl CredentialRotationPump {
                 VendOutcome::DeadlineExhausted => {
                     Err(self.rotation_failed("the credential provider exhausted its call deadline"))
                 }
+                VendOutcome::FencedAfterProviderCall => Err(self.rotation_failed(
+                    "credential provider retry was fenced after its first external request",
+                )),
                 VendOutcome::FencedBeforeProviderCall => Err(self.rotation_failed(
                     "credential provider job was fenced before its external request",
                 )),
@@ -452,11 +459,14 @@ impl CredentialRotationPump {
                     ProviderCallEntry::Closed => VendOutcome::FencedBeforeProviderCall,
                     ProviderCallEntry::Entered => {
                         let remaining = provider_deadline.saturating_duration_since(Instant::now());
+                        let dispatch_guard: Arc<dyn VendedS3CredentialRefreshDispatchGuard> =
+                            Arc::new(provider_fence.clone());
                         let policy = VendedS3CredentialRefreshCallPolicy::try_new(
                             remaining,
                             NonZeroU8::new(3)
                                 .expect("fixed provider refresh attempt count is nonzero"),
                             PROVIDER_RETRY_INITIAL,
+                            dispatch_guard,
                         );
                         match policy {
                             Err(error) => VendOutcome::Retryable(error.message().to_owned()),
@@ -467,6 +477,9 @@ impl CredentialRotationPump {
                                 }
                                 Err(QueryCredentialLeaseRefreshError::DeadlineExhausted) => {
                                     VendOutcome::DeadlineExhausted
+                                }
+                                Err(QueryCredentialLeaseRefreshError::FencedAfterProviderCall) => {
+                                    VendOutcome::FencedAfterProviderCall
                                 }
                             },
                         }
@@ -561,6 +574,9 @@ fn classify_residual_vending_outcome(
         Ok(VendOutcome::Refreshed(_)) => CredentialResidualJobOutcome::Completed,
         Ok(VendOutcome::FencedBeforeProviderCall) => {
             CredentialResidualJobOutcome::FencedBeforeProviderCall
+        }
+        Ok(VendOutcome::FencedAfterProviderCall) => {
+            CredentialResidualJobOutcome::FencedAfterProviderCall
         }
         Ok(VendOutcome::DeadlineExhausted) => CredentialResidualJobOutcome::DeadlineExhausted,
         Ok(VendOutcome::Retryable(_)) | Err(_) => CredentialResidualJobOutcome::Failed,

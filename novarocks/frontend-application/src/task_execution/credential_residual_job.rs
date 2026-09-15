@@ -9,19 +9,18 @@
 //! its terminal status.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use novarocks_spi::connector::{
+    VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
+};
 use novarocks_types::QueryExecutionId;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
 use super::blocking_io::{ConnectorBlockingIoError, ConnectorBlockingIoJob};
-
-const FENCE_OPEN: u8 = 0;
-const FENCE_ENTERED: u8 = 1;
-const FENCE_CLOSED: u8 = 2;
 
 /// One attempt-local capability used exactly at the external provider edge.
 ///
@@ -30,7 +29,9 @@ const FENCE_CLOSED: u8 = 2;
 /// shutdown cannot claim that the request was prevented; it must transfer the
 /// job to the process-runtime owner instead.
 #[derive(Clone, Debug)]
-pub(crate) struct AttemptProviderGenerationFence(Arc<AtomicU8>);
+pub(crate) struct AttemptProviderGenerationFence {
+    closed: Arc<AtomicBool>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderCallEntry {
@@ -40,30 +41,31 @@ pub(crate) enum ProviderCallEntry {
 
 impl AttemptProviderGenerationFence {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(FENCE_OPEN)))
+        Self {
+            closed: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub(crate) fn enter_provider_call(&self) -> ProviderCallEntry {
-        match self.0.compare_exchange(
-            FENCE_OPEN,
-            FENCE_ENTERED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => ProviderCallEntry::Entered,
-            Err(FENCE_CLOSED) => ProviderCallEntry::Closed,
-            Err(FENCE_ENTERED) => ProviderCallEntry::Entered,
-            Err(state) => unreachable!("unknown provider generation fence state {state}"),
+        if self.closed.load(Ordering::Acquire) {
+            ProviderCallEntry::Closed
+        } else {
+            ProviderCallEntry::Entered
         }
     }
 
     pub(crate) fn close(&self) {
-        let _ = self.0.compare_exchange(
-            FENCE_OPEN,
-            FENCE_CLOSED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+impl VendedS3CredentialRefreshDispatchGuard for AttemptProviderGenerationFence {
+    fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch {
+        if self.closed.load(Ordering::Acquire) {
+            VendedS3CredentialRefreshDispatch::Fenced
+        } else {
+            VendedS3CredentialRefreshDispatch::Permitted
+        }
     }
 }
 
@@ -74,6 +76,7 @@ pub(crate) enum CredentialResidualJobOutcome {
     Failed,
     DeadlineExhausted,
     FencedBeforeProviderCall,
+    FencedAfterProviderCall,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,6 +236,17 @@ mod tests {
         let fence = AttemptProviderGenerationFence::new();
         fence.close();
         assert_eq!(fence.enter_provider_call(), ProviderCallEntry::Closed);
+    }
+
+    #[test]
+    fn entered_fence_blocks_a_later_provider_retry_after_close() {
+        let fence = AttemptProviderGenerationFence::new();
+        assert_eq!(fence.enter_provider_call(), ProviderCallEntry::Entered);
+        fence.close();
+        assert_eq!(
+            fence.provider_dispatch(),
+            VendedS3CredentialRefreshDispatch::Fenced
+        );
     }
 
     #[test]
