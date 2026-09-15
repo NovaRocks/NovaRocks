@@ -470,16 +470,20 @@ impl IcebergMetadataContext {
                 None,
             );
         };
-        // The cache is an admission-only freeze. A terminal write context has
-        // deliberately dropped the collector and carries a replacement
-        // terminal-only resolver; it must reload through that resolver rather
-        // than reuse a FileIO that was bound to the active attempt lease.
+        // The request cache freezes every read-only planning observation in
+        // one request scope, including the metadata/statistics/typed-scan
+        // paths before an attempt collector exists. A terminal write context
+        // deliberately drops that collector and retains a replacement storage
+        // resolver; it must reload through that resolver rather than reuse a
+        // FileIO bound to the completed attempt.
         //
-        // It must also reach the catalog rather than the control-state table
-        // cache: this is the observation a commit decides against, so a cached
-        // table would let it compute replacements from a snapshot the branch
-        // has already moved past.
-        if request_context.vended_credential_lease_sink().is_none() {
+        // Terminal reloads must also reach the catalog rather than the
+        // control-state table cache: a commit decides against that current
+        // observation, so a cached table could compute replacements from a
+        // snapshot the branch has already moved past.
+        if request_context.vended_credential_lease_sink().is_none()
+            && request_context.storage_resolver().is_some()
+        {
             return self.observe_table_classified(
                 &namespace,
                 &table,
