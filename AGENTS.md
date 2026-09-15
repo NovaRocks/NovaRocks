@@ -132,23 +132,23 @@ SQL client
   Native top-level command dispatch. The only server command is `standalone`;
   it chooses `fe`, `be`, or `all-in-one` before startup side effects.
 
-- `novarocks/frontend/src/**`
-  FE application composition, SQL admission, connector control host, and
-  distributed query coordination. `state_family/**` is the closed manifest of
-  every frontend-local state family: it owns each family's classification
-  (`ExternalProjection` / `ProcessRuntime` / `Accelerator`) and is the single
-  definition point for persistent key prefixes and record versions, so a
-  runtime family structurally cannot own durable state (ADR-0114).
-  `catalog_application/desired_state.rs` owns the catalog desired-state
-  snapshot and its mutually exclusive source modes (ADR-0115).
+- `novarocks/frontend-application/src/**`
+  FE application composition, SQL admission, catalog projection, native query
+  execution adapter and distributed task coordination. Query-local semantic
+  policy remains in `novarocks/query-application/src/**`; long-lived Catalog
+  generation ownership remains in `novarocks/catalog-application/src/**`.
+  `state_family/**` is the closed manifest of every frontend-local state
+  family: it owns each family's classification (`ExternalProjection` /
+  `ProcessRuntime` / `Accelerator`) and is the single definition point for
+  persistent key prefixes and record versions, so a runtime family
+  structurally cannot own durable state (ADR-0114).
 
-- `novarocks/backend/src/**`
-  BE application composition, native gRPC services, task execution registry,
-  and connector execution host. `rpc/**` owns generated stubs, codec, client,
-  listener composition, data-plane handlers, and the role-local data runtime;
-  `fragment/{ingress.rs,decode/**}`, `task_execution/{ingress.rs,receipt.rs}`,
-  `runtime_filter/{rpc.rs,install_decode.rs,transport.rs}`, and
-  `connector/binding_decode.rs` own their respective wire adapters.
+- `novarocks/worker/src/**` and `novarocks/native-adapter/src/**`
+  Worker owns BE-local Task/context admission, lifecycle, leases, convergence
+  and connector execution policy. Native Adapter owns generated stubs/codec,
+  listener composition, data-plane handlers and role-local wire projection.
+  Keep generated DTO decode at the adapter boundary; do not move it into
+  Worker or recreate a Backend facade.
 
 - `novarocks/core/src/**`
   Carrier-neutral execution, query lifecycle contracts, and native runtime
@@ -272,7 +272,7 @@ SQL client
   SQL-owned local `PlannerMemoryCatalog`; it stores private planner facts and
   materializes only SQL catalog-visible values.
 
-- `novarocks/frontend/src/catalog_application/query_catalog/**`
+- `novarocks/frontend-application/src/catalog_application/query_catalog/**`
   Frontend-owned query catalog registry, schema cache, and service composition.
   Connector admission and local-catalog snapshots remain application-owned.
 
@@ -317,9 +317,9 @@ SQL client
 
 ### 5.3 Native Distributed Task Execution Path
 
-1. `novarocks/frontend/src/coordinator/execution.rs` freezes a
+1. `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs` freezes a
    `QueryExecutionId` and, from one live backend snapshot, a task graph:
-   `novarocks/frontend/src/task_execution/graph.rs` mints a `TaskIdentity`
+   `novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
    ({QueryExecutionId, StageId, TaskId, BackendProcessId}) per placement and a
    `QueryContextRef` ({QueryExecutionId, FrontendProcessId, BackendProcessId})
    per participating backend. A context exists only where the scheduler placed
@@ -327,7 +327,7 @@ SQL client
    splits, never of the cluster size.
 2. `execute_round_on_task_protocol` establishes every context and creates every
    task through a bounded, fair dispatcher
-   (`novarocks/frontend/src/task_execution/{round,dispatch,context_owner}.rs`).
+   (`novarocks/frontend-application/src/task_execution/{round,dispatch,context_owner}.rs`).
    Each operation gets one verdict per domain -- Apply / Idempotent / Older /
    Conflict -- and a domain never rolls back, which is why replaying the exact
    request is the prescribed recovery for an unknown outcome and a conflicting
@@ -336,7 +336,7 @@ SQL client
    acknowledged its task's creation
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no
    frame can precede the receiver that counts it.
-4. `novarocks/backend/src/task_execution/registry.rs` owns the BE-local
+4. `novarocks/worker/src/task_registry.rs` owns the BE-local
    context and task state, exact admission, lease renewal and expiry, bounded
    tombstones, and one termination latch per task. The latch is first-wins with
    a single exception: a derived cause (`Aborted(PeerTaskFailed)`) is a
@@ -344,11 +344,11 @@ SQL client
    exactly once.
 5. Runtime-filter contributions and an operator's own counters ride
    `ReleaseQueryContextAck`: release is the backend's own statement that every
-   local task is a terminal record, and the frontend drives it for every
+   local task is a terminal record, and the Frontend Application drives it for every
    intent. The task protocol mints no participant proof or attestation -- a
    task's terminal *is* its own status.
-6. Client cancellation is `KILL QUERY` through the frontend query-control
-   owner, delivered as `AbortQueryContext`. The frontend withholds the
+6. Client cancellation is `KILL QUERY` through the Query Application query-control
+   owner, delivered as `AbortQueryContext`. The Frontend Application withholds the
    interrupt until its coordinator worker unwinds, so the next statement on
    that connection cannot race the statement generation.
 
@@ -391,7 +391,7 @@ SQL client
   mismatching is fatal; neither is ever partially matched.
 
 - `TaskExecutionRegistry`:
-  `novarocks/backend/src/task_execution/registry.rs`
+  `novarocks/worker/src/task_registry.rs`
   BE-owned context and task state, exact admission, per-domain progression,
   lease renewal and expiry, bounded tombstones, and one termination latch per
   task.
@@ -708,9 +708,10 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 - **Scheduling/parallelism**: inspect `src/exec/pipeline/*`.
 - **Exchange behavior**: inspect `src/runtime/exchange.rs`, `src/runtime/exchange_scan.rs`, `src/service/grpc_*.rs`.
 - **Native distributed task execution**: inspect
-  `novarocks/frontend/src/coordinator/execution.rs`,
-  `novarocks/frontend/src/task_execution/**`,
-  `novarocks/backend/src/task_execution/**`, and
+  `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
+  `novarocks/frontend-application/src/task_execution/**`,
+  `novarocks/worker/src/{task_registry,ingress,convergence}.rs`,
+  `novarocks/native-adapter/src/{backend_application,task_protocol_ingress}.rs`, and
   `novarocks/execution/src/task_execution/**`. Preserve the destination-ACK
   gated edge-open barrier and the per-domain Apply / Idempotent / Older /
   Conflict verdict; do not add a protocol shim, a standalone direct-call path,
@@ -719,8 +720,9 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   `novarocks/fs/**`. The active sealed providers are Iceberg and Paimon;
   StarRocks is retired and must not be restored through a local-binding config
   or runtime fallback.
-- **FE/BE interface behavior**: inspect `novarocks/frontend/src/**`,
-  `novarocks/backend/src/**`, and the neutral contracts under `novarocks/spi/**`
+- **FE/BE interface behavior**: inspect `novarocks/frontend-application/src/**`,
+  `novarocks/query-application/src/**`, `novarocks/worker/src/**`,
+  `novarocks/native-adapter/src/**`, and the neutral contracts under `novarocks/spi/**`
   (Connector) and `novarocks/state-store/api/**` (StateStore). Those two
   provider domains are separate compilation units: the StateStore contract does
   not depend on Arrow or on the Connector contract, and its shared test
