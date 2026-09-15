@@ -39,11 +39,10 @@ use crate::query_execution::write_transaction::{
 use novarocks_parser::ast::{Query, Statement};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
-    ConnectorPreReadyWritePlanningRequest, ConnectorTableHandle, ConnectorWriteActivationIntent,
-    ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
-    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
-    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    ConnectorTableHandle, ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest,
+    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease,
+    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
+    ConnectorWritePreparationRequest,
 };
 #[cfg(test)]
 use novarocks_sql::literal::bytes_to_latin1_string;
@@ -273,17 +272,7 @@ fn prepare_iceberg_distributed_write(
         table_bindings,
         execution,
         connector_context: connector_context.clone(),
-        operation_id: connector_operation_id,
-        write_lease: write_lease.clone(),
         write_session,
-        pre_ready_planning_request: ConnectorPreReadyWritePlanningRequest::new(
-            ConnectorWriteActivationRequest {
-                operation_id: connector_operation_id,
-                source: ConnectorWriteActivationSource::Prepared(preparation),
-                intent: ConnectorWriteActivationIntent::Ordinary,
-                context: connector_context.clone(),
-            },
-        ),
     };
     let spec = IcebergWriteTransactionSpec {
         is_overwrite: overwrite_mode.is_overwrite(),
@@ -523,11 +512,6 @@ impl PreparedIcebergWrite {
                 Some(self.prepare_native_assembly_for_execution(
                     self.semantic_binding.execution.as_ref(),
                 )?);
-            // The first assembly completed all semantic materialization. Any
-            // later topology round may only reuse these exact captured facts.
-            self.semantic_binding
-                .table_bindings
-                .seal_for_topology_replan();
         }
         Ok(PreparedIcebergWriteNativeEncoding {
             inner: PreparedIcebergWriteNativeEncodingInner::Assembly(assembly),
@@ -555,25 +539,10 @@ impl PreparedIcebergWrite {
             .ok_or_else(|| {
                 "prepared Iceberg write attempt reservation was already consumed".to_string()
             })?;
-        let publication_id = novarocks_spi::connector::LakePublicationId::try_from_bytes(
-            self.semantic_binding.operation_id.to_bytes(),
-        )
-        .map_err(|error| {
-            format!("Iceberg write operation lacks a UUIDv7 publication identity: {error}")
-        })?;
         let outcome = query_execution
             .execute_prepared_raw(
-                crate::query_execution::completion::PreparedRetriableDistributedRequest::new(
-                    request,
-                    Box::new(IcebergWriteRoundFactory {
-                        binding: Arc::clone(&self.semantic_binding),
-                        effect_tracker:
-                            novarocks_query_application::statement_effect::StatementEffectTracker::mutating(
-                                publication_id,
-                            ),
-                    }),
-                )
-                .with_attempt_reservation(attempt_reservation),
+                crate::query_execution::completion::PreparedRawDistributedRequest::new(request)
+                    .with_attempt_reservation(attempt_reservation),
             )
             .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
             .map_err(|error| error.to_string())?;
@@ -606,7 +575,7 @@ impl PreparedIcebergWrite {
 ///
 /// This type owns no SQL routing or application transaction policy. The
 /// frontend DML services drive production statement lifecycles.
-/// First-admission write semantics retained across topology-only rounds. It
+/// First-admission write semantics retained until its one native round. It
 /// intentionally contains no native fragments, splits, writer cohorts,
 /// runtime-filter layout, schedule, native bundle, or request.
 struct FrozenIcebergWriteSemanticBinding {
@@ -617,152 +586,9 @@ struct FrozenIcebergWriteSemanticBinding {
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    /// This statement's durable publication identity. It stays in this
-    /// frontend layer: it never reaches a writer recipe or a commit fragment.
-    operation_id: ConnectorWriteOperationId,
-    /// The exact generation's write lease, retained only so a topology replan
-    /// can ask it for an effect-free planning proof.
-    write_lease: ConnectorWriteLease,
     /// The one commit authority for this statement. Every round of this
     /// statement encodes the same sealed recipes from it.
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    pre_ready_planning_request: ConnectorPreReadyWritePlanningRequest,
-}
-
-impl FrozenIcebergWriteSemanticBinding {
-    fn prepare_replanned_native_assembly(
-        &self,
-        topology: novarocks_query_application::api::BackendTopologySnapshot,
-    ) -> Result<
-        crate::query_execution::compiler::PreparedDmlWriteAssembly,
-        crate::dml::error::DmlExecutionError,
-    > {
-        if !self.table_bindings.is_sealed_for_topology_replan() {
-            return Err(crate::dml::error::DmlExecutionError::from(
-                "Iceberg write topology replan requires a sealed first-round semantic binding store".to_string(),
-            ));
-        }
-        let execution = self.execution_for_topology(topology)?;
-        let proof = self
-            .write_lease
-            .certify_pre_ready_write_planning(self.pre_ready_planning_request.clone())
-            .map_err(|error| {
-                crate::dml::error::DmlExecutionError::from(format!(
-                    "Iceberg write topology replan has no effect-free planning proof: {error}"
-                ))
-            })?;
-        self.write_lease
-            .validate_pre_ready_write_planning_proof(&proof, &self.pre_ready_planning_request)
-            .map_err(|error| {
-                crate::dml::error::DmlExecutionError::from(format!(
-                    "Iceberg write topology replan lost its effect-free planning proof: {error}"
-                ))
-            })?;
-        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
-            &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.query,
-            self.sql_write_input.clone(),
-            Arc::clone(&self.table_bindings),
-            None,
-            novarocks_sql::compiler::RootDistributionRequirement::Any,
-            Some(&execution),
-            &self.connector_context,
-            Arc::clone(&self.write_session),
-        )
-    }
-
-    fn execution_for_topology(
-        &self,
-        topology: novarocks_query_application::api::BackendTopologySnapshot,
-    ) -> Result<QueryExecutionContext, crate::dml::error::DmlExecutionError> {
-        let first = self.execution.as_ref().ok_or_else(|| {
-            crate::dml::error::DmlExecutionError::from(
-                "Iceberg write topology replan requires an admitted execution context".to_string(),
-            )
-        })?;
-        Ok(Self::execution_from_first_round(first, topology))
-    }
-
-    fn execution_from_first_round(
-        first: &QueryExecutionContext,
-        topology: novarocks_query_application::api::BackendTopologySnapshot,
-    ) -> QueryExecutionContext {
-        QueryExecutionContext::new(
-            first.role(),
-            topology,
-            first.deadline(),
-            first.cancellation().clone(),
-            first.optimizer_settings().clone(),
-        )
-    }
-}
-
-struct IcebergWriteRoundFactory {
-    binding: Arc<FrozenIcebergWriteSemanticBinding>,
-    effect_tracker: novarocks_query_application::statement_effect::StatementEffectTracker,
-}
-
-impl crate::query_execution::completion::PreReadyRetryBoundary for IcebergWriteRoundFactory {
-    fn permit_pre_ready_retry(
-        &self,
-    ) -> Result<(), crate::query_execution::contract::DistributedQueryError> {
-        self.effect_tracker
-            .issue_topology_retry_permit()
-            .map(|_| ())
-            .map_err(|error| {
-                crate::query_execution::contract::DistributedQueryError::new(
-                    crate::query_execution::contract::DistributedQueryErrorKind::TopologyRetryUnsupported,
-                    format!("Iceberg write topology retry is not effect-free: {error:?}"),
-                )
-            })
-    }
-
-    fn close_after_control_ready(&self) {
-        self.effect_tracker.close_after_control_ready();
-    }
-
-    fn close_after_stage_or_start(&self) {
-        self.effect_tracker.close_after_stage_or_start();
-    }
-}
-
-impl crate::query_execution::completion::PreparedDistributedRequestFactory
-    for IcebergWriteRoundFactory
-{
-    fn replan(
-        &mut self,
-        topology: novarocks_query_application::api::BackendTopologySnapshot,
-    ) -> Result<
-        crate::query_execution::contract::DistributedQueryRequest,
-        crate::query_execution::contract::DistributedQueryError,
-    > {
-        let assembly = self.binding.prepare_replanned_native_assembly(topology).map_err(|error| {
-            crate::query_execution::contract::DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::TopologyRetryUnsupported,
-                error.to_string(),
-            )
-        })?;
-        let native_bundle =
-            crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(
-                assembly.encoding(),
-            )
-            .map_err(|error| {
-                crate::query_execution::contract::DistributedQueryError::new(
-                    crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                    error,
-                )
-            })?;
-        let (_query_execution, request) =
-            assembly.into_request(native_bundle).map_err(|error| {
-                crate::query_execution::contract::DistributedQueryError::new(
-                    crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                    error,
-                )
-            })?;
-        Ok(request)
-    }
 }
 
 /// Build the `(query, Arrow write layout)` pair for an iceberg INSERT/OVERWRITE write
@@ -1351,12 +1177,6 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
     use novarocks_parser::{ast, printer};
-    use std::time::{Duration, Instant};
-
-    use novarocks_query_application::api::BackendTopologySnapshot;
-    use novarocks_query_application::cancellation::{
-        QueryCancellationReason, QueryCancellationSource,
-    };
     use novarocks_types::schema::ColumnDefault;
 
     fn test_column(
@@ -1379,37 +1199,6 @@ mod tests {
             panic!("expected exactly one query statement");
         };
         query.clone()
-    }
-
-    #[test]
-    fn replanned_execution_preserves_statement_stable_inputs() {
-        let cancellation = QueryCancellationSource::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let settings = novarocks_sql::compiler::SessionOptimizerSettings {
-            enable_global_runtime_filter: Some(false),
-            effective_backend_count: Some(3.0),
-            ..Default::default()
-        };
-        let first = QueryExecutionContext::new(
-            novarocks_types::ClusterRole::Fe,
-            BackendTopologySnapshot::empty(7),
-            Some(deadline),
-            cancellation.view(),
-            settings.clone(),
-        );
-
-        let replanned = FrozenIcebergWriteSemanticBinding::execution_from_first_round(
-            &first,
-            BackendTopologySnapshot::empty(8),
-        );
-
-        assert_eq!(replanned.role(), first.role());
-        assert_eq!(replanned.topology().revision(), 8);
-        assert_eq!(replanned.deadline(), Some(deadline));
-        assert_eq!(replanned.optimizer_settings(), &settings);
-        assert!(!replanned.cancellation().is_cancelled());
-        cancellation.request(QueryCancellationReason::DeadlineExceeded { timeout_ms: 30_000 });
-        assert!(replanned.cancellation().is_cancelled());
     }
 
     fn test_map_type(key: DataType, value: DataType) -> DataType {

@@ -2634,6 +2634,49 @@ fn assert_bounds(
 }
 
 #[test]
+fn an_initial_establish_rejection_remains_a_pre_ready_infrastructure_fact() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x43; 32]),
+        admission_epoch(),
+    );
+    grant_admission(&mut owner, MonotonicInstant::ORIGIN);
+    let establish = owner
+        .establish_intent(
+            FakeEstablish
+                .facts_for(context)
+                .expect("the fake source has facts"),
+            MonotonicInstant::ORIGIN,
+        )
+        .expect("the establish can be built")
+        .expect("the establish is released");
+
+    let error = owner
+        .on_context_ack(&OperationAcknowledgement::new(
+            establish.operation_id(),
+            OperationKind::UpdateQueryContext,
+            OperationOutcome::InvalidStateOrRequest,
+            AckPayload::None,
+        ))
+        .expect_err("a rejected initial Establish must terminate its local owner");
+
+    assert!(matches!(
+        error,
+        TaskExecutionError::PreReadyEstablishRejected {
+            backend,
+            outcome: OperationOutcome::InvalidStateOrRequest,
+        } if backend == context.backend_process_id()
+    ));
+    assert!(owner.is_released());
+}
+
+#[test]
 fn an_establish_accounts_for_its_query_options_payload() {
     let context = QueryContextRef::new(
         execution_id(),

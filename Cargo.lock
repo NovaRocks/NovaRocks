@@ -4347,6 +4347,7 @@ dependencies = [
  "mysql",
  "novarocks-cluster-harness",
  "novarocks-connector-iceberg",
+ "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-native-trust",
  "novarocks-proto-models",

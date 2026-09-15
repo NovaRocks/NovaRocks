@@ -781,6 +781,14 @@ impl QueryContextOwner {
         }
         self.state = QueryContextState::TerminalRetained;
         self.released = true;
+        if is_establish {
+            return Err(TaskExecutionError::PreReadyEstablishRejected {
+                backend: self.context.backend_process_id(),
+                outcome: ack
+                    .worker_outcome()
+                    .expect("a non-transport acknowledgement has a Worker outcome"),
+            });
+        }
         Err(TaskExecutionError::OperationFailed {
             kind: OperationKind::UpdateQueryContext,
             outcome: ack

@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::native::fragment_transport::{
@@ -1048,6 +1048,7 @@ impl FrontendDistributedQueryCoordinator {
             // window are read from this turn's state rather than last turn's.
             let classification = TaskRoundFailureClassification {
                 before_contexts_established: !contexts_established,
+                recovery_observation_allowed: retry_boundary.is_some(),
                 captured: &captured_topology,
                 observation_deadline: statement_deadline.min(
                     Instant::now()
@@ -1127,6 +1128,7 @@ impl FrontendDistributedQueryCoordinator {
             // judged against the window this turn actually reached.
             let classification = TaskRoundFailureClassification {
                 before_contexts_established: !contexts_established,
+                recovery_observation_allowed: retry_boundary.is_some(),
                 captured: &captured_topology,
                 observation_deadline: statement_deadline.min(
                     Instant::now()
@@ -2017,9 +2019,9 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
 
     fn execute_prepared_raw(
         &self,
-        operation: crate::query_execution::completion::PreparedRetriableDistributedRequest,
+        operation: crate::query_execution::completion::PreparedRawDistributedRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let (first_request, mut round_factory, reservation) = operation.into_parts();
+        let (first_request, reservation) = operation.into_parts();
         let reservation = match reservation {
             Some(reservation) => reservation,
             None => crate::query_execution::completion::QueryAttemptReservation::first(
@@ -2028,73 +2030,23 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         };
         let query_id = reservation.query_id();
         let first_execution_id = reservation.execution_id();
-        let retry_collected_vended_credentials = Arc::new(AtomicBool::new(
-            reservation.has_collected_credential_leases(),
-        ));
-        let first_revision = first_request.topology().revision();
         let retry_deadline = statement_deadline_for_request(&first_request)?;
-        match self.execute_round(
+        self.execute_round(
             query_id,
             first_execution_id,
             retry_deadline,
             first_request,
-            Some(round_factory.as_ref() as &dyn PreReadyRetryBoundary),
+            // A raw outcome is an external-effect execution. Its DML owner
+            // retains the connector commit/abort boundary, but this legacy
+            // coordinator has no engine/provider proof that a successor is
+            // externally isolated. Do not turn a pre-ready failure into a
+            // topology observation: the answer is already NoRecovery.
+            None,
             RoundCredentialLeaseSource::Reservation {
                 reservation: Some(reservation),
-                observed_collected: Some(Arc::clone(&retry_collected_vended_credentials)),
+                observed_collected: None,
             },
-        ) {
-            Ok(outcome) => Ok(outcome),
-            Err(first_error) => {
-                if first_error.pre_ready_topology_outcome().is_none() {
-                    return Err(first_error);
-                }
-                if retry_collected_vended_credentials.load(Ordering::Acquire) {
-                    return Err(DistributedQueryError::topology_retry_unsupported(
-                        first_error
-                            .pre_ready_topology_outcome()
-                            .expect("pre-ready topology outcome checked above"),
-                        "distributed write collected vended credentials and requires fresh whole-round materialization for a topology retry",
-                    ));
-                }
-                let reason = pre_ready_topology_reason(
-                    first_error
-                        .pre_ready_topology_outcome()
-                        .expect("pre-ready topology outcome checked above"),
-                );
-                if let Err(error) = round_factory.permit_pre_ready_retry() {
-                    record_pre_ready_effect_gate("rejected");
-                    return Err(error);
-                }
-                record_pre_ready_effect_gate("permitted");
-                record_pre_ready_replan(reason);
-                let waiting_started_at = Instant::now();
-                let fresh_topology = self
-                    .backend_topology
-                    .wait_for_eligible_after(first_revision, retry_deadline)
-                    .map_err(|error| {
-                        observe_waiting_for_backend(waiting_started_at.elapsed());
-                        DistributedQueryError::new(
-                            DistributedQueryErrorKind::Failed,
-                            error.to_string(),
-                        )
-                    })?;
-                observe_waiting_for_backend(waiting_started_at.elapsed());
-                let replan_started_at = Instant::now();
-                let replacement = round_factory.replan(fresh_topology);
-                observe_pre_ready_replan(replan_started_at.elapsed());
-                let replacement = replacement?;
-                let replacement_execution_id = execution_id_for_round(query_id, 2)?;
-                self.execute_round(
-                    query_id,
-                    replacement_execution_id,
-                    retry_deadline,
-                    replacement,
-                    None,
-                    RoundCredentialLeaseSource::Frozen(QueryCredentialLeases::empty()),
-                )
-            }
-        }
+        )
     }
 }
 
@@ -2468,9 +2420,8 @@ mod tests {
     };
     use crate::query_execution::completion::{
         LogicalQueryReservation, PreReadyRetryBoundary, PreparedDistributedAttempt,
-        PreparedDistributedAttemptFactory, PreparedDistributedQuery,
-        PreparedDistributedRequestFactory, PreparedQueryCompletion,
-        PreparedRetriableDistributedRequest,
+        PreparedDistributedAttemptFactory, PreparedDistributedQuery, PreparedQueryCompletion,
+        PreparedRawDistributedRequest,
     };
     use crate::query_execution::contract::{
         DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
@@ -2818,19 +2769,6 @@ mod tests {
         }
     }
 
-    impl PreparedDistributedRequestFactory for RecordingRetryFactory {
-        fn replan(
-            &mut self,
-            topology: novarocks_query_application::api::BackendTopologySnapshot,
-        ) -> Result<DistributedQueryRequest, DistributedQueryError> {
-            self.replanned_topologies
-                .lock()
-                .expect("replanned topologies")
-                .push(topology.clone());
-            fresh_result_request(topology)
-        }
-    }
-
     impl PreReadyRetryBoundary for RecordingRetryFactory {
         fn permit_pre_ready_retry(&self) -> Result<(), DistributedQueryError> {
             self.permits.fetch_add(1, Ordering::SeqCst);
@@ -3010,6 +2948,7 @@ mod tests {
             topology.as_ref(),
             super::TaskRoundFailureClassification {
                 before_contexts_established: true,
+                recovery_observation_allowed: true,
                 captured: &captured,
                 observation_deadline: started + OBSERVATION,
                 cancellation: &view,
@@ -3040,6 +2979,7 @@ mod tests {
             topology.as_ref(),
             super::TaskRoundFailureClassification {
                 before_contexts_established: true,
+                recovery_observation_allowed: true,
                 captured: &captured,
                 observation_deadline: started + OBSERVATION,
                 cancellation: &view,
@@ -3152,14 +3092,10 @@ mod tests {
         );
     }
 
-    /// The same replan through the raw entrypoint, which owns the write
-    /// outcome boundary.
-    ///
-    /// Its subject is that a replan does not lose that boundary, not how the
-    /// replan was triggered, so it follows the surviving trigger for the same
-    /// reason the test above does.
+    /// A raw outcome owns an external-effect boundary and therefore must not
+    /// enter the logical read replan controller.
     #[test]
-    fn raw_replan_on_a_replaced_process_keeps_the_write_outcome_boundary() {
+    fn raw_write_on_a_replaced_process_does_not_replan() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3201,38 +3137,18 @@ mod tests {
             .record_announce(replacement.clone(), BackendReportedState::Running)
             .expect("replacement announce");
         verify(topology.as_ref(), &replacement, 2);
-        let permits = Arc::new(AtomicUsize::new(0));
-        let control_ready_closures = Arc::new(AtomicUsize::new(0));
-        let stage_or_start_closures = Arc::new(AtomicUsize::new(0));
-        let replanned_topologies = Arc::new(Mutex::new(Vec::new()));
-        let operation = PreparedRetriableDistributedRequest::new(
+        let operation = PreparedRawDistributedRequest::new(
             fresh_result_request(first_snapshot.clone()).expect("first request"),
-            Box::new(RecordingRetryFactory {
-                permits: Arc::clone(&permits),
-                control_ready_closures: Arc::clone(&control_ready_closures),
-                stage_or_start_closures: Arc::clone(&stage_or_start_closures),
-                replanned_topologies: Arc::clone(&replanned_topologies),
-            }),
         );
 
         let error = match coordinator.execute_prepared_raw(operation) {
-            Ok(_) => panic!("the replanned raw round has no backend to reach"),
+            Ok(_) => panic!("the raw write round has no backend to reach"),
             Err(error) => error,
         };
         assert!(
-            error.message().contains("query timed out after"),
+            error.message().contains("generation changed"),
             "actual: {}",
             error.message()
-        );
-        assert_eq!(permits.load(Ordering::SeqCst), 1);
-        let replanned = replanned_topologies.lock().expect("replanned topologies");
-        assert_eq!(replanned.len(), 1);
-        assert!(replanned[0].revision() > first_snapshot.revision());
-        assert_eq!(
-            replanned[0].targets()[0]
-                .process_id()
-                .expect("replacement process id"),
-            replacement.process_id(),
         );
     }
 
@@ -3794,6 +3710,11 @@ fn advance_task_round(
 #[derive(Clone, Copy)]
 struct TaskRoundFailureClassification<'a> {
     before_contexts_established: bool,
+    /// Only the owner of an explicitly permitted successor attempt can make
+    /// use of replacement evidence. A one-shot external-effect execution is
+    /// already `NoRecovery`, so waiting for topology cannot improve its
+    /// answer.
+    recovery_observation_allowed: bool,
     captured: &'a BackendTopologySnapshot,
     observation_deadline: Instant,
     cancellation: &'a novarocks_query_application::cancellation::QueryCancellationView,
@@ -3803,8 +3724,9 @@ impl TaskRoundFailureClassification<'_> {
     /// Whether a membership observation could still change this attempt's
     /// answer.
     ///
-    /// It cannot once cancellation is latched, and there are only two
-    /// consumers of what such an observation would prove. The client is one:
+    /// It cannot once cancellation is latched or when the caller has no
+    /// permitted successor attempt. There are only two consumers of what
+    /// such an observation would prove. The client is one:
     /// a cancelled statement finishes `Cancelled`, so it is owed
     /// `ER_QUERY_INTERRUPTED` whatever the membership owner goes on to say.
     /// The pre-ready replan is the other, and it must never re-run a
@@ -3819,7 +3741,7 @@ impl TaskRoundFailureClassification<'_> {
     /// answer is decided, and every moment spent proving something about it
     /// is a moment the client waits for an answer it could already have had.
     fn observation_can_change_the_answer(self) -> bool {
-        !self.cancellation.is_cancelled()
+        self.recovery_observation_allowed && !self.cancellation.is_cancelled()
     }
 }
 

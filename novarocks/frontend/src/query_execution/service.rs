@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::query_execution::completion::{
-    LogicalQueryReservation, PreparedDistributedQuery, PreparedRetriableDistributedRequest,
+    LogicalQueryReservation, PreparedDistributedQuery, PreparedRawDistributedRequest,
     QueryAttemptReservation,
 };
 use crate::query_execution::contract::{
@@ -92,7 +92,7 @@ impl QueryExecutionService {
     /// distributed outcome, including write terminal handles.
     pub(crate) fn execute_prepared_raw(
         &self,
-        operation: PreparedRetriableDistributedRequest,
+        operation: PreparedRawDistributedRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.coordinator.execute_prepared_raw(operation)
     }

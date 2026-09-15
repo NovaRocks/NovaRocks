@@ -81,6 +81,14 @@ pub enum TaskExecutionError {
     /// ControlReady, so the whole-attempt recovery owner must observe whether
     /// this exact process was replaced before deciding a successor schedule.
     PreReadyEstablishTransportUnknown { backend: BackendProcessId },
+    /// The Worker definitively rejected the initial Establish. The immutable
+    /// attempt is unusable, but only the whole-attempt recovery owner may
+    /// decide whether independently observed process replacement permits a
+    /// successor schedule.
+    PreReadyEstablishRejected {
+        backend: BackendProcessId,
+        outcome: OperationOutcome,
+    },
     /// An acknowledgement named an operation this owner never sent, or named
     /// one that is already settled.
     UnknownOperation,
@@ -261,6 +269,10 @@ impl fmt::Display for TaskExecutionError {
             Self::PreReadyEstablishTransportUnknown { backend } => write!(
                 formatter,
                 "EstablishQueryContext for backend {backend} lost its Worker outcome before ControlReady"
+            ),
+            Self::PreReadyEstablishRejected { backend, outcome } => write!(
+                formatter,
+                "EstablishQueryContext for backend {backend} was rejected before ControlReady with {outcome:?}"
             ),
             Self::UnknownOperation => {
                 formatter.write_str("acknowledgement names an operation this owner did not send")

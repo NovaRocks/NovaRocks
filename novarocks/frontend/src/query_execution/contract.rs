@@ -721,9 +721,9 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
     /// transaction runner and cannot be rendered as a `StatementResult`.
     fn execute_prepared_raw(
         &self,
-        operation: crate::query_execution::completion::PreparedRetriableDistributedRequest,
+        operation: crate::query_execution::completion::PreparedRawDistributedRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let (request, _round_factory, reservation) = operation.into_parts();
+        let (request, reservation) = operation.into_parts();
         if reservation.is_some() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
@@ -733,7 +733,7 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         Err(DistributedQueryError::new(
             DistributedQueryErrorKind::ContractViolation,
             format!(
-                "injected coordinator does not implement raw pre-ready replan for {:?}",
+                "injected coordinator does not implement raw distributed execution for {:?}",
                 request.intent()
             ),
         ))

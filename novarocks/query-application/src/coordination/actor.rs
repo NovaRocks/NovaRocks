@@ -2324,12 +2324,10 @@ async fn run_actor(
             }
             event = wait_for_attempt_ledger_event(&mut attempts, clock.as_ref()) => {
                 apply_attempt_ledger_event(
-                    state,
                     &mut attempts,
                     event,
                     &mut establish_error,
                     &mut stand_down_error,
-                    result_runtime.as_mut(),
                 );
             }
             receipt = replacement_receipt_rx.recv(), if replacement_effect_pending => {
@@ -2519,12 +2517,10 @@ async fn wait_for_attempt_ledger_event(
 }
 
 fn apply_attempt_ledger_event(
-    state: &mut LogicalExecutionState,
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     event: AttemptLedgerEvent,
     establish_error: &mut Option<EstablishIssueError>,
     stand_down_error: &mut Option<ContextStandDownError>,
-    result_runtime: Option<&mut ResultRuntime>,
 ) {
     match event {
         AttemptLedgerEvent::Establish(execution, result) => {
@@ -2542,16 +2538,18 @@ fn apply_attempt_ledger_event(
                 establish_error.get_or_insert(error);
                 attempt.establish_error.get_or_insert(error);
                 attempt.establish.revoke_issue_authority();
-                if matches!(state.phase(), ExecutionPhase::Running { execution: current, .. } if current == execution)
-                {
-                    if let Some(runtime) = result_runtime {
-                        runtime.terminal_error = Some(QueryExecutionError::new(
-                            crate::api::QueryExecutionErrorKind::Failed,
-                            format!("logical execution Establish issue failed: {error}"),
-                        ));
-                    }
-                    conclude_failed(state);
-                }
+                // A Worker rejection makes this exact attempt unusable, but
+                // its Task-protocol owner is still responsible for publishing
+                // the authoritative terminal class. Ending the logical
+                // execution here would race that owner and turn a
+                // pre-visibility process replacement into an unconditional
+                // failure before the supervisor can apply recovery policy.
+                //
+                // Completion remains fenced by `ensure_success_ready`, so no
+                // rejected Establish can produce a success EOF. A native
+                // terminal owner subsequently consumes the running permit and
+                // either supplies its typed failure or starts a qualified
+                // replacement.
             }
         }
         AttemptLedgerEvent::StandDown(execution, Err(error)) => {
@@ -6455,7 +6453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_establish_rejection_preserves_the_result_stream_cause() {
+    async fn current_establish_rejection_defers_to_the_running_permit_owner() {
         let runtime = Handle::current();
         let execution = execution(822);
         let frontend = FrontendProcessId::new_v7();
@@ -6520,17 +6518,36 @@ mod tests {
             .worker_settled(OperationOutcome::ContextConflict)
             .unwrap();
 
-        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        for _ in 0..16 {
+            if actor.snapshot().await.unwrap().establish_error
+                == Some(EstablishIssueError::EstablishRejected)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            actor.snapshot().await.unwrap().establish_error,
+            Some(EstablishIssueError::EstablishRejected)
+        );
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+
+        let native_terminal = QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            "authoritative Native attempt terminal",
+        );
+        assert_eq!(
+            actor
+                .fail_attempt_with_error(running, native_terminal.clone())
+                .await
+                .unwrap(),
+            LogicalConclusion::Failed
+        );
         let error = match stream.next().await {
             Err(error) => error,
-            Ok(_) => panic!("failed Establish must terminate the result stream"),
+            Ok(_) => panic!("failed Native attempt must terminate the result stream"),
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        assert_eq!(
-            error.message(),
-            "logical execution Establish issue failed: logical execution completed after a Worker rejected Establish"
-        );
-        drop(running);
+        assert_eq!(error, native_terminal);
         drop(stream);
         drop(actor);
         drop(owner);

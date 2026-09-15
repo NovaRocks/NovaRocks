@@ -23,6 +23,10 @@ use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,14 +39,101 @@ const REQUIRED_BACKENDS: usize = 3;
 /// establish is the task protocol's first per-backend admission point.
 const RESTART_AFTER_ESTABLISH_CONTEXT: &str = "restart-after-establish-context";
 
-/// The token-scoped marker that rendezvous emits once the establish applied.
-const ESTABLISH_CONTEXT_OBSERVED_MARKER: &str = "NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED";
+/// Runner-side half of the establish-before-restart handoff.
+///
+/// The listener exists before the query starts. The backend sends the exact
+/// fault token after it applies EstablishQueryContext and keeps that RPC
+/// parked until the runner completes process replacement. A log marker proves
+/// the same event but cannot synchronize it: a polling runner can see the
+/// marker only after the backend has consumed the request boundary.
+struct RestartAfterEstablishRendezvous {
+    path: PathBuf,
+    token: String,
+    listener: UnixListener,
+}
+
+impl RestartAfterEstablishRendezvous {
+    const CANCEL: &'static [u8] = b"scenario-cancelled";
+
+    fn bind(token: &str) -> Result<Self> {
+        let path = novarocks_failpoint::restart_after_establish_rendezvous_socket_path(token)
+            .map_err(anyhow::Error::msg)?;
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove stale establish rendezvous {}", path.display()))?;
+        }
+        let listener = UnixListener::bind(&path)
+            .with_context(|| format!("bind establish rendezvous {}", path.display()))?;
+        Ok(Self {
+            path,
+            token: token.to_owned(),
+            listener,
+        })
+    }
+
+    /// Receives the backend's exact token before the runner kills the old
+    /// process. On timeout, connect once with a local cancellation payload so
+    /// the accept worker can finish before cleanup removes the listener.
+    fn wait_for_trigger(&self, deadline: Instant) -> Result<UnixStream> {
+        let listener = self
+            .listener
+            .try_clone()
+            .context("clone establish rendezvous listener")?;
+        let token = self.token.clone();
+        std::thread::scope(|scope| -> Result<UnixStream> {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let result = (|| -> Result<UnixStream> {
+                    let (mut stream, _) =
+                        listener.accept().context("accept establish rendezvous")?;
+                    let mut payload = Vec::new();
+                    stream
+                        .read_to_end(&mut payload)
+                        .context("read establish rendezvous token")?;
+                    if payload == token.as_bytes() {
+                        return Ok(stream);
+                    }
+                    if payload == Self::CANCEL {
+                        bail!("scenario ended before the establish rendezvous fired");
+                    }
+                    bail!("establish rendezvous received an unexpected token");
+                })();
+                let _ = sender.send(result);
+            });
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Self::cancel(&self.path);
+                    let _ = receiver.recv();
+                    bail!("timed out waiting for establish-before-restart rendezvous");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("establish rendezvous worker disconnected before an arrival");
+                }
+            }
+        })
+    }
+
+    fn cancel(path: &Path) {
+        let Ok(mut stream) = UnixStream::connect(path) else {
+            return;
+        };
+        let _ = stream.write_all(Self::CANCEL);
+        let _ = stream.shutdown(Shutdown::Write);
+    }
+}
+
+impl Drop for RestartAfterEstablishRendezvous {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(BackendSelfRegistration),
         Box::new(PreReadyReplan),
-        Box::new(PreReadyDmlReplan),
+        Box::new(PreReadyDmlNoRecovery),
     ]
 }
 
@@ -209,6 +300,7 @@ impl Scenario for PreReadyReplan {
             .handle()
             .armed_query_lifecycle_fault_token(target, RESTART_AFTER_ESTABLISH_CONTEXT)?
             .context("armed pre-ready restart has no token")?;
+        let rendezvous = RestartAfterEstablishRendezvous::bind(&token)?;
         let before_execution = context
             .handle()
             .query_lifecycle_structured_snapshot()?
@@ -231,7 +323,7 @@ impl Scenario for PreReadyReplan {
             let _ = sender.send(result);
         });
 
-        wait_for_token_scoped_marker(context, target, ESTABLISH_CONTEXT_OBSERVED_MARKER, &token)?;
+        let restart_ack = rendezvous.wait_for_trigger(context.deadline())?;
         let deadline = context.deadline();
         context
             .handle()
@@ -246,6 +338,7 @@ impl Scenario for PreReadyReplan {
             .handle()
             .clear_query_lifecycle_faults()
             .context("clear pre-ready restart trigger")?;
+        drop(restart_ack);
 
         let remaining = context.remaining("await re-planned query")?;
         let rows = receiver.recv_timeout(remaining).map_err(|error| {
@@ -272,17 +365,17 @@ impl Scenario for PreReadyReplan {
     }
 }
 
-struct PreReadyDmlReplan;
+struct PreReadyDmlNoRecovery;
 
-impl Scenario for PreReadyDmlReplan {
+impl Scenario for PreReadyDmlNoRecovery {
     fn name(&self) -> &'static str {
-        "membership/pre-ready-dml-replan"
+        "membership/pre-ready-dml-no-recovery"
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         ensure!(
             context.handle().be_count() == REQUIRED_BACKENDS,
-            "pre-ready DML replan acceptance requires exactly {REQUIRED_BACKENDS} BEs"
+            "pre-ready DML no-recovery acceptance requires exactly {REQUIRED_BACKENDS} BEs"
         );
         let catalog = "pre_ready_dml";
         let warehouse = context.runtime_dir().join("pre-ready-dml-warehouse");
@@ -329,21 +422,18 @@ impl Scenario for PreReadyDmlReplan {
             .handle()
             .armed_query_lifecycle_fault_token(target, RESTART_AFTER_ESTABLISH_CONTEXT)?
             .context("armed pre-ready DML restart has no token")?;
-        let before_execution = context
-            .handle()
-            .query_lifecycle_structured_snapshot()?
-            .and_then(|snapshot| snapshot.execution_id);
+        let rendezvous = RestartAfterEstablishRendezvous::bind(&token)?;
         context.action(format!(
             "armed token-scoped restart after BE[{target}] DML EstablishQueryContext; old_process_id={old_process_id}"
         ));
 
         let mysql_user = context.mysql_user().to_string();
         let mysql_port = context.mysql_port();
+        let mysql_timeout = context.remaining("connect DML execution client")?;
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let result = (|| -> Result<()> {
-                let mut connection =
-                    mysql_actor::connect(&mysql_user, mysql_port, Duration::from_secs(30))?;
+                let mut connection = mysql_actor::connect(&mysql_user, mysql_port, mysql_timeout)?;
                 connection
                     .query_drop("INSERT INTO pre_ready_dml.ns.orders VALUES (1, 10), (2, 20)")
                     .context("run DML during pre-ready replacement")
@@ -351,7 +441,7 @@ impl Scenario for PreReadyDmlReplan {
             let _ = sender.send(result);
         });
 
-        wait_for_token_scoped_marker(context, target, ESTABLISH_CONTEXT_OBSERVED_MARKER, &token)?;
+        let restart_ack = rendezvous.wait_for_trigger(context.deadline())?;
         let deadline = context.deadline();
         context
             .handle()
@@ -366,24 +456,17 @@ impl Scenario for PreReadyDmlReplan {
             .handle()
             .clear_query_lifecycle_faults()
             .context("clear pre-ready DML restart trigger")?;
-        receiver
-            .recv_timeout(context.remaining("await re-planned DML")?)
+        drop(restart_ack);
+        let error = receiver
+            .recv_timeout(context.remaining("await no-recovery DML")?)
             .map_err(|error| {
                 anyhow::anyhow!("pre-ready DML did not return before deadline: {error}")
-            })??;
-
-        // The lifecycle debug surface reports the latest distributed statement.
-        // Read the retried DML terminal before the verification SELECT creates
-        // its own distributed execution record.
-        let deadline = context.deadline();
-        let terminal = context
-            .handle()
-            .await_query_lifecycle_structured_snapshot_after(before_execution.as_deref(), deadline)
-            .context("read terminal snapshot for re-planned DML statement")?;
+            })?
+            .expect_err("a pre-ready external-effect execution must not auto-replan");
+        let error_message = format!("{error:#}");
         ensure!(
-            terminal.attempt_id == 2,
-            "pre-ready DML replacement must complete as statement attempt 2, got attempt {}",
-            terminal.attempt_id
+            error_message.contains("KnownUncommitted"),
+            "pre-ready DML without engine/provider isolation proof must return KnownUncommitted, got: {error_message}"
         );
 
         let mut verify = mysql_actor::connect(
@@ -393,50 +476,24 @@ impl Scenario for PreReadyDmlReplan {
         )?;
         let rows: Vec<(i32, i64)> = verify
             .query("SELECT k1, v2 FROM pre_ready_dml.ns.orders ORDER BY k1")
-            .context("read DML target after re-planned statement")?;
+            .context("read DML target after no-recovery statement")?;
+        ensure!(
+            rows.is_empty(),
+            "the rejected pre-ready DML must not publish data, got {rows:?}"
+        );
+        verify
+            .query_drop("INSERT INTO pre_ready_dml.ns.orders VALUES (1, 10), (2, 20)")
+            .context("retry the entire DML statement after KnownUncommitted")?;
+        let rows: Vec<(i32, i64)> = verify
+            .query("SELECT k1, v2 FROM pre_ready_dml.ns.orders ORDER BY k1")
+            .context("read DML target after client retry")?;
         ensure!(
             rows == vec![(1, 10), (2, 20)],
-            "pre-ready DML retry must publish one result set, got {rows:?}"
+            "the client statement retry must publish exactly once, got {rows:?}"
         );
         context.action(format!(
-            "replaced BE[{target}] after DML EstablishQueryContext and observed one Iceberg write result with successful statement attempt=2 completion; new_process_id={replacement_process_id}"
+            "replaced BE[{target}] after DML EstablishQueryContext; the first attempt returned KnownUncommitted without published data, then an explicit client statement retry published once; new_process_id={replacement_process_id}"
         ));
         Ok(())
-    }
-}
-
-/// Waits until the armed rendezvous reports that this exact backend applied the
-/// admission the fault parks on.
-///
-/// The token is part of the match rather than the marker name alone: the log is
-/// preserved across restarts, so an earlier scenario's rendezvous line would
-/// otherwise satisfy this wait and the harness would replace a process that had
-/// admitted nothing.
-fn wait_for_token_scoped_marker(
-    context: &mut ScenarioContext,
-    backend_index: usize,
-    marker: &str,
-    token: &str,
-) -> Result<()> {
-    let deadline = context.deadline();
-    loop {
-        let log = context.handle().be_log_contents(backend_index)?;
-        if log
-            .lines()
-            .any(|line| line.contains(marker) && line.contains(&format!("token={token}")))
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out waiting for token-scoped {marker} on BE[{backend_index}] token={token}; log_tail={:?}",
-                log.lines().rev().take(20).collect::<Vec<_>>()
-            );
-        }
-        thread::sleep(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(25)),
-        );
     }
 }

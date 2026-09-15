@@ -222,27 +222,14 @@ impl PreparedDistributedAttempt {
     }
 }
 
-/// Frontend-owned factory for a replacement whole distributed round whose
-/// caller retains the raw outcome (for example, a DML transaction runner
-/// still needs its exact commit/abort handles). It has the same no-reuse and
-/// one-way effect boundary as [`PreparedDistributedAttemptFactory`], but it
-/// intentionally has no statement-result formatter.
-pub(crate) trait PreparedDistributedRequestFactory: Send + PreReadyRetryBoundary {
-    fn replan(
-        &mut self,
-        topology: novarocks_query_application::api::BackendTopologySnapshot,
-    ) -> Result<
-        crate::query_execution::contract::DistributedQueryRequest,
-        crate::query_execution::contract::DistributedQueryError,
-    >;
-}
-
-/// One raw-outcome distributed operation plus the sole owner capable of
-/// generating its replacement round. The request remains move-only; the
-/// factory can only return a wholly new request from stable semantics.
-pub struct PreparedRetriableDistributedRequest {
+/// One raw-outcome distributed operation.
+///
+/// The caller retains its provider commit/abort boundary, but this carrier
+/// deliberately cannot create a successor round. An external-effect request
+/// without engine/provider proof of isolation must report `NoRecovery` rather
+/// than turn a pre-ready transport failure into an automatic replan.
+pub struct PreparedRawDistributedRequest {
     request: crate::query_execution::contract::DistributedQueryRequest,
-    round_factory: Box<dyn PreparedDistributedRequestFactory>,
     /// A DML operation can observe vended storage credentials while it is
     /// still building its first native request.  Keep the matching attempt
     /// reservation move-only with that request so lifecycle Init, rather than
@@ -250,14 +237,10 @@ pub struct PreparedRetriableDistributedRequest {
     reservation: Option<QueryAttemptReservation>,
 }
 
-impl PreparedRetriableDistributedRequest {
-    pub(crate) fn new(
-        request: crate::query_execution::contract::DistributedQueryRequest,
-        round_factory: Box<dyn PreparedDistributedRequestFactory>,
-    ) -> Self {
+impl PreparedRawDistributedRequest {
+    pub(crate) fn new(request: crate::query_execution::contract::DistributedQueryRequest) -> Self {
         Self {
             request,
-            round_factory,
             reservation: None,
         }
     }
@@ -271,10 +254,9 @@ impl PreparedRetriableDistributedRequest {
         self,
     ) -> (
         crate::query_execution::contract::DistributedQueryRequest,
-        Box<dyn PreparedDistributedRequestFactory>,
         Option<QueryAttemptReservation>,
     ) {
-        (self.request, self.round_factory, self.reservation)
+        (self.request, self.reservation)
     }
 }
 
