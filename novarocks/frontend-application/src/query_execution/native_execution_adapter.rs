@@ -80,6 +80,7 @@ use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 use crate::task_execution::abort_effect::{NativeAbortEffectAdapter, NativeAbortEffectIntake};
 use crate::task_execution::credential_pump::CredentialRotationPump;
+use crate::task_execution::credential_residual_job::CredentialResidualJobHandle;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::intent::{
     AckPayload, DispatchBatch, OperationIntent, TaskOperationQueueAdmission, TaskOperationSink,
@@ -810,6 +811,7 @@ pub(crate) struct FrontendNativeLogicalExecutionRuntime {
     abort_capacity: NonZeroUsize,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
+    credential_residual_jobs: CredentialResidualJobHandle,
 }
 
 impl std::fmt::Debug for FrontendNativeLogicalExecutionRuntime {
@@ -848,6 +850,7 @@ impl FrontendNativeLogicalExecutionRuntime {
         lifecycle_diagnostics: Arc<
             crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
         >,
+        credential_residual_jobs: CredentialResidualJobHandle,
     ) -> Self {
         Self {
             topology,
@@ -862,6 +865,7 @@ impl FrontendNativeLogicalExecutionRuntime {
             transport_budget,
             abort_capacity,
             lifecycle_diagnostics,
+            credential_residual_jobs,
         }
     }
 }
@@ -1365,6 +1369,7 @@ impl ProductionManifestAttemptProjection {
                 reads: Arc::clone(&result_transport) as Arc<dyn TaskDynamicFilterReads>,
                 initial_credential: &initial_credential,
                 credential_storage,
+                credential_residual_jobs: self.runtime.credential_residual_jobs.clone(),
             },
         );
         let (abort_route, abort_intake) =

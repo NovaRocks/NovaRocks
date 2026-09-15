@@ -43,6 +43,7 @@ use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::clock::ProcessMonotonicClock;
 use crate::task_execution::credential::CredentialRefreshOwner;
 use crate::task_execution::credential_pump::CredentialRotationPump;
+use crate::task_execution::credential_residual_job::CredentialResidualJobHandle;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::feedback_pump::{DynamicFilterFeedbackPump, TaskDynamicFilterReads};
@@ -95,6 +96,8 @@ pub(crate) struct AttemptPumps<'a> {
     pub(crate) initial_credential: &'a CredentialUpdate,
     /// This attempt's own credential table, absent when it vended none.
     pub(crate) credential_storage: Option<Arc<AttemptCredentialStorage>>,
+    /// FE process-runtime owner for a provider job that outlives this attempt.
+    pub(crate) credential_residual_jobs: CredentialResidualJobHandle,
 }
 
 /// Installs one attempt's per-turn owners and declares the set complete.
@@ -138,6 +141,7 @@ pub(crate) fn install_attempt_pumps(
             storage,
             Arc::new(ProcessMonotonicClock::new()),
             blocking_io.expect("credential storage requires blocking-I/O admission"),
+            pumps.credential_residual_jobs,
         )
     });
     if let Some(pump) = &credential {

@@ -27,6 +27,7 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorVendedS3CredentialLeaseRefresher,
     StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
     VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
+    VendedS3CredentialRefreshCallPolicy,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -467,18 +468,24 @@ impl IcebergRestVendedS3LeaseRefresher {
 impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestVendedS3LeaseRefresher {
     fn refresh_vended_s3_credentials(
         &self,
+        policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
         let catalog = Arc::clone(&self.catalog);
         let endpoint = Arc::clone(&self.scope.endpoint);
-        let delegation = self
-            .runtime
-            .block_on(async move {
-                catalog
-                    .load_credentials_with_access_delegation(endpoint.as_ref())
-                    .await
-            })
-            .map_err(|error| unavailable(format!("run Iceberg REST credential refresh: {error}")))?
-            .map_err(|error| unavailable(format!("load Iceberg REST credentials: {error}")))?;
+        let delegation = run_vended_refresh_with_policy(
+            &self.runtime,
+            policy,
+            "Iceberg REST credential refresh",
+            move || {
+                let catalog = Arc::clone(&catalog);
+                let endpoint = Arc::clone(&endpoint);
+                async move {
+                    catalog
+                        .load_credentials_with_access_delegation(endpoint.as_ref())
+                        .await
+                }
+            },
+        )?;
         let refreshed = match parse_vended_access_delegation(&delegation)? {
             IcebergAccessDelegation::Vended(seed) => seed,
             IcebergAccessDelegation::Static => {
@@ -534,24 +541,24 @@ impl IcebergRestLoadTableVendedS3LeaseRefresher {
 impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3LeaseRefresher {
     fn refresh_vended_s3_credentials(
         &self,
+        policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
         let catalog = Arc::clone(&self.catalog);
         let table = self.table.clone();
-        let response = self
-            .runtime
-            .block_on(async move {
-                catalog
-                    .load_table_deferred_with_access_delegation(&table)
-                    .await
-            })
-            .map_err(|error| {
-                unavailable(format!(
-                    "run Iceberg REST load-table credential refresh: {error}"
-                ))
-            })?
-            .map_err(|error| {
-                unavailable(format!("load Iceberg REST table credentials: {error}"))
-            })?;
+        let response = run_vended_refresh_with_policy(
+            &self.runtime,
+            policy,
+            "Iceberg REST load-table credential refresh",
+            move || {
+                let catalog = Arc::clone(&catalog);
+                let table = table.clone();
+                async move {
+                    catalog
+                        .load_table_deferred_with_access_delegation(&table)
+                        .await
+                }
+            },
+        )?;
         let (materialization, delegation) = response.into_parts();
         let refreshed = match parse_vended_access_delegation(&delegation)? {
             IcebergAccessDelegation::Vended(seed) => seed,
@@ -578,6 +585,76 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3L
             .into_parts();
         VendedS3CredentialLeaseRefresh::try_new(entries)
     }
+}
+
+/// Execute an idempotent provider GET under one call-local deadline.
+///
+/// The timeout owns the actual REST future, rather than an outer blocking-job
+/// handle. Dropping that future therefore stops waiting for its request and
+/// response body before the synchronous bridge returns its Connector permit.
+fn run_vended_refresh_with_policy<T, F, Fut>(
+    runtime: &crate::resources::IcebergCatalogRuntime,
+    policy: VendedS3CredentialRefreshCallPolicy,
+    operation: &'static str,
+    call: F,
+) -> Result<T, ConnectorError>
+where
+    T: Send + 'static,
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = crate::iceberg::Result<T>> + Send,
+{
+    runtime
+        .block_on(async move {
+            let deadline = tokio::time::Instant::now() + policy.remaining();
+            let mut attempts = 0_u8;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(refresh_deadline_exhausted(operation));
+                }
+                attempts = attempts.saturating_add(1);
+                let outcome = tokio::time::timeout(remaining, call()).await;
+                match outcome {
+                    Err(_) => return Err(refresh_deadline_exhausted(operation)),
+                    Ok(Ok(value)) => return Ok(value),
+                    Ok(Err(error)) => {
+                        let error = vended_refresh_read_error(operation, error);
+                        if !error.retryable_before_progress()
+                            || attempts >= policy.max_attempts().get()
+                        {
+                            return Err(error);
+                        }
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining <= policy.retry_backoff() {
+                            return Err(refresh_deadline_exhausted(operation));
+                        }
+                        tokio::time::sleep(policy.retry_backoff()).await;
+                    }
+                }
+            }
+        })
+        .map_err(|error| unavailable(format!("run {operation}: {error}")))?
+}
+
+fn vended_refresh_read_error(
+    operation: &'static str,
+    error: crate::iceberg::Error,
+) -> ConnectorError {
+    let retryable = matches!(error.kind(), crate::iceberg::ErrorKind::Unexpected);
+    let error = unavailable(format!("{operation}: {error}"));
+    if retryable {
+        error.with_retryable_before_progress()
+    } else {
+        error
+    }
+}
+
+fn refresh_deadline_exhausted(operation: &'static str) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::DeadlineExceeded,
+        format!("{operation} exhausted its provider-call deadline"),
+    )
 }
 
 pub(crate) struct IcebergVendedS3Credential {
@@ -1120,13 +1197,18 @@ fn cache_key(namespace_name: &str, table_name: &str) -> Result<(String, String),
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::num::NonZeroU8;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::time::Duration;
 
     use super::{
         CLIENT_REFRESH_CREDENTIALS_ENABLED, CLIENT_REFRESH_CREDENTIALS_ENDPOINT,
         IcebergAccessDelegation, RestCredentialInput, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY,
         S3_SESSION_TOKEN, S3_SESSION_TOKEN_EXPIRES_AT_MS, parse_vended_s3_credentials_at,
+        run_vended_refresh_with_policy,
     };
+    use novarocks_spi::connector::{ConnectorErrorKind, VendedS3CredentialRefreshCallPolicy};
 
     fn input(prefix: &str, expiration: u64, suffix: &str) -> RestCredentialInput {
         RestCredentialInput {
@@ -1215,6 +1297,101 @@ mod tests {
             .metadata_location(metadata_location.to_string())
             .build()
             .expect("table")
+    }
+
+    fn catalog_runtime() -> (
+        tokio::runtime::Runtime,
+        crate::resources::IcebergCatalogRuntime,
+    ) {
+        let owner = tokio::runtime::Runtime::new().expect("runtime");
+        let runtime = crate::resources::IcebergCatalogRuntime::new(owner.handle().clone());
+        (owner, runtime)
+    }
+
+    #[test]
+    fn vended_refresh_retries_one_unavailable_read_inside_its_call_budget() {
+        let (_owner, runtime) = catalog_runtime();
+        let attempts = Arc::new(AtomicU8::new(0));
+        let observed = Arc::clone(&attempts);
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(100),
+            NonZeroU8::new(2).expect("nonzero attempts"),
+            Duration::from_millis(1),
+        )
+        .expect("bounded policy");
+
+        let value = run_vended_refresh_with_policy(&runtime, policy, "test refresh", move || {
+            let observed = Arc::clone(&observed);
+            async move {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::Unexpected,
+                        "transient read failure",
+                    ))
+                } else {
+                    Ok(7_u8)
+                }
+            }
+        })
+        .expect("second GET succeeds inside the budget");
+
+        assert_eq!(value, 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn vended_refresh_times_out_the_provider_future_not_its_outer_worker() {
+        let (_owner, runtime) = catalog_runtime();
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(10),
+            NonZeroU8::new(1).expect("nonzero attempts"),
+            Duration::ZERO,
+        )
+        .expect("single-attempt policy permits no retry delay");
+
+        let error = run_vended_refresh_with_policy::<(), _, _>(
+            &runtime,
+            policy,
+            "test refresh",
+            || async { std::future::pending::<crate::iceberg::Result<()>>().await },
+        )
+        .expect_err("the provider future must obey its own deadline");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+    }
+
+    #[test]
+    fn vended_refresh_does_not_retry_a_nonretryable_provider_read_failure() {
+        let (_owner, runtime) = catalog_runtime();
+        let attempts = Arc::new(AtomicU8::new(0));
+        let observed = Arc::clone(&attempts);
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(100),
+            NonZeroU8::new(2).expect("nonzero attempts"),
+            Duration::from_millis(1),
+        )
+        .expect("bounded policy");
+
+        let error = run_vended_refresh_with_policy::<(), _, _>(
+            &runtime,
+            policy,
+            "test refresh",
+            move || {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "malformed credential response",
+                    ))
+                }
+            },
+        )
+        .expect_err("nonretryable response must stop at one call");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+        assert!(!error.retryable_before_progress());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

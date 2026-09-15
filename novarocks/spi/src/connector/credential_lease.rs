@@ -22,7 +22,9 @@
 //! here: the native lifecycle confidential carrier owns their short-lived
 //! transport and execution-side installation.
 
+use std::num::NonZeroU8;
 use std::sync::Arc;
+use std::time::Duration;
 
 use novarocks_secret::SecretValue;
 
@@ -244,12 +246,59 @@ impl VendedS3CredentialLeaseRefresh {
     }
 }
 
+/// Secret-free, FE-local bound for one provider credential-refresh call.
+///
+/// The provider starts one monotonic deadline when it receives this policy.
+/// Every attempt, its transport setup, response read, and retry wait must fit
+/// inside that one budget.  This is deliberately a synchronous call policy:
+/// it does not claim that a caller can forcibly abort an already-issued I/O
+/// operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VendedS3CredentialRefreshCallPolicy {
+    remaining: Duration,
+    max_attempts: NonZeroU8,
+    retry_backoff: Duration,
+}
+
+impl VendedS3CredentialRefreshCallPolicy {
+    pub fn try_new(
+        remaining: Duration,
+        max_attempts: NonZeroU8,
+        retry_backoff: Duration,
+    ) -> Result<Self, ConnectorError> {
+        if remaining.is_zero() {
+            return Err(invalid("vended S3 credential refresh remaining budget"));
+        }
+        if max_attempts.get() > 1 && retry_backoff.is_zero() {
+            return Err(invalid("vended S3 credential refresh retry backoff"));
+        }
+        Ok(Self {
+            remaining,
+            max_attempts,
+            retry_backoff,
+        })
+    }
+
+    pub const fn remaining(&self) -> Duration {
+        self.remaining
+    }
+
+    pub const fn max_attempts(&self) -> NonZeroU8 {
+        self.max_attempts
+    }
+
+    pub const fn retry_backoff(&self) -> Duration {
+        self.retry_backoff
+    }
+}
+
 /// FE-local provider capability for refreshing an already-admitted vended S3
 /// lease. Implementations must use their own catalog identity and may never
 /// be serialized or attached to a BE request.
 pub trait ConnectorVendedS3CredentialLeaseRefresher: Send + Sync {
     fn refresh_vended_s3_credentials(
         &self,
+        policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError>;
 }
 
@@ -594,14 +643,16 @@ fn validate_secret_scalar(value: &str) -> Result<(), ConnectorError> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU8;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
         ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
         ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
         CredentialLeaseProvider, MAX_CREDENTIAL_LEASE_PREFIXES,
         VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
-        VendedS3CredentialLeaseRefresh,
+        VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
     };
     use crate::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
@@ -627,6 +678,7 @@ mod tests {
     impl ConnectorVendedS3CredentialLeaseRefresher for ProviderLocalRefresher {
         fn refresh_vended_s3_credentials(
             &self,
+            _policy: VendedS3CredentialRefreshCallPolicy,
         ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
             panic!("the capability is not invoked by this construction test")
         }
@@ -647,6 +699,34 @@ mod tests {
             StorageAccessDomainId::from_bytes([9; 32]),
         )
         .expect("descriptor")
+    }
+
+    #[test]
+    fn refresh_call_policy_requires_a_live_budget_and_nonbusy_retry() {
+        assert!(
+            VendedS3CredentialRefreshCallPolicy::try_new(
+                Duration::ZERO,
+                NonZeroU8::new(1).expect("nonzero attempts"),
+                Duration::ZERO,
+            )
+            .is_err()
+        );
+        assert!(
+            VendedS3CredentialRefreshCallPolicy::try_new(
+                Duration::from_millis(1),
+                NonZeroU8::new(2).expect("nonzero attempts"),
+                Duration::ZERO,
+            )
+            .is_err()
+        );
+
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(20),
+            NonZeroU8::new(2).expect("nonzero attempts"),
+            Duration::from_millis(1),
+        )
+        .expect("valid bounded policy");
+        assert_eq!(policy.max_attempts().get(), 2);
     }
 
     #[test]

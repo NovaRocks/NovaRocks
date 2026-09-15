@@ -38,7 +38,7 @@ use novarocks_spi::connector::{
     ConnectorVendedCredentialLeaseSink, ConnectorVendedS3CredentialLeaseRefresher,
     CredentialConsumerRole, CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
     ResolvedVendedS3Access, StorageAccessRequest, StorageCredentialScopePrefix,
-    VendedS3CredentialLeaseContribution,
+    VendedS3CredentialLeaseContribution, VendedS3CredentialRefreshCallPolicy,
 };
 use novarocks_task_codec::domain::WireCredential;
 use novarocks_types::NativeCompatibilityId;
@@ -327,27 +327,31 @@ impl QueryCredentialLeaseRefresher for ProviderVendedS3LeaseRefresher {
     fn refresh(
         &self,
         current: &CredentialLeaseDescriptor,
-    ) -> Result<QueryCredentialLeaseRefresh, String> {
+        policy: VendedS3CredentialRefreshCallPolicy,
+    ) -> Result<QueryCredentialLeaseRefresh, QueryCredentialLeaseRefreshError> {
         if current.provider() != CredentialLeaseProvider::S3 || current.prefixes().len() != 1 {
-            return Err("vended S3 credential refresh has an invalid existing scope".to_string());
+            return Err(QueryCredentialLeaseRefreshError::retryable(
+                "vended S3 credential refresh has an invalid existing scope",
+            ));
         }
         let target_prefix = &current.prefixes()[0];
         let entry = self
             .provider
-            .refresh_vended_s3_credentials()
-            .map_err(|_| "provider vended S3 credential refresh failed".to_string())?
+            .refresh_vended_s3_credentials(policy)
+            .map_err(map_provider_refresh_error)?
             .into_entries()
             .into_iter()
             .find(|entry| entry.prefix() == target_prefix)
             .ok_or_else(|| {
-                "provider vended S3 credential refresh changed prefix scope".to_string()
+                QueryCredentialLeaseRefreshError::retryable(
+                    "provider vended S3 credential refresh changed prefix scope",
+                )
             })?;
         let (prefix, not_after_unix_ms, access_key_id, secret_access_key, session_token) =
             entry.into_parts();
-        let epoch = current
-            .epoch()
-            .checked_add(1)
-            .ok_or_else(|| "vended S3 credential lease epoch overflow".to_string())?;
+        let epoch = current.epoch().checked_add(1).ok_or_else(|| {
+            QueryCredentialLeaseRefreshError::retryable("vended S3 credential lease epoch overflow")
+        })?;
         let descriptor = CredentialLeaseDescriptor::try_new(
             current.lease_id(),
             epoch,
@@ -358,7 +362,11 @@ impl QueryCredentialLeaseRefresher for ProviderVendedS3LeaseRefresher {
             true,
             current.storage_access_domain_id(),
         )
-        .map_err(|_| "build refreshed vended S3 credential descriptor failed".to_string())?;
+        .map_err(|_| {
+            QueryCredentialLeaseRefreshError::retryable(
+                "build refreshed vended S3 credential descriptor failed",
+            )
+        })?;
         let envelope = CredentialLeaseSecretEnvelope::try_new(
             current.lease_id(),
             epoch,
@@ -367,9 +375,25 @@ impl QueryCredentialLeaseRefresher for ProviderVendedS3LeaseRefresher {
             session_token,
             not_after_unix_ms,
         )
-        .map_err(|_| "build refreshed vended S3 credential envelope failed".to_string())?;
-        QueryCredentialLeaseRefresh::try_new(descriptor, envelope)
-            .map_err(|_| "refreshed vended S3 credential lease violates its contract".to_string())
+        .map_err(|_| {
+            QueryCredentialLeaseRefreshError::retryable(
+                "build refreshed vended S3 credential envelope failed",
+            )
+        })?;
+        QueryCredentialLeaseRefresh::try_new(descriptor, envelope).map_err(|_| {
+            QueryCredentialLeaseRefreshError::retryable(
+                "refreshed vended S3 credential lease violates its contract",
+            )
+        })
+    }
+}
+
+fn map_provider_refresh_error(error: ConnectorError) -> QueryCredentialLeaseRefreshError {
+    match error.kind() {
+        ConnectorErrorKind::DeadlineExceeded => QueryCredentialLeaseRefreshError::DeadlineExhausted,
+        _ => QueryCredentialLeaseRefreshError::retryable(
+            "provider vended S3 credential refresh failed",
+        ),
     }
 }
 
@@ -414,7 +438,25 @@ pub(crate) trait QueryCredentialLeaseRefresher: Send + Sync + 'static {
     fn refresh(
         &self,
         current: &CredentialLeaseDescriptor,
-    ) -> Result<QueryCredentialLeaseRefresh, String>;
+        policy: VendedS3CredentialRefreshCallPolicy,
+    ) -> Result<QueryCredentialLeaseRefresh, QueryCredentialLeaseRefreshError>;
+}
+
+/// Sanitized result classification from one synchronous provider refresh.
+///
+/// This never carries provider errors or credential material. A terminated
+/// attempt uses the deadline variant to account for an already-entered call in
+/// the FE process-runtime residual-job owner without guessing from text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QueryCredentialLeaseRefreshError {
+    Retryable(String),
+    DeadlineExhausted,
+}
+
+impl QueryCredentialLeaseRefreshError {
+    pub(crate) fn retryable(detail: impl Into<String>) -> Self {
+        Self::Retryable(detail.into())
+    }
 }
 
 /// A next epoch obtained by the FE from the provider-private refresh source.
@@ -1010,7 +1052,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::{AttemptCredentialLeaseCollector, QueryCatalogLease, QueryInitOptions};
+    use super::{
+        AttemptCredentialLeaseCollector, QueryCatalogLease, QueryCredentialLeaseRefreshError,
+        QueryInitOptions, map_provider_refresh_error,
+    };
     use crate::query_execution::contract::ResolvedQueryOptions;
     use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_proto_codec::catalog::CatalogSet;
@@ -1104,6 +1149,7 @@ mod tests {
     impl ConnectorVendedS3CredentialLeaseRefresher for ProviderLocalRefresher {
         fn refresh_vended_s3_credentials(
             &self,
+            _policy: novarocks_spi::connector::VendedS3CredentialRefreshCallPolicy,
         ) -> Result<VendedS3CredentialLeaseRefresh, novarocks_spi::connector::ConnectorError>
         {
             panic!("the capability is not invoked by this collection test")
@@ -1123,6 +1169,7 @@ mod tests {
     impl ConnectorVendedS3CredentialLeaseRefresher for DropTrackedRefresher {
         fn refresh_vended_s3_credentials(
             &self,
+            _policy: novarocks_spi::connector::VendedS3CredentialRefreshCallPolicy,
         ) -> Result<VendedS3CredentialLeaseRefresh, novarocks_spi::connector::ConnectorError>
         {
             panic!("the drop-tracked refresher is never invoked")
@@ -1147,6 +1194,24 @@ mod tests {
             "an endpoint-free contribution without a provider source is not refreshable"
         );
         assert!(collector.into_credential_leases().is_err());
+    }
+
+    #[test]
+    fn provider_refresh_deadline_stays_typed_after_the_query_adapter() {
+        let error = map_provider_refresh_error(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded,
+            "provider deadline",
+        ));
+        assert_eq!(error, QueryCredentialLeaseRefreshError::DeadlineExhausted);
+
+        let retryable = map_provider_refresh_error(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            "provider outage",
+        ));
+        assert!(matches!(
+            retryable,
+            QueryCredentialLeaseRefreshError::Retryable(_)
+        ));
     }
 
     #[test]

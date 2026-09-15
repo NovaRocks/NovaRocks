@@ -103,6 +103,29 @@ fn test_connector_blocking_io() -> ConnectorBlockingIoSupervisor {
     )
 }
 
+fn test_credential_residual_jobs()
+-> crate::task_execution::credential_residual_job::CredentialResidualJobHandle {
+    static OWNER: OnceLock<
+        crate::task_execution::credential_residual_job::CredentialResidualJobOwner,
+    > = OnceLock::new();
+    OWNER
+        .get_or_init(|| {
+            static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+            let runtime = RUNTIME.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .max_blocking_threads(8)
+                    .enable_all()
+                    .build()
+                    .expect("test credential residual-job runtime")
+            });
+            crate::task_execution::credential_residual_job::CredentialResidualJobOwner::new(
+                runtime.handle().clone(),
+            )
+        })
+        .handle()
+}
+
 // ---------------------------------------------------------------------------
 // Fakes
 // ---------------------------------------------------------------------------
@@ -4907,6 +4930,7 @@ fn installing_the_attempt_pumps_supplies_both_feedback_loops() {
                 as Arc<dyn crate::task_execution::feedback_pump::TaskDynamicFilterReads>,
             initial_credential: &credential,
             credential_storage: Some(Arc::clone(&storage)),
+            credential_residual_jobs: test_credential_residual_jobs(),
         },
     );
 
@@ -4960,6 +4984,7 @@ fn an_attempt_with_no_channel_and_no_vended_credential_installs_no_owner() {
                 as Arc<dyn crate::task_execution::feedback_pump::TaskDynamicFilterReads>,
             initial_credential: &credential,
             credential_storage: None,
+            credential_residual_jobs: test_credential_residual_jobs(),
         },
     );
 
@@ -5076,13 +5101,21 @@ impl crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher for S
     fn refresh(
         &self,
         current: &novarocks_spi::connector::CredentialLeaseDescriptor,
-    ) -> Result<crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresh, String> {
+        _policy: novarocks_spi::connector::VendedS3CredentialRefreshCallPolicy,
+    ) -> Result<
+        crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresh,
+        crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefreshError,
+    > {
         use novarocks_proto_codec::lifecycle::CredentialLeaseSecretEnvelope;
         use novarocks_spi::connector::CredentialLeaseDescriptor;
 
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err("scripted provider failure".to_owned());
+            return Err(
+                crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefreshError::retryable(
+                    "scripted provider failure",
+                ),
+            );
         }
         let epoch = current.epoch() + 1;
         let not_after = current.not_after_unix_ms() + 600_000;
@@ -5096,7 +5129,11 @@ impl crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher for S
             true,
             current.storage_access_domain_id(),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefreshError::retryable(
+                error.to_string(),
+            )
+        })?;
         let envelope = CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
             current.lease_id(),
             epoch,
@@ -5105,11 +5142,19 @@ impl crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher for S
             "session-token".to_owned(),
             not_after,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefreshError::retryable(
+                error.to_string(),
+            )
+        })?;
         crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresh::try_new(
             descriptor, envelope,
         )
-        .map_err(|error| error.message().to_owned())
+        .map_err(|error| {
+            crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefreshError::retryable(
+                error.message(),
+            )
+        })
     }
 }
 
@@ -5472,6 +5517,7 @@ fn a_credential_rotation_reaches_every_context_and_is_reported_once() {
         Arc::clone(&storage),
         clock.clone() as Arc<dyn TaskProtocolClock>,
         test_connector_blocking_io(),
+        test_credential_residual_jobs(),
     )
     .expect("a refreshable lease means there is something to rotate");
     let mut driver = Arc::clone(&pump);
@@ -5587,6 +5633,7 @@ fn a_rotation_that_cannot_be_accepted_before_its_hard_deadline_fails_the_attempt
         storage,
         clock.clone() as Arc<dyn TaskProtocolClock>,
         test_connector_blocking_io(),
+        test_credential_residual_jobs(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);
@@ -5638,6 +5685,7 @@ fn a_provider_success_settled_at_the_hard_deadline_is_not_installed() {
         Arc::clone(&storage),
         clock.clone() as Arc<dyn TaskProtocolClock>,
         test_connector_blocking_io(),
+        test_credential_residual_jobs(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);
@@ -5715,6 +5763,7 @@ fn a_wiped_rotation_owner_stops_driving_the_credential_domain() {
         storage,
         clock.clone() as Arc<dyn TaskProtocolClock>,
         test_connector_blocking_io(),
+        test_credential_residual_jobs(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);
@@ -5758,6 +5807,7 @@ fn a_context_that_is_already_over_is_retired_rather_than_failing_the_rotation() 
         storage,
         clock.clone() as Arc<dyn TaskProtocolClock>,
         test_connector_blocking_io(),
+        test_credential_residual_jobs(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);

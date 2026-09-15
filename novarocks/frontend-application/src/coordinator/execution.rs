@@ -84,6 +84,9 @@ use crate::runtime_filter::compiler::{
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict, accept_final_info};
+use crate::task_execution::credential_residual_job::CredentialResidualJobHandle;
+#[cfg(test)]
+use crate::task_execution::credential_residual_job::CredentialResidualJobOwner;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::ReleasedRuntimeFilterContributions;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
@@ -293,6 +296,7 @@ pub struct FrontendDistributedQueryCoordinator {
     registry: Arc<FrontendQueryRegistry>,
     lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     data_runtime: FrontendDataRuntime,
+    credential_residual_jobs: CredentialResidualJobHandle,
     /// Every bound the task protocol runs one attempt with, frozen at startup.
     ///
     /// Held rather than read per attempt so a deployment's bounds cannot change
@@ -323,6 +327,7 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: novarocks_query_application::api::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
         lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
+        credential_residual_jobs: CredentialResidualJobHandle,
     ) -> Result<Self, DistributedQueryError> {
         let query_id_source = UniqueQueryIdSource::default();
         let query_namespace = query_id_source.namespace();
@@ -339,6 +344,7 @@ impl FrontendDistributedQueryCoordinator {
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
             lifecycle_diagnostics,
             data_runtime,
+            credential_residual_jobs,
             coordination_budgets,
             transport_budget,
             result_fetch_byte_limit,
@@ -404,6 +410,10 @@ impl FrontendDistributedQueryCoordinator {
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            credential_residual_jobs: CredentialResidualJobOwner::new(
+                tokio::runtime::Handle::current(),
+            )
+            .handle(),
             task_update_retry_policy:
                 novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
@@ -468,6 +478,10 @@ impl FrontendDistributedQueryCoordinator {
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            credential_residual_jobs: CredentialResidualJobOwner::new(
+                tokio::runtime::Handle::current(),
+            )
+            .handle(),
             task_update_retry_policy:
                 novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
@@ -988,6 +1002,7 @@ impl FrontendDistributedQueryCoordinator {
                 reads: Arc::clone(&result_transport) as Arc<dyn TaskDynamicFilterReads>,
                 initial_credential: &initial_credential,
                 credential_storage: attempt_storage.clone(),
+                credential_residual_jobs: self.credential_residual_jobs.clone(),
             },
         );
 

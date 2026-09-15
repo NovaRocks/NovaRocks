@@ -43,23 +43,30 @@
 //! backend fences its next epoch against.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU8;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks_execution::task_execution::domain::CredentialEpoch;
 use novarocks_execution::task_execution::identity::{QueryContextRef, TaskOperationId};
 use novarocks_execution::task_execution::operation::{OperationOutcome, QueryContextDomainReceipt};
 use novarocks_query_application::coordination::MonotonicInstant;
-use novarocks_spi::connector::CredentialLeaseId as StorageLeaseId;
+use novarocks_spi::connector::{
+    CredentialLeaseId as StorageLeaseId, VendedS3CredentialRefreshCallPolicy,
+};
 use novarocks_types::QueryExecutionId;
 
 use crate::query_execution::lifecycle_plan::{
-    AttemptCredentialStorage, QueryCredentialLeaseRefresh,
+    AttemptCredentialStorage, QueryCredentialLeaseRefresh, QueryCredentialLeaseRefreshError,
 };
 
 use super::blocking_io::{ConnectorBlockingIoJob, ConnectorBlockingIoSupervisor};
 use super::clock::TaskProtocolClock;
 use super::credential::{CredentialRefreshOwner, RefreshRefusal, refresh_timing};
+use super::credential_residual_job::{
+    AttemptProviderGenerationFence, CredentialResidualJobHandle, CredentialResidualJobOutcome,
+    ProviderCallEntry,
+};
 use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
 use super::intent::{AckPayload, OperationAcknowledgement};
@@ -83,6 +90,11 @@ enum VendOutcome {
     /// The provider did not answer. Trying again may work, inside the hard
     /// deadline.
     Retryable(String),
+    /// The provider consumed its complete call budget before answering.
+    DeadlineExhausted,
+    /// The attempt terminal fence closed while this job waited for blocking
+    /// admission. No provider request or retry was issued.
+    FencedBeforeProviderCall,
 }
 
 /// One in-flight provider call.
@@ -95,6 +107,7 @@ struct VendingRound {
     /// When the epoch being replaced stops being usable.
     hard_deadline: MonotonicInstant,
     outcome: ConnectorBlockingIoJob<VendOutcome>,
+    fence: AttemptProviderGenerationFence,
     /// A completed outcome staged by deterministic unit tests.
     #[cfg(test)]
     staged_outcome: Option<Result<VendOutcome, super::blocking_io::ConnectorBlockingIoError>>,
@@ -133,6 +146,7 @@ pub(crate) struct CredentialRotationPump {
     storage: Arc<AttemptCredentialStorage>,
     clock: Arc<dyn TaskProtocolClock>,
     blocking_io: ConnectorBlockingIoSupervisor,
+    residual_jobs: CredentialResidualJobHandle,
     state: Mutex<RotationState>,
 }
 
@@ -152,6 +166,7 @@ impl CredentialRotationPump {
         storage: Arc<AttemptCredentialStorage>,
         clock: Arc<dyn TaskProtocolClock>,
         blocking_io: ConnectorBlockingIoSupervisor,
+        residual_jobs: CredentialResidualJobHandle,
     ) -> Option<Arc<Self>> {
         if storage.refreshable().is_empty() {
             return None;
@@ -161,6 +176,7 @@ impl CredentialRotationPump {
             storage,
             clock,
             blocking_io,
+            residual_jobs,
             state: Mutex::new(RotationState {
                 owner,
                 vending: None,
@@ -223,15 +239,24 @@ impl CredentialRotationPump {
             .map(|round| round.hard_deadline)
     }
 
-    /// Stops rotating and drops the material.
+    /// Stops rotating and closes the attempt generation fence.
     ///
     /// Called when the attempt is done with its credential. After it the driver
-    /// can produce no further request, which is what makes it safe to keep on
-    /// the runner while an attempt unwinds.
+    /// can produce no further request. An already submitted blocking job is
+    /// transferred to the FE process-runtime owner: it either observes this
+    /// fence after admission and makes no request, or it has already entered
+    /// the provider and retains the Connector permit until it truly exits.
     pub(crate) fn wipe(&self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.finished = true;
-        state.vending = None;
+        if let Some(round) = state.vending.take() {
+            round.fence.close();
+            self.residual_jobs.retain(
+                self.execution_id,
+                round.outcome,
+                classify_residual_vending_outcome,
+            );
+        }
         state.in_flight.clear();
         state.owner.wipe();
     }
@@ -377,6 +402,12 @@ impl CredentialRotationPump {
                     state.retry_delay = state.retry_delay.saturating_mul(2).min(PROVIDER_RETRY_MAX);
                     Ok(0)
                 }
+                VendOutcome::DeadlineExhausted => {
+                    Err(self.rotation_failed("the credential provider exhausted its call deadline"))
+                }
+                VendOutcome::FencedBeforeProviderCall => Err(self.rotation_failed(
+                    "credential provider job was fenced before its external request",
+                )),
             },
         }
     }
@@ -412,15 +443,39 @@ impl CredentialRotationPump {
         // The provider call is blocking and must not be made on the turn: the
         // same thread owns the result loop, and a provider that took a second
         // would stop settling acknowledgements and opening edges for a second.
+        let provider_deadline = Instant::now() + timing.hard_delay();
+        let fence = AttemptProviderGenerationFence::new();
+        let provider_fence = fence.clone();
         let outcome =
             self.blocking_io
-                .spawn_protected(move || match refresher.refresh(&descriptor) {
-                    Ok(refreshed) => VendOutcome::Refreshed(Box::new(refreshed)),
-                    Err(detail) => VendOutcome::Retryable(detail),
+                .spawn_protected(move || match provider_fence.enter_provider_call() {
+                    ProviderCallEntry::Closed => VendOutcome::FencedBeforeProviderCall,
+                    ProviderCallEntry::Entered => {
+                        let remaining = provider_deadline.saturating_duration_since(Instant::now());
+                        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+                            remaining,
+                            NonZeroU8::new(3)
+                                .expect("fixed provider refresh attempt count is nonzero"),
+                            PROVIDER_RETRY_INITIAL,
+                        );
+                        match policy {
+                            Err(error) => VendOutcome::Retryable(error.message().to_owned()),
+                            Ok(policy) => match refresher.refresh(&descriptor, policy) {
+                                Ok(refreshed) => VendOutcome::Refreshed(Box::new(refreshed)),
+                                Err(QueryCredentialLeaseRefreshError::Retryable(detail)) => {
+                                    VendOutcome::Retryable(detail)
+                                }
+                                Err(QueryCredentialLeaseRefreshError::DeadlineExhausted) => {
+                                    VendOutcome::DeadlineExhausted
+                                }
+                            },
+                        }
+                    }
                 });
         state.vending = Some(VendingRound {
             hard_deadline,
             outcome,
+            fence,
             #[cfg(test)]
             staged_outcome: None,
         });
@@ -496,6 +551,19 @@ impl CredentialRotationPump {
             "credential rotation of {:?} failed: {detail}",
             self.execution_id
         ))
+    }
+}
+
+fn classify_residual_vending_outcome(
+    outcome: Result<VendOutcome, super::blocking_io::ConnectorBlockingIoError>,
+) -> CredentialResidualJobOutcome {
+    match outcome {
+        Ok(VendOutcome::Refreshed(_)) => CredentialResidualJobOutcome::Completed,
+        Ok(VendOutcome::FencedBeforeProviderCall) => {
+            CredentialResidualJobOutcome::FencedBeforeProviderCall
+        }
+        Ok(VendOutcome::DeadlineExhausted) => CredentialResidualJobOutcome::DeadlineExhausted,
+        Ok(VendOutcome::Retryable(_)) | Err(_) => CredentialResidualJobOutcome::Failed,
     }
 }
 

@@ -43,6 +43,9 @@ use novarocks_workload_control::{
 };
 
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
+use crate::task_execution::credential_residual_job::{
+    CredentialResidualJobHandle, CredentialResidualJobOwner,
+};
 use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
@@ -200,6 +203,7 @@ struct FrontendExecutionRuntimeOwner {
     query_cpu_executor: QueryCpuExecutor,
     query_blocking: QueryBlockingExecutorOwner,
     query_blocking_executor: QueryBlockingExecutor,
+    credential_residual_jobs: CredentialResidualJobOwner,
     decode: RootResultDecodeRuntimeOwner,
     decode_runtime: RootResultDecodeRuntime,
     terminal_error: Option<String>,
@@ -344,6 +348,7 @@ impl FrontendExecutionRuntimeOwner {
             &runtime,
             workload.owner.deadline_expiry_handle(),
         );
+        let credential_residual_jobs = CredentialResidualJobOwner::new(runtime);
         Ok(Self {
             supervisor,
             logical_execution_client,
@@ -357,6 +362,7 @@ impl FrontendExecutionRuntimeOwner {
             query_cpu_executor,
             query_blocking,
             query_blocking_executor,
+            credential_residual_jobs,
             decode,
             decode_runtime,
             terminal_error: None,
@@ -427,6 +433,10 @@ impl FrontendExecutionRuntimeOwner {
             self.shutdown_workload_until(deadline).await?;
         }
         self.deadline_supervisor.shutdown().await;
+
+        self.credential_residual_jobs
+            .shutdown_until(deadline)
+            .await?;
 
         if let Err(error) = self.query_cpu.shutdown_until(deadline).await {
             return Err(error);
@@ -556,6 +566,10 @@ impl FrontendExecutionRuntimeOwner {
 
     fn query_blocking_executor(&self) -> QueryBlockingExecutor {
         self.query_blocking_executor.clone()
+    }
+
+    fn credential_residual_jobs(&self) -> CredentialResidualJobHandle {
+        self.credential_residual_jobs.handle()
     }
 
     fn decode_runtime(&self) -> RootResultDecodeRuntime {
@@ -1590,6 +1604,7 @@ impl FrontendApplicationHost {
                 self.backend_topology_port(),
                 self.data_runtime.clone(),
                 self.execution_runtime_owner.lifecycle_diagnostics(),
+                self.execution_runtime_owner.credential_residual_jobs(),
             )
             .map_err(FrontendApplicationError::server)?,
         );
@@ -1651,6 +1666,7 @@ impl FrontendApplicationHost {
             config.transport_budget.into_codec(),
             config.abort_capacity,
             self.execution_runtime_owner.lifecycle_diagnostics(),
+            self.execution_runtime_owner.credential_residual_jobs(),
         );
         Arc::new(FrontendNativeLogicalReadLauncher::new(
             self.logical_execution_client(),

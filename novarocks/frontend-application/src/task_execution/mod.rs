@@ -43,6 +43,7 @@ pub(crate) mod context_convergence;
 pub(crate) mod context_owner;
 pub(crate) mod credential;
 pub(crate) mod credential_pump;
+pub(crate) mod credential_residual_job;
 pub(crate) mod dispatch;
 pub(crate) mod error;
 pub(crate) mod execution;

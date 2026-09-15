@@ -120,7 +120,7 @@ pub use credential_lease::{
     MAX_CREDENTIAL_LEASE_PREFIXES, MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES,
     MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES, MAX_CREDENTIAL_LEASES_PER_QUERY,
     VendedCredentialLease, VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
-    VendedS3CredentialLeaseRefresh,
+    VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,
