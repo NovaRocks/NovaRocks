@@ -38,16 +38,26 @@ use crate::query_execution::dml::add_files::{
 };
 use novarocks_query_application::admitted_query_context::RequestContext;
 
+/// A planned ADD FILES operation whose provider dispatch has not begun.
+///
+/// It retains the exact provider plan and publication identity, so a caller
+/// may cancel before dispatch without turning a non-effect into a retryable
+/// post-dispatch operation.
+pub(crate) struct PreparedAddFilesAttempt {
+    prepared: PreparedAddFiles,
+    attempt: DmlPublicationAttempt,
+}
+
 impl DmlService {
-    /// Executes an admitted ADD FILES statement as one non-durable attempt.
+    /// Plans an admitted ADD FILES statement without beginning dispatch.
     #[allow(clippy::result_large_err)]
-    pub fn execute_add_files(
+    pub(crate) fn prepare_add_files(
         &self,
         engine: &dyn AddFilesEngine,
         command: AddFilesCommand,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<u32, DmlError> {
+    ) -> Result<PreparedAddFilesAttempt, DmlError> {
         if !is_secret_free_source_location(&command.location) {
             return Err(DmlError::executor(
                 "ADD FILES source location must not contain credentials or query parameters",
@@ -66,7 +76,21 @@ impl DmlService {
             })
             .map_err(plan_error)?;
 
-        let mut attempt = attempt(&prepared.facts, publication_id)?;
+        let attempt = attempt(&prepared.facts, publication_id)?;
+        Ok(PreparedAddFilesAttempt { prepared, attempt })
+    }
+
+    /// Crosses the one-shot provider dispatch boundary for planned ADD FILES.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn execute_prepared_add_files(
+        &self,
+        engine: &dyn AddFilesEngine,
+        prepared: PreparedAddFilesAttempt,
+    ) -> Result<u32, DmlError> {
+        let PreparedAddFilesAttempt {
+            prepared,
+            mut attempt,
+        } = prepared;
         attempt
             .mark_dispatch_possible()
             .map_err(DmlError::executor)?;
@@ -225,7 +249,93 @@ fn is_secret_free_source_location(location: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
     use super::*;
+    use crate::query_execution::dml::add_files::{
+        AddFilesEvidence, AddFilesPlanSummary, AddFilesPrepared,
+    };
+    use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
+    use novarocks_query_application::api::BackendTopologySnapshot;
+    use novarocks_query_application::cancellation::QueryCancellationSource;
+    use novarocks_spi::connector::ConnectorDataMutationSourceScope;
+    use novarocks_types::ClusterRole;
+
+    struct TestPrepared;
+
+    impl AddFilesPrepared for TestPrepared {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAddFilesEngine {
+        plan_calls: AtomicUsize,
+        execute_calls: AtomicUsize,
+    }
+
+    impl AddFilesEngine for RecordingAddFilesEngine {
+        fn plan_add_files(
+            &self,
+            request: PlanAddFilesRequest,
+        ) -> Result<PreparedAddFiles, AddFilesPlanError> {
+            self.plan_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(PreparedAddFiles {
+                facts: AddFilesPlanFacts {
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: "orders".to_string(),
+                    source_location: request.command.location,
+                    provider_id: "iceberg".to_string(),
+                    instance_id: "ice".to_string(),
+                    incarnation: [1; 16],
+                    mutation_operation_id: request.mutation_operation_id,
+                    request_digest: [2; 32],
+                    plan_digest: [3; 32],
+                    state_digest: [4; 32],
+                    summary: AddFilesPlanSummary {
+                        file_count: 1,
+                        row_count: 2,
+                        total_bytes: 3,
+                    },
+                    source_scope: ConnectorDataMutationSourceScope::try_new_directory([5; 32])
+                        .expect("valid source scope"),
+                    public_plan_wire: vec![6],
+                },
+                handle: Arc::new(TestPrepared),
+            })
+        }
+
+        fn execute_add_files(&self, _prepared: &dyn AddFilesPrepared) -> AddFilesOutcome {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            unreachable!("this test must not cross the dispatch edge")
+        }
+
+        fn adjudicate_add_files(
+            &self,
+            _prepared: &dyn AddFilesPrepared,
+            _evidence: &AddFilesEvidence,
+        ) -> AddFilesOutcome {
+            unreachable!("this test must not adjudicate")
+        }
+    }
+
+    fn context() -> RequestContext {
+        let cancellation = QueryCancellationSource::new();
+        RequestContext::admit(RequestAdmission::new(
+            Some("ice".to_string()),
+            "db".to_string(),
+            ClusterRole::Fe,
+            BackendTopologySnapshot::empty(1),
+            Some(Instant::now() + Duration::from_secs(30)),
+            cancellation.view(),
+            Default::default(),
+        ))
+    }
 
     #[test]
     fn caller_source_validation_does_not_treat_path_spelling_as_credentials() {
@@ -238,5 +348,26 @@ mod tests {
         assert!(!is_secret_free_source_location(
             "s3://bucket/files?token=secret"
         ));
+    }
+
+    #[test]
+    fn planned_add_files_does_not_dispatch_until_the_second_edge() {
+        let engine = RecordingAddFilesEngine::default();
+        let prepared = DmlService::new()
+            .prepare_add_files(
+                &engine,
+                AddFilesCommand {
+                    table_parts: vec!["ice".to_string(), "db".to_string(), "orders".to_string()],
+                    location: "s3://bucket/source".to_string(),
+                },
+                &context(),
+                None,
+            )
+            .expect("plan ADD FILES without dispatch");
+
+        assert_eq!(engine.plan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 0);
+        drop(prepared);
+        assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 0);
     }
 }

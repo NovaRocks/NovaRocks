@@ -650,6 +650,46 @@ where
     .await
 }
 
+/// Runs a DML plan and its external-effect dispatch as distinct governed
+/// blocking edges. A successful plan is still pre-dispatch state, so the
+/// second edge independently checks cancellation before it can cross the
+/// publication boundary.
+async fn execute_prepared_dml_statement<P, Prepare, Execute>(
+    executor: QueryBlockingExecutor,
+    cancellation: QueryCancellationView,
+    diagnostic_statement: StatementToken,
+    execution_owner: WorkOwner,
+    prepare: Prepare,
+    execute: Execute,
+) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
+where
+    P: Send + 'static,
+    Prepare: FnOnce() -> Result<P, RoutedExecutionError> + Send + 'static,
+    Execute: FnOnce(P) -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
+{
+    let (prepared, execution_owner) = execute_synchronous_stage(
+        executor.clone(),
+        cancellation.clone(),
+        diagnostic_statement,
+        execution_owner,
+        prepare,
+    )
+    .await?;
+    match prepared {
+        Ok(prepared) => {
+            execute_synchronous_stage(
+                executor,
+                cancellation,
+                diagnostic_statement,
+                execution_owner,
+                move || execute(prepared),
+            )
+            .await
+        }
+        Err(error) => Ok((Err(error), execution_owner)),
+    }
+}
+
 async fn execute_product_statement(
     router: ProductCommandRouter,
     command: ProductSqlCommand,
@@ -1652,24 +1692,33 @@ impl FrontendQuerySession {
             }),
             ParsedStatement::Catalog(novarocks_parser::ast::CatalogStatement::TruncateTable(
                 statement,
-            )) => Box::pin(execute_synchronous_statement(
-                synchronous_command_executor,
-                worker_cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || {
-                    dml.execute_truncate(
-                        truncate_engine.as_ref(),
-                        crate::query_execution::dml::truncate::command_from_typed_statement(
-                            &statement,
-                        ),
-                        &context,
-                        Some(&query_options),
-                    )
-                    .map(|()| StatementResult::Ok)
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                },
-            )),
+            )) => {
+                let command =
+                    crate::query_execution::dml::truncate::command_from_typed_statement(&statement);
+                let prepare_dml = Arc::clone(&dml);
+                let prepare_truncate_engine = Arc::clone(&truncate_engine);
+                Box::pin(execute_prepared_dml_statement(
+                    synchronous_command_executor,
+                    worker_cancellation,
+                    diagnostic_statement,
+                    execution_owner,
+                    move || {
+                        prepare_dml
+                            .prepare_truncate(
+                                prepare_truncate_engine.as_ref(),
+                                command,
+                                &context,
+                                Some(&query_options),
+                            )
+                            .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                    },
+                    move |prepared| {
+                        dml.execute_prepared_truncate(truncate_engine.as_ref(), prepared)
+                            .map(|()| StatementResult::Ok)
+                            .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
+                    },
+                ))
+            }
             ParsedStatement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(
                 statement,
             )) => Box::pin(async move {
@@ -1677,24 +1726,35 @@ impl FrontendQuerySession {
                     &statement,
                 ) {
                     Ok(command) => {
-                        execute_synchronous_statement(
+                        let prepare_dml = Arc::clone(&dml);
+                        let prepare_add_files_engine = Arc::clone(&add_files_engine);
+                        execute_prepared_dml_statement(
                             synchronous_command_executor,
                             worker_cancellation,
                             diagnostic_statement,
                             execution_owner,
                             move || {
-                                dml.execute_add_files(
-                                    add_files_engine.as_ref(),
-                                    command,
-                                    &context,
-                                    Some(&query_options),
-                                )
-                                .map_err(|error| RoutedExecutionError::Engine(error.to_string()))
-                                .and_then(|count| {
-                                    add_files_status(count)
-                                        .map(StatementResult::Query)
-                                        .map_err(RoutedExecutionError::Engine)
-                                })
+                                prepare_dml
+                                    .prepare_add_files(
+                                        prepare_add_files_engine.as_ref(),
+                                        command,
+                                        &context,
+                                        Some(&query_options),
+                                    )
+                                    .map_err(|error| {
+                                        RoutedExecutionError::Engine(error.to_string())
+                                    })
+                            },
+                            move |prepared| {
+                                dml.execute_prepared_add_files(add_files_engine.as_ref(), prepared)
+                                    .map_err(|error| {
+                                        RoutedExecutionError::Engine(error.to_string())
+                                    })
+                                    .and_then(|count| {
+                                        add_files_status(count)
+                                            .map(StatementResult::Query)
+                                            .map_err(RoutedExecutionError::Engine)
+                                    })
                             },
                         )
                         .await

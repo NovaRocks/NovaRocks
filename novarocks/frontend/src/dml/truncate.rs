@@ -39,16 +39,27 @@ use crate::query_execution::dml::truncate::{
 };
 use novarocks_query_application::admitted_query_context::RequestContext;
 
+/// A planned TRUNCATE whose provider dispatch has not begun.
+///
+/// The preparation retains the exact provider session and its immutable
+/// publication identity. It may be dropped before dispatch without claiming
+/// an external effect; only [`DmlService::execute_prepared_truncate`] crosses
+/// the effect boundary.
+pub(crate) struct PreparedTruncateAttempt {
+    prepared: PreparedTruncate,
+    attempt: DmlPublicationAttempt,
+}
+
 impl DmlService {
-    /// Executes an admitted TRUNCATE as one non-durable statement attempt.
+    /// Plans an admitted TRUNCATE without beginning provider dispatch.
     #[allow(clippy::result_large_err)]
-    pub fn execute_truncate(
+    pub(crate) fn prepare_truncate(
         &self,
         engine: &dyn TruncateEngine,
         command: TruncateCommand,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<(), DmlError> {
+    ) -> Result<PreparedTruncateAttempt, DmlError> {
         let publication_id = LakePublicationId::new_v7();
         let session = context.session();
         let prepared = engine
@@ -62,7 +73,21 @@ impl DmlService {
             })
             .map_err(plan_error)?;
 
-        let mut attempt = attempt(&prepared.facts, publication_id)?;
+        let attempt = attempt(&prepared.facts, publication_id)?;
+        Ok(PreparedTruncateAttempt { prepared, attempt })
+    }
+
+    /// Crosses the one-shot provider dispatch boundary for a planned TRUNCATE.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn execute_prepared_truncate(
+        &self,
+        engine: &dyn TruncateEngine,
+        prepared: PreparedTruncateAttempt,
+    ) -> Result<(), DmlError> {
+        let PreparedTruncateAttempt {
+            prepared,
+            mut attempt,
+        } = prepared;
         attempt
             .mark_dispatch_possible()
             .map_err(DmlError::executor)?;
@@ -390,6 +415,12 @@ mod tests {
         }
     }
 
+    fn execute_test_truncate(engine: &FakeTruncateEngine) -> Result<(), DmlError> {
+        let service = DmlService::new();
+        let prepared = service.prepare_truncate(engine, command(), &context(), None)?;
+        service.execute_prepared_truncate(engine, prepared)
+    }
+
     #[test]
     fn direct_truncate_uses_data_mutation_marker_family() {
         assert_eq!(
@@ -399,11 +430,25 @@ mod tests {
     }
 
     #[test]
+    fn planned_truncate_does_not_dispatch_until_the_second_edge() {
+        let engine = FakeTruncateEngine::new(Mode::Committed, Mode::Committed);
+        let prepared = DmlService::new()
+            .prepare_truncate(&engine, command(), &context(), None)
+            .expect("plan truncate without dispatch");
+
+        assert_eq!(engine.plan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 0);
+
+        DmlService::new()
+            .execute_prepared_truncate(&engine, prepared)
+            .expect("explicit dispatch succeeds");
+        assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn unknown_is_adjudicated_once_and_exact_positive_commits_without_cleanup() {
         let engine = FakeTruncateEngine::new(Mode::CommitUnknown, Mode::Committed);
-        DmlService::new()
-            .execute_truncate(&engine, command(), &context(), None)
-            .expect("exact positive adjudication commits");
+        execute_test_truncate(&engine).expect("exact positive adjudication commits");
         assert_eq!(engine.plan_calls.load(Ordering::SeqCst), 1);
         assert_eq!(engine.execute_calls.load(Ordering::SeqCst), 1);
         assert_eq!(engine.adjudicate_calls.load(Ordering::SeqCst), 1);
@@ -412,9 +457,8 @@ mod tests {
     #[test]
     fn unknown_or_negative_adjudication_never_retries_or_mutates() {
         let engine = FakeTruncateEngine::new(Mode::CommitUnknown, Mode::KnownUncommitted);
-        let error = DmlService::new()
-            .execute_truncate(&engine, command(), &context(), None)
-            .expect_err("negative adjudication remains unknown");
+        let error =
+            execute_test_truncate(&engine).expect_err("negative adjudication remains unknown");
         let terminal = error.publication_terminal().expect("explicit terminal");
         assert_eq!(
             terminal.disposition(),
@@ -428,9 +472,7 @@ mod tests {
     #[test]
     fn finalization_failure_preserves_known_committed_terminal() {
         let engine = FakeTruncateEngine::new(Mode::CommittedFinalizationFailed, Mode::Committed);
-        let error = DmlService::new()
-            .execute_truncate(&engine, command(), &context(), None)
-            .expect_err("finalization failure is visible");
+        let error = execute_test_truncate(&engine).expect_err("finalization failure is visible");
         let terminal = error.publication_terminal().expect("explicit terminal");
         assert_eq!(
             terminal.disposition(),
