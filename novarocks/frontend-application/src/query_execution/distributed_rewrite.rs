@@ -93,11 +93,13 @@ impl DistributedRewriteSealing for QueryExecutionService {
 pub(crate) fn admit_pinned_rewrite_scan_binding(
     bindings: &QueryTableBindingStore,
     input_schema: &arrow::datatypes::SchemaRef,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
     crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
         bindings,
         &frozen_rewrite_identity(),
         input_schema,
+        planning_lease,
     )
 }
 
@@ -130,11 +132,13 @@ pub(crate) fn pinned_rewrite_read_resolver(
 pub(crate) fn admit_rewrite_group_scan_binding(
     bindings: &QueryTableBindingStore,
     input_schema: &arrow::datatypes::SchemaRef,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
     crate::query_execution::rewrite_group_read::admit_table_execute_scan_binding(
         bindings,
         &frozen_rewrite_identity(),
         input_schema,
+        planning_lease,
     )
 }
 

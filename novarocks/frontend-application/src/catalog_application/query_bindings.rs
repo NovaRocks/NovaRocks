@@ -237,12 +237,17 @@ pub enum QueryTableBindingAdmission {
     /// A connector-owned table admission retains the exact generation that
     /// admitted its read materialization or terminal write target.
     Exact(ConnectorControlPlanningLease),
+    /// A provider-frozen read has no independent table-selector materialization.
+    /// Its source facts remain opaque in the provider request, while this
+    /// retained lease fences the synthetic SQL relation to one exact control
+    /// generation.
+    FrozenRead(ConnectorControlPlanningLease),
 }
 
 impl QueryTableBindingAdmission {
     pub fn exact_planning_lease(&self) -> Result<ConnectorControlPlanningLease, String> {
         match self {
-            Self::Exact(lease) => Ok(lease.clone()),
+            Self::Exact(lease) | Self::FrozenRead(lease) => Ok(lease.clone()),
             Self::Local => Err("query binding has no connector planning lease".to_string()),
         }
     }
@@ -481,7 +486,9 @@ impl QueryTableBindingStore {
                 material.extend_from_slice(Sha256::digest(pin.table.payload()).as_slice());
                 material.extend_from_slice(Sha256::digest(pin.data_version.as_bytes()).as_slice());
             }
-            if let QueryTableBindingAdmission::Exact(lease) = &binding.admission {
+            if let QueryTableBindingAdmission::Exact(lease)
+            | QueryTableBindingAdmission::FrozenRead(lease) = &binding.admission
+            {
                 let descriptor = lease.binding().descriptor();
                 material.extend_from_slice(descriptor.provider_id.as_str().as_bytes());
                 material.push(0);
@@ -583,6 +590,14 @@ impl QueryTableBindingStore {
                         &materialization.table,
                         materialization.selector,
                     )?;
+                } else if let QueryTableBindingAdmission::FrozenRead(lease) = &binding.admission {
+                    let identity = catalog::materialization_identity_facts(&binding.resolved);
+                    self.exact_binding_receipts
+                        .register_frozen_connector_binding(
+                            id,
+                            [identity.catalog(), identity.namespace(), identity.table()],
+                            lease,
+                        )?;
                 }
                 let binding = Arc::new(binding);
                 self.by_id

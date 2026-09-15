@@ -406,6 +406,50 @@ impl ExactBindingReceiptStore {
         self.register_receipt(binding, receipt)
     }
 
+    /// Register a provider-frozen read that has no separately materialized
+    /// table selector. The frozen source facts remain opaque in the provider
+    /// read request; this receipt only binds the synthetic SQL relation to the
+    /// exact control generation that must serve those facts.
+    pub fn register_frozen_connector_binding(
+        &self,
+        binding: SqlTableBindingId,
+        object: [&str; 3],
+        planning_lease: &ConnectorControlPlanningLease,
+    ) -> Result<(), String> {
+        if !binding.belongs_to(self.scope) {
+            return Err("exact binding receipt token belongs to another query".to_string());
+        }
+        let descriptor = planning_lease.binding().descriptor();
+        let provider = descriptor.provider_id.as_str();
+        let format = |kind: &str| {
+            ProviderFactFormat::try_new(provider, kind)
+                .ok_or_else(|| "Connector binding fact format is invalid".to_string())
+        };
+        let object = ObjectPath::try_new(object)
+            .ok_or_else(|| "exact binding receipt object path is invalid".to_string())?;
+        let catalog_generation = CatalogGeneration::try_new(
+            format("connector-control-runtime/v1")?,
+            planning_lease.control_runtime_id().to_bytes(),
+        )
+        .ok_or_else(|| "Connector control generation fact is invalid".to_string())?;
+        let receipt = ExactObjectBinding {
+            object,
+            catalog_generation,
+            object_identity: None,
+            data_version: None,
+            read_binding: Some(ConnectorReadBinding::new(
+                descriptor.clone(),
+                planning_lease
+                    .binding()
+                    .catalog_properties()
+                    .map_err(|error| error.to_string())?
+                    .handle()
+                    .clone(),
+            )),
+        };
+        self.register_receipt(binding, receipt)
+    }
+
     fn register_receipt(
         &self,
         binding: SqlTableBindingId,

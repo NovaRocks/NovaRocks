@@ -35,6 +35,7 @@ use crate::catalog_application::query_bindings::{
 use crate::query_execution::preparation::scan::{
     QueryRewriteGroupRead, ResolvedScanExecution, ScanBindingResolver,
 };
+use novarocks_spi::connector::ConnectorControlPlanningLease;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
     FrozenConnectorScanIdentity, FrozenConnectorScanPlan, build_table_execute_scan_plan,
@@ -47,6 +48,7 @@ pub(crate) fn admit_table_execute_scan_binding(
     bindings: &QueryTableBindingStore,
     identity: &FrozenConnectorScanIdentity,
     input_schema: &SchemaRef,
+    planning_lease: ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
     bindings.resolve_or_insert_with_id(table_execute_binding_key(identity), |binding| {
         Ok(QueryTableBinding {
@@ -56,7 +58,7 @@ pub(crate) fn admit_table_execute_scan_binding(
                 binding,
             ),
             statistics_pin: None,
-            admission: QueryTableBindingAdmission::Local,
+            admission: QueryTableBindingAdmission::FrozenRead(planning_lease),
             scan_materialization: None,
             mv_target_read: None,
             write_target_admission: None,

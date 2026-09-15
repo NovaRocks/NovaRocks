@@ -35,6 +35,7 @@ use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
 use crate::query_execution::preparation::scan::{
     QueryPinnedFileSetRead, ResolvedScanExecution, ScanBindingResolver,
 };
+use novarocks_spi::connector::ConnectorControlPlanningLease;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
     FrozenConnectorScanIdentity, FrozenConnectorScanPlan, build_pinned_file_set_scan_plan,
@@ -46,9 +47,15 @@ pub(crate) fn admit_pinned_file_set_scan_binding(
     bindings: &QueryTableBindingStore,
     identity: &FrozenConnectorScanIdentity,
     input_schema: &SchemaRef,
+    planning_lease: ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
-    bindings.resolve_or_insert_with_id(pinned_file_set_binding_key(identity), |binding| {
-        pinned_file_set_query_table_binding(identity.clone(), input_schema.clone(), binding)
+    bindings.resolve_or_insert_with_id(pinned_file_set_binding_key(identity), move |binding| {
+        pinned_file_set_query_table_binding(
+            identity.clone(),
+            input_schema.clone(),
+            binding,
+            planning_lease,
+        )
     })
 }
 
@@ -58,6 +65,7 @@ pub(crate) fn admit_pinned_file_set_scan_binding(
 pub(crate) fn pinned_file_set_query_local_overlay(
     identity: &FrozenConnectorScanIdentity,
     input_schema: &SchemaRef,
+    planning_lease: ConnectorControlPlanningLease,
 ) -> QueryLocalTableOverlay {
     let identity = identity.clone();
     let schema = input_schema.clone();
@@ -66,7 +74,12 @@ pub(crate) fn pinned_file_set_query_local_overlay(
         identity.table().to_string(),
         pinned_file_set_binding_key(&identity),
         move |binding| {
-            pinned_file_set_query_table_binding(identity.clone(), schema.clone(), binding)
+            pinned_file_set_query_table_binding(
+                identity.clone(),
+                schema.clone(),
+                binding,
+                planning_lease.clone(),
+            )
         },
     )
 }
@@ -88,11 +101,12 @@ fn pinned_file_set_query_table_binding(
     identity: FrozenConnectorScanIdentity,
     input_schema: SchemaRef,
     binding: SqlTableBindingId,
+    planning_lease: ConnectorControlPlanningLease,
 ) -> Result<QueryTableBinding, String> {
     Ok(QueryTableBinding {
         resolved: pinned_file_set_resolved_analyzer_table(&identity, input_schema, binding),
         statistics_pin: None,
-        admission: QueryTableBindingAdmission::Local,
+        admission: QueryTableBindingAdmission::FrozenRead(planning_lease),
         scan_materialization: None,
         mv_target_read: None,
         write_target_admission: None,

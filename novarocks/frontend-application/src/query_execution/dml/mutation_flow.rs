@@ -2679,11 +2679,13 @@ fn run_one_cow_target(
                     table_bindings.as_ref(),
                     &frozen.identity,
                     &frozen.schema,
+                    planning_lease.clone(),
                 )?;
             let overlay =
                 crate::query_execution::pinned_connector_read::pinned_file_set_query_local_overlay(
                     &frozen.identity,
                     &frozen.schema,
+                    planning_lease.clone(),
                 );
             let resolver =
                 crate::query_execution::pinned_connector_read::PinnedFileSetReadResolver::new(
