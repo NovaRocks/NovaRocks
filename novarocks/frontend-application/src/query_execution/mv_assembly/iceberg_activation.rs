@@ -73,6 +73,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<PreparedMvNativeWriteAssembly, String> {
         match prepared.into_assembly_artifact() {
             PreparedMvRefreshWriteArtifact::FirstRefresh(prepared) => {
@@ -83,6 +84,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
                     planning_lease,
                     exact_lease,
                     execution,
+                    connector_context,
                 )
             }
             PreparedMvRefreshWriteArtifact::Incremental(prepared) => {
@@ -93,6 +95,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
                     planning_lease,
                     exact_lease,
                     execution,
+                    connector_context,
                 )
             }
         }

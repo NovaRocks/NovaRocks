@@ -190,15 +190,18 @@ fn execute_data(
             "SQL-prepared MV publication intent does not use its Lake publication identity",
         ));
     }
-    if intent.partition_spec_replacement().is_none() {
+    let context = if intent.partition_spec_replacement().is_none() {
         create_data_staging_branch(planning, &attempt, &finalize, &intent, context.clone())?;
-    }
+        context.after_external_effect()
+    } else {
+        context
+    };
     let write_lease = planning
         .derive_write_lease()
         .map_err(|error| unavailable(error.to_string()))?;
     let assembly = dependencies
         .provider_activation
-        .activate_write(prepared, planning, &write_lease, execution)
+        .activate_write(prepared, planning, &write_lease, execution, context.clone())
         .map_err(invalid)?;
     let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
     let authority = write_commit_authority(outcome.into_write_session())?;

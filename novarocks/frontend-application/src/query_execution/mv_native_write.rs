@@ -132,6 +132,7 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         planning_lease: &ConnectorControlPlanningLease,
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
+        connector_context: ConnectorRequestContext,
     ) -> Result<PreparedMvNativeWriteAssembly, String>;
 
     fn interpret_write_commit(

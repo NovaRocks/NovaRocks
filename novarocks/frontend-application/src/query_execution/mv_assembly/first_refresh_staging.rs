@@ -82,9 +82,8 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     planning_lease: &ConnectorControlPlanningLease,
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
-    let connector_context =
-        crate::connector::connector_request_context_for_execution(None, execution)?;
     // The session is opened before the plan is compiled because the plan's
     // writer node carries the recipe it seals: a plan and the session that
     // sealed it must not be separable.

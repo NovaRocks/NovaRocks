@@ -208,14 +208,13 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     planning_lease: &ConnectorControlPlanningLease,
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
     let (request, facts, mode, evidence, execution_artifact, publication_intent) =
         prepared.into_parts();
     if !exact_lease.matches_provider_binding_key(&request.observed_binding) {
         return Err("MV incremental write lease drifted from prepared binding".to_string());
     }
-    let connector_context =
-        crate::connector::connector_request_context_for_execution(None, execution)?;
     let refresh_rewrite = crate::query_execution::mv_assembly::first_refresh_staging::rebuild_frozen_mv_rewrite_context(
         ports,
         request.current_catalog.as_deref(),

@@ -236,6 +236,7 @@ pub struct ConnectorRequestContext {
     vended_credential_lease_sink: Option<Arc<dyn ConnectorVendedCredentialLeaseSink>>,
     vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
     request_scope: ConnectorRequestScope,
+    fresh_catalog_observation_required: bool,
     resources: Option<ConnectorRequestResources>,
 }
 
@@ -314,6 +315,7 @@ impl ConnectorRequestContext {
             vended_credential_lease_sink: None,
             vended_credential_lease_collection: None,
             request_scope: ConnectorRequestScope::new(),
+            fresh_catalog_observation_required: false,
             resources: None,
         })
     }
@@ -332,7 +334,14 @@ impl ConnectorRequestContext {
     /// same; only provider-private request-scope state is fresh.
     pub fn after_external_effect(mut self) -> Self {
         self.request_scope = ConnectorRequestScope::new();
+        self.fresh_catalog_observation_required = true;
         self
+    }
+
+    /// Whether the caller crossed a known external-effect boundary and the
+    /// next provider metadata observation must not reuse a generation cache.
+    pub const fn fresh_catalog_observation_required(&self) -> bool {
+        self.fresh_catalog_observation_required
     }
 
     /// Installs a local capability after query admission. It is intentionally
@@ -595,6 +604,26 @@ mod tests {
                 .sequence(),
             1
         );
+    }
+
+    #[test]
+    fn post_effect_observation_uses_a_fresh_provider_scope() {
+        struct ProviderMarker;
+
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(Active),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        let before = context.request_scope_extension_or_insert_with(|| ProviderMarker);
+        let after = context.clone().after_external_effect();
+        let observed = after.request_scope_extension_or_insert_with(|| ProviderMarker);
+
+        assert!(after.fresh_catalog_observation_required());
+        assert!(!Arc::ptr_eq(&before, &observed));
+        assert_eq!(context.deadline(), after.deadline());
     }
 
     #[test]

@@ -494,8 +494,9 @@ impl IcebergMetadataContext {
         // control-state table cache: a commit decides against that current
         // observation, so a cached table could compute replacements from a
         // snapshot the branch has already moved past.
-        if request_context.vended_credential_lease_sink().is_none()
-            && request_context.storage_resolver().is_some()
+        if request_context.fresh_catalog_observation_required()
+            || (request_context.vended_credential_lease_sink().is_none()
+                && request_context.storage_resolver().is_some())
         {
             return self.observe_table_classified(
                 &namespace,
