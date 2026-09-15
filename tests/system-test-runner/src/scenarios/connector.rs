@@ -1455,7 +1455,7 @@ impl Scenario for VendedRestRefreshPem {
         let refresh_baseline = self.vended_proxy_audit()?;
 
         context.action("start one long-running vended read on all three Backends");
-        let target = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        let target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
         let connection_id = target
             .ready
             .recv_timeout(context.remaining("receive vended refresh read connection id")?)
