@@ -9,7 +9,7 @@ use novarocks_cluster_harness::loopback_s3::{
     LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Object, LoopbackS3Request,
 };
 use novarocks_cluster_harness::vended_rest_catalog::{
-    VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
+    VendedRefreshBehavior, VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
     VendedTableCommitResponseBehavior,
 };
 use novarocks_cluster_harness::{
@@ -1453,9 +1453,55 @@ impl Scenario for VendedRestRefreshPem {
         // so the assertion below is attributable to the one long read.
         await_resource_convergence(context, &baseline, "short-TTL vended setup writes")?;
         let refresh_baseline = self.vended_proxy_audit()?;
+        self.arm_table_load_holds(2)?;
+        self.arm_refresh_holds(&[VendedRefreshBehavior::IssueRotatedCredential])?;
 
-        context.action("start one long-running vended read on all three Backends");
+        context.action("start one long-running vended read behind the planning metadata barrier");
         let target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        self.wait_for_held_table_load(
+            0,
+            context.remaining("observe planning metadata-load response")?,
+        )?;
+        let planning_audit = self.vended_proxy_audit()?;
+        assert_vended_audit_delta(
+            &refresh_baseline,
+            &planning_audit,
+            1,
+            0,
+            "planning metadata-load phase",
+        )?;
+        context.record_counter_observation(
+            "planning_metadata_load",
+            BTreeMap::from([
+                ("http_table_loads", 1),
+                ("http_refreshes", 0),
+                ("planning_metadata_load", 1),
+            ]),
+        )?;
+        self.release_held_table_load(0)?;
+
+        self.wait_for_held_table_load(
+            1,
+            context.remaining("observe attempt credential-acquisition response")?,
+        )?;
+        let attempt_audit = self.vended_proxy_audit()?;
+        assert_vended_audit_delta(
+            &refresh_baseline,
+            &attempt_audit,
+            2,
+            0,
+            "attempt credential-acquisition phase",
+        )?;
+        context.record_counter_observation(
+            "attempt_credential_acquisition",
+            BTreeMap::from([
+                ("attempt_credential_acquisition", 1),
+                ("http_table_loads", 2),
+                ("http_refreshes", 0),
+            ]),
+        )?;
+        self.release_held_table_load(1)?;
+
         let connection_id = target
             .ready
             .recv_timeout(context.remaining("receive vended refresh read connection id")?)
@@ -1466,19 +1512,41 @@ impl Scenario for VendedRestRefreshPem {
             "observe the short-TTL vended read on every Backend",
         )?;
 
-        context.action("wait for the FE-owned vended credential refresh response");
-        let _first_refresh = self.wait_for_refresh(context, refresh_baseline.refreshes)?;
-        // A refresh response alone precedes the distributed prepare/commit
-        // acknowledgement barrier. Keep the same statement alive after that
-        // barrier's local control round, then require every BE still owns its
-        // original reader before deliberately terminating the test query.
-        thread::sleep(
-            context
-                .remaining("allow vended refresh prepare/commit to settle")?
-                .min(Duration::from_secs(2)),
-        );
+        context.action("wait for the FE-owned vended credential refresh response barrier");
+        self.wait_for_held_refresh(
+            0,
+            context.remaining("observe vended credential refresh response")?,
+        )?;
+        let rotation_audit = self.vended_proxy_audit()?;
+        assert_vended_audit_delta(
+            &refresh_baseline,
+            &rotation_audit,
+            2,
+            1,
+            "credential rotation refresh phase",
+        )?;
+        context.record_counter_observation(
+            "rotation_refresh",
+            BTreeMap::from([
+                ("attempt_credential_acquisition", 1),
+                ("http_refreshes", 1),
+                ("http_table_loads", 2),
+                ("planning_metadata_load", 1),
+                ("rotation_refresh", 1),
+            ]),
+        )?;
+        self.release_held_refresh(0)?;
+
+        // The refresh response alone precedes the distributed prepare/commit
+        // acknowledgement barrier. The reader-ownership barrier proves the
+        // same attempt remained live after that commit without a timer.
+        wait_for_in_flight_reader_on_every_backend(
+            context,
+            CATALOG,
+            "verify every Backend continues the same vended read after refresh",
+        )?;
         let settled_audit = self.vended_proxy_audit()?;
-        let expected_table_loads = refresh_baseline.table_loads.saturating_add(1);
+        let expected_table_loads = refresh_baseline.table_loads.saturating_add(2);
         let expected_refreshes = refresh_baseline.refreshes.saturating_add(1);
         let strict_observation_failure = (settled_audit.table_loads != expected_table_loads
             || settled_audit.refreshes != expected_refreshes
@@ -1488,11 +1556,6 @@ impl Scenario for VendedRestRefreshPem {
                 "one vended attempt must observe one metadata response and execute one refresh; baseline={refresh_baseline:?}, expected_table_loads={expected_table_loads}, expected_refreshes={expected_refreshes}, observed={settled_audit:?}"
             )
         });
-        wait_for_in_flight_reader_on_every_backend(
-            context,
-            CATALOG,
-            "verify every Backend continues the same vended read after refresh",
-        )?;
         if let Ok(result) = target.done.try_recv() {
             bail!(
                 "vended read terminated after refresh instead of continuing across the 3-BE epoch commit: {result:?}"
@@ -1565,20 +1628,81 @@ impl VendedRestRefreshPem {
             .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))
     }
 
-    fn wait_for_refresh(
-        &self,
-        context: &mut ScenarioContext,
-        refresh_baseline: u64,
-    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
-        loop {
-            let audit = self.vended_proxy_audit()?;
-            if audit.refreshes > refresh_baseline {
-                return Ok(audit);
-            }
-            let remaining = context.remaining("observe vended credential refresh")?;
-            thread::sleep(remaining.min(Duration::from_millis(50)));
-        }
+    fn arm_table_load_holds(&self, count: usize) -> Result<()> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
+            .proxy
+            .arm_table_load_holds(count)
     }
+
+    fn wait_for_held_table_load(&self, ordinal: usize, timeout: Duration) -> Result<()> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
+            .proxy
+            .wait_for_held_table_load(ordinal, timeout)
+    }
+
+    fn release_held_table_load(&self, ordinal: usize) -> Result<()> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
+            .proxy
+            .release_held_table_load(ordinal)
+    }
+
+    fn arm_refresh_holds(&self, behaviors: &[VendedRefreshBehavior]) -> Result<()> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
+            .proxy
+            .arm_refresh_holds(behaviors)
+    }
+
+    fn wait_for_held_refresh(&self, ordinal: usize, timeout: Duration) -> Result<()> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
+            .proxy
+            .wait_for_held_refresh(ordinal, timeout)
+    }
+
+    fn release_held_refresh(&self, ordinal: usize) -> Result<()> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
+            .proxy
+            .release_held_refresh(ordinal)
+    }
+}
+
+fn assert_vended_audit_delta(
+    baseline: &novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit,
+    observed: &novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit,
+    table_loads: u64,
+    refreshes: u64,
+    phase: &str,
+) -> Result<()> {
+    let expected_table_loads = baseline.table_loads.saturating_add(table_loads);
+    let expected_refreshes = baseline.refreshes.saturating_add(refreshes);
+    ensure!(
+        observed.table_loads == expected_table_loads && observed.refreshes == expected_refreshes,
+        "unexpected vended REST audit delta during {phase}: expected table_loads={table_loads}, refreshes={refreshes}; baseline={baseline:?}, observed={observed:?}"
+    );
+    Ok(())
 }
 
 /// Proves a Frontend restart reconstructs its durable catalog projection

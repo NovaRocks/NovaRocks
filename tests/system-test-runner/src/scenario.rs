@@ -5,6 +5,7 @@ use novarocks_cluster_harness::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,6 +91,7 @@ pub struct ScenarioContext {
     scenario_root: PathBuf,
     deadline: Instant,
     actions: Vec<String>,
+    counter_observations: Vec<ScenarioCounterObservation>,
     binary: PathBuf,
     compatible_binary: Option<PathBuf>,
     other_island_binary: Option<PathBuf>,
@@ -126,6 +128,9 @@ struct ScenarioEvidence<'a> {
     cargo_lock_sha256: String,
     platform: ScenarioPlatformIdentity,
     actions: &'a [String],
+    /// Fixed-name, numeric phase observations. The API accepts only static
+    /// labels, which keeps scenario evidence secret-free by construction.
+    counter_observations: &'a [ScenarioCounterObservation],
     runtime_dir: String,
     primary_binary: String,
     base_config_path: String,
@@ -154,6 +159,12 @@ pub enum ScenarioEvidenceOutcome {
     Failed,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ScenarioCounterObservation {
+    phase: &'static str,
+    counters: BTreeMap<&'static str, u64>,
+}
+
 impl ScenarioContext {
     pub fn new(
         name: &'static str,
@@ -175,6 +186,7 @@ impl ScenarioContext {
             scenario_root,
             deadline: Instant::now() + timeout,
             actions: Vec::new(),
+            counter_observations: Vec::new(),
             binary,
             compatible_binary,
             other_island_binary,
@@ -255,6 +267,29 @@ impl ScenarioContext {
         &self.actions
     }
 
+    /// Adds a bounded, fixed-label counter snapshot to durable scenario
+    /// evidence. Dynamic text belongs in immediate diagnostics, never here.
+    pub fn record_counter_observation(
+        &mut self,
+        phase: &'static str,
+        counters: BTreeMap<&'static str, u64>,
+    ) -> Result<()> {
+        if phase.is_empty() || phase.len() > 96 {
+            bail!("scenario counter observation phase must be 1..=96 bytes");
+        }
+        if counters.is_empty()
+            || counters.len() > 16
+            || counters.keys().any(|key| key.is_empty() || key.len() > 96)
+        {
+            bail!(
+                "scenario counter observation must contain 1..=16 fixed labels of at most 96 bytes"
+            );
+        }
+        self.counter_observations
+            .push(ScenarioCounterObservation { phase, counters });
+        Ok(())
+    }
+
     pub fn runtime_dir(&self) -> &Path {
         self.handle.runtime_dir()
     }
@@ -326,7 +361,7 @@ impl ScenarioContext {
         let repository = workspace_root()?;
         let runner_executable = runner_executable_identity()?;
         let evidence = ScenarioEvidence {
-            schema_version: 4,
+            schema_version: 5,
             scenario: self.name,
             outcome,
             exit_code: match outcome {
@@ -344,6 +379,7 @@ impl ScenarioContext {
             cargo_lock_sha256: sha256_file(&repository.join("Cargo.lock"))?,
             platform: scenario_platform_identity()?,
             actions: &self.actions,
+            counter_observations: &self.counter_observations,
             runtime_dir: self.runtime_dir().display().to_string(),
             primary_binary: self.primary_binary().display().to_string(),
             base_config_path: self.base_config_path().display().to_string(),

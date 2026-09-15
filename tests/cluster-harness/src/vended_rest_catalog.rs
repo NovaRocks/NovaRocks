@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +46,7 @@ const VENDED_CREDENTIALS: &str = "vended-credentials";
 const REFRESH_PATH: &str = "/_fixture/vended-credentials/refresh";
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_KEY_ID_COUNTERS: usize = 2;
+const MAX_SCRIPTED_RESPONSE_HOLDS: usize = 8;
 
 /// Secret material for one response-local test credential.
 ///
@@ -194,6 +195,8 @@ pub struct VendedRestCatalogFixture {
     uri: String,
     audit: Arc<Mutex<VendedRestCatalogAudit>>,
     commit_response_hold: Option<Arc<CommitResponseHold>>,
+    table_load_holds: Arc<ResponseHoldSequence>,
+    refresh_holds: Arc<RefreshHoldSequence>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -215,6 +218,8 @@ impl VendedRestCatalogFixture {
         );
         let uri = format!("http://{address}");
         let audit = Arc::new(Mutex::new(VendedRestCatalogAudit::default()));
+        let table_load_holds = Arc::new(ResponseHoldSequence::default());
+        let refresh_holds = Arc::new(RefreshHoldSequence::default());
         let state = AppState {
             downstream: config.downstream.trim_end_matches('/').to_string(),
             scope_prefix: config.scope_prefix,
@@ -230,6 +235,8 @@ impl VendedRestCatalogFixture {
                 .build()
                 .context("build vended REST catalog fixture client")?,
             audit: Arc::clone(&audit),
+            table_load_holds: Arc::clone(&table_load_holds),
+            refresh_holds: Arc::clone(&refresh_holds),
             commit_response_hold: config
                 .hold_first_table_commit_response
                 .then(|| Arc::new(CommitResponseHold::default())),
@@ -266,6 +273,8 @@ impl VendedRestCatalogFixture {
             uri,
             audit,
             commit_response_hold,
+            table_load_holds,
+            refresh_holds,
             shutdown: Some(shutdown),
             thread: Some(thread),
         })
@@ -308,6 +317,35 @@ impl VendedRestCatalogFixture {
             hold.release();
         }
     }
+
+    /// Arms a bounded sequence of table-load response barriers. Each held
+    /// response is already counted in the non-secret audit before it waits.
+    pub fn arm_table_load_holds(&self, count: usize) -> Result<()> {
+        self.table_load_holds.arm(count)
+    }
+
+    pub fn wait_for_held_table_load(&self, ordinal: usize, timeout: Duration) -> Result<()> {
+        self.table_load_holds.wait_for_observation(ordinal, timeout)
+    }
+
+    pub fn release_held_table_load(&self, ordinal: usize) -> Result<()> {
+        self.table_load_holds.release(ordinal)
+    }
+
+    /// Arms bounded refresh-response barriers with a fixed, non-secret reply
+    /// behavior per request. The response is held only after its request is
+    /// recorded, so a scenario can prove request ordering without a timer.
+    pub fn arm_refresh_holds(&self, behaviors: &[VendedRefreshBehavior]) -> Result<()> {
+        self.refresh_holds.arm(behaviors)
+    }
+
+    pub fn wait_for_held_refresh(&self, ordinal: usize, timeout: Duration) -> Result<()> {
+        self.refresh_holds.wait_for_observation(ordinal, timeout)
+    }
+
+    pub fn release_held_refresh(&self, ordinal: usize) -> Result<()> {
+        self.refresh_holds.release(ordinal)
+    }
 }
 
 impl fmt::Debug for VendedRestCatalogFixture {
@@ -323,6 +361,8 @@ impl fmt::Debug for VendedRestCatalogFixture {
 impl Drop for VendedRestCatalogFixture {
     fn drop(&mut self) {
         self.release_held_table_commit_response();
+        self.table_load_holds.release_all();
+        self.refresh_holds.release_all();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -344,7 +384,266 @@ struct AppState {
     refresh_endpoint: String,
     client: reqwest::Client,
     audit: Arc<Mutex<VendedRestCatalogAudit>>,
+    table_load_holds: Arc<ResponseHoldSequence>,
+    refresh_holds: Arc<RefreshHoldSequence>,
     commit_response_hold: Option<Arc<CommitResponseHold>>,
+}
+
+#[derive(Default)]
+struct ResponseHoldSequence {
+    state: Mutex<ResponseHoldSequenceState>,
+}
+
+#[derive(Default)]
+struct ResponseHoldSequenceState {
+    holds: Vec<Arc<ResponseHold>>,
+    next: usize,
+}
+
+impl ResponseHoldSequence {
+    fn arm(&self, count: usize) -> Result<()> {
+        ensure!(
+            (1..=MAX_SCRIPTED_RESPONSE_HOLDS).contains(&count),
+            "vended REST fixture table-load hold count must be between 1 and {MAX_SCRIPTED_RESPONSE_HOLDS}"
+        );
+        let mut state = self
+            .state
+            .lock()
+            .expect("vended REST fixture table-load hold lock poisoned");
+        ensure!(
+            state.holds.is_empty()
+                || (state.next == state.holds.len()
+                    && state.holds.iter().all(|hold| hold.is_released())),
+            "vended REST fixture table-load holds are already armed"
+        );
+        state.holds = (0..count)
+            .map(|_| Arc::new(ResponseHold::default()))
+            .collect();
+        state.next = 0;
+        Ok(())
+    }
+
+    fn next(&self) -> Option<Arc<ResponseHold>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("vended REST fixture table-load hold lock poisoned");
+        let hold = state.holds.get(state.next).cloned();
+        state.next += usize::from(hold.is_some());
+        hold
+    }
+
+    fn hold_at(&self, ordinal: usize) -> Result<Arc<ResponseHold>> {
+        self.state
+            .lock()
+            .expect("vended REST fixture table-load hold lock poisoned")
+            .holds
+            .get(ordinal)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("vended REST fixture has no armed table-load hold {ordinal}")
+            })
+    }
+
+    fn wait_for_observation(&self, ordinal: usize, timeout: Duration) -> Result<()> {
+        let hold = self.hold_at(ordinal)?;
+        ensure!(
+            hold.wait_for_observation(timeout),
+            "timed out waiting for vended REST table-load hold {ordinal}"
+        );
+        Ok(())
+    }
+
+    fn release(&self, ordinal: usize) -> Result<()> {
+        self.hold_at(ordinal)?.release();
+        Ok(())
+    }
+
+    fn release_all(&self) {
+        let holds = self
+            .state
+            .lock()
+            .expect("vended REST fixture table-load hold lock poisoned")
+            .holds
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for hold in holds {
+            hold.release();
+        }
+    }
+}
+
+struct RefreshResponseHold {
+    behavior: VendedRefreshBehavior,
+    hold: Arc<ResponseHold>,
+}
+
+#[derive(Default)]
+struct RefreshHoldSequence {
+    state: Mutex<RefreshHoldSequenceState>,
+}
+
+#[derive(Default)]
+struct RefreshHoldSequenceState {
+    holds: Vec<RefreshResponseHold>,
+    next: usize,
+}
+
+impl RefreshHoldSequence {
+    fn arm(&self, behaviors: &[VendedRefreshBehavior]) -> Result<()> {
+        ensure!(
+            !behaviors.is_empty() && behaviors.len() <= MAX_SCRIPTED_RESPONSE_HOLDS,
+            "vended REST fixture refresh hold count must be between 1 and {MAX_SCRIPTED_RESPONSE_HOLDS}"
+        );
+        let mut state = self
+            .state
+            .lock()
+            .expect("vended REST fixture refresh hold lock poisoned");
+        ensure!(
+            state.holds.is_empty()
+                || (state.next == state.holds.len()
+                    && state.holds.iter().all(|entry| entry.hold.is_released())),
+            "vended REST fixture refresh holds are already armed"
+        );
+        state.holds = behaviors
+            .iter()
+            .copied()
+            .map(|behavior| RefreshResponseHold {
+                behavior,
+                hold: Arc::new(ResponseHold::default()),
+            })
+            .collect();
+        state.next = 0;
+        Ok(())
+    }
+
+    fn next(&self) -> Option<RefreshResponseHold> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("vended REST fixture refresh hold lock poisoned");
+        let hold = state
+            .holds
+            .get(state.next)
+            .map(|entry| RefreshResponseHold {
+                behavior: entry.behavior,
+                hold: Arc::clone(&entry.hold),
+            });
+        state.next += usize::from(hold.is_some());
+        hold
+    }
+
+    fn hold_at(&self, ordinal: usize) -> Result<Arc<ResponseHold>> {
+        self.state
+            .lock()
+            .expect("vended REST fixture refresh hold lock poisoned")
+            .holds
+            .get(ordinal)
+            .map(|entry| Arc::clone(&entry.hold))
+            .ok_or_else(|| {
+                anyhow::anyhow!("vended REST fixture has no armed refresh hold {ordinal}")
+            })
+    }
+
+    fn wait_for_observation(&self, ordinal: usize, timeout: Duration) -> Result<()> {
+        let hold = self.hold_at(ordinal)?;
+        ensure!(
+            hold.wait_for_observation(timeout),
+            "timed out waiting for vended REST refresh hold {ordinal}"
+        );
+        Ok(())
+    }
+
+    fn release(&self, ordinal: usize) -> Result<()> {
+        self.hold_at(ordinal)?.release();
+        Ok(())
+    }
+
+    fn release_all(&self) {
+        let holds = self
+            .state
+            .lock()
+            .expect("vended REST fixture refresh hold lock poisoned")
+            .holds
+            .iter()
+            .map(|entry| Arc::clone(&entry.hold))
+            .collect::<Vec<_>>();
+        for hold in holds {
+            hold.release();
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResponseHold {
+    state: Mutex<ResponseHoldState>,
+    observed: Condvar,
+    released: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct ResponseHoldState {
+    observed: bool,
+    released: bool,
+}
+
+impl ResponseHold {
+    async fn hold_after_observation(&self) {
+        let should_wait = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("vended REST response hold lock poisoned");
+            state.observed = true;
+            self.observed.notify_all();
+            !state.released
+        };
+        if !should_wait {
+            return;
+        }
+        loop {
+            let notified = self.released.notified();
+            if self
+                .state
+                .lock()
+                .expect("vended REST response hold lock poisoned")
+                .released
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn wait_for_observation(&self, timeout: Duration) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("vended REST response hold lock poisoned");
+        let (state, _) = self
+            .observed
+            .wait_timeout_while(state, timeout, |state| !state.observed)
+            .expect("vended REST response hold lock poisoned");
+        state.observed
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("vended REST response hold lock poisoned");
+        state.released = true;
+        drop(state);
+        self.released.notify_waiters();
+    }
+
+    fn is_released(&self) -> bool {
+        self.state
+            .lock()
+            .expect("vended REST response hold lock poisoned")
+            .released
+    }
 }
 
 #[derive(Default)]
@@ -383,7 +682,7 @@ fn router(state: AppState) -> Router {
 async fn dispatch(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     if parts.method == Method::GET && parts.uri.path() == REFRESH_PATH {
-        return refresh_response(&state);
+        return refresh_response(&state).await;
     }
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
@@ -410,9 +709,12 @@ async fn dispatch(State(state): State<Arc<AppState>>, request: Request) -> Respo
             );
         }
     }
+    let table_load_hold = matches!(action, Some(VendedAction::TableLoad))
+        .then(|| state.table_load_holds.next())
+        .flatten();
     match action {
         Some(action) if response.status().is_success() => {
-            inject_credentials(&state, action, response).await
+            inject_credentials(&state, action, response, table_load_hold).await
         }
         _ => response,
     }
@@ -423,7 +725,6 @@ enum VendedAction {
     TableLoad,
     StagedCreate,
     TableCommit,
-    Refresh,
 }
 
 fn is_existing_table_commit(method: &Method, uri: &Uri) -> bool {
@@ -493,6 +794,7 @@ async fn inject_credentials(
     state: &AppState,
     action: VendedAction,
     response: Response,
+    table_load_hold: Option<Arc<ResponseHold>>,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
@@ -522,17 +824,29 @@ async fn inject_credentials(
         Err(error) => return temporary_failure(format!("encode vended catalog response: {error}")),
     };
     record_issue(&state.audit, action, &key_id);
+    if let Some(hold) = table_load_hold {
+        hold.hold_after_observation().await;
+    }
     response_with_headers(parts.status, parts.headers, bytes)
 }
 
-fn refresh_response(state: &AppState) -> Response {
-    if state.refresh_behavior == VendedRefreshBehavior::FailUnavailable {
+async fn refresh_response(state: &AppState) -> Response {
+    let hold = state.refresh_holds.next();
+    record_refresh_started(&state.audit);
+    let behavior = hold
+        .as_ref()
+        .map(|entry| entry.behavior)
+        .unwrap_or(state.refresh_behavior);
+    if let Some(hold) = hold {
+        hold.hold.hold_after_observation().await;
+    }
+    if behavior == VendedRefreshBehavior::FailUnavailable {
         record_refresh_failure(&state.audit);
         return temporary_failure("configured vended credential refresh failure");
     }
     let key_id = state.rotated.access_key_id.clone();
     let credential = storage_credential(state, &state.rotated, state.refresh_ttl, None);
-    record_issue(&state.audit, VendedAction::Refresh, &key_id);
+    record_refresh_success(&state.audit, &key_id);
     json_response(json!({"storage-credentials": [credential]}))
 }
 
@@ -544,7 +858,6 @@ fn record_issue(audit: &Mutex<VendedRestCatalogAudit>, action: VendedAction, key
         VendedAction::TableLoad => audit.table_loads += 1,
         VendedAction::StagedCreate => audit.staged_creates += 1,
         VendedAction::TableCommit => audit.table_commits += 1,
-        VendedAction::Refresh => audit.refreshes += 1,
     }
     if audit.issued_key_ids.len() < MAX_KEY_ID_COUNTERS || audit.issued_key_ids.contains_key(key_id)
     {
@@ -556,8 +869,24 @@ fn record_refresh_failure(audit: &Mutex<VendedRestCatalogAudit>) {
     let mut audit = audit
         .lock()
         .expect("vended REST catalog fixture audit lock poisoned");
-    audit.refreshes += 1;
     audit.refresh_failures += 1;
+}
+
+fn record_refresh_started(audit: &Mutex<VendedRestCatalogAudit>) {
+    audit
+        .lock()
+        .expect("vended REST catalog fixture audit lock poisoned")
+        .refreshes += 1;
+}
+
+fn record_refresh_success(audit: &Mutex<VendedRestCatalogAudit>, key_id: &str) {
+    let mut audit = audit
+        .lock()
+        .expect("vended REST catalog fixture audit lock poisoned");
+    if audit.issued_key_ids.len() < MAX_KEY_ID_COUNTERS || audit.issued_key_ids.contains_key(key_id)
+    {
+        *audit.issued_key_ids.entry(key_id.to_string()).or_default() += 1;
+    }
 }
 
 fn storage_credential(
@@ -801,6 +1130,77 @@ mod tests {
                 ("rotated-key".to_string(), 1)
             ])
         );
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_holds_record_each_request_before_releasing_its_reply() {
+        let (downstream, shutdown, _requests) = downstream().await;
+        let fixture = Arc::new(
+            VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+                downstream,
+                scope_prefix: "s3://fixture/warehouse/".to_string(),
+                initial: credential("initial-key"),
+                rotated: credential("rotated-key"),
+                initial_ttl: Duration::from_secs(30),
+                refresh_ttl: Duration::from_secs(30),
+                refresh_behavior: Default::default(),
+                table_commit_response_behavior: Default::default(),
+                hold_first_table_commit_response: false,
+            })
+            .expect("fixture"),
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        fixture.arm_table_load_holds(1).expect("arm table hold");
+        let table_uri = format!("{}/v1/namespaces/db/tables/t", fixture.uri());
+        let table_request = tokio::spawn(async move {
+            client
+                .get(table_uri)
+                .header(ACCESS_DELEGATION_HEADER, VENDED_CREDENTIALS)
+                .send()
+                .await
+                .expect("table response")
+                .error_for_status()
+                .expect("table status")
+        });
+        fixture
+            .wait_for_held_table_load(0, Duration::from_secs(5))
+            .expect("observe table hold");
+        assert_eq!(fixture.audit().table_loads, 1);
+        fixture
+            .release_held_table_load(0)
+            .expect("release table hold");
+        table_request.await.expect("table task");
+
+        fixture
+            .arm_refresh_holds(&[VendedRefreshBehavior::FailUnavailable])
+            .expect("arm refresh hold");
+        let refresh_uri = format!("{}{}", fixture.uri(), REFRESH_PATH);
+        let refresh_request = tokio::spawn(async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(refresh_uri)
+                .send()
+                .await
+                .expect("refresh response")
+        });
+        fixture
+            .wait_for_held_refresh(0, Duration::from_secs(5))
+            .expect("observe refresh hold");
+        assert_eq!(fixture.audit().refreshes, 1);
+        fixture
+            .release_held_refresh(0)
+            .expect("release refresh hold");
+        assert_eq!(
+            refresh_request.await.expect("refresh task").status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let audit = fixture.audit();
+        assert_eq!(audit.refreshes, 1);
+        assert_eq!(audit.refresh_failures, 1);
         let _ = shutdown.send(());
     }
 
