@@ -326,6 +326,15 @@ impl ConnectorRequestContext {
         self
     }
 
+    /// Derive a post-commit observation context without carrying read-only
+    /// provider materializations across an external effect. The deadline,
+    /// cancellation, resource ledger, and installed capabilities remain the
+    /// same; only provider-private request-scope state is fresh.
+    pub fn after_external_effect(mut self) -> Self {
+        self.request_scope = ConnectorRequestScope::new();
+        self
+    }
+
     /// Installs a local capability after query admission. It is intentionally
     /// a builder step rather than a wire constructor argument.
     pub fn with_storage_resolver(

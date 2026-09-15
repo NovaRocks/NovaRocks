@@ -659,6 +659,10 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
         target: &CreatedMvTarget,
         operation_id: uuid::Uuid,
     ) -> Result<(), MvCreateProviderError> {
+        // The descriptor commit completed after this request first observed
+        // the target. Project its durable state from a fresh observation
+        // scope, while preserving this statement's deadline and cancellation.
+        let observation_context = self.connector_context.clone().after_external_effect();
         let catalog = target.target.catalog.as_deref().ok_or_else(|| {
             MvCreateProviderError::new(
                 MvCreateProviderErrorKind::DescriptorSync,
@@ -683,14 +687,14 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
             .load_table(novarocks_spi::connector::ConnectorTableRequest {
                 table,
                 resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-                context: self.connector_context.clone(),
+                context: observation_context.clone(),
             })
             .map_err(|error| engine_target_error(error.to_string()))?;
         let package = crate::mv::domain::storage_observation::observe_lake_package(
             self.ports.storage_observation.as_ref(),
             &lease,
             &loaded,
-            self.connector_context.clone(),
+            observation_context,
         )
         .map_err(|error| engine_target_error(error.to_string()))?
         .ok_or_else(|| {
