@@ -12,9 +12,9 @@ provenance:
 code-anchors:
   - "novarocks/query-application/src/preparation/description.rs (FrozenExecutionDescription)"
   - "novarocks/query-application/src/preparation/driver.rs (PreparationDriver)"
-  - "novarocks/frontend/src/query_execution/completion.rs (PreparedLogicalRead)"
-  - "novarocks/frontend/src/query_execution/native_execution_adapter.rs (FrontendNativeLogicalReadLauncher)"
-  - "novarocks/frontend/src/query_execution/attempt_initialization.rs (attempt access materialization)"
+  - "novarocks/frontend-application/src/query_execution/completion.rs (PreparedLogicalRead)"
+  - "novarocks/frontend-application/src/query_execution/native_execution_adapter.rs (FrontendNativeLogicalReadLauncher)"
+  - "novarocks/frontend-application/src/query_execution/attempt_initialization.rs (attempt access materialization)"
   - "novarocks/spi/src/connector/binding/role.rs (ConnectorReadAttemptAccess)"
 ---
 

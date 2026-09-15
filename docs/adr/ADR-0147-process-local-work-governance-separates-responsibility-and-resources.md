@@ -14,7 +14,7 @@ code-anchors:
   - "novarocks/workload-control/src/resource.rs (LocalResourceAuthority, ResultCredit)"
   - "novarocks/workload-control/src/observation.rs (obligations and control progress)"
   - "novarocks/query-application/src/coordination/supervisor.rs (governed logical executions)"
-  - "novarocks/frontend/src/application.rs (FrontendApplicationHost and shutdown ownership)"
+  - "novarocks/frontend-application/src/application.rs (FrontendApplicationHost and shutdown ownership)"
   - "novarocks-server/src/app_config.rs (explicit frontend workload configuration)"
 ---
 

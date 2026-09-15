@@ -15,7 +15,7 @@ code-anchors:
   - "novarocks/worker/src/lib.rs (worker-local execution policy)"
   - "novarocks/workload-control/src/lib.rs (process-local work governance)"
   - "novarocks/catalog-application/src/lib.rs (long-lived catalog generations)"
-  - "novarocks/frontend/src/application.rs (FrontendApplicationHost)"
+  - "novarocks/frontend-application/src/application.rs (FrontendApplicationHost)"
   - "novarocks-server/src/composition.rs (role composition)"
 ---
 

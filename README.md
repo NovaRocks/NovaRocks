@@ -76,6 +76,10 @@ Known limits:
 
 ## Architecture
 
+Application ownership, dependency direction, logical-execution lifecycle and
+the separation between responsibility, output, and resource release are
+described in the [application domains guide](docs/guides/architecture/application-domains.md).
+
 ### Native FE/BE Roles
 
 ```text

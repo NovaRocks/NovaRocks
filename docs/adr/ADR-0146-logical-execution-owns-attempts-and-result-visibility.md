@@ -15,9 +15,9 @@ code-anchors:
   - "novarocks/query-application/src/coordination/runtime_registry.rs (LogicalExecutionRuntimeRegistry)"
   - "novarocks/query-application/src/coordination/replacement.rs (replacement qualification)"
   - "novarocks/query-application/src/api/result.rs (bounded result delivery)"
-  - "novarocks/frontend/src/task_execution/manifest_round.rs (ManifestAssembledRound)"
-  - "novarocks/frontend/src/query_execution/native_execution_adapter.rs (Native logical execution adapter)"
-  - "novarocks/backend/src/task_execution/registry.rs (TaskExecutionRegistry)"
+  - "novarocks/frontend-application/src/task_execution/manifest_round.rs (ManifestAssembledRound)"
+  - "novarocks/frontend-application/src/query_execution/native_execution_adapter.rs (Native logical execution adapter)"
+  - "novarocks/worker/src/task_registry.rs (TaskExecutionRegistry)"
 ---
 
 ## 问题
