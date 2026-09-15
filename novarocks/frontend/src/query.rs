@@ -543,74 +543,6 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The typed DML boundary keeps one explicit engine per statement family."
-)]
-fn execute_typed_dml_statement(
-    dml: &DmlService,
-    insert_engine: &dyn InsertEngine,
-    delete_engine: &dyn DeleteEngine,
-    mutation_engine: &dyn MutationEngine,
-    ctas_engine: &dyn CtasEngine,
-    statement: &novarocks_parser::ast::DmlStatement,
-    source: &str,
-    context: &RequestContext,
-    query_options: &QueryOptions,
-) -> Result<StatementResult, RoutedExecutionError> {
-    use novarocks_parser::ast::DmlStatement;
-
-    match statement {
-        DmlStatement::Insert(statement) => dml_statement_result(
-            dml.prepare_insert(
-                insert_engine,
-                statement,
-                source,
-                context,
-                Some(query_options),
-            )
-            .and_then(|prepared| dml.execute_prepared_insert(insert_engine, prepared)),
-        ),
-        DmlStatement::Delete(statement) => dml_statement_result(
-            dml.prepare_delete(
-                delete_engine,
-                crate::query_execution::dml::delete::DeleteStatement::Predicate(statement),
-                source,
-                context,
-                Some(query_options),
-            )
-            .and_then(|prepared| dml.execute_prepared_delete(delete_engine, prepared)),
-        ),
-        DmlStatement::AddEqualityDelete(statement) => dml_statement_result(
-            dml.prepare_delete(
-                delete_engine,
-                crate::query_execution::dml::delete::DeleteStatement::Equality(statement),
-                source,
-                context,
-                Some(query_options),
-            )
-            .and_then(|prepared| dml.execute_prepared_delete(delete_engine, prepared)),
-        ),
-        DmlStatement::Update(_) | DmlStatement::Merge(_) => dml_statement_result(
-            dml.prepare_typed_mutation(
-                mutation_engine,
-                statement,
-                source,
-                context,
-                Some(query_options),
-            )
-            .and_then(|prepared| dml.execute_prepared_mutation(mutation_engine, prepared)),
-        ),
-        DmlStatement::CreateTableAsSelect(statement) => dml_statement_result(dml.try_execute_ctas(
-            ctas_engine,
-            statement,
-            source,
-            context,
-            Some(query_options),
-        )),
-    }
-}
-
 /// Executes one declared synchronous command edge after its bounded admission.
 ///
 /// Compilation and protocol delivery must not be captured here. Keeping this
@@ -642,26 +574,6 @@ where
             (result, execution_owner)
         })
         .await
-}
-
-async fn execute_synchronous_statement<F>(
-    executor: QueryBlockingExecutor,
-    cancellation: QueryCancellationView,
-    diagnostic_statement: StatementToken,
-    execution_owner: WorkOwner,
-    call: F,
-) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
-where
-    F: FnOnce() -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
-{
-    execute_synchronous_stage(
-        executor,
-        cancellation,
-        diagnostic_statement,
-        execution_owner,
-        call,
-    )
-    .await
 }
 
 /// Runs a DML plan and its external-effect dispatch as distinct governed
@@ -1778,25 +1690,36 @@ impl FrontendQuerySession {
                     },
                 ))
             }
-            ParsedStatement::Dml(statement) => Box::pin(execute_synchronous_statement(
-                synchronous_command_executor,
-                worker_cancellation,
-                diagnostic_statement,
-                execution_owner,
-                move || {
-                    execute_typed_dml_statement(
-                        dml.as_ref(),
-                        insert_engine.as_ref(),
-                        delete_engine.as_ref(),
-                        mutation_engine.as_ref(),
-                        ctas_engine.as_ref(),
-                        &statement,
-                        &sql,
-                        &context,
-                        &query_options,
-                    )
-                },
-            )),
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::CreateTableAsSelect(
+                statement,
+            )) => {
+                let prepare_dml = Arc::clone(&dml);
+                let execute_dml = dml;
+                let prepare_engine = Arc::clone(&ctas_engine);
+                let execute_engine = ctas_engine;
+                let prepare_context = context.clone();
+                let prepare_options = query_options.clone();
+                Box::pin(execute_prepared_dml_statement(
+                    synchronous_command_executor,
+                    worker_cancellation,
+                    diagnostic_statement,
+                    execution_owner,
+                    move || {
+                        dml_result(prepare_dml.prepare_ctas(
+                            prepare_engine.as_ref(),
+                            &statement,
+                            &sql,
+                            &prepare_context,
+                            Some(&prepare_options),
+                        ))
+                    },
+                    move |prepared| {
+                        dml_statement_result(
+                            execute_dml.execute_prepared_ctas(execute_engine.as_ref(), prepared),
+                        )
+                    },
+                ))
+            }
             ParsedStatement::Table(table_statement) => Box::pin(async move {
                 let command = validate_table_statement_admission(&table_statement, &sql)
                     .map_err(RoutedExecutionError::User)

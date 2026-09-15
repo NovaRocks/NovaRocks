@@ -44,8 +44,17 @@ use novarocks_spi::connector::{
     LakePublicationStatementTag, LakePublicationTarget,
 };
 
+pub(crate) struct PreparedCtasAttempt {
+    source_text: String,
+    preflight_facts: CtasTargetPreflightFacts,
+    prepared_source: PreparedCtasSource,
+    publication_id: LakePublicationId,
+    policy: CreatePolicy,
+    attempt: DmlPublicationAttempt,
+}
+
 impl DmlService {
-    /// Execute CTAS as one statement-local staged-create attempt.
+    /// Prepare CTAS before the staged-create provider dispatch boundary.
     ///
     /// This intentionally does not create a DML journal operation: a retained
     /// frontend record cannot safely replay, abort, clean up, or adjudicate a
@@ -55,14 +64,14 @@ impl DmlService {
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
     )]
-    pub fn try_execute_ctas(
+    pub(crate) fn prepare_ctas(
         &self,
         engine: &dyn CtasEngine,
         statement: &novarocks_parser::ast::CreateTableAsSelect,
         source: &str,
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
-    ) -> Result<(), DmlError> {
+    ) -> Result<PreparedCtasAttempt, DmlError> {
         let _ = self;
         let command = CtasCommand::from_typed(statement, source).map_err(|error| {
             DmlError::admit(DmlAdmissionError::CreateTableUnsupportedForm.to_user_error(
@@ -77,16 +86,70 @@ impl DmlService {
         } else {
             CreatePolicy::FailIfExists
         };
-        execute_standard_ctas_operation(
-            engine,
+        let preflight = match engine.preflight_standard_ctas_target(
             statement,
             source,
-            context,
-            query_options,
-            command,
-            policy,
+            &command,
             session.current_catalog(),
             session.current_database(),
+        ) {
+            Ok(CtasTargetPreflightOutcome::Ready(preflight)) => preflight,
+            Err(failure) => return Err(ctas_failure(source, failure)),
+        };
+        let publication_id = LakePublicationId::new_v7();
+        let mut attempt = new_attempt(publication_id, &preflight.facts)?;
+        let current_catalog = session.current_catalog().map(ToOwned::to_owned);
+        let current_database = session.current_database().to_string();
+        let prepared_source = match engine.prepare_standard_ctas_source(
+            preflight.handle.as_ref(),
+            PrepareCtasSourceRequest {
+                command,
+                current_catalog: current_catalog.clone(),
+                current_database: current_database.clone(),
+                query_options: query_options.cloned(),
+                execution: context.execution().clone(),
+            },
+        ) {
+            Ok(source) => source,
+            Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source, failure)),
+        };
+        if let Err(error) = validate_source_facts(
+            &prepared_source,
+            &preflight.facts,
+            current_catalog.as_deref(),
+            &current_database,
+        ) {
+            return Err(pre_dispatch_failure(&mut attempt, source, error));
+        }
+
+        Ok(PreparedCtasAttempt {
+            source_text: source.to_string(),
+            preflight_facts: preflight.facts,
+            prepared_source,
+            publication_id,
+            policy,
+            attempt,
+        })
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "Preserves the frozen DML error contract without a broad ABI migration."
+    )]
+    pub(crate) fn execute_prepared_ctas(
+        &self,
+        engine: &dyn CtasEngine,
+        prepared: PreparedCtasAttempt,
+    ) -> Result<(), DmlError> {
+        let _ = self;
+        execute_standard_ctas_operation(
+            engine,
+            prepared.source_text,
+            prepared.preflight_facts,
+            prepared.prepared_source,
+            prepared.publication_id,
+            prepared.policy,
+            prepared.attempt,
         )
     }
 }
@@ -101,50 +164,13 @@ impl DmlService {
 )]
 fn execute_standard_ctas_operation(
     engine: &dyn CtasEngine,
-    statement: &novarocks_parser::ast::CreateTableAsSelect,
-    source_text: &str,
-    context: &RequestContext,
-    query_options: Option<&QueryOptions>,
-    command: CtasCommand,
+    source_text: String,
+    preflight_facts: CtasTargetPreflightFacts,
+    prepared_source: PreparedCtasSource,
+    publication_id: LakePublicationId,
     policy: CreatePolicy,
-    current_catalog: Option<&str>,
-    current_database: &str,
+    mut attempt: DmlPublicationAttempt,
 ) -> Result<(), DmlError> {
-    let preflight = match engine.preflight_standard_ctas_target(
-        statement,
-        source_text,
-        &command,
-        current_catalog,
-        current_database,
-    ) {
-        Ok(CtasTargetPreflightOutcome::Ready(preflight)) => preflight,
-        Err(failure) => return Err(ctas_failure(source_text, failure)),
-    };
-    let publication_id = LakePublicationId::new_v7();
-    let mut attempt = new_attempt(publication_id, &preflight.facts)?;
-
-    let prepared_source = match engine.prepare_standard_ctas_source(
-        preflight.handle.as_ref(),
-        PrepareCtasSourceRequest {
-            command,
-            current_catalog: current_catalog.map(ToOwned::to_owned),
-            current_database: current_database.to_string(),
-            query_options: query_options.cloned(),
-            execution: context.execution().clone(),
-        },
-    ) {
-        Ok(source) => source,
-        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
-    };
-    if let Err(error) = validate_source_facts(
-        &prepared_source,
-        &preflight.facts,
-        current_catalog,
-        current_database,
-    ) {
-        return Err(pre_dispatch_failure(&mut attempt, source_text, error));
-    }
-
     let target = match engine.prepare_standard_ctas_target(
         prepared_source.handle.as_ref(),
         publication_id,
@@ -154,31 +180,33 @@ fn execute_standard_ctas_operation(
             Ok(StandardCtasStageOutcome::Prepared { target, .. }) => target,
             Ok(StandardCtasStageOutcome::KnownUncommitted { failure })
             | Ok(StandardCtasStageOutcome::CommitUnknown { failure, .. })
-            | Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
+            | Err(failure) => {
+                return Err(pre_dispatch_failure(&mut attempt, &source_text, failure));
+            }
         },
-        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
+        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, &source_text, failure)),
     };
-    if let Err(error) = validate_target_facts(&preflight.facts, &target.facts, publication_id) {
-        return Err(pre_dispatch_failure(&mut attempt, source_text, error));
+    if let Err(error) = validate_target_facts(&preflight_facts, &target.facts, publication_id) {
+        return Err(pre_dispatch_failure(&mut attempt, &source_text, error));
     }
 
     let prepared_write = match engine
         .prepare_standard_ctas_write(prepared_source.handle.as_ref(), target.handle.as_ref())
     {
         Ok(write) => write,
-        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
+        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, &source_text, failure)),
     };
     if let Err(error) = validate_prepared_write(&prepared_source, &target, &prepared_write) {
-        return Err(pre_dispatch_failure(&mut attempt, source_text, error));
+        return Err(pre_dispatch_failure(&mut attempt, &source_text, error));
     }
     let native_bundle = match standard_native_bundle(&prepared_write) {
         Ok(bundle) => bundle,
-        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
+        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, &source_text, failure)),
     };
     if let Err(failure) =
         engine.bind_standard_ctas_write_native_bundle(prepared_write.handle.as_ref(), native_bundle)
     {
-        return Err(pre_dispatch_failure(&mut attempt, source_text, failure));
+        return Err(pre_dispatch_failure(&mut attempt, &source_text, failure));
     }
 
     let write = match engine.execute_standard_ctas_write(prepared_write.handle.as_ref()) {
@@ -189,20 +217,20 @@ fn execute_standard_ctas_operation(
             if let Err(error) =
                 validate_sealed_write(&prepared_source, &prepared_write, execution_identity)
             {
-                return Err(pre_dispatch_failure(&mut attempt, source_text, error));
+                return Err(pre_dispatch_failure(&mut attempt, &source_text, error));
             }
             write
         }
         StandardCtasWriteOutcome::KnownUncommitted { failure }
         | StandardCtasWriteOutcome::CommitUnknown { failure, .. } => {
-            return Err(pre_dispatch_failure(&mut attempt, source_text, failure));
+            return Err(pre_dispatch_failure(&mut attempt, &source_text, failure));
         }
     };
 
     let publish =
         match engine.prepare_standard_publish_ctas(target.handle.as_ref(), publication_id, write) {
             Ok(publish) => publish,
-            Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
+            Err(failure) => return Err(pre_dispatch_failure(&mut attempt, &source_text, failure)),
         };
     finish_standard_publication(engine, &mut attempt, target, publish)
 }
@@ -495,11 +523,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
+    use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
+    use novarocks_query_application::api::BackendTopologySnapshot;
+    use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_spi::connector::{
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
-        ConnectorProviderId, ExternalMutationEvidence, LakePublicationDisposition,
-        ProviderBindingEpoch,
+        ConnectorColumnDefinition, ConnectorDataType, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderId,
+        ExternalMutationEvidence, LakePublicationDisposition, ProviderBindingEpoch,
     };
+    use novarocks_sql::compiler::SessionOptimizerSettings;
+    use novarocks_types::ClusterRole;
 
     use super::*;
 
@@ -517,6 +550,124 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
+    }
+
+    struct TestPreflight;
+
+    impl crate::query_execution::dml::ctas::CtasPreparedTargetPreflight for TestPreflight {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct TestSource;
+
+    impl crate::query_execution::dml::ctas::CtasPreparedSource for TestSource {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn execution_identity(&self) -> [u8; 32] {
+            [9; 32]
+        }
+    }
+
+    #[derive(Default)]
+    struct PrepareOnlyEngine {
+        staged_targets: AtomicUsize,
+    }
+
+    impl CtasEngine for PrepareOnlyEngine {
+        fn preflight_standard_ctas_target(
+            &self,
+            _statement: &novarocks_parser::ast::CreateTableAsSelect,
+            _source: &str,
+            _command: &CtasCommand,
+            _current_catalog: Option<&str>,
+            _current_database: &str,
+        ) -> Result<CtasTargetPreflightOutcome, CtasFailure> {
+            Ok(CtasTargetPreflightOutcome::Ready(
+                crate::query_execution::dml::ctas::PreparedCtasTargetPreflight {
+                    facts: CtasTargetPreflightFacts {
+                        provider_id: "iceberg".to_string(),
+                        instance_id: "iceberg".to_string(),
+                        control_runtime_id: [3; 16],
+                        capability_version: 1,
+                        target_namespace: "db".to_string(),
+                        target_table: "dst".to_string(),
+                    },
+                    handle: Arc::new(TestPreflight),
+                },
+            ))
+        }
+
+        fn prepare_standard_ctas_source(
+            &self,
+            _preflight: &dyn crate::query_execution::dml::ctas::CtasPreparedTargetPreflight,
+            request: PrepareCtasSourceRequest,
+        ) -> Result<PreparedCtasSource, CtasFailure> {
+            Ok(PreparedCtasSource {
+                facts: crate::query_execution::dml::ctas::CtasPreparedSourceFacts {
+                    target_catalog: "iceberg".to_string(),
+                    target_namespace: "db".to_string(),
+                    target_table: "dst".to_string(),
+                    source_catalog: request.current_catalog,
+                    source_database: request.current_database,
+                    plan_digest: [4; 32],
+                    schema_digest: [5; 32],
+                    execution_identity: [9; 32],
+                    output_columns: vec![ConnectorColumnDefinition {
+                        name: Arc::from("x"),
+                        data_type: ConnectorDataType::Int,
+                        nullable: false,
+                        aggregation: None,
+                        default: None,
+                    }],
+                },
+                handle: Arc::new(TestSource),
+            })
+        }
+
+        fn stage_standard_ctas_target(
+            &self,
+            _action: &dyn crate::query_execution::dml::ctas::CtasPreparedCatalogAction,
+        ) -> Result<StandardCtasStageOutcome, CtasFailure> {
+            self.staged_targets.fetch_add(1, Ordering::SeqCst);
+            Err(internal_failure(
+                "test stage must not run during preparation",
+            ))
+        }
+    }
+
+    #[test]
+    fn prepared_ctas_can_drop_before_staged_create_dispatch() {
+        let engine = PrepareOnlyEngine::default();
+        let cancellation = QueryCancellationSource::new();
+        let context = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db".to_string(),
+            ClusterRole::Fe,
+            BackendTopologySnapshot::empty(101),
+            None,
+            cancellation.view(),
+            SessionOptimizerSettings::default(),
+        ));
+        let sql = "CREATE TABLE iceberg.db.dst AS SELECT 1 AS x";
+        let parsed = novarocks_parser::parse(sql).expect("CTAS parses");
+        let statement = match &parsed[0] {
+            novarocks_parser::ast::Statement::Dml(
+                novarocks_parser::ast::DmlStatement::CreateTableAsSelect(statement),
+            ) => statement,
+            _ => panic!("expected typed CTAS"),
+        };
+
+        let prepared = DmlService::new()
+            .prepare_ctas(&engine, statement, sql, &context, None)
+            .expect("preparation remains before staged create");
+        assert_eq!(engine.staged_targets.load(Ordering::SeqCst), 0);
+
+        drop(prepared);
+        assert_eq!(engine.staged_targets.load(Ordering::SeqCst), 0);
     }
 
     struct PublishUnknownEngine {
