@@ -1567,6 +1567,14 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
         inputs: &'a mut ManifestBoundNativeAttemptInputs,
         cancellation: CancellationView,
     ) -> NativeActiveAttemptConvergenceFuture<'a> {
+        // The client-visible outcome has already been decided when convergence
+        // starts. The drain still turns the Task round, so a live rotation
+        // owner could otherwise start provider work for an attempt whose
+        // tasks no longer read the credential. Keep the native adapter's
+        // lifecycle boundary identical to the direct coordinator path.
+        if let Some(rotation) = &self.credential_rotation {
+            rotation.wipe();
+        }
         let execution_id = inputs.execution_id();
         Box::pin(async move {
             let convergence = self.attempt.converge(cancellation).await;
