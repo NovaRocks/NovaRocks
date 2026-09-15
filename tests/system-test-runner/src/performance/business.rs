@@ -619,7 +619,15 @@ pub(super) fn execute_job(
                 if let Some(observed) =
                     observe_exact_job(analyze_jobs(connection, job)?, &mut exact_job_id)?
                 {
-                    if terminal_success(&observed.state, "SUCCEEDED")? {
+                    if terminal_success(&observed.state, "SUCCEEDED").with_context(|| {
+                        format!(
+                            "await mixed {} job {} for {} in state {}",
+                            job.kind.name(),
+                            job.ordinal,
+                            job.target(),
+                            observed.state
+                        )
+                    })? {
                         break observed;
                     }
                     last_state = Some(observed.state);
@@ -655,7 +663,15 @@ pub(super) fn execute_job(
                 if let Some(observed) =
                     observe_exact_job(optimize_jobs(connection, job)?, &mut exact_job_id)?
                 {
-                    if terminal_success(&observed.state, "FINISHED")? {
+                    if terminal_success(&observed.state, "FINISHED").with_context(|| {
+                        format!(
+                            "await mixed {} job {} for {} in state {}",
+                            job.kind.name(),
+                            job.ordinal,
+                            job.target(),
+                            observed.state
+                        )
+                    })? {
                         break observed;
                     }
                     last_state = Some(observed.state);
