@@ -2979,12 +2979,14 @@ fn start_connector_read_on(
     let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
     let (release, release_rx) = mpsc::channel();
     let user = user.to_string();
-    // Keep every file reader in flight long enough to observe and cancel it,
-    // while bounding each synchronous SLEEP evaluation to one second per
-    // 4,096-row connector batch. Sleeping once for every input row would keep
-    // the driver inside a single expression evaluation for hours after abort.
+    // Keep every file reader in flight long enough to observe and cancel it.
+    // The sleep belongs in the scan-side filter: a projection can be moved to
+    // the root after exchange, which leaves remote page sources free to close
+    // before the scenario reaches its reader-ready barrier. The vectorized
+    // filter evaluates it once per 4,096-row connector batch rather than once
+    // per input row, so cancellation remains bounded.
     let query = format!(
-        "SELECT t.s FROM (SELECT sleep(1) AS s FROM {catalog}.{database}.{table} WHERE v % 4096 = 0) AS t CROSS JOIN TABLE(generate_series(1, 1000000000)) AS gs(x)"
+        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = 0) AS t CROSS JOIN TABLE(generate_series(1, 1000000000)) AS gs(x)"
     );
     let thread = thread::spawn(move || -> Result<()> {
         let mut connection = match connection_form {
