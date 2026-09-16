@@ -1707,6 +1707,66 @@ impl Scenario for VendedRestRefreshPem {
                 "vended refresh audit changed unexpectedly after cancellation; settled={terminal_audit:?}, observed={audit:?}"
             );
         }
+
+        // Exercise the provider deadline through the real 1FE+3BE path without
+        // adding another concurrent reader: this read begins only after both
+        // preceding attempts have terminalized. The fixture records its one
+        // refresh request before holding the response, so no elapsed-time race
+        // is used to claim that the response read was actually in flight.
+        self.arm_refresh_holds(&[VendedRefreshBehavior::IssueRotatedCredential])?;
+        context.action("start one sequential vended read with its refresh response held to the provider deadline");
+        let deadline_target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        let deadline_connection_id = deadline_target
+            .ready
+            .recv_timeout(context.remaining("receive provider-deadline vended read connection id")?)
+            .context("provider-deadline vended read ended before publishing its connection id")?;
+        wait_for_in_flight_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe the provider-deadline vended read on every Backend",
+        )?;
+        self.wait_for_held_refresh(
+            0,
+            context.remaining("observe provider-deadline held refresh response")?,
+        )?;
+        let deadline_refresh_audit = self.vended_proxy_audit()?;
+        ensure!(
+            deadline_refresh_audit.refreshes == terminal_audit.refreshes.saturating_add(1),
+            "provider-deadline witness must enter exactly one held provider request; terminal={terminal_audit:?}, observed={deadline_refresh_audit:?}"
+        );
+        context.action(
+            "await the real provider response-read deadline without releasing its response",
+        );
+        assert_provider_deadline_query(
+            &deadline_target.done,
+            Duration::from_secs(15)
+                .min(context.remaining("await provider response-read deadline")?),
+        )?;
+        // The provider future has already returned on its deadline. Release
+        // the fixture only to drain its test handler; it cannot cause a retry
+        // in the completed provider call.
+        self.release_held_refresh(0)?;
+        assert_target_connection_remains_usable(
+            &deadline_target,
+            context.remaining("verify provider-deadline query connection behavior")?,
+        )?;
+        assert_idle_query(&mut control, deadline_connection_id)?;
+        release_connector_read(&deadline_target)?;
+        deadline_target
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("provider-deadline vended reader thread panicked"))??;
+        let deadline_reader_logs = wait_for_balanced_reader_lifecycle(
+            context,
+            "wait for provider-deadline vended reader close after failure",
+        )?;
+        ensure!(
+            deadline_reader_logs.iter().all(|log| {
+                let (opens, closes) = reader_counts(log);
+                opens > 0 && opens == closes
+            }),
+            "provider-deadline vended readers did not converge to balanced open/close state"
+        );
         await_resource_convergence(context, &baseline, "short-TTL vended credential refresh")?;
         if let Some(failure) = strict_observation_failure {
             bail!("{failure}");
@@ -3433,6 +3493,25 @@ fn assert_cancelled_query(
         mysql::Error::MySqlError(error) if error.code == 1317 => Ok(()),
         other => bail!("expected MySQL cancellation error 1317, received {other}"),
     }
+}
+
+fn assert_provider_deadline_query(
+    done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    timeout: Duration,
+) -> Result<()> {
+    let error = match done.recv_timeout(timeout).context(
+        "provider-deadline connector reader did not terminate before its bounded deadline",
+    )? {
+        Ok(rows) => bail!("provider-deadline connector reader unexpectedly succeeded: {rows:?}"),
+        Err(error) => error,
+    };
+    ensure!(
+        error
+            .to_string()
+            .contains("credential provider exhausted its call deadline"),
+        "held provider response failed the query without the provider-deadline cause: {error}"
+    );
+    Ok(())
 }
 
 fn assert_connection_killed_query(
