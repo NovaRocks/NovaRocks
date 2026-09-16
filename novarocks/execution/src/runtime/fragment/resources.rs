@@ -169,6 +169,15 @@ impl ResultRegistration {
         }
         self.cleanup_should_fail = false;
     }
+
+    /// Interrupt a result write as soon as cancellation wins, while retaining
+    /// this registration until the fragment has actually stopped.
+    fn abort_for_cancellation(&mut self, reason: String) {
+        if self.active {
+            self.session.abort(ResultAbort::Cancelled(reason));
+            self.active = false;
+        }
+    }
 }
 
 impl Drop for ResultRegistration {
@@ -321,6 +330,16 @@ impl FragmentResources {
         self.result
             .as_ref()
             .map(|registration| Arc::clone(&registration.session))
+    }
+
+    /// Wake a root result sink that is blocked on its client-facing session.
+    ///
+    /// This does not release the registration or establish a terminal fact;
+    /// those remain owned by the actual driver-stop path.
+    pub(crate) fn abort_result_for_cancellation(&mut self, reason: &str) {
+        if let Some(result) = self.result.as_mut() {
+            result.abort_for_cancellation(reason.to_string());
+        }
     }
 
     pub(crate) fn acquire_exchange(
