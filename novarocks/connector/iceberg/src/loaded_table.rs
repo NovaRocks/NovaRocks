@@ -1236,9 +1236,12 @@ fn cache_key(namespace_name: &str, table_name: &str) -> Result<(String, String),
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::num::NonZeroU8;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::thread::JoinHandle;
     use std::time::Duration;
 
     use super::{
@@ -1269,6 +1272,111 @@ mod tests {
             } else {
                 VendedS3CredentialRefreshDispatch::Fenced
             }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum LoopbackResponse {
+        ServiceUnavailable,
+        Hold,
+    }
+
+    struct LoopbackHttpServer {
+        address: SocketAddr,
+        accepted: Arc<AtomicBool>,
+        requests: Arc<AtomicU8>,
+        shutdown: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl LoopbackHttpServer {
+        fn start(response: LoopbackResponse) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback HTTP server");
+            listener
+                .set_nonblocking(true)
+                .expect("make loopback HTTP server nonblocking");
+            let address = listener.local_addr().expect("read loopback HTTP address");
+            let accepted = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(AtomicU8::new(0));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let thread_accepted = Arc::clone(&accepted);
+            let thread_requests = Arc::clone(&requests);
+            let thread_shutdown = Arc::clone(&shutdown);
+            let thread = std::thread::spawn(move || {
+                while !thread_shutdown.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            thread_accepted.store(true, Ordering::SeqCst);
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+                            let mut request = [0_u8; 1024];
+                            if stream.read(&mut request).unwrap_or(0) == 0 {
+                                continue;
+                            }
+                            thread_requests.fetch_add(1, Ordering::SeqCst);
+                            match response {
+                                LoopbackResponse::ServiceUnavailable => {
+                                    stream
+                                        .write_all(
+                                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                        )
+                                        .expect("write retryable loopback response");
+                                }
+                                LoopbackResponse::Hold => {
+                                    while !thread_shutdown.load(Ordering::SeqCst) {
+                                        std::thread::sleep(Duration::from_millis(1));
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept loopback HTTP connection: {error}"),
+                    }
+                }
+            });
+            Self {
+                address,
+                accepted,
+                requests,
+                shutdown,
+                thread: Some(thread),
+            }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://{}/credentials", self.address)
+        }
+    }
+
+    impl Drop for LoopbackHttpServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("join loopback HTTP server");
+            }
+        }
+    }
+
+    fn retryable_loopback_get(
+        client: reqwest::Client,
+        endpoint: String,
+    ) -> impl std::future::Future<Output = crate::iceberg::Result<()>> + Send {
+        async move {
+            let response = client.get(endpoint).send().await.map_err(|error| {
+                crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    format!("loopback credential request failed: {error}"),
+                )
+            })?;
+            if response.status().is_server_error() {
+                return Err(crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    "loopback credential request received retryable HTTP status",
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -1422,6 +1530,89 @@ mod tests {
         .expect_err("the provider future must obey its own deadline");
 
         assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+    }
+
+    #[test]
+    fn vended_refresh_deadline_covers_real_loopback_connect_failures_and_retries() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+        let endpoint = format!(
+            "http://{}/credentials",
+            listener.local_addr().expect("read reserved loopback port")
+        );
+        drop(listener);
+
+        let (_owner, runtime) = catalog_runtime();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback HTTP client");
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(50),
+            NonZeroU8::new(u8::MAX).expect("nonzero attempts"),
+            Duration::from_millis(5),
+            Arc::new(PermittedDispatch),
+        )
+        .expect("bounded policy");
+
+        let error = run_vended_refresh_with_policy(&runtime, policy, "test refresh", move || {
+            retryable_loopback_get(client.clone(), endpoint.clone())
+        })
+        .expect_err("connect failures must consume the call-local deadline");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+    }
+
+    #[test]
+    fn vended_refresh_deadline_covers_a_real_response_read_hold() {
+        let server = LoopbackHttpServer::start(LoopbackResponse::Hold);
+        let endpoint = server.endpoint();
+        let (_owner, runtime) = catalog_runtime();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback HTTP client");
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(50),
+            NonZeroU8::new(1).expect("nonzero attempts"),
+            Duration::ZERO,
+            Arc::new(PermittedDispatch),
+        )
+        .expect("single-attempt policy");
+
+        let error = run_vended_refresh_with_policy(&runtime, policy, "test refresh", move || {
+            retryable_loopback_get(client.clone(), endpoint.clone())
+        })
+        .expect_err("a response read hold must not outlive the call-local deadline");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+        assert!(server.accepted.load(Ordering::SeqCst));
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn vended_refresh_deadline_covers_real_retryable_http_responses() {
+        let server = LoopbackHttpServer::start(LoopbackResponse::ServiceUnavailable);
+        let endpoint = server.endpoint();
+        let (_owner, runtime) = catalog_runtime();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback HTTP client");
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(50),
+            NonZeroU8::new(u8::MAX).expect("nonzero attempts"),
+            Duration::from_millis(5),
+            Arc::new(PermittedDispatch),
+        )
+        .expect("bounded policy");
+
+        let error = run_vended_refresh_with_policy(&runtime, policy, "test refresh", move || {
+            retryable_loopback_get(client.clone(), endpoint.clone())
+        })
+        .expect_err("retryable HTTP responses must not escape the call-local deadline");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+        assert!(server.requests.load(Ordering::SeqCst) >= 2);
     }
 
     #[test]

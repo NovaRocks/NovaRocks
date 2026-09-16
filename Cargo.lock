@@ -3671,6 +3671,7 @@ dependencies = [
  "prost-build",
  "protoc-bin-vendored",
  "rand 0.8.5",
+ "reqwest",
  "roaring 0.10.12",
  "serde",
  "serde_json",

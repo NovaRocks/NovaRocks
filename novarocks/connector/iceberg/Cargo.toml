@@ -61,6 +61,7 @@ novarocks-spi.workspace = true
 novarocks-types.workspace = true
 
 [dev-dependencies]
+reqwest = { workspace = true, features = ["rustls-tls"] }
 tempfile.workspace = true
 
 [build-dependencies]
