@@ -13,7 +13,9 @@ warehouse limit is three, so it must observe the one fair query-admission
 queue. The one-row `sleep` query bounds BE memory and makes queueing
 observable without introducing a CPU benchmark.
 
-The scenario writes `uea4a1-performance.json`, process thread/RSS samples in
+The scenario writes `uea4a1-performance.json`, including the p99 latency of
+the existing FE management read (`GET /v1/frontend/state`) used as the
+control-plane sample, process thread/RSS samples in
 `process-resources.json`, and the runner's hash-bound `scenario-evidence.json`.
 The latter records binary path, source revision/tree state, platform, rendered
 role configuration and the native process identities. Run the controller with
@@ -38,4 +40,6 @@ target/release/novarocks-system-tests \
 Compare normal windows as the regression signal. Saturated windows report the
 different policies: B0 may admit more logical work while the candidate must
 keep admitted queries at or below three and report waiting work. Do not treat
-their throughput as equivalent capacity.
+their throughput as equivalent capacity. For the candidate, every saturated
+window also requires the management-read p99 to stay within two seconds and
+within three times the largest normal-window p99.

@@ -538,6 +538,7 @@ struct Uea4a1PerformanceWindow {
     p50_micros: u128,
     p95_micros: u128,
     p99_micros: u128,
+    control_p99_micros: u128,
     peak_active_statements: usize,
     peak_admitted_queries: usize,
     peak_waiting_records: usize,
@@ -596,6 +597,30 @@ fn run_uea4a1_performance(
                 );
             }
             windows.push(window);
+        }
+        if matches!(profile, Uea4a1PerformanceProfile::Candidate) {
+            let normal_control_p99 = windows
+                .iter()
+                .filter(|window| window.workload == "normal")
+                .map(|window| window.control_p99_micros)
+                .max()
+                .context("candidate performance did not record normal control samples")?;
+            for window in windows
+                .iter()
+                .filter(|window| window.workload == "saturated")
+            {
+                ensure!(
+                    window.control_p99_micros <= 2_000_000,
+                    "candidate saturated control p99 exceeded two seconds: {}us",
+                    window.control_p99_micros
+                );
+                ensure!(
+                    window.control_p99_micros <= normal_control_p99.saturating_mul(3),
+                    "candidate saturated control p99 exceeded three times the no-fault p99: {}us > {}us",
+                    window.control_p99_micros,
+                    normal_control_p99.saturating_mul(3)
+                );
+            }
         }
         Ok::<_, anyhow::Error>(windows)
     })();
@@ -676,8 +701,11 @@ fn run_uea4a1_performance_window(
     let mut peak_admitted_queries = 0;
     let mut peak_waiting_records = 0;
     let mut peak_obligations = 0;
+    let mut control_samples = Vec::new();
     while Instant::now() < deadline {
+        let control_started = Instant::now();
         let state = frontend_state(context)?;
+        control_samples.push(control_started.elapsed().as_micros());
         peak_active_statements = peak_active_statements.max(state.workload.active.statement);
         peak_admitted_queries =
             peak_admitted_queries.max(state.workload.governance.admitted_queries);
@@ -712,6 +740,7 @@ fn run_uea4a1_performance_window(
         p50_micros: percentile_micros(&mut samples, 50),
         p95_micros: percentile_micros(&mut samples, 95),
         p99_micros: percentile_micros(&mut samples, 99),
+        control_p99_micros: percentile_values(&mut control_samples, 99),
         peak_active_statements,
         peak_admitted_queries,
         peak_waiting_records,
@@ -731,9 +760,18 @@ fn execute_uea4a1_performance_query(connection: &mut mysql::Conn, query: &str) -
 }
 
 fn percentile_micros(samples: &mut [Uea4a1LatencySample], percentile: usize) -> u128 {
-    samples.sort_by_key(|sample| sample.total_micros);
-    let index = ((samples.len() - 1) * percentile) / 100;
-    samples[index].total_micros
+    let mut values = samples
+        .iter()
+        .map(|sample| sample.total_micros)
+        .collect::<Vec<_>>();
+    percentile_values(&mut values, percentile)
+}
+
+fn percentile_values(values: &mut [u128], percentile: usize) -> u128 {
+    assert!(!values.is_empty(), "percentile requires one sample");
+    values.sort_unstable();
+    let index = ((values.len() - 1) * percentile) / 100;
+    values[index]
 }
 
 #[derive(Debug, Default, Deserialize)]

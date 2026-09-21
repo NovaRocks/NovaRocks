@@ -50,6 +50,7 @@
     "p50_micros",
     "p95_micros",
     "p99_micros",
+    "control_p99_micros",
     "peak_active_statements",
     "peak_admitted_queries",
     "peak_waiting_records",
