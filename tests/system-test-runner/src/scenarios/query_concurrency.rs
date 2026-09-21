@@ -70,7 +70,7 @@ const PERFORMANCE_WINDOW: Duration = Duration::from_secs(120);
 const PERFORMANCE_REPETITIONS: usize = 3;
 const PERFORMANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const PERFORMANCE_NORMAL_QUERY: &str = "SELECT SUM(i) FROM TABLE(generate_series(1, 1000)) AS t(i)";
-const PERFORMANCE_SATURATED_QUERY: &str = "SELECT sleep(0.25) FROM TABLE(generate_series(1, 1))";
+const PERFORMANCE_SATURATED_QUERY: &str = "SELECT sleep(1) FROM TABLE(generate_series(1, 1))";
 const PERFORMANCE_NORMAL_THINK_TIME: Duration = Duration::from_millis(20);
 const PERFORMANCE_SATURATED_CLIENTS: usize = CONCURRENCY_LIMIT + 1;
 

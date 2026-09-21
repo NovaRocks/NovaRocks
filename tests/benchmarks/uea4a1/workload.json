@@ -40,7 +40,7 @@
     "saturated": {
       "clients": 4,
       "client_think_time_ms": 0,
-      "query": "SELECT sleep(0.25) FROM TABLE(generate_series(1, 1))"
+      "query": "SELECT sleep(1) FROM TABLE(generate_series(1, 1))"
     }
   },
   "sampling_interval_ms": 100,
