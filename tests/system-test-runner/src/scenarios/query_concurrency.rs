@@ -635,8 +635,7 @@ fn run_uea4a1_performance_window(
     for _ in 0..clients {
         let mut connection =
             mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
-        connection
-            .query_drop(query)
+        execute_uea4a1_performance_query(&mut connection, query)
             .with_context(|| format!("warm 4A-1 {workload} performance query"))?;
         connections.push(connection);
     }
@@ -652,8 +651,7 @@ fn run_uea4a1_performance_window(
                 let mut samples = Vec::new();
                 while Instant::now() < deadline {
                     let started = Instant::now();
-                    connection
-                        .query_drop(query)
+                    execute_uea4a1_performance_query(&mut connection, query)
                         .with_context(|| format!("run 4A-1 {workload} performance query"))?;
                     samples.push(Uea4a1LatencySample {
                         total_micros: started.elapsed().as_micros(),
@@ -708,6 +706,17 @@ fn run_uea4a1_performance_window(
         peak_waiting_records,
         peak_obligations,
     })
+}
+
+fn execute_uea4a1_performance_query(connection: &mut mysql::Conn, query: &str) -> Result<()> {
+    let mut result = connection.query_iter(query)?;
+    let mut rows = 0;
+    for row in result.by_ref() {
+        row?;
+        rows += 1;
+    }
+    ensure!(rows > 0, "4A-1 performance query returned no rows");
+    Ok(())
 }
 
 fn percentile_micros(samples: &mut [Uea4a1LatencySample], percentile: usize) -> u128 {
