@@ -11,7 +11,9 @@
         "preparation_limit": 16,
         "execution_limit": 64,
         "waiting_limit": 1024,
-        "logical_start_capacity": 256
+        "logical_start_capacity": 256,
+        "logical_context_admission_issue_capacity": 1024,
+        "logical_context_establish_capacity": 1024
       }
     },
     "candidate": {
@@ -20,6 +22,8 @@
         "concurrency_limit": 3,
         "waiting_limit": 512,
         "capacity_wait_timeout_ms": 30000,
+        "logical_context_admission_issue_capacity": 1024,
+        "logical_context_establish_capacity": 1024,
         "logical_remote_cleanup_timeout_ms": 5000,
         "planning_idle_keepalive_ms": 60000
       }
@@ -30,10 +34,12 @@
     "repetitions": 3,
     "normal": {
       "clients": 1,
+      "client_think_time_ms": 20,
       "query": "SELECT SUM(i) FROM TABLE(generate_series(1, 1000)) AS t(i)"
     },
     "saturated": {
       "clients": 4,
+      "client_think_time_ms": 0,
       "query": "SELECT sleep(0.25) FROM TABLE(generate_series(1, 1))"
     }
   },

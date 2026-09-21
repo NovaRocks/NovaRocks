@@ -71,6 +71,7 @@ const PERFORMANCE_REPETITIONS: usize = 3;
 const PERFORMANCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const PERFORMANCE_NORMAL_QUERY: &str = "SELECT SUM(i) FROM TABLE(generate_series(1, 1000)) AS t(i)";
 const PERFORMANCE_SATURATED_QUERY: &str = "SELECT sleep(0.25) FROM TABLE(generate_series(1, 1))";
+const PERFORMANCE_NORMAL_THINK_TIME: Duration = Duration::from_millis(20);
 const PERFORMANCE_SATURATED_CLIENTS: usize = CONCURRENCY_LIMIT + 1;
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -475,13 +476,17 @@ fn uea4a1_performance_launch_config(profile: Uea4a1PerformanceProfile) -> Scenar
              preparation_limit = 16\n\
              execution_limit = 64\n\
              waiting_limit = 1024\n\
-             logical_start_capacity = 256\n"
+             logical_start_capacity = 256\n\
+             logical_context_admission_issue_capacity = 1024\n\
+             logical_context_establish_capacity = 1024\n"
             .to_owned(),
         Uea4a1PerformanceProfile::Candidate => format!(
             "[runtime.frontend_workload]\n\
              concurrency_limit = {CONCURRENCY_LIMIT}\n\
              waiting_limit = {WAITING_LIMIT}\n\
              capacity_wait_timeout_ms = 30000\n\
+             logical_context_admission_issue_capacity = 1024\n\
+             logical_context_establish_capacity = 1024\n\
              logical_remote_cleanup_timeout_ms = 5000\n\
              planning_idle_keepalive_ms = 60000\n"
         ),
@@ -525,6 +530,7 @@ struct Uea4a1PerformanceWindow {
     workload: &'static str,
     repetition: usize,
     clients: usize,
+    client_think_time_ms: u64,
     started_unix_millis: u128,
     ended_unix_millis: u128,
     completed: usize,
@@ -566,6 +572,7 @@ fn run_uea4a1_performance(
                 repetition,
                 1,
                 PERFORMANCE_NORMAL_QUERY,
+                PERFORMANCE_NORMAL_THINK_TIME,
             )?);
         }
         for repetition in 0..PERFORMANCE_REPETITIONS {
@@ -575,6 +582,7 @@ fn run_uea4a1_performance(
                 repetition,
                 PERFORMANCE_SATURATED_CLIENTS,
                 PERFORMANCE_SATURATED_QUERY,
+                Duration::ZERO,
             )?;
             if matches!(profile, Uea4a1PerformanceProfile::Candidate) {
                 ensure!(
@@ -629,6 +637,7 @@ fn run_uea4a1_performance_window(
     repetition: usize,
     clients: usize,
     query: &'static str,
+    client_think_time: Duration,
 ) -> Result<Uea4a1PerformanceWindow> {
     let timeout = bounded_io_timeout(context, "connect 4A-1 performance clients")?;
     let mut connections = Vec::with_capacity(clients);
@@ -656,6 +665,7 @@ fn run_uea4a1_performance_window(
                     samples.push(Uea4a1LatencySample {
                         total_micros: started.elapsed().as_micros(),
                     });
+                    thread::sleep(client_think_time);
                 }
                 Ok(samples)
             },
@@ -694,6 +704,7 @@ fn run_uea4a1_performance_window(
         workload,
         repetition,
         clients,
+        client_think_time_ms: client_think_time.as_millis() as u64,
         started_unix_millis,
         ended_unix_millis,
         completed: samples.len(),

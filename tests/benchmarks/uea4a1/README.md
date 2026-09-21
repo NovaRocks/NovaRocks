@@ -8,7 +8,7 @@ documented FE workload policy differs.
 
 Each run starts a native 1FE+3BE cluster and executes three 120-second normal
 windows followed by three 120-second saturated windows. The normal workload
-has one client. The saturated workload has four clients while the candidate
+has one client and a fixed 20 ms think time. The saturated workload has four clients while the candidate
 warehouse limit is three, so it must observe the one fair query-admission
 queue. The one-row `sleep` query bounds BE memory and makes queueing
 observable without introducing a CPU benchmark.
