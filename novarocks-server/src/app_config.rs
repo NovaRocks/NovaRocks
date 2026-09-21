@@ -708,7 +708,6 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_application_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
     validate_connector_blocking_io_config(&cfg.runtime)?;
-    validate_query_cpu_config(&cfg.runtime)?;
     validate_query_blocking_config(&cfg.runtime)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
@@ -1147,13 +1146,10 @@ impl Default for StandaloneServerConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FrontendWorkloadRuntimeConfig {
-    pub root_limit: usize,
-    pub business_limit: usize,
-    pub preparation_limit: usize,
-    pub execution_limit: usize,
-    pub executions_per_root: usize,
+    /// Warehouse-wide admitted compute queries. This is the Frontend's only
+    /// query-load control: it covers planning through protocol terminality.
+    pub concurrency_limit: usize,
     pub waiting_limit: usize,
-    pub waiting_bytes: u64,
     pub capacity_wait_timeout_ms: u64,
     pub restarts_per_work: usize,
     pub old_attempts_per_work: usize,
@@ -1165,7 +1161,6 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub control_ready_limit: usize,
     pub control_bytes: u64,
     pub per_scope_bytes: u64,
-    pub logical_start_capacity: usize,
     pub logical_actor_mailbox_capacity: usize,
     pub logical_context_admission_issue_capacity: usize,
     pub logical_context_establish_capacity: usize,
@@ -1174,19 +1169,18 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub result_decode_queue_capacity: usize,
     pub logical_rows_delivery_capacity: usize,
     pub logical_replacement_reservation_ms: u64,
+    pub logical_remote_cleanup_timeout_ms: u64,
     pub logical_result_fetch_wait_ms: u64,
+    /// How long an idle elastic planning worker remains reusable before it
+    /// exits. This affects worker reuse only; it is not an admission bound.
+    pub planning_idle_keepalive_ms: u64,
 }
 
 impl Default for FrontendWorkloadRuntimeConfig {
     fn default() -> Self {
         Self {
-            root_limit: 256,
-            business_limit: 256,
-            preparation_limit: 16,
-            execution_limit: 64,
-            executions_per_root: 4,
+            concurrency_limit: 256,
             waiting_limit: 1024,
-            waiting_bytes: 64 * 1024 * 1024,
             capacity_wait_timeout_ms: 30_000,
             restarts_per_work: 2,
             old_attempts_per_work: 2,
@@ -1198,7 +1192,6 @@ impl Default for FrontendWorkloadRuntimeConfig {
             control_ready_limit: 256,
             control_bytes: 64 * 1024 * 1024,
             per_scope_bytes: 2 * 1024 * 1024 * 1024,
-            logical_start_capacity: 256,
             logical_actor_mailbox_capacity: 64,
             logical_context_admission_issue_capacity: 16,
             logical_context_establish_capacity: 16,
@@ -1207,12 +1200,15 @@ impl Default for FrontendWorkloadRuntimeConfig {
             result_decode_queue_capacity: 32,
             logical_rows_delivery_capacity: 32,
             logical_replacement_reservation_ms: 30_000,
+            logical_remote_cleanup_timeout_ms: 5_000,
             logical_result_fetch_wait_ms: 200,
+            planning_idle_keepalive_ms: 60_000,
         }
     }
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default = "default_exchange_wait_ms")]
     pub exchange_wait_ms: u64,
@@ -1359,13 +1355,6 @@ pub struct RuntimeConfig {
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
     pub data_runtime_max_blocking_threads: usize,
-    /// Fixed FE CPU preparation workers. `0` derives the deployment's
-    /// configured execution parallelism.
-    #[serde(default = "default_query_cpu_worker_threads")]
-    pub query_cpu_worker_threads: usize,
-    /// Maximum queued FE CPU preparation jobs; zero is rejected at preflight.
-    #[serde(default = "default_query_cpu_queue_capacity")]
-    pub query_cpu_queue_capacity: usize,
     /// Fixed FE workers for synchronous query command edges. `0` derives the
     /// configured execution parallelism.
     #[serde(default = "default_query_blocking_worker_threads")]
@@ -1877,16 +1866,6 @@ fn validate_connector_blocking_io_config(runtime: &RuntimeConfig) -> Result<()> 
     Ok(())
 }
 
-fn validate_query_cpu_config(runtime: &RuntimeConfig) -> Result<()> {
-    if runtime.actual_query_cpu_workers() == 0 {
-        bail!("runtime.query_cpu_worker_threads must resolve to a nonzero value");
-    }
-    if runtime.query_cpu_queue_capacity == 0 {
-        bail!("runtime.query_cpu_queue_capacity must be nonzero");
-    }
-    Ok(())
-}
-
 fn validate_query_blocking_config(runtime: &RuntimeConfig) -> Result<()> {
     if runtime.actual_query_blocking_workers() == 0 {
         bail!("runtime.query_blocking_worker_threads must resolve to a nonzero value");
@@ -2143,14 +2122,6 @@ fn default_data_runtime_max_blocking_threads() -> usize {
     64
 }
 
-fn default_query_cpu_worker_threads() -> usize {
-    0
-}
-
-fn default_query_cpu_queue_capacity() -> usize {
-    64
-}
-
 fn default_query_blocking_worker_threads() -> usize {
     0
 }
@@ -2320,8 +2291,6 @@ impl Default for RuntimeConfig {
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
-            query_cpu_worker_threads: default_query_cpu_worker_threads(),
-            query_cpu_queue_capacity: default_query_cpu_queue_capacity(),
             query_blocking_worker_threads: default_query_blocking_worker_threads(),
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
             connector_blocking_io_max_inflight: default_connector_blocking_io_max_inflight(),
@@ -2493,14 +2462,6 @@ impl RuntimeConfig {
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
-        }
-    }
-
-    pub fn actual_query_cpu_workers(&self) -> usize {
-        if self.query_cpu_worker_threads > 0 {
-            self.query_cpu_worker_threads
-        } else {
-            self.actual_exec_threads()
         }
     }
 
@@ -2765,6 +2726,34 @@ mod tests {
 
         runtime.query_blocking_queue_capacity = 0;
         assert!(validate_query_blocking_config(&runtime).is_err());
+    }
+
+    #[test]
+    fn frontend_workload_rejects_retired_capacity_switches() {
+        for field in [
+            "root_limit",
+            "business_limit",
+            "preparation_limit",
+            "execution_limit",
+            "executions_per_root",
+            "waiting_bytes",
+            "logical_start_capacity",
+        ] {
+            let document = format!("[runtime.frontend_workload]\n{field} = 1\n",);
+            let error = match toml::from_str::<NovaRocksConfig>(&document) {
+                Ok(_) => panic!("retired FE capacity configuration must be rejected: {field}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(field), "{field}: {error}");
+        }
+        for field in ["query_cpu_worker_threads", "query_cpu_queue_capacity"] {
+            let document = format!("[runtime]\n{field} = 1\n");
+            let error = match toml::from_str::<NovaRocksConfig>(&document) {
+                Ok(_) => panic!("retired planning-pool configuration must be rejected: {field}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(field), "{field}: {error}");
+        }
     }
 
     #[test]

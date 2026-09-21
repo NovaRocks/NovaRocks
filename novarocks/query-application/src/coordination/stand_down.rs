@@ -132,6 +132,10 @@ pub enum ContextClosureState {
     /// this context. This fences the old process identity but does not claim
     /// that its resources were released cleanly.
     WorkerProcessReplaced,
+    /// The coordinator stopped tracking an unreachable context after its
+    /// finite cleanup window. This is a local observation-retirement result,
+    /// never a Worker stop or zero-resource fact.
+    RemoteTrackingEnded,
 }
 
 impl ContextClosureState {
@@ -145,6 +149,7 @@ impl ContextClosureState {
                 | Self::Gone
                 | Self::WorkerStoppedAndContextFenced
                 | Self::WorkerProcessReplaced
+                | Self::RemoteTrackingEnded
         )
     }
 
@@ -601,6 +606,18 @@ impl ContextStandDownLedger {
                 .all(|record| record.closure.residual_resource_settled())
     }
 
+    /// Every remaining context either has positive resource-closure evidence
+    /// or this coordinator has ended its finite remote observation. The latter
+    /// permits FE retirement only; it deliberately does not make
+    /// `residual_resource_settled` true.
+    pub(crate) fn remote_tracking_ended(&self) -> bool {
+        self.started
+            && self.records.values().all(|record| {
+                record.closure.residual_resource_settled()
+                    || record.closure == ContextClosureState::RemoteTrackingEnded
+            })
+    }
+
     pub(crate) fn has_unsettled_establish_issue(&self) -> bool {
         self.records
             .values()
@@ -619,6 +636,11 @@ impl ContextStandDownLedger {
             .records
             .get_mut(&context)
             .ok_or(ContextStandDownError::UnknownContext)?;
+        if convergence == RegistryContextConvergence::RemoteTrackingEnded
+            && record.closure.residual_resource_settled()
+        {
+            return Ok(());
+        }
         record.registry_fenced = true;
         record.retry_not_before = None;
         record.request = None;
@@ -631,6 +653,9 @@ impl ContextStandDownLedger {
             }
             RegistryContextConvergence::WorkerProcessReplaced => {
                 ContextClosureState::WorkerProcessReplaced
+            }
+            RegistryContextConvergence::RemoteTrackingEnded => {
+                ContextClosureState::RemoteTrackingEnded
             }
         };
         Ok(())
@@ -760,6 +785,7 @@ pub(crate) enum RegistryContextConvergence {
     NeverEstablished,
     WorkerStoppedAndContextFenced,
     WorkerProcessReplaced,
+    RemoteTrackingEnded,
 }
 
 fn settle_worker(

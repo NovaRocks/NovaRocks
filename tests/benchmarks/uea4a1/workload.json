@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "topology": "native 1FE+3BE",
+  "fixture": "TABLE(generate_series(1, 1000)) and TABLE(generate_series(1, 1))",
+  "profiles": {
+    "b0": {
+      "policy": "legacy stage limits; no whole-query concurrency gate",
+      "frontend_workload": {
+        "root_limit": 256,
+        "business_limit": 256,
+        "preparation_limit": 16,
+        "execution_limit": 64,
+        "waiting_limit": 1024,
+        "logical_start_capacity": 256
+      }
+    },
+    "candidate": {
+      "policy": "warehouse whole-query admission",
+      "frontend_workload": {
+        "concurrency_limit": 3,
+        "waiting_limit": 512,
+        "capacity_wait_timeout_ms": 30000,
+        "logical_remote_cleanup_timeout_ms": 5000,
+        "planning_idle_keepalive_ms": 60000
+      }
+    }
+  },
+  "windows": {
+    "duration_ms": 120000,
+    "repetitions": 3,
+    "normal": {
+      "clients": 1,
+      "query": "SELECT SUM(i) FROM TABLE(generate_series(1, 1000)) AS t(i)"
+    },
+    "saturated": {
+      "clients": 4,
+      "query": "SELECT sleep(0.25) FROM TABLE(generate_series(1, 1))"
+    }
+  },
+  "sampling_interval_ms": 100,
+  "metrics": [
+    "completed",
+    "throughput_per_second",
+    "p50_micros",
+    "p95_micros",
+    "p99_micros",
+    "peak_active_statements",
+    "peak_admitted_queries",
+    "peak_waiting_records",
+    "peak_obligations",
+    "process-resources.json"
+  ]
+}

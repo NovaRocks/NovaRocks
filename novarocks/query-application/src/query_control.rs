@@ -605,6 +605,10 @@ mod tests {
     use super::*;
     use crate::session_control::{GovernedQueryStatementBeginError, QueryControlPort};
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
 
     fn register(
         control: &QueryApplicationControl,
@@ -804,6 +808,79 @@ mod tests {
         .expect("workload authority");
         workload.mark_ready().expect("workload authority ready");
         (control, service, workload)
+    }
+
+    #[tokio::test]
+    async fn queued_governed_query_registers_kill_before_its_concurrency_grant() {
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let mut config = WorkloadConfig::default();
+        config.query_concurrency_limit = 1;
+        let workload = WorkloadControl::try_new(
+            config,
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .expect("workload authority");
+        workload.mark_ready().expect("workload authority ready");
+        let first_session = register(&control, 7, 1, "root");
+        let second_session = register(&control, 8, 1, "root");
+
+        let mut first = service
+            .begin_queued_governed_query_statement(
+                first_session,
+                &workload.root_admission(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("first query grant");
+        let query_admission = workload.root_admission();
+        let mut second = Box::pin(service.begin_queued_governed_query_statement(
+            second_session,
+            &query_admission,
+            None,
+            None,
+            None,
+        ));
+        assert!(matches!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        assert_eq!(workload.snapshot().admitted_queries, 1);
+        assert_eq!(workload.snapshot().admission_records, 1);
+
+        assert_eq!(
+            control.cancel_session_statement(
+                second_session,
+                QueryCancellationReason::ExplicitKill {
+                    requester_connection_id: 7,
+                },
+            ),
+            QueryCancelOutcome::Requested
+        );
+        assert!(matches!(
+            second.await,
+            Err(GovernedQueryStatementBeginError::Admission(
+                WorkError::Cancelled(CancellationReason::ExplicitKill { .. })
+            ))
+        ));
+        assert_eq!(workload.snapshot().admitted_queries, 1);
+        assert_eq!(workload.snapshot().admission_records, 0);
+
+        first
+            .take_execution_owner()
+            .expect("first execution owner")
+            .complete();
+        assert_eq!(first.finish(), GovernedStatementFinishOutcome::Completed);
+        assert_eq!(workload.snapshot().admitted_queries, 0);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
     }
 
     #[test]

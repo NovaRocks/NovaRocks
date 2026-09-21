@@ -126,8 +126,24 @@ pub struct FrontendWorkloadServingSnapshot {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct FrontendWorkloadGovernanceSnapshot {
     pub root_responsibilities: usize,
+    /// Queries currently holding the warehouse-wide execution permit.
+    pub admitted_queries: usize,
     pub preparation: usize,
     pub execution: usize,
+    /// Retired attempt observations that still consume their dedicated
+    /// governance allowance. This is observation only; it is never a claim
+    /// about a remote Worker's physical state.
+    pub old_attempts: usize,
+    /// Unknown create observations that still consume their dedicated
+    /// governance allowance.
+    pub unknown_creates: usize,
+    /// All live remote-observation records held by the Frontend.
+    pub obligations: usize,
+    /// Cumulative records closed by actual remote settlement evidence.
+    pub obligations_settled_with_evidence: usize,
+    /// Cumulative records whose Frontend tracking ended while remote state
+    /// remained unknown. This is deliberately distinct from physical stop.
+    pub obligations_tracking_ended_remote_unknown: usize,
     pub waiting_records: usize,
     pub peak_waiting_records: usize,
     pub waiting_bytes: u64,
@@ -264,8 +280,16 @@ fn frontend_workload_snapshot(
         active,
         governance: FrontendWorkloadGovernanceSnapshot {
             root_responsibilities: workload.root_responsibilities,
+            admitted_queries: workload.admitted_queries,
             preparation: workload.preparation,
             execution: workload.execution,
+            old_attempts: workload.old_attempts,
+            unknown_creates: workload.unknown_creates,
+            obligations: workload.obligations,
+            obligations_settled_with_evidence: workload.obligation_endings.settled_with_evidence,
+            obligations_tracking_ended_remote_unknown: workload
+                .obligation_endings
+                .tracking_ended_remote_unknown,
             waiting_records: workload.waiting_records,
             peak_waiting_records: workload.peak_waiting_records,
             waiting_bytes: workload.waiting_bytes,

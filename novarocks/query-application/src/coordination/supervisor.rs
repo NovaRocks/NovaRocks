@@ -18,9 +18,10 @@
 //! Process-owned logical execution supervision.
 //!
 //! The supervisor is the sole constructor of [`QueryExecutionClient`]. A
-//! bounded start mailbox transfers one governed work owner before returning a
-//! future to the caller. Accepted requests remain in the supervisor's JoinSet
-//! even when that caller drops its reply future.
+//! start mailbox transfers one governed work owner before returning a future to
+//! the caller. Warehouse concurrency admission happened before this handoff,
+//! so the mailbox has no independent capacity policy. Accepted requests remain
+//! in the supervisor's JoinSet even when that caller drops its reply future.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -38,7 +39,7 @@ use novarocks_types::identity::{
     QueryProcessNamespace,
 };
 use novarocks_workload_control::{
-    CancellationReason, LocalResourceAuthority, Stage, StageRequest, WorkError, WorkOwner,
+    CancellationReason, LocalResourceAuthority, Stage, WorkError, WorkOwner,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -64,15 +65,16 @@ use super::{
 
 static NEXT_PROCESS_QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const NATIVE_CONVERGENCE_PANIC_BACKOFF: Duration = Duration::from_millis(10);
+const DEFAULT_REMOTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Explicit process bounds used by the first supervisor slice.
+/// Explicit process bounds used by the logical execution supervisor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalExecutionSupervisorConfig {
-    start_capacity: NonZeroUsize,
     actor_mailbox_capacity: NonZeroUsize,
     max_admission_issues_per_context: NonZeroUsize,
     max_establish_authorizations_per_context: NonZeroUsize,
     rows: LogicalExecutionRowsConfig,
+    remote_cleanup_timeout: Duration,
 }
 
 /// Process-fixed bounds for every row-producing logical execution.
@@ -109,23 +111,35 @@ impl LogicalExecutionRowsConfig {
 
 impl LogicalExecutionSupervisorConfig {
     pub const fn new(
-        start_capacity: NonZeroUsize,
         actor_mailbox_capacity: NonZeroUsize,
         max_admission_issues_per_context: NonZeroUsize,
         max_establish_authorizations_per_context: NonZeroUsize,
         rows: LogicalExecutionRowsConfig,
     ) -> Self {
         Self {
-            start_capacity,
             actor_mailbox_capacity,
             max_admission_issues_per_context,
             max_establish_authorizations_per_context,
             rows,
+            remote_cleanup_timeout: DEFAULT_REMOTE_CLEANUP_TIMEOUT,
         }
     }
 
     pub const fn replacement_reservation_valid_for(self) -> Duration {
         self.rows.replacement_reservation_valid_for
+    }
+
+    /// Sets the one absolute observation budget that starts after the FE has
+    /// reached a logical terminal outcome. It governs FE tracking only; it
+    /// does not assert a Worker stop deadline.
+    pub const fn with_remote_cleanup_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "remote cleanup timeout must be nonzero");
+        self.remote_cleanup_timeout = timeout;
+        self
+    }
+
+    pub const fn remote_cleanup_timeout(self) -> Duration {
+        self.remote_cleanup_timeout
     }
 }
 
@@ -205,11 +219,14 @@ impl LogicalExecutionSupervisor {
         frontend_process_id: FrontendProcessId,
         config: LogicalExecutionSupervisorConfig,
     ) -> (Self, QueryExecutionClient) {
-        let (starts, start_rx) = mpsc::channel(config.start_capacity.get());
+        // Query admission is the sole warehouse scheduling queue. This
+        // unbounded handoff only transfers already admitted work to the
+        // supervisor; it must never reject a query with a second capacity.
+        let (starts, start_rx) = mpsc::unbounded_channel();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let registry = LogicalExecutionRuntimeRegistry::new(runtime.clone());
         let registry_handle = registry.handle();
-        let driver = BoundedQueryExecutionDriver {
+        let driver = QueryExecutionDriverHandle {
             starts,
             shutdown: shutdown_rx.clone(),
         };
@@ -307,12 +324,12 @@ impl LogicalExecutionSupervisor {
 }
 
 #[derive(Debug)]
-struct BoundedQueryExecutionDriver {
-    starts: mpsc::Sender<StartCommand>,
+struct QueryExecutionDriverHandle {
+    starts: mpsc::UnboundedSender<StartCommand>,
     shutdown: watch::Receiver<bool>,
 }
 
-impl QueryExecutionDriver for BoundedQueryExecutionDriver {
+impl QueryExecutionDriver for QueryExecutionDriverHandle {
     fn start(&self, request: QueryExecutionRequest, owner: WorkOwner) -> QueryExecutionFuture {
         if *self.shutdown.borrow() {
             return rejected_start(owner, "logical execution supervisor is shutting down");
@@ -332,7 +349,7 @@ impl QueryExecutionDriver for BoundedQueryExecutionDriver {
             owner,
             reply,
         };
-        match self.starts.try_send(command) {
+        match self.starts.send(command) {
             Ok(()) => Box::pin(async move {
                 tokio::select! {
                     biased;
@@ -347,11 +364,7 @@ impl QueryExecutionDriver for BoundedQueryExecutionDriver {
                     )),
                 }
             }),
-            Err(mpsc::error::TrySendError::Full(command)) => rejected_start(
-                command.owner,
-                "logical execution start capacity is exhausted",
-            ),
-            Err(mpsc::error::TrySendError::Closed(command)) => {
+            Err(mpsc::error::SendError(command)) => {
                 rejected_start(command.owner, "logical execution supervisor is closed")
             }
         }
@@ -436,7 +449,7 @@ async fn run_supervisor(
     namespace: QueryProcessNamespace,
     frontend_process_id: FrontendProcessId,
     config: LogicalExecutionSupervisorConfig,
-    mut starts: mpsc::Receiver<StartCommand>,
+    mut starts: mpsc::UnboundedReceiver<StartCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), QueryExecutionError> {
     let query_ids = Arc::new(ProcessQueryIdAllocator::new(namespace));
@@ -633,32 +646,9 @@ async fn run_logical_execution(
             );
         }
     };
-    let stage_admission = match scope.acquire(StageRequest {
-        stage: Stage::Execution,
-        retained_bytes: 0,
-    }) {
-        Ok(admission) => admission,
+    let stage = match scope.track_stage(Stage::Execution) {
+        Ok(stage) => stage,
         Err(error) => return fail_uninstalled_start(pending_owner, reply, work_error(error)),
-    };
-    let stage = match await_before_actor_install(
-        stage_admission,
-        cancellation.clone(),
-        &mut shutdown,
-        &requester,
-    )
-    .await
-    {
-        PreInstallWait::Completed(Ok(stage)) => stage,
-        PreInstallWait::Completed(Err(error)) => {
-            return fail_uninstalled_start(pending_owner, reply, work_error(error));
-        }
-        PreInstallWait::Cancelled(reason) => {
-            return fail_uninstalled_start(
-                pending_owner,
-                reply,
-                pre_install_cancellation_error(reason),
-            );
-        }
     };
     let contexts = schedule.contexts().to_vec();
     let reservation = match registry.reserve(initial_execution, contexts.clone()) {
@@ -803,9 +793,14 @@ async fn run_logical_execution(
                 Err(error) => {
                     let error = actor_error(error);
                     let _ = requester.request(CancellationReason::Requested);
-                    let convergence =
-                        converge_active(active.as_mut(), cancellation, &mut shutdown, &requester)
-                            .await;
+                    let convergence = converge_active(
+                        active.as_mut(),
+                        cancellation,
+                        &mut shutdown,
+                        &requester,
+                        config.remote_cleanup_timeout(),
+                    )
+                    .await;
                     drop(active);
                     let convergence_result = record_reported_active_convergence(
                         &registry,
@@ -865,8 +860,14 @@ async fn run_logical_execution(
                 .map(|_| ())
                 .map_err(actor_error);
             let _ = requester.request(CancellationReason::Requested);
-            let convergence =
-                converge_active(active.as_mut(), cancellation, &mut shutdown, &requester).await;
+            let convergence = converge_active(
+                active.as_mut(),
+                cancellation,
+                &mut shutdown,
+                &requester,
+                config.remote_cleanup_timeout(),
+            )
+            .await;
             drop(active);
             let convergence_result = record_reported_active_convergence(
                 &registry,
@@ -896,8 +897,14 @@ async fn run_logical_execution(
                 .map(|_| ())
                 .map_err(actor_error);
             let _ = requester.request(CancellationReason::Requested);
-            let convergence =
-                converge_active(active.as_mut(), cancellation, &mut shutdown, &requester).await;
+            let convergence = converge_active(
+                active.as_mut(),
+                cancellation,
+                &mut shutdown,
+                &requester,
+                config.remote_cleanup_timeout(),
+            )
+            .await;
             drop(active);
             let convergence_result = record_reported_active_convergence(
                 &registry,
@@ -923,8 +930,14 @@ async fn run_logical_execution(
         Err(error) => {
             let error = actor_error(error);
             let _ = requester.request(CancellationReason::Requested);
-            let convergence =
-                converge_active(active.as_mut(), cancellation, &mut shutdown, &requester).await;
+            let convergence = converge_active(
+                active.as_mut(),
+                cancellation,
+                &mut shutdown,
+                &requester,
+                config.remote_cleanup_timeout(),
+            )
+            .await;
             drop(active);
             let convergence_result = record_reported_active_convergence(
                 &registry,
@@ -956,12 +969,13 @@ async fn run_logical_execution(
     .await;
     let (actor_result, convergence) = match terminal {
         Ok(NativeAttemptTerminal::Completed) => {
-            let convergence =
-                converge_active(active.as_mut(), cancellation, &mut shutdown, &requester).await;
-            drop(active);
+            // The logical conclusion is the client-visible terminal boundary.
+            // It must precede bounded remote observation so the statement
+            // owner can release its warehouse query permit while FE cleanup
+            // continues independently.
             let actor_result = match actor.complete_attempt(running).await {
                 Ok(super::LogicalConclusion::Succeeded) => {
-                    let handle = ExecutionHandle::new(requester, output.into_output());
+                    let handle = ExecutionHandle::new(requester.clone(), output.into_output());
                     let _ = reply.send(Ok(handle));
                     Ok(())
                 }
@@ -979,6 +993,15 @@ async fn run_logical_execution(
                     Err(error)
                 }
             };
+            let convergence = converge_active(
+                active.as_mut(),
+                cancellation,
+                &mut shutdown,
+                &requester,
+                config.remote_cleanup_timeout(),
+            )
+            .await;
+            drop(active);
             (actor_result, convergence)
         }
         Ok(NativeAttemptTerminal::Failed(failure)) => {
@@ -989,8 +1012,14 @@ async fn run_logical_execution(
                 .map(|_| ())
                 .map_err(actor_error);
             let _ = reply.send(Err(client_error));
-            let convergence =
-                converge_active(active.as_mut(), cancellation, &mut shutdown, &requester).await;
+            let convergence = converge_active(
+                active.as_mut(),
+                cancellation,
+                &mut shutdown,
+                &requester,
+                config.remote_cleanup_timeout(),
+            )
+            .await;
             drop(active);
             (actor_result, convergence)
         }
@@ -1002,8 +1031,14 @@ async fn run_logical_execution(
                 .map(|_| ())
                 .map_err(actor_error);
             let _ = reply.send(Err(error.clone()));
-            let convergence =
-                converge_active(active.as_mut(), cancellation, &mut shutdown, &requester).await;
+            let convergence = converge_active(
+                active.as_mut(),
+                cancellation,
+                &mut shutdown,
+                &requester,
+                config.remote_cleanup_timeout(),
+            )
+            .await;
             drop(active);
             (
                 first_supervision_error(Err(error), actor_result),
@@ -1035,8 +1070,17 @@ struct RowsAttempt {
 
 type ResidualRowsConvergence = JoinSet<(
     Box<[novarocks_execution_contract::QueryContextRef]>,
-    NativeAttemptConvergence,
+    ActiveAttemptConvergence,
 )>;
+
+/// The supervisor's local outcome for an active Native attempt. Native owns
+/// only positive Worker/process closure evidence; bounded FE observation is a
+/// Query Application fact and therefore has a separate variant.
+#[derive(Debug)]
+enum ActiveAttemptConvergence {
+    Evidence(NativeAttemptConvergence),
+    RemoteTrackingEnded,
+}
 
 fn supervise_residual_rows_attempt(
     residuals: &mut ResidualRowsConvergence,
@@ -1045,10 +1089,17 @@ fn supervise_residual_rows_attempt(
     cancellation: novarocks_workload_control::CancellationView,
     mut shutdown: watch::Receiver<bool>,
     requester: novarocks_workload_control::WorkCancellationRequester,
+    cleanup_timeout: Duration,
 ) {
     residuals.spawn(async move {
-        let convergence =
-            converge_active(active.as_mut(), cancellation, &mut shutdown, &requester).await;
+        let convergence = converge_active(
+            active.as_mut(),
+            cancellation,
+            &mut shutdown,
+            &requester,
+            cleanup_timeout,
+        )
+        .await;
         (contexts, convergence)
     });
 }
@@ -1063,8 +1114,10 @@ async fn converge_rows_attempts(
     registration: &super::LogicalExecutionRegistration,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
+    cleanup_timeout: Duration,
 ) -> Result<(), QueryExecutionError> {
-    let active_convergence = converge_active(active, cancellation, shutdown, requester).await;
+    let active_convergence =
+        converge_active(active, cancellation, shutdown, requester, cleanup_timeout).await;
     let result = record_reported_active_convergence(
         registry,
         registration,
@@ -1220,6 +1273,7 @@ async fn supervise_rows(
                     registration,
                     shutdown,
                     requester,
+                    config.remote_cleanup_timeout(),
                 )
                 .await;
             }
@@ -1233,6 +1287,7 @@ async fn supervise_rows(
                     registration,
                     shutdown,
                     requester,
+                    config.remote_cleanup_timeout(),
                 )
                 .await;
                 return first_supervision_error(
@@ -1253,6 +1308,7 @@ async fn supervise_rows(
                     registration,
                     shutdown,
                     requester,
+                    config.remote_cleanup_timeout(),
                 )
                 .await;
                 return if matches!(
@@ -1274,6 +1330,7 @@ async fn supervise_rows(
                     registration,
                     shutdown,
                     requester,
+                    config.remote_cleanup_timeout(),
                 )
                 .await;
                 return first_supervision_error(Err(failure.error().clone()), convergence);
@@ -1310,6 +1367,7 @@ async fn supervise_rows(
                         registration,
                         shutdown,
                         requester,
+                        config.remote_cleanup_timeout(),
                     )
                     .await;
                     return first_supervision_error(actor_result, convergence);
@@ -1332,6 +1390,7 @@ async fn supervise_rows(
                             registration,
                             shutdown,
                             requester,
+                            config.remote_cleanup_timeout(),
                         )
                         .await;
                         return first_supervision_error(
@@ -1365,6 +1424,7 @@ async fn supervise_rows(
                             registration,
                             shutdown,
                             requester,
+                            config.remote_cleanup_timeout(),
                         )
                         .await;
                         return first_supervision_error(
@@ -1395,6 +1455,7 @@ async fn supervise_rows(
                             registration,
                             shutdown,
                             requester,
+                            config.remote_cleanup_timeout(),
                         )
                         .await;
                         return first_supervision_error(
@@ -1411,6 +1472,7 @@ async fn supervise_rows(
                     cancellation.clone(),
                     shutdown.clone(),
                     requester.clone(),
+                    config.remote_cleanup_timeout(),
                 );
                 let instantiation = match await_with_shutdown(
                     actor.activate_replacement(qualification),
@@ -1540,8 +1602,14 @@ async fn supervise_rows(
                         .map(|_| ())
                         .map_err(actor_error);
                     let mut active = active;
-                    let convergence =
-                        converge_active(active.as_mut(), cancellation, shutdown, requester).await;
+                    let convergence = converge_active(
+                        active.as_mut(),
+                        cancellation,
+                        shutdown,
+                        requester,
+                        config.remote_cleanup_timeout(),
+                    )
+                    .await;
                     drop(active);
                     let replacement_convergence = record_reported_active_convergence(
                         registry,
@@ -1565,9 +1633,14 @@ async fn supervise_rows(
                     Ok(running) => running,
                     Err(error) => {
                         let mut active = active;
-                        let convergence =
-                            converge_active(active.as_mut(), cancellation, shutdown, requester)
-                                .await;
+                        let convergence = converge_active(
+                            active.as_mut(),
+                            cancellation,
+                            shutdown,
+                            requester,
+                            config.remote_cleanup_timeout(),
+                        )
+                        .await;
                         let replacement_convergence = record_reported_active_convergence(
                             registry,
                             registration,
@@ -1655,8 +1728,11 @@ async fn record_reported_active_convergence(
     registry: &LogicalExecutionRuntimeRegistryHandle,
     registration: &super::LogicalExecutionRegistration,
     expected_contexts: &[novarocks_execution_contract::QueryContextRef],
-    convergence: NativeAttemptConvergence,
+    convergence: ActiveAttemptConvergence,
 ) -> Result<(), QueryExecutionError> {
+    let ActiveAttemptConvergence::Evidence(convergence) = convergence else {
+        return record_remote_tracking_ended(registry, registration, expected_contexts).await;
+    };
     let NativeAttemptConvergence::Contexts(facts) = convergence else {
         return record_active_convergence(registry, registration, expected_contexts).await;
     };
@@ -1702,6 +1778,23 @@ async fn record_reported_active_convergence(
     first_error.map_or(Ok(()), Err)
 }
 
+async fn record_remote_tracking_ended(
+    registry: &LogicalExecutionRuntimeRegistryHandle,
+    registration: &super::LogicalExecutionRegistration,
+    contexts: &[novarocks_execution_contract::QueryContextRef],
+) -> Result<(), QueryExecutionError> {
+    let mut first_error = None;
+    for &context in contexts {
+        if let Err(error) = registry
+            .end_remote_context_tracking(registration, context)
+            .await
+        {
+            first_error.get_or_insert_with(|| registry_error(error));
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 async fn converge_dormant(
     owner: &mut dyn DormantNativeAttemptOwner,
     cancellation: novarocks_workload_control::CancellationView,
@@ -1726,16 +1819,38 @@ async fn converge_active(
     cancellation: novarocks_workload_control::CancellationView,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
-) -> NativeAttemptConvergence {
+    cleanup_timeout: Duration,
+) -> ActiveAttemptConvergence {
+    let deadline = tokio::time::Instant::now() + cleanup_timeout;
+    let mut shutdown_open = true;
     loop {
         let convergence = async { owner.converge(cancellation.clone()).await };
-        if let Ok(convergence) =
-            await_with_shutdown(catch_future_panic(convergence), shutdown, requester).await
-        {
-            return convergence;
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, catch_future_panic(convergence)) => {
+                match result {
+                    Ok(Ok(convergence)) => return ActiveAttemptConvergence::Evidence(convergence),
+                    Ok(Err(())) => {
+                        let _ = requester.request(CancellationReason::Requested);
+                        if tokio::time::Instant::now() >= deadline {
+                            return ActiveAttemptConvergence::RemoteTrackingEnded;
+                        }
+                        tokio::time::sleep(NATIVE_CONVERGENCE_PANIC_BACKOFF).await;
+                    }
+                    Err(_) => return ActiveAttemptConvergence::RemoteTrackingEnded,
+                }
+            }
+            changed = shutdown.changed(), if shutdown_open => {
+                shutdown_open = changed.is_ok();
+                if !shutdown_open || *shutdown.borrow() {
+                    let _ = requester.request(CancellationReason::ServerShutdown);
+                    // The FE process is leaving and can no longer own a
+                    // remote observation. Do not let its optional cleanup
+                    // window overrun the process shutdown deadline; Workers
+                    // retain their lease-backed responsibility.
+                    return ActiveAttemptConvergence::RemoteTrackingEnded;
+                }
+            }
         }
-        let _ = requester.request(CancellationReason::Requested);
-        tokio::time::sleep(NATIVE_CONVERGENCE_PANIC_BACKOFF).await;
     }
 }
 
@@ -2008,9 +2123,8 @@ mod tests {
         .expect("a plan with no provider read needs no enumerated work")
     }
 
-    fn supervisor_config(start_capacity: usize) -> LogicalExecutionSupervisorConfig {
+    fn supervisor_config() -> LogicalExecutionSupervisorConfig {
         LogicalExecutionSupervisorConfig::new(
-            NonZeroUsize::new(start_capacity).unwrap(),
             NonZeroUsize::new(8).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
@@ -2024,11 +2138,86 @@ mod tests {
         )
     }
 
+    #[derive(Debug)]
+    struct NeverConverges;
+
+    impl ActiveNativeAttemptOwner for NeverConverges {
+        fn run<'a>(
+            &'a mut self,
+            _drive: &'a NativeAttemptDrive,
+            _cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            Box::pin(async { NativeAttemptTerminal::Completed })
+        }
+
+        fn converge<'a>(
+            &'a mut self,
+            _cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            Box::pin(async { std::future::pending::<NativeAttemptConvergence>().await })
+        }
+    }
+
+    #[tokio::test]
+    async fn active_cleanup_deadline_ends_fe_tracking_without_fabricating_stop_evidence() {
+        let (_control, root) = governance();
+        let cancellation = root.owner.scope().cancellation().unwrap();
+        let requester = root.owner.cancellation_requester();
+        let (_shutdown_sender, mut shutdown) = watch::channel(false);
+        let mut owner = NeverConverges;
+
+        let outcome = converge_active(
+            &mut owner,
+            cancellation,
+            &mut shutdown,
+            &requester,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ActiveAttemptConvergence::RemoteTrackingEnded
+        ));
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_ends_active_remote_tracking_without_waiting_for_cleanup_window() {
+        let (_control, root) = governance();
+        let cancellation = root.owner.scope().cancellation().unwrap();
+        let requester = root.owner.cancellation_requester();
+        let (shutdown_sender, mut shutdown) = watch::channel(false);
+        let mut owner = NeverConverges;
+        shutdown_sender.send_replace(true);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(10),
+            converge_active(
+                &mut owner,
+                cancellation,
+                &mut shutdown,
+                &requester,
+                Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("shutdown must not wait for the normal cleanup window");
+
+        assert!(matches!(
+            outcome,
+            ActiveAttemptConvergence::RemoteTrackingEnded
+        ));
+        root.owner.complete();
+        root.business.release();
+    }
+
     #[tokio::test]
     async fn accepted_start_returns_on_cancellation_before_supervisor_verdict() {
-        let (starts, mut start_rx) = mpsc::channel(NonZeroUsize::new(1).unwrap().get());
+        let (starts, mut start_rx) = mpsc::unbounded_channel();
         let (_shutdown, shutdown) = watch::channel(false);
-        let client = QueryExecutionClient::new(BoundedQueryExecutionDriver { starts, shutdown });
+        let client = QueryExecutionClient::new(QueryExecutionDriverHandle { starts, shutdown });
         let (_control, root) = governance();
         let requester = root.owner.cancellation_requester();
         let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
@@ -2355,7 +2544,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x4f),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
 
         let payload = catch_unwind(AssertUnwindSafe(move || {
@@ -2381,7 +2570,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x45),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
@@ -2413,7 +2602,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x46),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
@@ -2606,7 +2795,7 @@ mod tests {
             control.resources(),
             QueryProcessNamespace::new(0x52),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
 
         let mut handle = tokio::time::timeout(
@@ -3043,7 +3232,7 @@ mod tests {
             control.resources(),
             QueryProcessNamespace::new(0x54),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let mut handle = client
             .start(
@@ -3108,7 +3297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_exit_abandonment_is_finite_with_a_lost_residual_attempt() {
+    async fn shutdown_finishes_remote_tracking_for_a_lost_residual_attempt() {
         let prepares = Arc::new(AtomicU64::new(0));
         let runs = Arc::new(AtomicU64::new(0));
         let convergences = Arc::new(AtomicU64::new(0));
@@ -3130,7 +3319,7 @@ mod tests {
             control.resources(),
             QueryProcessNamespace::new(0x55),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let mut handle = client
             .start(
@@ -3179,19 +3368,14 @@ mod tests {
         drop(stream);
         root.business.release();
 
-        let shutdown = supervisor
+        supervisor
             .shutdown_until(Instant::now() + Duration::from_millis(10))
-            .await;
-        assert!(matches!(
-            shutdown,
-            Err(LogicalExecutionSupervisorShutdownError::DeadlineExceeded)
-        ));
+            .await
+            .expect("shutdown must end FE tracking without waiting for a lost residual attempt");
         assert_eq!(convergences.load(Ordering::SeqCst), 1);
-        supervisor.abandon_for_process_exit();
         drop(supervisor);
 
-        // The real process would exit here. Let the synthetic lost worker
-        // report afterwards so the test runtime can drain its detached task.
+        // A later worker fact cannot revive the retired FE observation.
         allow_initial_convergence.notify_one();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -3228,7 +3412,7 @@ mod tests {
             control.resources(),
             QueryProcessNamespace::new(0x55),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let mut handle = client
             .start(
@@ -3448,7 +3632,7 @@ mod tests {
             control.resources(),
             QueryProcessNamespace::new(0x56),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let mut handle = client
             .start(
@@ -3627,7 +3811,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(namespace),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
@@ -3683,7 +3867,7 @@ mod tests {
             control.resources(),
             QueryProcessNamespace::new(0x53),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
 
         let error = match client
@@ -3727,7 +3911,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x50),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
@@ -3738,6 +3922,13 @@ mod tests {
         };
         assert_eq!(error.message(), "injected Native attempt failure");
         root.business.release();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while convergence_calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary finite cleanup retries a convergence panic before shutdown");
         supervisor
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
@@ -3957,7 +4148,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x50),
             frontend,
-            supervisor_config(4),
+            supervisor_config(),
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
@@ -4060,7 +4251,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x4a),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
@@ -4082,55 +4273,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_and_closed_start_admission_complete_rejected_work() {
+    async fn start_handoff_has_no_second_capacity_and_closed_supervisor_rejects_work() {
         let seed_drops = Arc::new(AtomicU64::new(0));
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            supervisor_resources(),
-            QueryProcessNamespace::new(0x48),
-            FrontendProcessId::new_v7(),
-            supervisor_config(1),
-        );
+        let (starts, mut start_rx) = mpsc::unbounded_channel();
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let client = QueryExecutionClient::new(QueryExecutionDriverHandle { starts, shutdown });
+
         let (first_control, first) = governance();
         let first_scope = first.owner.scope();
-        let accepted = client.start(drop_tracked_request(&seed_drops), first.owner);
+        let first_start = client.start(drop_tracked_request(&seed_drops), first.owner);
         let (second_control, second) = governance();
         let second_scope = second.owner.scope();
         let second_cancellation = second_scope.cancellation().unwrap();
-        let rejected = client.start(drop_tracked_request(&seed_drops), second.owner);
-        let error = match rejected.await {
-            Ok(_) => panic!("a full start mailbox must reject synchronously"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Rejected);
+        let second_start = client.start(drop_tracked_request(&seed_drops), second.owner);
+
+        let first_command = start_rx
+            .recv()
+            .await
+            .expect("first admitted query reaches the handoff");
+        let second_command = start_rx
+            .recv()
+            .await
+            .expect("second admitted query reaches the same unbounded handoff");
         assert!(
             second_control.next_control().is_none(),
-            "full admission rejection must not manufacture cancellation work"
+            "handoff must not manufacture cancellation work"
         );
         assert_eq!(second_cancellation.reason(), None);
-        assert_eq!(seed_drops.load(Ordering::SeqCst), 1);
-        second.business.release();
-        second_scope.wait_released().await;
+        assert!(
+            first_control.next_control().is_none(),
+            "handoff must not manufacture cancellation work"
+        );
 
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        let first_error = match accepted.await {
-            Ok(_) => panic!("queued request must receive an explicit shutdown verdict"),
+        let StartCommand {
+            request: first_request,
+            owner: first_owner,
+            reply: first_reply,
+        } = first_command;
+        let StartCommand {
+            request: second_request,
+            owner: second_owner,
+            reply: second_reply,
+        } = second_command;
+        first_owner.complete();
+        second_owner.complete();
+        let start_error = || {
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::Rejected,
+                "injected supervisor handoff completion",
+            )
+        };
+        assert!(first_reply.send(Err(start_error())).is_ok());
+        assert!(second_reply.send(Err(start_error())).is_ok());
+        let first_error = match first_start.await {
+            Ok(_) => panic!("injected handoff reply must fail"),
+            Err(error) => error,
+        };
+        let second_error = match second_start.await {
+            Ok(_) => panic!("injected handoff reply must fail"),
             Err(error) => error,
         };
         assert_eq!(first_error.kind(), QueryExecutionErrorKind::Rejected);
-        assert!(
-            first_control.next_control().is_none(),
-            "accepted but unstarted shutdown rejection must not manufacture cancellation work"
-        );
-        assert_eq!(first_scope.cancellation().unwrap().reason(), None);
+        assert_eq!(second_error.kind(), QueryExecutionErrorKind::Rejected);
+        drop(first_request);
+        drop(second_request);
         assert_eq!(seed_drops.load(Ordering::SeqCst), 2);
-        first.business.release();
-        first_scope.wait_released().await;
 
+        first.business.release();
+        second.business.release();
+        first_scope.wait_released().await;
+        second_scope.wait_released().await;
+
+        drop(start_rx);
         let (closed_control, closed) = governance();
         let closed_scope = closed.owner.scope();
         let closed_cancellation = closed_scope.cancellation().unwrap();
@@ -4202,7 +4416,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x51),
             frontend,
-            supervisor_config(4),
+            supervisor_config(),
         );
         let (first_control, first) = governance();
         let first_scope = first.owner.scope();
@@ -4279,7 +4493,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x49),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
@@ -4365,7 +4579,7 @@ mod tests {
             control.resources(),
             QueryProcessNamespace::new(0x4a),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
 
         let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
@@ -4408,7 +4622,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x47),
             FrontendProcessId::new_v7(),
-            supervisor_config(4),
+            supervisor_config(),
         );
         let (control, root) = governance();
         let scope = root.owner.scope();
@@ -4454,7 +4668,7 @@ mod tests {
             supervisor_resources(),
             QueryProcessNamespace::new(0x4f),
             FrontendProcessId::new_v7(),
-            supervisor_config(1),
+            supervisor_config(),
         );
         let (_control, root) = governance();
         let scope = root.owner.scope();

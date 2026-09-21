@@ -185,6 +185,7 @@ pub struct QueryTaskExecution {
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     expired_actor_aborts: Vec<TaskOperationId>,
     status_reconciliations: BTreeSet<QueryContextRef>,
+    terminal_cleanup_started: bool,
     failure: TerminationLatch,
     read: ReadCompletionTracker,
     drained_tasks: BTreeSet<TaskId>,
@@ -380,6 +381,7 @@ impl QueryTaskExecution {
             operation_targets: BTreeMap::new(),
             expired_actor_aborts: Vec::new(),
             status_reconciliations: BTreeSet::new(),
+            terminal_cleanup_started: false,
             failure: TerminationLatch::open(),
             read,
             drained_tasks: BTreeSet::new(),
@@ -497,6 +499,9 @@ impl QueryTaskExecution {
         &mut self,
         establish: &dyn ContextEstablishSource,
     ) -> Result<PumpReport, TaskExecutionError> {
+        if self.terminal_cleanup_started {
+            return Ok(PumpReport::default());
+        }
         let now = self.clock.now();
         let expired = self.dispatcher.drain_expired(now);
         let mut first_expiry = None;
@@ -618,6 +623,11 @@ impl QueryTaskExecution {
         task_id: TaskId,
         update: TaskDomainUpdate,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
+        if self.terminal_cleanup_started {
+            return Err(TaskExecutionError::Schedule(
+                "attempt terminal cleanup rejects new task updates".to_owned(),
+            ));
+        }
         let stage_id = *self
             .stage_of_task
             .get(&task_id)
@@ -652,6 +662,11 @@ impl QueryTaskExecution {
         &mut self,
         request: UpdateQueryContext,
     ) -> Result<TaskOperationId, TaskExecutionError> {
+        if self.terminal_cleanup_started {
+            return Err(TaskExecutionError::Schedule(
+                "attempt terminal cleanup rejects new context-domain advances".to_owned(),
+            ));
+        }
         let UpdateQueryContext::AdvanceDomain(advance) = &request else {
             return Err(TaskExecutionError::Schedule(
                 "only a shared-domain advance may be sent by a domain owner".to_owned(),
@@ -795,6 +810,37 @@ impl QueryTaskExecution {
             .ok_or(TaskExecutionError::UnknownOperation)?;
         owner.observe_actor_abort_closure();
         Ok(())
+    }
+
+    /// Stops the normal attempt lifecycle once the logical query has reached
+    /// a terminal outcome. It preserves in-flight requests and actor Abort
+    /// effects, because their Worker facts may still be useful for cleanup,
+    /// while preventing them from causing a successor admission, establish,
+    /// renewal, create, or update.
+    pub(crate) fn begin_terminal_cleanup(&mut self) {
+        if self.terminal_cleanup_started {
+            return;
+        }
+        self.terminal_cleanup_started = true;
+        for owner in self.owners.values_mut() {
+            owner.begin_terminal_cleanup();
+        }
+        self.status_reconciliations.clear();
+        let normal_queued = self
+            .operation_targets
+            .iter()
+            .filter_map(|(&operation_id, &target)| {
+                (target != OperationTarget::ActorAbort
+                    && self.dispatcher.operation_state(operation_id).ok()
+                        == Some(DispatchOperationState::Queued))
+                .then_some((operation_id, target))
+            })
+            .collect::<Vec<_>>();
+        for (operation_id, target) in normal_queued {
+            let _ = self.dispatcher.cancel_queued(operation_id);
+            self.operation_targets.remove(&operation_id);
+            self.rollback_unsent(target, operation_id);
+        }
     }
 
     /// Forces one context down, ahead of everything queued for it.

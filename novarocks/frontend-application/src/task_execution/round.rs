@@ -121,6 +121,10 @@ pub(crate) trait StatusSubscriptions: Send + Sync {
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String>;
 
+    /// Stop one local observation stream when terminal cleanup has closed the
+    /// attempt. This never claims the backend task stopped.
+    fn stop(&self, context: QueryContextRef);
+
     /// The subscription's state once it has settled somewhere resubscribing
     /// cannot repair, and `None` while it can still recover.
     ///
@@ -147,6 +151,10 @@ impl StatusSubscriptions for TaskStatusSubscriber {
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String> {
         Self::resubscribe(self, context, cursors)
+    }
+
+    fn stop(&self, context: QueryContextRef) {
+        Self::stop(self, context);
     }
 
     fn settled_fatally(&self, context: QueryContextRef) -> Option<SubscriptionState> {
@@ -222,6 +230,7 @@ pub(crate) struct TaskRound {
     /// was already in flight when an older send finally answered.
     abort_closing_receipts:
         BTreeMap<novarocks_execution::task_execution::TaskOperationId, OperationAcknowledgement>,
+    terminal_cleanup_started: bool,
 }
 
 impl TaskRound {
@@ -252,6 +261,7 @@ impl TaskRound {
             abort_effects: BTreeMap::new(),
             late_abort_settlements: BTreeMap::new(),
             abort_closing_receipts: BTreeMap::new(),
+            terminal_cleanup_started: false,
         }
     }
 
@@ -395,6 +405,9 @@ impl TaskRound {
         }
 
         for context in self.execution.take_status_reconciliations() {
+            if self.terminal_cleanup_started {
+                break;
+            }
             self.subscriber
                 .resubscribe(context, self.execution.status_cursors(context))
                 .map_err(TaskExecutionError::Schedule)?;
@@ -427,7 +440,7 @@ impl TaskRound {
         if !status.resubscribe {
             self.try_settle_success_seal()?;
         }
-        if status.resubscribe {
+        if status.resubscribe && !self.terminal_cleanup_started {
             for &context in self.execution.graph().contexts() {
                 if self
                     .execution
@@ -449,8 +462,10 @@ impl TaskRound {
             }
         }
 
-        for pump in &mut self.pumps {
-            report.pumped += pump.drive(&mut self.execution)?;
+        if !self.terminal_cleanup_started {
+            for pump in &mut self.pumps {
+                report.pumped += pump.drive(&mut self.execution)?;
+            }
         }
 
         let pumped = match self.execution.pump(self.establish.as_ref()) {
@@ -475,6 +490,9 @@ impl TaskRound {
         // status. Waiting for the acknowledgement is the ordering every other
         // operation on this protocol already obeys; tolerating the refusal
         // instead would make an observation loss the normal case.
+        if self.terminal_cleanup_started {
+            return Ok(report);
+        }
         for &context in self.execution.graph().contexts() {
             if self
                 .execution
@@ -500,6 +518,27 @@ impl TaskRound {
         }
 
         Ok(report)
+    }
+
+    /// Freezes normal attempt progress before remote convergence. Status and
+    /// acknowledgements remain consumable, and actor-owned Abort effects keep
+    /// their priority path, but this round cannot resubscribe or run a pump
+    /// that would create a successor request.
+    pub(crate) fn begin_terminal_cleanup(&mut self) {
+        if self.terminal_cleanup_started {
+            return;
+        }
+        self.terminal_cleanup_started = true;
+        self.pending_success_seal.take().map(|request| {
+            request.reject(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "success seal closed by terminal cleanup",
+            ));
+        });
+        for &context in self.execution.graph().contexts() {
+            self.subscriber.stop(context);
+        }
+        self.execution.begin_terminal_cleanup();
     }
 
     fn drive_actor_abort_effect(&mut self) -> Result<usize, TaskExecutionError> {

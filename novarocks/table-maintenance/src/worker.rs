@@ -52,8 +52,9 @@ pub enum OptimizeJobAdmission {
 }
 
 /// Host adapter for role-local admission and resource attribution.
+#[async_trait::async_trait]
 pub trait OptimizeJobAdmissionPort: Send + Sync {
-    fn try_begin(&self) -> Result<OptimizeJobAdmission, String>;
+    async fn begin(&self) -> Result<OptimizeJobAdmission, String>;
 }
 
 /// Exact role-local provider/native execution capability for one OPTIMIZE job.
@@ -170,7 +171,7 @@ async fn run_worker(
             cancel_for_shutdown(jobs.as_ref()).await?;
             return Ok(());
         }
-        let scope = match admission.try_begin()? {
+        let scope = match admission.begin().await? {
             OptimizeJobAdmission::Acquired(scope) => scope,
             OptimizeJobAdmission::RetryLater => {
                 tokio::select! {
@@ -381,8 +382,9 @@ mod tests {
         closed: Arc<AtomicBool>,
     }
 
+    #[async_trait::async_trait]
     impl OptimizeJobAdmissionPort for TestAdmission {
-        fn try_begin(&self) -> Result<OptimizeJobAdmission, String> {
+        async fn begin(&self) -> Result<OptimizeJobAdmission, String> {
             if self.closed.load(Ordering::Acquire) {
                 return Ok(OptimizeJobAdmission::Closed);
             }

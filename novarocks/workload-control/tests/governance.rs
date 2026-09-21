@@ -29,6 +29,7 @@ fn config() -> WorkloadConfig {
     WorkloadConfig {
         root_limit: 8,
         business_limit: 8,
+        query_concurrency_limit: 2,
         preparation_limit: 2,
         execution_limit: 2,
         executions_per_root: 4,
@@ -64,6 +65,11 @@ fn root(control: &WorkloadControl, class: WorkClass) -> RootWork {
     control.mark_ready().unwrap();
     control.try_begin_root(WorkRequest::new(class)).unwrap()
 }
+fn pending_query(control: &WorkloadControl) -> PendingQueryRoot {
+    control
+        .begin_query_root(WorkRequest::new(WorkClass::Query))
+        .unwrap()
+}
 fn child(scope: &WorkScope) -> WorkOwner {
     scope.child(WorkRequest::new(WorkClass::Query)).unwrap()
 }
@@ -85,6 +91,98 @@ fn drain_control(control: &WorkloadControl) {
     while let Some(work) = control.next_control() {
         work.acknowledge();
     }
+}
+
+#[tokio::test]
+async fn query_concurrency_stays_held_after_preparation_and_wakes_the_next_query() {
+    let mut limits = config();
+    limits.query_concurrency_limit = 1;
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
+    control.mark_ready().unwrap();
+
+    let first = pending_query(&control);
+    let first_scope = first.owner.scope();
+    let first_permit = first_scope.admit_query().unwrap().await.unwrap();
+    assert_eq!(control.snapshot().admitted_queries, 1);
+
+    let second = pending_query(&control);
+    let second_scope = second.owner.scope();
+    let mut second_wait = Box::pin(second_scope.admit_query().unwrap());
+    assert!(poll(&mut second_wait).is_pending());
+    assert_eq!(control.snapshot().admission_records, 1);
+
+    // Completing preparation is represented by the absence of a stage permit;
+    // the query slot remains with the logical query until its terminal owner
+    // releases it.
+    drop(first_permit);
+    let second_permit = second_wait.await.unwrap();
+    assert_eq!(control.snapshot().admitted_queries, 1);
+    assert_eq!(control.snapshot().admission_records, 0);
+
+    first.owner.complete();
+    second.owner.complete();
+    drop(second_permit);
+    assert_eq!(control.snapshot().root_responsibilities, 0);
+}
+
+#[tokio::test]
+async fn compute_background_roots_share_the_warehouse_query_queue() {
+    let mut limits = config();
+    limits.query_concurrency_limit = 1;
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
+    control.mark_ready().unwrap();
+
+    let foreground = pending_query(&control);
+    let foreground_permit = foreground
+        .owner
+        .scope()
+        .admit_query()
+        .unwrap()
+        .await
+        .unwrap();
+    let refresh = control
+        .begin_warehouse_root(WorkRequest::new(WorkClass::MaterializedView))
+        .unwrap();
+    let mut refresh_admission = Box::pin(refresh.owner.scope().admit_query().unwrap());
+    assert!(poll(&mut refresh_admission).is_pending());
+
+    drop(foreground_permit);
+    let refresh_permit = refresh_admission.await.unwrap();
+    assert_eq!(control.snapshot().admitted_queries, 1);
+    drop(refresh_permit);
+    foreground.owner.complete();
+    refresh.owner.complete();
+    assert_eq!(control.snapshot().admitted_queries, 0);
+}
+
+#[tokio::test]
+async fn cancelled_queued_query_never_consumes_concurrency_or_leaks_its_root() {
+    let mut limits = config();
+    limits.query_concurrency_limit = 1;
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
+    control.mark_ready().unwrap();
+
+    let first = pending_query(&control);
+    let first_permit = first.owner.scope().admit_query().unwrap().await.unwrap();
+    let second = pending_query(&control);
+    let mut second_wait = Box::pin(second.owner.scope().admit_query().unwrap());
+    assert!(poll(&mut second_wait).is_pending());
+
+    second.owner.cancel(CancellationReason::Requested);
+    assert!(matches!(second_wait.await, Err(WorkError::Cancelled(_))));
+    assert_eq!(control.snapshot().admitted_queries, 1);
+    assert_eq!(control.snapshot().admission_records, 0);
+
+    second.owner.complete_after_terminal_cancel_settled();
+    first.owner.complete();
+    drop(first_permit);
+    assert_eq!(control.snapshot().root_responsibilities, 0);
 }
 
 #[test]
@@ -1924,6 +2022,64 @@ fn unknown_create_and_old_attempt_bounds_preserve_last_known_usage() {
     assert_eq!(control.snapshot().root_responsibilities, 1);
     unknown2.resolve();
     assert_eq!(control.snapshot().root_responsibilities, 0);
+}
+
+#[test]
+fn finite_remote_tracking_retirement_returns_governance_capacity_without_claiming_stop() {
+    let mut limits = config();
+    limits.old_attempts_limit = 1;
+    limits.old_attempts_per_work = 1;
+    let control = WorkloadControl::try_new_split(limits, resources())
+        .unwrap()
+        .owner;
+    control.mark_ready().unwrap();
+    let first = root(&control, WorkClass::Query);
+    let first_scope = first.owner.scope();
+    let retired = first_scope
+        .register_obligation(key(31), ObligationKind::RetiredAttempt)
+        .unwrap();
+    let second = root(&control, WorkClass::Query);
+    assert!(matches!(
+        second
+            .owner
+            .scope()
+            .register_obligation(key(32), ObligationKind::RetiredAttempt),
+        Err(WorkError::Capacity("retired attempts"))
+    ));
+
+    assert!(retired.end_remote_tracking_unknown());
+    assert!(
+        !retired.resolve(),
+        "retirement is an exact one-winner transition"
+    );
+    let snapshot = control.snapshot();
+    assert_eq!(snapshot.obligations, 0);
+    assert_eq!(snapshot.old_attempts, 0);
+    assert_eq!(snapshot.obligation_endings.settled_with_evidence, 0);
+    assert_eq!(snapshot.obligation_endings.tracking_ended_remote_unknown, 1);
+    let second_retired = second
+        .owner
+        .scope()
+        .register_obligation(key(32), ObligationKind::RetiredAttempt)
+        .expect("released retired-attempt capacity admits another root");
+
+    let running = first_scope
+        .register_obligation(key(33), ObligationKind::RunningWork)
+        .unwrap();
+    assert!(
+        running.end_remote_tracking_unknown(),
+        "a remote-attempt holder may end finite observation without asserting physical completion"
+    );
+    assert_eq!(control.snapshot().obligations, 1);
+    assert!(
+        !running.resolve(),
+        "remote-tracking retirement is an exact one-winner transition"
+    );
+    second_retired.resolve();
+    first.owner.complete();
+    first.business.release();
+    second.owner.complete();
+    second.business.release();
 }
 
 #[test]

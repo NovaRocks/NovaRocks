@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::{
-    CancellationReason, WorkError, WorkId, WorkScope,
+    CancellationReason, QueryConcurrencyPermit, WorkError, WorkId, WorkScope,
     scope::{State, WorkloadConfig},
 };
 use std::{
@@ -49,51 +49,69 @@ pub(crate) enum AdmissionState {
     Rejected(WorkError),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdmissionKind {
+    Query,
+    Stage(Stage),
+}
+
 pub(crate) struct PendingAdmission {
     pub work: WorkId,
     pub root: WorkId,
-    pub stage: Stage,
+    pub kind: AdmissionKind,
     pub bytes: u64,
     pub wait_deadline: Instant,
     pub state: AdmissionState,
     pub waker: Option<Waker>,
 }
 
-fn capacity(state: &State, config: &WorkloadConfig, root: WorkId, stage: Stage) -> bool {
-    match stage {
-        Stage::Preparation => state.preparation < config.preparation_limit,
-        Stage::Execution => {
+fn capacity(state: &State, config: &WorkloadConfig, root: WorkId, kind: AdmissionKind) -> bool {
+    match kind {
+        AdmissionKind::Query => state.admitted_queries < config.query_concurrency_limit,
+        AdmissionKind::Stage(Stage::Preparation) => state.preparation < config.preparation_limit,
+        AdmissionKind::Stage(Stage::Execution) => {
             state.execution < config.execution_limit
                 && state.nodes[&root].root_executions < config.executions_per_root
         }
     }
 }
 
-fn grant(state: &mut State, root: WorkId, stage: Stage) {
-    match stage {
-        Stage::Preparation => state.preparation += 1,
-        Stage::Execution => {
+fn grant(state: &mut State, root: WorkId, kind: AdmissionKind) {
+    match kind {
+        AdmissionKind::Query => {
+            state.admitted_queries += 1;
+            state.nodes.get_mut(&root).unwrap().query_admitted = true;
+        }
+        AdmissionKind::Stage(Stage::Preparation) => state.preparation += 1,
+        AdmissionKind::Stage(Stage::Execution) => {
             state.execution += 1;
             state.nodes.get_mut(&root).unwrap().root_executions += 1;
         }
     }
 }
 
-fn release(state: &mut State, work: WorkId, root: WorkId, stage: Stage) {
-    match stage {
-        Stage::Preparation => state.preparation -= 1,
-        Stage::Execution => {
+fn release(state: &mut State, work: WorkId, root: WorkId, kind: AdmissionKind) {
+    match kind {
+        AdmissionKind::Query => {
+            state.admitted_queries -= 1;
+            state.nodes.get_mut(&root).unwrap().query_admitted = false;
+        }
+        AdmissionKind::Stage(Stage::Preparation) => state.preparation -= 1,
+        AdmissionKind::Stage(Stage::Execution) => {
             state.execution -= 1;
             state.nodes.get_mut(&root).unwrap().root_executions -= 1;
         }
     }
-    state.nodes.get_mut(&work).unwrap().stages.remove(&stage);
+    if let AdmissionKind::Stage(stage) = kind {
+        state.nodes.get_mut(&work).unwrap().stages.remove(&stage);
+    }
 }
 
-fn remove_queue(state: &mut State, root: WorkId, id: u64, stage: Stage) {
-    match stage {
-        Stage::Preparation => state.preparation_queue.remove(root, id),
-        Stage::Execution => state.execution_queue.remove(root, id),
+fn remove_queue(state: &mut State, root: WorkId, id: u64, kind: AdmissionKind) {
+    match kind {
+        AdmissionKind::Query => state.query_queue.remove(root, id),
+        AdmissionKind::Stage(Stage::Preparation) => state.preparation_queue.remove(root, id),
+        AdmissionKind::Stage(Stage::Execution) => state.execution_queue.remove(root, id),
     }
 }
 
@@ -118,16 +136,16 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker>
         .collect::<Vec<_>>();
     for (id, error) in rejected {
         let request = &state.requests[&id];
-        let (work, root, stage, granted) = (
+        let (work, root, kind, granted) = (
             request.work,
             request.root,
-            request.stage,
+            request.kind,
             matches!(request.state, AdmissionState::Granted),
         );
-        remove_queue(state, root, id, stage);
+        remove_queue(state, root, id, kind);
         if granted {
-            release(state, work, root, stage);
-        } else {
+            release(state, work, root, kind);
+        } else if let AdmissionKind::Stage(stage) = kind {
             state.nodes.get_mut(&work).unwrap().stages.remove(&stage);
         }
         let request = state.requests.get_mut(&id).unwrap();
@@ -136,29 +154,39 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker>
             wake.push(waker);
         }
     }
-    for stage in [Stage::Preparation, Stage::Execution] {
+    for kind in [
+        AdmissionKind::Query,
+        AdmissionKind::Stage(Stage::Preparation),
+        AdmissionKind::Stage(Stage::Execution),
+    ] {
         loop {
-            let available = match stage {
-                Stage::Preparation => state.preparation < config.preparation_limit,
-                Stage::Execution => state.execution < config.execution_limit,
+            let available = match kind {
+                AdmissionKind::Query => state.admitted_queries < config.query_concurrency_limit,
+                AdmissionKind::Stage(Stage::Preparation) => {
+                    state.preparation < config.preparation_limit
+                }
+                AdmissionKind::Stage(Stage::Execution) => state.execution < config.execution_limit,
             };
             if !available {
                 break;
             }
             let nodes = &state.nodes;
             let ready = |root: WorkId| {
-                stage == Stage::Preparation
+                !matches!(kind, AdmissionKind::Stage(Stage::Execution))
                     || nodes[&root].root_executions < config.executions_per_root
             };
-            let next = match stage {
-                Stage::Preparation => state.preparation_queue.pop_runnable(ready),
-                Stage::Execution => state.execution_queue.pop_runnable(ready),
+            let next = match kind {
+                AdmissionKind::Query => state.query_queue.pop_runnable(ready),
+                AdmissionKind::Stage(Stage::Preparation) => {
+                    state.preparation_queue.pop_runnable(ready)
+                }
+                AdmissionKind::Stage(Stage::Execution) => state.execution_queue.pop_runnable(ready),
             };
             let Some(id) = next else {
                 break;
             };
             let root = state.requests[&id].root;
-            grant(state, root, stage);
+            grant(state, root, kind);
             let request = state.requests.get_mut(&id).unwrap();
             request.state = AdmissionState::Granted;
             if let Some(waker) = request.waker.take() {
@@ -179,16 +207,18 @@ fn take_request(state: &mut State, id: u64, receive: bool) -> PendingAdmission {
         .pending_admissions -= 1;
     match request.state {
         AdmissionState::Granted if !receive => {
-            release(state, request.work, request.root, request.stage)
+            release(state, request.work, request.root, request.kind)
         }
         AdmissionState::Waiting => {
-            remove_queue(state, request.root, id, request.stage);
-            state
-                .nodes
-                .get_mut(&request.work)
-                .unwrap()
-                .stages
-                .remove(&request.stage);
+            remove_queue(state, request.root, id, request.kind);
+            if let AdmissionKind::Stage(stage) = request.kind {
+                state
+                    .nodes
+                    .get_mut(&request.work)
+                    .unwrap()
+                    .stages
+                    .remove(&stage);
+            }
         }
         _ => {}
     }
@@ -197,6 +227,24 @@ fn take_request(state: &mut State, id: u64, receive: bool) -> PendingAdmission {
 }
 
 impl WorkScope {
+    /// Creates a scope-bound lifecycle marker without queueing or reserving
+    /// FE capacity. Query concurrency is admitted once at the warehouse
+    /// boundary; execution keeps this marker only to retain the existing
+    /// ownership checks while the legacy stage quota is removed.
+    pub fn track_stage(&self, stage: Stage) -> Result<StagePermit, WorkError> {
+        let root = self.inner.update(|state| {
+            let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
+            node.check()?;
+            Ok(node.root)
+        })?;
+        Ok(StagePermit {
+            scope: Some(self.clone()),
+            root,
+            stage,
+            capacity_admission: false,
+        })
+    }
+
     /// Queue a stage without holding another stage or a business object lock.
     /// For two-condition acquisition, try the other condition without waiting;
     /// on failure drop the stage permit and requeue. Product locks stay external.
@@ -228,7 +276,7 @@ impl WorkScope {
                 PendingAdmission {
                     work: self.id,
                     root,
-                    stage: request.stage,
+                    kind: AdmissionKind::Stage(request.stage),
                     bytes: request.retained_bytes,
                     wait_deadline,
                     state: AdmissionState::Waiting,
@@ -271,15 +319,18 @@ impl WorkScope {
                 Stage::Preparation => state.preparation_queue.is_empty(),
                 Stage::Execution => state.execution_queue.is_empty(),
             };
-            if !queue_empty || !capacity(state, &self.inner.config, root, stage) {
+            if !queue_empty
+                || !capacity(state, &self.inner.config, root, AdmissionKind::Stage(stage))
+            {
                 return Err(WorkError::Capacity("stage admission"));
             }
-            grant(state, root, stage);
+            grant(state, root, AdmissionKind::Stage(stage));
             state.nodes.get_mut(&self.id).unwrap().stages.insert(stage);
             Ok(StagePermit {
                 scope: Some(self.clone()),
                 root,
                 stage,
+                capacity_admission: true,
             })
         })
     }
@@ -327,7 +378,10 @@ impl Future for StageAdmission {
                     }
                     return None;
                 }
-                AdmissionState::Granted => Ok((request.root, request.stage)),
+                AdmissionState::Granted => match request.kind {
+                    AdmissionKind::Stage(stage) => Ok((request.root, stage)),
+                    AdmissionKind::Query => Err(WorkError::Conflict),
+                },
                 AdmissionState::Rejected(error) => Err(error.clone()),
             }
             .and_then(|grant| {
@@ -350,7 +404,139 @@ impl Future for StageAdmission {
             scope: Some(self.scope.clone()),
             root,
             stage,
+            capacity_admission: true,
         }))
+    }
+}
+
+impl WorkScope {
+    /// Await the warehouse-wide slot for this registered compute-producing
+    /// root. The scope must be the root, so scalar children and preparation
+    /// steps cannot create a nested queue entry while their parent is running.
+    pub fn admit_query(&self) -> Result<QueryAdmission, WorkError> {
+        let cancellation = self.cancellation()?;
+        let wait_deadline = Instant::now()
+            .checked_add(self.inner.config.capacity_wait_timeout)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let id = self.inner.update(|state| {
+            let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
+            node.check()?;
+            if node.parent.is_some()
+                || node.root != self.id
+                || !node.class.uses_warehouse_concurrency()
+            {
+                return Err(WorkError::Conflict);
+            }
+            if node.query_admitted {
+                return Err(WorkError::AlreadyAdmitted);
+            }
+            if state.waiting_records() >= self.inner.config.waiting_limit {
+                return Err(WorkError::Capacity("waiting entries"));
+            }
+            let id = state.next_id()?;
+            state.requests.insert(
+                id,
+                PendingAdmission {
+                    work: self.id,
+                    root: self.id,
+                    kind: AdmissionKind::Query,
+                    bytes: 0,
+                    wait_deadline,
+                    state: AdmissionState::Waiting,
+                    waker: None,
+                },
+            );
+            state.peak_waiting = state.peak_waiting.max(state.requests.len());
+            state.record_waiting_peak();
+            state.nodes.get_mut(&self.id).unwrap().pending_admissions += 1;
+            state.query_queue.push(self.id, id);
+            Ok(id)
+        })?;
+        Ok(QueryAdmission {
+            scope: self.clone(),
+            id: Some(id),
+            cancelled: Box::pin(async move { cancellation.cancelled().await }),
+            capacity_timeout: Box::pin(
+                async move { tokio::time::sleep_until(wait_deadline).await },
+            ),
+        })
+    }
+}
+
+/// A pending warehouse query admission. Its cancellation and timeout rules
+/// match stage admission, but it grants a lifetime permit rather than a stage
+/// permit.
+#[must_use = "A query admission must be awaited or dropped"]
+pub struct QueryAdmission {
+    scope: WorkScope,
+    id: Option<u64>,
+    cancelled: Pin<Box<dyn Future<Output = CancellationReason> + Send>>,
+    capacity_timeout: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl Future for QueryAdmission {
+    type Output = Result<QueryConcurrencyPermit, WorkError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let id = self.id.expect("Query admission polled after completion");
+        if let Poll::Ready(reason) = self.cancelled.as_mut().poll(cx) {
+            self.id = None;
+            self.scope.inner.update(|state| {
+                take_request(state, id, false);
+            });
+            return Poll::Ready(Err(WorkError::Cancelled(reason)));
+        }
+        if self.capacity_timeout.as_mut().poll(cx).is_ready() {
+            self.id = None;
+            self.scope.inner.update(|state| {
+                take_request(state, id, false);
+            });
+            return Poll::Ready(Err(WorkError::CapacityWaitTimeout));
+        }
+        let inner = Arc::clone(&self.scope.inner);
+        let result = inner.update(|state| {
+            let request = state.requests.get_mut(&id).unwrap();
+            let result = match &request.state {
+                AdmissionState::Waiting => {
+                    if request
+                        .waker
+                        .as_ref()
+                        .is_none_or(|waker| !waker.will_wake(cx.waker()))
+                    {
+                        request.waker = Some(cx.waker().clone());
+                    }
+                    return None;
+                }
+                AdmissionState::Granted => Ok(()),
+                AdmissionState::Rejected(error) => Err(error.clone()),
+            }
+            .and_then(|grant| {
+                state.nodes[&self.scope.id].check()?;
+                if Instant::now() >= state.requests[&id].wait_deadline {
+                    return Err(WorkError::CapacityWaitTimeout);
+                }
+                Ok(grant)
+            });
+            take_request(state, id, result.is_ok());
+            Some(result)
+        });
+        let Some(result) = result else {
+            return Poll::Pending;
+        };
+        self.id = None;
+        Poll::Ready(result.map(|()| QueryConcurrencyPermit {
+            scope: Some(self.scope.clone()),
+        }))
+    }
+}
+
+impl Drop for QueryAdmission {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.scope.inner.update(|state| {
+                take_request(state, id, false);
+            });
+        }
     }
 }
 
@@ -370,6 +556,7 @@ pub struct StagePermit {
     scope: Option<WorkScope>,
     root: WorkId,
     stage: Stage,
+    capacity_admission: bool,
 }
 
 impl StagePermit {
@@ -395,8 +582,11 @@ impl StagePermit {
 impl Drop for StagePermit {
     fn drop(&mut self) {
         if let Some(scope) = self.scope.take() {
+            if !self.capacity_admission {
+                return;
+            }
             scope.inner.update(|state| {
-                release(state, scope.id, self.root, self.stage);
+                release(state, scope.id, self.root, AdmissionKind::Stage(self.stage));
                 state.collect(scope.id);
             });
         }

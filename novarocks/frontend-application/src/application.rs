@@ -86,15 +86,15 @@ const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RESULT_DECODE_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 const DEFAULT_RESULT_DECODE_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
-const DEFAULT_QUERY_CPU_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
-const DEFAULT_QUERY_CPU_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+/// Cached planning workers retire after one minute without an admitted job.
+/// This is a reuse window, not a Frontend CPU or query-capacity limit.
+const DEFAULT_QUERY_CPU_IDLE_KEEPALIVE: Duration = Duration::from_secs(60);
 const DEFAULT_QUERY_BLOCKING_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 const DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const DEFAULT_RESULT_DELIVERY_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).unwrap();
 const DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR: Duration = Duration::from_secs(30);
 const DEFAULT_RESULT_FETCH_MAX_WAIT: Duration = Duration::from_millis(200);
-const DEFAULT_LOGICAL_EXECUTION_START_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(16).unwrap();
@@ -742,7 +742,6 @@ impl FrontendLogicalExecutionRuntimeConfig {
     fn for_test() -> Self {
         Self::new(
             LogicalExecutionSupervisorConfig::new(
-                DEFAULT_LOGICAL_EXECUTION_START_CAPACITY,
                 DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY,
                 DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY,
                 DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY,
@@ -799,7 +798,7 @@ pub struct FrontendExecutionConfig {
     connector_blocking_io_budget: ConnectorBlockingIoBudget,
     /// Positive root-result payload credit placed on every Native fetch.
     result_fetch_byte_limit: ResultByteLimit,
-    /// Fixed process-wide CPU preparation workers and bounded waiting queue.
+    /// Elastic process-wide workers for already-admitted CPU preparation.
     query_cpu_executor_config: QueryCpuExecutorConfig,
     /// Fixed process-wide workers for legacy synchronous query command edges.
     query_blocking_executor_config: QueryBlockingExecutorConfig,
@@ -851,9 +850,8 @@ impl FrontendExecutionConfig {
             connector_blocking_io_budget: ConnectorBlockingIoBudget::default(),
             result_fetch_byte_limit: ResultByteLimit::new(16 * 1024 * 1024)
                 .expect("the test result fetch byte limit is nonzero"),
-            query_cpu_executor_config: QueryCpuExecutorConfig::new(
-                DEFAULT_QUERY_CPU_WORKER_COUNT,
-                DEFAULT_QUERY_CPU_QUEUE_CAPACITY,
+            query_cpu_executor_config: QueryCpuExecutorConfig::with_idle_keepalive(
+                DEFAULT_QUERY_CPU_IDLE_KEEPALIVE,
             ),
             query_blocking_executor_config: QueryBlockingExecutorConfig::new(
                 DEFAULT_QUERY_BLOCKING_WORKER_COUNT,
@@ -941,8 +939,9 @@ impl FrontendExecutionConfig {
         self
     }
 
-    /// Server composition freezes query preparation CPU capacity before the
-    /// Frontend opens any process runtime.
+    /// Server composition freezes the elastic planning worker reuse window
+    /// before the Frontend opens any process runtime. This is not a query
+    /// capacity setting.
     pub fn with_query_cpu_executor_config(mut self, config: QueryCpuExecutorConfig) -> Self {
         self.query_cpu_executor_config = config;
         self
@@ -2006,7 +2005,6 @@ mod tests {
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(1).unwrap(),
                 LogicalExecutionRowsConfig::new(
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
@@ -2021,10 +2019,7 @@ mod tests {
                 control_bytes: 1 << 10,
                 per_scope_bytes: 1 << 18,
             },
-            QueryCpuExecutorConfig::new(
-                NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(1).unwrap(),
-            ),
+            QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
@@ -2061,7 +2056,6 @@ mod tests {
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(1).unwrap(),
                 LogicalExecutionRowsConfig::new(
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
@@ -2076,10 +2070,7 @@ mod tests {
                 control_bytes: 1 << 10,
                 per_scope_bytes: 1 << 18,
             },
-            QueryCpuExecutorConfig::new(
-                NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(1).unwrap(),
-            ),
+            QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
@@ -2126,7 +2117,6 @@ mod tests {
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(1).unwrap(),
                 LogicalExecutionRowsConfig::new(
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroU32::new(1).unwrap(),
@@ -2141,10 +2131,7 @@ mod tests {
                 control_bytes: 1 << 10,
                 per_scope_bytes: 1 << 18,
             },
-            QueryCpuExecutorConfig::new(
-                NonZeroUsize::new(1).unwrap(),
-                NonZeroUsize::new(1).unwrap(),
-            ),
+            QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),

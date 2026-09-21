@@ -32,7 +32,7 @@ use novarocks_sql::compiler::{
     SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch, render_completed_plan,
     render_completed_plan_tree,
 };
-use novarocks_workload_control::{CancellationView, Stage, StageRequest, WorkScope};
+use novarocks_workload_control::{CancellationView, WorkScope};
 
 use super::runtime_access::{
     CompletedPlanWithAccess, FinalPlanAccessError, FrozenReadAccess, ReadAccessSink,
@@ -155,11 +155,11 @@ pub trait SqlCompletionFactSource: Send + Sync {
 
 /// Drives one query's pure SQL completion protocol under its admitted scope.
 ///
-/// The driver carries no resource authority. It holds the stage permit for the
-/// complete preparation lifetime, interrupts the pending role adapter on
-/// statement cancellation or the frozen deadline, and owns every runtime
-/// capability the completion takes until it either publishes them with a plan
-/// or returns them unpaired.
+/// The driver carries no resource authority. It interrupts the pending role
+/// adapter on statement cancellation or the frozen deadline, and owns every
+/// runtime capability the completion takes until it either publishes them with
+/// a plan or returns them unpaired. Warehouse concurrency is acquired once by
+/// the query owner before this driver starts; preparation has no second queue.
 pub struct FinalPlanCompletionDriver<A> {
     facts: Arc<dyn SqlCompletionFactSource<Access = A>>,
 }
@@ -203,17 +203,6 @@ impl<A: Send> FinalPlanCompletionDriver<A> {
         taken: &ReadAccessSink<A>,
     ) -> Result<CompletedPhysicalPlanCandidate, FinalPlanCompletionError> {
         let control = request.control().clone();
-        let permit = scope
-            .acquire(StageRequest {
-                stage: Stage::Preparation,
-                retained_bytes: 0,
-            })
-            .map_err(governance_error)?
-            .await
-            .map_err(governance_error)?;
-        permit
-            .check(scope, Stage::Preparation)
-            .map_err(governance_error)?;
         scope.check().map_err(governance_error)?;
         let cancellation = scope.cancellation().map_err(governance_error)?;
         let mut progress =

@@ -50,6 +50,18 @@ pub enum WorkClass {
     Management,
 }
 
+impl WorkClass {
+    /// Work that can initiate warehouse computation shares the one query
+    /// concurrency queue. Management requests retain their own protocol
+    /// semantics and never consume this slot.
+    pub const fn uses_warehouse_concurrency(self) -> bool {
+        matches!(
+            self,
+            Self::Query | Self::MaterializedView | Self::Statistics | Self::TableMaintenance
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServingState {
     Initializing,
@@ -78,6 +90,10 @@ impl WorkRequest {
 pub struct WorkloadConfig {
     pub root_limit: usize,
     pub business_limit: usize,
+    /// Concurrent logical queries admitted by the warehouse. This is separate
+    /// from the legacy protocol-business limit while production callers move
+    /// to `begin_query_root`.
+    pub query_concurrency_limit: usize,
     pub preparation_limit: usize,
     pub execution_limit: usize,
     pub executions_per_root: usize,
@@ -102,6 +118,7 @@ impl Default for WorkloadConfig {
         Self {
             root_limit: 256,
             business_limit: 256,
+            query_concurrency_limit: 256,
             preparation_limit: 16,
             execution_limit: 64,
             executions_per_root: 4,
@@ -125,6 +142,7 @@ impl WorkloadConfig {
         for (name, value) in [
             ("root_limit", self.root_limit),
             ("business_limit", self.business_limit),
+            ("query_concurrency_limit", self.query_concurrency_limit),
             ("preparation_limit", self.preparation_limit),
             ("execution_limit", self.execution_limit),
             ("executions_per_root", self.executions_per_root),
@@ -173,6 +191,7 @@ pub(crate) struct Node {
     pub owner: OwnerState,
     pub handoffs: u64,
     pub business: bool,
+    pub query_admitted: bool,
     pub stages: BTreeSet<Stage>,
     pub pending_admissions: usize,
     pub root_executions: usize,
@@ -206,6 +225,7 @@ impl Node {
             owner: OwnerState::Active,
             handoffs: 0,
             business: false,
+            query_admitted: false,
             stages: BTreeSet::new(),
             pending_admissions: 0,
             root_executions: 0,
@@ -242,6 +262,7 @@ pub(crate) struct State {
     pub nodes: BTreeMap<WorkId, Node>,
     pub roots: usize,
     pub businesses: usize,
+    pub admitted_queries: usize,
     pub preparation: usize,
     pub execution: usize,
     pub requests: BTreeMap<u64, PendingAdmission>,
@@ -251,10 +272,12 @@ pub(crate) struct State {
     pub next_protocol_waiter_id: u64,
     pub preparation_queue: FairQueue,
     pub execution_queue: FairQueue,
+    pub query_queue: FairQueue,
     pub waiting_bytes: u64,
     pub old_attempts: usize,
     pub unknown_creates: usize,
     pub obligations: usize,
+    pub obligation_endings: crate::ObligationEndSnapshot,
     pub control_ready: VecDeque<WorkId>,
     pub control_waiting: BTreeSet<WorkId>,
     pub control_inflight: usize,
@@ -290,6 +313,7 @@ impl State {
             && self.nodes.is_empty()
             && self.roots == 0
             && self.businesses == 0
+            && self.admitted_queries == 0
             && self.preparation == 0
             && self.execution == 0
             && self.requests.is_empty()
@@ -351,6 +375,7 @@ impl State {
             if !node.completed
                 || node.children != 0
                 || node.business
+                || node.query_admitted
                 || !node.stages.is_empty()
                 || node.pending_admissions != 0
                 || !node.obligations.is_empty()
@@ -601,9 +626,74 @@ fn try_begin_root(inner: &Arc<Inner>, request: WorkRequest) -> Result<RootWork, 
     })
 }
 
+fn begin_warehouse_root(
+    inner: &Arc<Inner>,
+    request: WorkRequest,
+) -> Result<PendingQueryRoot, WorkError> {
+    inner.update(|state| {
+        let class = request.class;
+        let result = (|| {
+            if !class.uses_warehouse_concurrency() {
+                return Err(WorkError::Conflict);
+            }
+            if state.closed {
+                return Err(WorkError::Closed);
+            }
+            if !state.ready {
+                return Err(WorkError::NotReady);
+            }
+            // A warehouse query enters the one fair query queue below. Root
+            // and scope-record accounting must not become a second Frontend
+            // admission decision before that queue can observe the request.
+            let cancellation = Cancellation::root(request.deadline);
+            if let Some(reason) = cancellation.reason() {
+                return Err(WorkError::Cancelled(reason));
+            }
+            let id = WorkId(state.next_id()?);
+            state
+                .nodes
+                .insert(id, Node::new(None, id, class, cancellation));
+            state.roots += 1;
+            Ok(PendingQueryRoot {
+                owner: WorkOwner {
+                    scope: Some(WorkScope {
+                        inner: Arc::clone(inner),
+                        id,
+                    }),
+                },
+            })
+        })();
+        if result.is_err() {
+            state.root_lifecycle.rejected_admissions.increment(class);
+        }
+        result
+    })
+}
+
 impl RootAdmissionHandle {
     pub fn try_begin_root(&self, request: WorkRequest) -> Result<RootWork, WorkError> {
         try_begin_root(&self.inner, request)
+    }
+
+    /// Register a logical query before it receives warehouse concurrency.
+    /// The caller installs protocol cancellation from the returned owner, then
+    /// awaits `WorkScope::admit_query` without creating a second root.
+    pub fn begin_query_root(&self, request: WorkRequest) -> Result<PendingQueryRoot, WorkError> {
+        if request.class != WorkClass::Query {
+            return Err(WorkError::Conflict);
+        }
+        begin_warehouse_root(&self.inner, request)
+    }
+
+    /// Register one compute-producing warehouse root before it receives the
+    /// shared query concurrency permit. Statistics, MV refresh and table
+    /// maintenance use the same queue as foreground queries; management work
+    /// remains outside this admission class.
+    pub fn begin_warehouse_root(
+        &self,
+        request: WorkRequest,
+    ) -> Result<PendingQueryRoot, WorkError> {
+        begin_warehouse_root(&self.inner, request)
     }
 }
 
@@ -651,6 +741,20 @@ impl WorkloadControl {
 
     pub fn try_begin_root(&self, request: WorkRequest) -> Result<RootWork, WorkError> {
         try_begin_root(&self.inner, request)
+    }
+
+    pub fn begin_query_root(&self, request: WorkRequest) -> Result<PendingQueryRoot, WorkError> {
+        if request.class != WorkClass::Query {
+            return Err(WorkError::Conflict);
+        }
+        begin_warehouse_root(&self.inner, request)
+    }
+
+    pub fn begin_warehouse_root(
+        &self,
+        request: WorkRequest,
+    ) -> Result<PendingQueryRoot, WorkError> {
+        begin_warehouse_root(&self.inner, request)
     }
 
     /// Returns the narrow process-supervision capability for observing new
@@ -903,6 +1007,13 @@ impl Drop for WorkloadControl {
 pub struct RootWork {
     pub owner: WorkOwner,
     pub business: BusinessPermit,
+}
+
+/// A registered logical query that has a cancellation authority but has not
+/// yet received warehouse concurrency. Dropping its owner follows the normal
+/// orphan/cancellation path; it never consumes a query permit by itself.
+pub struct PendingQueryRoot {
+    pub owner: WorkOwner,
 }
 
 /// Cloneable, non-forgeable attribution. Clones do not create work or permits.
@@ -1220,6 +1331,31 @@ impl Drop for WorkOwner {
 /// tree. Release this at that boundary, including during a longer cleanup tail.
 pub struct BusinessPermit {
     scope: Option<WorkScope>,
+}
+
+/// One non-copyable warehouse query-concurrency grant. It is intentionally
+/// independent of thread execution and remote cleanup; its owner releases it
+/// when the logical query reaches a Frontend terminal outcome.
+pub struct QueryConcurrencyPermit {
+    pub(crate) scope: Option<WorkScope>,
+}
+
+impl QueryConcurrencyPermit {
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for QueryConcurrencyPermit {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.take() {
+            scope.inner.update(|state| {
+                state.nodes.get_mut(&scope.id).unwrap().query_admitted = false;
+                state.admitted_queries -= 1;
+                state.collect(scope.id);
+            });
+        }
+    }
 }
 
 impl BusinessPermit {

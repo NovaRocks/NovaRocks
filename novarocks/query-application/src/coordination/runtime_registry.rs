@@ -642,6 +642,22 @@ impl LogicalExecutionRuntimeRegistryHandle {
         .await
     }
 
+    /// Ends the FE's bounded observation of this context without asserting
+    /// that the Worker stopped or released its resources. The actor records a
+    /// distinct retirement reason and returns only its governance tracking.
+    pub(crate) async fn end_remote_context_tracking(
+        &self,
+        registration: &LogicalExecutionRegistration,
+        context: QueryContextRef,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.observe_context_convergence(
+            registration,
+            context,
+            RegistryContextConvergence::RemoteTrackingEnded,
+        )
+        .await
+    }
+
     pub(crate) async fn join_readiness(
         &self,
         registration: &LogicalExecutionRegistration,

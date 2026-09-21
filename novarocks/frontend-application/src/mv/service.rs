@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_workload_control::{
-    BusinessPermit, RootAdmissionHandle, RootWork, WorkClass, WorkOwner, WorkRequest,
+    QueryConcurrencyPermit, RootAdmissionHandle, WorkClass, WorkOwner, WorkRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -163,6 +163,7 @@ impl FrontendMvProductAdapter {
             root_admission: self.root_admission.clone(),
             optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
             attempt_timeout: self.attempt_timeout,
+            runtime: tokio::runtime::Handle::current(),
             startup_isolation: self.startup_isolation.clone(),
         })?;
         reservation.install(runtime).map_err(lifecycle_error)
@@ -297,6 +298,10 @@ struct RefreshWorkerDependencies {
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
+    /// The MV product owns bare lifecycle threads. This handle lets those
+    /// threads await the shared warehouse queue without blocking a Tokio
+    /// worker or creating a local admission queue.
+    runtime: tokio::runtime::Handle,
     startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
 }
 
@@ -438,10 +443,14 @@ fn run_scheduled_refreshes(
             scheduler::requeue(dependencies.product_service.as_ref(), request);
             break;
         }
-        let RootWork { owner, business } = match dependencies
-            .root_admission
-            .try_begin_root(WorkRequest::new(WorkClass::MaterializedView))
-        {
+        let AdmittedBackgroundQuery {
+            owner,
+            query_concurrency,
+        } = match admit_background_query(
+            &dependencies.root_admission,
+            &dependencies.runtime,
+            WorkClass::MaterializedView,
+        ) {
             Ok(work) => work,
             Err(_) => {
                 // Draining is terminal for this process runtime. Preserve the
@@ -455,7 +464,7 @@ fn run_scheduled_refreshes(
                 view, None,
             ),
             Err(_) => {
-                finish_background_root(owner, business);
+                finish_background_root(owner, query_concurrency);
                 scheduler::requeue(dependencies.product_service.as_ref(), request);
                 break;
             }
@@ -466,19 +475,19 @@ fn run_scheduled_refreshes(
         ) {
             Ok(ticket) => ticket,
             Err(_) => {
-                finish_background_root(owner, business);
+                finish_background_root(owner, query_concurrency);
                 continue;
             }
         };
         let lease = match ticket.try_acquire() {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                finish_background_root(owner, business);
+                finish_background_root(owner, query_concurrency);
                 scheduler::requeue(dependencies.product_service.as_ref(), request);
                 continue;
             }
             Err(_) => {
-                finish_background_root(owner, business);
+                finish_background_root(owner, query_concurrency);
                 continue;
             }
         };
@@ -514,16 +523,34 @@ fn run_scheduled_refreshes(
             // Release the activity lease only after the scheduler terminal is
             // durable, then complete the governed root.
             drop(lease);
-            finish_background_root(owner, business);
+            finish_background_root(owner, query_concurrency);
         } else {
-            finish_background_root(owner, business);
+            finish_background_root(owner, query_concurrency);
             scheduler::requeue(dependencies.product_service.as_ref(), request);
         }
     }
 }
 
-fn finish_background_root(owner: WorkOwner, business: BusinessPermit) {
-    drop(business);
+struct AdmittedBackgroundQuery {
+    owner: WorkOwner,
+    query_concurrency: QueryConcurrencyPermit,
+}
+
+fn admit_background_query(
+    root_admission: &RootAdmissionHandle,
+    runtime: &tokio::runtime::Handle,
+    class: WorkClass,
+) -> Result<AdmittedBackgroundQuery, novarocks_workload_control::WorkError> {
+    let root = root_admission.begin_warehouse_root(WorkRequest::new(class))?;
+    let query_concurrency = runtime.block_on(async { root.owner.scope().admit_query()?.await })?;
+    Ok(AdmittedBackgroundQuery {
+        owner: root.owner,
+        query_concurrency,
+    })
+}
+
+fn finish_background_root(owner: WorkOwner, query_concurrency: QueryConcurrencyPermit) {
+    drop(query_concurrency);
     owner.complete();
 }
 

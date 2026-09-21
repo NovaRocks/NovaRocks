@@ -32,7 +32,7 @@ use novarocks_statistics_application::{
     StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobCreate,
     StatisticsJobId, StatisticsJobRuntime, StatisticsJobService, StatisticsTarget,
 };
-use novarocks_workload_control::{RootAdmissionHandle, WorkClass, WorkOwner, WorkRequest};
+use novarocks_workload_control::{PendingQueryRoot, RootAdmissionHandle, WorkClass, WorkRequest};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatisticsStatementResult {
@@ -66,7 +66,7 @@ pub trait TableStatisticsReader: Send + Sync {
 /// implementation: borrowing the statement observer would let observer
 /// cancellation destroy the job root.
 pub trait StatisticsJobRootScopeSource: Send + Sync {
-    fn begin_statistics_job(&self) -> Result<WorkOwner, String>;
+    fn begin_statistics_job(&self) -> Result<PendingQueryRoot, String>;
 }
 
 /// Role-local source for independently-owned ANALYZE jobs.
@@ -87,15 +87,10 @@ impl RootAdmissionStatisticsJobSource {
 }
 
 impl StatisticsJobRootScopeSource for RootAdmissionStatisticsJobSource {
-    fn begin_statistics_job(&self) -> Result<WorkOwner, String> {
-        let root = self
-            .admission
-            .try_begin_root(WorkRequest::new(WorkClass::Statistics))
-            .map_err(|error| error.to_string())?;
-        // The job repository now owns the root responsibility. It is not a
-        // foreground business admission and must not retain that permit.
-        drop(root.business);
-        Ok(root.owner)
+    fn begin_statistics_job(&self) -> Result<PendingQueryRoot, String> {
+        self.admission
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -192,10 +187,22 @@ impl FrontendStatisticsApplicationPort {
                 let capture = self
                     .target_resolver
                     .capture_table_object(&target, context)?;
-                let owner = self
+                let root = self
                     .root_scope
                     .begin_statistics_job()
                     .map_err(application::StatisticsApplicationError::new)?;
+                let permit = root
+                    .owner
+                    .scope()
+                    .admit_query()
+                    .map_err(|error| {
+                        application::StatisticsApplicationError::new(error.to_string())
+                    })?
+                    .await
+                    .map_err(|error| {
+                        application::StatisticsApplicationError::new(error.to_string())
+                    })?;
+                let owner = root.owner;
                 let columns = match columns {
                     application::StatisticsColumnIntent::AllColumns => StatisticsColumns::All,
                     application::StatisticsColumnIntent::Explicit(columns) => {
@@ -205,7 +212,7 @@ impl FrontendStatisticsApplicationPort {
                     }
                 };
                 self.job_runtime
-                    .submit(
+                    .submit_admitted(
                         StatisticsJobCreate {
                             target: StatisticsTarget {
                                 catalog: Arc::from(target.catalog),
@@ -217,6 +224,7 @@ impl FrontendStatisticsApplicationPort {
                             submitted_at_ms,
                         },
                         owner,
+                        permit,
                     )
                     .await
                     .map(StatisticsStatementResult::JobSubmitted)

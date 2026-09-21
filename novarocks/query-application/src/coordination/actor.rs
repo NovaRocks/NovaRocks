@@ -752,13 +752,16 @@ fn identity_of(capability: &AttemptCapability) -> AttemptActivationIdentity {
     }
 }
 
-fn retired_obligation_key(identity: ReplacementQualificationIdentity) -> ObligationKey {
-    let query = identity.failed().query_id();
+fn attempt_obligation_key(
+    actor: LogicalExecutionActorId,
+    execution: QueryExecutionId,
+) -> ObligationKey {
+    let query = execution.query_id();
     let mut bytes = [0_u8; 32];
-    bytes[0..8].copy_from_slice(&identity.actor().get().to_le_bytes());
+    bytes[0..8].copy_from_slice(&actor.get().to_le_bytes());
     bytes[8..16].copy_from_slice(&query.high().to_le_bytes());
     bytes[16..24].copy_from_slice(&query.low().to_le_bytes());
-    bytes[24..32].copy_from_slice(&identity.failed().attempt_id().get().to_le_bytes());
+    bytes[24..32].copy_from_slice(&execution.attempt_id().get().to_le_bytes());
     ObligationKey(bytes)
 }
 
@@ -1182,7 +1185,7 @@ struct AttemptLedgers {
     stand_down_error: Option<ContextStandDownError>,
     pending_aborts: BTreeMap<QueryContextRef, AbortQueryContextIssuePermit>,
     abort_backpressured: bool,
-    retired_obligation: Option<Obligation>,
+    attempt_obligation: Option<Obligation>,
     active_resources: Option<ActiveReplacementResources>,
 }
 
@@ -1209,7 +1212,7 @@ impl fmt::Debug for AttemptLedgers {
         formatter
             .debug_struct("AttemptLedgers")
             .field("activation", &self.activation)
-            .field("has_retired_obligation", &self.retired_obligation.is_some())
+            .field("has_attempt_obligation", &self.attempt_obligation.is_some())
             .field("has_active_resources", &self.active_resources.is_some())
             .finish_non_exhaustive()
     }
@@ -2032,28 +2035,6 @@ pub(crate) fn spawn_logical_execution_actor(
         .execution_stage
         .take()
         .ok_or(LogicalExecutionActorError::InvariantViolation)?;
-    let work_owner = config
-        .work_owner
-        .take()
-        .ok_or(LogicalExecutionActorError::InvariantViolation)?;
-    let attempts = BTreeMap::from([(
-        config.initial_execution,
-        AttemptLedgers {
-            activation: capability_identity,
-            establish,
-            establish_error: None,
-            stand_down,
-            stand_down_error: None,
-            pending_aborts: BTreeMap::new(),
-            abort_backpressured: false,
-            retired_obligation: None,
-            active_resources: None,
-        },
-    )]);
-    let clock = Arc::clone(&config.clock);
-    let actor_lifetime = Arc::clone(&lifetime);
-    let abort_effect_port = config.abort_effect_port.take();
-    let replacement_effect_port = config.replacement_effect_port.take();
     let (result_runtime, output) = match config.output_mode {
         LogicalOutputMode::CompletionOnly => (None, ExecutionOutput::Completion),
         LogicalOutputMode::ResultStream => {
@@ -2089,6 +2070,38 @@ pub(crate) fn spawn_logical_execution_actor(
             )
         }
     };
+    let work_owner = config
+        .work_owner
+        .take()
+        .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+    let attempt_obligation = match work_owner.scope().register_obligation(
+        attempt_obligation_key(actor_id, config.initial_execution),
+        ObligationKind::RunningWork,
+    ) {
+        Ok(obligation) => obligation,
+        Err(_) => {
+            close_unstarted_governance(work_owner, execution_stage);
+            return Err(LogicalExecutionActorError::InvariantViolation);
+        }
+    };
+    let attempts = BTreeMap::from([(
+        config.initial_execution,
+        AttemptLedgers {
+            activation: capability_identity,
+            establish,
+            establish_error: None,
+            stand_down,
+            stand_down_error: None,
+            pending_aborts: BTreeMap::new(),
+            abort_backpressured: false,
+            attempt_obligation: Some(attempt_obligation),
+            active_resources: None,
+        },
+    )]);
+    let clock = Arc::clone(&config.clock);
+    let actor_lifetime = Arc::clone(&lifetime);
+    let abort_effect_port = config.abort_effect_port.take();
+    let replacement_effect_port = config.replacement_effect_port.take();
     let join = runtime.spawn(async move {
         run_actor(
             &mut state,
@@ -2223,6 +2236,7 @@ async fn run_actor(
             state,
             &mut attempts,
             &mut replacement,
+            &work_owner.scope(),
             max_admission_issues_per_context,
             max_establish_authorizations_per_context,
             max_abort_authorizations_per_context,
@@ -2401,7 +2415,6 @@ async fn run_actor(
                     &mut replacement,
                     &mut replacement_error,
                     clock.as_ref(),
-                    &work_owner.scope(),
                     &work_cancellation,
                     replacement_reservation_valid_for,
                     result_runtime.as_mut(),
@@ -2640,13 +2653,34 @@ fn synchronize_all_stand_down(
             }
             attempt.abort_backpressured = !attempt.pending_aborts.is_empty();
         }
-        if attempt.stand_down.residual_resource_settled() {
+        if attempt.stand_down.remote_tracking_ended()
+            && !attempt.stand_down.residual_resource_settled()
+        {
+            let obligation_ended = attempt
+                .attempt_obligation
+                .as_ref()
+                .is_none_or(Obligation::end_remote_tracking_unknown);
+            if obligation_ended {
+                attempt.attempt_obligation.take();
+                // This invokes the resource owner's abnormal exit path. It
+                // must not be replaced with `finish()`: finite FE tracking is
+                // not evidence that the remote attempt physically stopped.
+                attempt.active_resources.take();
+            } else {
+                stand_down_error
+                    .get_or_insert(ContextStandDownError::ResponsibilitySettlementFailed);
+                attempt
+                    .stand_down_error
+                    .get_or_insert(ContextStandDownError::ResponsibilitySettlementFailed);
+                continue;
+            }
+        } else if attempt.stand_down.residual_resource_settled() {
             let obligation_resolved = attempt
-                .retired_obligation
+                .attempt_obligation
                 .as_ref()
                 .is_none_or(Obligation::resolve);
             if obligation_resolved {
-                attempt.retired_obligation.take();
+                attempt.attempt_obligation.take();
             } else {
                 stand_down_error
                     .get_or_insert(ContextStandDownError::ResponsibilitySettlementFailed);
@@ -2825,6 +2859,7 @@ fn try_activate_qualified_replacement(
     state: &mut LogicalExecutionState,
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     replacement: &mut Option<ReplacementRuntime>,
+    work: &WorkScope,
     max_admission_issues_per_context: NonZeroUsize,
     max_establish_authorizations_per_context: NonZeroUsize,
     max_abort_authorizations_per_context: NonZeroUsize,
@@ -2862,17 +2897,15 @@ fn try_activate_qualified_replacement(
     }
     // The opaque reservation proves reachability, isolation, successor
     // admission, and that the registry's old usage record remains under
-    // last-known/current-unknown ownership. The exact failed attempt must also
-    // have registered the actor-owned same-scope RetiredAttempt obligation,
-    // whose registration consumes old-attempt capacity even when no byte
-    // observation is available. The handle remains present until positive
-    // residual convergence; an already converged no-remote attempt may have
-    // resolved it before successor activation.
+    // last-known/current-unknown ownership. The exact failed attempt retains
+    // its actor-owned RunningWork observation record until positive residual
+    // convergence; an already converged no-remote attempt may have resolved
+    // it before successor activation.
     if !active.stale_usage_accounted
         || !attempts
             .get(&active.identity.failed())
             .is_some_and(|attempt| {
-                attempt.retired_obligation.is_some()
+                attempt.attempt_obligation.is_some()
                     || attempt.stand_down.residual_resource_settled()
             })
     {
@@ -2945,6 +2978,7 @@ fn try_activate_qualified_replacement(
                     max_establish_authorizations_per_context,
                     max_abort_authorizations_per_context,
                     None,
+                    work,
                 )
                 .and_then(|mut ledgers| {
                     for admission in activated.admissions() {
@@ -3565,7 +3599,6 @@ fn handle_command(
     replacement: &mut Option<ReplacementRuntime>,
     replacement_error: &mut Option<ReplacementQualificationFailure>,
     clock: &dyn LogicalExecutionClock,
-    work: &WorkScope,
     work_cancellation: &CancellationView,
     replacement_reservation_valid_for: Option<Duration>,
     mut result_runtime: Option<&mut ResultRuntime>,
@@ -4040,22 +4073,6 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::InvariantViolation));
                 return;
             };
-            let obligation = match work.register_obligation(
-                retired_obligation_key(identity),
-                ObligationKind::RetiredAttempt,
-            ) {
-                Ok(obligation) => obligation,
-                Err(_) => {
-                    let _ = state.conclude_replacement(&token, LogicalConclusion::Failed);
-                    lifetime.settle();
-                    let _ = reply.send(Err(LogicalExecutionActorError::InvariantViolation));
-                    return;
-                }
-            };
-            let failed = attempts
-                .get_mut(&activation.execution())
-                .expect("failed attempt was validated before replacement transition");
-            failed.retired_obligation = Some(obligation);
             let issued_at = clock.now();
             let conservative_expiry = issued_at.saturating_add(reservation_valid_for);
             let (effect_cancellation, _) = watch::channel(false);
@@ -4323,6 +4340,7 @@ fn new_attempt_ledgers(
     max_establish_authorizations_per_context: NonZeroUsize,
     max_abort_authorizations_per_context: NonZeroUsize,
     active_resources: Option<ActiveReplacementResources>,
+    work: &WorkScope,
 ) -> Result<AttemptLedgers, LogicalExecutionActorError> {
     if required_contexts
         .iter()
@@ -4337,6 +4355,15 @@ fn new_attempt_ledgers(
     );
     let stand_down =
         ContextStandDownLedger::new(required_contexts, max_abort_authorizations_per_context)?;
+    let attempt_obligation = work
+        .register_obligation(
+            attempt_obligation_key(
+                LogicalExecutionActorId(activation.actor_instance_id),
+                activation.execution(),
+            ),
+            ObligationKind::RunningWork,
+        )
+        .map_err(|_| LogicalExecutionActorError::InvariantViolation)?;
     Ok(AttemptLedgers {
         activation,
         establish,
@@ -4345,7 +4372,7 @@ fn new_attempt_ledgers(
         stand_down_error: None,
         pending_aborts: BTreeMap::new(),
         abort_backpressured: false,
-        retired_obligation: None,
+        attempt_obligation: Some(attempt_obligation),
         active_resources,
     })
 }
@@ -4458,8 +4485,9 @@ fn actor_cleanup_complete(
 ) -> bool {
     let attempt_settled = |attempt: &AttemptLedgers| {
         attempt.stand_down.started()
-            && attempt.stand_down.residual_resource_settled()
-            && attempt.retired_obligation.is_none()
+            && (attempt.stand_down.residual_resource_settled()
+                || attempt.stand_down.remote_tracking_ended())
+            && attempt.attempt_obligation.is_none()
             && attempt.active_resources.is_none()
     };
     let replacement_effect_settled = replacement
@@ -9268,7 +9296,7 @@ mod tests {
                 stand_down_error: None,
                 pending_aborts: BTreeMap::new(),
                 abort_backpressured: false,
-                retired_obligation: None,
+                attempt_obligation: None,
                 active_resources: None,
             }
         };

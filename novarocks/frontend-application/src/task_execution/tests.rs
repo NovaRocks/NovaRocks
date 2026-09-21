@@ -2631,6 +2631,62 @@ fn assert_bounds(
 }
 
 #[test]
+fn terminal_cleanup_stops_new_context_lifecycle_issuance() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let compatibility = NativeCompatibilityId::new([0x42; 32]);
+    let mut owner = QueryContextOwner::new(context, 0, compatibility, admission_epoch());
+    let admission = owner
+        .admission_intent(MonotonicInstant::ORIGIN)
+        .expect("the request is legal")
+        .expect("admission is required");
+    let OperationIntent::AcquireQueryContextAdmissionTicket(request) = admission else {
+        unreachable!("admission has its own operation kind");
+    };
+    owner
+        .on_admission_ack(
+            &OperationAcknowledgement::transport_unknown(
+                request.envelope().operation_id(),
+                OperationKind::AcquireQueryContextAdmissionTicket,
+            ),
+            MonotonicInstant::from_origin(Duration::from_millis(1)),
+        )
+        .expect("an unknown admission outcome remains one exact in-flight request");
+
+    owner.begin_terminal_cleanup();
+
+    assert!(
+        owner
+            .admission_intent(MonotonicInstant::from_origin(Duration::from_millis(2)))
+            .expect("terminal cleanup is not an admission error")
+            .is_none(),
+        "terminal cleanup must not replay a normal admission request"
+    );
+    assert!(
+        owner
+            .establish_intent(
+                FakeEstablish
+                    .facts_for(context)
+                    .expect("the fake source has facts"),
+                MonotonicInstant::from_origin(Duration::from_millis(2)),
+            )
+            .expect("terminal cleanup is not an establish error")
+            .is_none(),
+        "a late ticket acknowledgement must not cause a new Establish"
+    );
+    assert!(
+        owner
+            .renew_intent(MonotonicInstant::from_origin(Duration::from_secs(30)))
+            .expect("terminal cleanup is not a renewal error")
+            .is_none(),
+        "terminal cleanup must not mint a successor lease renewal"
+    );
+}
+
+#[test]
 fn an_initial_establish_rejection_remains_a_pre_ready_infrastructure_fact() {
     let context = QueryContextRef::new(
         execution_id(),
@@ -3068,6 +3124,7 @@ fn an_accepted_create_without_its_receipt_is_refused() {
 struct RecordingSubscriptions {
     ensured: Mutex<Vec<(QueryContextRef, usize)>>,
     resubscribed: Mutex<Vec<(QueryContextRef, usize)>>,
+    stopped: Mutex<Vec<QueryContextRef>>,
     /// What a settled subscription reports, so a test can put a backend out
     /// of observation without a transport.
     settled: Mutex<Option<crate::native::task_transport::SubscriptionState>>,
@@ -3098,6 +3155,13 @@ impl crate::task_execution::round::StatusSubscriptions for RecordingSubscription
         Ok(())
     }
 
+    fn stop(&self, context: QueryContextRef) {
+        self.stopped
+            .lock()
+            .expect("subscription stop ledger")
+            .push(context);
+    }
+
     fn settled_fatally(
         &self,
         _context: QueryContextRef,
@@ -3109,6 +3173,58 @@ impl crate::task_execution::round::StatusSubscriptions for RecordingSubscription
             .expect("settled subscription")
             .filter(|state| state.is_fatal())
     }
+}
+
+/// Terminal cleanup is a local observation boundary.  It must close every
+/// status stream before the bounded remote-convergence period starts, while
+/// leaving any already-running Worker work to its own lease and stop rules.
+#[test]
+fn terminal_cleanup_stops_status_observation_for_every_context() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    let harness = Harness::new(&[0, 1], &[0], 512);
+    let mut expected = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+
+    let subscriptions = Arc::new(RecordingSubscriptions::default());
+    let mut round = TaskRound::new(
+        harness.execution,
+        TaskAckIntake::new(Arc::clone(&harness.wake) as Arc<dyn StatusIntakeWake>),
+        Box::new(FakeEstablish),
+        Arc::clone(&subscriptions) as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+    round.seal_pumps();
+
+    round.begin_terminal_cleanup();
+    round
+        .turn()
+        .expect("a terminal-cleanup turn only settles already-owned work");
+
+    let mut stopped = subscriptions.stopped.lock().expect("stop ledger").clone();
+    stopped.sort_unstable();
+    assert_eq!(stopped, expected);
+    assert!(
+        subscriptions
+            .ensured
+            .lock()
+            .expect("ensure ledger")
+            .is_empty(),
+        "terminal cleanup must not open a new status observation stream"
+    );
+    assert!(
+        subscriptions
+            .resubscribed
+            .lock()
+            .expect("resubscribe ledger")
+            .is_empty(),
+        "terminal cleanup must not reopen status observation"
+    );
 }
 
 /// The defect this catches: a create acknowledgement adopted the receipt's

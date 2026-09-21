@@ -15,7 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{any::Any, num::NonZeroUsize, time::Instant};
+use std::{
+    any::Any,
+    collections::BTreeMap,
+    num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
+
+use tokio::sync::oneshot;
 
 use crate::{
     cancellation::{QueryCancellationReason, QueryCancellationView},
@@ -27,27 +40,21 @@ use crate::{
 
 type CpuResult = Box<dyn Any + Send>;
 
-/// Fixed process limits for CPU-bound query preparation work.
+/// Reuse window for one idle synchronous-preparation worker. This does not
+/// bound query concurrency or keep a backlog: every admitted job either takes
+/// an idle worker or causes one new worker to be created.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryCpuExecutorConfig {
-    worker_threads: NonZeroUsize,
-    queue_capacity: NonZeroUsize,
+    idle_keepalive: Duration,
 }
 
 impl QueryCpuExecutorConfig {
-    pub const fn new(worker_threads: NonZeroUsize, queue_capacity: NonZeroUsize) -> Self {
-        Self {
-            worker_threads,
-            queue_capacity,
-        }
+    pub const fn with_idle_keepalive(idle_keepalive: Duration) -> Self {
+        Self { idle_keepalive }
     }
 
-    pub const fn worker_threads(self) -> NonZeroUsize {
-        self.worker_threads
-    }
-
-    pub const fn queue_capacity(self) -> NonZeroUsize {
-        self.queue_capacity
+    pub const fn idle_keepalive(self) -> Duration {
+        self.idle_keepalive
     }
 }
 
@@ -56,13 +63,303 @@ impl QueryCpuExecutorConfig {
 /// Query sessions receive only [`QueryCpuExecutor`], so closing or dropping a
 /// session cannot close the CPU queue or join its fixed workers.
 pub struct QueryCpuExecutorOwner {
-    owner: BoundedResultDecodeOwner<CpuResult>,
+    pool: Arc<ElasticPlanningPool>,
     executor: QueryCpuExecutor,
 }
 
 #[derive(Clone)]
 pub struct QueryCpuExecutor {
-    handle: BoundedResultDecodeHandle<CpuResult>,
+    pool: Arc<ElasticPlanningPool>,
+}
+
+type WorkerId = u64;
+
+struct ElasticPlanningJob {
+    run: Box<dyn FnOnce() -> CpuResult + Send>,
+    result: oneshot::Sender<Result<CpuResult, String>>,
+}
+
+enum WorkerCommand {
+    Run(ElasticPlanningJob),
+    Shutdown,
+}
+
+enum ElasticWorkerState {
+    Starting,
+    Running,
+    Idle(Sender<WorkerCommand>),
+    Assigned,
+    Retiring,
+}
+
+struct ElasticPlanningPoolState {
+    accepting: bool,
+    next_worker_id: WorkerId,
+    workers: BTreeMap<WorkerId, ElasticWorkerState>,
+    joins: BTreeMap<WorkerId, JoinHandle<()>>,
+}
+
+impl Default for ElasticPlanningPoolState {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            next_worker_id: 0,
+            workers: BTreeMap::new(),
+            joins: BTreeMap::new(),
+        }
+    }
+}
+
+struct ElasticPlanningPool {
+    idle_keepalive: Duration,
+    state: Mutex<ElasticPlanningPoolState>,
+}
+
+impl ElasticPlanningPool {
+    fn try_new(config: QueryCpuExecutorConfig) -> Result<Self, String> {
+        if config.idle_keepalive().is_zero() {
+            return Err("query CPU executor idle keepalive must be positive".to_owned());
+        }
+        Ok(Self {
+            idle_keepalive: config.idle_keepalive(),
+            state: Mutex::new(ElasticPlanningPoolState::default()),
+        })
+    }
+
+    fn submit(
+        self: &Arc<Self>,
+        run: impl FnOnce() -> CpuResult + Send + 'static,
+    ) -> Result<oneshot::Receiver<Result<CpuResult, String>>, String> {
+        self.reap_finished();
+        let (result, receipt) = oneshot::channel();
+        let job = ElasticPlanningJob {
+            run: Box::new(run),
+            result,
+        };
+        let assignment = {
+            let mut state = self.state.lock().unwrap();
+            if !state.accepting {
+                return Err("query CPU executor closed before admitting work".to_owned());
+            }
+            if let Some((id, sender)) = state.workers.iter().find_map(|(&id, worker)| {
+                matches!(worker, ElasticWorkerState::Idle(_)).then(|| match worker {
+                    ElasticWorkerState::Idle(sender) => (id, sender.clone()),
+                    _ => unreachable!(),
+                })
+            }) {
+                state.workers.insert(id, ElasticWorkerState::Assigned);
+                ElasticAssignment::Idle { id, sender }
+            } else {
+                state.next_worker_id = state
+                    .next_worker_id
+                    .checked_add(1)
+                    .ok_or_else(|| "query CPU worker id overflow".to_owned())?;
+                let id = state.next_worker_id;
+                state.workers.insert(id, ElasticWorkerState::Starting);
+                ElasticAssignment::Start { id }
+            }
+        };
+        match assignment {
+            ElasticAssignment::Idle { id, sender } => match sender.send(WorkerCommand::Run(job)) {
+                Ok(()) => Ok(receipt),
+                Err(error) => {
+                    self.state.lock().unwrap().workers.remove(&id);
+                    let WorkerCommand::Run(job) = error.0 else {
+                        unreachable!("only a job is assigned to an idle worker")
+                    };
+                    let _ = job.result.send(Err(
+                        "query CPU worker exited before accepting work".to_owned()
+                    ));
+                    Ok(receipt)
+                }
+            },
+            ElasticAssignment::Start { id } => {
+                let (sender, receiver) = mpsc::channel();
+                let pool = Arc::clone(self);
+                match std::thread::Builder::new()
+                    .name(format!("novarocks-query-planning-{id}"))
+                    .spawn(move || worker_loop(pool, id, sender, receiver, job))
+                {
+                    Ok(join) => {
+                        self.state.lock().unwrap().joins.insert(id, join);
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        self.state.lock().unwrap().workers.remove(&id);
+                        Err(format!("create query CPU worker: {error}"))
+                    }
+                }
+            }
+        }
+    }
+
+    fn request_close(&self) {
+        let senders = {
+            let mut state = self.state.lock().unwrap();
+            state.accepting = false;
+            let ids = state
+                .workers
+                .iter()
+                .filter_map(|(&id, worker)| match worker {
+                    ElasticWorkerState::Idle(sender) => Some((id, sender.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for (id, _) in &ids {
+                state.workers.insert(*id, ElasticWorkerState::Retiring);
+            }
+            ids
+        };
+        for (_, sender) in senders {
+            let _ = sender.send(WorkerCommand::Shutdown);
+        }
+    }
+
+    async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {
+        self.request_close();
+        loop {
+            self.reap_finished();
+            if self.state.lock().unwrap().joins.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("query CPU workers did not exit before shutdown deadline".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    fn reap_finished(&self) {
+        let joins = {
+            let mut state = self.state.lock().unwrap();
+            let completed = state
+                .joins
+                .iter()
+                .filter_map(|(&id, join)| join.is_finished().then_some(id))
+                .collect::<Vec<_>>();
+            completed
+                .into_iter()
+                .filter_map(|id| state.joins.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for join in joins {
+            let _ = join.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> ElasticPlanningPoolSnapshot {
+        let state = self.state.lock().unwrap();
+        ElasticPlanningPoolSnapshot {
+            workers: state.workers.len(),
+            idle: state
+                .workers
+                .values()
+                .filter(|worker| matches!(worker, ElasticWorkerState::Idle(_)))
+                .count(),
+            running: state
+                .workers
+                .values()
+                .filter(|worker| matches!(worker, ElasticWorkerState::Running))
+                .count(),
+            accepting: state.accepting,
+        }
+    }
+}
+
+enum ElasticAssignment {
+    Idle {
+        id: WorkerId,
+        sender: Sender<WorkerCommand>,
+    },
+    Start {
+        id: WorkerId,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ElasticPlanningPoolSnapshot {
+    workers: usize,
+    idle: usize,
+    running: usize,
+    accepting: bool,
+}
+
+fn worker_loop(
+    pool: Arc<ElasticPlanningPool>,
+    id: WorkerId,
+    sender: Sender<WorkerCommand>,
+    receiver: Receiver<WorkerCommand>,
+    mut job: ElasticPlanningJob,
+) {
+    loop {
+        {
+            let mut state = pool.state.lock().unwrap();
+            let Some(worker) = state.workers.get_mut(&id) else {
+                return;
+            };
+            *worker = ElasticWorkerState::Running;
+        }
+        let output = catch_unwind(AssertUnwindSafe(job.run));
+        let panicked = output.is_err();
+        let output = output.map_err(|_| "query CPU worker panicked".to_owned());
+        let _ = job.result.send(output);
+
+        if panicked {
+            pool.state.lock().unwrap().workers.remove(&id);
+            return;
+        }
+
+        let should_retire = {
+            let mut state = pool.state.lock().unwrap();
+            if !state.accepting {
+                state.workers.remove(&id);
+                true
+            } else {
+                state
+                    .workers
+                    .insert(id, ElasticWorkerState::Idle(sender.clone()));
+                false
+            }
+        };
+        if should_retire {
+            return;
+        }
+
+        let next = match receiver.recv_timeout(pool.idle_keepalive) {
+            Ok(WorkerCommand::Run(job)) => job,
+            Ok(WorkerCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                pool.state.lock().unwrap().workers.remove(&id);
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let assigned = {
+                    let mut state = pool.state.lock().unwrap();
+                    match state.workers.get(&id) {
+                        Some(ElasticWorkerState::Assigned) => true,
+                        Some(ElasticWorkerState::Idle(_)) | Some(ElasticWorkerState::Retiring) => {
+                            state.workers.remove(&id);
+                            false
+                        }
+                        _ => false,
+                    }
+                };
+                if assigned {
+                    match receiver.recv() {
+                        Ok(WorkerCommand::Run(job)) => job,
+                        Ok(WorkerCommand::Shutdown) | Err(_) => {
+                            pool.state.lock().unwrap().workers.remove(&id);
+                            return;
+                        }
+                    }
+                } else {
+                    return;
+                }
+            }
+        };
+        job = next;
+    }
 }
 
 /// The outcome of waiting for query-preparation CPU work.
@@ -114,32 +411,25 @@ pub struct QueryBlockingExecutor {
 
 impl QueryCpuExecutorOwner {
     pub fn try_new(config: QueryCpuExecutorConfig) -> Result<Self, String> {
-        let owner = BoundedResultDecodeOwner::try_new(ResultDecodeExecutorConfig::new(
-            config.worker_threads(),
-            config.queue_capacity(),
-        ))
-        .map_err(|error| format!("open query CPU executor: {error}"))?;
+        let pool = Arc::new(ElasticPlanningPool::try_new(config)?);
         let executor = QueryCpuExecutor {
-            handle: owner.handle(),
+            pool: Arc::clone(&pool),
         };
-        Ok(Self { owner, executor })
+        Ok(Self { pool, executor })
     }
 
     pub fn executor(&self) -> QueryCpuExecutor {
         self.executor.clone()
     }
 
-    /// Stops new CPU work and waits for this exact fixed worker set.
+    /// Stops new CPU work and observes every accepted planning worker.
     pub async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
-        self.owner
-            .shutdown_until(deadline)
-            .await
-            .map_err(|error| format!("shut down query CPU executor: {error}"))
+        self.pool.shutdown_until(deadline).await
     }
 
     /// Closes CPU admission when the role has committed to process exit.
     pub fn request_shutdown_for_process_exit(&self) {
-        self.owner.request_close();
+        self.pool.request_close();
     }
 }
 
@@ -149,15 +439,10 @@ impl QueryCpuExecutor {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let receipt = self
-            .handle
-            .submit(ResultDecodeJob::new(move || Box::new(work()) as CpuResult))
+        self.pool
+            .submit(move || Box::new(work()) as CpuResult)?
             .await
-            .map_err(|_| "query CPU executor closed before admitting work".to_owned())?;
-        receipt
-            .complete()
-            .await
-            .map_err(|error| format!("query CPU worker failed: {error}"))?
+            .map_err(|_| "query CPU worker exited without reporting its result".to_owned())??
             .downcast::<T>()
             .map(|result| *result)
             .map_err(|_| "query CPU worker returned an invalid result type".to_owned())
@@ -182,30 +467,25 @@ impl QueryCpuExecutor {
             return Err(QueryCpuRunError::Cancelled(reason));
         }
         let worker_cancellation = cancellation.clone();
-        let submit = self.handle.submit(ResultDecodeJob::new(move || {
-            Box::new((!worker_cancellation.is_cancelled()).then(work)) as CpuResult
-        }));
-        tokio::pin!(submit);
-        let receipt = tokio::select! {
-            biased;
-            reason = cancellation.cancelled() => return Err(QueryCpuRunError::Cancelled(reason)),
-            result = &mut submit => result
-                .map_err(|_| QueryCpuRunError::Executor("query CPU executor closed before admitting work".to_owned()))?,
-        };
-        let complete = receipt.complete();
-        tokio::pin!(complete);
+        let receipt = self
+            .pool
+            .submit(move || Box::new((!worker_cancellation.is_cancelled()).then(work)) as CpuResult)
+            .map_err(QueryCpuRunError::Executor)?;
+        tokio::pin!(receipt);
         tokio::select! {
             biased;
             reason = cancellation.cancelled() => Err(QueryCpuRunError::Cancelled(reason)),
-            result = &mut complete => match result {
+            result = &mut receipt => match result {
                 Ok(value) => value
+                    .map_err(QueryCpuRunError::Executor)
+                    .and_then(|value| value
                     .downcast::<Option<T>>()
                     .map(|value| *value)
                     .map_err(|_| QueryCpuRunError::Executor("query CPU worker returned an invalid result type".to_owned()))
                     .and_then(|value| value.ok_or_else(|| QueryCpuRunError::Cancelled(
                     cancellation.reason().expect("cancelled CPU work retains its reason"),
-                ))),
-                Err(error) => Err(QueryCpuRunError::Executor(format!("query CPU worker failed: {error}"))),
+                )))),
+                Err(_) => Err(QueryCpuRunError::Executor("query CPU worker exited without reporting its result".to_owned())),
             },
         }
     }
@@ -286,59 +566,52 @@ mod tests {
         QueryCpuExecutorOwner, QueryCpuRunError,
     };
 
-    fn executor(workers: usize, queue: usize) -> QueryCpuExecutorOwner {
-        QueryCpuExecutorOwner::try_new(QueryCpuExecutorConfig::new(
-            NonZeroUsize::new(workers).expect("nonzero workers"),
-            NonZeroUsize::new(queue).expect("nonzero queue"),
-        ))
-        .expect("open CPU executor")
+    fn executor(keepalive: Duration) -> QueryCpuExecutorOwner {
+        QueryCpuExecutorOwner::try_new(QueryCpuExecutorConfig::with_idle_keepalive(keepalive))
+            .expect("open CPU executor")
     }
 
     #[tokio::test]
-    async fn fixed_cpu_workers_bound_concurrent_work() {
-        let owner = executor(2, 2);
+    async fn elastic_cpu_workers_expand_for_every_admitted_job() {
+        let mut owner = executor(Duration::from_secs(1));
         let executor = owner.executor();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
         let mut work = Vec::new();
         for value in 0..4 {
             let gate = Arc::clone(&gate);
             let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
             let executor = executor.clone();
             work.push(tokio::spawn(async move {
                 executor
                     .run(move || {
-                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(current, Ordering::SeqCst);
+                        active.fetch_add(1, Ordering::SeqCst);
                         let (lock, ready) = &*gate;
                         let mut open = lock.lock().expect("gate lock");
                         while !*open {
                             open = ready.wait(open).expect("gate wait");
                         }
-                        active.fetch_sub(1, Ordering::SeqCst);
                         value
                     })
                     .await
             }));
         }
         tokio::time::timeout(Duration::from_secs(1), async {
-            while active.load(Ordering::SeqCst) != 2 {
+            while active.load(Ordering::SeqCst) != 4 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("two fixed CPU workers started");
+        .expect("all admitted planning jobs started without a fixed queue");
+        assert_eq!(executor.pool.snapshot().running, 4);
+
         let (lock, ready) = &*gate;
         *lock.lock().expect("gate lock") = true;
         ready.notify_all();
         for (expected, work) in work.into_iter().enumerate() {
             assert_eq!(work.await.expect("join").expect("run"), expected);
         }
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
         drop(executor);
-        let mut owner = owner;
         owner
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
@@ -346,17 +619,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_queued_cpu_work_releases_its_waiter_without_running() {
-        let mut owner = executor(1, 2);
+    async fn elastic_cpu_worker_reuses_idle_thread_and_reclaims_it_after_keepalive() {
+        let mut owner = executor(Duration::from_millis(20));
+        let executor = owner.executor();
+        let first = executor.run(|| std::thread::current().id()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.pool.snapshot().idle != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first worker did not become idle");
+        let second = executor.run(|| std::thread::current().id()).await.unwrap();
+        assert_eq!(first, second);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.pool.snapshot().workers != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle worker was not reclaimed");
+        drop(executor);
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shut down reclaimed CPU workers");
+    }
+
+    #[tokio::test]
+    async fn panicked_planning_worker_reports_failure_then_retires() {
+        let mut owner = executor(Duration::from_secs(1));
+        let executor = owner.executor();
+        let error = executor
+            .run::<(), _>(|| panic!("planning test panic"))
+            .await
+            .expect_err("panic must reach the submitting query");
+        assert!(error.contains("panicked"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.pool.snapshot().workers != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panicked worker did not retire");
+        assert_eq!(executor.run(|| 7_u8).await, Ok(7));
+        drop(executor);
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shut down replacement CPU worker");
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_the_waiter_without_claiming_running_work_stopped() {
+        let mut owner = executor(Duration::from_secs(1));
         let executor = owner.executor();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let running_gate = Arc::clone(&gate);
+        let cancellation = QueryCancellationSource::new();
+        let ran = Arc::new(AtomicUsize::new(0));
         let running = tokio::spawn({
             let executor = executor.clone();
+            let gate = Arc::clone(&gate);
+            let cancellation = cancellation.view();
+            let ran = Arc::clone(&ran);
             async move {
                 executor
-                    .run(move || {
-                        let (lock, ready) = &*running_gate;
+                    .run_cancellable(cancellation, move || {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        let (lock, ready) = &*gate;
                         let mut open = lock.lock().expect("gate lock");
                         while !*open {
                             open = ready.wait(open).expect("gate wait");
@@ -366,140 +696,34 @@ mod tests {
             }
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while executor.handle.snapshot().running != 1 {
+            while ran.load(Ordering::SeqCst) != 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("CPU worker did not start");
-
-        let cancellation = QueryCancellationSource::new();
-        let ran = Arc::new(AtomicUsize::new(0));
-        let waiting = tokio::spawn({
-            let executor = executor.clone();
-            let ran = Arc::clone(&ran);
-            let cancellation = cancellation.view();
-            async move {
-                executor
-                    .run_cancellable(cancellation, move || {
-                        ran.fetch_add(1, Ordering::SeqCst);
-                    })
-                    .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while executor.handle.snapshot().queued != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancellable CPU work was not queued");
-
+        .expect("planning closure did not start");
         assert_eq!(
             cancellation.request(QueryCancellationReason::ClientDisconnected),
             crate::cancellation::QueryCancellationRequestResult::Requested
         );
         assert_eq!(
-            waiting.await.expect("waiting task"),
+            running.await.expect("planning task"),
             Err(QueryCpuRunError::Cancelled(
                 QueryCancellationReason::ClientDisconnected
             ))
         );
+        assert_eq!(executor.pool.snapshot().running, 1);
 
         let (lock, ready) = &*gate;
         *lock.lock().expect("gate lock") = true;
         ready.notify_all();
-        running.await.expect("running task").expect("CPU work");
         tokio::time::timeout(Duration::from_secs(1), async {
-            while executor.handle.snapshot().queued != 0 || executor.handle.snapshot().running != 0
-            {
+            while executor.pool.snapshot().running != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("CPU queue did not drain");
-        assert_eq!(ran.load(Ordering::SeqCst), 0);
-        drop(executor);
-        owner
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .expect("shut down CPU workers");
-    }
-
-    #[tokio::test]
-    async fn cancelled_cpu_work_waiting_for_full_queue_returns_without_admission() {
-        let mut owner = executor(1, 1);
-        let executor = owner.executor();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let running_gate = Arc::clone(&gate);
-        let running = tokio::spawn({
-            let executor = executor.clone();
-            async move {
-                executor
-                    .run(move || {
-                        let (lock, ready) = &*running_gate;
-                        let mut open = lock.lock().expect("gate lock");
-                        while !*open {
-                            open = ready.wait(open).expect("gate wait");
-                        }
-                    })
-                    .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while executor.handle.snapshot().running != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("CPU worker did not start");
-
-        let queued = tokio::spawn({
-            let executor = executor.clone();
-            async move { executor.run(|| ()).await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while executor.handle.snapshot().queued != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("CPU queue did not become full");
-
-        let cancellation = QueryCancellationSource::new();
-        let ran = Arc::new(AtomicUsize::new(0));
-        let waiting = tokio::spawn({
-            let executor = executor.clone();
-            let ran = Arc::clone(&ran);
-            let cancellation = cancellation.view();
-            async move {
-                executor
-                    .run_cancellable(cancellation, move || {
-                        ran.fetch_add(1, Ordering::SeqCst);
-                    })
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        assert_eq!(executor.handle.snapshot().queued, 1);
-
-        assert_eq!(
-            cancellation.request(QueryCancellationReason::DeadlineExceeded { timeout_ms: 50 }),
-            crate::cancellation::QueryCancellationRequestResult::Requested
-        );
-        assert_eq!(
-            waiting.await.expect("waiting task"),
-            Err(QueryCpuRunError::Cancelled(
-                QueryCancellationReason::DeadlineExceeded { timeout_ms: 50 }
-            ))
-        );
-        assert_eq!(ran.load(Ordering::SeqCst), 0);
-
-        let (lock, ready) = &*gate;
-        *lock.lock().expect("gate lock") = true;
-        ready.notify_all();
-        running.await.expect("running task").expect("CPU work");
-        queued.await.expect("queued task").expect("queued CPU work");
+        .expect("actual planning work did not exit");
         drop(executor);
         owner
             .shutdown_until(Instant::now() + Duration::from_secs(1))

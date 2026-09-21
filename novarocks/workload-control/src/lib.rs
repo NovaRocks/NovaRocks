@@ -73,12 +73,12 @@ mod queue;
 mod resource;
 mod scope;
 
-pub use admission::{Stage, StageAdmission, StagePermit, StageRequest};
+pub use admission::{QueryAdmission, Stage, StageAdmission, StagePermit, StageRequest};
 pub use cancellation::{CancellationReason, CancellationView};
 pub use observation::{
-    ControlIntent, ControlIntents, ControlPermit, Obligation, ObligationKey, ObligationKind,
-    ObligationSnapshot, OwnerState, RootLifecycleSnapshot, ScopeSnapshot, UsageObservation,
-    WorkClassTotals, WorkloadObservationHandle, WorkloadSnapshot,
+    ControlIntent, ControlIntents, ControlPermit, Obligation, ObligationEndSnapshot, ObligationKey,
+    ObligationKind, ObligationSnapshot, OwnerState, RootLifecycleSnapshot, ScopeSnapshot,
+    UsageObservation, WorkClassTotals, WorkloadObservationHandle, WorkloadSnapshot,
 };
 pub use resource::{
     AllocationCharge, LocalResourceAuthority, Reservation, ResourceClass, ResourceConfig,
@@ -86,11 +86,12 @@ pub use resource::{
     ResultCreditStage,
 };
 pub use scope::{
-    BusinessPermit, DeadlineExpiryHandle, RootAdmissionHandle, RootWork, ServingState,
-    WorkCancellationRequestOutcome, WorkCancellationRequester, WorkClass, WorkId, WorkOwner,
-    WorkRequest, WorkScope, WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig,
-    WorkloadControl, WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision,
-    WorkloadShutdown, WorkloadShutdownError, WorkloadShutdownFailure,
+    BusinessPermit, DeadlineExpiryHandle, PendingQueryRoot, QueryConcurrencyPermit,
+    RootAdmissionHandle, RootWork, ServingState, WorkCancellationRequestOutcome,
+    WorkCancellationRequester, WorkClass, WorkId, WorkOwner, WorkRequest, WorkScope,
+    WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig, WorkloadControl,
+    WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision, WorkloadShutdown,
+    WorkloadShutdownError, WorkloadShutdownFailure,
 };
 
 /// Admission failures never imply cancellation, physical stop, or release.

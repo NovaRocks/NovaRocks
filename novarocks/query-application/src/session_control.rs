@@ -26,9 +26,9 @@ use crate::cancellation::{
 };
 use crate::client_connection::ClientConnectionToken;
 use novarocks_workload_control::{
-    BusinessPermit, CancellationReason, CancellationView, RootAdmissionHandle,
-    WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner, WorkRequest, WorkScope,
-    WorkSuccessSealer,
+    BusinessPermit, CancellationReason, CancellationView, QueryConcurrencyPermit,
+    RootAdmissionHandle, WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner,
+    WorkRequest, WorkScope, WorkSuccessSealer,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -415,6 +415,76 @@ impl QueryControlService {
         )
     }
 
+    /// Register protocol cancellation before awaiting the warehouse query
+    /// queue. The returned owner holds the sole permit through the logical
+    /// query's terminal protocol outcome; preparation completion alone cannot
+    /// release it.
+    pub async fn begin_queued_governed_query_statement(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        let mut request = WorkRequest::new(WorkClass::Query);
+        request.deadline = deadline;
+        let root = admission
+            .begin_query_root(request)
+            .map_err(GovernedQueryStatementBeginError::Admission)?;
+        let cancellation = match GovernedStatementCancellation::new(&root.owner) {
+            Ok(cancellation) => cancellation,
+            Err(error) => {
+                root.owner.complete();
+                return Err(GovernedQueryStatementBeginError::Admission(error));
+            }
+        };
+        let registration = match self.port.begin_statement_with_governed_cancellation(
+            session,
+            cancellation,
+            statement_text,
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                root.owner.complete();
+                return Err(GovernedQueryStatementBeginError::QueryControl(error));
+            }
+        };
+        let scope = root.owner.scope();
+        let query_admission = match scope.admit_query() {
+            Ok(admission) => admission,
+            Err(error) => {
+                root.owner.complete();
+                let _ = self.port.fail_governed_statement(registration.token());
+                return Err(GovernedQueryStatementBeginError::Admission(error));
+            }
+        };
+        let permit = match query_admission.await {
+            Ok(permit) => permit,
+            Err(error) => {
+                if matches!(error, WorkError::Cancelled(_)) {
+                    root.owner.complete_after_terminal_cancel_settled();
+                    let _ = self.port.finish_governed_statement(registration.token());
+                } else {
+                    root.owner.complete();
+                    let _ = self.port.fail_governed_statement(registration.token());
+                }
+                return Err(GovernedQueryStatementBeginError::Admission(error));
+            }
+        };
+        Ok(GovernedQueryStatementOwner {
+            service: self.clone(),
+            registration,
+            scope,
+            execution_owner: Some(root.owner),
+            business: None,
+            query_concurrency: Some(permit),
+            timeout_ms,
+            success_visibility_sealed: false,
+            finished: false,
+        })
+    }
+
     /// Admit one protocol-visible statement under its actual workload class.
     /// The returned owner remains the sole holder of the statement generation,
     /// business permit, cancellation authority, and final protocol outcome.
@@ -463,6 +533,7 @@ impl QueryControlService {
             scope: root.owner.scope(),
             execution_owner: Some(root.owner),
             business: Some(root.business),
+            query_concurrency: None,
             timeout_ms,
             success_visibility_sealed: false,
             finished: false,
@@ -578,6 +649,7 @@ pub struct GovernedQueryStatementOwner {
     scope: WorkScope,
     execution_owner: Option<WorkOwner>,
     business: Option<BusinessPermit>,
+    query_concurrency: Option<QueryConcurrencyPermit>,
     timeout_ms: Option<u64>,
     success_visibility_sealed: bool,
     finished: bool,
@@ -627,6 +699,11 @@ impl GovernedQueryStatementOwner {
         }
     }
 
+    fn release_terminal_concurrency(&mut self) {
+        self.query_concurrency.take();
+        self.business.take();
+    }
+
     /// Atomically wins the terminal success boundary against every later
     /// cancellation request while retaining business and statement ownership.
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
@@ -662,11 +739,11 @@ impl GovernedQueryStatementOwner {
         if let Some(owner) = self.execution_owner.take() {
             owner.complete_after_terminal_cancel_settled();
         }
+        self.release_terminal_concurrency();
         let outcome = self
             .service
             .port
             .finish_governed_statement(self.registration.token());
-        self.business.take();
         outcome
     }
 
@@ -698,11 +775,11 @@ impl GovernedQueryStatementOwner {
         if let Some(owner) = self.execution_owner.take() {
             owner.complete();
         }
+        self.release_terminal_concurrency();
         let outcome = self
             .service
             .port
             .fail_governed_statement(self.registration.token());
-        self.business.take();
         outcome
     }
 
@@ -714,11 +791,11 @@ impl GovernedQueryStatementOwner {
         if let Some(owner) = self.execution_owner.take() {
             owner.complete();
         }
+        self.release_terminal_concurrency();
         let outcome = self
             .service
             .port
             .finish_governed_statement(self.registration.token());
-        self.business.take();
         outcome
     }
 }
@@ -731,11 +808,11 @@ impl Drop for GovernedQueryStatementOwner {
                 if let Some(owner) = self.execution_owner.take() {
                     owner.complete();
                 }
+                self.release_terminal_concurrency();
                 let _ = self
                     .service
                     .port
                     .fail_governed_statement(self.registration.token());
-                self.business.take();
             } else {
                 let _ = self.service.port.cancel_governed_statement(
                     self.registration.token(),

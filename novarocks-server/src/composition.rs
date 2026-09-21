@@ -514,10 +514,6 @@ pub fn compose_frontend_role_config(
     let runtime_config = &config.runtime;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
-    let query_cpu_workers = NonZeroUsize::new(runtime_config.actual_query_cpu_workers())
-        .ok_or_else(|| anyhow::anyhow!("runtime.query_cpu_worker_threads must be nonzero"))?;
-    let query_cpu_queue = NonZeroUsize::new(runtime_config.query_cpu_queue_capacity)
-        .ok_or_else(|| anyhow::anyhow!("runtime.query_cpu_queue_capacity must be nonzero"))?;
     let query_blocking_workers = NonZeroUsize::new(runtime_config.actual_query_blocking_workers())
         .ok_or_else(|| anyhow::anyhow!("runtime.query_blocking_worker_threads must be nonzero"))?;
     let query_blocking_queue = NonZeroUsize::new(runtime_config.query_blocking_queue_capacity)
@@ -627,9 +623,8 @@ pub fn compose_frontend_role_config(
         )
         .map_err(|error| anyhow::anyhow!("construct Connector blocking-I/O budget: {error}"))?,
     )
-    .with_query_cpu_executor_config(QueryCpuExecutorConfig::new(
-        query_cpu_workers,
-        query_cpu_queue,
+    .with_query_cpu_executor_config(QueryCpuExecutorConfig::with_idle_keepalive(
+        Duration::from_millis(runtime_config.frontend_workload.planning_idle_keepalive_ms),
     ))
     .with_query_blocking_executor_config(QueryBlockingExecutorConfig::new(
         query_blocking_workers,
@@ -752,13 +747,21 @@ fn compose_frontend_workload_runtime(
 )> {
     let input = &runtime.frontend_workload;
     let workload = WorkloadConfig {
-        root_limit: input.root_limit,
-        business_limit: input.business_limit,
-        preparation_limit: input.preparation_limit,
-        execution_limit: input.execution_limit,
-        executions_per_root: input.executions_per_root,
+        // These generic bookkeeping ceilings protect finite in-process state.
+        // Frontend compute roots use `query_concurrency_limit` below as their
+        // single operational queue; these do not form a second FE workload
+        // admission policy.
+        root_limit: input.scope_records_limit,
+        business_limit: input.scope_records_limit,
+        query_concurrency_limit: input.concurrency_limit,
+        preparation_limit: input.scope_records_limit,
+        execution_limit: input.scope_records_limit,
+        executions_per_root: input.scope_records_limit,
         waiting_limit: input.waiting_limit,
-        waiting_bytes: input.waiting_bytes,
+        // Query admission has no retained-byte declaration. Keep the generic
+        // stage-accounting invariant valid without exposing a second FE query
+        // capacity knob.
+        waiting_bytes: 1,
         capacity_wait_timeout: Duration::from_millis(input.capacity_wait_timeout_ms),
         restarts_per_work: input.restarts_per_work,
         old_attempts_per_work: input.old_attempts_per_work,
@@ -811,6 +814,14 @@ fn compose_frontend_workload_runtime(
             "runtime.frontend_workload.logical_replacement_reservation_ms must be nonzero"
         );
     }
+    if input.logical_remote_cleanup_timeout_ms == 0 {
+        anyhow::bail!(
+            "runtime.frontend_workload.logical_remote_cleanup_timeout_ms must be nonzero"
+        );
+    }
+    if input.planning_idle_keepalive_ms == 0 {
+        anyhow::bail!("runtime.frontend_workload.planning_idle_keepalive_ms must be nonzero");
+    }
     let rows = LogicalExecutionRowsConfig::new(
         nonzero(
             "logical_rows_delivery_capacity",
@@ -829,7 +840,6 @@ fn compose_frontend_workload_runtime(
         result_fetch_byte_limit,
     );
     let supervisor = LogicalExecutionSupervisorConfig::new(
-        nonzero("logical_start_capacity", input.logical_start_capacity)?,
         nonzero(
             "logical_actor_mailbox_capacity",
             input.logical_actor_mailbox_capacity,
@@ -843,7 +853,10 @@ fn compose_frontend_workload_runtime(
             input.logical_context_establish_capacity,
         )?,
         rows,
-    );
+    )
+    .with_remote_cleanup_timeout(Duration::from_millis(
+        input.logical_remote_cleanup_timeout_ms,
+    ));
     Ok((
         supervisor,
         workload,
@@ -1325,22 +1338,14 @@ mod tests {
         let (_, workload, resources, decode_workers, decode_queue, abort_capacity) =
             compose_frontend_workload_runtime(&config.runtime, byte_limit)
                 .expect("explicit frontend workload fields compose");
-        assert_eq!(workload.execution_limit, 64);
+        assert_eq!(workload.query_concurrency_limit, 256);
+        assert_eq!(workload.execution_limit, workload.scope_records_limit);
         assert_eq!(resources.total_bytes, 966_367_641);
         assert_eq!(resources.per_scope_bytes, 512 * 1024 * 1024);
         assert_eq!(decode_workers.get(), 2);
         assert_eq!(decode_queue.get(), 32);
         assert_eq!(abort_capacity.get(), 16);
 
-        config.runtime.frontend_workload.logical_start_capacity = 0;
-        assert!(
-            compose_frontend_workload_runtime(&config.runtime, byte_limit)
-                .expect_err("zero logical start capacity must fail preflight")
-                .to_string()
-                .contains("logical_start_capacity")
-        );
-
-        config.runtime.frontend_workload.logical_start_capacity = 256;
         config
             .runtime
             .frontend_workload

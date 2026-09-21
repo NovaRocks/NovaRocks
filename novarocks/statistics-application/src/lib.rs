@@ -30,7 +30,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use novarocks_workload_control::{WorkClass, WorkOwner, WorkRequest, WorkScope};
+use novarocks_workload_control::{
+    QueryConcurrencyPermit, WorkClass, WorkOwner, WorkRequest, WorkScope,
+};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -278,6 +280,9 @@ struct LiveJob {
     /// The business root remains owned until actual runtime convergence, not
     /// merely until a terminal job conclusion becomes observable.
     owner: Option<WorkOwner>,
+    /// An independently submitted statistics job is warehouse compute. Its
+    /// permit lasts through actual job convergence, alongside the root owner.
+    query_concurrency: Option<QueryConcurrencyPermit>,
 }
 
 #[derive(Default)]
@@ -309,10 +314,30 @@ impl StatisticsJobRepository {
         self.create_now(request, owner)
     }
 
+    /// Submit a statistics job after it has received the warehouse query
+    /// permit. The repository owns both facts until terminal convergence.
+    pub async fn create_admitted(
+        &self,
+        request: StatisticsJobCreate,
+        owner: WorkOwner,
+        query_concurrency: QueryConcurrencyPermit,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.create_now_with_permit(request, owner, Some(query_concurrency))
+    }
+
     pub(crate) fn create_now(
         &self,
         request: StatisticsJobCreate,
         owner: WorkOwner,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.create_now_with_permit(request, owner, None)
+    }
+
+    fn create_now_with_permit(
+        &self,
+        request: StatisticsJobCreate,
+        owner: WorkOwner,
+        query_concurrency: Option<QueryConcurrencyPermit>,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
         let mut state = self.lock()?;
         if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
@@ -327,6 +352,7 @@ impl StatisticsJobRepository {
             LiveJob {
                 job: job.clone(),
                 owner: Some(owner),
+                query_concurrency,
             },
         );
         drop(state);
@@ -426,6 +452,7 @@ impl StatisticsJobRepository {
                 execution_resources_released: true,
                 provider_session_closed: true,
             };
+            drop(entry.query_concurrency.take());
             if let Some(owner) = entry.owner.take() {
                 owner.complete();
             }
@@ -480,6 +507,7 @@ impl StatisticsJobRepository {
                 execution_resources_released: true,
                 provider_session_closed: true,
             };
+            drop(entry.query_concurrency.take());
             if let Some(owner) = entry.owner.take() {
                 owner.complete();
             }
@@ -613,6 +641,7 @@ impl StatisticsJobRepository {
         entry.job.convergence.provider_session_closed |= convergence.provider_session_closed;
         entry.job.updated_at_ms = at_ms;
         if entry.job.state.is_terminal() && entry.job.convergence.is_complete() {
+            drop(entry.query_concurrency.take());
             if let Some(owner) = entry.owner.take() {
                 owner.complete();
             }

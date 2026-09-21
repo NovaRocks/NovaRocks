@@ -2643,33 +2643,10 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
             ),
         );
     }
-    if query_lifecycle_faults_enabled {
-        // The production terminal-retention contract remains 120s.  Runner
-        // fault scenarios use a short, self-contained lease so a deliberately
-        // crashed FE proves BE runtime release and bounded record reclamation
-        // without turning the distributed suite into a two-minute sleep.
-        let runtime_table = table_mut(root, "runtime");
-        runtime_table.insert(
-            "query_control_terminal_ack_timeout_ms".to_string(),
-            Value::Integer(500),
-        );
-        runtime_table.insert(
-            "query_control_terminal_fallback_rpc_timeout_ms".to_string(),
-            Value::Integer(500),
-        );
-        runtime_table.insert(
-            "query_control_terminal_fallback_initial_backoff_ms".to_string(),
-            Value::Integer(50),
-        );
-        runtime_table.insert(
-            "query_control_terminal_fallback_max_backoff_ms".to_string(),
-            Value::Integer(100),
-        );
-        runtime_table.insert(
-            "query_control_terminal_retention_ms".to_string(),
-            Value::Integer(2_000),
-        );
-    }
+    // Query-lifecycle faults select runner-owned file fixtures below. They no
+    // longer require a second terminal-retention configuration: terminal and
+    // finite remote-cleanup policy are resolved by the FE workload owner.
+    let _ = query_lifecycle_faults_enabled;
     if cleanup_faults_enabled && role == ClusterProcessRole::Fe {
         let debug = table_mut(root, "debug");
         debug.insert(

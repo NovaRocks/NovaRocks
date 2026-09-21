@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 hex.workspace = true
 novarocks-query-application.workspace = true
 novarocks-state-store-api.workspace = true

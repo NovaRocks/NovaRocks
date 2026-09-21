@@ -69,7 +69,6 @@ exchange_io_threads = 1
 # core and blocking capacity beyond the two admitted Connector jobs.
 data_runtime_worker_threads = 2
 data_runtime_max_blocking_threads = 4
-query_cpu_worker_threads = 1
 query_blocking_worker_threads = 1
 connector_blocking_io_max_inflight = 2
 connector_split_blocking_io_max_inflight = 1

@@ -422,6 +422,7 @@ impl ManifestAssembledRound {
         _cancellation: CancellationView,
     ) -> NativeAttemptConvergence {
         if !self.convergence_started {
+            self.round.begin_terminal_cleanup();
             self.split_delivery
                 .abandon("Native attempt entered convergence");
             self.convergence_started = true;

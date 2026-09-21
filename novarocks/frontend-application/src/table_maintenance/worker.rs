@@ -42,7 +42,7 @@ use novarocks_table_maintenance::{
     MaintenanceEffectId, MaintenanceTarget, MaintenanceTargetRebind, OptimizeJob,
 };
 use novarocks_workload_control::{
-    RootAdmissionHandle, RootWork, WorkClass, WorkError, WorkRequest,
+    QueryConcurrencyPermit, RootAdmissionHandle, WorkClass, WorkError, WorkOwner, WorkRequest,
 };
 
 use crate::query_execution::maintenance::TableMaintenanceEngine;
@@ -400,32 +400,62 @@ impl FrontendOptimizeJobAdmissionPort {
     }
 }
 
+#[async_trait::async_trait]
 impl OptimizeJobAdmissionPort for FrontendOptimizeJobAdmissionPort {
-    fn try_begin(&self) -> Result<OptimizeJobAdmission, String> {
-        match self
+    async fn begin(&self) -> Result<OptimizeJobAdmission, String> {
+        let root = match self
             .root_admission
-            .try_begin_root(WorkRequest::new(WorkClass::TableMaintenance))
+            .begin_warehouse_root(WorkRequest::new(WorkClass::TableMaintenance))
         {
-            Ok(work) => Ok(OptimizeJobAdmission::Acquired(Box::new(
-                FrontendOptimizeJobScope::new(work),
-            ))),
+            Ok(root) => root,
             Err(WorkError::NotReady)
             | Err(WorkError::Capacity(_))
-            | Err(WorkError::CapacityWaitTimeout) => Ok(OptimizeJobAdmission::RetryLater),
-            Err(WorkError::Closed) => Ok(OptimizeJobAdmission::Closed),
-            Err(error) => Err(format!("admit governed optimize root failed: {error}")),
-        }
+            | Err(WorkError::CapacityWaitTimeout) => return Ok(OptimizeJobAdmission::RetryLater),
+            Err(WorkError::Closed) => return Ok(OptimizeJobAdmission::Closed),
+            Err(error) => return Err(format!("admit governed optimize root failed: {error}")),
+        };
+        let permit = match root.owner.scope().admit_query() {
+            Ok(admission) => match admission.await {
+                Ok(permit) => permit,
+                Err(WorkError::Cancelled(_))
+                | Err(WorkError::Capacity(_))
+                | Err(WorkError::CapacityWaitTimeout) => {
+                    return Ok(OptimizeJobAdmission::RetryLater);
+                }
+                Err(WorkError::Closed) => return Ok(OptimizeJobAdmission::Closed),
+                Err(error) => {
+                    return Err(format!("admit warehouse optimize query failed: {error}"));
+                }
+            },
+            Err(WorkError::Closed) => return Ok(OptimizeJobAdmission::Closed),
+            Err(error) => {
+                return Err(format!(
+                    "register warehouse optimize admission failed: {error}"
+                ));
+            }
+        };
+        Ok(OptimizeJobAdmission::Acquired(Box::new(
+            FrontendOptimizeJobScope::new(root.owner, permit),
+        )))
     }
 }
 
 struct FrontendOptimizeJobScope {
-    work: Mutex<Option<RootWork>>,
+    work: Mutex<Option<AdmittedOptimizeJob>>,
+}
+
+struct AdmittedOptimizeJob {
+    owner: WorkOwner,
+    query_concurrency: QueryConcurrencyPermit,
 }
 
 impl FrontendOptimizeJobScope {
-    fn new(work: RootWork) -> Self {
+    fn new(owner: WorkOwner, query_concurrency: QueryConcurrencyPermit) -> Self {
         Self {
-            work: Mutex::new(Some(work)),
+            work: Mutex::new(Some(AdmittedOptimizeJob {
+                owner,
+                query_concurrency,
+            })),
         }
     }
 }
@@ -449,7 +479,10 @@ impl OptimizeJobScope for FrontendOptimizeJobScope {
 
 impl Drop for FrontendOptimizeJobScope {
     fn drop(&mut self) {
-        let Some(RootWork { owner, business }) = self
+        let Some(AdmittedOptimizeJob {
+            owner,
+            query_concurrency,
+        }) = self
             .work
             .get_mut()
             .unwrap_or_else(|error| error.into_inner())
@@ -457,7 +490,7 @@ impl Drop for FrontendOptimizeJobScope {
         else {
             return;
         };
-        drop(business);
+        drop(query_concurrency);
         owner.complete();
     }
 }

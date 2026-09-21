@@ -127,12 +127,23 @@ pub struct RootLifecycleSnapshot {
     pub frontend_drain_deadline_cancelled: WorkClassTotals,
 }
 
+/// Cumulative local endings for remote-observation records. The second count
+/// records a Frontend decision to stop tracking an unknown remote state; it is
+/// never evidence that the Worker stopped or released its own resources.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObligationEndSnapshot {
+    pub settled_with_evidence: usize,
+    pub tracking_ended_remote_unknown: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkloadSnapshot {
     pub serving: crate::ServingState,
     pub admission_closed: bool,
     pub root_responsibilities: usize,
     pub businesses: usize,
+    /// Logical queries that currently hold the warehouse concurrency permit.
+    pub admitted_queries: usize,
     pub preparation: usize,
     pub execution: usize,
     /// Includes grants not yet received; their future still owns queue memory.
@@ -146,6 +157,10 @@ pub struct WorkloadSnapshot {
     pub peak_waiting_bytes: u64,
     pub old_attempts: usize,
     pub unknown_creates: usize,
+    /// All live obligations, including kinds that do not consume a dedicated
+    /// per-kind limit.
+    pub obligations: usize,
+    pub obligation_endings: ObligationEndSnapshot,
     pub control_ready: usize,
     pub control_inflight: usize,
     /// Fixed process-local resource ceiling resolved by Server at startup.
@@ -207,6 +222,7 @@ fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
         admission_closed: state.closed,
         root_responsibilities: state.roots,
         businesses: state.businesses,
+        admitted_queries: state.admitted_queries,
         preparation: state.preparation,
         execution: state.execution,
         admission_records: state.requests.len(),
@@ -218,6 +234,8 @@ fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
         peak_waiting_bytes: state.peak_waiting_bytes,
         old_attempts: state.old_attempts,
         unknown_creates: state.unknown_creates,
+        obligations: state.obligations,
+        obligation_endings: state.obligation_endings,
         control_ready: state.control_ready.len(),
         control_inflight: state.control_inflight,
         resource_limit_bytes: inner.resource_config.total_bytes,
@@ -432,27 +450,90 @@ impl Obligation {
     /// that authorize this method. Returns false for an already settled handle.
     pub fn resolve(&self) -> bool {
         self.scope.inner.update_facts(|state| {
-            let Some(node) = state.nodes.get_mut(&self.scope.id) else {
+            remove_obligation(
+                state,
+                self.scope.id,
+                self.key,
+                self.generation,
+                ObligationEndReason::SettledWithEvidence,
+            )
+        })
+    }
+
+    /// End only the Frontend's remote-observation responsibility after its
+    /// bounded cleanup has reached its deadline or retry budget. This does not
+    /// assert remote completion. A `RunningWork` record is eligible only when
+    /// its holder represents an attempt observed through a remote boundary;
+    /// callers that own local work must resolve it with a completion fact.
+    pub fn end_remote_tracking_unknown(&self) -> bool {
+        self.scope.inner.update_facts(|state| {
+            let Some(node) = state.nodes.get(&self.scope.id) else {
                 return false;
             };
-            if node
-                .obligations
-                .get(&self.key)
-                .is_none_or(|record| record.generation != self.generation)
+            let Some(record) = node.obligations.get(&self.key) else {
+                return false;
+            };
+            if record.generation != self.generation
+                || !matches!(
+                    record.kind,
+                    ObligationKind::RunningWork
+                        | ObligationKind::RetiredAttempt
+                        | ObligationKind::UnknownCreate
+                )
             {
                 return false;
             }
-            let record = node.obligations.remove(&self.key).unwrap();
-            state.obligations -= 1;
-            match record.kind {
-                ObligationKind::RetiredAttempt => state.old_attempts -= 1,
-                ObligationKind::UnknownCreate => state.unknown_creates -= 1,
-                _ => {}
-            }
-            state.collect(self.scope.id);
-            true
+            remove_obligation(
+                state,
+                self.scope.id,
+                self.key,
+                self.generation,
+                ObligationEndReason::TrackingEndedRemoteUnknown,
+            )
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObligationEndReason {
+    SettledWithEvidence,
+    TrackingEndedRemoteUnknown,
+}
+
+fn remove_obligation(
+    state: &mut State,
+    scope: WorkId,
+    key: ObligationKey,
+    generation: u64,
+    ending: ObligationEndReason,
+) -> bool {
+    let Some(node) = state.nodes.get_mut(&scope) else {
+        return false;
+    };
+    if node
+        .obligations
+        .get(&key)
+        .is_none_or(|record| record.generation != generation)
+    {
+        return false;
+    }
+    let record = node.obligations.remove(&key).unwrap();
+    state.obligations -= 1;
+    match record.kind {
+        ObligationKind::RetiredAttempt => state.old_attempts -= 1,
+        ObligationKind::UnknownCreate => state.unknown_creates -= 1,
+        _ => {}
+    }
+    match ending {
+        ObligationEndReason::SettledWithEvidence => {
+            state.obligation_endings.settled_with_evidence += 1;
+        }
+        ObligationEndReason::TrackingEndedRemoteUnknown => {
+            state.obligation_endings.tracking_ended_remote_unknown += 1;
+        }
+    }
+    state.collect(scope);
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

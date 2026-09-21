@@ -40,7 +40,11 @@ code-anchors:
 
 `WorkScope` 不能由调用者构造，只能由进程 owner 签发；生产观察、准备和协调入口必须验证它属于同一 authority。父子关系表达责任与取消传播，不自动继承资源 permit。资源由 `LocalResourceAuthority` 在本进程内保留和计费；FE 对 BE 只做 last-known/current-unknown 计数与排队政策，不声称从远端可分配容量中划出内存。
 
-准入使用根间轮转和根内 FIFO，分别限制 root、业务、阶段、waiter、bytes、restarts、residual attempts、unknown creates、obligations 与 control 工作。取消是 first-wins 意图，但取消请求能力不拥有 scope 或释放权；业务成功也需要准确 success seal，不能由 transport EOF 或 owner Drop 推导。
+单 FE 的 serverless warehouse 采用一条公平的查询并发队列作为 FE 侧负载上限。`QueryConcurrencyPermit` 在查询获准后覆盖规划、BE 执行和协议终态；它在 FE 已固定用户可见结论时归还，而不等待失联 BE 的物理退出。MV、统计和表维护每次发起实际计算查询时也消费同一许可。FE 的 planning executor 按空闲复用、无空闲扩展和有限 keepalive 运行，不构成第二个固定 worker 或 backlog 队列。`StagePermit` 仍记录阶段责任，但此部署中的 preparation/execution stage 不再是独立的 FE 查询容量开关。
+
+终态后的远端观察有独立的有限期限：FE 关闭新建、续租和状态订阅，消费已经在途的协议事实，并在期限到达时结束本地跟踪。该结束会归还对应 `RetiredAttempt` / `UnknownCreate` 的治理计数，并明确记录为“远端未知”；它不表示 Worker stopped、不提前释放 Worker 本地资源，也不重置重试预算。BE 的租约和旧身份隔离决定遗留工作的实际寿命与迟到结果是否可被接受。
+
+除 warehouse 查询队列外，根、scope 与 obligation 记录上限用于保证本地簿记可回收，不独立拒绝 FE 计算查询。Worker 继续在本地对真实 CPU、I/O 和 bytes 实施容量保护。取消是 first-wins 意图，但取消请求能力不拥有 scope 或释放权；业务成功也需要准确 success seal，不能由 transport EOF 或 owner Drop 推导。
 
 进程生命周期只有一个不可克隆的 `WorkloadControl` owner。它向应用注入 `RootAdmissionHandle`、`WorkloadObservationHandle` 和 `LocalResourceAuthority` 等窄能力；这些 handle 不能 mark ready、关闭准入或完成 shutdown。`FrontendApplicationHost` 同时持有 WorkloadControl、LogicalExecutionSupervisor、result decode runtime 和其他长期 owner，并按依赖逆序收敛。普通 shutdown deadline 或等待 future 取消后，exact owner 留在原对象中，可以再次调用；只有进程确定退出时才允许显式放弃本进程 owner，且不能伪造远端 Worker 已停止。
 
@@ -65,11 +69,12 @@ ADR-0121 的单向 FE serving drain、signal authority、readiness 和连接生�
 3. **Single-charge rule。** reservation 到 allocation、Fetch 到 decode 到 protocol 的额度通过 move-only token 转移；成功、错误、取消和 Drop 的每条路径恰好结算一次，不能重复扣额或提前释放。
 4. **Local-authority rule。** `LocalResourceAuthority` 只保证它明确管理的本机 reservation/charge。FE 不预留 BE 内存，不把 heartbeat 估计写成严格集群容量；未知远端占用以具名 unknown obligation 保守计账。
 5. **Hierarchical-cancellation rule。** scope 树传播 deadline 与 first-wins cancellation，取消 requester 只发意图，不持有完成、资源释放或业务成功权。Control lane 有独立有界容量，在业务/执行饱和时仍能推进取消和 cleanup。
-6. **Fair-bounded-admission rule。** 根间轮转、根内 FIFO，root/business/stage/waiter/bytes/restart/residual/unknown/control 均有显式非零上限和 timeout；等待超时只结束这次等待，不暗示工作已经取消或资源已经停止。
+6. **Fair warehouse-admission rule。** 单 FE serverless warehouse 以一条根间轮转、根内 FIFO 的 `QueryConcurrencyPermit` 队列限制获准计算查询；它不是 FE CPU、内存或规划线程配额。MV、统计和维护发起的计算查询与 SQL 查询使用同一队列。等待上限与超时只结束这次等待，不暗示工作已经取消或资源已经停止；root/scope/obligation 的簿记上限不能另行拒绝该查询。
 7. **One-process-owner rule。** `WorkloadControl` 不可克隆，只由 Application Host 持有；服务只取得完成其职责所需的窄 handle。配置在 Server 层显式构造并验证，不由测试 default 或相邻字段推导。
 8. **Retryable-shutdown rule。** shutdown 先关闭新 root admission，再推进 control、逻辑执行/registry join-retire、workload drain、decode 和依赖 owner。deadline、暂时错误或等待 future 取消后保留 exact owner，可用同一绝对 deadline 的后续阶段继续收敛。
 9. **Process-exit rule。** 确定进程即将退出时可以显式 abandon 本机 join/registry owner，防止 Drop 产生第二次 panic；这只承认本机不再继续监督，不产生 Worker stopped、result delivered 或 external effect settled 事实。
 10. **Product-autonomy rule。** Workload Control 不拥有 MV/Statistics/Maintenance 的业务状态、表级互斥或提交决定；产品在合法 scope 内使用通用查询能力，业务 lock 和 resource relationship 分开表达。
+11. **Terminal-retirement rule。** FE 终态先关闭结果与新的远端推进、归还 `QueryConcurrencyPermit`，再进行有期限的远端收尾。实际结算与“本地跟踪结束、远端未知”都必须归还同一组 obligation 治理计数，但观测中保留不同结束原因；后者绝不能伪装为物理停止或外部效果结算。
 
 ## 接受的妥协（诚实记录）
 
@@ -82,6 +87,8 @@ ADR-0121 的单向 FE serving drain、signal authority、readiness 和连接生�
 shutdown 对 timeout/error 可重试意味着 Application Host 必须保留 owner，不能简单 `take()` 后失败即 Drop。确定 process exit 时的显式 abandon 放弃了进一步本机诊断和收敛机会；它只是有限的退出语义，不是正常 shutdown 成功。
 
 所有治理状态是进程内存。FE 崩溃后 scope、队列和 credits 一起消失；外部效果 truth 和 Worker 残留必须由各自 owner/identity 处理。本 ADR 没有提供持久 workload journal。
+
+FE 在有限退休后可能与尚未到期的 Worker 工作短暂重叠，因此 `concurrency_limit` 是已获准且尚未终态的 FE 查询上限，不是瞬时物理执行数的严格上界。最后一个有效租约、其已在途 renew 窗口以及 Worker 的本地终止尾部决定残留工作的上界；远端清理期限只界定 FE 跟踪寿命，不能被解释为远端停止保证。
 
 ## 何时重新评估
 

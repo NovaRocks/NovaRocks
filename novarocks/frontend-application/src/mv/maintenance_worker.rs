@@ -30,7 +30,7 @@
 
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_workload_control::{
-    BusinessPermit, RootAdmissionHandle, RootWork, WorkClass, WorkOwner, WorkRequest,
+    QueryConcurrencyPermit, RootAdmissionHandle, WorkClass, WorkOwner, WorkRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -203,11 +203,13 @@ impl FrontendMaintenanceWorker {
             }
         };
 
-        let RootWork { owner, business } = match self
-            .dependencies
-            .root_admission
-            .try_begin_root(WorkRequest::new(WorkClass::MaterializedView))
-        {
+        let AdmittedAutomaticQuery {
+            owner,
+            query_concurrency,
+        } = match admit_automatic_query(
+            &self.dependencies.root_admission,
+            &self.dependencies.runtime,
+        ) {
             Ok(work) => work,
             Err(_) => {
                 pass.skipped.push(FrontendMaintenanceSkip::Stopping {
@@ -221,7 +223,7 @@ impl FrontendMaintenanceWorker {
                 view, None,
             ),
             Err(_) => {
-                finish_automatic_root(owner, business);
+                finish_automatic_root(owner, query_concurrency);
                 pass.skipped.push(FrontendMaintenanceSkip::Stopping {
                     mv_id: definition.mv_id,
                 });
@@ -229,7 +231,7 @@ impl FrontendMaintenanceWorker {
             }
         };
         if cancellation.is_cancelled() {
-            finish_automatic_root(owner, business);
+            finish_automatic_root(owner, query_concurrency);
             pass.skipped.push(FrontendMaintenanceSkip::Stopping {
                 mv_id: definition.mv_id,
             });
@@ -242,7 +244,7 @@ impl FrontendMaintenanceWorker {
         {
             Ok(attempt) => attempt,
             Err(admission) => {
-                finish_automatic_root(owner, business);
+                finish_automatic_root(owner, query_concurrency);
                 pass.skipped.push(FrontendMaintenanceSkip::Admission {
                     mv_id: definition.mv_id,
                     admission,
@@ -265,7 +267,7 @@ impl FrontendMaintenanceWorker {
         };
         let execution = MaintenanceCoordinator::execute_attempt(&attempt, &mut runner);
         self.runtime.finish(attempt, &execution, now_ms);
-        finish_automatic_root(owner, business);
+        finish_automatic_root(owner, query_concurrency);
         pass.attempts.push(FrontendMaintenanceAttemptReport {
             mv_id: definition.mv_id,
             target,
@@ -274,8 +276,26 @@ impl FrontendMaintenanceWorker {
     }
 }
 
-fn finish_automatic_root(owner: WorkOwner, business: BusinessPermit) {
-    drop(business);
+struct AdmittedAutomaticQuery {
+    owner: WorkOwner,
+    query_concurrency: QueryConcurrencyPermit,
+}
+
+fn admit_automatic_query(
+    root_admission: &RootAdmissionHandle,
+    runtime: &tokio::runtime::Handle,
+) -> Result<AdmittedAutomaticQuery, novarocks_workload_control::WorkError> {
+    let root =
+        root_admission.begin_warehouse_root(WorkRequest::new(WorkClass::MaterializedView))?;
+    let query_concurrency = runtime.block_on(async { root.owner.scope().admit_query()?.await })?;
+    Ok(AdmittedAutomaticQuery {
+        owner: root.owner,
+        query_concurrency,
+    })
+}
+
+fn finish_automatic_root(owner: WorkOwner, query_concurrency: QueryConcurrencyPermit) {
+    drop(query_concurrency);
     owner.complete();
 }
 

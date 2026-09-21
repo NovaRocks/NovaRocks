@@ -366,8 +366,9 @@ mod tests {
 
     struct ReadyAdmission;
 
+    #[async_trait::async_trait]
     impl OptimizeJobAdmissionPort for ReadyAdmission {
-        fn try_begin(&self) -> Result<OptimizeJobAdmission, String> {
+        async fn begin(&self) -> Result<OptimizeJobAdmission, String> {
             Ok(OptimizeJobAdmission::Acquired(Box::new(ActiveScope)))
         }
     }

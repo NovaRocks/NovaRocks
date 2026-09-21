@@ -1273,13 +1273,14 @@ impl FrontendQuerySession {
         let mut statement = self
             .service
             .query_control
-            .begin_governed_query_statement(
+            .begin_queued_governed_query_statement(
                 token,
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
                 Some(Arc::from(source.as_str())),
             )
+            .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
         for assignment in &set.assignments {
             let ast::SetTarget::UserVariable(variable) = &assignment.target else {
@@ -1448,13 +1449,14 @@ impl FrontendQuerySession {
         let mut statement = self
             .service
             .query_control
-            .begin_governed_query_statement(
+            .begin_queued_governed_query_statement(
                 token,
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
                 Some(Arc::from(sql.as_str())),
             )
+            .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
         let prepared = match self
             .prepare_governed_query_operation(
@@ -1570,18 +1572,29 @@ impl FrontendQuerySession {
             deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         let timeout_ms = timeout_duration.map(timeout_message_millis);
         let token = self.token()?;
-        let mut statement = self
-            .service
-            .query_control
-            .begin_governed_statement(
+        let work_class = typed_statement_work_class(&parsed_statement);
+        let mut statement = if work_class == WorkClass::Query {
+            self.service
+                .query_control
+                .begin_queued_governed_query_statement(
+                    token,
+                    &self.service.workload_root_admission,
+                    deadline.map(tokio::time::Instant::from_std),
+                    timeout_ms,
+                    Some(Arc::from(sql.as_str())),
+                )
+                .await
+        } else {
+            self.service.query_control.begin_governed_statement(
                 token,
                 &self.service.workload_root_admission,
-                typed_statement_work_class(&parsed_statement),
+                work_class,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
                 Some(Arc::from(sql.as_str())),
             )
-            .map_err(|error| self.governed_statement_begin_error(error))?;
+        }
+        .map_err(|error| self.governed_statement_begin_error(error))?;
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
             statement.timeout_ms(),

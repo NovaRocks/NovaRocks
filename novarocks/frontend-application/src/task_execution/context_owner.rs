@@ -173,6 +173,11 @@ pub struct QueryContextOwner {
     admission_ticket: Option<GrantedAdmission>,
     admission_reissue_at: Option<MonotonicInstant>,
     admission_qualified: bool,
+    /// Once terminal cleanup starts, this owner may settle requests already
+    /// handed to transport, but it must not mint or replay normal lifecycle
+    /// work. In particular, a remote cleanup wait must never keep extending a
+    /// Worker lease after the FE has fixed the query outcome.
+    terminal_cleanup_started: bool,
     lease_sequence: LeaseSequence,
     renew_schedule: Option<RenewSchedule>,
     establish: Option<ReleasedEstablish>,
@@ -219,6 +224,7 @@ impl QueryContextOwner {
             admission_ticket: None,
             admission_reissue_at: None,
             admission_qualified: true,
+            terminal_cleanup_started: false,
             lease_sequence: LeaseSequence::INITIAL,
             renew_schedule: None,
             establish: None,
@@ -323,17 +329,20 @@ impl QueryContextOwner {
     /// as the root task's output is complete, while this context still holds
     /// resources until the release is answered.
     pub const fn must_keep_renewing(&self) -> bool {
-        !self.released && !matches!(self.state, QueryContextState::Gone)
+        !self.terminal_cleanup_started
+            && !self.released
+            && !matches!(self.state, QueryContextState::Gone)
     }
 
     /// Whether this owner still has to establish its context.
     pub const fn needs_establish(&self) -> bool {
-        !self.establish_acknowledged
+        !self.terminal_cleanup_started && !self.establish_acknowledged
     }
 
     /// Whether this context still needs a Worker capacity grant.
     pub const fn needs_admission_ticket(&self) -> bool {
-        self.admission_qualified
+        !self.terminal_cleanup_started
+            && self.admission_qualified
             && self.admission_ticket.is_none()
             && self.establish.is_none()
             && !self.establish_acknowledged
@@ -527,13 +536,21 @@ impl QueryContextOwner {
         if self.released || self.abort.is_some() {
             return None;
         }
+        self.begin_terminal_cleanup();
         let request = *self.abort.get_or_insert_with(|| {
             AbortQueryContext::new(TaskOperationId::new_v7(), self.context, cause)
         });
-        self.admission_qualified = false;
-        self.admission_ticket = None;
-        self.admission_reissue_at = None;
         Some(OperationIntent::AbortQueryContext(request))
+    }
+
+    /// Closes future normal lifecycle issuance while retaining any immutable
+    /// request that already crossed transport. A late Worker settlement may
+    /// still apply that request once, but the FE never uses the settlement to
+    /// mint a successor admission, establish, or renewal.
+    pub(crate) fn begin_terminal_cleanup(&mut self) {
+        self.terminal_cleanup_started = true;
+        self.admission_qualified = false;
+        self.admission_reissue_at = None;
     }
 
     /// Rolls back a lifecycle request that never crossed process queue
