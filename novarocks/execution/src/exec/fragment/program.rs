@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 use crate::exec::chunk::ChunkSchemaRef;
@@ -26,56 +26,11 @@ use crate::exec::fragment::error::{
 use crate::exec::fragment::sink::FragmentSinkProgram;
 use crate::exec::node::{ExecNodeKind, ExecPlan};
 pub use novarocks_execution_contract::{FragmentContractVersion, FragmentNodeId, FragmentSinkKind};
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RuntimeFilterId(i32);
-
-impl RuntimeFilterId {
-    pub const fn new(value: i32) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> i32 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FragmentProgramOptions {
-    contract_version: FragmentContractVersion,
-}
-
-impl FragmentProgramOptions {
-    pub const fn new(contract_version: FragmentContractVersion) -> Self {
-        Self { contract_version }
-    }
-
-    pub const fn contract_version(&self) -> FragmentContractVersion {
-        self.contract_version
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScanAssignmentKind {
-    File,
-    BrokerFile,
-    SchemaSelection,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ScanSourceContract {
-    assignment_kind: ScanAssignmentKind,
-}
-
-impl ScanSourceContract {
-    pub const fn new(assignment_kind: ScanAssignmentKind) -> Self {
-        Self { assignment_kind }
-    }
-
-    pub const fn assignment_kind(&self) -> ScanAssignmentKind {
-        self.assignment_kind
-    }
-}
+pub use novarocks_local_program::{
+    CompileProfile, FragmentProgramOptions, FragmentSinkAssignmentKind,
+    FragmentSinkAssignmentRequirement, RuntimeFilterContract, RuntimeFilterId, ScanAssignmentKind,
+    ScanSourceContract,
+};
 
 #[derive(Clone, Debug)]
 pub struct ExchangeInputContract {
@@ -90,48 +45,6 @@ impl ExchangeInputContract {
     pub fn expected_schema(&self) -> &ChunkSchemaRef {
         &self.expected_schema
     }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RuntimeFilterContract {
-    build_filters: BTreeSet<RuntimeFilterId>,
-    probe_filters: BTreeSet<RuntimeFilterId>,
-}
-
-impl RuntimeFilterContract {
-    pub fn new(
-        build_filters: BTreeSet<RuntimeFilterId>,
-        probe_filters: BTreeSet<RuntimeFilterId>,
-    ) -> Self {
-        Self {
-            build_filters,
-            probe_filters,
-        }
-    }
-
-    pub fn build_filters(&self) -> &BTreeSet<RuntimeFilterId> {
-        &self.build_filters
-    }
-
-    pub fn probe_filters(&self) -> &BTreeSet<RuntimeFilterId> {
-        &self.probe_filters
-    }
-
-    pub fn has_bindings(&self) -> bool {
-        !self.build_filters.is_empty() || !self.probe_filters.is_empty()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FragmentSinkAssignmentKind {
-    StreamDestinations,
-    DestinationGroups(NonZeroUsize),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FragmentSinkAssignmentRequirement {
-    None,
-    Required(FragmentSinkAssignmentKind),
 }
 
 #[derive(Clone, Debug)]

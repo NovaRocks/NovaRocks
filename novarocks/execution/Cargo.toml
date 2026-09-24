@@ -33,6 +33,7 @@ md-5.workspace = true
 novarocks-types.workspace = true
 novarocks-execution-contract.workspace = true
 novarocks-functions.workspace = true
+novarocks-local-program.workspace = true
 novarocks-memory.workspace = true
 novarocks-spi.workspace = true
 novarocks-type-contract.workspace = true

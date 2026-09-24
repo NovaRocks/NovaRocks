@@ -3796,6 +3796,7 @@ dependencies = [
  "novarocks-connector-iceberg-functions",
  "novarocks-execution-contract",
  "novarocks-functions",
+ "novarocks-local-program",
  "novarocks-memory",
  "novarocks-spi",
  "novarocks-sql",
@@ -3934,6 +3935,16 @@ dependencies = [
  "arrow-schema",
  "novarocks-type-contract",
  "sha2",
+]
+
+[[package]]
+name = "novarocks-local-program"
+version = "0.1.0"
+dependencies = [
+ "arrow-schema",
+ "novarocks-connector-contract",
+ "novarocks-execution-contract",
+ "novarocks-types",
 ]
 
 [[package]]
