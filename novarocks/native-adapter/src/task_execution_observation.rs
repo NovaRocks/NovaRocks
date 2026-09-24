@@ -99,6 +99,32 @@ fn emit_task(name: &str, identity: TaskIdentity) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
+/// Test-only observation of the exact effective DOP admitted with a task.
+/// The execution kernel uses this positive descriptor value unchanged as its
+/// base graph DOP; this marker carries no scheduling authority.
+pub(crate) fn emit_prepared_task_dop(
+    identity: TaskIdentity,
+    fragment_instance_id: novarocks_types::UniqueId,
+    dop: usize,
+) {
+    if !enabled() {
+        return;
+    }
+    let execution = identity.query_execution_id();
+    println!(
+        "NOVAROCKS_TASK_PREPARED_DOP execution_id={}:{}:{} stage={} task={} backend={} finst={:x}:{:x} dop={dop}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        identity.stage_id().get(),
+        identity.task_id().get(),
+        identity.backend_process_id(),
+        fragment_instance_id.high(),
+        fragment_instance_id.low(),
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
 fn emit(event: TaskProtocolEvent) {
     if !enabled() {
         return;

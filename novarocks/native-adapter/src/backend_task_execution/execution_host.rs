@@ -847,6 +847,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             resource_exhausted(format!("task {identity} could not be prepared: {error}"))
         })?;
 
+        crate::task_execution_observation::emit_prepared_task_dop(
+            identity,
+            descriptor.fragment_instance_id(),
+            descriptor.pipeline_dop().get(),
+        );
+
         self.tasks.lock().expect(TASK_LOCK).insert(
             identity,
             Arc::new(TaskRuntime {
