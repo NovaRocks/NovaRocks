@@ -1251,7 +1251,7 @@ fn command_bytes(directory: &Path, program: &str, arguments: &[&str]) -> Result<
     Ok(output.stdout)
 }
 
-pub(super) fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     Ok(sha256_bytes(&fs::read(path).with_context(|| {
         format!("read {} for SHA256", path.display())
     })?))

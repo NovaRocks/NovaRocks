@@ -276,19 +276,31 @@ mod tests {
     #[test]
     fn startup_baseline_requires_the_performance_profile_before_launch() {
         let scenarios = crate::scenarios::all();
-        let selected = select(&scenarios, &["task-execution/startup-baseline".to_string()])
-            .expect("select startup baseline scenario");
-        let scenario = selected[0];
         assert!(
-            scenario
-                .validate_runner_inputs(
-                    novarocks_cluster_harness::LaunchProfile::FaultScenario,
-                    None
-                )
-                .is_err()
+            select(&scenarios, &[])
+                .expect("select default scenarios")
+                .iter()
+                .all(|scenario| scenario.name() != "task-execution/uea5d-startup-baseline"),
+            "the 1,000-query formal baseline must remain an explicit stage"
         );
-        scenario
-            .validate_runner_inputs(novarocks_cluster_harness::LaunchProfile::Performance, None)
-            .expect("performance profile is accepted before startup");
+        for name in [
+            "task-execution/startup-baseline",
+            "task-execution/uea5d-startup-baseline",
+        ] {
+            let selected =
+                select(&scenarios, &[name.to_string()]).expect("select startup baseline scenario");
+            let scenario = selected[0];
+            assert!(
+                scenario
+                    .validate_runner_inputs(
+                        novarocks_cluster_harness::LaunchProfile::FaultScenario,
+                        None
+                    )
+                    .is_err()
+            );
+            scenario
+                .validate_runner_inputs(novarocks_cluster_harness::LaunchProfile::Performance, None)
+                .expect("performance profile is accepted before startup");
+        }
     }
 }

@@ -65,10 +65,30 @@ const DEEP_QUERY: &str = "SELECT COUNT(*) AS total FROM \
            JOIN (SELECT 1 AS k UNION ALL SELECT 2 UNION ALL SELECT 3) c ON b.k = c.k";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(StartupBaseline)]
+    vec![Box::new(StartupBaseline), Box::new(Uea5dStartupBaseline)]
 }
 
 struct StartupBaseline;
+struct Uea5dStartupBaseline;
+
+#[derive(Clone, Copy)]
+struct SamplingProfile {
+    warmups: usize,
+    measured: usize,
+    artifact_stem: &'static str,
+}
+
+const UEA5D_SAMPLING: SamplingProfile = SamplingProfile {
+    warmups: 5,
+    measured: 200,
+    artifact_stem: "uea5d-startup-baseline",
+};
+
+const LEGACY_SAMPLING: SamplingProfile = SamplingProfile {
+    warmups: WARMUP_RUNS,
+    measured: MEASURED_RUNS,
+    artifact_stem: "startup-baseline",
+};
 
 /// One measured execution of one fixture.
 #[derive(Clone, Copy)]
@@ -98,88 +118,179 @@ impl Scenario for StartupBaseline {
         launch_profile: LaunchProfile,
         _uea1_workload_manifest: Option<&Path>,
     ) -> Result<()> {
-        ensure!(
-            launch_profile == LaunchProfile::Performance,
-            "{} requires --launch-profile performance because formal release measurement cannot carry debug fault markers",
-            self.name()
-        );
-        Ok(())
+        validate_performance_profile(self.name(), launch_profile)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let fixture_spec = serde_json::to_vec(&(DEEP_FIXTURE_ID, SHALLOW_QUERY, DEEP_QUERY))?;
-        let fixture_sha256 = format!("{:x}", Sha256::digest(&fixture_spec));
-        let run_manifest = crate::performance::provenance::begin_run_manifest(
+        run_startup_baseline(context, self.name(), LEGACY_SAMPLING)
+    }
+}
+
+impl Scenario for Uea5dStartupBaseline {
+    fn name(&self) -> &'static str {
+        "task-execution/uea5d-startup-baseline"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn validate_runner_inputs(
+        &self,
+        launch_profile: LaunchProfile,
+        _uea1_workload_manifest: Option<&Path>,
+    ) -> Result<()> {
+        validate_performance_profile(self.name(), launch_profile)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_startup_baseline(context, self.name(), UEA5D_SAMPLING)
+    }
+}
+
+fn validate_performance_profile(name: &str, launch_profile: LaunchProfile) -> Result<()> {
+    ensure!(
+        launch_profile == LaunchProfile::Performance,
+        "{name} requires --launch-profile performance because formal release measurement cannot carry debug fault markers"
+    );
+    Ok(())
+}
+
+fn run_startup_baseline(
+    context: &mut ScenarioContext,
+    scenario_name: &str,
+    sampling: SamplingProfile,
+) -> Result<()> {
+    let measured_binary_sha256 = (sampling.artifact_stem == UEA5D_SAMPLING.artifact_stem)
+        .then(|| crate::performance::provenance::sha256_file(context.primary_binary()))
+        .transpose()?;
+    let runner_binary_sha256 = (sampling.artifact_stem == UEA5D_SAMPLING.artifact_stem)
+        .then(|| {
+            crate::performance::provenance::sha256_file(
+                &std::env::current_exe().context("resolve system runner binary")?,
+            )
+        })
+        .transpose()?;
+    let mut fixtures = vec![
+        ("shallow", SHALLOW_QUERY.to_string(), None),
+        (DEEP_FIXTURE_ID, DEEP_QUERY.to_string(), None),
+    ];
+    if sampling.artifact_stem == UEA5D_SAMPLING.artifact_stem {
+        fixtures.extend([
+            ("union-width-4", union_fixture(4), Some(4)),
+            ("union-width-8", union_fixture(8), Some(8)),
+            ("union-width-16", union_fixture(16), Some(16)),
+        ]);
+    }
+    let fixture_spec = if sampling.artifact_stem == UEA5D_SAMPLING.artifact_stem {
+        serde_json::to_vec(&fixtures)?
+    } else {
+        serde_json::to_vec(&(DEEP_FIXTURE_ID, SHALLOW_QUERY, DEEP_QUERY))?
+    };
+    let fixture_sha256 = format!("{:x}", Sha256::digest(&fixture_spec));
+    let run_manifest = crate::performance::provenance::begin_run_manifest(
+        context,
+        scenario_name,
+        &fixture_sha256,
+        &fixture_spec,
+        &fixture_spec,
+        true,
+        crate::performance::provenance::RunManifestKind::StartupBaseline,
+    )?;
+    require_backends(context)?;
+
+    let connect_timeout = bounded_timeout(context, "connect the baseline MySQL client")?;
+    let mut connection =
+        mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
+    context.action("connected through the public MySQL protocol");
+
+    let shapes = fixtures
+        .iter()
+        .map(|(name, query, _)| {
+            measure_plan_shape(&mut connection, query)
+                .with_context(|| format!("explain fixed fixture {name}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut reports = Vec::new();
+    for ((name, query, expected_rows), shape) in fixtures.iter().zip(shapes) {
+        let report = measure_fixture(
             context,
-            self.name(),
-            &fixture_sha256,
-            &fixture_spec,
-            &fixture_spec,
-            true,
-            crate::performance::provenance::RunManifestKind::StartupBaseline,
+            &mut connection,
+            name,
+            query,
+            shape,
+            sampling,
+            *expected_rows,
         )?;
-        require_backends(context)?;
-
-        let connect_timeout = bounded_timeout(context, "connect the baseline MySQL client")?;
-        let mut connection =
-            mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
-        context.action("connected through the public MySQL protocol");
-
-        let shallow_shape = measure_plan_shape(&mut connection, SHALLOW_QUERY)
-            .context("explain the shallow fixture")?;
-
-        let deep_shape = measure_plan_shape(&mut connection, DEEP_QUERY)
-            .with_context(|| format!("explain fixed deep fixture {DEEP_FIXTURE_ID}"))?;
-
-        let mut reports = Vec::new();
-        for (name, query, shape) in [
-            ("shallow", SHALLOW_QUERY, shallow_shape),
-            (DEEP_FIXTURE_ID, DEEP_QUERY, deep_shape),
-        ] {
-            let report = measure_fixture(context, &mut connection, name, query, shape)?;
-            context.action(format!(
+        context.action(format!(
                 "measured {name}: {} plan fragments, {} exchange levels, median first row {:?}, median total {:?}",
                 report.plan_fragments,
                 report.exchange_levels,
                 median(&report.measured, |sample| sample.first_row),
                 median(&report.measured, |sample| sample.total),
             ));
-            reports.push(report);
-        }
+        reports.push(report);
+    }
 
-        // The whole point of the pair is that one is deeper than the other. If
-        // the planner ever flattens the deep fixture, the comparison silently
-        // stops measuring what it claims to, so this is the one latency-shaped
-        // fact worth failing on.
-        let shallow = &reports[0];
-        let deep = &reports[1];
-        ensure!(
-            deep.exchange_levels > shallow.exchange_levels,
-            "no deep candidate stacks more exchange levels than the shallow fixture \
+    // The whole point of the pair is that one is deeper than the other. If
+    // the planner ever flattens the deep fixture, the comparison silently
+    // stops measuring what it claims to, so this is the one latency-shaped
+    // fact worth failing on.
+    let shallow = &reports[0];
+    let deep = &reports[1];
+    ensure!(
+        deep.exchange_levels > shallow.exchange_levels,
+        "no deep candidate stacks more exchange levels than the shallow fixture \
              (fixed fixture was {} with {} levels against {}), so the frozen fixture no longer \
              measures plan depth. Revise the fixture as a new explicit version before measuring.",
-            deep.name,
-            deep.exchange_levels,
-            shallow.exchange_levels
+        deep.name,
+        deep.exchange_levels,
+        shallow.exchange_levels
+    );
+
+    let resources = context.handle().query_execution_resource_snapshot()?;
+    let backend_count = resources.map_or(0, |snapshot| snapshot.backends.len());
+
+    if let Some(expected) = &measured_binary_sha256 {
+        ensure!(
+            crate::performance::provenance::sha256_file(context.primary_binary())? == *expected,
+            "measured server binary changed during the startup run"
         );
-
-        let resources = context.handle().query_execution_resource_snapshot()?;
-        let backend_count = resources.map_or(0, |snapshot| snapshot.backends.len());
-
-        let run_manifest = run_manifest.finish_success()?;
-        write_report(
-            context.scenario_root(),
-            &reports,
-            backend_count,
-            &run_manifest.run_id,
-            &run_manifest.sha256,
-        )?;
-        context.action(format!(
-            "wrote startup-baseline.csv and startup-baseline.md under {}",
-            context.scenario_root().display()
-        ));
-        Ok(())
     }
+    if let Some(expected) = &runner_binary_sha256 {
+        ensure!(
+            crate::performance::provenance::sha256_file(&std::env::current_exe()?)? == *expected,
+            "system runner binary changed during the startup run"
+        );
+    }
+
+    let run_manifest = run_manifest.finish_success()?;
+    write_report(
+        context.scenario_root(),
+        &reports,
+        backend_count,
+        &run_manifest.run_id,
+        &run_manifest.sha256,
+        sampling,
+        measured_binary_sha256.as_deref(),
+        runner_binary_sha256.as_deref(),
+    )?;
+    context.action(format!(
+        "wrote {}.csv and {}.md under {}",
+        sampling.artifact_stem,
+        sampling.artifact_stem,
+        context.scenario_root().display()
+    ));
+    Ok(())
+}
+
+fn union_fixture(branches: usize) -> String {
+    let arms = (1..=branches)
+        .map(|value| format!("SELECT {value} AS v"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    format!("SELECT v FROM ({arms}) t ORDER BY v")
 }
 
 fn require_backends(context: &mut ScenarioContext) -> Result<()> {
@@ -249,16 +360,18 @@ fn measure_fixture(
     name: &'static str,
     query: &str,
     shape: PlanShape,
+    sampling: SamplingProfile,
+    expected_rows: Option<usize>,
 ) -> Result<FixtureReport> {
-    let mut warmup = Vec::with_capacity(WARMUP_RUNS);
-    for run in 0..WARMUP_RUNS {
+    let mut warmup = Vec::with_capacity(sampling.warmups);
+    for run in 0..sampling.warmups {
         context.remaining(&format!("{name} warm-up run {run}"))?;
-        warmup.push(measure_one(connection, query)?);
+        warmup.push(measure_one(connection, query, expected_rows)?);
     }
-    let mut measured = Vec::with_capacity(MEASURED_RUNS);
-    for run in 0..MEASURED_RUNS {
+    let mut measured = Vec::with_capacity(sampling.measured);
+    for run in 0..sampling.measured {
         context.remaining(&format!("{name} measured run {run}"))?;
-        measured.push(measure_one(connection, query)?);
+        measured.push(measure_one(connection, query, expected_rows)?);
     }
     Ok(FixtureReport {
         name,
@@ -273,7 +386,11 @@ fn measure_fixture(
 
 /// Runs one query, stopping the clock twice: when the first row arrives and
 /// when the result is fully drained.
-fn measure_one(connection: &mut mysql::Conn, query: &str) -> Result<RunSample> {
+fn measure_one(
+    connection: &mut mysql::Conn,
+    query: &str,
+    expected_rows: Option<usize>,
+) -> Result<RunSample> {
     let started = Instant::now();
     let mut rows = connection
         .query_iter(query)
@@ -292,6 +409,12 @@ fn measure_one(connection: &mut mysql::Conn, query: &str) -> Result<RunSample> {
         observed > 0,
         "the fixture returned no rows, so there is no first-row latency to measure"
     );
+    if let Some(expected) = expected_rows {
+        ensure!(
+            observed == expected,
+            "the width fixture returned {observed} rows, expected {expected}"
+        );
+    }
     Ok(RunSample {
         first_row: first_row.expect("a row was observed"),
         total,
@@ -324,6 +447,9 @@ fn write_report(
     backend_count: usize,
     run_id: &str,
     run_manifest_sha256: &str,
+    sampling: SamplingProfile,
+    measured_binary_sha256: Option<&str>,
+    runner_binary_sha256: Option<&str>,
 ) -> Result<()> {
     let mut csv = String::from("fixture,phase,run,first_row_micros,total_micros\n");
     for report in reports {
@@ -346,7 +472,7 @@ fn write_report(
             ));
         }
     }
-    fs::write(root.join("startup-baseline.csv"), csv)
+    fs::write(root.join(format!("{}.csv", sampling.artifact_stem)), csv)
         .context("write the startup baseline samples")?;
 
     #[derive(Serialize)]
@@ -362,12 +488,18 @@ fn write_report(
         schema_version: u32,
         run_id: &'a str,
         run_manifest_sha256: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        measured_binary_sha256: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runner_binary_sha256: Option<&'a str>,
         fixtures: Vec<FixtureIdentity<'a>>,
     }
     let identity = StartupIdentity {
         schema_version: 1,
         run_id,
         run_manifest_sha256,
+        measured_binary_sha256,
+        runner_binary_sha256,
         fixtures: reports
             .iter()
             .map(|report| FixtureIdentity {
@@ -380,7 +512,7 @@ fn write_report(
             .collect(),
     };
     fs::write(
-        root.join("startup-baseline-fixtures.json"),
+        root.join(format!("{}-fixtures.json", sampling.artifact_stem)),
         serde_json::to_vec_pretty(&identity)?,
     )
     .context("write startup fixture identities")?;
@@ -388,15 +520,21 @@ fn write_report(
     let mut summary = String::from("# Native distributed startup baseline\n\n");
     summary.push_str(&format!(
         "Topology: 1 FE + {backend_count} BE, separate processes.\n\
-         Runs per fixture: {WARMUP_RUNS} warm-up (recorded, excluded) + {MEASURED_RUNS} measured.\n\
+         Runs per fixture: {} warm-up (recorded, excluded) + {} measured.\n\
          Time to first row is measured client-side on a lazy row iterator.\n\
-         Run identity: `{run_id}`; run manifest SHA256: `{run_manifest_sha256}`.\n\n"
+         Run identity: `{run_id}`; run manifest SHA256: `{run_manifest_sha256}`.\n\n",
+        sampling.warmups, sampling.measured
     ));
-    summary.push_str("| fixture | SQL SHA256 | plan SHA256 | plan fragments | exchange levels | median first row | p95 first row | median total | p95 total |\n");
-    summary.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|\n");
+    if sampling.measured >= 100 {
+        summary.push_str("| fixture | SQL SHA256 | plan SHA256 | plan fragments | exchange levels | median first row | p95 first row | p99 first row | median total | p95 total | p99 total |\n");
+        summary.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    } else {
+        summary.push_str("| fixture | SQL SHA256 | plan SHA256 | plan fragments | exchange levels | median first row | p95 first row | median total | p95 total |\n");
+        summary.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|\n");
+    }
     for report in reports {
-        summary.push_str(&format!(
-            "| {} | `{}` | `{}` | {} | {} | {:?} | {:?} | {:?} | {:?} |\n",
+        let common = format!(
+            "| {} | `{}` | `{}` | {} | {} | {:?} | {:?} |",
             report.name,
             report.query_sha256,
             report.plan_sha256,
@@ -404,9 +542,22 @@ fn write_report(
             report.exchange_levels,
             median(&report.measured, |sample| sample.first_row),
             percentile(&report.measured, &|sample: &RunSample| sample.first_row, 95),
-            median(&report.measured, |sample| sample.total),
-            percentile(&report.measured, &|sample: &RunSample| sample.total, 95),
-        ));
+        );
+        if sampling.measured >= 100 {
+            summary.push_str(&format!(
+                "{common} {:?} | {:?} | {:?} | {:?} |\n",
+                percentile(&report.measured, &|sample: &RunSample| sample.first_row, 99),
+                median(&report.measured, |sample| sample.total),
+                percentile(&report.measured, &|sample: &RunSample| sample.total, 95),
+                percentile(&report.measured, &|sample: &RunSample| sample.total, 99),
+            ));
+        } else {
+            summary.push_str(&format!(
+                "{common} {:?} | {:?} |\n",
+                median(&report.measured, |sample| sample.total),
+                percentile(&report.measured, &|sample: &RunSample| sample.total, 95),
+            ));
+        }
     }
     summary.push_str(
         "\n## What this does not measure\n\n\
@@ -420,7 +571,12 @@ fn write_report(
          figure above is the whole control plane plus the first batch, and it is comparable across the\n\
          cutover only as that whole.\n",
     );
-    fs::write(root.join("startup-baseline.md"), summary)
+    if sampling.measured >= 100 {
+        summary.push_str(
+            "\nThe 200 measured samples permit a nearest-rank p99; raw samples are in the CSV.\n",
+        );
+    }
+    fs::write(root.join(format!("{}.md", sampling.artifact_stem)), summary)
         .context("write the startup baseline summary")?;
     Ok(())
 }
