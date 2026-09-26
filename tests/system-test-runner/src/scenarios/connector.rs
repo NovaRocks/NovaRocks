@@ -828,8 +828,12 @@ impl Scenario for CatalogReadyLifecycle {
         context.action("fail the cold catalog install on one Backend and reject the query");
         let failed_query: Result<Vec<i64>, mysql::Error> =
             control.query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"));
-        if let Ok(rows) = failed_query {
-            bail!("catalog install failure query unexpectedly succeeded: {rows:?}");
+        match failed_query {
+            Err(mysql::Error::MySqlError(_)) => {}
+            Ok(rows) => bail!("catalog install failure query unexpectedly succeeded: {rows:?}"),
+            Err(error) => {
+                bail!("catalog install failure did not return a public SQL error: {error}")
+            }
         }
         wait_for_catalog_lifecycle_marker_on_backend(
             context,

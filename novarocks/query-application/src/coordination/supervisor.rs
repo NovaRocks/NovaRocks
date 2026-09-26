@@ -1218,6 +1218,9 @@ async fn supervise_rows(
     schema: ResultSchema,
 ) -> Result<(), QueryExecutionError> {
     let mut residuals = JoinSet::new();
+    // One recovery window covers every replacement preparation. A failed
+    // successor cannot renew the topology wait by starting another attempt.
+    let mut replacement_preparation_deadline = None;
     loop {
         // Every attempt, the first and each replacement, runs the activated
         // plan itself: the one the description froze, by identity.
@@ -1383,12 +1386,18 @@ async fn supervise_rows(
                         );
                     }
                 };
+                let preparation_deadline =
+                    *replacement_preparation_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + config.rows.replacement_reservation_valid_for
+                    });
                 let prepared = prepare_native_attempt(
                     session,
                     replacement,
                     frontend_process_id,
                     shutdown,
                     requester,
+                    cancellation.clone(),
+                    preparation_deadline,
                 )
                 .await;
                 let (replacement_schedule, mut dormant) = match prepared {
@@ -1658,12 +1667,30 @@ async fn prepare_native_attempt(
     frontend_process_id: FrontendProcessId,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
+    cancellation: novarocks_workload_control::CancellationView,
+    deadline: tokio::time::Instant,
 ) -> Result<(super::AttemptSchedule, Box<dyn DormantNativeAttemptOwner>), QueryExecutionError> {
     let (request, acceptance) = session.issue_attempt(execution).map_err(contract_error)?;
-    let prepared = await_with_shutdown(session.prepare(request), shutdown, requester)
-        .await
-        .and_then(|prepared| acceptance.accept(prepared).map_err(Into::into))
-        .map_err(native_prepare_error)?;
+    let preparation = await_with_shutdown(session.prepare(request), shutdown, requester);
+    tokio::pin!(preparation);
+    let prepared = tokio::select! {
+        biased;
+        reason = cancellation.cancelled() => {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Cancelled,
+                format!("Native replacement preparation was cancelled: {reason:?}"),
+            ));
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "Native replacement preparation exceeded its recovery budget",
+            ));
+        }
+        prepared = &mut preparation => prepared,
+    }
+    .and_then(|prepared| acceptance.accept(prepared).map_err(Into::into))
+    .map_err(native_prepare_error)?;
     let schedule = build_attempt_schedule(
         execution,
         frontend_process_id,
@@ -2970,6 +2997,7 @@ mod tests {
         allow_initial_convergence: Arc<tokio::sync::Notify>,
         block_initial_convergence: bool,
         replacement_missing_rows: bool,
+        failures_before_success: u64,
     }
 
     impl NativeAttemptPreparationPort for RecoveringRowsPreparationPort {
@@ -2986,6 +3014,7 @@ mod tests {
                 allow_initial_convergence: Arc::clone(&self.allow_initial_convergence),
                 block_initial_convergence: self.block_initial_convergence,
                 replacement_missing_rows: self.replacement_missing_rows,
+                failures_before_success: self.failures_before_success,
             };
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(&request);
@@ -3003,6 +3032,7 @@ mod tests {
         allow_initial_convergence: Arc<tokio::sync::Notify>,
         block_initial_convergence: bool,
         replacement_missing_rows: bool,
+        failures_before_success: u64,
     }
 
     impl DormantNativeAttemptOwner for RecoveringRowsDormantOwner {
@@ -3024,6 +3054,7 @@ mod tests {
             let allow_initial_convergence = Arc::clone(&self.allow_initial_convergence);
             let block_initial_convergence = self.block_initial_convergence;
             let replacement_missing_rows = self.replacement_missing_rows;
+            let failures_before_success = self.failures_before_success;
             Box::pin(async move {
                 if replacement_missing_rows && ordinal > 1 {
                     return Ok(ActivatedNativeAttempt::completion(PanickingActiveOwner {
@@ -3100,6 +3131,7 @@ mod tests {
                 Ok(ActivatedNativeAttempt::rows(
                     RecoveringRowsActiveOwner {
                         ordinal,
+                        failures_before_success,
                         context,
                         runs,
                         convergences,
@@ -3125,6 +3157,7 @@ mod tests {
 
     struct RecoveringRowsActiveOwner {
         ordinal: u64,
+        failures_before_success: u64,
         context: QueryContextRef,
         runs: Arc<AtomicU64>,
         convergences: Arc<AtomicU64>,
@@ -3150,7 +3183,7 @@ mod tests {
         ) -> NativeAttemptRunFuture<'a> {
             Box::pin(async move {
                 self.runs.fetch_add(1, Ordering::SeqCst);
-                if self.ordinal == 1 {
+                if self.ordinal <= self.failures_before_success {
                     NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
                         AttemptFailureClass::RecoverableInfrastructure,
                         QueryExecutionError::new(
@@ -3191,6 +3224,317 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct HeldReplacementPreparationPort {
+        inner: RecoveringRowsPreparationPort,
+        release: Arc<tokio::sync::Notify>,
+        exits: Arc<AtomicU64>,
+        entered: Arc<AtomicU64>,
+    }
+
+    impl NativeAttemptPreparationPort for HeldReplacementPreparationPort {
+        fn prepare(
+            &mut self,
+            request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            let replacement = request.execution().attempt_id().get() > 1;
+            let prepared = self.inner.prepare(request);
+            let release = Arc::clone(&self.release);
+            let exits = Arc::clone(&self.exits);
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                struct PreparationExit(Arc<AtomicU64>);
+                impl Drop for PreparationExit {
+                    fn drop(&mut self) {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                if replacement {
+                    let _exit = PreparationExit(exits);
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    prepared.await
+                } else {
+                    prepared.await
+                }
+            })
+        }
+    }
+
+    async fn exercise_held_replacement_preparation(cancel: bool, release: bool) {
+        let prepares = Arc::new(AtomicU64::new(0));
+        let runs = Arc::new(AtomicU64::new(0));
+        let convergences = Arc::new(AtomicU64::new(0));
+        let exits = Arc::new(AtomicU64::new(0));
+        let entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let attempts = HeldReplacementPreparationPort {
+            inner: RecoveringRowsPreparationPort {
+                backend: BackendProcessId::new_v7(),
+                prepares: Arc::clone(&prepares),
+                runs: Arc::clone(&runs),
+                convergences: Arc::clone(&convergences),
+                allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
+                block_initial_convergence: false,
+                replacement_missing_rows: false,
+                failures_before_success: 1,
+            },
+            release: Arc::clone(&gate),
+            exits: Arc::clone(&exits),
+            entered: Arc::clone(&entered),
+        };
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let mut config = supervisor_config();
+        config.rows.replacement_reservation_valid_for = if cancel || release {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_millis(50)
+        };
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            control.resources(),
+            QueryProcessNamespace::new(0x59),
+            FrontendProcessId::new_v7(),
+            config,
+        );
+        let mut handle = client
+            .start(
+                rows_request(
+                    RecoveryMode::RestartAttemptBeforeVisibility,
+                    Some(Arc::new(ImmediateReplacementPort::default())),
+                    attempts,
+                ),
+                root.owner,
+            )
+            .await
+            .unwrap();
+        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+            panic!("recoverable Rows execution must retain its result consumer");
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while entered.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the failed attempt must enter replacement preparation");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        stream.begin_schema().unwrap().complete();
+        if release {
+            gate.notify_one();
+            let crate::api::ResultDelivery::Batch(delivery) =
+                tokio::time::timeout(Duration::from_secs(1), stream.next())
+                    .await
+                    .expect("replacement released within the budget must deliver")
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("replacement must deliver its actual result batch");
+            };
+            let bytes = delivery.decoded_bytes();
+            delivery
+                .reserve_protocol(&control.resources(), bytes)
+                .unwrap()
+                .begin_protocol_write(bytes)
+                .unwrap()
+                .complete()
+                .unwrap();
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+        }
+        if cancel || release {
+            handle.request_cancel().unwrap();
+        }
+        let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("bounded preparation or cancellation must terminate the public stream");
+        let Err(error) = terminal else {
+            panic!("the stream must expose the failed logical execution");
+        };
+        if cancel || release {
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+            assert_eq!(
+                error.to_string(),
+                "logical execution was cancelled before success EOF"
+            );
+        } else {
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+            assert_eq!(
+                error.to_string(),
+                "injected pre-visibility infrastructure failure"
+            );
+        }
+        if !release {
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                1,
+                "a held prepare cannot activate"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while exits.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the pending preparation must really exit before shutdown is requested");
+        drop(stream);
+        root.business.release();
+        let shutdown = supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        if release {
+            shutdown.unwrap();
+        } else if cancel {
+            let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown
+            else {
+                panic!("the supervisor must retain the exact preparation cancellation");
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+            assert_eq!(
+                error.to_string(),
+                "Native replacement preparation was cancelled: Requested"
+            );
+        } else {
+            let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown
+            else {
+                panic!("the supervisor must retain the precise preparation failure");
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+            assert_eq!(
+                error.to_string(),
+                "Native replacement preparation exceeded its recovery budget"
+            );
+        }
+        acknowledge_all_control(&control);
+        scope.wait_released().await;
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            convergences.load(Ordering::SeqCst),
+            if release { 2 } else { 1 }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_recovery_does_not_refresh_the_preparation_deadline() {
+        let prepares = Arc::new(AtomicU64::new(0));
+        let runs = Arc::new(AtomicU64::new(0));
+        let convergences = Arc::new(AtomicU64::new(0));
+        let exits = Arc::new(AtomicU64::new(0));
+        let entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let attempts = HeldReplacementPreparationPort {
+            inner: RecoveringRowsPreparationPort {
+                backend: BackendProcessId::new_v7(),
+                prepares: Arc::clone(&prepares),
+                runs: Arc::clone(&runs),
+                convergences: Arc::clone(&convergences),
+                allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
+                block_initial_convergence: false,
+                replacement_missing_rows: false,
+                failures_before_success: 2,
+            },
+            release: Arc::clone(&gate),
+            exits: Arc::clone(&exits),
+            entered: Arc::clone(&entered),
+        };
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let mut config = supervisor_config();
+        config.rows.max_attempts = NonZeroU32::new(3).unwrap();
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            control.resources(),
+            QueryProcessNamespace::new(0x5a),
+            FrontendProcessId::new_v7(),
+            config,
+        );
+        let mut handle = client
+            .start(
+                rows_request(
+                    RecoveryMode::RestartAttemptBeforeVisibility,
+                    Some(Arc::new(ImmediateReplacementPort::default())),
+                    attempts,
+                ),
+                root.owner,
+            )
+            .await
+            .unwrap();
+        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+            panic!("recovery must retain the public stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        while entered.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(20)).await;
+        gate.notify_one();
+        while entered.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while exits.load(Ordering::SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the held third prepare must exit at the original deadline");
+        let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("the third prepare must expire at the first recovery deadline");
+        let Err(error) = terminal else {
+            panic!("the expired replacement must retain the originating failure");
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(
+            error.to_string(),
+            "injected pre-visibility infrastructure failure"
+        );
+        assert_eq!(exits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "expired third prepare cannot activate"
+        );
+        drop(stream);
+        root.business.release();
+        // shutdown_until converts the supplied std Instant back into Tokio
+        // time. Use the advanced clock so this is a future deadline, rather
+        // than the wall clock's already-past instant in this paused test.
+        let shutdown_deadline = tokio::time::Instant::now().into_std() + Duration::from_secs(1);
+        let shutdown = supervisor.shutdown_until(shutdown_deadline).await;
+        let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown else {
+            panic!("the preparation budget failure must survive owned shutdown: {shutdown:?}");
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(
+            error.message(),
+            "Native replacement preparation exceeded its recovery budget"
+        );
+        acknowledge_all_control(&control);
+        scope.wait_released().await;
+        assert_eq!(convergences.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn replacement_preparation_budget_expires_and_converges_the_original_owner() {
+        exercise_held_replacement_preparation(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_pending_replacement_preparation() {
+        exercise_held_replacement_preparation(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_preparation_released_within_budget_can_activate() {
+        exercise_held_replacement_preparation(false, true).await;
+    }
+
     #[tokio::test]
     async fn recoverable_pre_visibility_failure_activates_a_rows_replacement() {
         let prepares = Arc::new(AtomicU64::new(0));
@@ -3205,6 +3549,7 @@ mod tests {
             allow_initial_convergence: Arc::clone(&allow_initial_convergence),
             block_initial_convergence: true,
             replacement_missing_rows: false,
+            failures_before_success: 1,
         };
         let replacements = Arc::new(ImmediateReplacementPort::default());
         let (control, root) = governance();
@@ -3293,6 +3638,7 @@ mod tests {
             allow_initial_convergence: Arc::clone(&allow_initial_convergence),
             block_initial_convergence: true,
             replacement_missing_rows: false,
+            failures_before_success: 1,
         };
         let (control, root) = governance();
         let scope = root.owner.scope();
@@ -3386,6 +3732,7 @@ mod tests {
             allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
             block_initial_convergence: false,
             replacement_missing_rows: true,
+            failures_before_success: 1,
         };
         let (control, root) = governance();
         let scope = root.owner.scope();
