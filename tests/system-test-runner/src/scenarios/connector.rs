@@ -19,6 +19,7 @@ use novarocks_cluster_harness::{
 use novarocks_secret::SecretValue;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -3143,7 +3144,21 @@ impl Scenario for CatalogVersionDrain {
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        let mut launch = connector_launch_config();
+        // The old reader's scan-side filter holds its scan worker in SLEEP.
+        // Reserve a second scan worker so the replacement query can run before
+        // cancellation; this scenario verifies concurrent catalog versions.
+        let overlay = launch
+            .config_overlay
+            .be
+            .as_mut()
+            .expect("connector BE overlay");
+        *overlay = overlay.replacen(
+            "[runtime]",
+            "[runtime]\npipeline_scan_thread_pool_thread_num = 2",
+            1,
+        );
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -3155,6 +3170,10 @@ impl Scenario for CatalogVersionDrain {
             port,
             context.remaining("connect catalog version drain control session")?,
         )?;
+
+        control
+            .query_drop("SET pipeline_dop = 1")
+            .context("bound catalog version drain control driver parallelism")?;
 
         let warehouse = create_warehouse(context, "catalog-version-drain")?;
         context.action("create the first Iceberg catalog version and three data files");
@@ -3168,12 +3187,14 @@ impl Scenario for CatalogVersionDrain {
 
         context.action("start a read pinned to the first catalog version");
         let baseline_logs = backend_log_snapshots(context)?;
-        let target = start_connector_read(
+        let target = start_connector_read_on(
             &user,
             port,
             "connector_generation_catalog",
             "connector_generation_db",
             "connector_generation_data",
+            ReaderConnection::SocketBounded,
+            Some(NonZeroU32::new(1).expect("nonzero reader DOP")),
         )?;
         let connection_id = target
             .ready
@@ -3835,6 +3856,7 @@ fn start_connector_read(
         database,
         table,
         ReaderConnection::SocketBounded,
+        None,
     )
 }
 
@@ -3854,6 +3876,7 @@ fn start_held_connector_read(
         database,
         table,
         ReaderConnection::ScenarioBounded,
+        None,
     )
 }
 
@@ -3864,6 +3887,7 @@ fn start_connector_read_on(
     database: &str,
     table: &str,
     connection_form: ReaderConnection,
+    pipeline_dop: Option<NonZeroU32>,
 ) -> Result<ConnectorRead> {
     let (ready_tx, ready) = mpsc::sync_channel(1);
     let (done_tx, done) = mpsc::sync_channel(1);
@@ -3907,6 +3931,11 @@ fn start_connector_read_on(
             }
         }
         .context("connect connector reader MySQL client")?;
+        if let Some(dop) = pipeline_dop {
+            connection
+                .query_drop(format!("SET pipeline_dop = {}", dop.get()))
+                .context("set explicit connector reader driver parallelism")?;
+        }
         ready_tx
             .send(connection.connection_id())
             .context("publish connector reader MySQL connection id")?;
