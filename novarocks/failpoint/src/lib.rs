@@ -841,14 +841,18 @@ mod tests {
     }
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 25);
+        let mut stems = std::collections::BTreeSet::new();
         for kind in QueryLifecycleFaultKind::ALL {
+            assert!(stems.insert(kind.file_stem()), "duplicate fault file stem");
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 23);
+        assert_eq!(
+            parse_runner_rfo_kind("create-task-before-worker-hold"),
+            Some(QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold)
+        );
         assert_eq!(
             parse_runner_rfo_kind("runtime-filter-contribution-ack-drop"),
             Some(QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop)
