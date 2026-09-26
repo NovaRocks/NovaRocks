@@ -796,15 +796,19 @@ fn await_backend_revoked_for_future_admission(
 /// reading only after the BE exit above, so this validates both result delivery
 /// and that no result became visible before recovery was required.
 pub(super) fn assert_two_sleep_rows(stream: &mut MysqlStream) -> Result<()> {
-    let packets = [
-        stream.read_packet("recovered read column count")?,
-        stream.read_packet("recovered read column definition")?,
-        stream.read_packet("recovered read metadata terminator")?,
-        stream.read_packet("recovered read first row")?,
-        stream.read_packet("recovered read second row")?,
-        stream.read_packet("recovered read terminal")?,
-    ];
-    for (offset, packet) in packets.iter().enumerate() {
+    let mut packets = Vec::with_capacity(6);
+    for (offset, operation) in [
+        "recovered read column count",
+        "recovered read column definition",
+        "recovered read metadata terminator",
+        "recovered read first row",
+        "recovered read second row",
+        "recovered read terminal",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let packet = stream.read_packet(operation)?;
         ensure!(
             packet.sequence() == offset as u8 + 1,
             "recovered read packet {} had sequence {}, expected {}",
@@ -812,12 +816,14 @@ pub(super) fn assert_two_sleep_rows(stream: &mut MysqlStream) -> Result<()> {
             packet.sequence(),
             offset + 1
         );
+        // An ERR terminates the response; no later result packet will arrive.
         ensure!(
             !packet.is_error(),
             "recovered read packet {} was a MySQL error: {:?}",
             offset + 1,
             packet.payload()
         );
+        packets.push(packet);
     }
     ensure!(
         packets[0].payload() == [1],

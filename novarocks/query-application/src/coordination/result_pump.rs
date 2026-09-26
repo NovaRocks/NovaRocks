@@ -36,7 +36,7 @@ use novarocks_workload_control::{
 };
 use tokio::sync::{oneshot, watch};
 
-use crate::api::NativeAttemptTerminal;
+use crate::api::{NativeAttemptTerminal, NativeAttemptTopologyRequirement};
 use crate::api::{QueryExecutionError, QueryExecutionErrorKind, ResultSchema};
 
 use super::result_decode::{
@@ -336,13 +336,30 @@ impl RootResultPumpBinding {
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RootResultFetchFailure {
+    topology_requirement: NativeAttemptTopologyRequirement,
     class: AttemptFailureClass,
     error: QueryExecutionError,
 }
 
 impl RootResultFetchFailure {
+    pub const fn with_topology_requirement(
+        mut self,
+        requirement: NativeAttemptTopologyRequirement,
+    ) -> Self {
+        self.topology_requirement = requirement;
+        self
+    }
+
     pub fn new(class: AttemptFailureClass, error: QueryExecutionError) -> Self {
-        Self { class, error }
+        Self {
+            class,
+            error,
+            topology_requirement: NativeAttemptTopologyRequirement::LiveSnapshot,
+        }
+    }
+
+    pub const fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
+        self.topology_requirement
     }
 
     pub const fn class(&self) -> AttemptFailureClass {
@@ -722,6 +739,7 @@ pub enum ResultPumpFailure {
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct ResultPumpDecision {
+    topology_requirement: NativeAttemptTopologyRequirement,
     permit: RunningAttemptPermit,
     observer: Option<RootResultObserver>,
     class: AttemptFailureClass,
@@ -729,6 +747,10 @@ pub struct ResultPumpDecision {
 }
 
 impl ResultPumpDecision {
+    pub const fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
+        self.topology_requirement
+    }
+
     pub const fn class(&self) -> AttemptFailureClass {
         self.class
     }
@@ -853,9 +875,13 @@ impl PumpRuntime {
                 self.native_completed = true;
                 Ok(())
             }
-            Ok(NativeAttemptTerminal::Failed(failure)) => Err(PumpInterruption::Decision(
-                RootResultFetchFailure::new(failure.class(), failure.error().clone()),
-            )),
+            Ok(NativeAttemptTerminal::Failed(failure)) => {
+                Err(PumpInterruption::Decision(RootResultFetchFailure {
+                    class: failure.class(),
+                    error: failure.error().clone(),
+                    topology_requirement: failure.topology_requirement(),
+                }))
+            }
             Err(error) => Err(PumpInterruption::Decision(contract_failure(error))),
         }
     }
@@ -1484,6 +1510,7 @@ fn pump_failure(
     failure: RootResultFetchFailure,
 ) -> ResultPumpFailure {
     ResultPumpFailure::DecisionPending(ResultPumpDecision {
+        topology_requirement: failure.topology_requirement,
         permit,
         observer: None,
         class: failure.class,
@@ -1516,6 +1543,7 @@ async fn bound_pump_failure(
         .await
     {
         Ok(()) => ResultPumpFailure::DecisionPending(ResultPumpDecision {
+            topology_requirement: failure.topology_requirement,
             permit,
             observer: Some(observer.clone()),
             class: failure.class,
@@ -4000,8 +4028,16 @@ mod tests {
         } = harness(24).await;
         let (_status_sender, statuses) = accepted_root_status_projection(root);
         let (terminal_sender, terminal_source) = native_attempt_terminal_channel();
-        terminal_sender.publish(failed_native_terminal(
-            "Native run failed before root status",
+        let failed_backend = novarocks_types::identity::BackendProcessId::new_v7();
+        let NativeAttemptTerminal::Failed(native_failure) =
+            failed_native_terminal("Native run failed before root status")
+        else {
+            unreachable!()
+        };
+        terminal_sender.publish(NativeAttemptTerminal::Failed(
+            native_failure.with_topology_requirement(
+                NativeAttemptTopologyRequirement::ExcludeProcess(failed_backend),
+            ),
         ));
         let ResultPumpFailure::DecisionPending(failure) = run_root_result_pump(
             permit,
@@ -4025,6 +4061,10 @@ mod tests {
         assert_eq!(
             failure.class(),
             AttemptFailureClass::RecoverableInfrastructure
+        );
+        assert_eq!(
+            failure.topology_requirement(),
+            NativeAttemptTopologyRequirement::ExcludeProcess(failed_backend)
         );
         assert_eq!(
             failure.error().message(),

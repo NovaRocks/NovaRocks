@@ -347,6 +347,15 @@ impl ActorGateOwner {
         result.map(|()| moved)
     }
 
+    /// Settles every already observed Worker verdict after the Task round has
+    /// failed. No new actor authorization is legal for a terminal attempt.
+    pub(crate) async fn settle_terminal_acknowledgements(
+        &mut self,
+        drive: &NativeAttemptDrive,
+    ) -> Result<usize, TaskExecutionError> {
+        self.settle_acknowledgements(drive).await
+    }
+
     /// Closes the role-local half after the active run has stopped issuing
     /// actor-gated operations.
     ///
@@ -491,6 +500,7 @@ impl ActorGateOwner {
         drive: &NativeAttemptDrive,
     ) -> Result<usize, TaskExecutionError> {
         let mut moved = 0;
+        let mut first_error = None;
         loop {
             if self.active_acknowledgement.is_none() {
                 self.active_acknowledgement = self.shared.take_acknowledgement();
@@ -514,16 +524,14 @@ impl ActorGateOwner {
                     moved += settled;
                 }
                 Err(error) => {
-                    // This exact fact caused the terminal contract error and
-                    // is consumed into that error. Later facts stay queued for
-                    // the next drive; retrying this permanently invalid fact
-                    // would prevent convergence.
+                    // Consume this failed fact, but settle later independent
+                    // Worker verdicts before returning the first error.
                     self.active_acknowledgement = None;
-                    return Err(error);
+                    first_error.get_or_insert(error);
                 }
             }
         }
-        Ok(moved)
+        first_error.map_or(Ok(moved), Err)
     }
 
     async fn settle_admission_acknowledgement(
@@ -1452,29 +1460,135 @@ mod tests {
         assert_eq!(inner.submitted.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn failed_ack_settlement_consumes_current_fact_without_dropping_later_facts() {
+    #[tokio::test]
+    async fn terminal_ack_drain_settles_later_verdict_after_first_error() {
+        let backend = BackendProcessId::new_v7();
+        let context = context(backend);
+        let (mut logical, drive, _abort_intake) = logical_execution(context).await;
         let inner = Arc::new(CountingSink::default());
         let wake = Arc::new(CountingWake::default());
-        let (_sink, owner, _observer) = ActorGatedTaskOperationSink::pair(
+        let (_sink, mut owner, observer) = ActorGatedTaskOperationSink::pair(
             inner as Arc<dyn TaskOperationSink>,
             wake,
             NativeCompatibilityId::new([13; 32]),
         );
-        let first = OperationAcknowledgement::transport_unknown(
-            TaskOperationId::new_v7(),
-            OperationKind::UpdateQueryContext,
+        let OperationIntent::AcquireQueryContextAdmissionTicket(request) = admission(context, 13)
+        else {
+            unreachable!()
+        };
+        let issue = drive.begin_admission_issue(request).await.unwrap();
+        let invalid_operation = TaskOperationId::new_v7();
+        owner.admission_issues.insert(invalid_operation, issue);
+        owner
+            .admission_issues
+            .insert(request.envelope().operation_id(), issue);
+        let first = OperationAcknowledgement::worker_receipt(
+            invalid_operation,
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            OperationOutcome::InvalidStateOrRequest,
+            AckPayload::None,
         );
-        let second = OperationAcknowledgement::transport_unknown(
-            TaskOperationId::new_v7(),
-            OperationKind::UpdateQueryContext,
+        let second = OperationAcknowledgement::worker_receipt(
+            request.envelope().operation_id(),
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            OperationOutcome::Accepted,
+            AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+                AdmissionTicketId::try_from_bytes([13; 16]).unwrap(),
+                context,
+                request.valid_for(),
+            )),
         );
-        owner.shared.enqueue_acknowledgement(first.clone());
-        owner.shared.enqueue_acknowledgement(second.clone());
+        observer.observe_acknowledgement(&first).unwrap();
+        observer.observe_acknowledgement(&second).unwrap();
 
-        let failed = owner.shared.take_acknowledgement().unwrap();
-        assert_eq!(failed, first);
-        assert_eq!(owner.shared.take_acknowledgement(), Some(second));
+        let result = owner.settle_terminal_acknowledgements(&drive).await;
+        assert!(
+            result.is_err(),
+            "the first settlement must fail: {result:?}"
+        );
         assert_eq!(owner.shared.take_acknowledgement(), None);
+        assert_eq!(owner.active_acknowledgement, None);
+        assert!(
+            !owner
+                .admission_issues
+                .contains_key(&request.envelope().operation_id())
+        );
+        assert!(owner.prepare_convergence());
+
+        drop(drive);
+        drop(owner);
+        logical.abandon_running_attempt();
+        while logical
+            .stand_down_snapshot(context)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+        logical
+            .observe_worker_process_replaced(context)
+            .await
+            .unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_ack_drain_does_not_authorize_queued_admission() {
+        let backend = BackendProcessId::new_v7();
+        let context = context(backend);
+        let (mut logical, drive, _abort_intake) = logical_execution(context).await;
+        let inner = Arc::new(CountingSink::default());
+        let wake = Arc::new(CountingWake::default());
+        let (sink, mut owner, _observer) = ActorGatedTaskOperationSink::pair(
+            inner as Arc<dyn TaskOperationSink>,
+            wake,
+            NativeCompatibilityId::new([14; 32]),
+        );
+        let retained = match sink.try_submit(batch(backend, admission(context, 14))) {
+            TaskOperationSubmit::Backpressured(batch) => batch,
+            other => panic!("admission awaits actor authorization: {other:?}"),
+        };
+        assert_eq!(owner.pending_authorizations(), 1);
+
+        // This is the gate path ManifestAssembledRound takes after turn() fails.
+        assert_eq!(
+            owner
+                .settle_terminal_acknowledgements(&drive)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(owner.admission_issues.is_empty());
+        assert_eq!(owner.pending_authorizations(), 1);
+        assert!(!owner.prepare_convergence());
+        assert!(matches!(
+            sink.try_submit(retained),
+            TaskOperationSubmit::Rejected { .. }
+        ));
+        assert!(owner.prepare_convergence());
+
+        drop(drive);
+        drop(owner);
+        logical.abandon_running_attempt();
+        while logical
+            .stand_down_snapshot(context)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+        logical
+            .observe_worker_process_replaced(context)
+            .await
+            .unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 }

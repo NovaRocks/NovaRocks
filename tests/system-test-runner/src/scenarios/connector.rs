@@ -864,7 +864,29 @@ impl Scenario for CatalogReadyLifecycle {
             ESTABLISH_CONTEXT_ACK_DROPPED_MARKER,
         )?;
         assert_catalog_runtime_built_at_most_once(&before_replay, &after_replay, CATALOG)?;
-        await_resource_convergence(context, &baseline, "catalog ready lifecycle")?;
+        // A prepared task with no registered fragment must release its query
+        // context at terminal settlement, not wait for the 300-second query
+        // timeout. Allow ample scheduling slack while enforcing that owner.
+        let release_deadline = context
+            .deadline()
+            .min(std::time::Instant::now() + Duration::from_secs(30));
+        context.action("await catalog ready lifecycle resource release within 30 seconds");
+        context
+            .handle()
+            .await_query_execution_resource_convergence(&baseline, release_deadline)
+            .context("catalog ready lifecycle resource release")?;
+        // This scenario never kills a Backend. Resource convergence alone
+        // treats process exit as release, so also require every process to
+        // survive the complete catalog lifecycle.
+        let final_resources = resource_baseline(context)?;
+        if !final_resources.fe_running
+            || final_resources
+                .backends
+                .iter()
+                .any(|backend| !backend.process_running)
+        {
+            bail!("catalog ready lifecycle lost a native process: {final_resources:?}");
+        }
         Ok(())
     }
 }

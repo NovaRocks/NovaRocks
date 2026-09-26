@@ -22,7 +22,7 @@
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks-server", "novarocks/catalog-application", "novarocks/connector-contract", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend-application", "novarocks/fs", "novarocks/functions", "novarocks/memory", "novarocks/memory-arrow", "novarocks/mv-application", "novarocks/mysql-adapter", "novarocks/native-adapter", "novarocks/native-trust", "novarocks/parser", "novarocks/physical-plan", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/state-store/runtime", "novarocks/state-store/sqlite", "novarocks/state-store/testkit", "novarocks/statistics-application", "novarocks/table-maintenance", "novarocks/task-codec", "novarocks/type-contract", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "tests/cluster-harness", "tests/datasketches-tck", "tests/sql/runner", "tests/system-test-runner", "tests/test-support", "tools", "tools/arrow-pool-bench", "tools/connector-binding-bench", "tools/datasketches-bench", "tools/error-manifest"]
+members = ["novarocks-server", "novarocks/catalog-application", "novarocks/connector-contract", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend-application", "novarocks/fs", "novarocks/functions", "novarocks/memory", "novarocks/memory-arrow", "novarocks/mv-application", "novarocks/mysql-adapter", "novarocks/native-adapter", "novarocks/native-trust", "novarocks/parser", "novarocks/physical-plan", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/state-store/runtime", "novarocks/state-store/sqlite", "novarocks/state-store/testkit", "novarocks/statistics-application", "novarocks/table-maintenance", "novarocks/task-codec", "novarocks/type-contract", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "tests/cluster-harness", "tests/datasketches-tck", "tests/sql/runner", "tests/system-test-runner", "tests/test-support", "tools", "tools/connector-binding-bench", "tools/datasketches-bench", "tools/error-manifest"]
 # Native development defaults to the server package.
 default-members = ["novarocks-server"]
 # Vendored upstream packages keep their own workspace and lock authority.
@@ -35,6 +35,7 @@ license = "Apache-2.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
@@ -44,16 +45,9 @@ unimplemented = "deny"
 [workspace.dependencies]
 anyhow = "1"
 apache-avro = "0.21"
-# The `pool` feature is a process-level semantic switch, not one consumer's
-# option: it adds a reservation to every `Bytes` and `MutableBuffer` in the
-# build, so enabling it anywhere but here would leave a single-crate test or a
-# benchmark observing different buffer behaviour from the shipping binary. It
-# is what lets `novarocks-memory-arrow` bind a charge to a buffer's real
-# backing. Design: ADR-0148
-# (docs/adr/ADR-0148-process-memory-capacity-authority.md).
-arrow = { version = "58.2.0", features = ["pool"] }
-arrow-array = { version = "58.2.0", features = ["pool"] }
-arrow-buffer = { version = "58.2.0", features = ["pool"] }
+arrow = "58.2.0"
+arrow-array = "58.2.0"
+arrow-buffer = "58.2.0"
 arrow-cast = "58.2.0"
 arrow-schema = "58.2.0"
 async-trait = "0.1"

@@ -435,7 +435,7 @@ impl QueryControlService {
         let cancellation = match GovernedStatementCancellation::new(&root.owner) {
             Ok(cancellation) => cancellation,
             Err(error) => {
-                root.owner.complete();
+                root.owner.complete_after_terminal_cancel_settled();
                 return Err(GovernedQueryStatementBeginError::Admission(error));
             }
         };
@@ -446,7 +446,7 @@ impl QueryControlService {
         ) {
             Ok(registration) => registration,
             Err(error) => {
-                root.owner.complete();
+                root.owner.complete_after_terminal_cancel_settled();
                 return Err(GovernedQueryStatementBeginError::QueryControl(error));
             }
         };
@@ -454,7 +454,7 @@ impl QueryControlService {
         let query_admission = match scope.admit_query() {
             Ok(admission) => admission,
             Err(error) => {
-                root.owner.complete();
+                root.owner.complete_after_terminal_cancel_settled();
                 let _ = self.port.fail_governed_statement(registration.token());
                 return Err(GovernedQueryStatementBeginError::Admission(error));
             }
@@ -466,7 +466,7 @@ impl QueryControlService {
                     root.owner.complete_after_terminal_cancel_settled();
                     let _ = self.port.finish_governed_statement(registration.token());
                 } else {
-                    root.owner.complete();
+                    root.owner.complete_after_terminal_cancel_settled();
                     let _ = self.port.fail_governed_statement(registration.token());
                 }
                 return Err(GovernedQueryStatementBeginError::Admission(error));
@@ -510,7 +510,7 @@ impl QueryControlService {
         let cancellation = match GovernedStatementCancellation::new(&root.owner) {
             Ok(cancellation) => cancellation,
             Err(error) => {
-                root.owner.complete();
+                root.owner.complete_after_terminal_cancel_settled();
                 root.business.release();
                 return Err(GovernedQueryStatementBeginError::Admission(error));
             }
@@ -522,7 +522,7 @@ impl QueryControlService {
         ) {
             Ok(registration) => registration,
             Err(error) => {
-                root.owner.complete();
+                root.owner.complete_after_terminal_cancel_settled();
                 root.business.release();
                 return Err(GovernedQueryStatementBeginError::QueryControl(error));
             }
@@ -692,10 +692,12 @@ impl GovernedQueryStatementOwner {
 
     /// Releases only the execution root after synchronous work has stopped.
     /// The statement generation and business permit intentionally remain with
-    /// this owner until the protocol terminal outcome is known.
+    /// this owner until the protocol terminal outcome is known. The protocol
+    /// keeps the cancellation view; no execution dispatcher remains to consume
+    /// a Cancel control after this local work has stopped.
     pub fn complete_execution(&mut self) {
         if let Some(owner) = self.execution_owner.take() {
-            owner.complete();
+            owner.complete_after_terminal_cancel_settled();
         }
     }
 
@@ -736,9 +738,7 @@ impl GovernedQueryStatementOwner {
             return GovernedStatementFinishOutcome::Stale;
         }
         self.finished = true;
-        if let Some(owner) = self.execution_owner.take() {
-            owner.complete_after_terminal_cancel_settled();
-        }
+        self.complete_local_owner_after_terminal();
         self.release_terminal_concurrency();
         let outcome = self
             .service
@@ -772,9 +772,7 @@ impl GovernedQueryStatementOwner {
             return GovernedStatementFinishOutcome::Stale;
         }
         self.finished = true;
-        if let Some(owner) = self.execution_owner.take() {
-            owner.complete();
-        }
+        self.complete_local_owner_after_terminal();
         self.release_terminal_concurrency();
         let outcome = self
             .service
@@ -788,15 +786,22 @@ impl GovernedQueryStatementOwner {
             return GovernedStatementFinishOutcome::Stale;
         }
         self.finished = true;
-        if let Some(owner) = self.execution_owner.take() {
-            owner.complete();
-        }
+        self.complete_local_owner_after_terminal();
         self.release_terminal_concurrency();
         let outcome = self
             .service
             .port
             .finish_governed_statement(self.registration.token());
         outcome
+    }
+
+    // A root still held here never reached the logical execution supervisor.
+    // This terminal path has no actor left to consume its Cancel control;
+    // the cancellation reason remains visible through the statement token.
+    fn complete_local_owner_after_terminal(&mut self) {
+        if let Some(owner) = self.execution_owner.take() {
+            owner.complete_after_terminal_cancel_settled();
+        }
     }
 }
 
@@ -805,9 +810,7 @@ impl Drop for GovernedQueryStatementOwner {
         if !self.finished {
             if self.success_visibility_sealed {
                 self.finished = true;
-                if let Some(owner) = self.execution_owner.take() {
-                    owner.complete();
-                }
+                self.complete_local_owner_after_terminal();
                 self.release_terminal_concurrency();
                 let _ = self
                     .service

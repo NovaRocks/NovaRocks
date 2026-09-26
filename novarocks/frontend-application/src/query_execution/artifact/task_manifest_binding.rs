@@ -292,11 +292,27 @@ impl FrozenAttemptTopology {
     pub(crate) fn capture(
         snapshot: BackendTopologySnapshot,
     ) -> Result<Self, DistributedQueryError> {
+        Self::capture_for_candidate(
+            snapshot,
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot,
+        )
+    }
+
+    pub(crate) fn capture_for_candidate(
+        snapshot: BackendTopologySnapshot,
+        requirement: novarocks_query_application::api::NativeAttemptTopologyRequirement,
+    ) -> Result<Self, DistributedQueryError> {
         let revision = snapshot.revision();
+        // Retain every exact owner-provided target. Selection constrains this
+        // attempt's placement, never the registry's membership snapshot.
         let backends = validate_backend_snapshot(snapshot.targets())?;
         let eligible_backends = backends
             .keys()
             .copied()
+            .filter(|process| match requirement {
+                novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot => true,
+                novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(excluded) => *process != excluded,
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Ok(Self {
@@ -1354,6 +1370,35 @@ mod tests {
             descriptor,
             AdmissionEpochCapability::try_from_bytes([epoch; 16]).expect("nonzero admission epoch"),
         )
+    }
+
+    #[test]
+    fn successor_selection_preserves_the_complete_owner_snapshot() {
+        let failed = BackendProcessId::new_v7();
+        let remaining = BackendProcessId::new_v7();
+        let snapshot = BackendTopologySnapshot::try_new(
+            7,
+            vec![
+                live_target(0, failed, 18999),
+                live_target(1, remaining, 19000),
+            ],
+        )
+        .unwrap();
+        let frozen = FrozenAttemptTopology::capture_for_candidate(
+            snapshot,
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                failed,
+            ),
+        )
+        .unwrap();
+        assert_eq!(frozen.eligible_backends(), &[remaining]);
+        assert_eq!(frozen.revision(), 7);
+        let (_, retained) = frozen.into_parts();
+        assert!(
+            retained.contains_key(&failed),
+            "failed target remains an exact snapshot fact"
+        );
+        assert!(retained.contains_key(&remaining));
     }
 
     #[test]

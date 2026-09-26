@@ -633,6 +633,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         self.capabilities.close_context(context);
     }
 
+    fn retire_context_execution(&self, context: QueryContextRef) {
+        self.queries
+            .retire_idle_execution(context.query_execution_id());
+    }
+
     fn forget_context_admission(&self, context: QueryContextRef) {
         self.capabilities.forget_context(context);
     }
@@ -1471,7 +1476,7 @@ mod tests {
     };
     use crate::task_query_context_options::query_options_fingerprint;
 
-    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1512,7 +1517,7 @@ mod tests {
     use novarocks_execution_contract::task_execution::operation::{
         AcquireQueryContextAdmissionTicket, CreateTask, CredentialUpdate, EstablishQueryContext,
         OperationEnvelope, OperationKind, OperationOutcome, QueryContextDomainUpdate,
-        TaskDomainUpdate, UpdateQueryContext,
+        ReleaseQueryContext, TaskDomainUpdate, UpdateQueryContext,
     };
     use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
@@ -1529,6 +1534,7 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use novarocks_types::{NativeCompatibilityId, UniqueId};
+    use novarocks_worker::query_context::{QueryExecutionKey, query_context_manager};
     use novarocks_worker::{InboundFrameClaim, IngressRejection, TaskInboundCapabilities};
     use prost::Message;
 
@@ -3540,6 +3546,10 @@ mod tests {
             self.inner.close_context_admission(context);
         }
 
+        fn retire_context_execution(&self, context: QueryContextRef) {
+            self.inner.retire_context_execution(context);
+        }
+
         fn forget_context_admission(&self, context: QueryContextRef) {
             self.inner.forget_context_admission(context);
         }
@@ -3742,6 +3752,47 @@ mod tests {
             let (request, input): (CreateTask, TaskCreationInput) = decoded.into_parts();
             self.registry.create_task(&request, input)
         }
+    }
+
+    #[test]
+    fn terminal_task_context_retires_prepared_unregistered_query_context() {
+        let fixture = OwnerFixture::new(60_901);
+        let execution = fixture.context.query_execution_id();
+        let query = QueryExecutionKey::native_attempt(
+            QueryId::new(execution.query_id().high(), execution.query_id().low()),
+            NonZeroU64::new(execution.attempt_id().get()).unwrap(),
+        );
+        fixture
+            .host
+            .inner
+            .queries
+            .prepare_admission_execution(
+                execution,
+                UniqueId::new(60_903, 1),
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+                None,
+                None,
+            )
+            .expect("preparation creates the zero-fragment query context");
+        assert!(
+            query_context_manager()
+                .query_mem_tracker_execution(query)
+                .is_some()
+        );
+
+        let released = fixture
+            .registry
+            .release_query_context(&ReleaseQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+            ));
+        assert_eq!(released.outcome(), OperationOutcome::Accepted);
+        assert!(
+            query_context_manager()
+                .query_mem_tracker_execution(query)
+                .is_none()
+        );
     }
 
     /// A winning round interprets its body once; a replay of the same

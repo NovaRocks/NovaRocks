@@ -54,21 +54,6 @@ pub struct NativeFragmentQueryRuntime {
 }
 
 impl NativeFragmentQueryRuntime {
-    pub fn publish_resource_snapshot(&self) {
-        let snapshot = self.manager.native_execution_resource_snapshot();
-        crate::backend_metrics::publish_backend_query_execution_resource(
-            "native_query_contexts_active",
-            snapshot.active_contexts,
-        );
-        crate::backend_metrics::publish_backend_query_execution_resource(
-            "native_query_contexts_second_chance",
-            snapshot.second_chance_contexts,
-        );
-        crate::backend_metrics::publish_backend_query_execution_resource(
-            "native_query_active_fragments",
-            snapshot.active_fragments,
-        );
-    }
     pub fn global(memory_authority: Arc<MemoryAuthority>) -> Self {
         Self {
             manager: query_context_manager(),
@@ -132,7 +117,6 @@ impl NativeFragmentQueryRuntime {
             fragment_mem_tracker,
             runtime_filter,
         };
-        self.publish_resource_snapshot();
         Ok(resources)
     }
 
@@ -158,14 +142,17 @@ impl NativeFragmentQueryRuntime {
             fragment_instance_id,
             active: true,
         };
-        self.publish_resource_snapshot();
         Ok(lease)
     }
 
     pub fn finish_fragment(&self, execution_id: QueryExecutionId) {
         self.manager
             .finish_fragment_execution(execution_key(execution_id));
-        self.publish_resource_snapshot();
+    }
+
+    pub fn retire_idle_execution(&self, execution_id: QueryExecutionId) -> bool {
+        self.manager
+            .retire_idle_native_execution(execution_key(execution_id))
     }
 
     pub fn unregister_fragment_execution(
@@ -175,7 +162,6 @@ impl NativeFragmentQueryRuntime {
     ) {
         self.manager
             .unregister_finst_execution(fragment_instance_id, execution_key(execution_id));
-        self.publish_resource_snapshot();
     }
 }
 

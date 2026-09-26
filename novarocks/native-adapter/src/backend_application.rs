@@ -254,6 +254,8 @@ struct UnroutedTaskExecutionHost;
 impl TaskExecutionHost for UnroutedTaskExecutionHost {
     fn close_context_admission(&self, _context: QueryContextRef) {}
 
+    fn retire_context_execution(&self, _context: QueryContextRef) {}
+
     fn forget_context_admission(&self, _context: QueryContextRef) {}
 
     fn install_receiver(
@@ -379,10 +381,6 @@ fn compose_backend_application_services(
             )
         },
     )?);
-    novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime::global(
-        Arc::clone(&memory_authority),
-    )
-    .publish_resource_snapshot();
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
     let runtime_filter_factory = NativeRuntimeFilterParticipantFactory::new(data_runtime.clone());
@@ -627,6 +625,10 @@ impl BackendApplicationHost {
                 .map_err(|error| {
                     BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
                 })?
+                .with_native_query_resources(Arc::new(|| {
+                    novarocks_worker::query_context::query_context_manager()
+                        .native_execution_resource_snapshot()
+                }))
                 .with_worker_reservations(
                     services
                         .task_execution_registry

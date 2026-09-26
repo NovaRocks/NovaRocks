@@ -2674,6 +2674,7 @@ impl TaskExecutionRegistry {
             self.ports.discard_task(identity);
         }
         self.admission_tickets.release_context(context, now);
+        self.task_host.retire_context_execution(context);
 
         let entry = state
             .contexts

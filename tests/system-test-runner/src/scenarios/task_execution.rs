@@ -93,6 +93,10 @@ impl Scenario for StartupBaseline {
         "task-execution/startup-baseline"
     }
 
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
     fn validate_runner_inputs(
         &self,
         launch_profile: LaunchProfile,

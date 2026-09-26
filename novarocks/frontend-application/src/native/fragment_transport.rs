@@ -597,6 +597,21 @@ impl NativeRootResultFetchError {
         }
     }
 
+    fn into_pump_failure_for_backend(
+        self,
+        backend: novarocks_types::identity::BackendProcessId,
+    ) -> RootResultFetchFailure {
+        let requirement = if self.class == NativeRootResultFetchErrorClass::Infrastructure {
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                backend,
+            )
+        } else {
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+        };
+        self.into_pump_failure()
+            .with_topology_requirement(requirement)
+    }
+
     fn into_pump_failure(self) -> RootResultFetchFailure {
         let (class, kind) = match self.class {
             NativeRootResultFetchErrorClass::Infrastructure => (
@@ -796,7 +811,9 @@ pub(crate) fn native_root_result_pump_binding(
                     request.max_result_bytes,
                 )
                 .await
-                .map_err(NativeRootResultFetchError::into_pump_failure)?;
+                .map_err(|error| {
+                    error.into_pump_failure_for_backend(request.root.backend_process_id())
+                })?;
             adapt_native_root_result_outcome(outcome, expected_output_schema)
         }
     })
@@ -1183,6 +1200,24 @@ mod tests {
         let capacity = NativeRootResultFetchError::resource_governance("fetch intake closed")
             .into_pump_failure();
         assert_eq!(capacity.class(), AttemptFailureClass::ResourceGovernance);
+    }
+
+    #[test]
+    fn fetch_transport_loss_excludes_only_its_exact_root_process() {
+        use novarocks_query_application::api::NativeAttemptTopologyRequirement;
+        let backend = novarocks_types::identity::BackendProcessId::new_v7();
+        let lost = NativeRootResultFetchError::infrastructure("endpoint lost")
+            .into_pump_failure_for_backend(backend);
+        assert_eq!(
+            lost.topology_requirement(),
+            NativeAttemptTopologyRequirement::ExcludeProcess(backend)
+        );
+        let refusal = NativeRootResultFetchError::contract("answered refusal")
+            .into_pump_failure_for_backend(backend);
+        assert_eq!(
+            refusal.topology_requirement(),
+            NativeAttemptTopologyRequirement::LiveSnapshot
+        );
     }
 
     #[test]

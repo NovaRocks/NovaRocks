@@ -36,7 +36,7 @@ cat >"$fake_runner" <<'RUNNER'
 #!/usr/bin/env bash
 set -uo pipefail
 
-if [ "${1:-}" = "--list" ]; then
+if [ "${1:-}" = "--list-default" ]; then
   if [ -n "${FAKE_RUNNER_LIST_FAILS:-}" ]; then
     echo "registry exploded" >&2
     exit 3

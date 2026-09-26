@@ -121,19 +121,45 @@ impl fmt::Display for LogicalNativeOpenError {
 
 impl std::error::Error for LogicalNativeOpenError {}
 
+/// Placement constraint retained from a failed attempt's typed transport verdict.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeAttemptTopologyRequirement {
+    #[default]
+    LiveSnapshot,
+    /// Successor placement selects other eligible processes from the live snapshot.
+    ExcludeProcess(BackendProcessId),
+}
+
 /// Runtime failure while preparing one physical attempt.
 ///
 /// Coordination consumes the attempt failure class for recovery policy and
 /// retains the query error for the caller-visible terminal result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeAttemptPreparationFailure {
+    topology_requirement: NativeAttemptTopologyRequirement,
     class: AttemptFailureClass,
     error: QueryExecutionError,
 }
 
 impl NativeAttemptPreparationFailure {
     pub const fn new(class: AttemptFailureClass, error: QueryExecutionError) -> Self {
-        Self { class, error }
+        Self {
+            class,
+            error,
+            topology_requirement: NativeAttemptTopologyRequirement::LiveSnapshot,
+        }
+    }
+
+    pub const fn with_topology_requirement(
+        mut self,
+        requirement: NativeAttemptTopologyRequirement,
+    ) -> Self {
+        self.topology_requirement = requirement;
+        self
+    }
+
+    pub const fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
+        self.topology_requirement
     }
 
     pub const fn class(&self) -> AttemptFailureClass {
@@ -718,6 +744,7 @@ impl LogicalNativeSession {
                 logical_ticket: Arc::clone(&self.ticket),
                 attempt_ticket: Arc::clone(&attempt_ticket),
                 execution,
+                topology_requirement: NativeAttemptTopologyRequirement::LiveSnapshot,
             },
             NativeAttemptPreparationAcceptance::new(&self.ticket, attempt_ticket, execution),
         ))
@@ -769,6 +796,7 @@ pub enum NativeScanWork {
 /// }
 /// ```
 pub struct NativeAttemptPreparationRequest {
+    topology_requirement: NativeAttemptTopologyRequirement,
     logical_ticket: Arc<LogicalNativeTicket>,
     attempt_ticket: Arc<AttemptTicket>,
     execution: QueryExecutionId,
@@ -784,6 +812,18 @@ impl fmt::Debug for NativeAttemptPreparationRequest {
 }
 
 impl NativeAttemptPreparationRequest {
+    pub const fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
+        self.topology_requirement
+    }
+
+    pub(crate) fn require_topology(
+        mut self,
+        requirement: NativeAttemptTopologyRequirement,
+    ) -> Self {
+        self.topology_requirement = requirement;
+        self
+    }
+
     pub const fn execution(&self) -> QueryExecutionId {
         self.execution
     }

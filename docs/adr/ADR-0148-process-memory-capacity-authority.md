@@ -12,7 +12,6 @@ provenance:
 code-anchors:
   - "novarocks/memory/src/lib.rs (crate root)"
   - "novarocks/memory/src/account.rs (Account, AccountHandle)"
-  - "novarocks/memory-arrow/src/pool.rs (FulfilmentPool)"
   - "novarocks-server/src/memory_observation.rs (GLOBAL)"
 ---
 

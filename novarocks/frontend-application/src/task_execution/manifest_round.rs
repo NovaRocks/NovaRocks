@@ -275,13 +275,20 @@ impl ManifestAssembledRound {
         }
         let report = self.round.turn();
         // ACK observers run inside TaskRound before a state-machine error is
-        // returned. Always let the actor gate settle those observed ACKs so a
-        // local protocol failure cannot strand authorization responsibility.
-        let gated = self.actor_gate.drive(drive).await;
-        match (report, gated) {
-            (Ok(report), Ok(gated)) => Ok(!report.is_idle() || gated != 0),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+        // returned. Settle all observed ACKs before publishing that error,
+        // without authorizing another batch for the terminal attempt.
+        match report {
+            Ok(report) => {
+                let gated = self.actor_gate.drive(drive).await?;
+                Ok(!report.is_idle() || gated != 0)
+            }
+            Err(error) => {
+                let _ = self
+                    .actor_gate
+                    .settle_terminal_acknowledgements(drive)
+                    .await;
+                Err(error)
+            }
         }
     }
 
@@ -458,6 +465,20 @@ impl ManifestAssembledRound {
 }
 
 fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
+    let topology_requirement = match &error {
+        TaskExecutionError::ParticipantUnobservable {
+            backend,
+            state: ParticipantObservationFailure::Transport(_),
+        }
+        | TaskExecutionError::PreReadyEstablishTransportUnknown { backend }
+        | TaskExecutionError::PreReadyEstablishRejected {
+            backend,
+            outcome: novarocks_execution_contract::OperationOutcome::IdentityMismatch,
+        } => novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+            *backend,
+        ),
+        _ => novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot,
+    };
     let (class, kind) = match &error {
         TaskExecutionError::Capacity(_) => (
             AttemptFailureClass::ResourceGovernance,
@@ -488,10 +509,13 @@ fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
             QueryExecutionErrorKind::InvalidRequest,
         ),
     };
-    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::new(
-        class,
-        QueryExecutionError::new(kind, format!("Native Task protocol failed: {error}")),
-    ))
+    NativeAttemptTerminal::Failed(
+        NativeAttemptPreparationFailure::new(
+            class,
+            QueryExecutionError::new(kind, format!("Native Task protocol failed: {error}")),
+        )
+        .with_topology_requirement(topology_requirement),
+    )
 }
 
 fn cancellation_failure(reason: CancellationReason) -> NativeAttemptTerminal {
@@ -534,9 +558,10 @@ mod tests {
 
     #[test]
     fn pre_ready_establish_unknown_preserves_whole_attempt_recovery() {
+        let backend = novarocks_types::identity::BackendProcessId::new_v7();
         let terminal =
             task_protocol_failure(TaskExecutionError::PreReadyEstablishTransportUnknown {
-                backend: novarocks_types::identity::BackendProcessId::new_v7(),
+                backend,
             });
         let NativeAttemptTerminal::Failed(failure) = terminal else {
             panic!("transport uncertainty must terminate the old attempt");
@@ -546,6 +571,12 @@ mod tests {
             AttemptFailureClass::RecoverableInfrastructure
         );
         assert_eq!(failure.error().kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                backend
+            )
+        );
     }
 
     #[test]
@@ -562,5 +593,45 @@ mod tests {
             AttemptFailureClass::RecoverableInfrastructure
         );
         assert_eq!(failure.error().kind(), QueryExecutionErrorKind::Failed);
+    }
+    #[test]
+    fn pre_ready_identity_mismatch_excludes_the_failed_process() {
+        let backend = novarocks_types::identity::BackendProcessId::new_v7();
+        let NativeAttemptTerminal::Failed(failure) =
+            task_protocol_failure(TaskExecutionError::PreReadyEstablishRejected {
+                backend,
+                outcome: novarocks_execution_contract::OperationOutcome::IdentityMismatch,
+            })
+        else {
+            panic!("identity mismatch must fail the attempt");
+        };
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                backend
+            )
+        );
+    }
+    #[test]
+    fn lost_status_transport_preserves_failed_process_for_replacement() {
+        let backend = novarocks_types::identity::BackendProcessId::new_v7();
+        let NativeAttemptTerminal::Failed(failure) =
+            task_protocol_failure(TaskExecutionError::ParticipantUnobservable {
+                backend,
+                state: ParticipantObservationFailure::Transport("stream_lost"),
+            })
+        else {
+            panic!("lost participant must fail the attempt");
+        };
+        assert_eq!(
+            failure.class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                backend
+            )
+        );
     }
 }

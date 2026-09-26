@@ -1017,6 +1017,75 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_local_query_terminals_do_not_leave_ready_control() {
+        for terminal in 0..3 {
+            let (control, service, workload) = governed_control();
+            let session = register(&control, 7, 1, "root");
+            let statement = service
+                .begin_governed_query_statement(
+                    session,
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("governed query statement");
+            assert_eq!(
+                control.cancel_session_statement(
+                    session,
+                    QueryCancellationReason::DeadlineExceeded { timeout_ms: 50 },
+                ),
+                QueryCancelOutcome::Requested
+            );
+
+            match terminal {
+                0 => {
+                    assert_eq!(
+                        statement.finish(),
+                        GovernedStatementFinishOutcome::Cancelled(
+                            CancellationReason::DeadlineExceeded
+                        )
+                    );
+                }
+                1 => {
+                    assert_eq!(
+                        statement.protocol_fail(),
+                        GovernedStatementFinishOutcome::ProtocolFailed
+                    );
+                }
+                _ => drop(statement),
+            }
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
+            assert!(workload.next_control().is_none());
+        }
+    }
+
+    #[test]
+    fn cancelled_synchronous_execution_settles_control_before_protocol_finish() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let mut statement = service
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
+            .expect("governed query statement");
+        assert_eq!(
+            control.cancel_session_statement(
+                session,
+                QueryCancellationReason::DeadlineExceeded { timeout_ms: 50 },
+            ),
+            QueryCancelOutcome::Requested
+        );
+
+        statement.complete_execution();
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        assert!(workload.next_control().is_none());
+        assert_eq!(
+            statement.finish(),
+            GovernedStatementFinishOutcome::Cancelled(CancellationReason::DeadlineExceeded)
+        );
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+
+    #[test]
     fn governed_generation_and_business_permit_span_execution_start_to_protocol_finish() {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");

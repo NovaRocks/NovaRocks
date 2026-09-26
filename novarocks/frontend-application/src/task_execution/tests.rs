@@ -4325,6 +4325,76 @@ fn accepted_create_ack(intent: &OperationIntent) -> OperationAcknowledgement {
     )
 }
 
+#[test]
+fn a_rejected_establish_does_not_discard_later_context_acknowledgements() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::dispatch::DispatchOperationState;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let harness = Harness::from_graph(graph);
+    let sink = Arc::clone(&harness.sink);
+    let wake = Arc::clone(&harness.wake);
+    let intake = TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>);
+    let acks = intake.handle();
+    let mut round = TaskRound::new(
+        harness.execution,
+        intake,
+        Box::new(FakeEstablish),
+        Arc::new(RecordingSubscriptions::default()),
+    );
+    round.seal_pumps();
+
+    round.turn().expect("admission dispatch");
+    for intent in released_admissions(&sink) {
+        acks.publish(admission_ack(&intent));
+    }
+    round.turn().expect("admission settlement");
+    let establishes = released_establishes(&sink);
+    assert_eq!(establishes.len(), 2);
+    let OperationIntent::EstablishQueryContext(rejected) = &establishes[0] else {
+        unreachable!("an establish carries its request");
+    };
+    let OperationIntent::EstablishQueryContext(accepted) = &establishes[1] else {
+        unreachable!("an establish carries its request");
+    };
+    acks.publish(OperationAcknowledgement::new(
+        establishes[0].operation_id(),
+        OperationKind::UpdateQueryContext,
+        OperationOutcome::InvalidStateOrRequest,
+        AckPayload::None,
+    ));
+    acks.publish(establish_ack(&establishes[1]));
+
+    assert!(matches!(
+        round.turn(),
+        Err(TaskExecutionError::PreReadyEstablishRejected { .. })
+    ));
+    assert_eq!(
+        round.execution().owner(accepted.context()).unwrap().state(),
+        QueryContextState::Active,
+        "a failed peer must not discard this context's definitive Worker receipt"
+    );
+    assert!(
+        round
+            .execution()
+            .owner(rejected.context())
+            .unwrap()
+            .is_released()
+    );
+    assert_eq!(
+        round
+            .execution()
+            .dispatcher()
+            .operation_state(establishes[1].operation_id())
+            .unwrap(),
+        DispatchOperationState::Absent,
+        "the accepted establish cannot remain in flight after its receipt"
+    );
+}
+
 /// The defect this catches: the runner subscribed to task status for every
 /// context on the same turn that merely *released* the establish, so the
 /// subscription and the establish raced to the backend as two independent

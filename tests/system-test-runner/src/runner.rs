@@ -16,6 +16,12 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+    if cli.list_default {
+        for scenario in select(&scenarios, &[])? {
+            println!("{}", scenario.name());
+        }
+        return Ok(());
+    }
     let config = RunnerConfig::from_cli(&cli)?;
     let selected = select(&scenarios, &cli.only)?;
     if selected.is_empty() {
@@ -237,6 +243,7 @@ mod tests {
         let selected = select(&scenarios, &[]).expect("select default system baseline");
         assert!(selected.iter().all(|scenario| {
             scenario.name() != "frontend-lifecycle/blue-green-session-cutover"
+                && scenario.name() != "query-concurrency/uea4a1-b0-performance"
         }));
         assert!(
             select(
@@ -247,6 +254,19 @@ mod tests {
             .iter()
             .any(|scenario| scenario.name() == "frontend-lifecycle/blue-green-session-cutover")
         );
+    }
+
+    #[test]
+    fn default_selection_accepts_the_default_launch_inputs() {
+        let scenarios = crate::scenarios::all();
+        for scenario in select(&scenarios, &[]).expect("select default system baseline") {
+            scenario
+                .validate_runner_inputs(
+                    novarocks_cluster_harness::LaunchProfile::FaultScenario,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("default scenario {}: {error:#}", scenario.name()));
+        }
     }
 
     #[test]

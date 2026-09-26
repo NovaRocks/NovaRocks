@@ -117,6 +117,99 @@ mod tests {
         assert!(error.contains("already has limit 1024"), "{error}");
     }
 
+    #[test]
+    fn terminal_attempt_retires_a_prepared_context_without_a_registered_fragment() {
+        let manager = QueryContextManager::new_for_test();
+        let runtime = NativeFragmentQueryRuntime::new_for_test(
+            manager.clone(),
+            crate::backend_test_support::test_memory_authority(),
+        );
+        let query_id = QueryId::new(91_111, 91_112);
+        let first = QueryExecutionId::new(query_id, AttemptId::new(1).unwrap()).unwrap();
+        let second = QueryExecutionId::new(query_id, AttemptId::new(2).unwrap()).unwrap();
+        runtime
+            .prepare_admission_execution(
+                first,
+                UniqueId::new(91_113, 1),
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+                Some(4096),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.native_execution_resource_snapshot().active_contexts,
+            1
+        );
+        assert_eq!(
+            manager
+                .native_execution_resource_snapshot()
+                .active_fragments,
+            0
+        );
+
+        assert!(!runtime.retire_idle_execution(second));
+        assert!(runtime.retire_idle_execution(first));
+        assert_eq!(
+            manager.native_execution_resource_snapshot().active_contexts,
+            0
+        );
+        runtime
+            .prepare_admission_execution(
+                second,
+                UniqueId::new(91_113, 2),
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+                Some(8192),
+                None,
+            )
+            .expect("a successor attempt receives a fresh query context");
+    }
+
+    #[test]
+    fn terminal_attempt_keeps_a_registered_fragment_until_its_owner_releases_it() {
+        let manager = QueryContextManager::new_for_test();
+        let runtime = NativeFragmentQueryRuntime::new_for_test(
+            manager.clone(),
+            crate::backend_test_support::test_memory_authority(),
+        );
+        let execution =
+            QueryExecutionId::new(QueryId::new(91_121, 91_122), AttemptId::new(1).unwrap())
+                .unwrap();
+        let finst = UniqueId::new(91_123, 1);
+        runtime
+            .prepare_admission_execution(
+                execution,
+                finst,
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+                None,
+                None,
+            )
+            .unwrap();
+        let registration = runtime
+            .register_fragment_execution(
+                execution,
+                finst,
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+            )
+            .unwrap();
+
+        assert!(!runtime.retire_idle_execution(execution));
+        assert_eq!(
+            manager
+                .native_execution_resource_snapshot()
+                .active_fragments,
+            1
+        );
+        drop(registration);
+        assert_eq!(
+            manager.native_execution_resource_snapshot().active_contexts,
+            0
+        );
+    }
+
     /// The limit is stated on both mechanisms at the same number, and the
     /// account is one per query rather than one per fragment.
     #[test]

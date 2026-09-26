@@ -811,7 +811,7 @@ impl Drop for LogicalExecutionActorConfig {
     fn drop(&mut self) {
         self.execution_stage.take();
         if let Some(owner) = self.work_owner.take() {
-            owner.complete();
+            owner.complete_after_terminal_cancel_settled();
         }
     }
 }

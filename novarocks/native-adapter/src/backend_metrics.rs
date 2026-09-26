@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::management_http::RoleMetricsRenderer;
+use novarocks_worker::query_context::NativeQueryExecutionResourceSnapshot;
 use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntGaugeVec, Opts, Registry, TextEncoder,
@@ -28,12 +30,18 @@ use prometheus::{
 /// leak a foreign role's metric families through the BE management endpoint.
 pub struct BackendMetricsRegistry {
     registry: Registry,
+    native_query_resources:
+        Option<std::sync::Arc<dyn Fn() -> NativeQueryExecutionResourceSnapshot + Send + Sync>>,
     worker_reservations: Option<(
         std::sync::Arc<novarocks_worker::AdmissionReservationObservation>,
         usize,
     )>,
     worker_registry_lock: Option<std::sync::Arc<novarocks_worker::RegistryLockObservation>>,
 }
+
+// Native query resource gauges are process-global. Serialize their owner
+// snapshot, gauge update, and collection across concurrent management scrapes.
+static NATIVE_QUERY_RESOURCE_SCRAPE_LOCK: Mutex<()> = Mutex::new(());
 
 impl BackendMetricsRegistry {
     pub fn new() -> Result<Self, String> {
@@ -89,9 +97,18 @@ impl BackendMetricsRegistry {
         novarocks_execution::runtime::scan_stream_metrics::register_scan_stream_metrics(&registry)?;
         Ok(Self {
             registry,
+            native_query_resources: None,
             worker_reservations: None,
             worker_registry_lock: None,
         })
+    }
+
+    pub fn with_native_query_resources(
+        mut self,
+        observation: std::sync::Arc<dyn Fn() -> NativeQueryExecutionResourceSnapshot + Send + Sync>,
+    ) -> Self {
+        self.native_query_resources = Some(observation);
+        self
     }
 
     pub fn with_worker_reservations(
@@ -112,6 +129,29 @@ impl BackendMetricsRegistry {
     }
 
     fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
+        let _query_resource_scrape_guard = self.native_query_resources.as_ref().map(|_| {
+            NATIVE_QUERY_RESOURCE_SCRAPE_LOCK
+                .lock()
+                .expect("native query resource scrape lock")
+        });
+        // Contexts can disappear in rollback and expiry paths. The owner is
+        // the only source for these gauges, and the lock keeps concurrent
+        // scrapes from publishing snapshots out of order.
+        if let Some(observation) = &self.native_query_resources {
+            let snapshot = observation();
+            publish_backend_query_execution_resource(
+                "native_query_contexts_active",
+                snapshot.active_contexts,
+            );
+            publish_backend_query_execution_resource(
+                "native_query_contexts_second_chance",
+                snapshot.second_chance_contexts,
+            );
+            publish_backend_query_execution_resource(
+                "native_query_active_fragments",
+                snapshot.active_fragments,
+            );
+        }
         if let Some((observation, limit)) = &self.worker_reservations {
             publish_worker_context_reservation(
                 observation.used(),
@@ -785,11 +825,37 @@ fn ensure_backend_metric_label_families() {
 }
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Barrier};
 
     use prometheus::{IntGauge, Opts, Registry};
 
     use super::*;
+
+    #[test]
+    fn query_resource_scrape_replaces_stale_gauge() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&active);
+        let backend = BackendMetricsRegistry::new()
+            .expect("construct Backend registry")
+            .with_native_query_resources(Arc::new(move || NativeQueryExecutionResourceSnapshot {
+                active_contexts: observed.load(AtomicOrdering::Relaxed),
+                second_chance_contexts: 0,
+                active_fragments: 0,
+            }));
+
+        publish_backend_query_execution_resource("native_query_contexts_active", 1);
+        let rendered = render_metrics(&backend).expect("render refreshed Backend metrics");
+        assert!(rendered.contains(
+            "novarocks_backend_query_execution_resources{resource=\"native_query_contexts_active\"} 0"
+        ));
+
+        active.store(2, AtomicOrdering::Relaxed);
+        let rendered = render_metrics(&backend).expect("render changed Backend metrics");
+        assert!(rendered.contains(
+            "novarocks_backend_query_execution_resources{resource=\"native_query_contexts_active\"} 2"
+        ));
+    }
 
     #[test]
     fn role_registry_excludes_foreign_registry_families() {

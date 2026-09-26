@@ -29,7 +29,7 @@
 ci_system_scenario_list() {
   local runner="$1"
 
-  "$runner" --list
+  "$runner" --list-default
 }
 
 # Build the two explicit native-compatibility fixtures without leaving the

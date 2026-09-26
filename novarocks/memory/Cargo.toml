@@ -32,3 +32,10 @@ doctest = false
 # enforces this, and MEM-1 treats it as a design contract rather than a
 # convention. Arrow lives behind `novarocks-memory-arrow`.
 [dependencies]
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
+
+[[bench]]
+name = "reservation_cost"
+harness = false

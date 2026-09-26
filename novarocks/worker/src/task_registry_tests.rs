@@ -57,7 +57,8 @@ use crate::{
     HostRejection, ManualClock, QueryContextHost, ReleasedContextEvidence, RootResultRoute,
     RunnableTask, SharedFactsRequest, TaskCreationGate, TaskExecutionHost, TaskExecutionMetrics,
     TaskExecutionPorts, TaskExecutionRegistry, TaskExecutionRegistryConfig, TaskProtocolEvent,
-    TaskProtocolObserver, TaskResultLifecycle, TaskStatusReporter, WorkerMonotonicClock,
+    TaskProtocolObserver, TaskResultLifecycle, TaskStatusEvent, TaskStatusReporter,
+    WorkerMonotonicClock,
 };
 
 /// The static half of a creation this test host prepares a result sink from.
@@ -167,6 +168,7 @@ struct TestTaskHost {
     capabilities_installed: AtomicUsize,
     submitted: AtomicUsize,
     domains_applied: AtomicUsize,
+    reporters: Mutex<Vec<TaskStatusReporter>>,
     cancel_calls: Arc<AtomicUsize>,
 }
 
@@ -181,6 +183,8 @@ impl TestTaskHost {
 
 impl TaskExecutionHost for TestTaskHost {
     fn close_context_admission(&self, _context: QueryContextRef) {}
+
+    fn retire_context_execution(&self, _context: QueryContextRef) {}
 
     fn forget_context_admission(&self, _context: QueryContextRef) {}
 
@@ -232,9 +236,13 @@ impl TaskExecutionHost for TestTaskHost {
     fn submit_runnable(
         &self,
         _descriptor: &TaskDescriptor,
-        _reporter: TaskStatusReporter,
+        reporter: TaskStatusReporter,
     ) -> Result<Arc<dyn RunnableTask>, HostRejection> {
         self.submitted.fetch_add(1, Ordering::SeqCst);
+        self.reporters
+            .lock()
+            .expect("test reporters")
+            .push(reporter);
         Ok(Arc::new(TestRunnable {
             cancel_calls: Arc::clone(&self.cancel_calls),
         }))
@@ -982,6 +990,74 @@ fn a_changed_body_converges_on_the_creation_in_progress_without_preempting_it() 
         fixture.registry.root_result_route(identity),
         RootResultRoute::Serve(_)
     ));
+}
+
+#[test]
+fn a_create_rejected_after_context_closure_reaps_without_a_published_status() {
+    let backend = BackendProcessId::new_v7();
+    let frontend = FrontendProcessId::new_v7();
+    let clock = Arc::new(ManualClock::new());
+    let gate = Arc::new(InstallGate::held());
+    let host = Arc::new(TestTaskHost {
+        install_gate: Some(Arc::clone(&gate)),
+        ..TestTaskHost::default()
+    });
+    let registry = Arc::new(TaskExecutionRegistry::new(
+        TaskExecutionRegistryConfig::for_process(backend, 17, 9),
+        Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
+        Arc::new(TestContextHost),
+        Arc::clone(&host) as Arc<dyn TaskExecutionHost>,
+        test_ports(),
+    ));
+    let execution = execution(82);
+    let context = QueryContextRef::new(execution, frontend, backend);
+    establish(&registry, context);
+    let identity = task(execution, backend);
+    let source = registry
+        .status_source(context)
+        .expect("established status source");
+    let request = CreateTask::try_new(
+        TaskOperationId::new_v7(),
+        context,
+        descriptor(identity),
+        Vec::new(),
+    )
+    .expect("legal create");
+    let creating = Arc::clone(&registry);
+    let create = std::thread::spawn(move || creating.create_task(&request, body(RESULT_PLAN)));
+    gate.wait_until_entered();
+
+    clock.advance(Duration::from_secs(10));
+    assert_eq!(registry.advance_deadlines().leases_expired, 1);
+    gate.release();
+    let rejected = create.join().expect("create thread");
+    assert_eq!(rejected.outcome(), OperationOutcome::ContextTerminalReceipt);
+    assert!(rejected.acknowledgement().is_none());
+    assert!(source.latest(identity).is_none());
+
+    let reporter = host.reporters.lock().expect("test reporters")[0].clone();
+    reporter.release_output();
+    reporter.note_actual_stopped();
+    reporter.note_resources_converged();
+    assert_eq!(registry.advance_deadlines().tasks_retired, 1);
+    assert!(source.latest(identity).is_none());
+
+    clock.advance(Duration::from_secs(121));
+    assert_eq!(registry.advance_deadlines().tasks_reaped, 1);
+    assert!(source.latest(identity).is_none());
+    assert!(matches!(
+        registry.root_result_route(identity),
+        RootResultRoute::Gone
+    ));
+    assert_eq!(
+        source.observe(
+            novarocks_execution_contract::task_execution::status::TaskStatusCursor::unobserved(
+                identity,
+            ),
+        ),
+        crate::observation::CursorObservation::Unknown,
+    );
+    assert!(source.next_task_event().is_none());
 }
 
 /// Initial-domain membership is the winner's own check, run under its

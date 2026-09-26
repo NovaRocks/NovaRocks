@@ -251,13 +251,14 @@ pub struct MemoryEvent {
     pub kind: MemoryEventKind,
 }
 
-/// Events read from the ring, plus whether anything was lost before them.
+/// Events read from the ring, plus whether anything was lost in the requested
+/// sequence range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventBatch {
     /// The events, in sequence order.
     pub events: Vec<MemoryEvent>,
-    /// Events dropped before the first returned event because the reader fell
-    /// behind. A non-zero value means the reader must re-read the snapshot.
+    /// Missing events between the requested sequence and `next_sequence`.
+    /// A non-zero value means the reader must re-read the snapshot.
     pub dropped_before: u64,
     /// The sequence to request next.
     pub next_sequence: u64,
@@ -272,9 +273,11 @@ impl EventBatch {
 
 /// A bounded ring of observation events.
 ///
-/// The ring never blocks a producer and never grows: when it is full the
-/// oldest event is dropped and a counter records the loss, so a slow observer
-/// costs memory nothing and still cannot silently miss a change.
+/// The ring never grows: when it is full the oldest event is dropped and a
+/// counter records the loss. Reservation cleanup uses a nonblocking record
+/// path, so a busy observer cannot delay cleanup or silently hide a change.
+/// Deferred reservation events may be published after a later state change;
+/// consumers use notifications to re-read the authoritative snapshot.
 #[derive(Debug)]
 pub struct EventRing {
     capacity: usize,
@@ -306,11 +309,13 @@ impl EventRing {
     /// This is deliberately infallible: an event is a notification, and losing
     /// one must never fail the capacity operation that produced it.
     pub fn record(&self, kind: MemoryEventKind) {
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let mut buffered = self
             .buffered
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Assign the sequence under the buffer lock so readers cannot mistake
+        // an event waiting to be inserted for a dropped event.
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         if buffered.len() == self.capacity {
             buffered.pop_front();
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -318,32 +323,58 @@ impl EventRing {
         buffered.push_back(MemoryEvent { sequence, kind });
     }
 
+    /// Records without waiting for an observer. A busy ring loses this
+    /// notification with a detectable sequence gap instead of delaying
+    /// reservation cleanup.
+    pub(crate) fn record_nonblocking(&self, kind: MemoryEventKind) {
+        let mut buffered = match self.buffered.try_lock() {
+            Ok(buffered) => buffered,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.skip_dropped(1);
+                return;
+            }
+        };
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        if buffered.len() == self.capacity {
+            buffered.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        buffered.push_back(MemoryEvent { sequence, kind });
+    }
+
+    /// Reserves sequence positions for events discarded before publication.
+    /// This path uses only atomics, so it can be called while a reservation's
+    /// slow lock is held and the observer will still detect the loss.
+    pub(crate) fn skip_dropped(&self, count: u64) {
+        if count > 0 {
+            self.next_sequence.fetch_add(count, Ordering::Relaxed);
+            self.dropped.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
     /// Returns buffered events with a sequence at or after `from_sequence`.
     ///
-    /// The batch reports how many events were dropped before the first
-    /// returned one, which is how a reader detects that it fell behind.
+    /// The batch reports missing positions anywhere in the requested sequence
+    /// range, including positions skipped after the latest buffered event.
     pub fn read_from(&self, from_sequence: u64) -> EventBatch {
         let buffered = self
             .buffered
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next_sequence = self.next_sequence.load(Ordering::Relaxed);
         let events: Vec<MemoryEvent> = buffered
             .iter()
             .copied()
-            .filter(|event| event.sequence >= from_sequence)
+            .filter(|event| event.sequence >= from_sequence && event.sequence < next_sequence)
             .collect();
-        let oldest_present = buffered.front().map(|event| event.sequence);
-        let dropped_before = match oldest_present {
-            Some(oldest) => oldest.saturating_sub(from_sequence),
-            None => self
-                .next_sequence
-                .load(Ordering::Relaxed)
-                .saturating_sub(from_sequence),
-        };
-        let next_sequence = events
-            .last()
-            .map(|event| event.sequence + 1)
-            .unwrap_or_else(|| self.next_sequence.load(Ordering::Relaxed));
+        let mut cursor = from_sequence.min(next_sequence);
+        let mut dropped_before = 0;
+        for event in &events {
+            dropped_before += event.sequence.saturating_sub(cursor);
+            cursor = event.sequence + 1;
+        }
+        dropped_before += next_sequence.saturating_sub(cursor);
         EventBatch {
             events,
             dropped_before,
@@ -480,5 +511,79 @@ mod tests {
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].sequence, 1);
         assert!(batch.has_gap());
+    }
+
+    #[test]
+    fn skipped_events_leave_detectable_internal_and_trailing_gaps() {
+        let ring = EventRing::new(4);
+        ring.record(MemoryEventKind::GrowthFrozen {
+            scope: AccountId::new(1),
+        });
+        ring.skip_dropped(2);
+        ring.record(MemoryEventKind::GrowthResumed {
+            scope: AccountId::new(1),
+        });
+        ring.skip_dropped(1);
+
+        let batch = ring.read_from(0);
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+        assert_eq!(batch.next_sequence, 5);
+        assert_eq!(batch.dropped_before, 3);
+        assert!(batch.has_gap());
+        assert_eq!(ring.dropped_total(), 3);
+
+        let tail = ring.read_from(4);
+        assert!(tail.events.is_empty());
+        assert_eq!(tail.dropped_before, 1);
+        assert!(tail.has_gap());
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn reservation_cleanup_does_not_wait_for_a_busy_event_reader() {
+        use crate::Reservation;
+        use crate::account::TopUpPolicy;
+        use crate::authority::{AuthorityConfig, MemoryAuthority};
+        use crate::ids::{AccountKind, ExternalRef};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mut config = AuthorityConfig::new(8, 4, 4);
+        config.top_up = TopUpPolicy::uniform(2);
+        let authority = MemoryAuthority::new(config).unwrap();
+        let sponsor = authority
+            .create_account(AccountKind::Work, ExternalRef::from_u128(1))
+            .unwrap();
+        let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
+        drop(leaf.try_grow(2).unwrap());
+        leaf.trim();
+        assert!(
+            authority.events().read_from(0).events.iter().any(|event| {
+                matches!(event.kind, MemoryEventKind::IdleCapacityReclaimed { .. })
+            })
+        );
+        let lease = leaf.try_grow(2).unwrap();
+        let reader = authority.events().buffered.lock().unwrap();
+
+        let (done, finished) = mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            assert!(leaf.try_grow(8).is_err());
+            leaf.close();
+            drop(lease);
+            done.send(()).unwrap();
+        });
+        let completed_while_reader_held = finished.recv_timeout(Duration::from_secs(5)).is_ok();
+        drop(reader);
+        cleanup.join().unwrap();
+        assert!(completed_while_reader_held);
+        assert!(authority.events().dropped_total() > 0);
+        assert!(authority.events().read_from(0).has_gap());
     }
 }

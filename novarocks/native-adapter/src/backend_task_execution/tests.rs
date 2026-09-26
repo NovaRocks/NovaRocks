@@ -422,6 +422,8 @@ impl TaskExecutionHost for FakeTaskHost {
         self.ledger.contexts_closed.fetch_add(1, Ordering::SeqCst);
     }
 
+    fn retire_context_execution(&self, _context: QueryContextRef) {}
+
     fn forget_context_admission(&self, _context: QueryContextRef) {}
 
     fn install_receiver(
