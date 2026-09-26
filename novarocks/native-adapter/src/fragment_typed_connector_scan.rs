@@ -26,14 +26,24 @@
 //! actually reads, resolving the installed typed provider for exactly this
 //! binding generation, and assembling the execution scan node.
 
+use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::fragment_scan_output::DecodedScanOutputColumns;
 use crate::fragment_variant_path::NativeVariantPathPlan;
+use novarocks_connector_contract::{
+    ConnectorInstanceDescriptor, ConnectorReadBinding, ConnectorReadRelationKind,
+    ConnectorReadRelationPayload, ConnectorReadRelationRecipe, ConnectorReadRelationRecipeDraft,
+    TupleDomain,
+};
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::{BoundScanRanges, ScanSource};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_local_program::{
+    ScanColumnId, StaticConnectorScan, StaticScanAssignment, StaticScanDynamicFilter,
+};
 use novarocks_proto_codec::connector_read::{ConnectorRelation, ConnectorRelationKind};
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{connector_read as dto, plan};
@@ -197,6 +207,8 @@ fn lower_typed_connector_scan(
             error.to_string(),
         )
     })?;
+    let static_scan = compile_static_connector_scan(&scan_source, &execution)?;
+    ctx.capture_static_scan(node.node_id, static_scan)?;
     let descriptor = novarocks_worker::TypedConnectorReadDescriptor::new(
         decoded_scan.relation().table().clone(),
         decoded_scan.assignments().to_vec(),
@@ -315,6 +327,122 @@ fn lower_typed_connector_scan(
         layout,
         output_schema,
     })
+}
+
+fn compile_static_connector_scan(
+    source: &novarocks_proto_codec::connector_read::ConnectorTableScanSource,
+    execution: &novarocks_spi::connector::ConnectorExecutionReadBinding,
+) -> Result<StaticConnectorScan, NativeFragmentLeafDecodeError> {
+    let table = source.table();
+    let relation_kind = match table.relation_kind() {
+        ConnectorRelationKind::Table => ConnectorReadRelationKind::Table,
+        ConnectorRelationKind::TableFunction => ConnectorReadRelationKind::TableFunction,
+        ConnectorRelationKind::ChangeWindow => ConnectorReadRelationKind::ChangeWindow,
+        ConnectorRelationKind::SystemTable => ConnectorReadRelationKind::SystemTable,
+        ConnectorRelationKind::TableExecute => ConnectorReadRelationKind::TableExecute,
+        ConnectorRelationKind::MergeTable => ConnectorReadRelationKind::MergeTable,
+    };
+    let binding = ConnectorReadBinding::new(
+        ConnectorInstanceDescriptor {
+            provider_id: table
+                .relation()
+                .provider_payload()
+                .header()
+                .provider_id()
+                .clone(),
+            instance_id: table.catalog_handle().catalog_name().clone(),
+        },
+        table.catalog_handle().clone(),
+    );
+    if &binding != execution.binding() {
+        return Err(static_scan_error(
+            "static scan binding does not match installed read execution".to_owned(),
+        ));
+    }
+    let relation = ConnectorReadRelationPayload::new(
+        relation_kind,
+        table.relation().provider_payload().clone(),
+        table.transaction().provider_payload().clone(),
+    );
+    let columns = source
+        .assignments()
+        .iter()
+        .map(|assignment| assignment.column().provider_payload().clone())
+        .collect();
+    let draft = ConnectorReadRelationRecipeDraft::try_new(binding, relation, columns)
+        .map_err(|error| static_scan_error(error.to_string()))?;
+    let recipe = ConnectorReadRelationRecipe::try_compile_with_provider(
+        &draft,
+        execution.recipe_compiler().as_ref(),
+    )
+    .map_err(|error| static_scan_error(error.to_string()))?;
+
+    let mut column_ordinals = BTreeMap::new();
+    let assignments = source
+        .assignments()
+        .iter()
+        .enumerate()
+        .map(|(index, assignment)| {
+            column_ordinals.insert(
+                assignment.column().canonical_bytes(),
+                ScanColumnId::new(index),
+            );
+            StaticScanAssignment::new(Arc::from(assignment.variable()), assignment.value_type())
+        })
+        .collect();
+    let map_domain =
+        |domain: &TupleDomain<novarocks_proto_codec::connector_read::ValidatedColumnHandle>| {
+            let Some(domains) = domain.domains() else {
+                return Ok(TupleDomain::none());
+            };
+            let mut by_ordinal = BTreeMap::new();
+            for (column, value) in domains {
+                let ordinal = column_ordinals
+                    .get(column.canonical_bytes())
+                    .ok_or_else(|| static_scan_error("scan predicate names no assignment"))?;
+                by_ordinal.insert(*ordinal, value.clone());
+            }
+            TupleDomain::with_column_domains(by_ordinal)
+                .map_err(|error| static_scan_error(error.to_string()))
+        };
+    let dynamic_filters = source
+        .dynamic_filters()
+        .iter()
+        .map(|filter| {
+            StaticScanDynamicFilter::new(filter.filter_id(), Arc::from(filter.variable()))
+        })
+        .collect();
+    let max_batch_rows = NonZeroU64::new(source.max_batch_rows())
+        .ok_or_else(|| static_scan_error("scan batch rows must be positive"))?;
+    let max_batch_bytes = NonZeroU64::new(source.max_batch_bytes())
+        .ok_or_else(|| static_scan_error("scan batch bytes must be positive"))?;
+    StaticConnectorScan::try_new(
+        recipe,
+        assignments,
+        map_domain(source.enforced_predicate())?,
+        map_domain(source.unenforced_predicate())?,
+        source.remaining_expression().cloned(),
+        dynamic_filters,
+        max_batch_rows,
+        max_batch_bytes,
+        match source.work_source() {
+            novarocks_proto_codec::connector_read::ScanWorkSource::RuntimeSplits => {
+                ConnectorReadWorkSource::RuntimeSplits
+            }
+            novarocks_proto_codec::connector_read::ScanWorkSource::WholeRelation => {
+                ConnectorReadWorkSource::WholeRelation
+            }
+        },
+    )
+    .map_err(|error| static_scan_error(error.to_string()))
+}
+
+fn static_scan_error(detail: impl Into<String>) -> NativeFragmentLeafDecodeError {
+    NativeFragmentLeafDecodeError::at_field(
+        ProtocolErrorKind::InvalidValue,
+        "typed_connector_read.static_program",
+        detail.into(),
+    )
 }
 
 /// The fragment-local runtime inputs a typed scan needs beyond its carrier.
@@ -1093,6 +1221,37 @@ mod tests {
         );
         decode_node(&node, &mut ExprArena::default(), &ctx)
             .expect("an opaque assignment variable binds the typed scan");
+        let scans = ctx.take_captured_static_scans();
+        let static_scan = scans.get(&node.node_id).expect("exact static scan node");
+        assert_eq!(static_scan.assignments().len(), 1);
+        assert_eq!(
+            static_scan.recipe().draft().binding().catalog_handle(),
+            &novarocks_proto_codec::connector_read::CatalogTableHandle::parse(
+                test_support::scan_source_proto().table.expect("test table"),
+                FieldPath::root("table"),
+            )
+            .expect("test table carrier")
+            .catalog_handle()
+            .clone(),
+        );
+    }
+
+    #[test]
+    fn static_scan_rejects_a_different_installed_catalog_generation() {
+        let source = novarocks_proto_codec::connector_read::ConnectorTableScanSource::parse(
+            test_support::scan_source_proto(),
+            FieldPath::root("scan"),
+        )
+        .expect("valid scan carrier");
+        let execution = test_support::installed_read_execution_with_factory_version([2; 32]);
+        let error = compile_static_connector_scan(&source, &execution)
+            .expect_err("a recipe cannot bind a different installed generation");
+        assert!(
+            error
+                .to_string()
+                .contains("static scan binding does not match installed read execution"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Derived columns are a property of the plan node, not of how the scan's

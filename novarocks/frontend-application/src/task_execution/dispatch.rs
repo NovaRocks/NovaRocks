@@ -32,7 +32,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use novarocks_execution::task_execution::TaskOperationId;
+use novarocks_execution::task_execution::{OperationKind, TaskOperationId};
 use novarocks_query_application::coordination::{DispatchBudget, DispatchLane, MonotonicInstant};
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::BackendProcessId;
@@ -429,6 +429,37 @@ impl OperationDispatcher {
                 "one operation identity has multiple dispatcher owners".to_owned(),
             )),
         }
+    }
+
+    pub(super) fn queued_operation_kind(
+        &self,
+        operation_id: TaskOperationId,
+    ) -> Option<OperationKind> {
+        self.backends
+            .values()
+            .flat_map(|queues| queues.lanes.iter())
+            .flat_map(|lane| lane.iter())
+            .find(|entry| entry.intent.operation_id() == operation_id)
+            .map(|entry| entry.intent.kind())
+    }
+
+    /// Normal drain preserves only the exact close control carried by an
+    /// UpdateTask; all ordinary input updates are withdrawn.
+    pub(super) fn queued_destination_close(&self, operation_id: TaskOperationId) -> bool {
+        self.backends
+            .values()
+            .flat_map(|queues| queues.lanes.iter())
+            .flat_map(|lane| lane.iter())
+            .find(|entry| entry.intent.operation_id() == operation_id)
+            .is_some_and(|entry| match &entry.intent {
+                OperationIntent::UpdateTask(request) => request.domains().iter().all(|domain| {
+                    matches!(
+                        domain,
+                        novarocks_execution::task_execution::TaskDomainUpdate::CloseExchangeDestination { .. }
+                    )
+                }),
+                _ => false,
+            })
     }
 
     /// Removes one exact operation that has not crossed process transport.

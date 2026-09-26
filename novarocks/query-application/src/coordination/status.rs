@@ -47,13 +47,17 @@ pub enum StatusObservation {
     VersionConflict,
     IdentityMismatch(IdentityMismatch),
     TerminalOverwrite,
+    InstallationRegression,
 }
 
 impl StatusObservation {
     pub const fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::VersionConflict | Self::IdentityMismatch(_) | Self::TerminalOverwrite
+            Self::VersionConflict
+                | Self::IdentityMismatch(_)
+                | Self::TerminalOverwrite
+                | Self::InstallationRegression
         )
     }
 }
@@ -78,6 +82,9 @@ pub fn classify_observation(
     }
     if observed.version() < current {
         return StatusObservation::Ignore;
+    }
+    if held.is_some_and(|held| held.installed() && !observed.installed()) {
+        return StatusObservation::InstallationRegression;
     }
     if held.is_some_and(TaskStatus::is_terminal) {
         return StatusObservation::TerminalOverwrite;

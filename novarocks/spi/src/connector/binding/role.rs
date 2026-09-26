@@ -17,6 +17,8 @@
 
 use std::sync::Arc;
 
+use novarocks_connector_contract::ConnectorReadRelationRecipeCompiler;
+
 use crate::connector::read_stack::{
     ConnectorAdmittedReadProviderFactory, ConnectorReadAttemptAccessSource,
     ConnectorReadAttemptRuntime, ConnectorReadBinding, ConnectorReadMetadata,
@@ -28,9 +30,10 @@ use crate::connector::write_stack::{
     ConnectorWriteExecution as ConnectorWriteStackExecution,
 };
 use crate::connector::{
-    ConnectorControlBinding, ConnectorError, ConnectorReadWireDecoder, ConnectorReadWireEncoder,
-    ConnectorWriteControl, ConnectorWriteFragmentWireDecoder, ConnectorWriteFragmentWireEncoder,
-    ConnectorWriteHandleWireDecoder, ConnectorWriteHandleWireEncoder, NormalizedCatalogProperties,
+    ConnectorCodecError, ConnectorControlBinding, ConnectorError, ConnectorReadWireDecoder,
+    ConnectorReadWireEncoder, ConnectorWriteControl, ConnectorWriteFragmentWireDecoder,
+    ConnectorWriteFragmentWireEncoder, ConnectorWriteHandleWireDecoder,
+    ConnectorWriteHandleWireEncoder, NormalizedCatalogProperties,
 };
 
 /// The complete FE typed-read group for one exact control generation.
@@ -352,22 +355,33 @@ impl ConnectorControlRoleBinding {
 }
 
 /// The complete BE typed-read group for one exact execution binding.
-/// Design: ADR-0156. The factory requires task-admitted resources.
+/// Its pure recipe compiler validates static private facts before task-owned
+/// resources are opened. Design: ADR-0156. The factory requires task-admitted
+/// resources.
 #[derive(Clone)]
 pub struct ConnectorExecutionReadBinding {
+    binding: ConnectorReadBinding,
     provider_factory: Arc<dyn ConnectorAdmittedReadProviderFactory>,
     decoder: Arc<dyn ConnectorReadWireDecoder>,
+    recipe_compiler: Arc<dyn ConnectorReadRelationRecipeCompiler<Error = ConnectorCodecError>>,
 }
 
 impl ConnectorExecutionReadBinding {
     pub fn new(
         provider_factory: Arc<dyn ConnectorAdmittedReadProviderFactory>,
         decoder: Arc<dyn ConnectorReadWireDecoder>,
+        recipe_compiler: Arc<dyn ConnectorReadRelationRecipeCompiler<Error = ConnectorCodecError>>,
     ) -> Self {
         Self {
+            binding: provider_factory.binding().clone(),
             provider_factory,
             decoder,
+            recipe_compiler,
         }
+    }
+
+    pub const fn binding(&self) -> &ConnectorReadBinding {
+        &self.binding
     }
 
     pub fn provider_factory(&self) -> Arc<dyn ConnectorAdmittedReadProviderFactory> {
@@ -376,6 +390,13 @@ impl ConnectorExecutionReadBinding {
 
     pub fn decoder(&self) -> Arc<dyn ConnectorReadWireDecoder> {
         Arc::clone(&self.decoder)
+    }
+
+    /// Pure private validation from this exact installed read generation.
+    pub fn recipe_compiler(
+        &self,
+    ) -> Arc<dyn ConnectorReadRelationRecipeCompiler<Error = ConnectorCodecError>> {
+        Arc::clone(&self.recipe_compiler)
     }
 }
 
@@ -435,6 +456,18 @@ impl ConnectorExecutionRoleBinding {
         read: Option<ConnectorExecutionReadBinding>,
         write: Option<ConnectorExecutionWriteBinding>,
     ) -> Result<Self, ConnectorError> {
+        if let Some(read) = &read {
+            let binding = read.binding();
+            if binding.catalog_handle() != properties.handle()
+                || &binding.descriptor().provider_id != properties.provider_id()
+                || binding.descriptor().instance_id != *properties.handle().catalog_name()
+            {
+                return Err(ConnectorError::new(
+                    crate::connector::ConnectorErrorKind::InvalidRequest,
+                    "execution read binding does not match normalized catalog generation",
+                ));
+            }
+        }
         Ok(Self {
             properties,
             read,

@@ -25,6 +25,7 @@ use novarocks_native_trust::{NativeClientAuthInterceptor, NativeTrust};
 use novarocks_proto_models::{filter, novarocks as proto};
 use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::UniqueId;
+use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -59,19 +60,6 @@ impl NativeRpcClient {
         channel_endpoint(&endpoint)
             .map_err(|error| format!("invalid BE endpoint {endpoint}: {error}"))?;
         Ok(Self { runtime, endpoint })
-    }
-
-    fn make_client(&self) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
-        let endpoint = self.endpoint.clone();
-        let runtime = self.runtime.clone();
-        let channel_runtime = runtime.clone();
-        let channel = runtime
-            .clone()
-            .block_on(async move { get_or_create_channel(&channel_runtime, endpoint).await })?;
-        Ok(client_from_channel(
-            channel,
-            runtime.native_trust().as_ref(),
-        ))
     }
 
     async fn make_deadline_async_client(
@@ -159,8 +147,9 @@ impl NativeRpcClient {
         eos: bool,
         sequence: i64,
         payload: Vec<u8>,
-    ) -> Result<(), String> {
-        let mut client = self.make_client()?;
+        timeout: Duration,
+        stop: CancellationToken,
+    ) -> Result<Option<proto::ExchangeNormalClosed>, String> {
         let request = proto::ExchangeRequest {
             finst_id_hi: finst_id.high(),
             finst_id_lo: finst_id.low(),
@@ -175,22 +164,44 @@ impl NativeRpcClient {
             sequence,
             payload,
         };
-        self.runtime.block_on(async move {
+        self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => Err("exchange send cancelled by task stop".to_string()),
+                result = async {
+            let deadline_at = tokio::time::Instant::now() + timeout;
+            let mut client = self
+                .make_deadline_async_client("exchange", deadline_at)
+                .await?;
+            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("exchange deadline exceeded before unary RPC submission".to_string());
+            }
+            let mut request = Request::new(request);
+            request.set_timeout(remaining);
             let response = client
-                .exchange_unary(request)
+                .exchange_unary(request);
+            let response = tokio::time::timeout_at(deadline_at, response)
                 .await
+                .map_err(|_| "exchange deadline exceeded during unary RPC".to_string())?
                 .map_err(|error| format!("exchange rpc failed: {error}"))?
                 .into_inner();
-            if let Some(status) = response.status.as_ref()
-                && status.code != 0
-            {
+            if response.ack_sequence != sequence {
+                return Err("exchange rpc returned a different request sequence".to_string());
+            }
+            let status = response.status.as_ref().ok_or_else(||
+                "exchange rpc omitted its status".to_string()
+            )?;
+            if status.code != 0 {
                 return Err(if status.message.is_empty() {
                     format!("exchange rpc returned status_code={}", status.code)
                 } else {
                     format!("exchange rpc failed: {}", status.message)
                 });
             }
-            Ok(())
+            Ok(response.normal_closed)
+                } => result,
+            }
         })
     }
 }
@@ -254,7 +265,102 @@ async fn get_or_create_channel(
 
 #[cfg(test)]
 mod tests {
-    use super::channel_endpoint;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use novarocks_types::UniqueId;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{NativeRpcClient, channel_endpoint};
+
+    fn send_to_test_endpoint(
+        port: u16,
+        timeout: Duration,
+        stop: CancellationToken,
+    ) -> Result<(), String> {
+        let client = NativeRpcClient::new_host_port(
+            crate::backend_test_support::test_backend_data_runtime(),
+            "127.0.0.1".to_string(),
+            port,
+        )
+        .expect("legal endpoint");
+        client
+            .exchange_unary(
+                UniqueId::new(1, 2),
+                3,
+                UniqueId::new(4, 5),
+                0,
+                1,
+                0,
+                0,
+                false,
+                0,
+                Vec::new(),
+                timeout,
+                stop,
+            )
+            .map(|_| ())
+    }
+
+    #[test]
+    fn task_stop_interrupts_exchange_before_channel_acquisition() {
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let started = Instant::now();
+        let error = send_to_test_endpoint(1, Duration::from_secs(10), stop)
+            .expect_err("cancelled task cannot start a send");
+        assert!(error.contains("cancelled by task stop"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn task_stop_interrupts_a_stalled_exchange_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind blackhole endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("set blackhole nonblocking");
+        let port = listener.local_addr().expect("blackhole address").port();
+        let stop = CancellationToken::new();
+        let worker_stop = stop.clone();
+        let send =
+            thread::spawn(move || send_to_test_endpoint(port, Duration::from_secs(3), worker_stop));
+        let accept_deadline = Instant::now() + Duration::from_secs(1);
+        let accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < accept_deadline, "exchange did not connect");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("blackhole accept failed: {error}"),
+            }
+        };
+        let started = Instant::now();
+        stop.cancel();
+        let error = send
+            .join()
+            .expect("exchange worker did not panic")
+            .expect_err("stalled exchange should stop");
+        drop(accepted);
+        assert!(error.contains("cancelled by task stop"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn exchange_deadline_covers_a_stalled_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind blackhole endpoint");
+        let port = listener.local_addr().expect("blackhole address").port();
+        let started = Instant::now();
+        let error =
+            send_to_test_endpoint(port, Duration::from_millis(30), CancellationToken::new())
+                .expect_err("blackhole exchange must time out");
+        assert!(
+            error.contains("deadline exceeded") || error.contains("Timeout expired"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn channel_endpoint_formats_ipv4_and_ipv6_hosts() {

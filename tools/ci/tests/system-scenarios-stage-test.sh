@@ -36,7 +36,7 @@ cat >"$fake_runner" <<'RUNNER'
 #!/usr/bin/env bash
 set -uo pipefail
 
-if [ "${1:-}" = "--list" ]; then
+if [ "${1:-}" = "--list" ] || [ "${1:-}" = "--list-default" ]; then
   if [ -n "${FAKE_RUNNER_LIST_FAILS:-}" ]; then
     echo "registry exploded" >&2
     exit 3
@@ -45,6 +45,9 @@ if [ "${1:-}" = "--list" ]; then
     printf "%s" "$FAKE_RUNNER_SCENARIOS"
   else
     printf "alpha/one\nbeta/two\nbeta/three\n"
+  fi
+  if [ "${1:-}" = "--list" ]; then
+    printf "explicit/performance\n"
   fi
   exit 0
 fi
@@ -94,7 +97,7 @@ printf 'compatible\n' >"$compatible_binary"
 printf 'other-island\n' >"$other_island_binary"
 chmod +x "$primary_binary" "$compatible_binary" "$other_island_binary"
 
-# --- 1. every registered scenario runs, in registry order, one --only each ----
+# --- 1. every default scenario runs, in registry order, one --only each ----
 primary_binary="$tmpdir/novarocks"
 compatible_binary="$tmpdir/novarocks-compatible"
 other_island_binary="$tmpdir/novarocks-other-island"
@@ -104,6 +107,15 @@ printf 'other-island\n' >"$other_island_binary"
 chmod +x "$primary_binary" "$compatible_binary" "$other_island_binary"
 
 reset_stage
+all_list="$("$fake_runner" --list)"
+case "$all_list" in
+  *"explicit/performance"*) ;;
+  *) fail "the complete registry must expose explicit stages" ;;
+esac
+default_list="$(ci_system_scenario_list "$fake_runner")"
+case "$default_list" in
+  *"explicit/performance"*) fail "CI discovery must exclude explicit stages" ;;
+esac
 if ! ci_run_system_scenarios "$fake_runner" "$primary_binary" \
   "$compatible_binary" "$other_island_binary" "$tmpdir/base.toml" \
   "$tmpdir/artifacts" 3 300; then

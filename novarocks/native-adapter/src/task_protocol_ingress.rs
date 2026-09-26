@@ -47,14 +47,14 @@
 use std::sync::Arc;
 
 use novarocks_execution_contract::task_execution::operation::{
-    OperationOutcome, TaskDomainReceipt, UpdateQueryContext,
+    CreateTaskReceipt, OperationOutcome, TaskDomainReceipt, UpdateQueryContext,
 };
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::operation::{
     DecodedOperation, DecodedUpdateQueryContext, encode_abort_cause_field, encode_create_task_ack,
-    encode_query_context_ack, encode_query_context_admission_ticket_ack, encode_receipt,
-    encode_release_ack, encode_update_task_ack,
+    encode_query_context_ack, encode_query_context_admission_ticket_ack, encode_quiesce_ack,
+    encode_receipt, encode_release_ack, encode_update_task_ack,
 };
 use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
@@ -141,18 +141,29 @@ impl RegistryTaskExecutionIngress {
                 })
             }
             DecodedOperation::CreateTask(decoded) => {
+                fault::create_task_before_worker_hold(
+                    decoded.request().identity(),
+                    decoded.descriptor().topology().outbound().len(),
+                )?;
                 // The request is what the owner decides on; the input is the
                 // body only this identity's creation winner will interpret.
-                let (request, input) = decoded.into_parts();
+                let (request, input, retained_bytes) = decoded.into_parts_with_retained_bytes();
                 let identity = request.identity();
-                let receipt =
-                    self.registry
-                        .create_task_with_local_wait_cap(&request, input, local_wait_cap);
-                // Claimed after the owner applied it: the task is admitted and
-                // running, and only this answer is lost.
+                let receipt = self.registry.accept_create_task_with_retained_bytes(
+                    &request,
+                    input,
+                    retained_bytes,
+                );
+                // Claimed after Worker took ownership. Installation and
+                // driver start are independent later status facts.
                 fault::create_task_ack_dropped(identity, receipt.outcome())?;
-                let mut encoded = encode_operation_receipt(&receipt, |ack| {
-                    encode_create_task_ack(ack).map(ReceiptAck::CreateTask)
+                let mut encoded = encode_operation_receipt(&receipt, |status| {
+                    encode_create_task_ack(&CreateTaskReceipt::new(
+                        identity,
+                        Vec::new(),
+                        status.clone(),
+                    ))
+                    .map(ReceiptAck::CreateTask)
                 })?;
                 // The two wire-value faults are claimed on the encoded answer,
                 // because the value each one misstates exists only there: the
@@ -274,6 +285,12 @@ impl RegistryTaskExecutionIngress {
                     encoded.termination_cause =
                         ack.termination_cause().map(encode_abort_cause_field);
                     Some(ReceiptAck::ReleaseQueryContext(encoded))
+                })
+            }
+            DecodedOperation::QuiesceQueryContext(request) => {
+                let receipt = self.registry.quiesce_query_context(&request);
+                encode_operation_receipt(&receipt, |ack| {
+                    encode_quiesce_ack(ack).map(ReceiptAck::QuiesceQueryContext)
                 })
             }
         }
@@ -811,6 +828,35 @@ mod tests {
             )
         }
 
+        fn wait_status(
+            &self,
+            identity: TaskIdentity,
+            predicate: impl Fn(&TaskStatus) -> bool,
+        ) -> TaskStatus {
+            let source = self
+                .registry
+                .status_source(self.context())
+                .expect("the established context retains its status source");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = source.latest(identity)
+                    && predicate(&status)
+                {
+                    return status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "task {identity} did not reach the expected status"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn wait_installed(&self, identity: TaskIdentity) {
+            self.wait_status(identity, TaskStatus::installed);
+            assert!(self.registry.has_live_task(identity));
+        }
+
         fn apply(
             &self,
             operations: Vec<proto::TaskOperation>,
@@ -897,6 +943,7 @@ mod tests {
             ),
             Some(proto::task_operation::Operation::CancelTask(_))
             | Some(proto::task_operation::Operation::AbortQueryContext(_))
+            | Some(proto::task_operation::Operation::QuiesceQueryContext(_))
             | Some(proto::task_operation::Operation::ReleaseQueryContext(_)) => true,
             _ => false,
         }
@@ -917,6 +964,9 @@ mod tests {
             }
             proto::task_operation::Operation::AbortQueryContext(abort) => {
                 proto::task_control_operation::Control::AbortQueryContext(abort)
+            }
+            proto::task_operation::Operation::QuiesceQueryContext(quiesce) => {
+                proto::task_control_operation::Control::QuiesceQueryContext(quiesce)
             }
             proto::task_operation::Operation::ReleaseQueryContext(release) => {
                 proto::task_control_operation::Control::ReleaseQueryContext(release)
@@ -1029,6 +1079,17 @@ mod tests {
             envelope: Some(envelope(operation)),
             operation: Some(proto::task_operation::Operation::ReleaseQueryContext(
                 proto::ReleaseQueryContextRequest {
+                    query_context: Some(encode_query_context_ref(context)),
+                },
+            )),
+        }
+    }
+
+    fn quiesce(context: QueryContextRef, operation: TaskOperationId) -> proto::TaskOperation {
+        proto::TaskOperation {
+            envelope: Some(envelope(operation)),
+            operation: Some(proto::task_operation::Operation::QuiesceQueryContext(
+                proto::QuiesceQueryContextRequest {
                     query_context: Some(encode_query_context_ref(context)),
                 },
             )),
@@ -1205,6 +1266,23 @@ mod tests {
         proto::TaskOperationOutcome::try_from(receipt.outcome).expect("a known outcome")
     }
 
+    fn assert_create_replay(
+        original: &proto::TaskOperationReceipt,
+        replay: &proto::TaskOperationReceipt,
+    ) {
+        let (Some(ReceiptAck::CreateTask(original)), Some(ReceiptAck::CreateTask(replay))) =
+            (original.ack.as_ref(), replay.ack.as_ref())
+        else {
+            panic!("both create receipts carry the original Task identity");
+        };
+        assert_eq!(replay.identity, original.identity);
+        assert_eq!(replay.accepted_domains, original.accepted_domains);
+        let original_status = original.current_status.as_ref().expect("initial status");
+        let replay_status = replay.current_status.as_ref().expect("current status");
+        assert_eq!(replay_status.identity, original_status.identity);
+        assert!(replay_status.status_version >= original_status.status_version);
+    }
+
     #[test]
     fn a_foreign_compatibility_identity_is_rejected_before_context_side_effects() {
         let fixture = Fixture::new();
@@ -1327,14 +1405,16 @@ mod tests {
             TaskOperationId::new_v7(),
             TaskOperationId::new_v7(),
             TaskOperationId::new_v7(),
+            TaskOperationId::new_v7(),
         ];
         let response = fixture.apply(vec![
             fixture.establish(context, ids[0]),
             renew_lease(context, ids[1], 1),
-            release(context, ids[2]),
+            quiesce(context, ids[2]),
+            release(context, ids[3]),
         ]);
 
-        assert_eq!(response.receipts.len(), 3);
+        assert_eq!(response.receipts.len(), 4);
         for (receipt, expected) in response.receipts.iter().zip(ids) {
             assert_eq!(
                 receipt
@@ -1357,6 +1437,10 @@ mod tests {
         ));
         assert!(matches!(
             response.receipts[2].ack,
+            Some(ReceiptAck::QuiesceQueryContext(_))
+        ));
+        assert!(matches!(
+            response.receipts[3].ack,
             Some(ReceiptAck::ReleaseQueryContext(_))
         ));
     }
@@ -1868,11 +1952,13 @@ mod tests {
         let mut stream = fixture
             .ingress
             .subscribe_task_status(proto::SubscribeTaskStatusRequest {
+                generation: 1,
                 query_context: Some(encode_query_context_ref(context)),
                 cursors: vec![novarocks_task_codec::status::encode_task_status_cursor(
                     TaskStatusCursor::unobserved(identity),
                 )],
                 context_convergence_cursor: None,
+                ..Default::default()
             })
             .expect("an active context accepts a subscription");
 
@@ -1897,7 +1983,7 @@ mod tests {
                 )
                 .expect("an aware subscriber can still catch up"),
             vec![TaskStatusEvent::ContextConvergence(convergence)],
-            "a legacy cursor-free stream must not consume context convergence"
+            "the stream must not consume retained context convergence"
         );
     }
 
@@ -1910,13 +1996,16 @@ mod tests {
             fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
+        fixture.wait_installed(identity);
 
         let request = || proto::SubscribeTaskStatusRequest {
+            generation: 1,
             query_context: Some(encode_query_context_ref(context)),
             cursors: vec![novarocks_task_codec::status::encode_task_status_cursor(
                 TaskStatusCursor::unobserved(identity),
             )],
             context_convergence_cursor: None,
+            ..Default::default()
         };
         let mut old_stream = fixture
             .ingress
@@ -1930,12 +2019,12 @@ mod tests {
         // Drain both retained catch-up frames before publishing the live
         // terminal. This is the overlap window created while HTTP/2
         // cancellation of the old handler is still in flight.
-        assert_eq!(next_status_version(&mut old_stream).await, 1);
-        assert_eq!(next_status_version(&mut replacement_stream).await, 1);
+        assert_eq!(next_status_version(&mut old_stream).await, 2);
+        assert_eq!(next_status_version(&mut replacement_stream).await, 2);
 
         let terminal = TaskStatus::try_new(
             identity,
-            TaskStatusVersion::FIRST.next().expect("version two"),
+            TaskStatusVersion::new(3).expect("version three"),
             TaskState::Finished,
             None,
             TaskOutputFacts::new(true),
@@ -1948,10 +2037,10 @@ mod tests {
         source.publish(terminal);
         source.mark_gone(identity);
 
-        assert_eq!(next_status_version(&mut old_stream).await, 2);
+        assert_eq!(next_status_version(&mut old_stream).await, 3);
         assert_eq!(
             next_status_version(&mut replacement_stream).await,
-            2,
+            3,
             "the old handler cannot consume the terminal retained for its replacement"
         );
         next_gone_identity(&mut old_stream, identity).await;
@@ -1977,6 +2066,7 @@ mod tests {
         let mut stream = fixture
             .ingress
             .subscribe_task_status(proto::SubscribeTaskStatusRequest {
+                generation: 1,
                 query_context: Some(encode_query_context_ref(context)),
                 cursors: Vec::new(),
                 context_convergence_cursor: Some(
@@ -1984,6 +2074,7 @@ mod tests {
                         QueryContextConvergenceCursor::unobserved(context),
                     ),
                 ),
+                ..Default::default()
             })
             .expect("an unobserved context cursor opens a subscription");
         let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
@@ -2009,6 +2100,7 @@ mod tests {
         let mut replacement = fixture
             .ingress
             .subscribe_task_status(proto::SubscribeTaskStatusRequest {
+                generation: 1,
                 query_context: Some(encode_query_context_ref(context)),
                 cursors: Vec::new(),
                 context_convergence_cursor: Some(
@@ -2016,6 +2108,7 @@ mod tests {
                         QueryContextConvergenceCursor::unobserved(context),
                     ),
                 ),
+                ..Default::default()
             })
             .expect("a replacement stream owns an independent cursor");
         let event = tokio::time::timeout(Duration::from_secs(5), replacement.next())
@@ -2040,6 +2133,7 @@ mod tests {
         let Err(error) = fixture
             .ingress
             .subscribe_task_status(proto::SubscribeTaskStatusRequest {
+            generation: 1,
             query_context: Some(encode_query_context_ref(context)),
             cursors: Vec::new(),
             context_convergence_cursor: Some(
@@ -2047,6 +2141,7 @@ mod tests {
                     future,
                 ),
             ),
+            ..Default::default()
         }) else {
             panic!("a future cursor must fail closed");
         };
@@ -2068,20 +2163,22 @@ mod tests {
             "unexpected create refusal: {}",
             response.receipts[1].safe_detail
         );
-        assert!(fixture.registry.has_live_task(identity));
+        fixture.wait_installed(identity);
 
         let mut stream = fixture
             .ingress
             .subscribe_task_status(proto::SubscribeTaskStatusRequest {
+                generation: 1,
                 query_context: Some(encode_query_context_ref(context)),
                 cursors: vec![novarocks_task_codec::status::encode_task_status_cursor(
                     TaskStatusCursor::unobserved(identity),
                 )],
                 context_convergence_cursor: None,
+                ..Default::default()
             })
             .expect("an active context accepts a subscription");
         // Proves the stream was really live before it was dropped.
-        assert_eq!(next_status_version(&mut stream).await, 1);
+        assert!(next_status_version(&mut stream).await >= 2);
         drop(stream);
 
         assert!(
@@ -2100,9 +2197,11 @@ mod tests {
         let Err(error) = fixture
             .ingress
             .subscribe_task_status(proto::SubscribeTaskStatusRequest {
+                generation: 1,
                 query_context: Some(encode_query_context_ref(fixture.context())),
                 cursors: Vec::new(),
                 context_convergence_cursor: None,
+                ..Default::default()
             })
         else {
             panic!("this process holds no such context");
@@ -2156,46 +2255,45 @@ mod tests {
 
     /// Takes the next frame, refusing to hang if the stream never wakes.
     async fn next_status_version(stream: &mut TaskStatusEventStream) -> u64 {
-        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("a published frame must wake the subscription")
-            .expect("the stream is still open")
-            .expect("an observation frame is never a status error");
-        match event.event.expect("a frame carries a body") {
-            proto::task_status_stream_event::Event::TaskStatus(status) => status.status_version,
-            proto::task_status_stream_event::Event::TaskGone(_) => {
-                panic!("expected a status frame, not a reclamation")
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = stream
+                    .next()
+                    .await
+                    .expect("stream remains open")
+                    .expect("valid frame");
+                if let Some(proto::task_status_stream_event::Event::TaskStatus(status)) =
+                    event.event
+                {
+                    return status.status_version;
+                }
             }
-            proto::task_status_stream_event::Event::ContextConvergence(_) => {
-                panic!("expected a task status frame, not context convergence")
-            }
-        }
+        })
+        .await
+        .expect("published status must arrive within its budget")
     }
 
     async fn next_gone_identity(stream: &mut TaskStatusEventStream, expected: TaskIdentity) {
-        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("a retained gone frame must wake the subscription")
-            .expect("the stream is still open")
-            .expect("an observation frame is never a status error");
-        match novarocks_task_codec::operation::decode_context_aware_status_event(
-            &event,
-            FieldPath::root("task_status_stream_event"),
-        )
-        .expect("the backend encoded a valid observation")
-        {
-            novarocks_task_codec::operation::ContextAwareStatusStreamEvent::Gone(identity) => {
-                assert_eq!(identity, expected);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = stream
+                    .next()
+                    .await
+                    .expect("stream remains open")
+                    .expect("valid frame");
+                if let Some(proto::task_status_stream_event::Event::TaskGone(gone)) = event.event {
+                    let identity = novarocks_task_codec::identity::decode_task_identity(
+                        gone.identity.as_ref().expect("gone has identity"),
+                        FieldPath::root("gone"),
+                    )
+                    .expect("exact identity decodes");
+                    assert_eq!(identity, expected);
+                    return;
+                }
             }
-            novarocks_task_codec::operation::ContextAwareStatusStreamEvent::Status(_) => {
-                panic!("expected a reclamation frame, not a status")
-            }
-            novarocks_task_codec::operation::ContextAwareStatusStreamEvent::ContextConvergence(
-                _,
-            ) => {
-                panic!("expected a task reclamation frame, not context convergence")
-            }
-        }
+        })
+        .await
+        .expect("retained Gone must arrive within its budget");
     }
 
     #[test]
@@ -2207,6 +2305,7 @@ mod tests {
             fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
+        fixture.wait_installed(identity);
         let response = fixture
             .ingress
             .fetch_task_dynamic_filters(proto::FetchTaskDynamicFiltersRequest {
@@ -2233,7 +2332,7 @@ mod tests {
             fixture.establish(context, TaskOperationId::new_v7()),
             create_producer_task(context, producer, TaskOperationId::new_v7()),
         ]);
-        assert!(fixture.registry.has_live_task(producer));
+        fixture.wait_installed(producer);
 
         let response = fixture
             .ingress
@@ -2268,6 +2367,7 @@ mod tests {
             fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
+        fixture.wait_installed(identity);
         let envelope = novarocks_proto_models::filter::RuntimeFilterEnvelope {
             channel_id: 7,
             ..Default::default()
@@ -2316,6 +2416,7 @@ mod tests {
             fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
+        fixture.wait_installed(identity);
         fixture
             .task_host
             .reporter(identity)
@@ -2380,10 +2481,8 @@ mod tests {
             "{:?}",
             response.receipts[1]
         );
-        let original_ack = response.receipts[1]
-            .ack
-            .clone()
-            .expect("an accepted create is acknowledged");
+        assert!(response.receipts[1].ack.is_some());
+        fixture.wait_installed(identity);
 
         let mut changed = CreateCarriers::producer(context, identity);
         changed.frozen.pipeline_dop_domain = Some(proto::PipelineDopDomain {
@@ -2424,11 +2523,7 @@ mod tests {
             "{:?}",
             replay.receipts[0]
         );
-        assert_eq!(
-            replay.receipts[0].ack.as_ref(),
-            Some(&original_ack),
-            "the replay is answered with the original entity receipt"
-        );
+        assert_create_replay(&response.receipts[1], &replay.receipts[0]);
         assert_eq!(
             replay.receipts[0].operation_id,
             Some(encode_task_operation_id(replay_operation)),
@@ -2455,15 +2550,10 @@ mod tests {
         );
     }
 
-    /// A static fragment is read only by the round that wins its identity.
-    ///
-    /// The ingress bounds the static carrier but does not decode it, so an
-    /// unreadable one reaches the owner. As a first creation it is the
-    /// winner's body and is refused, and the refused round leaves nothing
-    /// behind; once a legal body has won, the same unreadable carrier is only
-    /// a replay of that identity and is never read at all.
+    /// A bad static fragment fails after Accepted, retains the spent identity,
+    /// and cannot be replaced by a different body under that identity.
     #[test]
-    fn an_unreadable_static_fragment_is_refused_only_when_it_would_be_interpreted() {
+    fn an_unreadable_static_fragment_fails_preparation_without_recreating_identity() {
         let fixture = Fixture::new();
         let context = fixture.context();
         let identity = fixture.identity(6, 6);
@@ -2476,45 +2566,45 @@ mod tests {
             )
         };
 
-        let refused = fixture.apply(vec![
+        let accepted = fixture.apply(vec![
             fixture.establish(context, TaskOperationId::new_v7()),
             unreadable(),
         ]);
         assert_eq!(
-            outcome_of(&refused.receipts[1]),
-            proto::TaskOperationOutcome::InvalidStateOrRequest,
-            "{:?}",
-            refused.receipts[1]
-        );
-        assert!(refused.receipts[1].ack.is_none());
-        assert!(
-            !fixture.registry.has_live_task(identity),
-            "the refused first round was rolled back completely"
-        );
-
-        let accepted = fixture.apply(vec![legal.operation(TaskOperationId::new_v7())]);
-        assert_eq!(
-            outcome_of(&accepted.receipts[0]),
+            outcome_of(&accepted.receipts[1]),
             proto::TaskOperationOutcome::Accepted,
             "{:?}",
-            accepted.receipts[0]
+            accepted.receipts[1]
+        );
+        let failed = fixture.wait_status(identity, TaskStatus::is_terminal);
+        assert_eq!(failed.state(), TaskState::Failed);
+        assert!(!failed.installed());
+        assert!(
+            !fixture.registry.has_live_task(identity),
+            "a preparation failure cannot install a runnable"
         );
 
-        let replay = fixture.apply(vec![unreadable()]);
+        let replay = fixture.apply(vec![legal.operation(TaskOperationId::new_v7())]);
         assert_eq!(
             outcome_of(&replay.receipts[0]),
             proto::TaskOperationOutcome::Idempotent,
             "{:?}",
             replay.receipts[0]
         );
-        assert_eq!(replay.receipts[0].ack, accepted.receipts[0].ack);
+        assert_create_replay(&accepted.receipts[1], &replay.receipts[0]);
+
+        let same_body_replay = fixture.apply(vec![unreadable()]);
+        assert_eq!(
+            outcome_of(&same_body_replay.receipts[0]),
+            proto::TaskOperationOutcome::Idempotent,
+            "{:?}",
+            same_body_replay.receipts[0]
+        );
+        assert_create_replay(&accepted.receipts[1], &same_body_replay.receipts[0]);
         assert_eq!(
             fixture.task_host.prepared(),
-            vec![
-                bytes::Bytes::from_static(&[0x0a, 0x80]),
-                legal.frozen_bytes()
-            ],
-            "each winning round was interpreted once and the replay never was"
+            vec![bytes::Bytes::from_static(&[0x0a, 0x80])],
+            "the accepted identity is interpreted exactly once"
         );
     }
 
@@ -2534,6 +2624,7 @@ mod tests {
             outcome_of(&response.receipts[1]),
             proto::TaskOperationOutcome::Accepted
         );
+        fixture.wait_installed(identity);
 
         let mut malformed = original.clone();
         malformed
@@ -2555,14 +2646,14 @@ mod tests {
             error.message()
         );
 
-        assert!(fixture.registry.has_live_task(identity));
+        fixture.wait_installed(identity);
         assert_eq!(fixture.task_host.prepared().len(), 1);
         let replay = fixture.apply(vec![original.operation(TaskOperationId::new_v7())]);
         assert_eq!(
             outcome_of(&replay.receipts[0]),
             proto::TaskOperationOutcome::Idempotent
         );
-        assert_eq!(replay.receipts[0].ack, response.receipts[1].ack);
+        assert_create_replay(&response.receipts[1], &replay.receipts[0]);
     }
 
     /// The receipt belongs to the exact context that created the task. The

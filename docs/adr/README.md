@@ -189,10 +189,10 @@ code-anchors:
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0158）
 - ADR-0124 — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active）
-- ADR-0146 — 逻辑执行为何拥有 attempts、结果可见性与残余收敛，并在其下保留 Task 唯一生命周期权威（active；其中背景对两段创建载体的描述与 Create 的 conflict verdict 已由 ADR-0158 替换，其余仍有效）
+- ADR-0146 — 逻辑执行为何拥有 attempts、结果可见性与残余收敛，并在其下保留 Task 唯一生命周期权威（active；创建接管、读 success seal、单一覆盖观察与正常残余收敛已同步更新；准确创建载体见 Task 创建 ADR-0158）
 - ADR-0151 — 凭据续期为何由用它签名的那个消费者驱动、材料为何不再跨进程（active；supersedes ADR-0149）
-- ADR-0157 — Native RPC 接收保护为何分布在认证后入口、方法尺寸门和 codec（active；规则 3 所称的创建冲突判定已由 ADR-0158 取消，owner 分工不变）
-- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 与生命周期重放，逻辑执行为何只激活一次计划（active）
+- ADR-0157 — Native RPC 接收保护为何分布在认证后入口、方法尺寸门和 codec（active；接管前容量分类、Quiesce 小控制与单一覆盖观察入口责任已同步更新）
+- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 接管/准备/重放，以及正常围栏和覆盖观察如何分工（active；准确文件：ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md）
 
 #### 历史
 
@@ -220,7 +220,7 @@ code-anchors:
 - ADR-0073 — SQL compiler 为何先完成全部 binding 分析物化、再冻结 statistics 并以无 catalog 的第二阶段优化封存（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
 - ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active；其中「首次提交关闭替换窗口 / DispatchSeal」规则已由 ADR-0158 的一次激活与固定版本恢复替换，其余仍有效）
-- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 与生命周期重放，逻辑执行为何只激活一次计划（active）
+- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 接管/准备/重放，以及正常围栏和覆盖观察如何分工（active；准确文件：ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md）
 - ADR-0100 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active）
 - ADR-0145 — 查询语义为何先于 per-attempt execution access 冻结，重试为何不得重新规划或携带秘密（active）
 

@@ -319,6 +319,7 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         let read = ConnectorExecutionReadBinding::new(
             typed_read.admitted_provider_factory(),
             typed_read.decoder(),
+            Arc::new(crate::typed_read::codec::IcebergReadRecipeCompiler),
         );
         let write = ConnectorExecutionWriteBinding::new(
             write_execution,

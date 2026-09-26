@@ -15,6 +15,8 @@ test-support = ["dep:novarocks-secret"]
 novarocks-native-trust.workspace = true
 novarocks-execution.workspace = true
 novarocks-execution-contract.workspace = true
+novarocks-local-program.workspace = true
+novarocks-connector-contract.workspace = true
 novarocks-functions.workspace = true
 novarocks-memory.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
@@ -39,6 +41,7 @@ once_cell.workspace = true
 prometheus.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util.workspace = true
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util"] }

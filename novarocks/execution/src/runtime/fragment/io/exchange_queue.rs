@@ -20,21 +20,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::io::IoExecutor;
+use crate::runtime::io::{IoExecutor, IoTaskHandle};
 use crate::runtime::mem_tracker::TrackedBytes;
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeErrorState;
 use novarocks_types::UniqueId;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-use super::exchange_edge::EdgeSendGate;
+use super::exchange_edge::{EdgeSendGate, ExchangeDestinationKey};
 use super::exchange_metrics::observe_exchange_shuffle_bytes;
 use super::{ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection};
-use crate::task_execution::domain::ExchangeEdgeId;
 
 pub struct ExchangeSendTracker {
     inflight_tasks: AtomicUsize,
     inflight_bytes: AtomicUsize,
+    active_tasks: AtomicUsize,
+    cancelled: CancellationToken,
+    handles: Mutex<Vec<IoTaskHandle>>,
 }
 
 impl ExchangeSendTracker {
@@ -42,6 +45,9 @@ impl ExchangeSendTracker {
         Arc::new(Self {
             inflight_tasks: AtomicUsize::new(0),
             inflight_bytes: AtomicUsize::new(0),
+            active_tasks: AtomicUsize::new(0),
+            cancelled: CancellationToken::new(),
+            handles: Mutex::new(Vec::new()),
         })
     }
 
@@ -57,10 +63,55 @@ impl ExchangeSendTracker {
 
     pub fn is_idle(&self) -> bool {
         self.inflight_tasks.load(Ordering::Acquire) == 0
+            && self.active_tasks.load(Ordering::Acquire) == 0
     }
 
     pub fn inflight_bytes(&self) -> usize {
         self.inflight_bytes.load(Ordering::Acquire)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.is_cancelled()
+    }
+
+    fn cancel(&self) {
+        self.cancelled.cancel();
+        let mut handles = self.handles.lock().expect("exchange send handles lock");
+        handles.retain(|handle| !handle.is_finished());
+        for handle in handles.iter() {
+            handle.cancel();
+        }
+    }
+
+    fn retain_handle(&self, handle: IoTaskHandle) {
+        let mut handles = self.handles.lock().expect("exchange send handles lock");
+        handles.retain(|handle| !handle.is_finished());
+        if self.is_cancelled() {
+            handle.cancel();
+        }
+        handles.push(handle);
+    }
+
+    fn begin_task(self: &Arc<Self>, notify: Arc<Observable>) -> SendTaskActivity {
+        self.active_tasks.fetch_add(1, Ordering::AcqRel);
+        SendTaskActivity {
+            tracker: Arc::clone(self),
+            notify,
+        }
+    }
+}
+
+/// Keeps the exact I/O closure in the owner's stop debt through queue
+/// succession and bookkeeping, including unwind from the callback.
+struct SendTaskActivity {
+    tracker: Arc<ExchangeSendTracker>,
+    notify: Arc<Observable>,
+}
+
+impl Drop for SendTaskActivity {
+    fn drop(&mut self) {
+        self.tracker.active_tasks.fetch_sub(1, Ordering::AcqRel);
+        self.notify.defer_notify().arm();
     }
 }
 
@@ -209,8 +260,11 @@ impl ExchangeSendQueue {
     ) -> Result<ExchangeSendEnqueue, String> {
         let reserve_bytes = reserve_bytes.max(1);
         task.tracker.on_enqueue(reserve_bytes);
-        self.enqueue_task(task, reserve_bytes);
-        Ok(ExchangeSendEnqueue::Enqueued)
+        if self.enqueue_task(task, reserve_bytes) {
+            Ok(ExchangeSendEnqueue::Enqueued)
+        } else {
+            Err("exchange send owner was cancelled".to_string())
+        }
     }
 
     pub fn try_submit(
@@ -235,8 +289,11 @@ impl ExchangeSendQueue {
         }
 
         task.tracker.on_enqueue(reserve_bytes);
-        self.enqueue_task(task, reserve_bytes);
-        Ok(ExchangeSendEnqueue::Enqueued)
+        if self.enqueue_task(task, reserve_bytes) {
+            Ok(ExchangeSendEnqueue::Enqueued)
+        } else {
+            Err("exchange send owner was cancelled".to_string())
+        }
     }
 
     fn reserve_bytes(&self, bytes: usize) -> bool {
@@ -328,7 +385,7 @@ impl ExchangeSendQueue {
         true
     }
 
-    fn enqueue_task(self: &Arc<Self>, task: ExchangeSendTask, reserve_bytes: usize) {
+    fn enqueue_task(self: &Arc<Self>, task: ExchangeSendTask, reserve_bytes: usize) -> bool {
         let key = ExchangeSendKey::from_task(&task);
         let eos_marker = (task.frame.eos
             && crate::runtime::exchange::exchange_snapshot_markers_enabled())
@@ -341,20 +398,37 @@ impl ExchangeSendQueue {
                 task.frame.sequence,
             )
         });
-        let queued = QueuedSendTask {
+        let mut queued = Some(QueuedSendTask {
             task,
             reserve_bytes,
-        };
+        });
 
         let mut start_now = None;
         {
             let mut guard = self.queues.lock().expect("exchange send queue lock");
-            if let Some(queue) = guard.get_mut(&key) {
-                queue.push_back(queued);
-            } else {
-                guard.insert(key.clone(), VecDeque::new());
-                start_now = Some(queued);
+            let pending = &queued.as_ref().expect("queued send exists").task;
+            if !pending.tracker.is_cancelled()
+                && !pending
+                    .edge_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.is_normally_canceled())
+            {
+                if let Some(queue) = guard.get_mut(&key) {
+                    queue.push_back(queued.take().expect("queued send exists"));
+                } else {
+                    guard.insert(key.clone(), VecDeque::new());
+                    start_now = queued.take();
+                }
             }
+        }
+
+        if let Some(cancelled) = queued {
+            let owner_cancelled = cancelled.task.tracker.is_cancelled();
+            self.release_discarded(cancelled);
+            // A destination that closed between the sink's gate check and
+            // queue admission owes no frame. Its normal close is not a query
+            // error; a cancelled owner is still reported to its caller.
+            return !owner_cancelled;
         }
 
         if let Some((sender_finst, sender_ordinal, sender_count, be_number, sequence)) = eos_marker
@@ -381,9 +455,21 @@ impl ExchangeSendQueue {
         if let Some(queued) = start_now {
             self.spawn_send_task(key, queued);
         }
+        true
     }
 
     fn run_send_task(self: &Arc<Self>, task: ExchangeSendTask, reserve_bytes: usize) {
+        if task
+            .edge_gate
+            .as_ref()
+            .is_some_and(|gate| gate.is_normally_canceled())
+        {
+            self.release_discarded(QueuedSendTask {
+                task,
+                reserve_bytes,
+            });
+            return;
+        }
         let send_start = Instant::now();
         // Built before the send moves `task.payload`, so we can release this destination's per-channel
         // reservation symmetrically with the global one on completion.
@@ -411,7 +497,7 @@ impl ExchangeSendQueue {
         let be_number = frame.backend_number;
         let eos = frame.eos;
         let sequence = frame.sequence;
-        let result = transmitter.transmit(frame);
+        let result = transmitter.transmit_cancellable(frame, tracker.cancelled.clone());
         let send_ns = send_start.elapsed().as_nanos();
 
         if let Some(profile) = profiles.as_ref() {
@@ -468,12 +554,18 @@ impl ExchangeSendQueue {
             }
             // A destination's normal departure is not this producer's
             // failure, so the shared error state stays clean: only that
-            // destination's edge closes and only that edge's frames are
+            // destination's gate closes and only its queued frames are
             // dropped. Whether this attempt succeeded remains the
             // coordinator's decision, and the producer waits to be cancelled.
             Err(ExchangeTransmitRejection::DestinationCanceled(reason)) => match edge_gate.as_ref()
             {
-                Some(gate) => {
+                Some(gate)
+                    if gate.destination()
+                        == ExchangeDestinationKey::new(
+                            destination_fragment_instance_id,
+                            destination_node_id,
+                        ) =>
+                {
                     if eos {
                         crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
                             format!(
@@ -491,12 +583,7 @@ impl ExchangeSendQueue {
                             )
                         });
                     }
-                    let closed_here = gate.close_for_normal_cancellation();
-                    let discarded = if closed_here {
-                        self.discard_edge(gate.edge_id())
-                    } else {
-                        0
-                    };
+                    let (closed_here, discarded) = self.close_destination_normally(gate);
                     debug!(
                         "exchange destination cancelled normally: edge={} reason={} dest={} dest_finst={} node_id={} sender_id={} seq={} closed_here={} discarded_frames={}",
                         gate.edge_id(),
@@ -510,7 +597,7 @@ impl ExchangeSendQueue {
                         discarded
                     );
                 }
-                None => {
+                _ => {
                     if eos {
                         crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
                             format!(
@@ -528,11 +615,10 @@ impl ExchangeSendQueue {
                             )
                         });
                     }
-                    // With no gated edge there is nothing to attribute the
-                    // departure to, so it cannot be told apart from a
-                    // failure: fail closed rather than assume a cancellation.
+                    // The exact destination gate is required to attribute
+                    // this answer. A missing or mismatched gate fails closed.
                     let message = format!(
-                        "exchange destination reported {reason} but this producer has no gated outbound edge"
+                        "exchange destination reported {reason} but this producer has no matching gated outbound destination"
                     );
                     error!(
                         "exchange send rejected: dest={} dest_finst={} sender_finst={} node_id={} sender_id={} seq={} error={}",
@@ -583,21 +669,34 @@ impl ExchangeSendQueue {
         self.inflight_bytes
             .fetch_sub(reserve_bytes, Ordering::AcqRel);
         self.release_per_dest(&dest_key, reserve_bytes);
+        drop(payload_accounting);
         tracker.on_complete(reserve_bytes);
         let deferred_notify = notify.defer_notify();
         deferred_notify.arm();
         self.notify_send_observers();
-        drop(payload_accounting);
     }
 
-    /// Drops every queued frame of one abandoned edge and returns how many
+    /// Atomically latches one destination's normal close and drops only its
+    /// queued frames. This can also be called when the producer receives an
+    /// accurate no-more-input decision before any frame reaches the receiver.
+    pub fn close_destination_normally(self: &Arc<Self>, gate: &Arc<EdgeSendGate>) -> (bool, usize) {
+        let closed_here = gate.close_for_normal_cancellation();
+        let discarded = if closed_here {
+            self.discard_destination_gate(gate)
+        } else {
+            0
+        };
+        (closed_here, discarded)
+    }
+
+    /// Drops every queued frame of one normally closed destination and returns how many
     /// were dropped.
     ///
-    /// Only that edge's frames go: a destination that left normally must not
+    /// Only that destination's frames go: a destination that left normally must not
     /// cost a healthy destination its backlog. The per-destination keys are
     /// kept even when they empty, because a present key is what tells
     /// [`Self::on_task_complete`] a send is still running for it.
-    fn discard_edge(self: &Arc<Self>, edge: ExchangeEdgeId) -> usize {
+    fn discard_destination_gate(self: &Arc<Self>, closed_gate: &Arc<EdgeSendGate>) -> usize {
         let discarded = {
             let mut guard = self.queues.lock().expect("exchange send queue lock");
             let mut discarded = Vec::new();
@@ -608,7 +707,7 @@ impl ExchangeSendQueue {
                         .task
                         .edge_gate
                         .as_ref()
-                        .is_some_and(|gate| gate.edge_id() == edge)
+                        .is_some_and(|gate| Arc::ptr_eq(gate, closed_gate))
                     {
                         discarded.push(queued);
                     } else {
@@ -627,6 +726,31 @@ impl ExchangeSendQueue {
         count
     }
 
+    /// Revoke one operator's queued work. A synchronous transmit already in
+    /// progress remains owned until it returns and releases its reservation.
+    pub fn cancel_tracker(self: &Arc<Self>, tracker: &Arc<ExchangeSendTracker>) {
+        tracker.cancel();
+        let discarded = {
+            let mut guard = self.queues.lock().expect("exchange send queue lock");
+            let mut discarded = Vec::new();
+            for queue in guard.values_mut() {
+                let mut retained = VecDeque::with_capacity(queue.len());
+                while let Some(queued) = queue.pop_front() {
+                    if Arc::ptr_eq(&queued.task.tracker, tracker) {
+                        discarded.push(queued);
+                    } else {
+                        retained.push_back(queued);
+                    }
+                }
+                *queue = retained;
+            }
+            discarded
+        };
+        for queued in discarded {
+            self.release_discarded(queued);
+        }
+    }
+
     /// Releases a discarded frame's reservations exactly as a completed send
     /// would, so an abandoned edge never leaks budget from the shared or the
     /// per-destination ceiling.
@@ -639,34 +763,67 @@ impl ExchangeSendQueue {
         self.inflight_bytes
             .fetch_sub(reserve_bytes, Ordering::AcqRel);
         self.release_per_dest(&dest_key, reserve_bytes);
+        drop(task.payload_accounting);
         task.tracker.on_complete(reserve_bytes);
         let deferred_notify = task.notify.defer_notify();
         deferred_notify.arm();
-        drop(task.payload_accounting);
         self.notify_send_observers();
     }
 
     fn spawn_send_task(self: &Arc<Self>, key: ExchangeSendKey, queued: QueuedSendTask) {
         let queue = Arc::clone(self);
-        self.io_executor.submit(move |_ctx| {
-            queue.run_send_task(queued.task, queued.reserve_bytes);
+        let tracker = Arc::clone(&queued.task.tracker);
+        let activity = tracker.begin_task(Arc::clone(&queued.task.notify));
+        let handle = self.io_executor.submit(move |ctx| {
+            let _activity = activity;
+            if ctx.is_cancelled()
+                || queued.task.tracker.is_cancelled()
+                || queued
+                    .task
+                    .edge_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.is_normally_canceled())
+            {
+                queue.release_discarded(queued);
+            } else {
+                queue.run_send_task(queued.task, queued.reserve_bytes);
+            }
             queue.on_task_complete(key);
         });
+        tracker.retain_handle(handle);
     }
 
     fn on_task_complete(self: &Arc<Self>, key: ExchangeSendKey) {
-        let next = {
+        let (next, discarded) = {
             let mut guard = self.queues.lock().expect("exchange send queue lock");
             let Some(queue) = guard.get_mut(&key) else {
                 return;
             };
-            if let Some(next) = queue.pop_front() {
-                Some(next)
-            } else {
+            let mut discarded = Vec::new();
+            let next = loop {
+                match queue.pop_front() {
+                    Some(task)
+                        if task.task.tracker.is_cancelled()
+                            || task
+                                .task
+                                .edge_gate
+                                .as_ref()
+                                .is_some_and(|gate| gate.is_normally_canceled()) =>
+                    {
+                        discarded.push(task)
+                    }
+                    other => break other,
+                }
+            };
+            if next.is_none() {
                 guard.remove(&key);
-                None
             }
+            (next, discarded)
         };
+
+        for task in discarded {
+            self.release_discarded(task);
+        }
 
         if let Some(task) = next {
             self.spawn_send_task(key, task);
@@ -713,7 +870,9 @@ impl ExchangeSendQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::task_execution::domain::ExchangeEdgeId;
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
 
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::fragment::io::exchange_edge::{
@@ -753,6 +912,69 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    struct BlockingTransmitter {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+    }
+
+    impl ExchangeFrameTransmitter for BlockingTransmitter {
+        fn transmit(&self, _frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            if call == 0 {
+                self.entered.send(()).expect("test observes first transmit");
+                let _ = self.release.lock().expect("release lock").recv();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancelling_a_blocked_send_discards_its_successor_and_waits_for_transmit_return() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let transmitter = Arc::new(BlockingTransmitter {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        });
+        let queue = Arc::new(ExchangeSendQueue::with_limits(100, 100));
+        let tracker = ExchangeSendTracker::new();
+        let error_state = Arc::new(RuntimeErrorState::default());
+        for _ in 0..2 {
+            queue
+                .try_submit(
+                    exchange_task(
+                        Arc::clone(&transmitter) as Arc<dyn ExchangeFrameTransmitter>,
+                        Arc::clone(&error_state),
+                        Arc::clone(&tracker),
+                    ),
+                    false,
+                )
+                .expect("admit send");
+        }
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first transmit started");
+        assert_eq!(queue.backlog_len_for_test(), 1);
+        assert_eq!(tracker.handles.lock().expect("handles lock").len(), 1);
+
+        queue.cancel_tracker(&tracker);
+        assert_eq!(queue.backlog_len_for_test(), 0);
+        assert!(!tracker.is_idle(), "blocked transmit still owns its task");
+        assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
+        drop(queue);
+        release_tx.send(()).expect("release real transmit");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !tracker.is_idle() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(tracker.is_idle(), "real transmit return releases the owner");
+        assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
+        assert_eq!(error_state.error(), None);
     }
 
     fn finst() -> UniqueId {
@@ -800,6 +1022,7 @@ mod tests {
             frame: ExchangeFrame {
                 destination: RuntimeEndpoint::new("be-2", 9060).expect("destination"),
                 destination_fragment_instance_id: UniqueId::new(2, 3),
+                destination_task_identity: None,
                 sender_fragment_instance_id: UniqueId::new(4, 5),
                 sender_ordinal: 0,
                 sender_count: 1,
@@ -989,9 +1212,64 @@ mod tests {
         assert!(
             error_state
                 .error()
-                .is_some_and(|error| error.contains("no gated outbound edge")),
+                .is_some_and(|error| error.contains("no matching gated outbound destination")),
             "an unattributable cancellation cannot be told apart from a failure"
         );
+    }
+
+    #[test]
+    fn normal_reply_cannot_close_another_destinations_gate() {
+        let first = UniqueId::new(2, 40);
+        let second = UniqueId::new(2, 41);
+        let gates = ExchangeEdgeGates::try_new([(
+            edge_id(1),
+            vec![
+                ExchangeDestinationKey::new(first, 6),
+                ExchangeDestinationKey::new(second, 6),
+            ],
+        )])
+        .expect("two destinations");
+        gates
+            .open(EdgeOpenVersion::FIRST, &[edge_id(1)])
+            .expect("open edge");
+        let wrong_gate = Arc::clone(
+            gates
+                .gate_for_destination(ExchangeDestinationKey::new(first, 6))
+                .expect("first gate"),
+        );
+        let transmitter = Arc::new(RecordingTransmitter::rejecting(
+            ExchangeTransmitRejection::DestinationCanceled(CancelReason::UpstreamNoLongerNeeded),
+        ));
+        let error_state = Arc::new(RuntimeErrorState::default());
+        let tracker = ExchangeSendTracker::new();
+        let queue = Arc::new(ExchangeSendQueue::with_limits(8, 8));
+        assert!(queue.reserve_bytes_for("be-2", 9060, second, 6, 7, 2));
+        tracker.on_enqueue(2);
+        queue.run_send_task(
+            task_on_edge(
+                transmitter as Arc<dyn ExchangeFrameTransmitter>,
+                Arc::clone(&error_state),
+                Arc::clone(&tracker),
+                wrong_gate,
+                second,
+            ),
+            2,
+        );
+        assert!(error_state.error().is_some());
+        assert!(gates.normally_canceled_destinations().is_empty());
+        assert!(
+            gates
+                .gate_for_destination(ExchangeDestinationKey::new(first, 6))
+                .unwrap()
+                .may_send()
+        );
+        assert!(
+            gates
+                .gate_for_destination(ExchangeDestinationKey::new(second, 6))
+                .unwrap()
+                .may_send()
+        );
+        assert!(tracker.is_idle());
     }
 
     #[test]
@@ -1063,6 +1341,109 @@ mod tests {
             gates.gate(edge_id(2)).expect("edge two").may_send(),
             "the healthy edge keeps its send permission"
         );
+    }
+
+    #[test]
+    fn partial_close_keeps_the_same_edges_other_destination_backlog() {
+        let closed = UniqueId::new(2, 30);
+        let healthy = UniqueId::new(2, 31);
+        let gates = ExchangeEdgeGates::try_new([(
+            edge_id(1),
+            vec![
+                ExchangeDestinationKey::new(closed, 6),
+                ExchangeDestinationKey::new(healthy, 6),
+            ],
+        )])
+        .expect("one edge with two destinations");
+        gates
+            .open(EdgeOpenVersion::FIRST, &[edge_id(1)])
+            .expect("open edge");
+        let closed_gate = Arc::clone(
+            gates
+                .gate_for_destination(ExchangeDestinationKey::new(closed, 6))
+                .expect("closed destination"),
+        );
+        let healthy_gate = Arc::clone(
+            gates
+                .gate_for_destination(ExchangeDestinationKey::new(healthy, 6))
+                .expect("healthy destination"),
+        );
+        let error_state = Arc::new(RuntimeErrorState::default());
+        let tracker = ExchangeSendTracker::new();
+        let queue = Arc::new(ExchangeSendQueue::with_limits(100, 100));
+        for _ in 0..2 {
+            queue.backlog_for_test(
+                task_on_edge(
+                    crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+                    Arc::clone(&error_state),
+                    Arc::clone(&tracker),
+                    Arc::clone(&closed_gate),
+                    closed,
+                ),
+                2,
+            );
+        }
+        let healthy_transmitter = Arc::new(RecordingTransmitter::default());
+        queue.backlog_for_test(
+            task_on_edge(
+                Arc::clone(&healthy_transmitter) as Arc<dyn ExchangeFrameTransmitter>,
+                Arc::clone(&error_state),
+                Arc::clone(&tracker),
+                Arc::clone(&healthy_gate),
+                healthy,
+            ),
+            3,
+        );
+        assert_eq!(queue.backlog_len_for_test(), 3);
+        assert_eq!(queue.inflight_bytes(), 7);
+
+        let (closed_here, discarded) = queue.close_destination_normally(&closed_gate);
+        assert!(closed_here);
+        assert_eq!(discarded, 2);
+        assert_eq!(queue.close_destination_normally(&closed_gate), (false, 0));
+        assert_eq!(queue.backlog_len_for_test(), 1);
+        assert_eq!(queue.inflight_bytes(), 3);
+        assert_eq!(tracker.inflight_bytes(), 3);
+        assert_eq!(
+            gates.normally_canceled_destinations(),
+            vec![ExchangeDestinationKey::new(closed, 6)]
+        );
+        assert!(gates.normally_canceled_edges().is_empty());
+        assert!(healthy_gate.may_send());
+        assert_eq!(error_state.error(), None);
+
+        // A frame arriving after the close is accounted and discarded without
+        // transmitting or turning normal close into a producer error.
+        let later = Arc::new(RecordingTransmitter::default());
+        assert!(queue.reserve_bytes_for("be-2", 9060, closed, 6, 7, 2));
+        tracker.on_enqueue(2);
+        queue.run_send_task(
+            task_on_edge(
+                Arc::clone(&later) as Arc<dyn ExchangeFrameTransmitter>,
+                Arc::clone(&error_state),
+                Arc::clone(&tracker),
+                closed_gate,
+                closed,
+            ),
+            2,
+        );
+        assert_eq!(later.frame_count(), 0);
+        assert_eq!(queue.inflight_bytes(), 3);
+
+        queue.on_task_complete(ExchangeSendKey {
+            dest_host: "be-2".to_string(),
+            dest_port: 9060,
+            finst_id: healthy,
+            node_id: 6,
+            sender_id: 7,
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !tracker.is_idle() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(healthy_transmitter.frame_count(), 1);
+        assert!(tracker.is_idle());
+        assert_eq!(queue.inflight_bytes(), 0);
     }
 
     #[test]

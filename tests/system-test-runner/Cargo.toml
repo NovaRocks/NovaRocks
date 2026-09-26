@@ -31,6 +31,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+arrow-array.workspace = true
 bytes.workspace = true
 h2.workspace = true
 http.workspace = true
@@ -39,6 +40,7 @@ novarocks-cluster-harness.workspace = true
 novarocks-connector-iceberg.workspace = true
 novarocks-fs.workspace = true
 novarocks-failpoint.workspace = true
+novarocks-execution.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-secret.workspace = true

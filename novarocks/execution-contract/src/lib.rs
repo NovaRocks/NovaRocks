@@ -31,6 +31,7 @@ pub mod lease;
 pub mod membership;
 pub mod operation;
 pub mod status;
+pub mod task_convergence;
 pub mod transition;
 
 /// Stable namespace used by protocol codecs and role applications.
@@ -62,6 +63,9 @@ pub mod task_execution {
     pub mod status {
         pub use crate::status::*;
     }
+    pub mod task_convergence {
+        pub use crate::task_convergence::*;
+    }
     pub mod transition {
         pub use crate::transition::*;
     }
@@ -76,4 +80,5 @@ pub use lease::*;
 pub use membership::*;
 pub use operation::*;
 pub use status::*;
+pub use task_convergence::*;
 pub use transition::*;

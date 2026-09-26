@@ -19,14 +19,6 @@ pub use novarocks_connector_contract::{
     ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
 };
 
-use super::{ConnectorError, ConnectorErrorKind};
-
-impl From<ConnectorIdentityError> for ConnectorError {
-    fn from(error: ConnectorIdentityError) -> Self {
-        Self::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::ConnectorInstanceId;

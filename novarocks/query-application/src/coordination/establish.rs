@@ -57,15 +57,16 @@ pub struct AdmissionIssueReceipt {
     first_sent_at: MonotonicInstant,
 }
 
-/// Exact Worker settlement for one admission operation.
+/// Exact settlement for one admission operation.
 ///
 /// The type itself fixes the operation kind. Applied outcomes must carry the
 /// grant they acknowledge, while every rejection must carry no grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdmissionIssueSettlement {
     operation_id: TaskOperationId,
-    outcome: OperationOutcome,
+    outcome: Option<OperationOutcome>,
     ticket: Option<QueryContextAdmissionTicketReceipt>,
+    prior_transport_unknown: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,8 +89,9 @@ impl AdmissionIssueSettlement {
         }
         Ok(Self {
             operation_id,
-            outcome,
+            outcome: Some(outcome),
             ticket: Some(ticket),
+            prior_transport_unknown: false,
         })
     }
 
@@ -105,8 +107,9 @@ impl AdmissionIssueSettlement {
         }
         Ok(Self {
             operation_id,
-            outcome,
+            outcome: Some(outcome),
             ticket: None,
+            prior_transport_unknown: false,
         })
     }
 
@@ -114,7 +117,25 @@ impl AdmissionIssueSettlement {
         self.operation_id
     }
 
-    pub const fn outcome(self) -> OperationOutcome {
+    /// A settled ingress refusal never mints a Worker verdict or grant.
+    pub const fn pre_worker_rejected(operation_id: TaskOperationId) -> Self {
+        Self::pre_worker_rejected_with_prior_unknown(operation_id, false)
+    }
+
+    /// A previous send may have reached Worker even though this send did not.
+    pub const fn pre_worker_rejected_with_prior_unknown(
+        operation_id: TaskOperationId,
+        prior_transport_unknown: bool,
+    ) -> Self {
+        Self {
+            operation_id,
+            outcome: None,
+            ticket: None,
+            prior_transport_unknown,
+        }
+    }
+
+    pub const fn outcome(self) -> Option<OperationOutcome> {
         self.outcome
     }
 
@@ -249,6 +270,7 @@ pub enum EstablishIssueState {
     TransportOwned,
     DefinitelyUnsent,
     TransportUnknown,
+    PreWorkerRejected,
     WorkerSettled(EstablishWorkerSettlement),
 }
 
@@ -461,6 +483,7 @@ enum EstablishIssueEventKind {
     TransportOwned,
     DefinitelyUnsent,
     TransportUnknown,
+    PreWorkerRejected,
     WorkerSettled(EstablishWorkerSettlement),
 }
 
@@ -481,6 +504,8 @@ enum AdmissionIssueState {
     },
     ExpiredGrant(QueryContextAdmissionTicketReceipt),
     Rejected(OperationOutcome),
+    PreWorkerRejected,
+    PreWorkerRejectedAfterUnknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -639,7 +664,9 @@ impl EstablishIssueLedger {
                 .is_some_and(|record| record.state == EstablishIssueState::TicketHeld),
             AdmissionIssueState::Pending
             | AdmissionIssueState::Granted { .. }
-            | AdmissionIssueState::Rejected(_) => false,
+            | AdmissionIssueState::Rejected(_)
+            | AdmissionIssueState::PreWorkerRejected
+            | AdmissionIssueState::PreWorkerRejectedAfterUnknown => false,
         };
         if !replaceable {
             return Err(EstablishIssueError::ConflictingAdmissionIssue);
@@ -709,7 +736,7 @@ impl EstablishIssueLedger {
             return Err(EstablishIssueError::AdmissionTimeInFuture);
         }
         match (settlement.outcome, settlement.ticket) {
-            (OperationOutcome::Accepted | OperationOutcome::Idempotent, Some(ticket)) => {
+            (Some(OperationOutcome::Accepted | OperationOutcome::Idempotent), Some(ticket)) => {
                 if ticket.context() != context || ticket.valid_for() != admission_issue.valid_for {
                     return Err(EstablishIssueError::InvalidAdmissionSettlement);
                 }
@@ -756,9 +783,11 @@ impl EstablishIssueLedger {
                 Ok(AdmissionIssueDisposition::Granted)
             }
             (
-                outcome @ (OperationOutcome::OperationTimedOut
-                | OperationOutcome::ResourceExhausted
-                | OperationOutcome::AdmissionTicketStillActive),
+                Some(
+                    outcome @ (OperationOutcome::OperationTimedOut
+                    | OperationOutcome::ResourceExhausted
+                    | OperationOutcome::AdmissionTicketStillActive),
+                ),
                 None,
             ) => match record.state {
                 AdmissionIssueState::Pending => {
@@ -770,7 +799,20 @@ impl EstablishIssueLedger {
                 }
                 _ => Err(EstablishIssueError::InvalidAdmissionSettlement),
             },
-            (outcome, None) => match record.state {
+            (None, None) => match record.state {
+                AdmissionIssueState::Pending
+                | AdmissionIssueState::PreWorkerRejected
+                | AdmissionIssueState::PreWorkerRejectedAfterUnknown => {
+                    record.state = if settlement.prior_transport_unknown {
+                        AdmissionIssueState::PreWorkerRejectedAfterUnknown
+                    } else {
+                        AdmissionIssueState::PreWorkerRejected
+                    };
+                    Err(EstablishIssueError::AdmissionRejected)
+                }
+                _ => Err(EstablishIssueError::InvalidAdmissionSettlement),
+            },
+            (Some(outcome), None) => match record.state {
                 AdmissionIssueState::Pending => {
                     record.state = AdmissionIssueState::Rejected(outcome);
                     Err(EstablishIssueError::AdmissionRejected)
@@ -958,11 +1000,12 @@ impl EstablishIssueLedger {
             .collect())
     }
 
-    pub(crate) fn has_worker_rejection(&self) -> bool {
+    pub(crate) fn has_establish_rejection(&self) -> bool {
         self.records.values().any(|record| {
             matches!(
                 record.state,
                 EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Rejected(_))
+                    | EstablishIssueState::PreWorkerRejected
             )
         })
     }
@@ -975,7 +1018,8 @@ impl EstablishIssueLedger {
                 Some(EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied)) => {}
                 Some(EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Rejected(
                     _,
-                ))) => {
+                )))
+                | Some(EstablishIssueState::PreWorkerRejected) => {
                     return Err(EstablishIssueError::EstablishRejected);
                 }
                 Some(_) => return Err(EstablishIssueError::EstablishNotSettled),
@@ -1002,7 +1046,8 @@ impl EstablishIssueLedger {
                 EstablishIssueEventKind::WorkerSettled(outcome) => settle_worker(record, outcome),
                 EstablishIssueEventKind::TransportOwned
                 | EstablishIssueEventKind::DefinitelyUnsent
-                | EstablishIssueEventKind::TransportUnknown => Ok(false),
+                | EstablishIssueEventKind::TransportUnknown
+                | EstablishIssueEventKind::PreWorkerRejected => Ok(false),
             };
         }
 
@@ -1014,7 +1059,10 @@ impl EstablishIssueLedger {
                 _ => Err(EstablishIssueError::WrongState),
             };
         }
-        if matches!(record.state, EstablishIssueState::WorkerSettled(_)) {
+        if matches!(
+            record.state,
+            EstablishIssueState::WorkerSettled(_) | EstablishIssueState::PreWorkerRejected
+        ) {
             return Ok(false);
         }
 
@@ -1029,11 +1077,17 @@ impl EstablishIssueLedger {
             (EstablishIssueState::TransportOwned, EstablishIssueEventKind::TransportUnknown) => {
                 EstablishIssueState::TransportUnknown
             }
+            (EstablishIssueState::TransportOwned, EstablishIssueEventKind::PreWorkerRejected)
+            | (EstablishIssueState::TransportUnknown, EstablishIssueEventKind::PreWorkerRejected) => {
+                EstablishIssueState::PreWorkerRejected
+            }
             (state, kind) if event_matches_state(state, kind) => return Ok(false),
             _ => return Err(EstablishIssueError::WrongState),
         };
         record.state = next;
-        if next == EstablishIssueState::DefinitelyUnsent && !issue_authority_open {
+        if next == EstablishIssueState::PreWorkerRejected
+            || (next == EstablishIssueState::DefinitelyUnsent && !issue_authority_open)
+        {
             record.request = None;
         }
         Ok(true)
@@ -1046,6 +1100,7 @@ fn admission_may_hold_worker_capacity(state: AdmissionIssueState) -> bool {
         AdmissionIssueState::Pending
             | AdmissionIssueState::Granted { .. }
             | AdmissionIssueState::ExpiredGrant(_)
+            | AdmissionIssueState::PreWorkerRejectedAfterUnknown
             | AdmissionIssueState::RetryableNoGrant(OperationOutcome::AdmissionTicketStillActive)
     )
 }
@@ -1061,7 +1116,7 @@ fn replay_retired_admission_settlement(
                 ticket,
                 conservative_expiry,
             },
-            OperationOutcome::Accepted | OperationOutcome::Idempotent,
+            Some(OperationOutcome::Accepted | OperationOutcome::Idempotent),
             Some(replayed_ticket),
         ) if replayed_ticket == ticket => Ok(if now.has_reached(conservative_expiry) {
             AdmissionIssueDisposition::Retryable
@@ -1070,10 +1125,10 @@ fn replay_retired_admission_settlement(
         }),
         (
             AdmissionIssueState::ExpiredGrant(ticket),
-            OperationOutcome::Accepted | OperationOutcome::Idempotent,
+            Some(OperationOutcome::Accepted | OperationOutcome::Idempotent),
             Some(replayed_ticket),
         ) if replayed_ticket == ticket => Ok(AdmissionIssueDisposition::Retryable),
-        (AdmissionIssueState::RetryableNoGrant(outcome), replayed_outcome, None)
+        (AdmissionIssueState::RetryableNoGrant(outcome), Some(replayed_outcome), None)
             if replayed_outcome == outcome =>
         {
             Ok(AdmissionIssueDisposition::Retryable)
@@ -1139,6 +1194,9 @@ fn event_matches_state(state: EstablishIssueState, event: EstablishIssueEventKin
         ) | (
             EstablishIssueState::TransportUnknown,
             EstablishIssueEventKind::TransportUnknown
+        ) | (
+            EstablishIssueState::PreWorkerRejected,
+            EstablishIssueEventKind::PreWorkerRejected
         )
     )
 }
@@ -1292,6 +1350,10 @@ impl EstablishTransportSubmission {
         ))
     }
 
+    pub fn pre_worker_rejected(mut self) -> Result<(), EstablishIssueError> {
+        self.settle(EstablishIssueEventKind::PreWorkerRejected)
+    }
+
     fn settle(&mut self, kind: EstablishIssueEventKind) -> Result<(), EstablishIssueError> {
         self.publish(kind)?;
         self.request.take();
@@ -1339,6 +1401,16 @@ impl LateEstablishWorkerSettlement {
                 kind: EstablishIssueEventKind::WorkerSettled(
                     EstablishWorkerSettlement::from_outcome(outcome),
                 ),
+            })
+            .map_err(|_| EstablishIssueError::EventChannelClosed)
+    }
+
+    pub fn pre_worker_rejected(self) -> Result<(), EstablishIssueError> {
+        self.events
+            .send(EstablishIssueEvent {
+                identity: self.identity,
+                authorization_generation: self.authorization_generation,
+                kind: EstablishIssueEventKind::PreWorkerRejected,
             })
             .map_err(|_| EstablishIssueError::EventChannelClosed)
     }
@@ -1651,6 +1723,98 @@ mod tests {
             NonZeroUsize::new(3).unwrap(),
             NonZeroUsize::new(max_authorizations).unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn pre_worker_admission_refusal_closes_replay_without_a_grant() {
+        let execution = execution(31);
+        let activation = activation(execution);
+        let context = context(execution);
+        let now = times().0;
+        let mut ledger = issue_ledger(context, 2);
+        let request = admission_request(context, 31);
+        let issue = ledger
+            .begin_admission_issue(activation, request, now)
+            .unwrap();
+        let settlement = AdmissionIssueSettlement::pre_worker_rejected(issue.operation_id());
+        assert_eq!(settlement.outcome(), None);
+        assert_eq!(settlement.ticket(), None);
+        assert_eq!(
+            ledger.settle_admission_issue(activation, issue, settlement, now),
+            Err(EstablishIssueError::AdmissionRejected)
+        );
+        assert_eq!(
+            ledger.begin_admission_issue(activation, request, now),
+            Err(EstablishIssueError::AdmissionReplayClosed)
+        );
+        assert_eq!(
+            ledger.stand_down_facts().unwrap(),
+            vec![(context, EstablishStandDownFact::NoGrant)]
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_refusal_after_unknown_keeps_abort_responsibility() {
+        let execution = execution(33);
+        let activation = activation(execution);
+        let context = context(execution);
+        let now = times().0;
+        let mut ledger = issue_ledger(context, 2);
+        let issue = ledger
+            .begin_admission_issue(activation, admission_request(context, 33), now)
+            .unwrap();
+        assert_eq!(
+            ledger.settle_admission_issue(
+                activation,
+                issue,
+                AdmissionIssueSettlement::pre_worker_rejected_with_prior_unknown(
+                    issue.operation_id(),
+                    true,
+                ),
+                now,
+            ),
+            Err(EstablishIssueError::AdmissionRejected)
+        );
+        assert_eq!(
+            ledger.stand_down_facts().unwrap(),
+            vec![(context, EstablishStandDownFact::AbortRequired)]
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_worker_establish_refusal_retains_ticket_abort_responsibility() {
+        let execution = execution(32);
+        let activation = activation(execution);
+        let context = context(execution);
+        let now = times().0;
+        let mut ledger = issue_ledger(context, 2);
+        let held = ticket(context, 32);
+        hold_ticket(&mut ledger, activation, held, 32, now, now);
+        let request = establish_request(context, held, 32);
+        let submission = submit(
+            ledger
+                .authorize_issue(
+                    activation,
+                    request,
+                    NativeCompatibilityId::new([32; 32]),
+                    now,
+                )
+                .unwrap(),
+        );
+        submission.pre_worker_rejected().unwrap();
+        ledger.drain_events().unwrap();
+        assert_eq!(
+            ledger.snapshot(context).unwrap().state(),
+            EstablishIssueState::PreWorkerRejected
+        );
+        assert_eq!(
+            ledger.ensure_success_ready(),
+            Err(EstablishIssueError::EstablishRejected)
+        );
+        assert_eq!(
+            ledger.stand_down_facts().unwrap(),
+            vec![(context, EstablishStandDownFact::AbortRequired)]
+        );
     }
 
     #[tokio::test]

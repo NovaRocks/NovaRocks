@@ -33,11 +33,21 @@ pub struct BackendMetricsRegistry {
         usize,
     )>,
     worker_registry_lock: Option<std::sync::Arc<novarocks_worker::RegistryLockObservation>>,
+    task_preparation: Option<std::sync::Arc<novarocks_worker::TaskExecutionRegistry>>,
+    task_preparation_gauges: IntGaugeVec,
+    scrape_lock: std::sync::Mutex<()>,
 }
 
 impl BackendMetricsRegistry {
     pub fn new() -> Result<Self, String> {
         let registry = Registry::new();
+        let task_preparation_gauges = IntGaugeVec::new(
+            Opts::new("novarocks_backend_task_preparation", "Temporary preparation ownership and configured limits from the Worker charge ledger."),
+            &["resource", "dimension"],
+        ).map_err(|error| format!("construct task preparation metrics: {error}"))?;
+        registry
+            .register(Box::new(task_preparation_gauges.clone()))
+            .map_err(|error| format!("register task preparation metrics: {error}"))?;
         let collectors = [
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone())
                 as Box<dyn prometheus::core::Collector>,
@@ -87,6 +97,9 @@ impl BackendMetricsRegistry {
             registry,
             worker_reservations: None,
             worker_registry_lock: None,
+            task_preparation: None,
+            task_preparation_gauges,
+            scrape_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -107,7 +120,42 @@ impl BackendMetricsRegistry {
         self
     }
 
+    pub fn with_task_preparation(
+        mut self,
+        owner: std::sync::Arc<novarocks_worker::TaskExecutionRegistry>,
+    ) -> Self {
+        self.task_preparation = Some(owner);
+        self
+    }
+
     fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
+        // Keep owner sampling, gauge projection and collection in one scrape order.
+        let _scrape = self.scrape_lock.lock().expect("backend metric scrape lock");
+        if let Some(owner) = &self.task_preparation {
+            let snapshot = owner.preparation_snapshot();
+            for (resource, used, limit) in [
+                ("positions", snapshot.positions, snapshot.position_limit),
+                (
+                    "context_positions",
+                    snapshot.context_positions,
+                    snapshot.context_position_limit,
+                ),
+                (
+                    "queued_positions",
+                    snapshot.queued_positions,
+                    snapshot.position_limit,
+                ),
+                ("workers", snapshot.workers, snapshot.worker_limit),
+                ("bytes", snapshot.bytes, snapshot.byte_limit),
+            ] {
+                self.task_preparation_gauges
+                    .with_label_values(&[resource, "used"])
+                    .set(i64::try_from(used).unwrap_or(i64::MAX));
+                self.task_preparation_gauges
+                    .with_label_values(&[resource, "limit"])
+                    .set(i64::try_from(limit).unwrap_or(i64::MAX));
+            }
+        }
         if let Some((observation, limit)) = &self.worker_reservations {
             publish_worker_context_reservation(
                 observation.used(),

@@ -413,6 +413,13 @@ impl NativeAbortEffect {
         }
 
         match acknowledgement.dispatch_result() {
+            OperationDispatchResult::IngressRejected(_)
+            | OperationDispatchResult::NonWorkerRejected => {
+                Err(NativeAbortEffectSettleError::rejected(
+                    NativeAbortEffectAckError::MissingWorkerReceipt,
+                    self,
+                ))
+            }
             OperationDispatchResult::TransportUnknown => {
                 let late = self
                     .submission

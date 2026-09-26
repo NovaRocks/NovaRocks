@@ -113,7 +113,10 @@ pub use host::{
     HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
     TaskExecutionHost,
 };
-pub use inbound_capability::{InboundFrameAdmission, InboundFrameClaim, TaskInboundCapabilities};
+pub use inbound_capability::{
+    InboundFrameAdmission, InboundFrameClaim, NormalClosedInbound, TaskInboundCapabilities,
+    TaskInboundCapabilityLimits,
+};
 pub use ingress::{IngressRejection, authorize_inbound_frame};
 pub use lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon};
 pub use lifecycle::{
@@ -123,14 +126,16 @@ pub use lifecycle::{
 };
 pub use novarocks_execution_contract::AdmissionEpochCapability;
 pub use observation::{
-    ContextConvergenceCursorError, CursorObservation, TaskStatusEvent, TaskStatusSource,
+    ContextConvergenceCursorError, CoveredObservationBookmark, CoveredObservationFact,
+    CoveredObservationFrame, CoveredSubscription, CoveredSubscriptionError, CursorObservation,
+    QuiesceObservationCursor, SelectedCoveredObservation, TaskStatusEvent, TaskStatusSource,
     TaskStatusSubscriptionPosition,
 };
 pub use operation::OperationWaitCaps;
 pub use receipt::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
-    FinalTaskInfoOutcome, OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement,
-    ReleaseQueryContextOutcome, TaskDynamicFilterRead, UpdateTaskOutcome,
+    FinalTaskInfoOutcome, OperationReceipt, QueryContextOutcome, QuiesceQueryContextOutcome,
+    ReleaseAcknowledgement, ReleaseQueryContextOutcome, TaskDynamicFilterRead, UpdateTaskOutcome,
 };
 pub use reliable_transport::{
     ReliableTransportAckOutcome, ReliableTransportFailOpenReason, ReliableTransportFailureOutcome,
@@ -155,9 +160,9 @@ pub use task_execution_ports::{
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 pub use task_registry::{
     DeadlineSweep, RegistryCounters, RegistryLockObservation, RegistryLockSnapshot,
-    TaskExecutionRegistry,
+    TaskExecutionRegistry, TaskPreparationSnapshot,
 };
-pub use task_registry_config::TaskExecutionRegistryConfig;
+pub use task_registry_config::{TaskExecutionRegistryConfig, TaskPreparationLimits};
 pub use typed_preparation_flow::ScanPreparationTimer;
 pub use typed_scan_runtime::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,

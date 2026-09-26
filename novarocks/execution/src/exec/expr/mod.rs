@@ -27,6 +27,7 @@ pub mod function;
 mod in_pred;
 mod literal;
 mod slot;
+pub(crate) mod static_program;
 mod struct_expr;
 pub use cast::cast_with_special_rules;
 

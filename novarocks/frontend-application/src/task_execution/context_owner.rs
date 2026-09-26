@@ -32,12 +32,13 @@ use novarocks_execution::task_execution::{
     AbortCause, AbortQueryContext, AcquireQueryContextAdmissionTicket, AdmissionEpochCapability,
     CodecOwnedContent, CredentialUpdate, EstablishQueryContext, LeaseSequence, LeaseValidFor,
     OperationKind, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef,
-    QueryContextState, ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease,
-    TaskOperationId, UpdateQueryContext,
+    QueryContextState, QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome,
+    ReleaseQueryContext, RenewQueryExecutionLease, TaskOperationId, UpdateQueryContext,
 };
 use novarocks_query_application::coordination::{
-    ContextTransition, FrontendAction, MonotonicInstant, QueryContextEvent, RenewSchedule,
-    RequestedLeaseDurations, classify_context_transition, context_state_is_closed, frontend_action,
+    ContextTransition, FrontendAction, MonotonicInstant, OperationDispatchResult,
+    QueryContextEvent, RenewSchedule, RequestedLeaseDurations, classify_context_transition,
+    context_state_is_closed, frontend_action,
 };
 
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
@@ -170,6 +171,7 @@ pub struct QueryContextOwner {
     admission_epoch_capability: AdmissionEpochCapability,
     state: QueryContextState,
     admission: Option<ReleasedAdmission>,
+    admission_remote_unknown: bool,
     admission_ticket: Option<GrantedAdmission>,
     admission_reissue_at: Option<MonotonicInstant>,
     admission_qualified: bool,
@@ -181,13 +183,18 @@ pub struct QueryContextOwner {
     lease_sequence: LeaseSequence,
     renew_schedule: Option<RenewSchedule>,
     establish: Option<ReleasedEstablish>,
+    establish_send_started: bool,
     establish_acknowledged: bool,
     renewal: Option<ReleasedLease>,
     expected_creates: usize,
-    acknowledged_creates: usize,
+    owned_creates: usize,
+    fenced_out_creates: usize,
     expected_tasks: usize,
     drained_tasks: usize,
     released_outputs: usize,
+    quiesce: Option<QuiesceQueryContext>,
+    quiesce_in_flight: bool,
+    quiesce_receipt: Option<QuiesceQueryContextReceipt>,
     release: Option<ReleaseQueryContext>,
     release_in_flight: bool,
     release_blocked_at: Option<u64>,
@@ -221,6 +228,7 @@ impl QueryContextOwner {
             admission_epoch_capability,
             state: QueryContextState::Absent,
             admission: None,
+            admission_remote_unknown: false,
             admission_ticket: None,
             admission_reissue_at: None,
             admission_qualified: true,
@@ -228,13 +236,18 @@ impl QueryContextOwner {
             lease_sequence: LeaseSequence::INITIAL,
             renew_schedule: None,
             establish: None,
+            establish_send_started: false,
             establish_acknowledged: false,
             renewal: None,
             expected_creates: tasks,
-            acknowledged_creates: 0,
+            owned_creates: 0,
+            fenced_out_creates: 0,
             expected_tasks: tasks,
             drained_tasks: 0,
             released_outputs: 0,
+            quiesce: None,
+            quiesce_in_flight: false,
+            quiesce_receipt: None,
             release: None,
             release_in_flight: false,
             release_blocked_at: None,
@@ -337,6 +350,33 @@ impl QueryContextOwner {
     /// Whether this owner still has to establish its context.
     pub const fn needs_establish(&self) -> bool {
         !self.terminal_cleanup_started && !self.establish_acknowledged
+    }
+
+    pub const fn establish_acknowledged(&self) -> bool {
+        self.establish_acknowledged
+    }
+
+    /// A first Create wave can follow only the exact Establish RPC start or
+    /// its acknowledgement, whichever the serial owner observes first.
+    pub const fn may_pipeline_first_create(&self) -> bool {
+        self.establish_send_started || self.establish_acknowledged
+    }
+
+    pub fn on_establish_send_started(
+        &mut self,
+        operation_id: TaskOperationId,
+    ) -> Result<(), TaskExecutionError> {
+        if self.establish_acknowledged {
+            return Ok(());
+        }
+        let Some(establish) = &self.establish else {
+            return Err(TaskExecutionError::UnknownOperation);
+        };
+        if establish.request.envelope().operation_id() != operation_id {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        self.establish_send_started = true;
+        Ok(())
     }
 
     /// Whether this context still needs a Worker capacity grant.
@@ -502,12 +542,115 @@ impl QueryContextOwner {
         Ok(Some(OperationIntent::UpdateQueryContext(request)))
     }
 
+    /// Installs one immutable normal fence after the attempt stops producing
+    /// work. A transport-unknown answer reissues this exact operation.
+    pub fn quiesce_intent(&mut self) -> Option<OperationIntent> {
+        if self.terminal_cleanup_started
+            || self.released
+            || self.quiesce_receipt.is_some()
+            || self.quiesce_in_flight
+        {
+            return None;
+        }
+        let request = *self.quiesce.get_or_insert_with(|| {
+            QuiesceQueryContext::new(TaskOperationId::new_v7(), self.context)
+        });
+        self.quiesce_in_flight = true;
+        Some(OperationIntent::QuiesceQueryContext(request))
+    }
+
+    /// Settles the exact normal fence, retaining its complete cumulative
+    /// membership until Release. No task is inferred absent from silence.
+    pub fn on_quiesce_ack(
+        &mut self,
+        ack: &OperationAcknowledgement,
+    ) -> Result<Option<QuiesceQueryContextReceipt>, TaskExecutionError> {
+        if !self.quiesce_in_flight
+            || self
+                .quiesce
+                .is_none_or(|request| request.envelope().operation_id() != ack.operation_id())
+        {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        self.quiesce_in_flight = false;
+        if ack.is_applied() {
+            let AckPayload::Quiesce(receipt) = ack.payload() else {
+                return Err(TaskExecutionError::MissingReceipt(
+                    OperationKind::QuiesceQueryContext,
+                ));
+            };
+            self.context.verify_matches(receipt.context())?;
+            if let Some(previous) = &self.quiesce_receipt {
+                if previous.fence_version() != receipt.fence_version()
+                    || previous.accepted_tasks() != receipt.accepted_tasks()
+                {
+                    return Err(TaskExecutionError::DomainReceipt(
+                        "a replayed Quiesce changed its cumulative accepted set".to_owned(),
+                    ));
+                }
+            }
+            self.state = receipt.state();
+            self.quiesce_receipt = Some(receipt.clone());
+            return Ok(Some(receipt.clone()));
+        }
+        if let Some(receipt) = &self.quiesce_receipt {
+            // A positive observation of this exact Worker fence is stronger
+            // than a delayed negative result from an earlier send attempt.
+            return Ok(Some(receipt.clone()));
+        }
+        if ack.dispatch_result() == OperationDispatchResult::TransportUnknown {
+            return Ok(None);
+        }
+        if let Some(outcome) = ack.worker_outcome() {
+            return Err(TaskExecutionError::OperationFailed {
+                kind: OperationKind::QuiesceQueryContext,
+                outcome,
+                detail: ack.detail().map(|detail| detail.as_str().to_owned()),
+            });
+        }
+        Err(TaskExecutionError::DispatchRejected {
+            kind: OperationKind::QuiesceQueryContext,
+            result: ack.dispatch_result(),
+        })
+    }
+
+    pub const fn quiesce_acknowledged(&self) -> bool {
+        self.quiesce_receipt.is_some()
+    }
+
+    /// Accepts the same complete Worker fence through the ordered observation
+    /// stream when the operation acknowledgement was lost. It does not retire
+    /// the transport's exact operation; a late acknowledgement still settles
+    /// that reservation against this immutable receipt.
+    pub(crate) fn observe_quiesce(
+        &mut self,
+        receipt: &QuiesceQueryContextReceipt,
+    ) -> Result<(), TaskExecutionError> {
+        self.context.verify_matches(receipt.context())?;
+        if self.quiesce.is_none() {
+            return Err(TaskExecutionError::DomainReceipt(
+                "observed a Quiesce fence before this Context issued one".to_owned(),
+            ));
+        }
+        if let Some(previous) = &self.quiesce_receipt
+            && (previous.fence_version() != receipt.fence_version()
+                || previous.accepted_tasks() != receipt.accepted_tasks())
+        {
+            return Err(TaskExecutionError::DomainReceipt(
+                "observed Quiesce conflicts with the settled fence".to_owned(),
+            ));
+        }
+        self.state = receipt.state();
+        self.quiesce_receipt = Some(receipt.clone());
+        Ok(())
+    }
+
     /// The release request, once every local obligation has closed.
     pub fn release_intent(&mut self, now: MonotonicInstant) -> Option<OperationIntent> {
         if self.released || self.release_in_flight {
             return None;
         }
-        if !matches!(self.state, QueryContextState::Active) {
+        if !matches!(self.state, QueryContextState::Quiescing) || self.quiesce_receipt.is_none() {
             return None;
         }
         if !self.creates_closed() || !self.locally_drained() {
@@ -580,6 +723,13 @@ impl QueryContextOwner {
             return;
         }
         if self
+            .quiesce
+            .is_some_and(|request| request.envelope().operation_id() == operation_id)
+        {
+            self.quiesce_in_flight = false;
+            return;
+        }
+        if self
             .release
             .is_some_and(|request| request.envelope().operation_id() == operation_id)
         {
@@ -596,7 +746,7 @@ impl QueryContextOwner {
 
     /// Whether no legal create can follow.
     pub const fn creates_closed(&self) -> bool {
-        self.acknowledged_creates >= self.expected_creates
+        self.owned_creates.saturating_add(self.fenced_out_creates) >= self.expected_creates
     }
 
     /// Whether every local task and output responsibility has drained.
@@ -608,8 +758,13 @@ impl QueryContextOwner {
         self.drained_tasks >= self.expected_tasks && self.released_outputs >= self.expected_tasks
     }
 
-    pub fn note_create_acknowledged(&mut self) {
-        self.acknowledged_creates += 1;
+    pub fn note_create_owned(&mut self) {
+        self.owned_creates += 1;
+        self.advance();
+    }
+
+    pub fn note_create_fenced_out(&mut self) {
+        self.fenced_out_creates += 1;
         self.advance();
     }
 
@@ -656,15 +811,20 @@ impl QueryContextOwner {
             frontend_action(ack.dispatch_result()),
             FrontendAction::RetryExactRequest
         ) {
+            self.admission_remote_unknown = true;
             return Ok(());
         }
         if !ack.is_applied() {
             self.fail_admission();
+            let Some(outcome) = ack.worker_outcome() else {
+                return Err(TaskExecutionError::DispatchRejected {
+                    kind: OperationKind::AcquireQueryContextAdmissionTicket,
+                    result: ack.dispatch_result(),
+                });
+            };
             return Err(TaskExecutionError::OperationFailed {
                 kind: OperationKind::AcquireQueryContextAdmissionTicket,
-                outcome: ack
-                    .worker_outcome()
-                    .expect("a non-transport acknowledgement has a Worker outcome"),
+                outcome,
                 detail: ack.detail().map(|detail| detail.as_str().to_owned()),
             });
         }
@@ -713,8 +873,10 @@ impl QueryContextOwner {
         self.admission_ticket = None;
         self.admission_reissue_at = None;
         self.admission_qualified = false;
-        self.state = QueryContextState::TerminalRetained;
-        self.released = true;
+        if !self.admission_remote_unknown {
+            self.state = QueryContextState::TerminalRetained;
+            self.released = true;
+        }
     }
 
     /// Settles one query-context acknowledgement.
@@ -770,21 +932,28 @@ impl QueryContextOwner {
             if is_establish {
                 self.establish_acknowledged = true;
                 self.establish = None;
-                match classify_context_transition(self.state, QueryContextEvent::EstablishCompleted)
-                {
-                    ContextTransition::Apply(state) => self.state = state,
-                    ContextTransition::Idempotent => {}
-                    _ => {
-                        return Err(TaskExecutionError::OperationFailed {
-                            kind: OperationKind::UpdateQueryContext,
-                            outcome: OperationOutcome::InvalidStateOrRequest,
-                            detail: ack.detail().map(|d| d.as_str().to_owned()),
-                        });
+                // An older Establish answer may arrive after Quiesce. It
+                // proves historical lease installation but cannot reopen the
+                // admission fence or change its accepted membership.
+                if self.quiesce_receipt.is_none() {
+                    match classify_context_transition(
+                        self.state,
+                        QueryContextEvent::EstablishCompleted,
+                    ) {
+                        ContextTransition::Apply(state) => self.state = state,
+                        ContextTransition::Idempotent => {}
+                        _ => {
+                            return Err(TaskExecutionError::OperationFailed {
+                                kind: OperationKind::UpdateQueryContext,
+                                outcome: OperationOutcome::InvalidStateOrRequest,
+                                detail: ack.detail().map(|d| d.as_str().to_owned()),
+                            });
+                        }
                     }
                 }
                 // A receipt may still report that the context closed while the
                 // establish was in flight; the backend's answer wins.
-                if context_state_is_closed(receipt.state()) {
+                if self.quiesce_receipt.is_none() && context_state_is_closed(receipt.state()) {
                     self.state = receipt.state();
                     self.released = true;
                 }
@@ -803,24 +972,33 @@ impl QueryContextOwner {
         }
         if is_establish {
             self.establish = None;
+            if self.quiesce_receipt.is_some() {
+                // The normal fence has already settled whether this Context
+                // owns any Task; an older negative Establish cannot undo it.
+                return Ok(());
+            }
         } else {
             self.renewal = None;
         }
+        let Some(outcome) = ack.worker_outcome() else {
+            // The admission grant may still occupy Worker capacity. Keep the
+            // context open so failure cleanup issues its exact Abort.
+            return Err(TaskExecutionError::DispatchRejected {
+                kind: OperationKind::UpdateQueryContext,
+                result: ack.dispatch_result(),
+            });
+        };
         self.state = QueryContextState::TerminalRetained;
         self.released = true;
         if is_establish {
             return Err(TaskExecutionError::PreReadyEstablishRejected {
                 backend: self.context.backend_process_id(),
-                outcome: ack
-                    .worker_outcome()
-                    .expect("a non-transport acknowledgement has a Worker outcome"),
+                outcome,
             });
         }
         Err(TaskExecutionError::OperationFailed {
             kind: OperationKind::UpdateQueryContext,
-            outcome: ack
-                .worker_outcome()
-                .expect("a non-transport acknowledgement has a Worker outcome"),
+            outcome,
             detail: ack.detail().map(|d| d.as_str().to_owned()),
         })
     }
@@ -877,12 +1055,16 @@ impl QueryContextOwner {
             });
         }
         let Some(outcome) = ack.worker_outcome() else {
-            // The backend outcome is unknown, so preserve the existing
-            // exact-request replay behavior without adding a NotReady delay
-            // that was never observed.
             self.release_blocked_at = None;
             self.release_retry_at = None;
-            return Ok(ReleaseSettlement::RetryExactRequest);
+            return if ack.dispatch_result() == OperationDispatchResult::TransportUnknown {
+                Ok(ReleaseSettlement::RetryExactRequest)
+            } else {
+                Err(TaskExecutionError::DispatchRejected {
+                    kind: OperationKind::ReleaseQueryContext,
+                    result: ack.dispatch_result(),
+                })
+            };
         };
         match outcome {
             OperationOutcome::ReleaseNotReady => {
@@ -912,6 +1094,14 @@ impl QueryContextOwner {
             .is_none_or(|request| request.envelope().operation_id() != ack.operation_id())
         {
             return Err(TaskExecutionError::UnknownOperation);
+        }
+        if ack.worker_outcome().is_none()
+            && ack.dispatch_result() != OperationDispatchResult::TransportUnknown
+        {
+            return Err(TaskExecutionError::DispatchRejected {
+                kind: OperationKind::AbortQueryContext,
+                result: ack.dispatch_result(),
+            });
         }
         if ack.is_applied()
             || matches!(

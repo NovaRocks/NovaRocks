@@ -25,15 +25,14 @@
 //! Six entry points: ordinary and small-control mutation methods, one status
 //! subscription, two typed observation reads, and the root result data plane.
 
-use std::collections::VecDeque;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor;
 use novarocks_execution_contract::task_execution::identity::{
     AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
 };
@@ -47,11 +46,12 @@ use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::identity::{decode_admission_ticket_id, decode_query_context_ref};
 use novarocks_task_codec::operation::{
-    DecodedOperation, decode_context_aware_subscribe_task_status, decode_control_operation_batch,
-    decode_envelope, decode_fetch_dynamic_filters, decode_get_final_task_info,
-    decode_ordinary_operation_batch, decode_ordinary_operation_batch_with_skip,
-    encode_context_convergence_event, encode_operation_outcome, encode_receipt,
-    encode_status_event, encode_task_gone_event,
+    CoveredCatchUpComplete, CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedOperation,
+    NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES, decode_control_operation_batch,
+    decode_covered_subscribe_task_status, decode_envelope, decode_fetch_dynamic_filters,
+    decode_get_final_task_info, decode_ordinary_operation_batch,
+    decode_ordinary_operation_batch_with_skip, encode_covered_status_event,
+    encode_operation_outcome, encode_receipt,
 };
 use novarocks_task_codec::status::encode_final_task_info;
 use novarocks_task_codec::{
@@ -63,9 +63,9 @@ use tokio_stream::Stream;
 use crate::native_ingress::NativeIngressOwnership;
 use crate::task_protocol_fault;
 use novarocks_worker::{
-    AdmissionTicketObservation, ContextConvergenceCursorError, DynamicFilterReadOutcome,
-    FinalTaskInfoOutcome, HostRejection, OperationReceipt, TaskDynamicFilterRead, TaskStatusEvent,
-    TaskStatusSource, TaskStatusSubscriptionPosition,
+    AdmissionTicketObservation, CoveredObservationFact, CoveredObservationFrame,
+    CoveredSubscription, DynamicFilterReadOutcome, FinalTaskInfoOutcome, HostRejection,
+    OperationReceipt, TaskDynamicFilterRead, TaskStatusSource,
 };
 
 /// The Tower-owned request clock carried into task operation dispatch.
@@ -483,29 +483,45 @@ pub fn subscribe_task_status(
     reader: &dyn TaskStatusSubscriptionReader,
     request: proto::SubscribeTaskStatusRequest,
 ) -> Result<TaskStatusEventStream, tonic::Status> {
-    let (context, cursors, context_convergence_cursor) =
-        decode_context_aware_subscribe_task_status(
-            &request,
-            FieldPath::root("subscribe_task_status"),
-        )
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-    let source = reader.task_status_source(context).ok_or_else(|| {
+    let decoded =
+        decode_covered_subscribe_task_status(&request, FieldPath::root("subscribe_task_status"))
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    let source = reader.task_status_source(decoded.context).ok_or_else(|| {
         tonic::Status::failed_precondition(
             "subscribe names a query context this backend does not hold",
         )
     })?;
-    // The catch-up frames are captured before the stream exists, so a cursor
-    // that is behind cannot miss a version published between the two.
-    let catch_up = source
-        .subscribe_context_aware(context, &cursors, context_convergence_cursor)
+    let quiesce_cursor =
+        decoded
+            .quiesce_cursor
+            .map(|cursor| novarocks_worker::QuiesceObservationCursor {
+                context: cursor.context,
+                fence_version: cursor.fence_version,
+            });
+    let covered = source
+        .begin_covered_subscription_with_quiesce(
+            decoded.context,
+            decoded.generation.get(),
+            &decoded.status_cursors,
+            &decoded.task_convergence_cursors,
+            decoded.context_cursor,
+            quiesce_cursor,
+            &decoded.required_identities,
+            novarocks_task_codec::status::MAX_SUBSCRIPTION_CURSORS,
+        )
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-    task_status_event_stream(
-        source,
-        catch_up,
-        context,
-        cursors,
-        context_convergence_cursor,
-    )
+    if task_protocol_fault::task_status_subscription_dropped(decoded.context)? {
+        return Ok(Box::pin(tokio_stream::once(Err(
+            tonic::Status::unavailable(
+                "runner-owned task status stream dropped after the subscription was established",
+            ),
+        ))));
+    }
+    Ok(Box::pin(CoveredTaskStatusSubscription::new(
+        decoded.context,
+        decoded.generation.get(),
+        covered,
+    )))
 }
 
 /// Decodes, delegates, classifies, and encodes one dynamic-filter observation.
@@ -726,140 +742,194 @@ pub fn encode_operation_receipt<T>(
     ))
 }
 
-/// Builds the server stream for one status subscription after its role owner
-/// has resolved the exact context and captured the initial frames.
-pub fn task_status_event_stream(
-    source: Arc<TaskStatusSource>,
-    catch_up: Vec<TaskStatusEvent>,
-    context: QueryContextRef,
-    task_cursors: Vec<novarocks_execution_contract::task_execution::status::TaskStatusCursor>,
-    context_convergence_cursor: Option<QueryContextConvergenceCursor>,
-) -> Result<TaskStatusEventStream, tonic::Status> {
-    if task_protocol_fault::task_status_subscription_dropped(context)? {
-        // The subscription was established and is then torn down from the
-        // stream body, which is what a lost stream looks like. Cursors are
-        // read-only, so the resubscription loses no frame.
-        return Ok(Box::pin(tokio_stream::once(Err(
-            tonic::Status::unavailable(
-                "runner-owned task status stream dropped after the subscription was established",
-            ),
-        ))));
+const TASK_STATUS_BOOKMARK_INTERVAL: Duration = Duration::from_secs(1);
+
+fn covered_stream_fact(fact: CoveredObservationFact) -> CoveredStatusStreamFact {
+    match fact {
+        CoveredObservationFact::Status(status) => CoveredStatusStreamFact::Status(status),
+        CoveredObservationFact::StatusUnchanged(identity) => {
+            CoveredStatusStreamFact::StatusUnchanged(identity)
+        }
+        CoveredObservationFact::Unknown(identity) => CoveredStatusStreamFact::Unknown(identity),
+        CoveredObservationFact::Gone(identity) => CoveredStatusStreamFact::Gone(identity),
+        CoveredObservationFact::TaskConvergence(receipt) => {
+            CoveredStatusStreamFact::TaskConvergence(receipt)
+        }
+        CoveredObservationFact::TaskConvergenceUnchanged(identity) => {
+            CoveredStatusStreamFact::TaskConvergenceUnchanged(identity)
+        }
+        CoveredObservationFact::ContextConvergence(receipt) => {
+            CoveredStatusStreamFact::ContextConvergence(receipt)
+        }
+        CoveredObservationFact::Quiesce(receipt) => CoveredStatusStreamFact::Quiesce(receipt),
     }
-    Ok(Box::pin(TaskStatusSubscription::new(
-        source,
-        catch_up,
-        context,
-        task_cursors,
-        context_convergence_cursor,
-    )))
 }
 
-/// The server side of one logical status subscription.
-///
-/// It holds the context's observation channel and nothing else, so dropping it
-/// — a client that went away, a coordinator that will resubscribe by cursor —
-/// cancels no task, aborts no context, and changes no owner state. Waiting is
-/// parked on the channel's own notify rather than sampled on a timer, because
-/// terminal delivery is on the critical path of every query's completion.
-struct TaskStatusSubscription {
-    source: Arc<TaskStatusSource>,
-    catch_up: VecDeque<TaskStatusEvent>,
-    context: QueryContextRef,
-    position: Arc<Mutex<TaskStatusSubscriptionPosition>>,
-    /// The parked wait for the next frame. It owns its own handle to the
-    /// source, so polling never borrows across the await.
-    pending: Option<
-        Pin<
-            Box<
-                dyn Future<Output = Result<Option<TaskStatusEvent>, ContextConvergenceCursorError>>
-                    + Send,
-            >,
-        >,
-    >,
+fn encode_covered_frame(
+    frame: CoveredObservationFrame,
+    generation: u64,
+) -> Result<proto::TaskStatusStreamEvent, tonic::Status> {
+    let event = match frame {
+        CoveredObservationFrame::CatchUp(fact) => CoveredStatusStreamEvent {
+            fact: covered_stream_fact(fact),
+            source_revision: None,
+        },
+        CoveredObservationFrame::CatchUpComplete { initial_cut } => CoveredStatusStreamEvent {
+            fact: CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
+                generation,
+                initial_cut,
+            }),
+            source_revision: None,
+        },
+        CoveredObservationFrame::Live { revision, fact } => CoveredStatusStreamEvent {
+            fact: covered_stream_fact(fact),
+            source_revision: Some(revision),
+        },
+    };
+    encode_covered_status_event(&event).map_err(|error| tonic::Status::internal(error.to_string()))
 }
 
-impl TaskStatusSubscription {
-    fn new(
-        source: Arc<TaskStatusSource>,
-        catch_up: Vec<TaskStatusEvent>,
-        context: QueryContextRef,
-        task_cursors: Vec<novarocks_execution_contract::task_execution::status::TaskStatusCursor>,
-        context_convergence_cursor: Option<QueryContextConvergenceCursor>,
-    ) -> Self {
+fn covered_frame_task_identity(frame: &CoveredObservationFrame) -> Option<TaskIdentity> {
+    let fact = match frame {
+        CoveredObservationFrame::CatchUp(fact) | CoveredObservationFrame::Live { fact, .. } => fact,
+        CoveredObservationFrame::CatchUpComplete { .. } => return None,
+    };
+    match fact {
+        CoveredObservationFact::Status(status) => Some(status.identity()),
+        CoveredObservationFact::StatusUnchanged(identity)
+        | CoveredObservationFact::Unknown(identity)
+        | CoveredObservationFact::Gone(identity)
+        | CoveredObservationFact::TaskConvergenceUnchanged(identity) => Some(*identity),
+        CoveredObservationFact::TaskConvergence(receipt) => Some(receipt.identity()),
+        CoveredObservationFact::ContextConvergence(_) | CoveredObservationFact::Quiesce(_) => None,
+    }
+}
+
+/// The covered subscription sends finite catch-up pages and live facts in one
+/// ordered stream. A selected source frame becomes covered only when this
+/// stream returns it to the transport; periodic bookmarks use the same order.
+struct CoveredTaskStatusSubscription {
+    generation: u64,
+    position: Arc<CoveredSubscription>,
+    wake: Option<Pin<Box<dyn Future<Output = u64> + Send>>>,
+    bookmark_timer: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl CoveredTaskStatusSubscription {
+    fn new(context: QueryContextRef, generation: u64, position: CoveredSubscription) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        context.hash(&mut hasher);
+        let stagger = Duration::from_millis(hasher.finish() % 750);
+        let first = tokio::time::Instant::now() + Duration::from_millis(250) + stagger;
         Self {
-            source,
-            catch_up: catch_up.into(),
-            context,
-            position: Arc::new(Mutex::new(TaskStatusSubscriptionPosition::new(
-                &task_cursors,
-                context_convergence_cursor,
-            ))),
-            pending: None,
+            generation,
+            position: Arc::new(position),
+            wake: None,
+            bookmark_timer: Box::pin(tokio::time::sleep_until(first)),
         }
     }
 
-    fn note_delivered(&mut self, event: &TaskStatusEvent) {
-        self.position
-            .lock()
-            .expect("task status subscription position")
-            .note_delivered(event);
+    fn encode_bookmark(&self) -> Result<proto::TaskStatusStreamEvent, tonic::Status> {
+        let bookmark = self.position.bookmark();
+        encode_covered_status_event(&CoveredStatusStreamEvent {
+            fact: CoveredStatusStreamFact::Bookmark(
+                novarocks_task_codec::operation::CoveredObservationBookmark {
+                    generation: bookmark.generation,
+                    sequence: bookmark.sequence,
+                    covered_prefix: bookmark.covered_prefix,
+                    source_cut: bookmark.source_cut,
+                },
+            ),
+            source_revision: None,
+        })
+        .map_err(|error| tonic::Status::internal(error.to_string()))
     }
 }
 
-impl Stream for TaskStatusSubscription {
+impl Stream for CoveredTaskStatusSubscription {
     type Item = Result<proto::TaskStatusStreamEvent, tonic::Status>;
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if let Some(event) = this.catch_up.pop_front() {
-            this.note_delivered(&event);
-            return Poll::Ready(Some(Ok(encode_task_status_event(&event))));
-        }
-        if this.pending.is_none() {
-            let source = Arc::clone(&this.source);
-            let context = this.context;
-            let position = Arc::clone(&this.position);
-            this.pending = Some(Box::pin(async move {
-                source
-                    .next_subscription_event_owned(context, &position)
-                    .await
-            }));
-        }
-        let pending = this.pending.as_mut().expect("a wait was just installed");
-        match pending.as_mut().poll(context) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(event)) => {
-                this.pending = None;
-                Poll::Ready(event.map(|event| {
-                    this.note_delivered(&event);
-                    Ok(encode_task_status_event(&event))
-                }))
+        loop {
+            if this.bookmark_timer.as_mut().poll(context).is_ready() {
+                this.bookmark_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + TASK_STATUS_BOOKMARK_INTERVAL);
+                return Poll::Ready(Some(this.encode_bookmark()));
             }
-            Poll::Ready(Err(error)) => {
-                this.pending = None;
-                Poll::Ready(Some(Err(tonic::Status::invalid_argument(
-                    error.to_string(),
-                ))))
-            }
-        }
-    }
-}
 
-fn encode_task_status_event(event: &TaskStatusEvent) -> proto::TaskStatusStreamEvent {
-    if let TaskStatusEvent::ContextConvergence(receipt) = event {
-        return encode_context_convergence_event(*receipt);
+            // Read the cut before selection. A publication after an empty
+            // selection then makes wait_for_change return immediately.
+            let observed_cut = this.position.source_cut();
+            let mut encoded = None;
+            let mut encode_error = None;
+            let selected =
+                this.position
+                    .select_next(NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES, |frame| {
+                        match encode_covered_frame(frame.clone(), this.generation) {
+                            Ok(wire) => {
+                                let bytes = wire.encoded_len();
+                                encoded = Some(wire);
+                                bytes
+                            }
+                            Err(error) => {
+                                encode_error = Some(error);
+                                NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES + 1
+                            }
+                        }
+                    });
+            if let Some(error) = encode_error {
+                return Poll::Ready(Some(Err(error)));
+            }
+            match selected {
+                Ok(Some(selected)) => {
+                    let task_identity = covered_frame_task_identity(&selected.frame);
+                    let mut wire = match encoded {
+                        Some(wire) => wire,
+                        None => match encode_covered_frame(selected.frame.clone(), this.generation)
+                        {
+                            Ok(wire) => wire,
+                            Err(error) => return Poll::Ready(Some(Err(error))),
+                        },
+                    };
+                    if wire.encoded_len() > NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES {
+                        return Poll::Ready(Some(Err(tonic::Status::resource_exhausted(
+                            "covered observation frame exceeds the native message bound",
+                        ))));
+                    }
+                    if let Some(task_identity) = task_identity {
+                        task_protocol_fault::task_status_foreign_process(task_identity, &mut wire);
+                    }
+                    if let Err(error) = this.position.note_delivered(selected.delivery_id) {
+                        return Poll::Ready(Some(Err(tonic::Status::internal(error.to_string()))));
+                    }
+                    this.wake = None;
+                    return Poll::Ready(Some(Ok(wire)));
+                }
+                Err(error) => {
+                    return Poll::Ready(Some(Err(tonic::Status::resource_exhausted(
+                        error.to_string(),
+                    ))));
+                }
+                Ok(None) => {}
+            }
+
+            if this.wake.is_none() {
+                let position = Arc::clone(&this.position);
+                this.wake = Some(Box::pin(async move {
+                    position.wait_for_change(observed_cut).await
+                }));
+            }
+            let wake = this.wake.as_mut().expect("covered wait installed");
+            match wake.as_mut().poll(context) {
+                Poll::Ready(_) => {
+                    this.wake = None;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
-    let (identity, mut encoded) = match event {
-        TaskStatusEvent::Status(status) => (status.identity(), encode_status_event(status)),
-        TaskStatusEvent::Gone(identity) => (*identity, encode_task_gone_event(*identity)),
-        TaskStatusEvent::ContextConvergence(_) => unreachable!("handled above"),
-    };
-    // Claimed on the frame that is about to leave this process, which is the
-    // only place the observation names a backend process the frontend will
-    // check. Both the catch-up frames and the live ones are encoded here, so
-    // no delivery path escapes it.
-    task_protocol_fault::task_status_foreign_process(identity, &mut encoded);
-    encoded
 }
 
 /// The Native task-protocol ingress port.
@@ -948,19 +1018,34 @@ pub trait TaskExecutionIngress: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use prost::Message;
+    use tokio_stream::StreamExt;
 
     use super::{
         Bytes, TaskResultRead, TaskResultReadError, TaskResultReadRequest, TaskResultReader,
-        fetch_task_result, proto, task_result_response,
+        TaskStatusSubscriptionReader, encode_covered_frame, fetch_task_result, proto,
+        subscribe_task_status, task_result_response,
     };
-    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+    use novarocks_execution_contract::task_execution::operation::QuiesceQueryContextReceipt;
+    use novarocks_execution_contract::task_execution::status::{
+        TaskStatus, TaskStatusCursor, TaskStatusVersion,
+    };
+    use novarocks_execution_contract::task_execution::transition::QueryContextState;
+    use novarocks_proto_codec::FieldPath;
     use novarocks_task_codec::operation::{
-        MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES, NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+        CoveredStatusStreamFact, DecodedCoveredSubscription, MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES,
+        NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES, decode_covered_status_event,
+        encode_covered_subscribe_task_status,
     };
     use novarocks_types::{
-        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
+    use novarocks_worker::{CoveredObservationFact, CoveredObservationFrame, TaskStatusSource};
     use proto::fetch_result_response::Status as FetchStatus;
 
     #[test]
@@ -1030,5 +1115,255 @@ mod tests {
         assert_eq!(response.packet_seq, 4);
         assert!(!response.eos);
         assert_eq!(response.result_arrow_ipc, Bytes::from_static(b"result"));
+    }
+
+    struct CoveredReader {
+        context: QueryContextRef,
+        source: Arc<TaskStatusSource>,
+    }
+
+    impl TaskStatusSubscriptionReader for CoveredReader {
+        fn task_status_source(&self, context: QueryContextRef) -> Option<Arc<TaskStatusSource>> {
+            (context == self.context).then(|| Arc::clone(&self.source))
+        }
+    }
+
+    fn covered_fixture() -> (CoveredReader, TaskIdentity, TaskIdentity) {
+        let execution = QueryExecutionId::new(
+            QueryId::new(31, 32),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("nonzero query");
+        let backend = BackendProcessId::new_v7();
+        let context = QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend);
+        let identity = |task| {
+            TaskIdentity::new(
+                execution,
+                StageId::new(1).expect("nonzero stage"),
+                TaskId::new(task).expect("nonzero task"),
+                backend,
+            )
+        };
+        (
+            CoveredReader {
+                context,
+                source: Arc::new(TaskStatusSource::new()),
+            },
+            identity(1),
+            identity(2),
+        )
+    }
+
+    fn covered_request(
+        context: QueryContextRef,
+        required: Vec<TaskIdentity>,
+    ) -> proto::SubscribeTaskStatusRequest {
+        encode_covered_subscribe_task_status(&DecodedCoveredSubscription {
+            context,
+            generation: NonZeroU64::new(7).expect("nonzero generation"),
+            status_cursors: Vec::new(),
+            task_convergence_cursors: Vec::new(),
+            context_cursor: None,
+            quiesce_cursor: None,
+            required_identities: required,
+        })
+        .expect("exact covered request")
+    }
+
+    async fn next_covered(
+        stream: &mut super::TaskStatusEventStream,
+    ) -> novarocks_task_codec::operation::CoveredStatusStreamEvent {
+        let wire = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("covered stream makes progress")
+            .expect("covered stream remains open")
+            .expect("covered frame is valid");
+        decode_covered_status_event(&wire, FieldPath::root("covered_stream"))
+            .expect("Native emits a valid covered frame")
+    }
+
+    #[tokio::test]
+    async fn covered_stream_has_finite_catch_up_live_revision_and_honest_bookmark() {
+        let (reader, a, b) = covered_fixture();
+        reader.source.publish(TaskStatus::created(a));
+        let mut stream =
+            subscribe_task_status(&reader, covered_request(reader.context, vec![a, b]))
+                .expect("covered subscription opens");
+        let mut saw_status = false;
+        let mut saw_unknown = false;
+        for _ in 0..3 {
+            let frame = next_covered(&mut stream).await;
+            match frame.fact {
+                CoveredStatusStreamFact::Status(status) => {
+                    assert_eq!(status.identity(), a);
+                    assert_eq!(frame.source_revision, None);
+                    saw_status = true;
+                }
+                CoveredStatusStreamFact::Unknown(identity) => {
+                    assert_eq!(identity, b);
+                    assert_eq!(frame.source_revision, None);
+                    saw_unknown = true;
+                }
+                CoveredStatusStreamFact::CatchUpComplete(complete) => {
+                    assert_eq!(complete.generation, 7);
+                    assert_eq!(complete.initial_cut, 1);
+                    assert!(saw_status && saw_unknown);
+                }
+                other => panic!("unexpected catch-up fact: {other:?}"),
+            }
+        }
+        reader.source.publish(TaskStatus::created(b));
+        let mut live = None;
+        for _ in 0..4 {
+            let frame = next_covered(&mut stream).await;
+            if matches!(&frame.fact, CoveredStatusStreamFact::Status(status) if status.identity() == b)
+            {
+                live = Some(frame);
+                break;
+            }
+        }
+        let live = live.expect("new task enters the same stream");
+        assert_eq!(live.source_revision, Some(2));
+        let mut bookmark = None;
+        for _ in 0..4 {
+            let frame = next_covered(&mut stream).await;
+            if let CoveredStatusStreamFact::Bookmark(value) = frame.fact {
+                bookmark = Some(value);
+                break;
+            }
+        }
+        let bookmark = bookmark.expect("quiet stream emits a periodic bookmark");
+        assert_eq!(bookmark.generation, 7);
+        assert!(bookmark.sequence > 0);
+        assert_eq!(bookmark.covered_prefix, 2);
+        assert_eq!(bookmark.source_cut, 2);
+    }
+
+    #[tokio::test]
+    async fn covered_subscription_rejects_future_status_and_quiesce_cursors() {
+        let (reader, a, _) = covered_fixture();
+        reader.source.publish(TaskStatus::created(a));
+        let mut status_future = covered_request(reader.context, vec![a]);
+        status_future
+            .cursors
+            .push(novarocks_task_codec::status::encode_task_status_cursor(
+                TaskStatusCursor::at(a, TaskStatusVersion::new(2).unwrap()),
+            ));
+        let error = match subscribe_task_status(&reader, status_future) {
+            Ok(_) => panic!("future status cursor must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        let mut quiesce_future = covered_request(reader.context, vec![a]);
+        quiesce_future.quiesce_cursor = Some(proto::QuiesceQueryContextCursor {
+            query_context: Some(novarocks_task_codec::identity::encode_query_context_ref(
+                reader.context,
+            )),
+            fence_version: 1,
+        });
+        let error = match subscribe_task_status(&reader, quiesce_future) {
+            Ok(_) => panic!("future quiesce cursor must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn covered_rpc_rejects_legacy_mode_future_convergence_and_foreign_context() {
+        let (reader, task, _) = covered_fixture();
+        let mut missing = covered_request(reader.context, vec![task]);
+        missing.generation = 0;
+        let legacy = proto::SubscribeTaskStatusRequest {
+            query_context: missing.query_context.clone(),
+            ..Default::default()
+        };
+        let mut future_task = covered_request(reader.context, vec![task]);
+        future_task.task_convergence_cursors = vec![proto::TaskConvergenceCursor {
+            identity: Some(novarocks_task_codec::identity::encode_task_identity(task)),
+            current_version: 1,
+        }];
+        let mut future_context = covered_request(reader.context, vec![task]);
+        future_context.context_convergence_cursor = Some(proto::QueryContextConvergenceCursor {
+            query_context: missing.query_context.clone(),
+            current_version: 1,
+        });
+        let mut foreign_context = covered_request(reader.context, vec![task]);
+        let foreign = QueryContextRef::new(
+            reader.context.query_execution_id(),
+            FrontendProcessId::new_v7(),
+            reader.context.backend_process_id(),
+        );
+        foreign_context.context_convergence_cursor = Some(proto::QueryContextConvergenceCursor {
+            query_context: Some(novarocks_task_codec::identity::encode_query_context_ref(
+                foreign,
+            )),
+            current_version: 0,
+        });
+        for (name, request) in [
+            ("missing generation", missing),
+            ("legacy cursor-only", legacy),
+            ("future Task convergence", future_task),
+            ("future Context convergence", future_context),
+            ("foreign Context", foreign_context),
+        ] {
+            match subscribe_task_status(&reader, request) {
+                Ok(_) => panic!("{name} must not start a subscription"),
+                Err(error) => assert_eq!(
+                    error.code(),
+                    tonic::Code::InvalidArgument,
+                    "{name}: {error}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn covered_frame_respects_native_bound_and_rejects_oversized_membership() {
+        let (reader, a, _) = covered_fixture();
+        let members: Vec<_> = (1..=4096)
+            .map(|task| {
+                TaskIdentity::new(
+                    a.query_execution_id(),
+                    a.stage_id(),
+                    TaskId::new(task).unwrap(),
+                    a.backend_process_id(),
+                )
+            })
+            .collect();
+        let receipt = QuiesceQueryContextReceipt::new(
+            reader.context,
+            1,
+            members.clone(),
+            QueryContextState::Quiescing,
+        );
+        let wire = encode_covered_frame(
+            CoveredObservationFrame::CatchUp(CoveredObservationFact::Quiesce(receipt)),
+            7,
+        )
+        .expect("legal maximum membership encodes");
+        assert!(wire.encoded_len() <= NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES);
+        let mut too_many = members;
+        too_many.push(TaskIdentity::new(
+            a.query_execution_id(),
+            a.stage_id(),
+            TaskId::new(4097).unwrap(),
+            a.backend_process_id(),
+        ));
+        let rejected = encode_covered_frame(
+            CoveredObservationFrame::CatchUp(CoveredObservationFact::Quiesce(
+                QuiesceQueryContextReceipt::new(
+                    reader.context,
+                    1,
+                    too_many,
+                    QueryContextState::Quiescing,
+                ),
+            )),
+            7,
+        );
+        assert!(
+            rejected.is_err(),
+            "an oversized fact must not be silently skipped"
+        );
     }
 }

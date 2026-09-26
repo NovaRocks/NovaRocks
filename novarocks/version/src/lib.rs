@@ -35,18 +35,19 @@ const PLAN_CONTRACT_DOMAIN: &[u8] = b"novarocks.physical-plan-contract/v1\0";
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
 ///
-/// Epoch 3 is the frozen task creation contract: a create carries its task
-/// assignment instead of a copied instance parameter set, a producer edge
-/// carries its own sender position, and a create is replayed by its exact
-/// identity rather than judged by its content. An epoch-2 process would read
-/// the same carriers under the retired semantics, so the two never share an
-/// island.
+/// Epoch 4 adds Accepted/Installed task creation and the normal context
+/// Quiesce operation, generation-required covered observation, and exact
+/// per-destination normal exchange closure with actual-stop convergence, and
+/// exact advertised per-context preparation positions.
+/// An epoch-3 process interprets the same task operation
+/// boundary under the synchronous creation and direct release contract, so
+/// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 3;
+pub const NATIVE_COMPAT_EPOCH: u64 = 4;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
-pub const NATIVE_COMPAT_EPOCH: u64 = 4;
+pub const NATIVE_COMPAT_EPOCH: u64 = 5;
 
 #[cfg(all(feature = "native-compatibility-test-fixture", not(debug_assertions)))]
 compile_error!("native-compatibility-test-fixture is only supported by debug and dev-opt builds");
@@ -609,10 +610,31 @@ mod tests {
     }
 
     #[test]
+    fn accepted_creation_and_quiesce_cut_off_the_synchronous_creation_epoch() {
+        const SYNCHRONOUS_CREATION_EPOCH: u64 = 3;
+        assert_ne!(NATIVE_COMPAT_EPOCH, SYNCHRONOUS_CREATION_EPOCH);
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"descriptor-v1",
+                carriers(),
+                [0x31; 32],
+                [0x41; 32],
+                1,
+                epoch,
+            )
+            .expect("valid material")
+        };
+        assert_ne!(
+            at(NATIVE_COMPAT_EPOCH).id(),
+            at(SYNCHRONOUS_CREATION_EPOCH).id()
+        );
+    }
+
+    #[test]
     fn test_fixture_epoch_is_explicit_and_never_ambient() {
         #[cfg(feature = "native-compatibility-test-fixture")]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 4);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 5);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 3);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 4);
     }
 }

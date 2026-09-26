@@ -58,4 +58,4 @@ pub(crate) mod stage;
 pub(crate) mod status_intake;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

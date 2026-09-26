@@ -33,6 +33,17 @@ prefetch_pause_release_ms = 500
 prefetch_rearm_ms = 500
 prefetch_progress_bucket_ms = 100
 
+# Active and retained exact normal-close records share these BE-local limits.
+# Capacity is reserved before Task acceptance and retained for legal late frames.
+# Preparation positions and bytes cover queued/running jobs until actual exit.
+# These limits are independent of active Task/completion capacity.
+task_preparation_max_tasks_per_context = 4096
+task_preparation_max_tasks = 32768
+task_preparation_max_bytes = 268435456
+task_preparation_max_workers = 4
+task_normal_close_max_records = 32768
+task_normal_close_max_bytes = 67108864
+
 # Native task ingress limits are per BE listener. The response cap stays large
 # because a Release acknowledgement may include runtime-filter/statistics data.
 [runtime.native_ingress]

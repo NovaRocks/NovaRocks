@@ -1204,6 +1204,7 @@ impl OperatorFactory for DataStreamSinkFactory {
             // Replaced at runtime binding with the host-frozen value.
             max_transmit_batched_bytes: 1,
             finished: AtomicBool::new(false),
+            aborting: AtomicBool::new(false),
             finishing: AtomicBool::new(false),
             finish_counted: AtomicBool::new(false),
             finish_completed_set: AtomicBool::new(false),
@@ -1263,6 +1264,7 @@ struct DataStreamSinkOperator {
     pending_payloads_per_dest: Vec<Option<PendingPayload>>,
     max_transmit_batched_bytes: usize,
     finished: AtomicBool,
+    aborting: AtomicBool,
     finishing: AtomicBool,
     /// Whether this driver's own finish has already been counted against the
     /// sink's driver set.
@@ -1397,6 +1399,27 @@ impl Operator for DataStreamSinkOperator {
 
     fn is_finished(&self) -> bool {
         self.maybe_mark_finished()
+    }
+
+    fn pending_finish(&self) -> bool {
+        !self.send_tracker.is_idle()
+    }
+
+    fn cancel(&mut self) {
+        if self.aborting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for pending in &mut self.pending_per_dest {
+            pending.clear();
+        }
+        self.pending_bytes_per_dest.fill(0);
+        for pending in &mut self.pending_payloads_per_dest {
+            *pending = None;
+        }
+        if let Some(queue) = self.exchange_queue.as_ref() {
+            queue.cancel_tracker(&self.send_tracker);
+        }
+        self.send_observable.defer_notify().arm();
     }
 }
 
@@ -1626,6 +1649,13 @@ impl DataStreamSinkOperator {
     fn maybe_mark_finished(&self) -> bool {
         if self.finished.load(Ordering::Acquire) {
             return true;
+        }
+        if self.aborting.load(Ordering::Acquire) {
+            if self.send_tracker.is_idle() {
+                self.finished.store(true, Ordering::Release);
+                return true;
+            }
+            return false;
         }
         // A destination still awaiting permission is owed its end-of-stream
         // even when no data is parked for it. Finishing without that marker
@@ -1885,6 +1915,7 @@ impl DataStreamSinkOperator {
             frame: ExchangeFrame {
                 destination: destination.endpoint().clone(),
                 destination_fragment_instance_id: *destination.finst_id(),
+                destination_task_identity: destination.task_identity(),
                 sender_fragment_instance_id: destination.source_finst_id(),
                 sender_ordinal: destination.sender_ordinal(),
                 sender_count: destination.sender_count(),
@@ -2255,6 +2286,9 @@ impl DataStreamSinkOperator {
 
 impl ProcessorOperator for DataStreamSinkOperator {
     fn finishing_wait(&self) -> FinishingWait {
+        if self.aborting.load(Ordering::Acquire) {
+            return FinishingWait::Complete;
+        }
         if !self.finishing.load(Ordering::Acquire) {
             return FinishingWait::Complete;
         }
@@ -2287,6 +2321,9 @@ impl ProcessorOperator for DataStreamSinkOperator {
     }
 
     fn need_input(&self) -> bool {
+        if self.aborting.load(Ordering::Acquire) {
+            return false;
+        }
         if self.maybe_mark_finished() {
             return false;
         }
@@ -2314,6 +2351,9 @@ impl ProcessorOperator for DataStreamSinkOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        if self.aborting.load(Ordering::Acquire) {
+            return Err("exchange sink was cancelled".to_string());
+        }
         if let Some(err) = self.init_error.as_ref() {
             return Err(err.clone());
         }
@@ -2341,6 +2381,10 @@ impl ProcessorOperator for DataStreamSinkOperator {
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
         use tracing::debug;
+
+        if self.aborting.load(Ordering::Acquire) {
+            return Ok(());
+        }
 
         if let Some(err) = self.init_error.as_ref() {
             return Err(err.clone());
@@ -2604,6 +2648,8 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatchOptions;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use crate::runtime::endpoint::RuntimeEndpoint;
 
@@ -2634,6 +2680,7 @@ mod tests {
             pending_payloads_per_dest: Vec::new(),
             max_transmit_batched_bytes: 1,
             finished: AtomicBool::new(false),
+            aborting: AtomicBool::new(false),
             finishing: AtomicBool::new(false),
             finish_counted: AtomicBool::new(false),
             finish_completed_set: AtomicBool::new(false),
@@ -2655,6 +2702,134 @@ mod tests {
             )),
             edge_gates: None,
         }
+    }
+
+    struct BlockingEosTransmitter {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+    }
+
+    impl ExchangeFrameTransmitter for BlockingEosTransmitter {
+        fn transmit(
+            &self,
+            frame: ExchangeFrame,
+        ) -> Result<(), crate::runtime::fragment::io::ExchangeTransmitRejection> {
+            assert!(frame.eos, "empty sink sends only its EOS frame");
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.entered.send(()).expect("test observes EOS send");
+            let _ = self.release.lock().expect("release lock").recv();
+            Ok(())
+        }
+    }
+
+    fn blocked_eos_sink() -> (
+        DataStreamSinkOperator,
+        Arc<BlockingEosTransmitter>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let transmitter = Arc::new(BlockingEosTransmitter {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        });
+        let mut sink = make_test_operator();
+        sink.transmitter = Arc::clone(&transmitter) as Arc<dyn ExchangeFrameTransmitter>;
+        sink.input.destinations = vec![make_test_destination()];
+        sink.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        sink.finish_state.register_driver();
+        (sink, transmitter, entered_rx, release_tx)
+    }
+
+    #[test]
+    fn normal_eos_does_not_finish_until_blocked_transmit_returns() {
+        let (mut sink, transmitter, entered, release) = blocked_eos_sink();
+        ProcessorOperator::set_finishing(&mut sink, &RuntimeState::default()).expect("enqueue EOS");
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("EOS transmit started");
+        assert!(!Operator::is_finished(&sink));
+        assert!(Operator::pending_finish(&sink));
+
+        release.send(()).expect("release real EOS transmit");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !Operator::is_finished(&sink) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(Operator::is_finished(&sink));
+        assert!(!Operator::pending_finish(&sink));
+        assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cancellation_revokes_eos_debt_but_waits_for_blocked_transmit() {
+        let (mut sink, transmitter, entered, release) = blocked_eos_sink();
+        ProcessorOperator::set_finishing(&mut sink, &RuntimeState::default()).expect("enqueue EOS");
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("EOS transmit started");
+        Operator::cancel(&mut sink);
+        assert!(!Operator::is_finished(&sink));
+        assert!(Operator::pending_finish(&sink));
+        assert!(!ProcessorOperator::need_input(&sink));
+
+        release.send(()).expect("release real EOS transmit");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !Operator::is_finished(&sink) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(Operator::is_finished(&sink));
+        assert!(!Operator::pending_finish(&sink));
+        assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn task_shutdown_waits_for_the_inflight_send_before_publishing_stopped() {
+        use crate::exec::pipeline::driver::PipelineDriver;
+        use crate::exec::pipeline::fragment_context::FragmentContext;
+        use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
+
+        let (mut sink, transmitter, entered, release) = blocked_eos_sink();
+        ProcessorOperator::set_finishing(&mut sink, &RuntimeState::default()).expect("enqueue EOS");
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("EOS transmit started");
+
+        let state = Arc::new(RuntimeState::default());
+        let driver = PipelineDriver::new(
+            1,
+            vec![Box::new(sink)],
+            None,
+            Vec::new(),
+            Arc::clone(&state),
+            None,
+        );
+        let completion = FragmentCompletion::new(1);
+        assert!(completion.fail("injected task shutdown".to_string()));
+        let context = Arc::new(FragmentContext::new(None, state, None, None, None, None));
+        let task = DriverTask::new(
+            driver,
+            Arc::clone(&completion),
+            context,
+            Duration::from_millis(10),
+        );
+        let task = task
+            .finish_due_to_abort()
+            .expect("blocked transmit keeps task pending");
+        assert!(completion.stopped_fact().is_none());
+
+        release.send(()).expect("release real EOS transmit");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while task.has_pending_finish() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!task.has_pending_finish());
+        assert!(task.finish_due_to_abort().is_none());
+        assert!(completion.stopped_fact().is_some());
+        assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
     }
 
     fn make_test_destination() -> FragmentDestination {

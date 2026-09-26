@@ -167,6 +167,8 @@ pub type AdmissionTicketOutcome = OperationReceipt<QueryContextAdmissionTicketRe
 pub type UpdateTaskOutcome = OperationReceipt<UpdateTaskReceipt>;
 pub type QueryContextOutcome = OperationReceipt<QueryContextReceipt>;
 pub type ReleaseQueryContextOutcome = OperationReceipt<ReleaseAcknowledgement>;
+pub type QuiesceQueryContextOutcome =
+    OperationReceipt<novarocks_execution_contract::QuiesceQueryContextReceipt>;
 pub type CancelTaskOutcome = OperationReceipt<TaskStatus>;
 pub type DynamicFilterReadOutcome = OperationReceipt<TaskDynamicFilterRead>;
 pub type FinalTaskInfoOutcome = OperationReceipt<FinalTaskInfo>;

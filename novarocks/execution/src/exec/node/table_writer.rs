@@ -106,6 +106,19 @@ pub struct TableWriterInputProjection {
 }
 
 impl TableWriterInputProjection {
+    pub(crate) fn from_static(
+        projection: &novarocks_local_program::StaticWriterProjection,
+    ) -> Result<Self, String> {
+        let arena = ExprArena::from_immutable(&projection.arena);
+        let exprs = projection
+            .expressions
+            .iter()
+            .map(|id| ExprId(id.index()))
+            .collect();
+        Self::try_new(arena, exprs, Arc::clone(projection.layout.schema()))
+            .map_err(|error| error.to_string())
+    }
+
     pub fn try_new(
         arena: ExprArena,
         exprs: Vec<ExprId>,
@@ -161,6 +174,31 @@ impl TableWriterInputProjection {
 
     pub const fn chunk_schema(&self) -> &ChunkSchemaRef {
         &self.chunk_schema
+    }
+
+    /// Consume decoder-owned expression backing when freezing the local
+    /// program. No writer or request capability crosses this boundary.
+    pub(crate) fn into_static(
+        self,
+    ) -> Result<novarocks_local_program::StaticWriterProjection, String> {
+        let layout = novarocks_local_program::StaticLayout::try_new(
+            self.chunk_schema.arrow_schema_ref(),
+            Arc::from(self.chunk_schema.slot_ids()),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(novarocks_local_program::StaticWriterProjection {
+            arena: Arc::new(
+                self.arena
+                    .into_immutable()
+                    .map_err(|error| error.to_string())?,
+            ),
+            expressions: self
+                .exprs
+                .into_iter()
+                .map(|id| novarocks_local_program::ProgramExprId::new(id.0))
+                .collect(),
+            layout,
+        })
     }
 
     /// Evaluate the projection once and expose the exact same target-typed
@@ -231,6 +269,18 @@ pub struct TableWriterNode {
     partial_aggregate_plan: WriterPartialAggregatePlan,
     #[cfg(debug_assertions)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+}
+
+/// Provider and attempt capabilities moved out of the transient decoder node.
+/// A pure local program never owns any of these values.
+pub(crate) struct TableWriterRuntimeBinding {
+    pub handle: ConnectorWriterHandle,
+    pub execution: Arc<dyn ConnectorWriteExecution>,
+    pub physical_template: TableWriterPhysicalContextTemplate,
+    pub request_context: ConnectorRequestContext,
+    pub fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
+    #[cfg(debug_assertions)]
+    pub aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
 impl TableWriterNode {
@@ -366,6 +416,40 @@ impl TableWriterNode {
 
     pub const fn partial_aggregate_plan(&self) -> &WriterPartialAggregatePlan {
         &self.partial_aggregate_plan
+    }
+
+    pub(crate) fn into_static_parts_with_binding(
+        self,
+    ) -> (
+        TableWriterRuntimeBinding,
+        (
+            Box<ExecNode>,
+            WriteTargetOrdinal,
+            SchemaRef,
+            TableWriterInputProjection,
+            crate::exec::node::table_write_relation::WriterMultiplexRelationSchema,
+            WriterPartialAggregatePlan,
+        ),
+    ) {
+        (
+            TableWriterRuntimeBinding {
+                handle: self.handle,
+                execution: self.execution,
+                physical_template: self.physical_template,
+                request_context: self.request_context,
+                fragment_encoder: self.fragment_encoder,
+                #[cfg(debug_assertions)]
+                aggregate_guard: self.aggregate_guard,
+            },
+            (
+                self.input,
+                self.target,
+                self.expected_schema,
+                self.projection,
+                self.writer_multiplex_schema,
+                self.partial_aggregate_plan,
+            ),
+        )
     }
 
     #[cfg(debug_assertions)]

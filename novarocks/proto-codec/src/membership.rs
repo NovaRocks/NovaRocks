@@ -61,6 +61,7 @@ impl BackendProcessDescriptor {
         deployment_id: impl Into<String>,
         build_identity: impl Into<String>,
         native_compatibility_id: NativeCompatibilityId,
+        preparing_positions: usize,
     ) -> Result<Self, ProtocolError> {
         let endpoint =
             RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port())).map_err(|error| {
@@ -75,6 +76,7 @@ impl BackendProcessDescriptor {
             deployment_id,
             build_identity,
             native_compatibility_id,
+            preparing_positions,
         )
         .map(Self::from_contract)
         .map_err(|error| {
@@ -113,12 +115,19 @@ impl BackendProcessDescriptor {
                     format!("backend process endpoint is invalid: {error}"),
                 )
             })?;
+        let preparing_positions = usize::try_from(raw.preparing_positions).map_err(|_| {
+            invalid(
+                FieldPath::root("backend_process_descriptor").field("preparing_positions"),
+                "backend preparation capacity cannot be represented on this host",
+            )
+        })?;
         ContractBackendProcessDescriptor::try_new(
             process_id,
             endpoint,
             raw.deployment_id,
             raw.build_identity,
             native_compatibility_id,
+            preparing_positions,
         )
         .map(Self::from_contract)
         .map_err(|error| {
@@ -142,6 +151,7 @@ impl BackendProcessDescriptor {
                     .as_proto()
                     .clone(),
                 ),
+                preparing_positions: descriptor.preparing_positions() as u64,
                 deployment_id: descriptor.deployment_id().to_string(),
                 build_identity: descriptor.build_identity().to_string(),
                 native_compatibility_id: Some(novarocks::NativeCompatibilityId {
@@ -168,6 +178,8 @@ impl BackendProcessDescriptor {
                 descriptor
                     .native_compatibility_id()
                     .expect("validated backend process descriptor retains compatibility"),
+                usize::try_from(descriptor.raw.preparing_positions)
+                    .expect("validated capacity fits host"),
             )
             .expect("validated backend process descriptor retains contract invariants")
         })
@@ -500,6 +512,7 @@ mod tests {
             "warehouse-a",
             "build-identity",
             NativeCompatibilityId::new([7; 32]),
+            4096,
         )
         .expect("descriptor")
     }
@@ -567,6 +580,29 @@ mod tests {
         assert_eq!(
             descriptor().native_compatibility_id().expect("exact id"),
             NativeCompatibilityId::new([7; 32])
+        );
+    }
+    #[test]
+    fn backend_preparation_capacity_is_exact_and_missing_is_rejected() {
+        let descriptor = descriptor();
+        assert_eq!(
+            descriptor.to_contract().unwrap().preparing_positions(),
+            4096
+        );
+        let mut raw = descriptor.as_proto().clone();
+        raw.preparing_positions = 2;
+        assert_eq!(
+            BackendProcessDescriptor::parse(raw.clone())
+                .unwrap()
+                .to_contract()
+                .unwrap()
+                .preparing_positions(),
+            2
+        );
+        raw.preparing_positions = 0;
+        assert!(
+            BackendProcessDescriptor::parse(raw).is_err(),
+            "a missing hard-cut capability cannot be defaulted from another backend"
         );
     }
 }

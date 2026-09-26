@@ -97,6 +97,10 @@ pub trait CreationContent: fmt::Debug + Send + Sync + 'static {
     /// The encoded size, for bounds and accounting.
     fn encoded_len(&self) -> usize;
 
+    /// Owned allocation bytes retained by this content, including its boxed value.
+    /// Codec owners account their concrete representation rather than its wire size.
+    fn retained_bytes(&self) -> usize;
+
     /// The stored value, for the codec that owns this representation.
     fn into_stored(self: Box<Self>) -> Box<dyn Any + Send>;
 }
@@ -132,6 +136,14 @@ impl TaskCreationInput {
         self.static_fragment
             .len()
             .saturating_add(self.assignment.encoded_len())
+    }
+
+    /// Owned preparation input bytes. Production freezing owners provide independent
+    /// encoded allocations, including the Native boundary's isolated copy.
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.static_fragment.len())
+            .saturating_add(self.assignment.retained_bytes())
     }
 
     pub fn into_parts(self) -> (FrozenBytes, Box<dyn CreationContent>) {
@@ -181,6 +193,9 @@ mod tests {
     struct Assignment(u32);
 
     impl CreationContent for Assignment {
+        fn retained_bytes(&self) -> usize {
+            std::mem::size_of::<Self>()
+        }
         fn encoded_len(&self) -> usize {
             4
         }

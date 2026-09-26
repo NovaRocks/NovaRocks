@@ -258,15 +258,21 @@ pub trait QueryContextHost: Send + Sync {
 /// A submitted, runnable task.
 ///
 /// The handle is deliberately narrow: the owner publishes status and decides
-/// terminal outcomes. The registry opens its completion gate at creation
-/// commit and may otherwise only ask the running task to stand down.
+/// terminal outcomes. The registry opens its completion gate and starts the
+/// dormant task only after installing its Live record.
 pub trait RunnableTask: fmt::Debug + Send + Sync {
-    /// Opens completion processing after the registry has installed the task
-    /// as a live creation. A fragment may physically stop before this call;
-    /// its exact completion slot retains the fact until commit.
+    /// Opens completion processing and starts the prepared task after the
+    /// registry has installed the Live creation. The task may publish a
+    /// synchronous stop; its exact completion slot retains that fact.
     fn commit_creation(&self);
 
     fn cancel(&self, reason: CancelReason);
+
+    /// Stop normally after the context admission fence while retaining
+    /// already published root results and write evidence until release.
+    fn quiesce(&self) {
+        self.cancel(CancelReason::UpstreamNoLongerNeeded);
+    }
 
     fn abort(&self, cause: AbortCause);
 }
@@ -274,18 +280,29 @@ pub trait RunnableTask: fmt::Debug + Send + Sync {
 /// The task side of execution.
 ///
 /// The three install steps are called in exactly the order the creation
-/// transaction commits them, and `submit_runnable` is last: it is the only one
-/// that starts executable work, so a failure in any earlier step is reported
-/// before a worker exists to clean up.
+/// transaction commits them, and `submit_runnable` is last. It prepares a
+/// dormant runnable; `commit_creation` starts executable work only after the
+/// registry has installed the Live record.
 pub trait TaskExecutionHost: Send + Sync {
     /// Closes data-plane admission for every task of this exact query
     /// execution. The registry calls this while it linearizes context
     /// termination, before any per-task capability can be withdrawn.
     fn close_context_admission(&self, context: QueryContextRef);
 
+    /// An abort revokes any earlier normal-close answers for this execution.
+    fn abort_context_admission(&self, context: QueryContextRef) {
+        self.close_context_admission(context);
+    }
+
     /// Reclaims the compact context fence after the registry has forgotten
     /// the context itself. No task capability for the execution may remain.
     fn forget_context_admission(&self, context: QueryContextRef);
+
+    /// Whether this context still owns a reserved normal-close answer that
+    /// must survive retained-context capacity pressure until its request horizon.
+    fn retains_normal_close(&self, _context: QueryContextRef) -> bool {
+        false
+    }
 
     /// Prepares the task a creation winner owns, from the input its create
     /// request carried.
@@ -306,7 +323,21 @@ pub trait TaskExecutionHost: Send + Sync {
 
     fn install_inbound_capability(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection>;
 
+    /// Reserve the bounded late-frame record before Create is Accepted.
+    fn reserve_inbound_close_capacity(
+        &self,
+        _descriptor: &TaskDescriptor,
+    ) -> Result<(), HostRejection> {
+        Ok(())
+    }
+
     fn remove_inbound_capability(&self, descriptor: &TaskDescriptor);
+
+    /// The production host serializes receiver removal with inbound delivery.
+    fn retire_receiver_normally(&self, descriptor: &TaskDescriptor) {
+        self.remove_inbound_capability(descriptor);
+        self.remove_receiver(descriptor);
+    }
 
     fn submit_runnable(
         &self,

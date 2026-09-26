@@ -54,6 +54,7 @@ use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 use crate::exec::node::table_finish::TableFinishNode;
+use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_write_aggregate::{
     WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
 };
@@ -91,6 +92,39 @@ pub struct TableFinishOperatorFactory {
 }
 
 impl TableFinishOperatorFactory {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "A local finish joins frozen relation facts and exact Task validation capability"
+    )]
+    pub(crate) fn new_local(
+        node_id: i32,
+        expected_targets: Vec<WriteTargetOrdinal>,
+        writer_schema: WriterMultiplexRelationSchema,
+        root_schema: RootWriteResultRelationSchema,
+        final_plan: WriterFinalAggregatePlan,
+        binding: &TableFinishRuntimeBinding,
+        arena: Arc<ExprArena>,
+    ) -> Result<Self, String> {
+        novarocks_spi::connector::write_stack::validate_query_target_ordinals(&expected_targets)
+            .map_err(|error| error.to_string())?;
+        let name = if node_id >= 0 {
+            format!("TABLE_FINISH (id={node_id})")
+        } else {
+            "TABLE_FINISH".to_string()
+        };
+        Ok(Self {
+            name,
+            expected_targets: Arc::new(expected_targets),
+            fragment_validator: Arc::clone(&binding.fragment_validator),
+            writer_schema,
+            root_schema,
+            final_plan,
+            #[cfg(debug_assertions)]
+            aggregate_guard: Arc::clone(&binding.aggregate_guard),
+            arena,
+        })
+    }
+
     /// Construct the NCP-8 composite with the same immutable expression arena
     /// that decoded the generic Unpivot constants.
     pub fn new_with_arena(node: &TableFinishNode, arena: Arc<ExprArena>) -> Self {
@@ -1005,6 +1039,7 @@ impl GroupedUnpivotDriver {
         }
         active.prepare()?;
         active.bind_runtime_state(state)?;
+        active.activate(state)?;
         let processor = active
             .as_processor_mut()
             .ok_or_else(|| "table finish grouped Unpivot is not a processor".to_string())?;
@@ -1215,6 +1250,13 @@ impl Operator for TableFinishOperator {
         aggregate.prepare()?;
         aggregate.bind_runtime_state(state)?;
         self.install_aggregate(aggregate);
+        Ok(())
+    }
+
+    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+        if let Some(aggregate) = self.aggregate.as_mut() {
+            aggregate.activate(state)?;
+        }
         Ok(())
     }
 

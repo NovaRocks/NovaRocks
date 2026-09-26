@@ -34,10 +34,10 @@ use novarocks_execution_contract::task_execution::identity::{
 };
 use novarocks_execution_contract::task_execution::operation::{
     CreateTaskReceipt, EstablishQueryContext, EstablishSemanticIdentity, OperationOutcome,
-    QueryContextReceipt,
+    QueryContextReceipt, QuiesceQueryContextReceipt,
 };
 use novarocks_execution_contract::task_execution::status::{
-    AbortCause, FinalTaskInfo, TaskStatus, TerminationDetail,
+    AbortCause, CancelReason, FinalTaskInfo, TaskStatus, TerminationDetail,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{StageId, TaskId};
@@ -96,22 +96,77 @@ pub(super) struct CreationFailure {
 /// winner's: the frontend freezes exactly one body per identity, so a request
 /// naming an identity asks for the entity that identity already names.
 pub(super) struct CreationCell {
-    failure: Mutex<Option<CreationFailure>>,
+    decision: Mutex<CreationDecision>,
+    accepted_status: Mutex<Option<Arc<TaskStatusOwner>>>,
+}
+
+struct CreationDecision {
+    failure: Option<CreationFailure>,
+    stop: Option<PreparationStop>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(super) enum PreparationStop {
+    Cancel(CancelReason),
+    Abort(AbortCause),
 }
 
 impl CreationCell {
     pub(super) const fn new() -> Self {
         Self {
-            failure: Mutex::new(None),
+            decision: Mutex::new(CreationDecision {
+                failure: None,
+                stop: None,
+            }),
+            accepted_status: Mutex::new(None),
         }
     }
 
     pub(super) fn fail(&self, failure: CreationFailure) {
-        *self.failure.lock().expect("creation cell lock") = Some(failure);
+        self.decision.lock().expect("creation cell lock").failure = Some(failure);
     }
 
     pub(super) fn failure(&self) -> Option<CreationFailure> {
-        self.failure.lock().expect("creation cell lock").clone()
+        self.decision
+            .lock()
+            .expect("creation cell lock")
+            .failure
+            .clone()
+    }
+
+    /// Orders a post-Accept preparation failure against a concurrent stop.
+    pub(super) fn claim_failure(&self, failure: CreationFailure) -> Option<PreparationStop> {
+        let mut decision = self.decision.lock().expect("creation cell lock");
+        if decision.stop.is_none() {
+            decision.failure = Some(failure);
+        }
+        decision.stop
+    }
+
+    pub(super) fn accept(&self, status: Arc<TaskStatusOwner>) {
+        *self.accepted_status.lock().expect("creation cell lock") = Some(status);
+    }
+
+    pub(super) fn accepted_status(&self) -> Option<Arc<TaskStatusOwner>> {
+        self.accepted_status
+            .lock()
+            .expect("creation cell lock")
+            .clone()
+    }
+
+    pub(super) fn request_stop(&self, stop: PreparationStop) -> bool {
+        let mut decision = self.decision.lock().expect("creation cell lock");
+        if decision.failure.is_some() {
+            return false;
+        }
+        if decision.stop.is_none() || matches!(stop, PreparationStop::Abort(_)) {
+            decision.stop = Some(stop);
+        }
+        true
+    }
+
+    pub(super) fn stop(&self) -> Option<PreparationStop> {
+        self.decision.lock().expect("creation cell lock").stop
     }
 }
 
@@ -245,6 +300,7 @@ pub(super) struct ContextEntry {
     pub(super) domains: QueryContextDomains,
     pub(super) source: Arc<TaskStatusSource>,
     pub(super) tasks: BTreeMap<TaskIdentity, TaskEntry>,
+    pub(super) quiesce: Option<QuiesceQueryContextReceipt>,
     /// Compact, context-lifetime anti-replay fence for every task identity
     /// that reached an installed worker. Detailed terminal records may be
     /// reclaimed independently; an identity in this set cannot be created a
@@ -282,6 +338,7 @@ impl ContextEntry {
             domains: QueryContextDomains::empty(),
             source,
             tasks: BTreeMap::new(),
+            quiesce: None,
             spent_tasks: BTreeSet::new(),
             retired_at: None,
             terminating_since: None,
@@ -318,6 +375,23 @@ impl ContextEntry {
 
     pub(super) fn clear_spent(&mut self) {
         self.spent_tasks.clear();
+    }
+
+    pub(super) fn accepted_identities(
+        &self,
+        context: novarocks_execution_contract::QueryContextRef,
+    ) -> Vec<TaskIdentity> {
+        self.spent_tasks
+            .iter()
+            .map(|identity| {
+                TaskIdentity::new(
+                    context.query_execution_id(),
+                    identity.stage,
+                    identity.task,
+                    context.backend_process_id(),
+                )
+            })
+            .collect()
     }
 
     /// The abort cause a terminal receipt reports.

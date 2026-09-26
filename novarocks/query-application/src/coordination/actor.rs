@@ -2561,7 +2561,7 @@ fn apply_attempt_ledger_event(
                 return;
             };
             let result = result.and_then(|()| {
-                if attempt.establish.has_worker_rejection() {
+                if attempt.establish.has_establish_rejection() {
                     Err(EstablishIssueError::EstablishRejected)
                 } else {
                     Ok(())
@@ -4617,7 +4617,8 @@ fn apply_root_status_observation(
         StatusObservation::Accept => {}
         StatusObservation::VersionConflict
         | StatusObservation::IdentityMismatch(_)
-        | StatusObservation::TerminalOverwrite => {
+        | StatusObservation::TerminalOverwrite
+        | StatusObservation::InstallationRegression => {
             fail_result_observation(state, runtime);
             reply_result_failure(state, reply);
             return;

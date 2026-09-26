@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
@@ -23,6 +24,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::runtime::endpoint::FragmentDestination;
 pub use novarocks_execution_contract::DataStreamPartitionType;
+use novarocks_local_program::{ProgramExprId, StaticSinkProgram, StaticStreamBranch};
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
@@ -43,6 +45,115 @@ impl FragmentSinkProgram {
             Self::SplitDataStream(program) => program.validate(),
         }
     }
+
+    /// Consume the decoder's temporary sink before any Task runtime is built.
+    /// Destination addresses and transmitters are bound separately per Task.
+    pub fn into_static(self) -> Result<StaticSinkProgram, String> {
+        self.validate().map_err(|error| error.to_string())?;
+        match self {
+            Self::Result => Ok(StaticSinkProgram::Result),
+            Self::Noop => Ok(StaticSinkProgram::Noop),
+            Self::DataStream(program) => {
+                let DataStreamSinkProgram {
+                    dest_node_id,
+                    output_exprs: _,
+                    output_partition_type,
+                    output_partition_exprs,
+                    output_columns,
+                    limit,
+                    partition_arena,
+                } = program;
+                let branch = static_stream_branch(
+                    dest_node_id,
+                    output_partition_type,
+                    output_partition_exprs,
+                    output_columns,
+                    limit,
+                )?;
+                let arena = Arc::new(
+                    partition_arena
+                        .into_immutable()
+                        .map_err(|error| error.to_string())?,
+                );
+                StaticSinkProgram::try_data_stream(branch, arena).map_err(|error| error.to_string())
+            }
+            Self::MultiCastDataStream(program) => {
+                let MultiCastDataStreamSinkProgram {
+                    sinks,
+                    partition_arena,
+                } = program;
+                let branches = sinks
+                    .into_iter()
+                    .map(static_stream_branch_from_group)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let arena = Arc::new(
+                    partition_arena
+                        .into_immutable()
+                        .map_err(|error| error.to_string())?,
+                );
+                StaticSinkProgram::try_multicast(branches, arena).map_err(|error| error.to_string())
+            }
+            Self::SplitDataStream(program) => {
+                let SplitDataStreamSinkProgram {
+                    sinks,
+                    split_exprs,
+                    arena,
+                    fanout,
+                } = program;
+                let branches = sinks
+                    .into_iter()
+                    .map(static_stream_branch_from_group)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let split_exprs = split_exprs
+                    .into_iter()
+                    .map(|expr| ProgramExprId::new(expr.0))
+                    .collect();
+                let arena = Arc::new(arena.into_immutable().map_err(|error| error.to_string())?);
+                StaticSinkProgram::try_split(branches, split_exprs, arena, fanout)
+                    .map_err(|error| error.to_string())
+            }
+        }
+    }
+}
+
+fn static_stream_branch_from_group(
+    branch: DataStreamSinkBranchProgram,
+) -> Result<StaticStreamBranch, String> {
+    let DataStreamSinkBranchProgram {
+        dest_node_id,
+        output_exprs: _,
+        output_partition_type,
+        output_partition_exprs,
+        output_columns,
+        limit,
+    } = branch;
+    static_stream_branch(
+        dest_node_id,
+        output_partition_type,
+        output_partition_exprs,
+        output_columns,
+        limit,
+    )
+}
+
+fn static_stream_branch(
+    dest_node_id: i32,
+    partition_type: DataStreamPartitionType,
+    partition_exprs: Vec<ExprId>,
+    output_columns: Vec<SlotId>,
+    limit: Option<i64>,
+) -> Result<StaticStreamBranch, String> {
+    StaticStreamBranch::try_new(
+        dest_node_id,
+        partition_type,
+        partition_exprs
+            .into_iter()
+            .map(|expr| ProgramExprId::new(expr.0))
+            .collect(),
+        output_columns,
+        limit,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Construction-time input for a distributed stream sink. The private
@@ -517,7 +628,7 @@ mod tests {
 
     use super::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
-        MultiCastDataStreamSinkProgram,
+        MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     };
     use crate::exec::expr::{ExprArena, ExprId, ExprNode};
     use crate::exec::fragment::error::ExecPlanInvariant;
@@ -659,5 +770,37 @@ mod tests {
             MultiCastDataStreamSinkProgram::try_new(vec![branch()], ExprArena::default())
                 .expect_err("multicast partition expression must belong to group arena");
         assert_eq!(multicast_error.invariant(), ExecPlanInvariant::Expression);
+    }
+
+    #[test]
+    fn temporary_split_sink_freezes_exact_branch_and_fanout_semantics() {
+        let mut arena = ExprArena::default();
+        let partition = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let split = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Boolean);
+        let branch = DataStreamSinkBranchProgram::try_new(
+            17,
+            Vec::new(),
+            DataStreamPartitionType::HashPartitioned,
+            vec![partition],
+            vec![SlotId::new(3)],
+            Some(9),
+        )
+        .expect("valid branch");
+        let static_sink = FragmentSinkProgram::SplitDataStream(
+            SplitDataStreamSinkProgram::try_new_with_fanout(vec![branch], vec![split], arena, true)
+                .expect("valid split sink"),
+        )
+        .into_static()
+        .expect("pure sink");
+
+        assert_eq!(static_sink.branches().len(), 1);
+        assert_eq!(static_sink.branches()[0].dest_node_id(), 17);
+        assert_eq!(static_sink.branches()[0].limit(), Some(9));
+        assert_eq!(
+            static_sink.branches()[0].partition_exprs()[0].index(),
+            partition.0
+        );
+        assert_eq!(static_sink.split_exprs()[0].index(), split.0);
+        assert!(static_sink.fanout());
     }
 }

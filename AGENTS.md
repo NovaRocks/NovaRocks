@@ -199,7 +199,7 @@ SQL client
   `native_type.rs` and `physical_expr.rs` encode the frozen type and expression vocabulary.
 
 - `novarocks/native-adapter/src/fragment_plan_node.rs`
-  Wire DTO to immutable Execution program projection, dispatched by node type.
+  Native node lowering during BE preparation, dispatched by node type.
 
 - `novarocks/native-adapter/src/fragment_plan_decode/**`
   Per-node decode (filter, project, sort, topn, joins, table function,
@@ -211,17 +211,30 @@ SQL client
 - `novarocks/native-adapter/src/{fragment_layout.rs,descriptor_snapshot.rs}`
   Output-layout and exchange-input contract projections; tuple/slot descriptors.
 
-- `novarocks/native-adapter/src/{fragment_submission.rs,fragment_instance.rs}`
-  Fragment envelope, static execution-contract projection, and the per-task
-  kernel instance projected from the descriptor, Context and task assignment.
+- `novarocks/native-adapter/src/{fragment_submission.rs,fragment_instance.rs,fragment_plan_decode_submission.rs}`
+  Fragment envelope and per-task assignment projection. Accepted preparation
+  separates the decoded construction plan into pure `LocalProgram` and exact
+  task-owned `LocalRuntimeBindings` before pipeline preparation.
 
 Keep generated DTO decode at this boundary; do not move it into Worker or
 Execution, and do not recreate a Backend facade around it.
 
 ### 4.4 Execution Plan and Operators
 
+- `novarocks/local-program/src/**`
+  Pure task-independent node, expression, layout, sink and binding-requirement
+  facts. `LocalProgram` owns no live scan, writer, connector or async capability.
+
+- `novarocks/execution/src/exec/node/lowering.rs`
+  Separates a construction `ExecPlan` into `LocalProgram` and per-task
+  `LocalRuntimeBindings`; the bindings retain exact scan/writer/finisher owners.
+
+- `novarocks/execution/src/runtime/fragment/submission.rs`
+  One task submission owns its program and runtime bindings, with exact
+  requirement/binding validation before drivers are prepared.
+
 - `novarocks/execution/src/exec/node/mod.rs`
-  `ExecNode`, `ExecNodeKind`, `ExecPlan` definitions.
+  `ExecNode`, `ExecNodeKind`, `ExecPlan` construction types.
 
 - `novarocks/execution/src/exec/expr/mod.rs`
   `ExprArena` and `ExprNode` execution-layer structures.
@@ -236,10 +249,13 @@ Execution, and do not recreate a Backend facade around it.
 ### 4.5 Pipeline Execution Framework
 
 - `novarocks/execution/src/exec/pipeline/builder.rs`
-  Builds pipeline graph from `ExecPlan`.
+  Construction-plan helpers; `builder/local.rs` builds the production pipeline
+  directly from `LocalProgram` and exact `LocalRuntimeBindings`.
 
 - `novarocks/execution/src/exec/pipeline/executor.rs`
-  Top-level pipeline execution entry.
+  Top-level pipeline execution entry, including
+  `prepare_report_neutral_local_program_pipeline_execution` for one pure program
+  and its task-owned capabilities.
 
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.
@@ -259,7 +275,7 @@ Execution, and do not recreate a Backend facade around it.
   Exchange receiver registry, chunk encode/decode, sender completion tracking.
 
 - `novarocks/execution/src/runtime/fragment/io/**`
-  Fragment I/O edges: `exchange_edge.rs` (the destination-ACK gated open
+  Fragment I/O edges: `exchange_edge.rs` (the Installed/normal-close gated open
   barrier), `exchange_queue.rs` (outbound queue and backpressure),
   `exchange_receiver.rs` (application-hosted ingress for one receiver),
   `result.rs`, `scan.rs`, `commit.rs`.
@@ -336,7 +352,7 @@ Execution, and do not recreate a Backend facade around it.
    outbound queue and backpressure, and transmit through
    `novarocks/native-adapter/src/exchange_transmitter.rs`.
 2. An exchange edge starts Closed and opens only after every frozen destination
-   has acknowledged its task
+   has an Installed fact or has normally withdrawn its exact input demand
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no frame
    can precede the receiver that counts it.
 3. Receiver side (`novarocks/native-adapter/src/exchange_data_plane.rs`) projects
@@ -365,9 +381,14 @@ Execution, and do not recreate a Backend facade around it.
    Each operation gets one verdict per domain -- Apply / Idempotent / Older /
    Conflict -- and a domain never rolls back, which is why replaying the exact
    request is the prescribed recovery for an unknown outcome and a conflicting
-   answer is fatal.
+   answer is fatal. `Accepted` proves Worker ownership before expensive
+   preparation; `Installed` separately proves that local runtime installation
+   completed. FE retains a per-backend deployment window W across Accepted or
+   unknown RPC outcomes until Installed, terminal evidence or permanent
+   stand-down. W must not exceed that exact backend descriptor's advertised
+   per-context preparation positions P.
 3. Push exchange edges start Closed and open once every frozen destination has
-   acknowledged its task's creation
+   an Installed fact or has normally withdrawn its exact input demand
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no
    frame can precede the receiver that counts it.
 4. `novarocks/worker/src/task_registry.rs` owns the BE-local
@@ -375,7 +396,13 @@ Execution, and do not recreate a Backend facade around it.
    tombstones, and one termination latch per task. The latch is first-wins with
    a single exception: a derived cause (`Aborted(PeerTaskFailed)`) is a
    placeholder that an originating cause (`Failed(TaskFailure)`) replaces
-   exactly once.
+   exactly once. Accepted jobs enter a bounded fair FIFO; count, byte and
+   per-context position charges remain until the preparation job actually exits,
+   including after Installed or terminal publication. See
+   `novarocks/worker/src/{task_registry.rs,task_registry_config.rs}`.
+   Native status observation uses covered subscriptions with a mandatory
+   nonzero generation (`novarocks/native-adapter/src/task_protocol.rs`);
+   cursor-only generation-zero requests are refused.
 5. Runtime-filter contributions and an operator's own counters ride
    `ReleaseQueryContextAck`: release is the backend's own statement that every
    local task is a terminal record, and the Frontend Application drives it for every
@@ -392,7 +419,8 @@ Execution, and do not recreate a Backend facade around it.
   Arrow `RecordBatch` wrapper with `slot_id -> column_index` mapping and memory accounting.
 
 - `ExecPlan` / `ExecNode` / `ExecNodeKind`: `novarocks/execution/src/exec/node/mod.rs`
-  Decoded execution plan tree.
+  Temporary construction plan tree; production driver preparation consumes
+  `LocalProgram` plus per-task `LocalRuntimeBindings`.
 
 - `ExprArena` / `ExprNode`: `novarocks/execution/src/exec/expr/mod.rs`
   Arena-based expression graph model.
@@ -788,8 +816,9 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/sql/src/optimizer/**` and `novarocks/sql/src/planner/**`.
 - **Fragment decode changes**: start with
   `novarocks/native-adapter/src/fragment_plan_node.rs` and the relevant
-  `fragment_plan_decode/**` or `fragment_expression/**` submodule; the wire
-  vocabulary itself lives in `novarocks/plan-codec/src/**`.
+  `fragment_plan_decode/**` or `fragment_expression/**` submodule; program/binding
+  separation is in `fragment_plan_decode_submission.rs` and Execution
+  `exec/node/lowering.rs`. The wire vocabulary lives in `novarocks/plan-codec/src/**`.
 - **MySQL protocol behavior**: inspect `novarocks/mysql-adapter/src/listener.rs`,
   `result_encoding.rs` and `row_encoding.rs`.
 - **DDL/DML behavior**: inspect `novarocks/query-application/src/sql/**` for
@@ -814,7 +843,7 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/frontend-application/src/task_execution/**`,
   `novarocks/worker/src/{task_registry,ingress,convergence}.rs`,
   `novarocks/native-adapter/src/{backend_application,task_protocol_ingress}.rs`, and
-  `novarocks/execution/src/task_execution/**`. Preserve the destination-ACK
+  `novarocks/execution/src/task_execution/**`. Preserve the Installed/normal-close
   gated edge-open barrier and the per-domain Apply / Idempotent / Older /
   Conflict verdict; do not add a protocol shim, a standalone direct-call path,
   or a no-runtime-filter retry inside an attempt. See ADR-0146.

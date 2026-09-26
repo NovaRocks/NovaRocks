@@ -14,6 +14,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+mod limit_zero;
+
 const REQUIRED_BACKENDS: usize = 3;
 const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -36,6 +38,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(QueryTimeout),
         Box::new(NoEffectReadAfterBackendExit),
         Box::new(LiveBackendPartition),
+        Box::new(limit_zero::LimitZeroUnknownSender),
         Box::new(Nid2CreateRejected),
         Box::new(Nid2CreateReceiptForeignTask),
         Box::new(Nid2ForeignStatusProcess),

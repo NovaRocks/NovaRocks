@@ -158,10 +158,50 @@ pub mod test_support {
     }
 
     pub fn installed_read_execution() -> ConnectorExecutionReadBinding {
+        installed_read_execution_with_factory_version([1; 32])
+    }
+
+    pub fn installed_read_execution_with_factory_version(
+        version: [u8; 32],
+    ) -> ConnectorExecutionReadBinding {
+        let codec = fixture_codec();
+        let binding = codec.adapter.binding();
         ConnectorExecutionReadBinding::new(
-            std::sync::Arc::new(FixtureFactory),
-            std::sync::Arc::new(fixture_codec()),
+            std::sync::Arc::new(FixtureFactory {
+                binding: novarocks_spi::connector::read_stack::ConnectorReadBinding::new(
+                    binding.descriptor().clone(),
+                    novarocks_spi::connector::CatalogHandle::new(
+                        binding.catalog_handle().catalog_name().clone(),
+                        novarocks_spi::connector::CatalogVersion::from_bytes(version),
+                    ),
+                ),
+            }),
+            std::sync::Arc::new(codec.clone()),
+            std::sync::Arc::new(codec),
         )
+    }
+
+    impl novarocks_connector_contract::ConnectorReadRelationRecipeCompiler for FixtureCodec {
+        type Error = novarocks_spi::connector::ConnectorCodecError;
+
+        fn compile_private(
+            &self,
+            draft: &novarocks_connector_contract::ConnectorReadRelationRecipeDraft,
+        ) -> Result<novarocks_connector_contract::ConnectorReadRelationRecipeDraft, Self::Error>
+        {
+            // This test fixture has no provider-private bytes. Product bindings
+            // use their provider's strict pure codec instead.
+            Ok(draft.clone())
+        }
+
+        fn compile_split_private(
+            &self,
+            _binding: &novarocks_connector_contract::ConnectorReadBinding,
+            draft: &novarocks_connector_contract::ConnectorReadRecipeSplitDraft,
+        ) -> Result<novarocks_connector_contract::ConnectorReadRecipeSplitDraft, Self::Error>
+        {
+            Ok(draft.clone())
+        }
     }
 
     impl novarocks_spi::connector::ConnectorReadWireDecoder for FixtureCodec {
@@ -262,8 +302,14 @@ pub mod test_support {
             ))
         }
     }
-    struct FixtureFactory;
+    struct FixtureFactory {
+        binding: novarocks_spi::connector::read_stack::ConnectorReadBinding,
+    }
     impl novarocks_spi::connector::read_stack::ConnectorAdmittedReadProviderFactory for FixtureFactory {
+        fn binding(&self) -> &novarocks_spi::connector::read_stack::ConnectorReadBinding {
+            &self.binding
+        }
+
         fn create_page_source_provider(
             &self,
             _: &novarocks_spi::connector::ConnectorRequestContext,

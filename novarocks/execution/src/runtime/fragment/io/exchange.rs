@@ -1,5 +1,6 @@
 use std::fmt;
 
+use novarocks_execution_contract::TaskIdentity;
 use novarocks_types::UniqueId;
 
 use crate::runtime::endpoint::RuntimeEndpoint;
@@ -13,6 +14,7 @@ use super::FragmentIoError;
 pub struct ExchangeFrame {
     pub destination: RuntimeEndpoint,
     pub destination_fragment_instance_id: UniqueId,
+    pub destination_task_identity: Option<TaskIdentity>,
     pub sender_fragment_instance_id: UniqueId,
     pub sender_ordinal: u32,
     pub sender_count: u32,
@@ -84,6 +86,17 @@ impl From<FragmentIoError> for ExchangeTransmitRejection {
 /// Host-owned transport boundary for exchange frames.
 pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
     fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection>;
+
+    /// A task-scoped stop signal. Transports with cancellable I/O should
+    /// override this so cancellation interrupts a blocked send as well as
+    /// preventing queued successors from starting.
+    fn transmit_cancellable(
+        &self,
+        frame: ExchangeFrame,
+        _stop: tokio_util::sync::CancellationToken,
+    ) -> Result<(), ExchangeTransmitRejection> {
+        self.transmit(frame)
+    }
 }
 
 #[cfg(test)]

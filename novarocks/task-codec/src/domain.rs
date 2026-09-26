@@ -32,6 +32,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use novarocks_execution_contract::TaskIdentity;
 use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
     DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer, SplitSequence,
@@ -287,6 +288,11 @@ pub enum DecodedTaskDomain {
         version: EdgeOpenVersion,
         edges: Vec<ExchangeEdgeId>,
     },
+    CloseExchangeDestination {
+        version: DomainVersion,
+        edge: ExchangeEdgeId,
+        destination: TaskIdentity,
+    },
 }
 
 impl DecodedTaskDomain {
@@ -303,6 +309,15 @@ impl DecodedTaskDomain {
             Self::OpenExchangeEdges { version, edges } => TaskDomainUpdate::OpenExchangeEdges {
                 version: *version,
                 edges: edges.clone(),
+            },
+            Self::CloseExchangeDestination {
+                version,
+                edge,
+                destination,
+            } => TaskDomainUpdate::CloseExchangeDestination {
+                version: *version,
+                edge: *edge,
+                destination: *destination,
             },
         }
     }
@@ -441,6 +456,28 @@ pub fn decode_task_domain(
             }
             Ok(DecodedTaskDomain::OpenExchangeEdges { version, edges })
         }
+        novarocks::task_domain_update::Domain::CloseExchangeDestination(close) => {
+            let close_path = path.field("close_exchange_destination");
+            let version = DomainVersion::new(close.version)
+                .map_err(|error| invalid(close_path.clone().field("version"), error.to_string()))?;
+            let edge = ExchangeEdgeId::new(close.edge_id)
+                .map_err(|error| invalid(close_path.clone().field("edge_id"), error.to_string()))?;
+            let destination = close.destination_task.as_ref().ok_or_else(|| {
+                missing(
+                    close_path.clone().field("destination_task"),
+                    "destination close requires a task identity",
+                )
+            })?;
+            let destination = crate::identity::decode_task_identity(
+                destination,
+                close_path.field("destination_task"),
+            )?;
+            Ok(DecodedTaskDomain::CloseExchangeDestination {
+                version,
+                edge,
+                destination,
+            })
+        }
     }
 }
 
@@ -474,6 +511,17 @@ pub fn encode_task_domain(value: &DecodedTaskDomain) -> novarocks::TaskDomainUpd
                 },
             )
         }
+        DecodedTaskDomain::CloseExchangeDestination {
+            version,
+            edge,
+            destination,
+        } => novarocks::task_domain_update::Domain::CloseExchangeDestination(
+            novarocks::CloseExchangeDestinationDomain {
+                version: version.get(),
+                edge_id: edge.get(),
+                destination_task: Some(crate::identity::encode_task_identity(*destination)),
+            },
+        ),
     };
     novarocks::TaskDomainUpdate {
         domain: Some(domain),
@@ -623,6 +671,17 @@ pub fn encode_neutral_task_domain(
                 },
             )
         }
+        TaskDomainUpdate::CloseExchangeDestination {
+            version,
+            edge,
+            destination,
+        } => novarocks::task_domain_update::Domain::CloseExchangeDestination(
+            novarocks::CloseExchangeDestinationDomain {
+                version: version.get(),
+                edge_id: edge.get(),
+                destination_task: Some(crate::identity::encode_task_identity(*destination)),
+            },
+        ),
     };
     Ok(novarocks::TaskDomainUpdate {
         domain: Some(domain),
@@ -846,8 +905,9 @@ mod tests {
     };
 
     use novarocks_execution_contract::task_execution::domain::{
-        CodecOwnedContent, ConfidentialContent, DomainVersion,
+        CodecOwnedContent, ConfidentialContent, DomainVersion, ExchangeEdgeId,
     };
+    use novarocks_execution_contract::{TaskDomainUpdate, TaskIdentity};
     use novarocks_proto_models::{catalog, filter, novarocks};
 
     use novarocks_proto_codec::FieldPath;
@@ -857,6 +917,39 @@ mod tests {
         CredentialLeaseId, CredentialLeaseProvider, StorageAccessDomainId,
         StorageCredentialScopePrefix,
     };
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+
+    #[test]
+    fn destination_close_wire_requires_and_preserves_exact_task_identity() {
+        let destination = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(51, 52), AttemptId::new(1).expect("attempt"))
+                .expect("query"),
+            StageId::new(2).expect("stage"),
+            TaskId::new(3).expect("task"),
+            BackendProcessId::new_v7(),
+        );
+        let update = TaskDomainUpdate::CloseExchangeDestination {
+            version: DomainVersion::FIRST,
+            edge: ExchangeEdgeId::new(7).expect("edge"),
+            destination,
+        };
+        let wire =
+            super::encode_neutral_task_domain(&update, FieldPath::root("domain")).expect("encodes");
+        assert!(matches!(
+            decode_task_domain(&wire, FieldPath::root("domain"))
+                .expect("decodes").as_neutral(),
+            TaskDomainUpdate::CloseExchangeDestination { destination: decoded, .. } if decoded == destination
+        ));
+        let mut missing = wire;
+        if let Some(novarocks::task_domain_update::Domain::CloseExchangeDestination(close)) =
+            missing.domain.as_mut()
+        {
+            close.destination_task = None;
+        }
+        assert!(decode_task_domain(&missing, FieldPath::root("domain")).is_err());
+    }
 
     fn descriptor_for(epoch: u64, prefix: &str) -> novarocks::CredentialLeaseDescriptor {
         encode_credential_lease_descriptor(

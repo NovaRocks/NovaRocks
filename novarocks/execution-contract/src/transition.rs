@@ -30,6 +30,8 @@ pub enum QueryContextState {
     Establishing,
     /// The context accepts normal task and domain operations.
     Active,
+    /// Normal admission fence is installed while owned work drains.
+    Quiescing,
     /// Normal release is converging.
     Releasing,
     /// Forced termination is converging.
@@ -46,6 +48,7 @@ impl QueryContextState {
             Self::Absent => "ABSENT",
             Self::Establishing => "ESTABLISHING",
             Self::Active => "ACTIVE",
+            Self::Quiescing => "QUIESCING",
             Self::Releasing => "RELEASING",
             Self::Aborting => "ABORTING",
             Self::TerminalRetained => "TERMINAL_RETAINED",
@@ -69,6 +72,7 @@ mod tests {
         assert_eq!(QueryContextState::Absent.as_str(), "ABSENT");
         assert_eq!(QueryContextState::Establishing.as_str(), "ESTABLISHING");
         assert_eq!(QueryContextState::Active.as_str(), "ACTIVE");
+        assert_eq!(QueryContextState::Quiescing.as_str(), "QUIESCING");
         assert_eq!(QueryContextState::Releasing.as_str(), "RELEASING");
         assert_eq!(QueryContextState::Aborting.as_str(), "ABORTING");
         assert_eq!(

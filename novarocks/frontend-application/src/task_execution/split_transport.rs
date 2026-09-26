@@ -340,12 +340,13 @@ impl SplitDeliveryBridge {
             // sending and reconcile -- is a decision about this attempt that
             // must not be resent. The exact outcome travels in `reason`, so
             // none of them is folded into another.
-            let worker_outcome = ack
-                .worker_outcome()
-                .expect("a settled Worker refusal carries its exact outcome");
+            let rejection = ack.worker_outcome().map_or_else(
+                || format!("{:?}", ack.dispatch_result()),
+                |outcome| format!("{outcome:?}"),
+            );
             DeliveryOutcome::Rejected {
-                reason: format!("{worker_outcome:?}"),
-                detail: format!("the task update was answered with {worker_outcome:?}"),
+                reason: rejection.clone(),
+                detail: format!("the task update was answered with {rejection}"),
             }
         };
         let retained = matches!(outcome, DeliveryOutcome::Unknown(_));

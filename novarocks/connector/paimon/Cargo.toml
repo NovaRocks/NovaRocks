@@ -38,6 +38,7 @@ prost.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 novarocks-fs.workspace = true
+novarocks-connector-contract.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-spi.workspace = true

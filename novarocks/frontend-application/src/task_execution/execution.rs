@@ -25,19 +25,29 @@
 //! what the intake queued. Nothing here opens a connection.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use novarocks_execution::task_execution::{
-    AbortCause, AdmissionEpochCapability, OperationKind, QueryContextRef, TaskDomainUpdate,
-    TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail,
-    UpdateQueryContext,
+    AbortCause, AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind,
+    QueryContextRef, TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus,
+    TaskStatusCursor, TerminationDetail, UpdateQueryContext,
+};
+use novarocks_execution::task_execution::{
+    QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QuiesceQueryContextReceipt,
+    TaskConvergenceCursor, TaskConvergenceReceipt,
 };
 use novarocks_query_application::coordination::{
     AttemptDrainFacts, DispatchBudget, DispatchLane, GoneObservation, LatchOutcome,
-    ReplacementWorkerAdmissionEvidence, StageState, StatusObservation, TerminationLatch,
-    parent_released_children,
+    MonotonicInstant, OperationDispatchResult, ReplacementWorkerAdmissionEvidence, StageState,
+    StatusObservation, TerminationLatch, parent_released_children,
 };
 use novarocks_task_codec::TransportBudget;
+use novarocks_task_codec::operation::{
+    CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedCoveredSubscription,
+    QuiesceObservationCursor,
+};
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::{StageId, TaskId};
 
@@ -58,8 +68,86 @@ use super::intent::{
 use super::remote_task::{
     CreateSettlement, RemoteTask, TaskTerminalReport, UpdateAdmission, UpdateSettlement,
 };
-use super::stage::{EdgeOpenTracker, StageExecution};
-use super::status_intake::{StatusEvent, StatusIntake, StatusIntakeEntry};
+use super::stage::{EdgeOpenTracker, EdgeReadyDecision, StageExecution};
+use super::status_intake::{
+    ObservationFrame, ObservationIntakeEntry, StatusEvent, StatusIntake, StatusIntakeEntry,
+};
+
+#[derive(Debug, Default)]
+struct CoveredContextObservation {
+    generation: u64,
+    initial_complete: bool,
+    bookmark_sequence: u64,
+    applied_prefix: u64,
+    source_cut: u64,
+    actual_stopped: BTreeMap<TaskIdentity, TaskConvergenceReceipt>,
+    context_convergence: Option<QueryContextConvergenceReceipt>,
+    quiesce: Option<QuiesceQueryContextReceipt>,
+    /// An accepted fact that could not establish its task's required terminal
+    /// evidence. Only a later complete catch-up with positive facts clears it.
+    missing_terminal: BTreeSet<TaskIdentity>,
+    gap_generation: Option<u64>,
+    gap_since: Option<MonotonicInstant>,
+    coverage_debt: Option<(u64, MonotonicInstant)>,
+}
+
+/// A frozen edge decision waiting for its producer's bounded process queue.
+/// The decision stays here until the producer has retained the domain intent.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum EdgeControlEffect {
+    Close {
+        producer: TaskIdentity,
+        edge: ExchangeEdgeId,
+        destination: TaskIdentity,
+    },
+    Open {
+        producer: TaskIdentity,
+        edge: ExchangeEdgeId,
+    },
+}
+
+impl EdgeControlEffect {
+    const fn producer(self) -> TaskIdentity {
+        match self {
+            Self::Close { producer, .. } | Self::Open { producer, .. } => producer,
+        }
+    }
+}
+
+impl CoveredContextObservation {
+    fn begin_generation(&mut self, generation: u64) {
+        if generation <= self.generation {
+            return;
+        }
+        self.generation = generation;
+        self.initial_complete = false;
+        self.bookmark_sequence = 0;
+        self.applied_prefix = 0;
+        self.source_cut = 0;
+    }
+
+    fn note_status_gap(&mut self, identity: TaskIdentity, now: MonotonicInstant) {
+        self.missing_terminal.insert(identity);
+        self.gap_generation.get_or_insert(self.generation);
+        self.gap_since.get_or_insert(now);
+    }
+
+    fn update_coverage_debt(&mut self, now: MonotonicInstant) {
+        if self
+            .coverage_debt
+            .is_some_and(|(target, _)| self.applied_prefix >= target)
+        {
+            self.coverage_debt = None;
+        }
+        if self.source_cut > self.applied_prefix && self.coverage_debt.is_none() {
+            self.coverage_debt = Some((self.source_cut, now));
+        }
+    }
+
+    fn gap_pending(&self) -> bool {
+        self.gap_generation.is_some()
+    }
+}
 
 /// Which owner settles one released operation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -161,6 +249,7 @@ enum CandidateAdmission {
     /// The candidate had nothing to send after all.
     Nothing,
     TargetFull,
+    DeploymentWindowFull,
     Ended(AdmissionPassEnd),
 }
 
@@ -229,12 +318,24 @@ pub struct QueryTaskExecution {
     clock: Arc<dyn TaskProtocolClock>,
     sink: Arc<dyn TaskOperationSink>,
     intake: StatusIntake,
+    covered_observation_active: bool,
+    covered_observation: BTreeMap<QueryContextRef, CoveredContextObservation>,
+    inbound_producers: BTreeMap<QueryContextRef, BTreeSet<TaskIdentity>>,
+    tasks_by_context: BTreeMap<QueryContextRef, Vec<TaskIdentity>>,
+    deployment_window_limits: BTreeMap<BackendProcessId, usize>,
+    deployment_window: BTreeMap<BackendProcessId, BTreeSet<TaskIdentity>>,
+    /// The frozen graph bounds this by sum(producers * (destinations + 1)):
+    /// the edge tracker emits each close member and each open only once.
+    edge_control_effects: VecDeque<EdgeControlEffect>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     expired_actor_aborts: Vec<TaskOperationId>,
     status_reconciliations: BTreeSet<QueryContextRef>,
+    covered_reconciliations: BTreeSet<QueryContextRef>,
+    normal_drain_started: bool,
     terminal_cleanup_started: bool,
     failure: TerminationLatch,
     read: ReadCompletionTracker,
+    required_evidence_deadlines: BTreeMap<TaskIdentity, MonotonicInstant>,
     drained_tasks: BTreeSet<TaskId>,
     released_outputs: BTreeSet<TaskId>,
     released_children_of: BTreeSet<StageId>,
@@ -306,22 +407,24 @@ impl QueryTaskExecution {
         {
             return Ok(QueuedContextAcknowledgement::NotQueued);
         }
-        Ok(if acknowledgement.worker_outcome().is_some() {
-            QueuedContextAcknowledgement::ApplyDefinitive
-        } else {
-            QueuedContextAcknowledgement::IgnoreOlderTransportUnknown
-        })
+        Ok(
+            if acknowledgement.dispatch_result() != OperationDispatchResult::TransportUnknown {
+                QueuedContextAcknowledgement::ApplyDefinitive
+            } else {
+                QueuedContextAcknowledgement::IgnoreOlderTransportUnknown
+            },
+        )
     }
 
     /// Cancels the current definitely-unsent replay and applies the definitive
-    /// Worker acknowledgement which arrived from an older transport generation.
+    /// settled acknowledgement which arrived from an older transport generation.
     pub(crate) fn acknowledge_queued_context_replay(
         &mut self,
         acknowledgement: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
-        if acknowledgement.worker_outcome().is_none() {
+        if acknowledgement.dispatch_result() == OperationDispatchResult::TransportUnknown {
             return Err(TaskExecutionError::Schedule(
-                "a queued context replay can be closed only by a definitive Worker acknowledgement"
+                "a queued context replay can be closed only by a definitive acknowledgement"
                     .to_owned(),
             ));
         }
@@ -354,16 +457,69 @@ impl QueryTaskExecution {
         transport: TransportBudget,
         native_compatibility_id: NativeCompatibilityId,
         admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
+        preparing_positions: &BTreeMap<BackendProcessId, usize>,
         clock: Arc<dyn TaskProtocolClock>,
         sink: Arc<dyn TaskOperationSink>,
         intake: StatusIntake,
     ) -> Result<Self, TaskExecutionError> {
+        let participants = graph
+            .contexts()
+            .map(|context| context.backend_process_id())
+            .collect::<BTreeSet<_>>();
+        if preparing_positions.keys().copied().collect::<BTreeSet<_>>() != participants
+            || preparing_positions
+                .values()
+                .any(|&positions| positions < budget.create_permits())
+        {
+            return Err(TaskExecutionError::Schedule(
+                "frozen backend preparation capacities must cover the configured deployment window for every exact participant"
+                    .to_owned(),
+            ));
+        }
+        let deployment_window_limits = preparing_positions
+            .iter()
+            .map(|(&process, _)| (process, budget.create_permits()))
+            .collect();
         let edges = EdgeOpenTracker::from_graph(&graph);
+        let mut exchange_destinations = BTreeMap::<
+            TaskId,
+            Vec<(
+                novarocks_execution::task_execution::ExchangeEdgeId,
+                TaskIdentity,
+            )>,
+        >::new();
+        let mut inbound_producers = BTreeMap::<QueryContextRef, BTreeSet<TaskIdentity>>::new();
+        for edge in graph.edges() {
+            for destination in edge.destinations() {
+                let context = graph
+                    .task(destination.task_id())
+                    .ok_or(TaskExecutionError::UnknownOperation)?
+                    .context();
+                inbound_producers
+                    .entry(context)
+                    .or_default()
+                    .extend(edge.producers().iter().copied());
+            }
+            for producer in edge.producers() {
+                let destinations = exchange_destinations.entry(producer.task_id()).or_default();
+                destinations.extend(
+                    edge.destinations()
+                        .iter()
+                        .copied()
+                        .map(|destination| (edge.edge_id(), destination)),
+                );
+            }
+        }
         let root_task = graph.root_task();
         let mut owners = BTreeMap::<QueryContextRef, QueryContextOwner>::new();
         let mut tasks_per_context = BTreeMap::<QueryContextRef, usize>::new();
+        let mut tasks_by_context = BTreeMap::<QueryContextRef, Vec<TaskIdentity>>::new();
         for task in graph.tasks() {
             *tasks_per_context.entry(task.context()).or_default() += 1;
+            tasks_by_context
+                .entry(task.context())
+                .or_default()
+                .push(task.identity());
         }
         for (&context, &tasks) in &tasks_per_context {
             let admission_epoch_capability = admission_epochs
@@ -401,10 +557,13 @@ impl QueryTaskExecution {
             }
             dispatcher.register_task(node.identity().backend_process_id())?;
             stage_of_task.insert(task_id, node.stage_id());
-            stage_tasks
-                .entry(node.stage_id())
-                .or_default()
-                .insert(task_id, RemoteTask::new(seed)?);
+            stage_tasks.entry(node.stage_id()).or_default().insert(
+                task_id,
+                RemoteTask::new(
+                    seed,
+                    exchange_destinations.remove(&task_id).unwrap_or_default(),
+                )?,
+            );
         }
 
         let mut stages = BTreeMap::<StageId, StageExecution>::new();
@@ -420,6 +579,11 @@ impl QueryTaskExecution {
         }
 
         let read = ReadCompletionTracker::new(graph.root_identity());
+        let covered_observation = graph
+            .contexts()
+            .copied()
+            .map(|context| (context, CoveredContextObservation::default()))
+            .collect();
         Ok(Self {
             graph,
             stages,
@@ -430,12 +594,22 @@ impl QueryTaskExecution {
             clock,
             sink,
             intake,
+            covered_observation_active: false,
+            covered_observation,
+            inbound_producers,
+            tasks_by_context,
+            deployment_window_limits,
+            deployment_window: BTreeMap::new(),
+            edge_control_effects: VecDeque::new(),
             operation_targets: BTreeMap::new(),
             expired_actor_aborts: Vec::new(),
             status_reconciliations: BTreeSet::new(),
+            covered_reconciliations: BTreeSet::new(),
+            normal_drain_started: false,
             terminal_cleanup_started: false,
             failure: TerminationLatch::open(),
             read,
+            required_evidence_deadlines: BTreeMap::new(),
             drained_tasks: BTreeSet::new(),
             released_outputs: BTreeSet::new(),
             released_children_of: BTreeSet::new(),
@@ -496,6 +670,10 @@ impl QueryTaskExecution {
         std::mem::take(&mut self.status_reconciliations)
     }
 
+    pub(crate) fn take_covered_reconciliations(&mut self) -> BTreeSet<QueryContextRef> {
+        std::mem::take(&mut self.covered_reconciliations)
+    }
+
     pub(crate) fn take_expired_actor_aborts(&mut self) -> Vec<TaskOperationId> {
         std::mem::take(&mut self.expired_actor_aborts)
     }
@@ -551,6 +729,7 @@ impl QueryTaskExecution {
         &mut self,
         establish: &dyn ContextEstablishSource,
     ) -> Result<PumpReport, TaskExecutionError> {
+        self.refresh_deployment_window();
         let now = self.clock.now();
         let expired = self.dispatcher.drain_expired(now);
         let mut first_expiry = None;
@@ -588,48 +767,104 @@ impl QueryTaskExecution {
             return Ok(report);
         }
 
+        self.flush_edge_control_effects()?;
+
         let mut lifecycle = Vec::<AdmissionCandidate>::new();
-        for (&context, owner) in &mut self.owners {
-            if let Some(intent) = owner.admission_intent(now)? {
-                lifecycle.push(AdmissionCandidate::minted(
-                    OperationTarget::Context(context),
-                    intent,
-                ));
+        if !self.normal_drain_started {
+            for (&context, owner) in &mut self.owners {
+                if let Some(intent) = owner.admission_intent(now)? {
+                    lifecycle.push(AdmissionCandidate::minted(
+                        OperationTarget::Context(context),
+                        intent,
+                    ));
+                }
+                if !owner.needs_establish() {
+                    continue;
+                }
+                if let Some(intent) = owner.establish_intent(establish.facts_for(context)?, now)? {
+                    lifecycle.push(AdmissionCandidate::minted(
+                        OperationTarget::Context(context),
+                        intent,
+                    ));
+                }
             }
-            if !owner.needs_establish() {
-                continue;
-            }
-            if let Some(intent) = owner.establish_intent(establish.facts_for(context)?, now)? {
-                lifecycle.push(AdmissionCandidate::minted(
-                    OperationTarget::Context(context),
-                    intent,
-                ));
+            for (&stage_id, stage) in &mut self.stages {
+                for (&task_id, task) in stage.tasks_mut() {
+                    if task.normally_stood_down()
+                        && task.create_ownership_proven()
+                        && let Some(intent) =
+                            task.cancel_intent(CancelReason::UpstreamNoLongerNeeded)
+                    {
+                        lifecycle.push(AdmissionCandidate::minted(
+                            OperationTarget::Task {
+                                stage: stage_id,
+                                task: task_id,
+                            },
+                            intent,
+                        ));
+                    }
+                }
             }
         }
         // Creates and updates are positions only. A task is asked what its
         // send would cost when the pass reaches it, so a create that waits
         // behind a full target is neither frozen nor re-measured.
         let mut work = Vec::<AdmissionCandidate>::new();
-        for (&stage_id, stage) in &self.stages {
-            for &task_id in stage.tasks().map(|(task_id, _)| task_id) {
-                work.push(AdmissionCandidate::Create {
-                    stage: stage_id,
-                    task: task_id,
-                });
-                work.push(AdmissionCandidate::Update {
-                    stage: stage_id,
-                    task: task_id,
-                });
+        if !self.normal_drain_started {
+            for (&stage_id, stage) in &self.stages {
+                for &task_id in stage.tasks().map(|(task_id, _)| task_id) {
+                    work.push(AdmissionCandidate::Create {
+                        stage: stage_id,
+                        task: task_id,
+                    });
+                    work.push(AdmissionCandidate::Update {
+                        stage: stage_id,
+                        task: task_id,
+                    });
+                }
+            }
+        } else {
+            // Exact no-more-input effects remain live during normal drain.
+            // Ordinary updates were discarded when the drain started.
+            for (&stage_id, stage) in &self.stages {
+                for &task_id in stage.tasks().map(|(task_id, _)| task_id) {
+                    work.push(AdmissionCandidate::Update {
+                        stage: stage_id,
+                        task: task_id,
+                    });
+                }
             }
         }
+        let release_ready = self
+            .graph
+            .contexts()
+            .copied()
+            .map(|context| {
+                Ok::<_, TaskExecutionError>((
+                    context,
+                    self.receiver_inputs_stopped(context)?
+                        && self.context_tasks_stopped(context)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         for (&context, owner) in &mut self.owners {
+            if self.normal_drain_started {
+                if let Some(intent) = owner.quiesce_intent() {
+                    lifecycle.push(AdmissionCandidate::minted(
+                        OperationTarget::Context(context),
+                        intent,
+                    ));
+                }
+            }
             if let Some(intent) = owner.renew_intent(now)? {
                 lifecycle.push(AdmissionCandidate::minted(
                     OperationTarget::Context(context),
                     intent,
                 ));
             }
-            if let Some(intent) = owner.release_intent(now) {
+            if release_ready.get(&context) == Some(&true)
+                && let Some(intent) = owner.release_intent(now)
+            {
                 lifecycle.push(AdmissionCandidate::minted(
                     OperationTarget::Context(context),
                     intent,
@@ -681,9 +916,9 @@ impl QueryTaskExecution {
         task_id: TaskId,
         update: TaskDomainUpdate,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
-        if self.terminal_cleanup_started {
+        if self.normal_drain_started || self.terminal_cleanup_started {
             return Err(TaskExecutionError::Schedule(
-                "attempt terminal cleanup rejects new task updates".to_owned(),
+                "attempt drain rejects new task updates".to_owned(),
             ));
         }
         let stage_id = *self
@@ -723,9 +958,9 @@ impl QueryTaskExecution {
         &mut self,
         request: UpdateQueryContext,
     ) -> Result<TaskOperationId, TaskExecutionError> {
-        if self.terminal_cleanup_started {
+        if self.normal_drain_started || self.terminal_cleanup_started {
             return Err(TaskExecutionError::Schedule(
-                "attempt terminal cleanup rejects new context-domain advances".to_owned(),
+                "attempt drain rejects new context-domain advances".to_owned(),
             ));
         }
         let UpdateQueryContext::AdvanceDomain(advance) = &request else {
@@ -873,6 +1108,89 @@ impl QueryTaskExecution {
         Ok(())
     }
 
+    /// Keeps observation and context closure live after a successful root
+    /// seal while stopping unsent task and input work. In-flight operations
+    /// may still settle; only exact destination-close controls may replay.
+    pub(crate) fn begin_normal_drain(&mut self) {
+        if self.normal_drain_started {
+            return;
+        }
+        let destinations = self
+            .graph
+            .tasks()
+            .map(|task| task.identity())
+            .collect::<Vec<_>>();
+        for destination in destinations {
+            self.stand_down_task_normally(destination)
+                .expect("the frozen task graph owns every destination");
+        }
+        self.normal_drain_started = true;
+        let unsent_inputs = self
+            .operation_targets
+            .iter()
+            .filter_map(|(&operation_id, &target)| {
+                let queued_kind = self.dispatcher.queued_operation_kind(operation_id);
+                (matches!(queued_kind, Some(OperationKind::CreateTask))
+                    || (queued_kind == Some(OperationKind::UpdateTask)
+                        && !self.dispatcher.queued_destination_close(operation_id))
+                    || (target != OperationTarget::ActorAbort
+                        && matches!(target, OperationTarget::ContextDomain(_))
+                        && queued_kind.is_some()))
+                .then_some((operation_id, target))
+            })
+            .collect::<Vec<_>>();
+        for (operation_id, target) in unsent_inputs {
+            let _ = self.dispatcher.cancel_queued(operation_id);
+            self.operation_targets.remove(&operation_id);
+            self.rollback_unsent(target, operation_id);
+        }
+    }
+
+    /// Applies one exact local no-more-input authorization. An unknown Create
+    /// outcome is kept for Context fencing, but cannot keep this destination
+    /// in the producer's opening barrier or revive its normal input need.
+    pub(crate) fn stand_down_task_normally(
+        &mut self,
+        identity: TaskIdentity,
+    ) -> Result<(), TaskExecutionError> {
+        let task = self
+            .task_by_identity_ref(identity)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        if task
+            .status()
+            .and_then(TaskStatus::termination)
+            .is_none_or(|detail| detail.is_success_compatible())
+        {
+            self.close_destination_normally(identity);
+        }
+        let queued_inputs = self
+            .operation_targets
+            .iter()
+            .filter_map(|(&operation_id, &target)| {
+                let OperationTarget::Task { stage, task } = target else {
+                    return None;
+                };
+                if stage != identity.stage_id() || task != identity.task_id() {
+                    return None;
+                }
+                let kind = self.dispatcher.queued_operation_kind(operation_id);
+                (kind == Some(OperationKind::CreateTask)
+                    || (kind == Some(OperationKind::UpdateTask)
+                        && !self.dispatcher.queued_destination_close(operation_id)))
+                .then_some((operation_id, target))
+            })
+            .collect::<Vec<_>>();
+        for (operation_id, target) in queued_inputs {
+            let _ = self.dispatcher.cancel_queued(operation_id)?;
+            self.operation_targets.remove(&operation_id);
+            self.rollback_unsent(target, operation_id);
+        }
+        self.task_by_identity(identity)
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .begin_normal_stand_down();
+        Ok(())
+    }
+
     /// Stops the normal attempt lifecycle once the logical query has reached
     /// a terminal outcome. It preserves in-flight requests and actor Abort
     /// effects, because their Worker facts may still be useful for cleanup,
@@ -883,6 +1201,12 @@ impl QueryTaskExecution {
             return;
         }
         self.terminal_cleanup_started = true;
+        self.deployment_window.clear();
+        for stage in self.stages.values_mut() {
+            for (_, task) in stage.tasks_mut() {
+                task.discard_creation_after_attempt_failure();
+            }
+        }
         for owner in self.owners.values_mut() {
             owner.begin_terminal_cleanup();
         }
@@ -996,7 +1320,12 @@ impl QueryTaskExecution {
             OperationKind::CreateTask => {
                 let identity = task.identity();
                 let context = task.context();
-                let settlement = task.on_create_ack(ack)?;
+                let was_owned = task.create_ownership_proven();
+                let context_established = self
+                    .owners
+                    .get(&context)
+                    .is_some_and(QueryContextOwner::establish_acknowledged);
+                let settlement = task.on_create_ack(ack, self.clock.now(), context_established)?;
                 if !matches!(settlement, CreateSettlement::Created) {
                     if let CreateSettlement::FailedClosed(outcome) = settlement {
                         return Err(TaskExecutionError::OperationFailed {
@@ -1009,11 +1338,14 @@ impl QueryTaskExecution {
                     // to be handed out again by the next pump.
                     return Ok(());
                 }
-                if let Some(owner) = self.owners.get_mut(&context) {
-                    owner.note_create_acknowledged();
+                if !was_owned && task.create_ownership_proven() {
+                    if let Some(owner) = self.owners.get_mut(&context) {
+                        owner.note_create_owned();
+                    }
                 }
-                self.open_ready_edges(identity)?;
+                self.reconcile_destination_input(identity)?;
                 self.settle_task_drain(stage_id, task_id);
+                self.accept_task_failure(identity);
                 Ok(())
             }
             OperationKind::UpdateTask => match task.on_update_ack(ack)? {
@@ -1047,7 +1379,26 @@ impl QueryTaskExecution {
             .ok_or(TaskExecutionError::UnknownOperation)?;
         match ack.kind() {
             OperationKind::AcquireQueryContextAdmissionTicket => owner.on_admission_ack(ack, now),
-            OperationKind::UpdateQueryContext => owner.on_context_ack(ack),
+            OperationKind::UpdateQueryContext => {
+                owner.on_context_ack(ack)?;
+                if owner.establish_acknowledged() {
+                    for stage in self.stages.values_mut() {
+                        for (_, task) in stage.tasks_mut() {
+                            if task.context() == context {
+                                task.on_context_established();
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            OperationKind::QuiesceQueryContext => {
+                let receipt = owner.on_quiesce_ack(ack)?;
+                if let Some(receipt) = receipt {
+                    self.apply_quiesce_membership(context, &receipt)?;
+                }
+                Ok(())
+            }
             OperationKind::ReleaseQueryContext => {
                 owner
                     .on_release_ack(ack, now)
@@ -1067,50 +1418,620 @@ impl QueryTaskExecution {
         }
     }
 
+    fn apply_quiesce_membership(
+        &mut self,
+        context: QueryContextRef,
+        receipt: &novarocks_execution::task_execution::QuiesceQueryContextReceipt,
+    ) -> Result<(), TaskExecutionError> {
+        let accepted = receipt
+            .accepted_tasks()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if accepted.len() != receipt.accepted_tasks().len() {
+            return Err(TaskExecutionError::DomainReceipt(
+                "quiesce membership contains duplicate task identities".to_owned(),
+            ));
+        }
+        for &identity in &accepted {
+            let Some(task) = self.task_by_identity(identity) else {
+                return Err(TaskExecutionError::DomainReceipt(format!(
+                    "quiesce membership names an unscheduled task {identity}"
+                )));
+            };
+            if task.context() != context {
+                return Err(TaskExecutionError::DomainReceipt(format!(
+                    "quiesce membership names task {identity} in another context"
+                )));
+            }
+        }
+        let mut drained = Vec::new();
+        for (&stage_id, stage) in &mut self.stages {
+            for (task_id, task) in stage.tasks_mut() {
+                if task.context() != context {
+                    continue;
+                }
+                let was_fenced_out = task.fenced_out();
+                let became_owned =
+                    task.on_quiesce_membership(accepted.contains(&task.identity()))?;
+                let owner = self
+                    .owners
+                    .get_mut(&context)
+                    .ok_or(TaskExecutionError::UnknownOperation)?;
+                if became_owned {
+                    owner.note_create_owned();
+                } else if task.fenced_out() && !was_fenced_out {
+                    owner.note_create_fenced_out();
+                }
+                drained.push((stage_id, *task_id));
+            }
+        }
+        for (stage_id, task_id) in drained {
+            self.settle_task_drain(stage_id, task_id);
+        }
+        Ok(())
+    }
+
+    /// Applies an exact transport send fact on the same serial owner as ACKs.
+    pub(crate) fn establish_send_started(
+        &mut self,
+        context: QueryContextRef,
+        operation_id: TaskOperationId,
+    ) -> Result<(), TaskExecutionError> {
+        self.owners
+            .get_mut(&context)
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .on_establish_send_started(operation_id)
+    }
+
     /// Records the edge-open decision every edge this destination completed.
     ///
     /// The fact is recorded on each producer's own task. A producer that is
     /// still `Creating` queues it, so the decision may be made early while the
     /// wire request still waits for that producer's own acknowledgement.
     fn open_ready_edges(&mut self, destination: TaskIdentity) -> Result<(), TaskExecutionError> {
-        for edge_id in self.edges.note_created(destination) {
+        let decisions = self.edges.note_created(destination);
+        self.apply_open_decisions(decisions);
+        Ok(())
+    }
+
+    fn apply_open_decisions(&mut self, decisions: Vec<EdgeReadyDecision>) {
+        if self.normal_drain_started {
+            return;
+        }
+        for decision in decisions {
+            let edge_id = decision.edge_id();
             let producers = self.edges.producers_of(edge_id).to_vec();
             tracing::debug!(
                 edge = %edge_id,
-                destination = %destination,
                 producers = producers.len(),
                 "exchange edge decided; recording the open on every producer"
             );
             for producer in producers {
-                // A producer this decision cannot reach never opens its edge,
-                // and its sink then waits for permission for the rest of the
-                // query. Losing that silently is what makes the resulting hang
-                // unattributable, so each miss is reported.
-                let Some(stage) = self.stages.get(&producer.stage_id()) else {
-                    tracing::warn!(
-                        edge = %edge_id,
-                        producer = %producer,
-                        "edge open cannot reach a producer whose stage is absent"
-                    );
-                    continue;
-                };
-                let Some(task) = stage.task(producer.task_id()) else {
-                    tracing::warn!(
-                        edge = %edge_id,
-                        producer = %producer,
-                        "edge open cannot reach a producer absent from its own stage"
-                    );
-                    continue;
-                };
-                let update = task.prepare_edge_open(edge_id)?;
-                self.enqueue_task_update(producer.task_id(), update)?;
-                tracing::debug!(
-                    edge = %edge_id,
-                    producer = %producer,
-                    "edge open recorded on its producer"
-                );
+                self.edge_control_effects
+                    .push_back(EdgeControlEffect::Open {
+                        producer,
+                        edge: edge_id,
+                    });
             }
         }
+    }
+
+    /// Projects a receiver's exact no-more-input decision to each frozen
+    /// producer before an edge-level open can follow it in that Task's update
+    /// sequence. Closing one destination does not close its siblings.
+    fn close_destination_normally(&mut self, destination: TaskIdentity) {
+        let resolution = self.edges.note_normally_closed(destination);
+        for effect in resolution.closed() {
+            let producers = self.edges.producers_of(effect.edge_id()).to_vec();
+            for producer in producers {
+                self.edge_control_effects
+                    .push_back(EdgeControlEffect::Close {
+                        producer,
+                        edge: effect.edge_id(),
+                        destination: effect.destination(),
+                    });
+            }
+        }
+        self.apply_open_decisions(resolution.opened().to_vec());
+    }
+
+    /// Moves frozen edge effects to the original per-task domain owner only
+    /// after the process transport has reserved their bounded queue capacity.
+    /// Backpressure leaves the exact decision in this graph-bounded queue.
+    /// One full producer cannot block independent producer processes, while
+    /// every producer retains its own close-before-open order.
+    fn flush_edge_control_effects(&mut self) -> Result<(), TaskExecutionError> {
+        let mut blocked_producers = BTreeSet::new();
+        let pass_len = self.edge_control_effects.len();
+        for _ in 0..pass_len {
+            let Some(effect) = self.edge_control_effects.pop_front() else {
+                break;
+            };
+            if self.normal_drain_started && matches!(effect, EdgeControlEffect::Open { .. }) {
+                continue;
+            }
+            let producer = effect.producer();
+            if blocked_producers.contains(&producer) {
+                self.edge_control_effects.push_back(effect);
+                continue;
+            }
+            let task = self
+                .task_by_identity_ref(producer)
+                .ok_or(TaskExecutionError::UnknownOperation)?;
+            if task.fenced_out() || self.task_actual_stopped(producer) {
+                continue;
+            }
+            if task.is_terminal() && self.covered_observation_active {
+                blocked_producers.insert(producer);
+                self.edge_control_effects.push_back(effect);
+                continue;
+            }
+            let update = match effect {
+                EdgeControlEffect::Close {
+                    edge, destination, ..
+                } => task.prepare_destination_close(edge, destination)?,
+                EdgeControlEffect::Open { edge, .. } => task.prepare_edge_open(edge)?,
+            };
+            let request =
+                TaskOperationQueueRequest::task_update(producer.backend_process_id(), &update);
+            self.dispatcher.validate_queue_request(request)?;
+            let Some(permit) = self.reserve_process_request(request) else {
+                blocked_producers.insert(producer);
+                self.edge_control_effects.push_back(effect);
+                continue;
+            };
+            self.task_by_identity(producer)
+                .ok_or(TaskExecutionError::UnknownOperation)?
+                .enqueue_update(update, permit)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_destination_input(
+        &mut self,
+        destination: TaskIdentity,
+    ) -> Result<(), TaskExecutionError> {
+        if self.normal_drain_started || self.terminal_cleanup_started {
+            return Ok(());
+        }
+        let task = self
+            .task_by_identity_ref(destination)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        if !task.installed() {
+            return Ok(());
+        }
+        if let Some(status) = task.status()
+            && status.is_terminal()
+        {
+            if status
+                .termination()
+                .is_none_or(|detail| detail.is_success_compatible())
+            {
+                self.close_destination_normally(destination);
+            }
+        } else {
+            self.open_ready_edges(destination)?;
+        }
+        self.flush_edge_control_effects()
+    }
+
+    /// Builds a reconnect request only from facts the serial owner has
+    /// applied, never from transport receipt or an unconsumed intake slot.
+    pub(crate) fn covered_subscription_request(
+        &self,
+        context: QueryContextRef,
+        generation: NonZeroU64,
+    ) -> Result<DecodedCoveredSubscription, TaskExecutionError> {
+        let state = self
+            .covered_observation
+            .get(&context)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let request = DecodedCoveredSubscription {
+            context,
+            generation,
+            status_cursors: self.status_cursors(context),
+            task_convergence_cursors: self
+                .graph
+                .tasks()
+                .filter(|task| task.context() == context)
+                .map(|task| {
+                    let identity = task.identity();
+                    state.actual_stopped.get(&identity).map_or_else(
+                        || TaskConvergenceCursor::unobserved(identity),
+                        |receipt| TaskConvergenceCursor::at(identity, receipt.version()),
+                    )
+                })
+                .collect(),
+            context_cursor: state
+                .context_convergence
+                .map(|receipt| QueryContextConvergenceCursor::at(context, receipt.version())),
+            quiesce_cursor: state
+                .quiesce
+                .as_ref()
+                .map(|receipt| QuiesceObservationCursor {
+                    context,
+                    fence_version: NonZeroU64::new(receipt.fence_version()),
+                }),
+            required_identities: self
+                .graph
+                .tasks()
+                .filter(|task| task.context() == context)
+                .map(|task| task.identity())
+                .collect(),
+        };
+        novarocks_task_codec::operation::encode_covered_subscribe_task_status(&request)
+            .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
+        Ok(request)
+    }
+
+    pub(crate) fn next_covered_generation(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<NonZeroU64, TaskExecutionError> {
+        let observed = self
+            .covered_observation
+            .get(&context)
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .generation;
+        let next = observed.checked_add(1).ok_or_else(|| {
+            TaskExecutionError::Schedule("covered stream generation exhausted".to_owned())
+        })?;
+        NonZeroU64::new(next).ok_or_else(|| {
+            TaskExecutionError::Schedule("covered stream generation must be nonzero".to_owned())
+        })
+    }
+
+    /// Only a registered local observation gap affects the read success cut.
+    /// Ordinary reconnect or an unrelated Context's catch-up does not.
+    pub(crate) fn covered_observation_ready(&self) -> bool {
+        self.covered_observation
+            .values()
+            .all(|state| !state.gap_pending())
+    }
+
+    pub(crate) fn covered_gap_contexts(&self) -> impl Iterator<Item = QueryContextRef> + '_ {
+        self.covered_observation
+            .iter()
+            .filter_map(|(&context, state)| state.gap_pending().then_some(context))
+    }
+
+    pub(crate) fn covered_recovery_expired(&self) -> bool {
+        let now = self.clock.now();
+        self.covered_observation.values().any(|state| {
+            state.gap_pending()
+                && [state.gap_since, state.coverage_debt.map(|(_, since)| since)]
+                    .into_iter()
+                    .flatten()
+                    .any(|since| now.has_reached(since.saturating_add(Duration::from_secs(30))))
+        })
+    }
+
+    pub(crate) fn activate_covered_observation(&mut self) {
+        assert!(!self.covered_observation_active);
+        self.covered_observation_active = true;
+    }
+
+    pub(crate) fn covered_observation_active(&self) -> bool {
+        self.covered_observation_active
+    }
+
+    pub(crate) fn task_actual_stopped(&self, identity: TaskIdentity) -> bool {
+        self.task_by_identity_ref(identity)
+            .and_then(|task| self.covered_observation.get(&task.context()))
+            .is_some_and(|state| state.actual_stopped.contains_key(&identity))
+    }
+
+    /// A receiver Context may release only after every frozen inbound sender
+    /// that the Worker actually accepted has stopped. A Task fenced out by
+    /// its own complete Quiesce receipt has no remote sender to wait for.
+    fn receiver_inputs_stopped(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<bool, TaskExecutionError> {
+        if !self.covered_observation_active {
+            return Ok(true);
+        }
+        for &producer in self.inbound_producers.get(&context).into_iter().flatten() {
+            let task = self
+                .task_by_identity_ref(producer)
+                .ok_or(TaskExecutionError::UnknownOperation)?;
+            if !task.fenced_out() && !self.task_actual_stopped(producer) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Keep this Context's own stopped facts until dependent receivers have
+    /// used them. A terminal status describes the Task's result, not the end
+    /// of its local exchange and resource responsibilities.
+    fn context_tasks_stopped(&self, context: QueryContextRef) -> Result<bool, TaskExecutionError> {
+        if !self.covered_observation_active {
+            return Ok(true);
+        }
+        for &identity in self.tasks_by_context.get(&context).into_iter().flatten() {
+            let remote = self
+                .task_by_identity_ref(identity)
+                .ok_or(TaskExecutionError::UnknownOperation)?;
+            if !remote.fenced_out() && !self.task_actual_stopped(identity) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Applies frames that the new intake registered before a success seal in
+    /// one order. A frame from an older generation still contributes its
+    /// positive entity fact; it cannot advance the current coverage watermark.
+    pub(crate) fn apply_covered_entries(
+        &mut self,
+        entries: Vec<ObservationIntakeEntry>,
+    ) -> Result<StatusReport, TaskExecutionError> {
+        let mut report = StatusReport::default();
+        for entry in entries {
+            match entry {
+                ObservationIntakeEntry::Frame(ObservationFrame::Covered {
+                    context,
+                    generation,
+                    event,
+                }) => self.apply_covered_frame(context, generation, event, &mut report)?,
+                ObservationIntakeEntry::Frame(_) => {
+                    return Err(TaskExecutionError::Schedule(
+                        "legacy observation entered the covered intake".to_owned(),
+                    ));
+                }
+                ObservationIntakeEntry::SuccessSeal(request) => {
+                    report.success_seal = Some(request);
+                    break;
+                }
+                #[cfg(test)]
+                ObservationIntakeEntry::TestSeal => break,
+            }
+        }
+        self.propagate_stage_release()?;
+        Ok(report)
+    }
+
+    fn apply_covered_frame(
+        &mut self,
+        context: QueryContextRef,
+        generation: u64,
+        event: CoveredStatusStreamEvent,
+        report: &mut StatusReport,
+    ) -> Result<(), TaskExecutionError> {
+        if generation == 0 {
+            return Err(TaskExecutionError::Schedule(
+                "covered observation generation must be nonzero".to_owned(),
+            ));
+        }
+        let now = self.clock.now();
+        let state = self
+            .covered_observation
+            .get_mut(&context)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        state.begin_generation(generation);
+        let gap_before = state.gap_pending();
+        let current_generation = generation == state.generation;
+        if current_generation && event.source_revision.is_some() && !state.initial_complete {
+            return Err(TaskExecutionError::Schedule(
+                "live covered observation preceded its catch-up boundary".to_owned(),
+            ));
+        }
+        if current_generation
+            && state.initial_complete
+            && event.source_revision.is_none()
+            && !matches!(
+                &event.fact,
+                CoveredStatusStreamFact::CatchUpComplete(_) | CoveredStatusStreamFact::Bookmark(_)
+            )
+        {
+            return Err(TaskExecutionError::Schedule(
+                "catch-up fact followed the completed covered boundary".to_owned(),
+            ));
+        }
+        match event.fact {
+            CoveredStatusStreamFact::Status(status) => {
+                let identity = status.identity();
+                self.verify_covered_task(context, identity)?;
+                self.apply_published(&status, report)?;
+                if status.is_terminal() {
+                    self.covered_observation
+                        .get_mut(&context)
+                        .expect("validated context")
+                        .missing_terminal
+                        .remove(&identity);
+                }
+            }
+            CoveredStatusStreamFact::Gone(identity) => {
+                self.verify_covered_task(context, identity)?;
+                if !current_generation {
+                    report.ignored += 1;
+                    return Ok(());
+                }
+                let has_terminal = self
+                    .task_by_identity_ref(identity)
+                    .and_then(RemoteTask::status)
+                    .is_some_and(TaskStatus::is_terminal);
+                if has_terminal {
+                    let task = self.task_by_identity(identity).expect("validated task");
+                    if matches!(task.observe_gone(), GoneObservation::TerminalNeverObserved) {
+                        self.covered_observation
+                            .get_mut(&context)
+                            .unwrap()
+                            .note_status_gap(identity, now);
+                    }
+                } else {
+                    self.covered_observation
+                        .get_mut(&context)
+                        .unwrap()
+                        .note_status_gap(identity, now);
+                }
+                report.ignored += 1;
+            }
+            CoveredStatusStreamFact::TaskConvergence(receipt) => {
+                self.verify_covered_task(context, receipt.identity())?;
+                let state = self.covered_observation.get_mut(&context).unwrap();
+                if let Some(previous) = state.actual_stopped.get(&receipt.identity()) {
+                    if previous != &receipt {
+                        return Err(TaskExecutionError::Schedule(
+                            "Task actual-stopped receipt changed after application".to_owned(),
+                        ));
+                    }
+                } else {
+                    state.actual_stopped.insert(receipt.identity(), receipt);
+                }
+                report.ignored += 1;
+            }
+            CoveredStatusStreamFact::ContextConvergence(receipt) => {
+                if receipt.context() != context {
+                    return Err(TaskExecutionError::Schedule(
+                        "Context convergence observation names another context".to_owned(),
+                    ));
+                }
+                let state = self.covered_observation.get_mut(&context).unwrap();
+                if let Some(previous) = state.context_convergence {
+                    if previous != receipt {
+                        return Err(TaskExecutionError::Schedule(
+                            "Context convergence receipt changed after application".to_owned(),
+                        ));
+                    }
+                } else {
+                    state.context_convergence = Some(receipt);
+                }
+                report.ignored += 1;
+            }
+            CoveredStatusStreamFact::Quiesce(receipt) => {
+                if receipt.context() != context {
+                    return Err(TaskExecutionError::Schedule(
+                        "Quiesce observation names another context".to_owned(),
+                    ));
+                }
+                if let Some(previous) = &self.covered_observation[&context].quiesce
+                    && (previous.fence_version() != receipt.fence_version()
+                        || previous.accepted_tasks() != receipt.accepted_tasks())
+                {
+                    return Err(TaskExecutionError::Schedule(
+                        "Quiesce observation changed its accepted membership".to_owned(),
+                    ));
+                }
+                self.apply_quiesce_membership(context, &receipt)?;
+                self.owners
+                    .get_mut(&context)
+                    .expect("validated context")
+                    .observe_quiesce(&receipt)?;
+                self.covered_observation.get_mut(&context).unwrap().quiesce = Some(receipt);
+                report.ignored += 1;
+            }
+            CoveredStatusStreamFact::StatusUnchanged(identity) => {
+                self.verify_covered_task(context, identity)?;
+                if current_generation
+                    && self
+                        .task_by_identity_ref(identity)
+                        .and_then(RemoteTask::status)
+                        .is_none()
+                {
+                    return Err(TaskExecutionError::Schedule(
+                        "covered StatusUnchanged has no applied status cursor".to_owned(),
+                    ));
+                }
+                report.ignored += 1;
+            }
+            CoveredStatusStreamFact::TaskConvergenceUnchanged(identity) => {
+                self.verify_covered_task(context, identity)?;
+                if current_generation
+                    && !self.covered_observation[&context]
+                        .actual_stopped
+                        .contains_key(&identity)
+                {
+                    return Err(TaskExecutionError::Schedule(
+                        "covered TaskConvergenceUnchanged has no applied convergence cursor"
+                            .to_owned(),
+                    ));
+                }
+                report.ignored += 1;
+            }
+            CoveredStatusStreamFact::Unknown(identity) => {
+                self.verify_covered_task(context, identity)?;
+                // The source's initial cut can precede an Accepted ACK that
+                // this serial owner applied before the Unknown frame arrived.
+                // This absence at an older cut cannot retract ownership.
+                report.ignored += 1;
+            }
+            CoveredStatusStreamFact::CatchUpComplete(marker) => {
+                if marker.generation != generation {
+                    return Err(TaskExecutionError::Schedule(
+                        "catch-up boundary names another stream generation".to_owned(),
+                    ));
+                }
+                if current_generation {
+                    let state = self.covered_observation.get_mut(&context).unwrap();
+                    if state.initial_complete {
+                        return Err(TaskExecutionError::Schedule(
+                            "covered catch-up boundary repeated".to_owned(),
+                        ));
+                    }
+                    state.initial_complete = true;
+                    state.applied_prefix = state.applied_prefix.max(marker.initial_cut);
+                    state.source_cut = state.source_cut.max(marker.initial_cut);
+                    if state.missing_terminal.is_empty()
+                        && state.gap_generation.is_some_and(|gap| generation > gap)
+                    {
+                        state.gap_generation = None;
+                        state.gap_since = None;
+                    }
+                }
+                report.ignored += 1;
+            }
+            CoveredStatusStreamFact::Bookmark(marker) => {
+                if marker.generation != generation {
+                    return Err(TaskExecutionError::Schedule(
+                        "bookmark names another stream generation".to_owned(),
+                    ));
+                }
+                if current_generation {
+                    let state = self.covered_observation.get_mut(&context).unwrap();
+                    if marker.sequence <= state.bookmark_sequence {
+                        report.ignored += 1;
+                        return Ok(());
+                    }
+                    if marker.covered_prefix > marker.source_cut
+                        || marker.source_cut < state.source_cut
+                        || marker.covered_prefix < state.applied_prefix
+                        || (!state.initial_complete && marker.covered_prefix != 0)
+                    {
+                        return Err(TaskExecutionError::Schedule(
+                            "covered bookmark regressed or crossed an unfinished catch-up"
+                                .to_owned(),
+                        ));
+                    }
+                    state.bookmark_sequence = marker.sequence;
+                    state.source_cut = marker.source_cut;
+                    state.applied_prefix = marker.covered_prefix;
+                }
+                report.ignored += 1;
+            }
+        }
+        self.covered_observation
+            .get_mut(&context)
+            .unwrap()
+            .update_coverage_debt(now);
+        if !gap_before && self.covered_observation[&context].gap_pending() {
+            self.covered_reconciliations.insert(context);
+        }
+        Ok(())
+    }
+
+    fn verify_covered_task(
+        &self,
+        context: QueryContextRef,
+        identity: TaskIdentity,
+    ) -> Result<(), TaskExecutionError> {
+        identity
+            .verify_query_context(context)
+            .map_err(TaskExecutionError::Identity)?;
+        self.locate(identity)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
         Ok(())
     }
 
@@ -1166,9 +2087,15 @@ impl QueryTaskExecution {
             .get_mut(&stage_id)
             .expect("the stage was just located");
         let task = stage.task_mut(task_id).expect("the task was just located");
+        let was_owned = task.create_ownership_proven();
         match task.observe_status(status)? {
             StatusObservation::Accept => report.accepted += 1,
             _ => report.ignored += 1,
+        }
+        let became_owned = !was_owned && task.create_ownership_proven();
+        let installed = task.installed();
+        if became_owned && let Some(owner) = self.owners.get_mut(&task.context()) {
+            owner.note_create_owned();
         }
         if let Some(terminal) = task.terminal_report() {
             if let Some(detail) = &terminal.termination
@@ -1179,8 +2106,27 @@ impl QueryTaskExecution {
             }
             report.terminal.push(terminal);
         }
+        if installed {
+            self.reconcile_destination_input(identity)?;
+        }
         self.settle_task_drain(stage_id, task_id);
+        self.accept_task_failure(identity);
         Ok(())
+    }
+
+    fn accept_task_failure(&mut self, identity: TaskIdentity) {
+        let detail = self
+            .task_by_identity_ref(identity)
+            .and_then(|task| task.status())
+            .and_then(|status| status.termination())
+            .filter(|detail| !detail.is_success_compatible())
+            .cloned();
+        if let Some(detail) = detail {
+            self.failure.latch(detail);
+            // Freeze normal admission in the fact's own serial turn. Returning
+            // W cannot authorize another Create after the attempt has failed.
+            self.begin_terminal_cleanup();
+        }
     }
 
     /// Publishes one task's drain facts to its context owner, once each.
@@ -1254,17 +2200,32 @@ impl QueryTaskExecution {
                 if !all_consumers_released {
                     continue;
                 }
-                let Some(stage) = self.stages.get_mut(&child) else {
+                let Some(stage) = self.stages.get(&child) else {
                     continue;
                 };
-                let intents = stage.cancel_non_root_tasks();
+                let identities = stage
+                    .tasks()
+                    .filter(|(task_id, _)| Some(**task_id) != stage.root_task())
+                    .map(|(_, task)| task.identity())
+                    .collect::<Vec<_>>();
+                for identity in identities {
+                    self.stand_down_task_normally(identity)?;
+                }
+                let intents = self
+                    .stages
+                    .get_mut(&child)
+                    .expect("the child stage was just located")
+                    .cancel_non_root_tasks();
                 for intent in intents {
-                    let task = match &intent {
-                        OperationIntent::CancelTask(request) => request.identity().task_id(),
+                    let identity = match &intent {
+                        OperationIntent::CancelTask(request) => request.identity(),
                         _ => continue,
                     };
                     candidates.push_back(AdmissionCandidate::minted(
-                        OperationTarget::Task { stage: child, task },
+                        OperationTarget::Task {
+                            stage: child,
+                            task: identity.task_id(),
+                        },
                         intent,
                     ));
                 }
@@ -1293,7 +2254,65 @@ impl QueryTaskExecution {
         end_of_stream: bool,
     ) -> Result<(), TaskExecutionError> {
         self.read
-            .consume_packet(root, packet_sequence, end_of_stream)
+            .consume_packet(root, packet_sequence, end_of_stream)?;
+        if end_of_stream {
+            self.require_terminal_evidence(std::iter::once(root))?;
+        }
+        Ok(())
+    }
+
+    /// Registers exact terminal evidence required after the consumer's result
+    /// proof arrives. Repeated declarations cannot renew an earlier budget;
+    /// unrelated Context coverage does not register any requirement.
+    pub(crate) fn require_terminal_evidence(
+        &mut self,
+        identities: impl IntoIterator<Item = TaskIdentity>,
+    ) -> Result<(), TaskExecutionError> {
+        let deadline = self.clock.now().saturating_add(Duration::from_secs(30));
+        for identity in identities {
+            if self.task_by_identity_ref(identity).is_none() {
+                return Err(TaskExecutionError::UnknownOperation);
+            }
+            self.required_evidence_deadlines
+                .entry(identity)
+                .or_insert(deadline);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn required_terminal_evidence_expired(&self) -> Option<TaskIdentity> {
+        let now = self.clock.now();
+        self.required_evidence_deadlines
+            .iter()
+            .find_map(|(&identity, &deadline)| {
+                let task = self.task_by_identity_ref(identity)?;
+                if task.is_terminal() {
+                    return None;
+                }
+                // A newly required consumer cannot grant an existing source
+                // debt a fresh recovery window. Only this exact Task's Context
+                // is relevant; unrelated coverage never gates read success.
+                let debt_expired = self
+                    .covered_observation
+                    .get(&task.context())
+                    .and_then(|state| state.coverage_debt)
+                    .is_some_and(|(_, since)| {
+                        now.has_reached(since.saturating_add(Duration::from_secs(30)))
+                    });
+                (now.has_reached(deadline) || debt_expired).then_some(identity)
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn required_root_evidence_expired(&self) -> bool {
+        self.required_evidence_deadlines
+            .get(&self.read.root())
+            .is_some_and(|&deadline| {
+                self.clock.now().has_reached(deadline)
+                    && !self
+                        .task_by_identity_ref(self.read.root())
+                        .is_some_and(RemoteTask::is_terminal)
+            })
     }
 
     /// Whether the client may be told the read is complete, and why not when
@@ -1407,6 +2426,7 @@ impl QueryTaskExecution {
             match self.admit_candidate(candidate, now)? {
                 CandidateAdmission::Admitted => pass.admitted += 1,
                 CandidateAdmission::Nothing => {}
+                CandidateAdmission::DeploymentWindowFull => pass.skipped = true,
                 CandidateAdmission::TargetFull => {
                     pass.full_targets.insert(backend);
                     pass.skipped = true;
@@ -1504,6 +2524,19 @@ impl QueryTaskExecution {
         })
     }
 
+    fn refresh_deployment_window(&mut self) {
+        let stages = &self.stages;
+        self.deployment_window.retain(|_, identities| {
+            identities.retain(|identity| {
+                stages
+                    .get(&identity.stage_id())
+                    .and_then(|stage| stage.task(identity.task_id()))
+                    .is_some_and(RemoteTask::needs_deployment_window)
+            });
+            !identities.is_empty()
+        });
+    }
+
     fn admit_candidate(
         &mut self,
         candidate: AdmissionCandidate,
@@ -1535,12 +2568,39 @@ impl QueryTaskExecution {
                 Ok(CandidateAdmission::Admitted)
             }
             AdmissionCandidate::Create { stage, task } => {
+                let context = self
+                    .stages
+                    .get(&stage)
+                    .and_then(|stage| stage.task(task))
+                    .ok_or(TaskExecutionError::UnknownOperation)?
+                    .context();
+                if !self
+                    .owners
+                    .get(&context)
+                    .is_some_and(QueryContextOwner::may_pipeline_first_create)
+                {
+                    return Ok(CandidateAdmission::Nothing);
+                }
+                let identity = self
+                    .stages
+                    .get(&stage)
+                    .and_then(|stage| stage.task(task))
+                    .ok_or(TaskExecutionError::UnknownOperation)?
+                    .identity();
+                let positions = self.deployment_window.get(&identity.backend_process_id());
+                if positions.is_some_and(|positions| {
+                    !positions.contains(&identity)
+                        && positions.len()
+                            >= self.deployment_window_limits[&identity.backend_process_id()]
+                }) {
+                    return Ok(CandidateAdmission::DeploymentWindowFull);
+                }
                 let remote = self
                     .stages
                     .get_mut(&stage)
                     .and_then(|stage| stage.task_mut(task))
                     .ok_or(TaskExecutionError::UnknownOperation)?;
-                let Some(candidate) = remote.create_candidate()? else {
+                let Some(candidate) = remote.create_candidate(now)? else {
                     return Ok(CandidateAdmission::Nothing);
                 };
                 self.dispatcher
@@ -1555,7 +2615,7 @@ impl QueryTaskExecution {
                     .and_then(|stage| stage.task_mut(task))
                     .ok_or(TaskExecutionError::UnknownOperation)?;
                 // A freeze failure drops the permit it was admitted with.
-                let intent = remote.release_create()?;
+                let intent = remote.release_create(now)?;
                 let target = OperationTarget::Task { stage, task };
                 if let Err(error) = self.dispatcher.enqueue_reserved(intent, now, permit) {
                     self.rollback_unsent(target, candidate.operation_id());
@@ -1563,6 +2623,10 @@ impl QueryTaskExecution {
                 }
                 self.operation_targets
                     .insert(candidate.operation_id(), target);
+                self.deployment_window
+                    .entry(identity.backend_process_id())
+                    .or_default()
+                    .insert(identity);
                 Ok(CandidateAdmission::Admitted)
             }
             AdmissionCandidate::Update { stage, task } => {
@@ -1707,5 +2771,33 @@ impl QueryTaskExecution {
     fn task_by_identity_ref(&self, identity: TaskIdentity) -> Option<&RemoteTask> {
         let (stage_id, task_id) = self.locate(identity)?;
         self.stages.get(&stage_id)?.task(task_id)
+    }
+}
+
+#[cfg(test)]
+mod covered_progress_tests {
+    use super::*;
+
+    #[test]
+    fn coverage_debt_keeps_first_target_and_age_across_cuts_and_generations() {
+        let mut state = CoveredContextObservation::default();
+        state.begin_generation(1);
+        state.source_cut = 10;
+        state.applied_prefix = 4;
+        state.update_coverage_debt(MonotonicInstant::ORIGIN);
+        state.source_cut = 20;
+        state.update_coverage_debt(MonotonicInstant::from_origin(Duration::from_secs(29)));
+        assert_eq!(state.coverage_debt, Some((10, MonotonicInstant::ORIGIN)));
+        state.begin_generation(2);
+        state.update_coverage_debt(MonotonicInstant::from_origin(Duration::from_secs(30)));
+        assert_eq!(state.coverage_debt, Some((10, MonotonicInstant::ORIGIN)));
+        state.source_cut = 25;
+        state.applied_prefix = 10;
+        let settled = MonotonicInstant::from_origin(Duration::from_secs(31));
+        state.update_coverage_debt(settled);
+        assert_eq!(state.coverage_debt, Some((25, settled)));
+        state.applied_prefix = 25;
+        state.update_coverage_debt(settled);
+        assert_eq!(state.coverage_debt, None);
     }
 }

@@ -17,94 +17,60 @@
 
 //! Instance-local scan materialization.
 //!
-//! The plan's `ScanNode` is static: it holds only a `ScanSource`. Each
-//! instance carries its own enriched `BoundScanRanges` in the
-//! `FragmentInstanceSpec`. At launch time this module replays those ranges
-//! through `ScanSource::bind` to produce the per-instance `ScanOp`, keyed by
-//! plan node id, which the pipeline builder consumes. This mirrors the
-//! exchange-binding materialization (`runtime::fragment::exchange`): one
-//! shared `Arc<FragmentProgram>` can back many instances, each with its own
-//! bound ops, without cloning or mutating the program.
+//! The pure LocalProgram names scan requirements. A FragmentSubmission owns
+//! the exact Task-local ScanSource capabilities and enriched scan ranges. At
+//! launch this module binds the latter to per-instance ScanOps keyed by native
+//! node ID. A shared FragmentProgram retains no provider runtime capability.
 
 use crate::exec::fragment::program::{FragmentNodeId, FragmentProgram};
-use crate::exec::node::{ExecNode, ExecNodeKind};
+use crate::exec::node::LocalRuntimeBindings;
 use crate::exec::pipeline::binding::ScanBindings;
 use crate::runtime::fragment::error::{
     FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
 };
 use crate::runtime::fragment::instance::FragmentInstanceSpec;
+use novarocks_local_program::ProgramNodeKind;
 
-/// Materialize per-node scan bindings for `instance` from the static program.
-///
-/// Walks the plan the same way `submission::ProgramInventory` enumerates scan
-/// nodes; for each `ExecNodeKind::Scan` with a `node_id`, looks up this
-/// instance's `ScanAssignment` and binds the node's `ScanSource` with the
-/// enriched `BoundScanRanges`. `ScanSource::bind` is where variant-vs-source
-/// correctness is enforced (a wrong `BoundScanRanges` variant fails here,
-/// before any pipeline runs).
-///
+/// Bind the exact Task-owned scan sources validated by FragmentSubmission.
+/// ScanSource::bind checks the assignment variant before any pipeline runs.
 pub(crate) fn materialize_scan_bindings(
     program: &FragmentProgram,
+    runtime_bindings: &LocalRuntimeBindings,
     instance: &FragmentInstanceSpec,
 ) -> Result<ScanBindings, FragmentLaunchError> {
     let mut bindings = ScanBindings::default();
-    visit(&program.plan().root, instance, &mut bindings)?;
+    for (node_id, source) in &runtime_bindings.scans {
+        let node = program
+            .local_program()
+            .nodes()
+            .get(node_id.index())
+            .ok_or_else(|| {
+                FragmentLaunchError::new(
+                    FragmentLaunchStage::Materialize,
+                    FragmentLaunchErrorKind::Materialization,
+                    format!(
+                        "runtime scan binding targets unknown local node {}",
+                        node_id.index()
+                    ),
+                )
+            })?;
+        if !matches!(node.kind(), ProgramNodeKind::Scan { .. }) {
+            return Err(FragmentLaunchError::new(
+                FragmentLaunchStage::Materialize,
+                FragmentLaunchErrorKind::Materialization,
+                format!(
+                    "runtime scan binding targets non-scan node {}",
+                    node.native_node_id()
+                ),
+            ));
+        }
+        bind_scan(source, node.native_node_id(), instance, &mut bindings)?;
+    }
     Ok(bindings)
 }
 
-fn visit(
-    node: &ExecNode,
-    instance: &FragmentInstanceSpec,
-    bindings: &mut ScanBindings,
-) -> Result<(), FragmentLaunchError> {
-    match &node.kind {
-        ExecNodeKind::Scan(scan) => {
-            if let Some(node_id) = scan.node_id() {
-                bind_scan(scan, node_id, instance, bindings)?;
-            }
-            Ok(())
-        }
-        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) => Ok(()),
-        ExecNodeKind::AssertNumRows(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::Project(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::Unpivot(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::Filter(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::Repeat(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::ChangeEventExpand(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::UnionAll(node) => visit_inputs(&node.inputs, instance, bindings),
-        ExecNodeKind::Limit(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::Aggregate(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::Join(node) => {
-            visit(&node.left, instance, bindings)?;
-            visit(&node.right, instance, bindings)
-        }
-        ExecNodeKind::NestedLoopJoin(node) => {
-            visit(&node.left, instance, bindings)?;
-            visit(&node.right, instance, bindings)
-        }
-        ExecNodeKind::Sort(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::TableFunction(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::Analytic(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::SetOp(node) => visit_inputs(&node.inputs, instance, bindings),
-        ExecNodeKind::RuntimeFilterConsumer(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::TableWriter(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::TableFinish(node) => visit_inputs(&node.inputs, instance, bindings),
-    }
-}
-
-fn visit_inputs(
-    inputs: &[ExecNode],
-    instance: &FragmentInstanceSpec,
-    bindings: &mut ScanBindings,
-) -> Result<(), FragmentLaunchError> {
-    for input in inputs {
-        visit(input, instance, bindings)?;
-    }
-    Ok(())
-}
-
 fn bind_scan(
-    scan: &crate::exec::node::scan::ScanNode,
+    source: &std::sync::Arc<dyn crate::exec::node::scan::ScanSource>,
     node_id: i32,
     instance: &FragmentInstanceSpec,
     bindings: &mut ScanBindings,
@@ -119,16 +85,13 @@ fn bind_scan(
                 format!("missing scan assignment for node {node_id}"),
             )
         })?;
-    let op = scan
-        .source()
-        .bind(assignment.ranges().clone())
-        .map_err(|error| {
-            FragmentLaunchError::new(
-                FragmentLaunchStage::Materialize,
-                FragmentLaunchErrorKind::Materialization,
-                format!("scan node {node_id} bind failed: {error}"),
-            )
-        })?;
+    let op = source.bind(assignment.ranges().clone()).map_err(|error| {
+        FragmentLaunchError::new(
+            FragmentLaunchStage::Materialize,
+            FragmentLaunchErrorKind::Materialization,
+            format!("scan node {node_id} bind failed: {error}"),
+        )
+    })?;
     bindings.insert(node_id, op);
     Ok(())
 }
@@ -217,15 +180,32 @@ mod tests {
     fn scan_program() -> FragmentProgram {
         let root = ExecNode {
             kind: ExecNodeKind::Scan(
-                ScanNode::new(Arc::new(CountingFileSource)).with_node_id(SCAN_NODE_ID),
+                ScanNode::new(Arc::new(CountingFileSource))
+                    .with_node_id(SCAN_NODE_ID)
+                    .with_output_chunk_schema(Arc::new(crate::exec::chunk::ChunkSchema::empty())),
             ),
         };
-        FragmentProgram::new(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root,
-            },
-            FragmentSinkSpec::try_new(FragmentSinkProgram::Noop).expect("noop sink"),
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root,
+        };
+        let profile = plan
+            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
+            .unwrap();
+        let (local, runtime) = plan
+            .into_local_program_and_bindings(
+                profile,
+                BTreeMap::from([(
+                    SCAN_NODE_ID,
+                    crate::runtime::fragment::submission::tests::static_scan_for_test(),
+                )]),
+                Vec::new(),
+                novarocks_local_program::StaticSinkProgram::Noop,
+            )
+            .unwrap();
+        assert_eq!(runtime.scan_count(), 1);
+        FragmentProgram::try_new(
+            Arc::new(local),
             FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
             BTreeMap::from([(
                 FragmentNodeId::new(SCAN_NODE_ID),
@@ -234,6 +214,18 @@ mod tests {
             BTreeMap::new(),
             RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
         )
+        .unwrap()
+    }
+
+    fn runtime_for_scan() -> crate::exec::node::LocalRuntimeBindings {
+        crate::exec::node::LocalRuntimeBindings {
+            scans: BTreeMap::from([(
+                novarocks_local_program::ProgramNodeId::new(0),
+                Arc::new(CountingFileSource) as Arc<dyn ScanSource>,
+            )]),
+            writers: BTreeMap::new(),
+            finishers: BTreeMap::new(),
+        }
     }
 
     fn instance_with_scan(assignments: ScanAssignments, finst: UniqueId) -> FragmentInstanceSpec {
@@ -266,7 +258,8 @@ mod tests {
             UniqueId::new(10, 11),
         );
 
-        let bindings = materialize_scan_bindings(&program, &instance).expect("materialize");
+        let bindings = materialize_scan_bindings(&program, &runtime_for_scan(), &instance)
+            .expect("materialize");
         let op = bindings.get(SCAN_NODE_ID).expect("bound op for scan node");
         assert_eq!(op.build_morsels().expect("morsels").morsels.len(), 1);
     }
@@ -285,8 +278,10 @@ mod tests {
             UniqueId::new(20, 2),
         );
 
-        let bindings_a = materialize_scan_bindings(&program, &instance_a).expect("materialize a");
-        let bindings_b = materialize_scan_bindings(&program, &instance_b).expect("materialize b");
+        let bindings_a = materialize_scan_bindings(&program, &runtime_for_scan(), &instance_a)
+            .expect("materialize a");
+        let bindings_b = materialize_scan_bindings(&program, &runtime_for_scan(), &instance_b)
+            .expect("materialize b");
 
         let op_a = bindings_a.get(SCAN_NODE_ID).expect("op a");
         let op_b = bindings_b.get(SCAN_NODE_ID).expect("op b");
@@ -304,7 +299,8 @@ mod tests {
             scan_assignments(static_source_ranges()),
             UniqueId::new(20, 3),
         );
-        let bindings_c = materialize_scan_bindings(&program, &instance_c).expect("materialize c");
+        let bindings_c = materialize_scan_bindings(&program, &runtime_for_scan(), &instance_c)
+            .expect("materialize c");
         assert_eq!(
             bindings_c
                 .get(SCAN_NODE_ID)
@@ -323,7 +319,7 @@ mod tests {
         // Instance with no scan assignment at all.
         let instance = instance_with_scan(ScanAssignments::default(), UniqueId::new(30, 1));
 
-        let error = materialize_scan_bindings(&program, &instance)
+        let error = materialize_scan_bindings(&program, &runtime_for_scan(), &instance)
             .expect_err("missing assignment must fail materialize");
         assert_eq!(error.stage(), FragmentLaunchStage::Materialize);
         assert_eq!(error.kind(), FragmentLaunchErrorKind::Materialization);
@@ -344,7 +340,7 @@ mod tests {
             UniqueId::new(40, 1),
         );
 
-        let error = materialize_scan_bindings(&program, &instance)
+        let error = materialize_scan_bindings(&program, &runtime_for_scan(), &instance)
             .expect_err("wrong range variant must fail at bind");
         assert_eq!(error.stage(), FragmentLaunchStage::Materialize);
         assert_eq!(error.kind(), FragmentLaunchErrorKind::Materialization);

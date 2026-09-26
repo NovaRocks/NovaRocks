@@ -489,6 +489,18 @@ pub fn compose_backend_server_config(
             runtime_config.result_retained_bytes_per_process,
         )
         .map_err(|error| anyhow::anyhow!("resolve native result retained-byte limits: {error}"))?,
+        preparation_limits: novarocks_worker::TaskPreparationLimits::try_new(
+            config.runtime.task_preparation_max_tasks_per_context,
+            config.runtime.task_preparation_max_tasks,
+            config.runtime.task_preparation_max_bytes,
+            config.runtime.task_preparation_max_workers,
+        )
+        .map_err(|error| anyhow::anyhow!("resolve preparation limits: {error}"))?,
+        inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::try_new(
+            runtime_config.task_normal_close_max_records,
+            runtime_config.task_normal_close_max_bytes,
+        )
+        .map_err(|error| anyhow::anyhow!("resolve normal-close capacity limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
         scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
             runtime_config.prefetch_input_bytes_per_stream,

@@ -133,6 +133,7 @@ impl TerminationLatch {
 pub enum QueryContextEvent {
     Establish,
     EstablishCompleted,
+    Quiesce,
     Release,
     ReleaseCompleted,
     Abort,
@@ -160,6 +161,15 @@ pub fn classify_context_transition(
         (State::Absent, Event::Establish) => ContextTransition::Apply(State::Establishing),
         (State::Absent, Event::Abort) => ContextTransition::Apply(State::TerminalRetained),
         (State::Establishing, Event::EstablishCompleted) => ContextTransition::Apply(State::Active),
+        (State::Absent | State::Establishing | State::Active, Event::Quiesce) => {
+            ContextTransition::Apply(State::Quiescing)
+        }
+        (State::Quiescing, Event::Quiesce) => ContextTransition::Idempotent,
+        (State::Quiescing, Event::Establish | Event::EstablishCompleted) => {
+            ContextTransition::AlreadyTerminal
+        }
+        (State::Quiescing, Event::Release) => ContextTransition::Apply(State::Releasing),
+        (State::Quiescing, Event::Abort) => ContextTransition::Apply(State::Aborting),
         (State::Establishing, Event::Abort) => ContextTransition::Apply(State::Aborting),
         (State::Establishing, Event::Establish) => ContextTransition::Idempotent,
         (State::Active, Event::Release) => ContextTransition::Apply(State::Releasing),
@@ -208,7 +218,11 @@ pub fn classify_operation_admission(
             _ => OperationAdmission::NotEstablished,
         },
         QueryContextState::Active => OperationAdmission::Admit,
+        QueryContextState::Quiescing if kind == ContextOperationKind::RenewLease => {
+            OperationAdmission::Admit
+        }
         QueryContextState::Releasing
+        | QueryContextState::Quiescing
         | QueryContextState::Aborting
         | QueryContextState::TerminalRetained => OperationAdmission::TerminalReceipt,
         QueryContextState::Gone => OperationAdmission::Gone,

@@ -16,6 +16,7 @@
 // under the License.
 
 pub use novarocks_execution_contract::RuntimeEndpoint;
+use novarocks_execution_contract::TaskIdentity;
 use novarocks_types::UniqueId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,6 +26,7 @@ pub struct FragmentDestination {
     source_finst_id: UniqueId,
     sender_ordinal: u32,
     sender_count: u32,
+    task_identity: Option<TaskIdentity>,
 }
 
 impl FragmentDestination {
@@ -49,7 +51,19 @@ impl FragmentDestination {
             source_finst_id,
             sender_ordinal,
             sender_count,
+            task_identity: None,
         })
+    }
+
+    /// Bind the descriptor's exact destination, including its process
+    /// incarnation, for typed normal-close response verification.
+    pub fn with_task_identity(mut self, task: TaskIdentity) -> Self {
+        self.task_identity = Some(task);
+        self
+    }
+
+    pub const fn task_identity(&self) -> Option<TaskIdentity> {
+        self.task_identity
     }
 
     pub fn finst_id(&self) -> &UniqueId {

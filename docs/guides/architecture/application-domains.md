@@ -84,6 +84,31 @@ predicate 或恢复承诺。无法证明 credential/delegation 覆盖冻结对�
 观察必须使用新的 request/provider scope；不得让 effect 前的 catalog/metadata cache 把
 effect 后的验证伪装成同一次观察。
 
+## 本地程序与 Task 准备
+
+`novarocks/local-program/src/**` 定义纯 `LocalProgram`：节点、表达式、布局、sink
+和 binding requirements 都是静态事实，不持有 scan、writer、Connector 或异步运行能力。
+Native 在 `novarocks/native-adapter/src/fragment_plan_decode_submission.rs` 完成 per Task
+准备时，经 `novarocks/execution/src/exec/node/lowering.rs` 将构造用的 `ExecPlan` 拆成
+纯程序与 `LocalRuntimeBindings`。后者持有本 Task 的准确 scan/writer/finisher owner；
+`novarocks/execution/src/runtime/fragment/submission.rs` 校验绑定闭合性，
+`novarocks/execution/src/exec/pipeline/builder/local.rs` 直接消费程序和绑定构建 pipeline。
+
+Worker 的 `Accepted` 只证明接管，昂贵准备在有界公平 FIFO 中继续；`Installed` 是本地
+运行资源安装完成的独立历史事实。准备失败保留已接管实体，不能伪造 Installed。
+Exchange 只有在冻结 destination 已 Installed 或准确正常撤回输入需求后才可开放；
+失败不能伪装成正常撤回。Native status 生产入口只接受 covered subscription 的非零
+generation，不再接入旧 cursor-only 模式。
+
+`novarocks/worker/src/task_registry.rs` 的准备数量、bytes 和 per-context position 预算
+在 job 实际退出后归还；发布 Installed 或 terminal 本身不能证明 job 已释放输入与临时
+展开资源。FE 的 `novarocks/frontend-application/src/task_execution/{execution,remote_task}.rs`
+另行持有每 BE 的部署窗口 W：Accepted ACK 或 RPC 未知结果不能归还位置，Installed、
+terminal evidence 或永久 stand-down 才能归还。W 必须小于等于该准确 BE immutable
+descriptor 广告的 per-context 准备位置 P；两端预算分别由各自 owner 负责。
+
+这些路径说明当前所有权边界，最终验收仍须按下文分层报告实际测试证据。
+
 ## 责任、结论、输出和资源分别收敛
 
 `LogicalExecutionSupervisor` 与其 actor 拥有逻辑执行的可变状态：当前允许推进的

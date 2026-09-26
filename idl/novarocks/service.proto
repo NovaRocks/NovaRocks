@@ -116,6 +116,8 @@ message BackendProcessDescriptor {
   string deployment_id = 3;
   string build_identity = 4;
   NativeCompatibilityId native_compatibility_id = 5;
+  // Exact immutable per-Context preparation capacity; missing or zero is invalid.
+  uint64 preparing_positions = 6;
 }
 
 message AnnounceBackendRequest {
@@ -348,10 +350,24 @@ message ExchangeRequest {
   uint32 sender_count = 12;
 }
 
-// Ack for one ExchangeRequest.
+// Exact receiver-side normal closure for one frozen inbound occurrence and
+// sender. It is not an acknowledgement that the frame payload was delivered.
+message ExchangeNormalClosed {
+  TaskIdentity destination_task = 1;
+  int64 destination_finst_id_hi = 2;
+  int64 destination_finst_id_lo = 3;
+  int32 destination_node_id = 4;
+  int64 source_finst_id_hi = 5;
+  int64 source_finst_id_lo = 6;
+  uint32 sender_ordinal = 7;
+  uint32 sender_count = 8;
+}
+
+// Result for one ExchangeRequest.
 message ExchangeResponse {
-  int64 ack_sequence = 1;                 // sequence value accepted for this request
+  int64 ack_sequence = 1;                 // request sequence, including a normal close
   novarocks.common.Status status = 2;     // native exchange handler status; code 0 == OK
+  ExchangeNormalClosed normal_closed = 3; // present only for exact normal closure
 }
 
 message ScanRangeParams {
@@ -748,11 +764,19 @@ message TaskDynamicFilterDomain {
 }
 
 // Grants send permission on edges the descriptor already froze. The only legal
-// move is closed to open; this release has no close, reconfigure, or dynamic
-// membership operation.
+// move is closed to open; normal destination closure is a separate domain.
 message OpenExchangeEdgesDomain {
   uint32 version = 1;             // nonzero, strictly monotonic; values may skip
   repeated uint32 edge_ids = 2;   // 1..=256, all frozen by the descriptor
+}
+
+// Withdraws one exact frozen destination of one producer edge. The producer
+// Task is the UpdateTask target; the destination identity includes its BE
+// process incarnation. No destination or topology can be added here.
+message CloseExchangeDestinationDomain {
+  uint64 version = 1;             // nonzero, strictly monotonic
+  uint32 edge_id = 2;             // frozen by the producer descriptor
+  TaskIdentity destination_task = 3;
 }
 
 // A closed task-scoped domain change.
@@ -761,6 +785,7 @@ message TaskDomainUpdate {
     TaskSplitAssignmentDomain split_assignment = 1;
     TaskDynamicFilterDomain dynamic_filter = 2;
     OpenExchangeEdgesDomain open_exchange_edges = 3;
+    CloseExchangeDestinationDomain close_exchange_destination = 4;
   }
 }
 
@@ -919,6 +944,10 @@ message ReleaseQueryContextRequest {
   QueryContextRef query_context = 1;
 }
 
+message QuiesceQueryContextRequest {
+  QueryContextRef query_context = 1;
+}
+
 // Read one task's dynamic filter domains. This is an observation read: it
 // creates nothing, advances no status, and renews no lease.
 message FetchTaskDynamicFiltersRequest {
@@ -948,6 +977,7 @@ message TaskOperation {
     AbortQueryContextRequest abort_query_context = 6;
     ReleaseQueryContextRequest release_query_context = 7;
     AcquireQueryContextAdmissionTicketRequest acquire_query_context_admission_ticket = 8;
+    QuiesceQueryContextRequest quiesce_query_context = 9;
   }
 }
 
@@ -968,6 +998,7 @@ message TaskControlOperation {
     CancelTaskRequest cancel_task = 3;
     AbortQueryContextRequest abort_query_context = 4;
     ReleaseQueryContextRequest release_query_context = 5;
+    QuiesceQueryContextRequest quiesce_query_context = 6;
   }
 }
 
@@ -1009,6 +1040,8 @@ enum TaskOperationOutcome {
   // Admission found an older unredeemed ticket for the same context. The new
   // operation created no grant and may retry after bounded backoff.
   TASK_OPERATION_OUTCOME_ADMISSION_TICKET_STILL_ACTIVE = 18;
+  TASK_OPERATION_OUTCOME_NOT_READY = 19;
+  TASK_OPERATION_OUTCOME_PREPARATION_BUSY = 20;
 }
 
 // Per plan node, the highest sequence this task has accepted and whether that
@@ -1058,6 +1091,7 @@ message TaskDomainReceipt {
     TaskSplitAssignmentReceipt split_assignment = 1;
     ScalarDomainReceipt dynamic_filter = 2;
     OpenExchangeEdgesReceipt open_exchange_edges = 3;
+    ScalarDomainReceipt close_exchange_destination = 5;
   }
   AcceptedDomainProgression progression = 4;
 }
@@ -1121,6 +1155,14 @@ enum QueryContextState {
   QUERY_CONTEXT_STATE_ABORTING = 4;
   QUERY_CONTEXT_STATE_TERMINAL_RETAINED = 5;
   QUERY_CONTEXT_STATE_GONE = 6;
+  QUERY_CONTEXT_STATE_QUIESCING = 7;
+}
+
+message QuiesceQueryContextAck {
+  QueryContextRef query_context = 1;
+  uint64 fence_version = 2;
+  repeated TaskIdentity accepted_tasks = 3;
+  QueryContextState state = 4;
 }
 
 message QueryContextAck {
@@ -1177,6 +1219,7 @@ message TaskOperationReceipt {
     ReleaseQueryContextAck release_query_context = 8;
     TaskStatus cancel_task = 9;
     QueryContextAdmissionTicketAck query_context_admission_ticket = 10;
+    QuiesceQueryContextAck quiesce_query_context = 11;
   }
 }
 
@@ -1211,9 +1254,16 @@ enum TaskFailureCategory {
   TASK_FAILURE_CATEGORY_INTERNAL = 5;
 }
 
+enum TaskFailurePhase {
+  TASK_FAILURE_PHASE_UNSPECIFIED = 0;
+  TASK_FAILURE_PHASE_PREPARATION = 1;
+  TASK_FAILURE_PHASE_EXECUTION = 2;
+}
+
 message TaskFailure {
   TaskFailureCategory category = 1;
   string safe_detail = 2;  // <= 512 bytes, redacted by the producer
+  TaskFailurePhase phase = 3;
 }
 
 // The cause a terminating or terminal state must carry. FINISHED carries none.
@@ -1266,6 +1316,9 @@ message TaskStatus {
   TaskOutputFacts output = 7;
   TaskResourceFacts resources = 8;
   optional TaskWriterFacts writer = 9;
+  // Monotonic installation history. A terminal preparation failure remains
+  // false; a task that ran retains true through retirement.
+  optional bool installed = 10;
 }
 
 // The frontend's observation position for one task.
@@ -1300,6 +1353,22 @@ message SubscribeTaskStatusRequest {
   QueryContextRef query_context = 1;
   repeated TaskStatusCursor cursors = 2;  // <= 4096
   QueryContextConvergenceCursor context_convergence_cursor = 3;
+  // Every subscription requires a nonzero generation. Missing or zero
+  // generation is rejected; cursor-only subscriptions have no wire mode.
+  uint64 generation = 4;
+  repeated TaskConvergenceCursor task_convergence_cursors = 5;  // <= 4096
+  repeated TaskIdentity required_identities = 6;               // <= 4096
+  QuiesceQueryContextCursor quiesce_cursor = 7;
+}
+
+message TaskConvergenceCursor {
+  TaskIdentity identity = 1;
+  uint64 current_version = 2;  // 0 means never observed
+}
+
+message QuiesceQueryContextCursor {
+  QueryContextRef query_context = 1;
+  uint64 fence_version = 2;  // 0 means never observed
 }
 
 // Retained state for this task was reclaimed. Inside the legal request horizon
@@ -1308,13 +1377,59 @@ message TaskGone {
   TaskIdentity identity = 1;
 }
 
+message TaskConvergenceReceipt {
+  TaskIdentity identity = 1;
+  uint64 version = 2;  // nonzero actual-stopped fact
+}
+
+message QuiesceQueryContextObservation {
+  QueryContextRef query_context = 1;
+  uint64 fence_version = 2;  // nonzero admission cut
+  repeated TaskIdentity accepted_tasks = 3;  // <= 4096, sorted and unique
+  QueryContextState state = 4;
+}
+
+message TaskStatusUnchanged {
+  TaskIdentity identity = 1;
+}
+
+message TaskConvergenceUnchanged {
+  TaskIdentity identity = 1;
+}
+
+message TaskUnknown {
+  TaskIdentity identity = 1;
+}
+
+message CatchUpComplete {
+  uint64 generation = 1;  // nonzero
+  uint64 initial_cut = 2;
+}
+
+message ObservationBookmark {
+  uint64 generation = 1;  // nonzero
+  uint64 sequence = 2;    // nonzero, strictly increasing per generation
+  uint64 covered_prefix = 3;
+  uint64 source_cut = 4;
+}
+
 // A full immutable snapshot, never a delta that depends on a previous frame.
 message TaskStatusStreamEvent {
   oneof event {
     TaskStatus task_status = 1;
     TaskGone task_gone = 2;
     QueryContextConvergenceReceipt context_convergence = 3;
+    TaskConvergenceReceipt task_convergence = 4;
+    QuiesceQueryContextObservation quiesce = 5;
+    TaskStatusUnchanged task_status_unchanged = 6;
+    TaskConvergenceUnchanged task_convergence_unchanged = 7;
+    TaskUnknown task_unknown = 8;
+    CatchUpComplete catch_up_complete = 9;
+    ObservationBookmark bookmark = 10;
   }
+  // Present only on live fact frames; absent on initial catch-up, complete,
+  // and bookmark. A present value is nonzero.
+  optional uint64 source_revision = 11;
 }
 
 // One named counter an operator's own profile subtree carried.

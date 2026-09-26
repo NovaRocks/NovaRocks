@@ -60,6 +60,13 @@ pub struct TableFinishNode {
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
+/// Runtime validation authority for a single Task instance of TableFinish.
+pub(crate) struct TableFinishRuntimeBinding {
+    pub fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
+    #[cfg(debug_assertions)]
+    pub aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+}
+
 impl TableFinishNode {
     pub fn try_new(
         inputs: Vec<ExecNode>,
@@ -153,6 +160,34 @@ impl TableFinishNode {
 
     pub const fn final_aggregate_plan(&self) -> &WriterFinalAggregatePlan {
         &self.final_aggregate_plan
+    }
+
+    pub(crate) fn into_static_parts_with_binding(
+        self,
+    ) -> (
+        TableFinishRuntimeBinding,
+        (
+            Vec<ExecNode>,
+            Vec<WriteTargetOrdinal>,
+            WriterMultiplexRelationSchema,
+            RootWriteResultRelationSchema,
+            WriterFinalAggregatePlan,
+        ),
+    ) {
+        (
+            TableFinishRuntimeBinding {
+                fragment_validator: self.fragment_validator,
+                #[cfg(debug_assertions)]
+                aggregate_guard: self.aggregate_guard,
+            },
+            (
+                self.inputs,
+                Arc::unwrap_or_clone(self.expected_targets),
+                self.writer_multiplex_schema,
+                self.root_result_schema,
+                self.final_aggregate_plan,
+            ),
+        )
     }
 
     #[cfg(debug_assertions)]

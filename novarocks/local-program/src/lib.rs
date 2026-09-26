@@ -21,17 +21,55 @@
 //! or async runtime dependency. A program's static representation moves here
 //! as its node and expression types are separated from task-owned bindings.
 
+mod connector_scan;
 mod contract;
+mod expressions;
 mod layout;
+mod program;
 mod requirements;
+mod runtime_filter;
+mod sink;
+mod values;
 
+pub use connector_scan::{
+    ScanColumnId, StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment,
+    StaticScanDynamicFilter,
+};
 pub use contract::{
     CompileProfile, FragmentProgramOptions, FragmentSinkAssignmentKind,
     FragmentSinkAssignmentRequirement, KernelAbiVersion, LayoutIdentity, RuntimeFilterContract,
     RuntimeFilterId, ScanAssignmentKind, ScanSourceContract,
 };
+pub use expressions::{
+    ImmutableExpressions, MAX_STATIC_EXPRESSION_DEPTH, MAX_STATIC_EXPRESSION_DYNAMIC_BYTES,
+    MAX_STATIC_EXPRESSIONS, ProgramExprId, StaticExprKind, StaticExprNode, StaticExpressionError,
+    StaticFieldSchema, StaticFunctionKind, StaticLiteral,
+};
 pub use layout::{LayoutError, StaticLayout};
+pub use program::{
+    AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
+    ChangeEventSpec, FilterConsumerAtExpr, FilterProducerAtExpr, JoinDistributionMode, JoinType,
+    LocalProgram, LocalProgramError, MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH,
+    MAX_PROGRAM_NODES, NestedLoopJoinType, ProgramNode, ProgramNodeKind, ProjectExpressionSlot,
+    RowAssertion, SetOpKind, SortExpression, SortTopNType, StaticAggregateCall,
+    StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
+    StaticWriterProjection, StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant,
+    UnpivotMapping, UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind,
+    WindowType, WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
+    WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
+};
 pub use requirements::{
     BindingRequirement, BindingRequirements, BindingRequirementsError, ProgramNodeId,
     ScanSourceKind,
 };
+pub use runtime_filter::{
+    FilterConsumerActivation, FilterLateApplyGranularity, FilterNullOrder, FilterNullSemantics,
+    FilterOrderKey, FilterProducerKind, FilterReduction, FilterScanDomainTarget,
+    FilterSortDirection, StaticFilterConsumer, StaticFilterContract, StaticFilterError,
+    StaticFilterProducer,
+};
+pub use sink::{
+    MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,
+    StaticSinkError, StaticSinkProgram, StaticStreamBranch,
+};
+pub use values::{MAX_STATIC_VALUES_BACKING_BYTES, StaticValues, StaticValuesError};

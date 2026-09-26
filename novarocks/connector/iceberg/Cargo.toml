@@ -54,6 +54,7 @@ typetag = "0.2"
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 novarocks-fs.workspace = true
+novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true

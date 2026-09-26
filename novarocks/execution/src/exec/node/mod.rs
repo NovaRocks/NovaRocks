@@ -22,6 +22,7 @@ pub mod exchange_source;
 pub mod filter;
 pub mod join;
 pub mod limit;
+mod lowering;
 pub mod nljoin;
 pub mod project;
 pub mod repeat;
@@ -37,6 +38,8 @@ pub mod table_writer;
 pub mod union_all;
 pub mod unpivot;
 pub mod values;
+
+pub use lowering::{ExternalSinkRequirement, LocalProgramLoweringError, LocalRuntimeBindings};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;

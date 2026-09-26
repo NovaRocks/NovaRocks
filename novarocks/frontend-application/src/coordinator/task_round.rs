@@ -33,21 +33,21 @@ use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecut
 
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::task_transport::{
-    AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskStatusSubscriber,
+    AttemptWireFacts, CoveredTaskStatusSubscriber, NativeTaskOperationSink, TaskAckIntake,
 };
 use crate::query_execution::artifact::ValidatedNativeSubmission;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::task_execution::clock::ProcessMonotonicClock;
+use crate::task_execution::clock::{ProcessMonotonicClock, TaskProtocolClock};
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::feedback_pump::{DynamicFilterFeedbackPump, TaskDynamicFilterReads};
 use crate::task_execution::graph::{TaskGraphInputs, build_task_graph};
 use crate::task_execution::intent::TaskOperationSink;
-use crate::task_execution::round::{AcknowledgementObserver, StatusSubscriptions, TaskRound};
+use crate::task_execution::round::{AcknowledgementObserver, TaskRound};
 use crate::task_execution::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
 use crate::task_execution::split_transport::SplitDeliveryBridge;
-use crate::task_execution::status_intake::{StatusIntake, StatusIntakeWake};
+use crate::task_execution::status_intake::{ObservationIntake, StatusIntake, StatusIntakeWake};
 
 /// How many status events one attempt may hold before the transport is told it
 /// lost observations.
@@ -123,6 +123,7 @@ pub(crate) fn assemble_round(
     edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     backend_process_ids: &BTreeMap<usize, BackendProcessId>,
     admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
+    preparing_positions: &BTreeMap<BackendProcessId, usize>,
     backends: &[(BackendProcessId, RuntimeEndpoint)],
     submissions: Vec<ValidatedNativeSubmission>,
     establish: AttemptEstablishFacts,
@@ -161,10 +162,20 @@ pub(crate) fn assemble_round(
     let sink = split_delivery.sink(Arc::new(sink) as Arc<dyn TaskOperationSink>);
 
     let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
+    let clock = Arc::new(ProcessMonotonicClock::new()) as Arc<dyn TaskProtocolClock>;
+    let observation = Arc::new(
+        ObservationIntake::for_task_attempt(Arc::clone(&wake), Arc::clone(&clock)).map_err(
+            |error| {
+                TaskExecutionError::Schedule(format!(
+                    "covered observation capacity is invalid: {error:?}"
+                ))
+            },
+        )?,
+    );
     let subscriber = Arc::new(
-        TaskStatusSubscriber::new(
+        CoveredTaskStatusSubscriber::new(
             backends,
-            intake.handle(),
+            Arc::clone(&observation),
             transport.status_subscription_error_budget,
             transport.data_runtime,
         )
@@ -177,16 +188,18 @@ pub(crate) fn assemble_round(
         transport.transport,
         native_compatibility_id,
         admission_epochs,
-        Arc::new(ProcessMonotonicClock::new()),
+        preparing_positions,
+        clock,
         sink,
         intake,
     )?;
 
-    let round = TaskRound::new(
+    let round = TaskRound::new_covered(
         execution,
         acks,
         Box::new(establish),
-        subscriber as Arc<dyn StatusSubscriptions>,
+        subscriber,
+        observation,
     )
     .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>)
     .with_connector_blocking_io(connector_blocking_io);

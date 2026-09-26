@@ -31,6 +31,13 @@ pub struct ChunkFieldSchema {
 }
 
 impl ChunkFieldSchema {
+    pub(crate) fn new(logical_type: Option<LogicalType>, children: Vec<Self>) -> Self {
+        Self {
+            logical_type,
+            children,
+        }
+    }
+
     /// Empty metadata used by owner-local test adapters when no source field
     /// metadata is available on the wire.
     pub fn empty() -> Self {
@@ -332,6 +339,38 @@ fn is_dictionary_string_carrier(expected: &DataType, actual: &DataType) -> bool 
 }
 
 impl ChunkSchema {
+    pub(crate) fn from_static_layout(
+        layout: &novarocks_local_program::StaticLayout,
+    ) -> Result<ChunkSchemaRef, String> {
+        if !layout.has_exact_slot_metadata() {
+            return Err("local program layout has no exact slot metadata".to_string());
+        }
+        let slots = layout
+            .schema()
+            .fields()
+            .iter()
+            .zip(layout.slots())
+            .enumerate()
+            .map(|(index, (field, slot))| {
+                let (field_schema, unique_id) = layout
+                    .slot_metadata_at(index)
+                    .ok_or_else(|| format!("local program slot {index} lacks metadata"))?;
+                ChunkSlotSchema::try_new_with_field(
+                    *slot,
+                    field.as_ref().clone(),
+                    Some(crate::exec::expr::static_program::thaw_field_schema(
+                        field_schema,
+                    )),
+                    unique_id,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Arc::new(Self::try_new_with_schema_metadata(
+            slots,
+            layout.schema().metadata().clone(),
+        )?))
+    }
+
     pub fn try_new(slots: Vec<ChunkSlotSchema>) -> Result<Self, String> {
         Self::try_new_with_schema_metadata(slots, HashMap::new())
     }

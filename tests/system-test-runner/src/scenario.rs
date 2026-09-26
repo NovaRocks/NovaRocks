@@ -41,9 +41,9 @@ pub trait Scenario: Send + Sync {
         Ok(())
     }
 
-    /// External-fixture scenarios remain discoverable and runnable by exact
-    /// selector, but do not turn the normal no-Docker system baseline into a
-    /// Docker requirement.
+    /// Explicit stages, including external fixtures and performance baselines,
+    /// remain discoverable and runnable by exact selector without joining the
+    /// default functional baseline.
     fn is_explicit_stage(&self) -> bool {
         false
     }

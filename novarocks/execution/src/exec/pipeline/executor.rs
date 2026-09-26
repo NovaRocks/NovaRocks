@@ -31,13 +31,16 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::exec::node::ExecPlan;
 use crate::exec::node::scan::ScanOp;
+use crate::exec::node::{ExecPlan, LocalRuntimeBindings};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::runtime::runtime_state::RuntimeState;
 use tracing::{info, warn};
 
-use super::builder::build_native_pipeline_graph_for_exec_plan_with_runtime_settings;
+use super::builder::{
+    PipelineGraph, build_native_pipeline_graph_for_exec_plan_with_runtime_settings,
+    build_native_pipeline_graph_for_local_program_with_runtime_settings,
+};
 use super::dependency::DependencyManager;
 use super::fragment_context::FragmentContext;
 use super::global_driver_executor::{DriverTask, FragmentCompletion, FragmentStoppedFact};
@@ -45,6 +48,7 @@ use super::operator_factory::OperatorFactory;
 use super::pipeline::Pipeline;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::io::FragmentEventSink;
+use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 
 use crate::runtime::profile::{Profiler, ScopedTimer};
 
@@ -106,13 +110,20 @@ impl PreparedPipelineExecution {
             fragment_ctx.set_final_status(error);
             terminate_scan_ops(&terminal_scan_ops);
         }
-        if let Some(runtime) = runtime_state.execution_runtime() {
-            runtime.driver_executor().submit(tasks);
+        let admitted = if let Some(runtime) = runtime_state.execution_runtime() {
+            runtime.driver_executor().submit(tasks)
         } else {
             #[cfg(test)]
-            test_driver_executor().submit(tasks);
+            {
+                test_driver_executor().submit(tasks)
+            }
             #[cfg(not(test))]
             panic!("prepared execution requires an ExecutionRuntime");
+        };
+        if !admitted {
+            // Rejection latches a failure and retains any pending cleanup until
+            // actual stop. Release scan resources alongside that failed start.
+            terminate_scan_ops(&terminal_scan_ops);
         }
         let fragment_wall_timer = Arc::new(Mutex::new(fragment_wall_timer));
         let timer_on_stop = Arc::clone(&fragment_wall_timer);
@@ -428,6 +439,122 @@ fn prepare_pipeline_execution_inner(
             .unwrap_or(-1),
     )?;
 
+    prepare_pipeline_execution_from_graph(
+        graph,
+        time_slice,
+        sink,
+        terminal_scan_ops,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        event_sink,
+        report_neutral,
+    )
+}
+
+/// Prepare drivers from one frozen LocalProgram and its exact Task capabilities.
+/// The program profile is authoritative for graph DOP and root sink placement.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Native runtime dependencies are explicit"
+)]
+pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
+    program: &LocalProgram,
+    bindings: &LocalRuntimeBindings,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    root_sink_dop: Option<i32>,
+    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
+    event_sink: Arc<dyn FragmentEventSink>,
+) -> Result<PreparedPipelineExecution, String> {
+    let profile = program.profile();
+    if profile.kernel_abi() != KernelAbiVersion::CURRENT {
+        return Err(format!(
+            "local program kernel ABI mismatch: frozen {:?}, runtime {:?}",
+            profile.kernel_abi(),
+            KernelAbiVersion::CURRENT,
+        ));
+    }
+    if usize::try_from(pipeline_dop).ok() != Some(profile.pipeline_dop().get())
+        || root_sink_dop.and_then(|dop| usize::try_from(dop).ok())
+            != profile.root_sink_dop().map(|dop| dop.get())
+    {
+        return Err(format!(
+            "local program profile mismatch: requested dop={pipeline_dop} root_sink_dop={root_sink_dop:?}, frozen dop={} root_sink_dop={:?}",
+            profile.pipeline_dop(),
+            profile.root_sink_dop(),
+        ));
+    }
+    let dep_manager = DependencyManager::new();
+    let terminal_scan_ops = scan_bindings.terminal_ops();
+    let execution_runtime = runtime_state.execution_runtime().ok_or_else(|| {
+        "native local program execution requires an execution runtime".to_string()
+    })?;
+    let graph = build_native_pipeline_graph_for_local_program_with_runtime_settings(
+        program,
+        bindings,
+        debug,
+        dep_manager,
+        exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
+        pipeline_dop,
+        root_sink_dop,
+        runtime_filter_session,
+        execution_runtime.function_set().clone(),
+        execution_runtime.config().operator_buffer_chunks,
+        execution_runtime
+            .config()
+            .local_exchange_buffer_mem_limit_per_driver,
+        execution_runtime.config().local_exchange_max_buffered_rows,
+    )?;
+    prepare_pipeline_execution_from_graph(
+        graph,
+        time_slice,
+        sink,
+        terminal_scan_ops,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        None,
+        None,
+        None,
+        event_sink,
+        true,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The graph and its Task runtime context are independent inputs"
+)]
+fn prepare_pipeline_execution_from_graph(
+    graph: PipelineGraph,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    terminal_scan_ops: Vec<Arc<dyn ScanOp>>,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    query_id: Option<novarocks_types::QueryId>,
+    fe_addr: Option<RuntimeEndpoint>,
+    backend_num: Option<i32>,
+    event_sink: Arc<dyn FragmentEventSink>,
+    report_neutral: bool,
+) -> Result<PreparedPipelineExecution, String> {
     let ctx = Arc::new(if report_neutral {
         FragmentContext::new_report_neutral(
             profiler.clone(),
@@ -661,6 +788,26 @@ mod tests {
 
     struct PanicOperator;
 
+    struct ActivationProbe {
+        activations: Arc<AtomicUsize>,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    impl Operator for ActivationProbe {
+        fn name(&self) -> &str {
+            "ActivationProbe"
+        }
+
+        fn activate(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.activations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn cancel(&mut self) {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     impl Operator for ParkedSourceOperator {
         fn name(&self) -> &str {
             "ParkedSourceOperator"
@@ -836,6 +983,30 @@ mod tests {
             handle.take_chunks().iter().map(Chunk::len).sum::<usize>(),
             1
         );
+    }
+
+    #[test]
+    fn failed_start_cleans_prepared_driver_without_activation() {
+        let runtime_state = test_runtime_state();
+        let activations = Arc::new(AtomicUsize::new(0));
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let driver = PipelineDriver::new(
+            1,
+            vec![Box::new(ActivationProbe {
+                activations: Arc::clone(&activations),
+                cancels: Arc::clone(&cancels),
+            })],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            None,
+        );
+
+        let running = manually_prepared_execution(driver, runtime_state, None)
+            .start_failed("injected prestart failure".to_string());
+        assert_eq!(running.join(), Err("injected prestart failure".to_string()));
+        assert_eq!(activations.load(Ordering::SeqCst), 0);
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -38,6 +38,34 @@ use arrow::array::{Int64Array, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_types::SlotId;
 
+/// Mirror the output contract used by the running Repeat operator when a
+/// fragment is frozen, including grouping slots appended after its input.
+pub(crate) fn repeat_output_chunk_schema(
+    input: &ChunkSchemaRef,
+    null_slot_ids: &[Vec<SlotId>],
+    grouping_slot_ids: &[SlotId],
+) -> Result<ChunkSchemaRef, String> {
+    let nullable_slot_ids: HashSet<SlotId> = null_slot_ids
+        .iter()
+        .flat_map(|slots| slots.iter().copied())
+        .collect();
+    let mut slots = Vec::with_capacity(input.slots().len() + grouping_slot_ids.len());
+    for slot in input.slots() {
+        slots.push(
+            slot.with_nullable(nullable_slot_ids.contains(&slot.slot_id()) || slot.nullable()),
+        );
+    }
+    for (index, slot_id) in grouping_slot_ids.iter().enumerate() {
+        slots.push(ChunkSlotSchema::try_new_with_field(
+            *slot_id,
+            Field::new(format!("repeat_grouping_{index}"), DataType::Int64, true),
+            None,
+            None,
+        )?);
+    }
+    Ok(Arc::new(crate::exec::chunk::ChunkSchema::try_new(slots)?))
+}
+
 /// Factory for repeat processors that expand rows for grouping-set style execution.
 pub struct RepeatProcessorFactory {
     name: String,
@@ -158,39 +186,13 @@ impl ProcessorOperator for RepeatProcessorOperator {
             return Ok(());
         }
 
-        let input_schema = chunk.batch.schema();
-        let nullable_slot_ids: HashSet<SlotId> = self
-            .null_slot_ids
-            .iter()
-            .flat_map(|slots| slots.iter().copied())
-            .collect();
-
-        let mut fields =
-            Vec::with_capacity(input_schema.fields().len() + self.grouping_slot_ids.len());
-        let mut slot_schemas =
-            Vec::with_capacity(input_schema.fields().len() + self.grouping_slot_ids.len());
-        for (idx, input_field) in input_schema.fields().iter().enumerate() {
-            let input_slot_schema = chunk.chunk_schema().slots().get(idx).ok_or_else(|| {
-                format!("repeat missing input chunk slot schema at index {}", idx)
-            })?;
-            let nullable = nullable_slot_ids.contains(&input_slot_schema.slot_id())
-                || input_field.is_nullable();
-            let field = input_field.as_ref().clone().with_nullable(nullable);
-            fields.push(Arc::new(field.clone()));
-            slot_schemas.push(input_slot_schema.with_field(field.clone())?);
-        }
-        for (i, slot_id) in self.grouping_slot_ids.iter().enumerate() {
-            if chunk.slot_id_to_index().contains_key(slot_id) {
-                return Err(format!("repeat cannot append existing slot id {}", slot_id));
-            }
-            let field = Field::new(format!("repeat_grouping_{i}"), DataType::Int64, true);
-            fields.push(Arc::new(field.clone()));
-            slot_schemas.push(ChunkSlotSchema::new_with_field(*slot_id, field, None, None));
-        }
-        self.output_schema = Some(Arc::new(Schema::new(fields)));
-        self.output_chunk_schema = Some(Arc::new(crate::exec::chunk::ChunkSchema::try_new(
-            slot_schemas,
-        )?));
+        let output = repeat_output_chunk_schema(
+            &chunk.chunk_schema_ref(),
+            &self.null_slot_ids,
+            &self.grouping_slot_ids,
+        )?;
+        self.output_schema = Some(output.arrow_schema_ref());
+        self.output_chunk_schema = Some(output);
 
         self.input = Some(chunk);
         self.repeat_idx = 0;

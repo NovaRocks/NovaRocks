@@ -17,17 +17,20 @@
 
 //! Fragment-owned native fragment submission assembly.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{
-    FragmentContractVersion, FragmentProgramOptions, FragmentSinkSpec,
+    FragmentContractVersion, FragmentProgram, FragmentProgramOptions,
 };
+use novarocks_execution::exec::node::ExternalSinkRequirement;
 use novarocks_execution::runtime::fragment::{
     FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSubmission, ScanAssignments,
 };
 use novarocks_execution_contract::task_execution::descriptor::ExchangeTopology;
+use novarocks_local_program::StaticSinkProgram;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 use novarocks_spi::connector::ConnectorStopView;
@@ -124,25 +127,69 @@ pub(crate) fn decode_fragment_submission(
     let scan_assignments = ScanAssignments::try_new(context.take_captured_scan_ranges())
         .map_err(NativeFragmentDecodeError::Binding)?;
     let sink_program = decode_fragment_sink_program(fragment, &decoded_root.layout)?;
-    let sink_spec =
-        FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
+    let static_sink = sink_program.into_static().map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(
+            FieldPath::root("plan_fragment").field("sink"),
+            error,
+        )
+    })?;
+    let sink_requirements = match &static_sink {
+        StaticSinkProgram::Result => vec![ExternalSinkRequirement::Result],
+        StaticSinkProgram::Noop => Vec::new(),
+        StaticSinkProgram::DataStream { .. }
+        | StaticSinkProgram::MultiCastDataStream { .. }
+        | StaticSinkProgram::SplitDataStream { .. } => (0..static_sink.branches().len())
+            .map(|branch| ExternalSinkRequirement::ExchangeOutput { branch })
+            .collect(),
+    };
     let plan = novarocks_execution::exec::node::ExecPlanBuilder::new(arena, decoded_root.node)
         .finish()
         .map_err(NativeFragmentDecodeError::from)?;
-    let program = novarocks_execution::exec::fragment::program::FragmentProgramBuilder::new(
-        plan,
-        sink_spec,
+    let logical_dop = i32::try_from(instance.pipeline_dop.get()).map_err(|_| {
+        NativeFragmentDecodeError::invalid_value(
+            FieldPath::root("plan_fragment").field("pipeline_dop"),
+            "pipeline DOP exceeds the runtime representation",
+        )
+    })?;
+    let effective_dop = novarocks_execution::runtime::exec_env::calc_pipeline_dop(logical_dop);
+    let effective_dop = usize::try_from(effective_dop)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::invalid_value(
+                FieldPath::root("plan_fragment").field("pipeline_dop"),
+                "effective pipeline DOP must be positive",
+            )
+        })?;
+    let profile = plan
+        .local_compile_profile(effective_dop, None)
+        .map_err(|error| {
+            NativeFragmentDecodeError::invalid_value(
+                FieldPath::root("plan_fragment").field("root"),
+                error,
+            )
+        })?;
+    let (local_program, runtime_bindings) = plan
+        .into_local_program_and_bindings(
+            profile,
+            context.take_captured_static_scans(),
+            sink_requirements,
+            static_sink,
+        )
+        .map_err(|error| {
+            NativeFragmentDecodeError::invalid_value(
+                FieldPath::root("plan_fragment").field("root"),
+                error,
+            )
+        })?;
+    let program = FragmentProgram::try_new(
+        Arc::new(local_program),
         FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-    )
-    .scan_sources(scan_sources)
-    .exchange_inputs(
+        scan_sources,
         decode_exchange_contracts(root, root_path).map_err(NativeFragmentDecodeError::from)?,
-    )
-    .runtime_filters(
         decode_runtime_filter_contract(fragment).map_err(NativeFragmentDecodeError::from)?,
     )
-    .finish()
-    .map_err(NativeFragmentDecodeError::from)?;
+    .map_err(NativeFragmentDecodeError::Binding)?;
     let backend_num = instance.backend_num.get();
     let fragment_instance = FragmentInstanceSpec::new_native(
         FragmentContractVersion::CURRENT,
@@ -155,8 +202,9 @@ pub(crate) fn decode_fragment_submission(
         instance.pipeline_dop,
         instance.backend_num,
     );
-    let submission = FragmentSubmission::try_new(Arc::new(program), fragment_instance)
-        .map_err(NativeFragmentDecodeError::Binding)?;
+    let submission =
+        FragmentSubmission::try_new(Arc::new(program), runtime_bindings, fragment_instance)
+            .map_err(NativeFragmentDecodeError::Binding)?;
     Ok(DecodedNativeFragment {
         submission,
         backend_num,
@@ -172,7 +220,6 @@ mod tests {
 
     use arrow::datatypes::DataType;
     use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
-    use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::runtime::fragment::{
         BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
     };
@@ -183,6 +230,7 @@ mod tests {
     };
     use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_local_program::ProgramNodeKind;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_proto_models::{common, expr, plan};
@@ -318,10 +366,11 @@ mod tests {
         assert_eq!(submission.instance().fragment_instance_id().get(), finst);
         assert_eq!(submission.instance().backend_num().get(), 3);
         assert_eq!(backend_num, 3);
-        assert_eq!(submission.program().sink().kind(), FragmentSinkKind::Noop);
+        assert_eq!(submission.program().sink_kind(), FragmentSinkKind::Noop);
+        let local = submission.program().local_program();
         assert!(matches!(
-            submission.program().plan().root.kind,
-            ExecNodeKind::Values(_)
+            local.nodes()[local.root().index()].kind(),
+            ProgramNodeKind::Values { .. }
         ));
     }
 
@@ -374,7 +423,7 @@ mod tests {
             .expect("hash sink expression must resolve through the decoded root layout");
         let (submission, _) = decoded.into_parts();
         assert_eq!(
-            submission.program().sink().kind(),
+            submission.program().sink_kind(),
             FragmentSinkKind::DataStream
         );
     }

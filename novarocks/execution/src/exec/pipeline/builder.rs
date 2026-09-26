@@ -30,6 +30,9 @@
 
 use std::sync::Arc;
 
+mod local;
+pub(crate) use local::build_native_pipeline_graph_for_local_program_with_runtime_settings;
+
 use crate::runtime_filter as execution;
 
 use crate::exec::expr::agg::SealedExecutionFunctionSet;
@@ -116,6 +119,7 @@ struct PipelineBuildContext {
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
+    precomputed_keyed_assert_keys: std::collections::HashMap<i32, Vec<ExprId>>,
 }
 
 struct PipelineRuntimeFilterExecution {
@@ -356,6 +360,7 @@ fn build_pipeline_graph_in_mode(
         local_exchange_buffer_mem_limit_per_driver: local_exchange_buffer_mem_limit_per_driver
             .max(1),
         local_exchange_max_buffered_rows,
+        precomputed_keyed_assert_keys: std::collections::HashMap::new(),
     };
     let mut build = build_pipeline_for_node(&plan.root, &mut ctx)?;
     if let Some(root_sink_dop) = root_sink_dop {
@@ -604,9 +609,19 @@ pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chun
         ExecNodeKind::Project(project) => Some(Arc::clone(&project.output_chunk_schema)),
         ExecNodeKind::Unpivot(unpivot) => Some(Arc::clone(&unpivot.output_chunk_schema)),
         ExecNodeKind::Filter(FilterNode { input, .. })
-        | ExecNodeKind::Repeat(RepeatNode { input, .. })
         | ExecNodeKind::Limit(LimitNode { input, .. })
         | ExecNodeKind::Sort(SortNode { input, .. }) => output_chunk_schema_for_node(input),
+        ExecNodeKind::Repeat(RepeatNode {
+            input,
+            null_slot_ids,
+            grouping_slot_ids,
+            ..
+        }) => crate::exec::operators::repeat_output_chunk_schema(
+            &output_chunk_schema_for_node(input)?,
+            null_slot_ids,
+            grouping_slot_ids,
+        )
+        .ok(),
         ExecNodeKind::ChangeEventExpand(node) => Some(Arc::clone(&node.output_chunk_schema)),
         ExecNodeKind::UnionAll(UnionAllNode { inputs, .. }) => {
             inputs.first().and_then(output_chunk_schema_for_node)

@@ -58,6 +58,7 @@ pub enum OperationKind {
     UpdateQueryContext,
     CancelTask,
     AbortQueryContext,
+    QuiesceQueryContext,
     ReleaseQueryContext,
     FetchTaskDynamicFilters,
     GetFinalTaskInfo,
@@ -76,6 +77,7 @@ pub enum OperationShape {
     RenewQueryExecutionLease,
     CancelTask,
     AbortQueryContext,
+    QuiesceQueryContext,
     ReleaseQueryContext,
     FetchTaskDynamicFilters,
     GetFinalTaskInfo,
@@ -94,6 +96,7 @@ impl OperationShape {
             Self::UpdateTask => OperationKind::UpdateTask,
             Self::CancelTask => OperationKind::CancelTask,
             Self::AbortQueryContext => OperationKind::AbortQueryContext,
+            Self::QuiesceQueryContext => OperationKind::QuiesceQueryContext,
             Self::ReleaseQueryContext => OperationKind::ReleaseQueryContext,
             Self::FetchTaskDynamicFilters => OperationKind::FetchTaskDynamicFilters,
             Self::GetFinalTaskInfo => OperationKind::GetFinalTaskInfo,
@@ -110,6 +113,7 @@ impl OperationKind {
             Self::UpdateQueryContext => "UpdateQueryContext",
             Self::CancelTask => "CancelTask",
             Self::AbortQueryContext => "AbortQueryContext",
+            Self::QuiesceQueryContext => "QuiesceQueryContext",
             Self::ReleaseQueryContext => "ReleaseQueryContext",
             Self::FetchTaskDynamicFilters => "FetchTaskDynamicFilters",
             Self::GetFinalTaskInfo => "GetFinalTaskInfo",
@@ -326,6 +330,12 @@ pub enum OperationOutcome {
     /// A per-context or per-backend capacity bound was reached. This fails
     /// closed rather than degrading: there is no older path to fall back to.
     ResourceExhausted,
+    /// Create arrived before its exact Context establishment became Active.
+    /// No task was accepted; wait for the Establish receipt before retrying.
+    NotReady,
+    /// The bounded preparation queue is full while charged work can still
+    /// leave it. No task was accepted by this operation.
+    PreparationBusy,
     /// Admission found an older unredeemed ticket for the same context. The
     /// new operation created no grant and may retry after bounded backoff.
     AdmissionTicketStillActive,
@@ -384,6 +394,10 @@ pub enum TaskDomainReceipt {
         opened: Vec<ExchangeEdgeId>,
         progression: DomainProgression,
     },
+    CloseExchangeDestination {
+        accepted_version: DomainVersion,
+        progression: DomainProgression,
+    },
 }
 
 impl TaskDomainReceipt {
@@ -392,6 +406,7 @@ impl TaskDomainReceipt {
             Self::SplitAssignment { .. } => TaskDomainKind::SplitAssignment,
             Self::TaskDynamicFilter { .. } => TaskDomainKind::TaskDynamicFilter,
             Self::OpenExchangeEdges { .. } => TaskDomainKind::OpenExchangeEdges,
+            Self::CloseExchangeDestination { .. } => TaskDomainKind::CloseExchangeDestination,
         }
     }
 
@@ -399,7 +414,8 @@ impl TaskDomainReceipt {
         match self {
             Self::SplitAssignment { progression, .. }
             | Self::TaskDynamicFilter { progression, .. }
-            | Self::OpenExchangeEdges { progression, .. } => *progression,
+            | Self::OpenExchangeEdges { progression, .. }
+            | Self::CloseExchangeDestination { progression, .. } => *progression,
         }
     }
 }
@@ -436,10 +452,10 @@ impl QueryContextDomainReceipt {
 
 /// The acknowledgement of a task creation.
 ///
-/// The acknowledgement itself is the linearization point: receiving it proves
-/// the task, its receiver, and its inbound capability are installed and the
-/// task was submitted as runnable. It carries the task's current status, which
-/// closes the window between creating a task and observing it.
+/// The acknowledgement proves Worker accepted this exact identity and owns
+/// its bounded preparation and eventual terminal record. Installation is a
+/// later versioned status fact; the initial domain receipts are absent until
+/// that fact, and the current snapshot closes the Create/observe race.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateTaskReceipt {
     identity: TaskIdentity,
@@ -651,6 +667,13 @@ pub enum TaskDomainUpdate {
         version: EdgeOpenVersion,
         edges: Vec<ExchangeEdgeId>,
     },
+    /// Withdraws one frozen destination's send need without changing its
+    /// edge's other destinations or claiming that the receiver has stopped.
+    CloseExchangeDestination {
+        version: DomainVersion,
+        edge: ExchangeEdgeId,
+        destination: TaskIdentity,
+    },
 }
 
 impl TaskDomainUpdate {
@@ -659,6 +682,7 @@ impl TaskDomainUpdate {
             Self::SplitAssignment(_) => TaskDomainKind::SplitAssignment,
             Self::TaskDynamicFilter { .. } => TaskDomainKind::TaskDynamicFilter,
             Self::OpenExchangeEdges { .. } => TaskDomainKind::OpenExchangeEdges,
+            Self::CloseExchangeDestination { .. } => TaskDomainKind::CloseExchangeDestination,
         }
     }
 }
@@ -1235,6 +1259,76 @@ impl AbortQueryContext {
 
     pub const fn cause(self) -> AbortCause {
         self.cause
+    }
+}
+
+/// Fence future task admission without claiming that owned work has stopped.
+#[derive(Copy, Clone, Debug)]
+pub struct QuiesceQueryContext {
+    envelope: OperationEnvelope,
+    context: QueryContextRef,
+}
+
+impl QuiesceQueryContext {
+    pub fn new(operation_id: TaskOperationId, context: QueryContextRef) -> Self {
+        Self {
+            envelope: OperationEnvelope::with_default_wait(
+                operation_id,
+                OperationKind::QuiesceQueryContext,
+            ),
+            context,
+        }
+    }
+
+    pub const fn envelope(self) -> OperationEnvelope {
+        self.envelope
+    }
+
+    pub const fn context(self) -> QueryContextRef {
+        self.context
+    }
+}
+
+/// An immutable admission cut and its current closing state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuiesceQueryContextReceipt {
+    context: QueryContextRef,
+    fence_version: u64,
+    accepted_tasks: Vec<TaskIdentity>,
+    state: QueryContextState,
+}
+
+impl QuiesceQueryContextReceipt {
+    pub fn new(
+        context: QueryContextRef,
+        fence_version: u64,
+        accepted_tasks: Vec<TaskIdentity>,
+        state: QueryContextState,
+    ) -> Self {
+        Self {
+            context,
+            fence_version,
+            accepted_tasks,
+            state,
+        }
+    }
+
+    pub const fn context(&self) -> QueryContextRef {
+        self.context
+    }
+    pub const fn fence_version(&self) -> u64 {
+        self.fence_version
+    }
+    pub fn accepted_tasks(&self) -> &[TaskIdentity] {
+        &self.accepted_tasks
+    }
+    pub const fn state(&self) -> QueryContextState {
+        self.state
+    }
+
+    pub fn with_state(mut self, state: QueryContextState) -> Self {
+        self.state = state;
+        self
     }
 }
 

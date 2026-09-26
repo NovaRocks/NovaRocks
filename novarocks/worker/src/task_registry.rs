@@ -74,8 +74,9 @@ use novarocks_execution_contract::task_execution::operation::{
     AbortQueryContext, AcquireQueryContextAdmissionTicket, AdvanceQueryContextDomain, CancelTask,
     CreateTask, CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters,
     GetFinalTaskInfo, OperationEnvelope, OperationOutcome, QueryContextDomainReceipt,
-    QueryContextDomainUpdate, QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
-    RenewQueryExecutionLease, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    QueryContextDomainUpdate, QueryContextReceipt, QuiesceQueryContext, QuiesceQueryContextReceipt,
+    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, UpdateQueryContext, UpdateTask,
+    UpdateTaskReceipt,
 };
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, TaskFailureCategory, TaskOutputFacts, TaskState, TerminationDetail,
@@ -85,16 +86,16 @@ use novarocks_types::identity::QueryExecutionId;
 
 use crate::lease_expiry_index::LeaseExpiryIndex;
 use crate::task_registry_entry::{
-    ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
-    estimate_retained_bytes,
+    ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, PreparationStop,
+    RetiredTask, TaskEntry, estimate_retained_bytes,
 };
 use crate::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
     FinalTaskInfoOutcome, OperationReceipt, QueryContextHost, QueryContextOutcome,
-    ReleaseAcknowledgement, ReleaseQueryContextOutcome, ReleasedContextEvidence, RootResultBinding,
-    RootResultRoute, RunnableTask, SharedFactsRequest, StatusAdvance, TaskDomains,
-    TaskExecutionHost, TaskExecutionRegistryConfig, TaskStatusOwner, TaskStatusReporter,
-    TaskStatusSource, UpdateTaskOutcome, WorkerAdmissionEpochAuthority,
+    QuiesceQueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
+    ReleasedContextEvidence, RootResultBinding, RootResultRoute, RunnableTask, SharedFactsRequest,
+    StatusAdvance, TaskDomains, TaskExecutionHost, TaskExecutionRegistryConfig, TaskStatusOwner,
+    TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome, WorkerAdmissionEpochAuthority,
     apply_planned_task_domain_updates, apply_task_domain_updates,
     commit_task_domain_execution_updates, plan_task_domain_execution_updates,
     validate_task_domain_execution_membership,
@@ -298,6 +299,20 @@ pub struct RegistryCounters {
     pub task_failure_escalations: u64,
 }
 
+/// One lock-consistent view of temporary preparation ownership.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaskPreparationSnapshot {
+    pub positions: usize,
+    pub position_limit: usize,
+    pub context_positions: usize,
+    pub context_position_limit: usize,
+    pub queued_positions: usize,
+    pub workers: usize,
+    pub worker_limit: usize,
+    pub bytes: usize,
+    pub byte_limit: usize,
+}
+
 #[derive(Debug, Default)]
 struct AtomicCounters {
     contexts_established: AtomicU64,
@@ -349,13 +364,40 @@ struct RegistryState {
     task_index: BTreeMap<TaskIdentity, QueryContextRef>,
     in_flight: BTreeMap<QueryContextRef, InFlight>,
     pending_termination: BTreeSet<QueryContextRef>,
+    pending_quiesce: BTreeSet<QueryContextRef>,
     retired_task_order: VecDeque<(QueryContextRef, TaskIdentity)>,
     gone_task_order: VecDeque<(QueryContextRef, TaskIdentity)>,
     retired_context_order: VecDeque<QueryContextRef>,
     gone_context_order: VecDeque<QueryContextRef>,
     active_tasks: usize,
+    prepare_queue: VecDeque<QueuedPreparation>,
+    preparing_contexts: BTreeSet<QueryContextRef>,
+    prepare_workers: usize,
+    prepare_charges: BTreeMap<TaskIdentity, usize>,
+    prepare_context_counts: BTreeMap<QueryContextRef, usize>,
+    prepare_bytes: usize,
     retained_tasks: usize,
     retained_bytes: usize,
+}
+
+struct QueuedPreparation {
+    request: CreateTask,
+    input: TaskCreationInput,
+    cell: Arc<CreationCell>,
+    source: Arc<TaskStatusSource>,
+}
+
+struct PreparationWorkerCompletion {
+    registry: Arc<TaskExecutionRegistry>,
+    context: QueryContextRef,
+    identity: TaskIdentity,
+}
+
+impl Drop for PreparationWorkerCompletion {
+    fn drop(&mut self) {
+        self.registry
+            .complete_preparation_worker(self.context, self.identity);
+    }
 }
 
 impl RegistryState {
@@ -385,6 +427,36 @@ pub struct TaskExecutionRegistry {
 }
 
 impl TaskExecutionRegistry {
+    /// Reports the existing charge ledger, including canceled jobs until their exit.
+    pub fn preparation_snapshot(&self) -> TaskPreparationSnapshot {
+        let state = self.state.lock().expect(REGISTRY_LOCK);
+        TaskPreparationSnapshot {
+            positions: state.prepare_charges.len(),
+            position_limit: self.config.max_preparing_tasks,
+            context_positions: state
+                .prepare_context_counts
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0),
+            context_position_limit: self.config.max_preparing_tasks_per_context,
+            queued_positions: state.prepare_queue.len(),
+            workers: state.prepare_workers,
+            worker_limit: self.config.max_prepare_workers,
+            bytes: state.prepare_bytes,
+            byte_limit: self.config.max_preparing_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_preparation_charge(&self, identity: TaskIdentity) -> bool {
+        self.state
+            .lock()
+            .expect(REGISTRY_LOCK)
+            .prepare_charges
+            .contains_key(&identity)
+    }
+
     pub fn new(
         config: TaskExecutionRegistryConfig,
         clock: Arc<dyn WorkerMonotonicClock>,
@@ -756,6 +828,336 @@ impl TaskExecutionRegistry {
         self.create_task_inner(request, input, None)
     }
 
+    /// Takes ownership of one task before its expensive preparation begins.
+    /// The returned status describes admission only; installation is observed
+    /// through this task's status stream.
+    pub fn accept_create_task(
+        self: &Arc<Self>,
+        request: &CreateTask,
+        input: TaskCreationInput,
+    ) -> OperationReceipt<novarocks_execution_contract::TaskStatus> {
+        self.accept_create_task_with_retained_bytes(request, input, 0)
+    }
+
+    /// `retained_bytes` is the adapter's exact bounded incoming Create item
+    /// size. The Worker also charges its neutral in-memory structural floor.
+    pub fn accept_create_task_with_retained_bytes(
+        self: &Arc<Self>,
+        request: &CreateTask,
+        input: TaskCreationInput,
+        retained_bytes: usize,
+    ) -> OperationReceipt<novarocks_execution_contract::TaskStatus> {
+        let operation = request.envelope().operation_id();
+        let identity = request.identity();
+        let context = request.context();
+        if let Err(mismatch) = identity.verify_query_context(context) {
+            return map_create_status(identity_mismatch(operation, mismatch));
+        }
+        if identity.backend_process_id() != self.config.backend_process_id {
+            return map_create_status(identity_mismatch(
+                operation,
+                IdentityMismatch::new(IdentityField::BackendProcess),
+            ));
+        }
+        let _scope = OperationScope::enter(self, context, Lane::Mutation);
+        let deadline = self.deadline_of(request.envelope(), None);
+        let (cell, source) = match self
+            .elect_creation_owner(context, identity, operation, deadline, true)
+        {
+            Ok(reservation) => reservation,
+            Err(outcome) => {
+                let receipt = self.map_create_status_current(identity, *outcome);
+                if let Some(status) = receipt.acknowledgement() {
+                    let event_receipt = OperationReceipt::acknowledged(
+                        operation,
+                        receipt.outcome(),
+                        CreateTaskReceipt::new(identity, Vec::new(), status.clone()),
+                    );
+                    if let Some(event) = TaskProtocolEvent::create_task(identity, &event_receipt) {
+                        self.ports.observe(event);
+                    }
+                }
+                return receipt;
+            }
+        };
+        // The incoming item bound covers codec-owned domain slices that can
+        // still retain its independently isolated metadata backing. Assignment
+        // storage is separate, so it must be added rather than hidden by max.
+        let bytes = input
+            .retained_bytes()
+            .saturating_add(retained_bytes)
+            .saturating_add(create_request_structural_bytes(request));
+        let status = Arc::new(TaskStatusOwner::new(
+            identity,
+            Arc::clone(&source),
+            Arc::clone(&self.clock),
+            self.config.metric_publish_min_interval,
+        ));
+        {
+            let mut state = self.state.lock().expect(REGISTRY_LOCK);
+            let rejection = if state.context_state(context) != QueryContextState::Active {
+                Some((
+                    OperationOutcome::ContextTerminalReceipt,
+                    "the query context closed before task admission",
+                ))
+            } else if bytes > self.config.max_preparing_bytes {
+                Some((
+                    OperationOutcome::ResourceExhausted,
+                    "one task exceeds the accepted preparation byte bound",
+                ))
+            } else if state
+                .prepare_context_counts
+                .get(&context)
+                .copied()
+                .unwrap_or(0)
+                >= self.config.max_preparing_tasks_per_context
+            {
+                Some((
+                    OperationOutcome::PreparationBusy,
+                    "query context reached its accepted preparation task bound",
+                ))
+            } else if state.prepare_charges.len() >= self.config.max_preparing_tasks {
+                Some((
+                    OperationOutcome::PreparationBusy,
+                    "backend reached its accepted preparation task bound",
+                ))
+            } else if bytes
+                > self
+                    .config
+                    .max_preparing_bytes
+                    .saturating_sub(state.prepare_bytes)
+            {
+                Some((
+                    OperationOutcome::PreparationBusy,
+                    "backend reached its accepted preparation byte bound",
+                ))
+            } else {
+                None
+            };
+            if let Some((outcome, detail)) = rejection {
+                cell.fail(CreationFailure {
+                    outcome,
+                    detail: detail.to_owned(),
+                });
+                state
+                    .contexts
+                    .get_mut(&context)
+                    .expect("reserved context")
+                    .tasks
+                    .remove(&identity);
+                state.task_index.remove(&identity);
+                state.active_tasks -= 1;
+                self.gate.notify_all();
+                return OperationReceipt::rejected(operation, outcome, detail);
+            }
+            if let Err(rejection) = self
+                .task_host
+                .reserve_inbound_close_capacity(request.descriptor())
+            {
+                let outcome = match rejection.category() {
+                    TaskFailureCategory::ResourceExhausted => OperationOutcome::ResourceExhausted,
+                    _ => OperationOutcome::InvalidStateOrRequest,
+                };
+                let detail = rejection.detail().to_string();
+                cell.fail(CreationFailure {
+                    outcome,
+                    detail: detail.clone(),
+                });
+                state
+                    .contexts
+                    .get_mut(&context)
+                    .expect("reserved context")
+                    .tasks
+                    .remove(&identity);
+                state.task_index.remove(&identity);
+                state.active_tasks -= 1;
+                self.gate.notify_all();
+                return OperationReceipt::rejected(operation, outcome, detail);
+            }
+            // This lock is the Accepted/Context-fence linearization point.
+            // The queue and both hard charges become owned by the Task before
+            // the first acknowledgement can leave the Worker.
+            cell.accept(Arc::clone(&status));
+            state
+                .contexts
+                .get_mut(&context)
+                .expect("reserved context")
+                .mark_spent(identity);
+            state.prepare_bytes += bytes;
+            state.prepare_charges.insert(identity, bytes);
+            *state.prepare_context_counts.entry(context).or_default() += 1;
+            state.prepare_queue.push_back(QueuedPreparation {
+                request: request.clone(),
+                input,
+                cell,
+                source,
+            });
+            status.release_to_observers();
+            self.gate.notify_all();
+        }
+        self.launch_preparations();
+        let result =
+            OperationReceipt::acknowledged(operation, OperationOutcome::Accepted, status.current());
+        let event_receipt = OperationReceipt::acknowledged(
+            operation,
+            OperationOutcome::Accepted,
+            CreateTaskReceipt::new(identity, Vec::new(), status.current()),
+        );
+        if let Some(event) = TaskProtocolEvent::create_task(identity, &event_receipt) {
+            self.ports.observe(event);
+        }
+        result
+    }
+
+    fn map_create_status_current(
+        &self,
+        identity: TaskIdentity,
+        receipt: CreateTaskOutcome,
+    ) -> OperationReceipt<novarocks_execution_contract::TaskStatus> {
+        if receipt.acknowledgement().is_none() {
+            return map_create_status(receipt);
+        }
+        let status = {
+            let state = self.state.lock().expect(REGISTRY_LOCK);
+            state
+                .task_index
+                .get(&identity)
+                .and_then(|context| state.contexts.get(context))
+                .and_then(|entry| entry.tasks.get(&identity))
+                .and_then(|task| match task {
+                    TaskEntry::Creating(cell) => {
+                        cell.accepted_status().map(|status| status.current())
+                    }
+                    TaskEntry::Live(live) => Some(live.status.current()),
+                    TaskEntry::Retired(retired) => Some(retired.status.clone()),
+                    TaskEntry::Gone => None,
+                })
+        };
+        match status {
+            Some(status) => {
+                OperationReceipt::acknowledged(receipt.operation_id(), receipt.outcome(), status)
+            }
+            None => map_create_status(receipt),
+        }
+    }
+
+    fn launch_preparations(self: &Arc<Self>) {
+        loop {
+            let job = {
+                let mut state = self.state.lock().expect(REGISTRY_LOCK);
+                if state.prepare_workers >= self.config.max_prepare_workers {
+                    return;
+                }
+                let Some(index) = state
+                    .prepare_queue
+                    .iter()
+                    .position(|job| !state.preparing_contexts.contains(&job.request.context()))
+                else {
+                    return;
+                };
+                let job = state
+                    .prepare_queue
+                    .remove(index)
+                    .expect("selected queue job");
+                state.preparing_contexts.insert(job.request.context());
+                state.prepare_workers += 1;
+                job
+            };
+            let context = job.request.context();
+            let identity = job.request.identity();
+            let holder = Arc::new(Mutex::new(Some(job)));
+            let runner_holder = Arc::clone(&holder);
+            let registry = Arc::clone(self);
+            let started = std::thread::Builder::new()
+                .name("novarocks-task-prepare".to_owned())
+                .spawn(move || {
+                    let _completion = PreparationWorkerCompletion {
+                        registry: Arc::clone(&registry),
+                        context,
+                        identity,
+                    };
+                    let job = runner_holder
+                        .lock()
+                        .expect("preparation job lock")
+                        .take()
+                        .expect("a launched worker owns one preparation job");
+                    registry.run_accepted_preparation(job);
+                });
+            if let Err(error) = started {
+                let job = holder
+                    .lock()
+                    .expect("preparation job lock")
+                    .take()
+                    .expect("a rejected worker retains its preparation job");
+                self.fail_accepted_preparation(
+                    job,
+                    format!("cannot start task preparation worker: {error}"),
+                );
+                self.settle();
+                self.complete_preparation_worker(context, identity);
+            }
+        }
+    }
+
+    fn run_accepted_preparation(&self, job: QueuedPreparation) {
+        let outcome =
+            self.prepare_reserved_create_task(&job.request, job.input, job.cell, job.source);
+        // A synchronous stop can race the prepare handoff. Retire and return
+        // its capacity from the actual convergence facts without waiting for
+        // the next maintenance tick.
+        let _ = outcome;
+        self.settle();
+    }
+
+    fn fail_accepted_preparation(&self, job: QueuedPreparation, detail: String) {
+        let mut transaction = CreationTransaction {
+            registry: self,
+            context: job.request.context(),
+            identity: job.request.identity(),
+            descriptor: Arc::new(job.request.descriptor().clone()),
+            cell: job.cell,
+            receiver_installed: false,
+            capability_installed: false,
+            failure: None,
+            stop: None,
+            committed: false,
+        };
+        let _ = transaction.abandon(
+            job.request.envelope().operation_id(),
+            OperationOutcome::ResourceExhausted,
+            detail,
+        );
+    }
+
+    fn complete_preparation_worker(
+        self: &Arc<Self>,
+        context: QueryContextRef,
+        identity: TaskIdentity,
+    ) {
+        {
+            let mut state = self.state.lock().expect(REGISTRY_LOCK);
+            state.preparing_contexts.remove(&context);
+            state.prepare_workers -= 1;
+            // The preparation job has returned: its input and temporary
+            // expansion have dropped or transferred to the execution owner.
+            // Installed/terminal publication alone never returns this charge.
+            let bytes = state
+                .prepare_charges
+                .remove(&identity)
+                .expect("exiting preparation owns its charge");
+            state.prepare_bytes -= bytes;
+            let count = state
+                .prepare_context_counts
+                .get_mut(&context)
+                .expect("exiting preparation owns its context position");
+            *count -= 1;
+            if *count == 0 {
+                state.prepare_context_counts.remove(&context);
+            }
+        }
+        self.launch_preparations();
+    }
+
     /// Applies the same exact create with a shorter local ingress wait budget.
     /// This cap is transport-local and never enters create identity or replay.
     pub fn create_task_with_local_wait_cap(
@@ -794,7 +1196,6 @@ impl TaskExecutionRegistry {
         let operation = envelope.operation_id();
         let identity = request.identity();
         let context = request.context();
-        let descriptor = request.descriptor();
 
         // Identity validation and process fencing come first, so a request
         // aimed at another process never reserves an identity and never waits
@@ -816,12 +1217,26 @@ impl TaskExecutionRegistry {
         // Every return before the reservation drops `input` unread. A request
         // that converges on, or replays, an existing identity never reaches
         // the execution host, so its body is neither interpreted nor applied.
-        let (cell, source) = match self.elect_creation_owner(context, identity, operation, deadline)
-        {
-            Ok(reservation) => reservation,
-            Err(outcome) => return *outcome,
-        };
+        let (cell, source) =
+            match self.elect_creation_owner(context, identity, operation, deadline, false) {
+                Ok(reservation) => reservation,
+                Err(outcome) => return *outcome,
+            };
 
+        self.prepare_reserved_create_task(request, input, cell, source)
+    }
+
+    fn prepare_reserved_create_task(
+        &self,
+        request: &CreateTask,
+        input: TaskCreationInput,
+        cell: Arc<CreationCell>,
+        source: Arc<TaskStatusSource>,
+    ) -> CreateTaskOutcome {
+        let operation = request.envelope().operation_id();
+        let identity = request.identity();
+        let context = request.context();
+        let descriptor = request.descriptor();
         // The transaction owns the identity from here. Its Drop rolls back
         // every install, removes the reservation, and publishes the shared
         // failure to whoever converged on it.
@@ -834,8 +1249,18 @@ impl TaskExecutionRegistry {
             receiver_installed: false,
             capability_installed: false,
             failure: None,
+            stop: None,
             committed: false,
         };
+
+        if let Some(stop) = transaction.cell.stop() {
+            transaction.stop = Some(stop);
+            return OperationReceipt::rejected(
+                operation,
+                OperationOutcome::ContextTerminalReceipt,
+                "task stopped before preparation",
+            );
+        }
 
         // Checked by the winner only, under the reservation it now owns and
         // before any install: an initial domain naming a member the descriptor
@@ -872,6 +1297,14 @@ impl TaskExecutionRegistry {
             }
         };
         transaction.receiver_installed = true;
+        if let Some(stop) = transaction.cell.stop() {
+            transaction.stop = Some(stop);
+            return OperationReceipt::rejected(
+                operation,
+                OperationOutcome::ContextTerminalReceipt,
+                "task stopped during preparation",
+            );
+        }
         if let Err(rejection) = self
             .task_host
             .install_inbound_capability(&transaction.descriptor)
@@ -899,12 +1332,23 @@ impl TaskExecutionRegistry {
             }
         };
 
-        let status = Arc::new(TaskStatusOwner::new(
-            identity,
-            source,
-            Arc::clone(&self.clock),
-            self.config.metric_publish_min_interval,
-        ));
+        if let Some(stop) = transaction.cell.stop() {
+            transaction.stop = Some(stop);
+            return OperationReceipt::rejected(
+                operation,
+                OperationOutcome::ContextTerminalReceipt,
+                "task stopped before activation",
+            );
+        }
+
+        let status = transaction.cell.accepted_status().unwrap_or_else(|| {
+            Arc::new(TaskStatusOwner::new(
+                identity,
+                source,
+                Arc::clone(&self.clock),
+                self.config.metric_publish_min_interval,
+            ))
+        });
         let runnable = match self.task_host.submit_runnable(
             &transaction.descriptor,
             TaskStatusReporter::new(Arc::clone(&status)),
@@ -933,7 +1377,7 @@ impl TaskExecutionRegistry {
             capability_installed: true,
         }) {
             // The context closed while this task was being built. Stand the
-            // submitted worker down. The closing context retained the live
+            // committed worker down. The closing context retained the Live
             // entry, so its eventual stop and resource convergence remain
             // owned and charged rather than becoming an untracked orphan.
             let cause = self
@@ -944,6 +1388,13 @@ impl TaskExecutionRegistry {
             self.counters
                 .creations_rolled_back
                 .fetch_add(1, Ordering::Relaxed);
+            if transaction.cell.accepted_status().is_some() {
+                return OperationReceipt::acknowledged(
+                    operation,
+                    OperationOutcome::Accepted,
+                    receipt,
+                );
+            }
             return OperationReceipt::rejected(
                 operation,
                 OperationOutcome::ContextTerminalReceipt,
@@ -982,6 +1433,7 @@ impl TaskExecutionRegistry {
         identity: TaskIdentity,
         operation: TaskOperationId,
         deadline: MonotonicInstant,
+        accepted_replay: bool,
     ) -> Result<(Arc<CreationCell>, Arc<TaskStatusSource>), Box<CreateTaskOutcome>> {
         let mut state = self.state.lock().expect(REGISTRY_LOCK);
         loop {
@@ -1002,6 +1454,13 @@ impl TaskExecutionRegistry {
                     // than at RPC ingress, so no task becomes admitted in the
                     // marker-to-process-loss interval.
                     if self.task_creation_gate.holds_task_creation(context) {
+                        if accepted_replay {
+                            return Err(Box::new(OperationReceipt::rejected(
+                                operation,
+                                OperationOutcome::NotReady,
+                                "create admission is waiting for context activation",
+                            )));
+                        }
                         drop(state);
                         self.task_creation_gate
                             .wait_for_task_creation_release(context);
@@ -1010,6 +1469,13 @@ impl TaskExecutionRegistry {
                     }
                 }
                 OperationAdmission::WaitForCreationGate => {
+                    if accepted_replay {
+                        return Err(Box::new(OperationReceipt::rejected(
+                            operation,
+                            OperationOutcome::NotReady,
+                            "create admission requires an active context",
+                        )));
+                    }
                     if now.has_reached(deadline) {
                         return Err(Box::new(OperationReceipt::rejected(
                             operation,
@@ -1023,7 +1489,11 @@ impl TaskExecutionRegistry {
                 OperationAdmission::NotEstablished => {
                     return Err(Box::new(OperationReceipt::rejected(
                         operation,
-                        OperationOutcome::ContextNotEstablished,
+                        if accepted_replay {
+                            OperationOutcome::NotReady
+                        } else {
+                            OperationOutcome::ContextNotEstablished
+                        },
                         "create reached a context that was never established",
                     )));
                 }
@@ -1038,6 +1508,13 @@ impl TaskExecutionRegistry {
                         .get(&context)
                         .and_then(|entry| entry.tasks.get(&identity))
                     {
+                        if accepted_replay && let Some(status) = cell.accepted_status() {
+                            return Err(Box::new(OperationReceipt::acknowledged(
+                                operation,
+                                OperationOutcome::Idempotent,
+                                CreateTaskReceipt::new(identity, Vec::new(), status.current()),
+                            )));
+                        }
                         if let Some(failure) = cell.failure() {
                             self.counters
                                 .creations_converged
@@ -1141,6 +1618,13 @@ impl TaskExecutionRegistry {
                     return Ok((cell, source));
                 }
                 Decision::Converge(cell) => {
+                    if accepted_replay && let Some(status) = cell.accepted_status() {
+                        return Err(Box::new(OperationReceipt::acknowledged(
+                            operation,
+                            OperationOutcome::Idempotent,
+                            CreateTaskReceipt::new(identity, Vec::new(), status.current()),
+                        )));
+                    }
                     if let Some(failure) = cell.failure() {
                         self.counters
                             .creations_converged
@@ -1474,6 +1958,22 @@ impl TaskExecutionRegistry {
 
         let mut state = self.state.lock().expect(REGISTRY_LOCK);
         let now = self.clock.now();
+        if state.context_state(context) == QueryContextState::Quiescing {
+            // Materialization lost to the normal admission fence. Release only
+            // staged shared facts; the fence and its membership remain intact.
+            let entry = state.contexts.get_mut(&context).expect("quiescing context");
+            entry.released_evidence = self.context_host.release(context);
+            entry.facts_released = true;
+            transaction.commit();
+            self.gate.notify_all();
+            let receipt = context_receipt(entry, context);
+            drop(state);
+            return OperationReceipt::acknowledged(
+                operation,
+                OperationOutcome::ContextTerminalReceipt,
+                receipt,
+            );
+        }
         if let Err(rejection) = materialized {
             transaction.abandon(&mut state, AbortCause::QueryFailed, now);
             drop(state);
@@ -1733,8 +2233,14 @@ impl TaskExecutionRegistry {
                 );
             }
         }
-        let entry = state.contexts.get_mut(&context).expect("active context");
-        let installed = entry.lease.expect("an active context holds a lease");
+        let entry = state.contexts.get_mut(&context).expect("admitted context");
+        let Some(installed) = entry.lease else {
+            return OperationReceipt::acknowledged(
+                operation,
+                OperationOutcome::ContextTerminalReceipt,
+                context_receipt(entry, context),
+            );
+        };
         match installed.classify_renewal(request.sequence(), request.valid_for()) {
             LeaseProgression::Apply { .. } => {
                 let renewed = installed.renew(
@@ -1835,6 +2341,31 @@ impl TaskExecutionRegistry {
                     Some((status, runnable))
                 }
                 TaskLocation::Creating => {
+                    if let Some(TaskEntry::Creating(cell)) = state
+                        .contexts
+                        .get(&context)
+                        .and_then(|entry| entry.tasks.get(&identity))
+                        && let Some(status) = cell.accepted_status()
+                    {
+                        if !cell.request_stop(PreparationStop::Cancel(request.reason())) {
+                            return OperationReceipt::acknowledged(
+                                operation,
+                                OperationOutcome::Idempotent,
+                                status.current(),
+                            );
+                        }
+                        status.advance(
+                            TaskState::Canceling,
+                            Some(TerminationDetail::Canceled(request.reason())),
+                            TaskOutputFacts::default(),
+                        );
+                        self.ports.discard_task(identity);
+                        return OperationReceipt::acknowledged(
+                            operation,
+                            OperationOutcome::Accepted,
+                            status.current(),
+                        );
+                    }
                     return OperationReceipt::rejected(
                         operation,
                         OperationOutcome::InvalidStateOrRequest,
@@ -1945,6 +2476,118 @@ impl TaskExecutionRegistry {
         }
     }
 
+    // ------------------------------------------------ quiesce query context
+
+    pub fn quiesce_query_context(
+        &self,
+        request: &QuiesceQueryContext,
+    ) -> QuiesceQueryContextOutcome {
+        let operation = request.envelope().operation_id();
+        let context = request.context();
+        if context.backend_process_id() != self.config.backend_process_id {
+            return identity_mismatch(
+                operation,
+                IdentityMismatch::new(IdentityField::BackendProcess),
+            );
+        }
+        let (receipt, outcome) = {
+            let mut state = self.state.lock().expect(REGISTRY_LOCK);
+            let now = self.clock.now();
+            self.expire_leases_locked(&mut state, now);
+            if let Err(mismatch) = fence_frontend(&state, context) {
+                return identity_mismatch(operation, mismatch);
+            }
+            let current = state.context_state(context);
+            if current == QueryContextState::Gone {
+                return OperationReceipt::rejected(
+                    operation,
+                    OperationOutcome::Gone,
+                    "quiesce reached a reclaimed query context",
+                );
+            }
+            if current == QueryContextState::Absent {
+                let vacant_fences = state
+                    .contexts
+                    .values()
+                    .filter(|entry| {
+                        entry.state == QueryContextState::Quiescing && entry.lease.is_none()
+                    })
+                    .count();
+                if vacant_fences >= self.config.retained_context_capacity {
+                    return OperationReceipt::rejected(
+                        operation,
+                        OperationOutcome::ResourceExhausted,
+                        "backend reached its vacant context fence bound",
+                    );
+                }
+                state.contexts.insert(
+                    context,
+                    ContextEntry::absent(Arc::new(TaskStatusSource::new())),
+                );
+                state
+                    .contexts
+                    .get_mut(&context)
+                    .expect("new context")
+                    .retired_at = Some(now);
+                state
+                    .context_by_execution
+                    .insert(context.query_execution_id(), context);
+            }
+            let entry = state
+                .contexts
+                .get_mut(&context)
+                .expect("quiesce fence retains context");
+            if entry.quiesce.is_some() {
+                let receipt = entry
+                    .quiesce
+                    .clone()
+                    .expect("checked")
+                    .with_state(entry.state);
+                (receipt, OperationOutcome::Idempotent)
+            } else if matches!(
+                entry.state,
+                QueryContextState::Aborting
+                    | QueryContextState::Releasing
+                    | QueryContextState::TerminalRetained
+            ) {
+                return OperationReceipt::rejected(
+                    operation,
+                    OperationOutcome::ContextTerminalReceipt,
+                    "quiesce reached a context already closing without a normal fence",
+                );
+            } else {
+                entry.state = QueryContextState::Quiescing;
+                let receipt = QuiesceQueryContextReceipt::new(
+                    context,
+                    1,
+                    entry.accepted_identities(context),
+                    entry.state,
+                );
+                entry.quiesce = Some(receipt.clone());
+                entry.source.publish_quiesce(receipt.clone());
+                // A prepared create has already been accepted and therefore
+                // belongs to the immutable receipt, even before installation.
+                for task in entry.tasks.values() {
+                    if let TaskEntry::Creating(cell) = task {
+                        if cell.request_stop(PreparationStop::Cancel(
+                            novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+                        )) {
+                            if let Some(status) = cell.accepted_status() {
+                                status.advance(TaskState::Canceling, Some(TerminationDetail::Canceled(novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded)), TaskOutputFacts::default());
+                            }
+                        }
+                    }
+                }
+                state.pending_quiesce.insert(context);
+                self.task_host.close_context_admission(context);
+                self.admission_tickets.revoke_unredeemed(context, now);
+                self.gate.notify_all();
+                (receipt, OperationOutcome::Accepted)
+            }
+        };
+        OperationReceipt::acknowledged(operation, outcome, receipt)
+    }
+
     // ------------------------------------------------- release query context
 
     pub fn release_query_context(
@@ -2023,13 +2666,23 @@ impl TaskExecutionRegistry {
                 false,
             ),
             QueryContextState::Active => {
+                drop(state);
+                return OperationReceipt::rejected(
+                    operation,
+                    OperationOutcome::InvalidStateOrRequest,
+                    "normal release requires a quiesce fence",
+                );
+            }
+            QueryContextState::Quiescing => {
                 self.retire_locked(&mut state, now);
                 if self.release_ready_locked(&state, context) {
-                    let entry = state.contexts.get_mut(&context).expect("active context");
-                    let lease = entry.lease.expect("active context holds an indexed lease");
+                    let entry = state.contexts.get_mut(&context).expect("quiescing context");
+                    let lease = entry.lease;
                     entry.state = QueryContextState::Releasing;
-                    let removed = state.lease_expiry.remove(context, lease);
-                    assert!(removed, "releasing context must have an indexed lease");
+                    if let Some(lease) = lease {
+                        let removed = state.lease_expiry.remove(context, lease);
+                        assert!(removed, "releasing context must have an indexed lease");
+                    }
                     self.task_host.close_context_admission(context);
                     self.admission_tickets.revoke_unredeemed(context, now);
                     (ReleaseOutcome::Released, OperationOutcome::Accepted, true)
@@ -2226,13 +2879,19 @@ impl TaskExecutionRegistry {
     fn settle(&self) -> DeadlineSweep {
         let mut sweep = DeadlineSweep::default();
         for _ in 0..MAX_SETTLE_PASSES {
-            let fanouts = {
+            let (normal_fanouts, fanouts) = {
                 let mut state = self.state.lock().expect(REGISTRY_LOCK);
                 let now = self.clock.now();
                 sweep.leases_expired += self.expire_leases_locked(&mut state, now);
                 self.escalate_task_failures_locked(&mut state, now);
-                std::mem::take(&mut state.pending_termination)
+                (
+                    std::mem::take(&mut state.pending_quiesce),
+                    std::mem::take(&mut state.pending_termination),
+                )
             };
+            for context in &normal_fanouts {
+                self.stand_down_quiescing_tasks(*context);
+            }
             for context in &fanouts {
                 self.stand_down_tasks(*context);
             }
@@ -2241,13 +2900,14 @@ impl TaskExecutionRegistry {
                 let now = self.clock.now();
                 sweep.tasks_retired += self.retire_locked(&mut state, now);
                 self.complete_terminations_locked(&mut state, now);
+                self.expire_vacant_quiesce_locked(&mut state, now);
                 let (tasks, contexts) = self.reap_locked(&mut state, now);
                 sweep.tasks_reaped += tasks;
                 sweep.contexts_reaped += contexts;
                 self.enforce_capacity_locked(&mut state);
             }
             self.gate.notify_all();
-            if fanouts.is_empty() {
+            if fanouts.is_empty() && normal_fanouts.is_empty() {
                 break;
             }
         }
@@ -2288,7 +2948,9 @@ impl TaskExecutionRegistry {
                 current.is_some_and(|entry| {
                     matches!(
                         entry.state,
-                        QueryContextState::Establishing | QueryContextState::Active
+                        QueryContextState::Establishing
+                            | QueryContextState::Active
+                            | QueryContextState::Quiescing
                     ) && entry
                         .lease
                         .is_some_and(|lease| lease.expires_at() == deadline)
@@ -2317,7 +2979,9 @@ impl TaskExecutionRegistry {
         for (context, entry) in &state.contexts {
             if !matches!(
                 entry.state,
-                QueryContextState::Establishing | QueryContextState::Active
+                QueryContextState::Establishing
+                    | QueryContextState::Active
+                    | QueryContextState::Quiescing
             ) {
                 continue;
             }
@@ -2383,7 +3047,7 @@ impl TaskExecutionRegistry {
             if !matches!(entry.latch.latch(detail), LatchOutcome::Won) {
                 return false;
             }
-            self.task_host.close_context_admission(context);
+            self.task_host.abort_context_admission(context);
             entry.state = QueryContextState::Aborting;
             entry.terminating_since = Some(now);
             let installed_lease = entry.lease.take();
@@ -2420,8 +3084,41 @@ impl TaskExecutionRegistry {
     }
 
     /// Asks every non-terminal task of a terminating context to stand down.
+    fn stand_down_quiescing_tasks(&self, context: QueryContextRef) {
+        let targets = {
+            let state = self.state.lock().expect(REGISTRY_LOCK);
+            let Some(entry) = state.contexts.get(&context) else {
+                return;
+            };
+            if entry.state != QueryContextState::Quiescing {
+                return;
+            }
+            entry
+                .tasks
+                .values()
+                .filter_map(|task| match task {
+                    TaskEntry::Live(live) if !live.status.is_terminal() => {
+                        Some((Arc::clone(&live.status), Arc::clone(&live.runnable)))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for (status, runnable) in targets {
+            status.advance(
+                TaskState::Canceling,
+                Some(TerminationDetail::Canceled(
+                    novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+                )),
+                TaskOutputFacts::default(),
+            );
+            runnable.quiesce();
+        }
+    }
+
+    /// Asks every non-terminal task of a terminating context to stand down.
     fn stand_down_tasks(&self, context: QueryContextRef) {
-        let (targets, cause) = {
+        let (targets, preparing, cause) = {
             let state = self.state.lock().expect(REGISTRY_LOCK);
             let Some(entry) = state.contexts.get(&context) else {
                 return;
@@ -2440,8 +3137,27 @@ impl TaskExecutionRegistry {
                     _ => None,
                 })
                 .collect();
-            (targets, cause)
+            let preparing = entry
+                .tasks
+                .values()
+                .filter_map(|task| match task {
+                    TaskEntry::Creating(cell) => cell
+                        .accepted_status()
+                        .map(|status| (Arc::clone(cell), status)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (targets, preparing, cause)
         };
+        for (cell, status) in preparing {
+            if cell.request_stop(PreparationStop::Abort(cause)) {
+                status.advance(
+                    TaskState::Aborting,
+                    Some(TerminationDetail::Aborted(cause)),
+                    TaskOutputFacts::default(),
+                );
+            }
+        }
         for (status, runnable) in targets {
             status.advance(
                 TaskState::Aborting,
@@ -2495,6 +3211,12 @@ impl TaskExecutionRegistry {
                     })
                     .collect();
                 let mut retirements = Vec::with_capacity(ready.len());
+                let normal_context = matches!(
+                    entry.state,
+                    QueryContextState::Active
+                        | QueryContextState::Quiescing
+                        | QueryContextState::Releasing
+                );
                 for identity in ready {
                     let Some(TaskEntry::Live(live)) = entry.tasks.remove(&identity) else {
                         continue;
@@ -2503,15 +3225,28 @@ impl TaskExecutionRegistry {
                     live.status
                         .retire()
                         .expect("a retirement-ready live task can retire exactly once");
-                    if live.capability_installed {
-                        self.task_host.remove_inbound_capability(&live.descriptor);
-                        live.capability_installed = false;
-                    }
-                    if live.receiver_installed {
-                        self.task_host.remove_receiver(&live.descriptor);
-                        live.receiver_installed = false;
-                    }
                     let status = live.status.current();
+                    let normally_stopped = normal_context
+                        && matches!(status.state(), TaskState::Finished | TaskState::Canceled)
+                        && (status.state() == TaskState::Finished
+                            || matches!(
+                                status.termination(),
+                                Some(TerminationDetail::Canceled(_))
+                            ));
+                    if normally_stopped && live.capability_installed && live.receiver_installed {
+                        self.task_host.retire_receiver_normally(&live.descriptor);
+                        live.capability_installed = false;
+                        live.receiver_installed = false;
+                    } else {
+                        if live.capability_installed {
+                            self.task_host.remove_inbound_capability(&live.descriptor);
+                            live.capability_installed = false;
+                        }
+                        if live.receiver_installed {
+                            self.task_host.remove_receiver(&live.descriptor);
+                            live.receiver_installed = false;
+                        }
+                    }
                     let final_info = live.status.final_info();
                     let result_owner = live.prepared.sink_kind() == FragmentSinkKind::Result;
                     let bytes =
@@ -2616,6 +3351,28 @@ impl TaskExecutionRegistry {
                         entry.tasks.len(),
                     ));
             }
+            self.retain_context_terminal_locked(state, context, now);
+        }
+    }
+
+    /// A fence installed before Establish has no lease to drive cleanup. It
+    /// retains its original cut for the legal request horizon, then retires
+    /// without claiming any Task ever existed.
+    fn expire_vacant_quiesce_locked(&self, state: &mut RegistryState, now: MonotonicInstant) {
+        let expired: Vec<QueryContextRef> = state
+            .contexts
+            .iter()
+            .filter_map(|(context, entry)| {
+                (entry.state == QueryContextState::Quiescing
+                    && entry.lease.is_none()
+                    && entry.tasks.is_empty()
+                    && entry.retired_at.is_some_and(|since| {
+                        !self.config.request_horizon.must_retain_at(since, now)
+                    }))
+                .then_some(*context)
+            })
+            .collect();
+        for context in expired {
             self.retain_context_terminal_locked(state, context, now);
         }
     }
@@ -2797,6 +3554,9 @@ impl TaskExecutionRegistry {
             entry.tasks.clear();
             entry.clear_spent();
         }
+        // Gone is beyond the legal request horizon for protected normal-close
+        // records. Return their Accepted-time reservation at that transition.
+        self.task_host.forget_context_admission(context);
         state.gone_context_order.push_back(context);
     }
 
@@ -2836,8 +3596,21 @@ impl TaskExecutionRegistry {
                 state.task_index.remove(&identity);
             }
         }
+        let now = self.clock.now();
         while state.retired_context_order.len() > self.config.retained_context_capacity {
-            let Some(context) = state.retired_context_order.pop_front() else {
+            let Some(position) = state.retired_context_order.iter().position(|context| {
+                let Some(entry) = state.contexts.get(context) else {
+                    return true;
+                };
+                let Some(retired_at) = entry.retired_at else {
+                    return true;
+                };
+                !self.task_host.retains_normal_close(*context)
+                    || !self.config.request_horizon.must_retain_at(retired_at, now)
+            }) else {
+                break;
+            };
+            let Some(context) = state.retired_context_order.remove(position) else {
                 break;
             };
             self.reap_context_locked(state, context);
@@ -3102,11 +3875,10 @@ impl TaskExecutionRegistry {
 
 /// The creation transaction's rollback guard.
 ///
-/// A creation is atomic because every step before the last one is undoable and
-/// the last one is the only step that can start execution: the receiver, the
-/// inbound capability, and the reservation are removed in reverse on any
-/// failure, and `submit_runnable` either returns a handle — after which
-/// nothing can fail — or returns an error before execution starts.
+/// A creation is atomic because every step before the Live commit is undoable:
+/// the receiver, inbound capability, and reservation are removed in reverse
+/// on failure. `submit_runnable` returns a dormant handle or fails before
+/// execution starts; only `commit_creation` starts it after Live is installed.
 struct CreationTransaction<'a> {
     registry: &'a TaskExecutionRegistry,
     context: QueryContextRef,
@@ -3116,6 +3888,7 @@ struct CreationTransaction<'a> {
     receiver_installed: bool,
     capability_installed: bool,
     failure: Option<CreationFailure>,
+    stop: Option<PreparationStop>,
     committed: bool,
 }
 
@@ -3128,10 +3901,14 @@ impl CreationTransaction<'_> {
         detail: impl Into<String>,
     ) -> CreateTaskOutcome {
         let detail = detail.into();
-        self.failure = Some(CreationFailure {
+        let failure = CreationFailure {
             outcome,
             detail: detail.clone(),
-        });
+        };
+        if self.cell.accepted_status().is_some() {
+            self.stop = self.cell.claim_failure(failure.clone());
+        }
+        self.failure = Some(failure);
         OperationReceipt::rejected(operation, outcome, detail)
     }
 
@@ -3153,7 +3930,7 @@ impl CreationTransaction<'_> {
         {
             let mut state = self.registry.state.lock().expect(REGISTRY_LOCK);
             closed = state.context_state(self.context) != QueryContextState::Active;
-            if closed {
+            if closed && self.cell.accepted_status().is_none() {
                 let failure = CreationFailure {
                     outcome: OperationOutcome::ContextTerminalReceipt,
                     detail: "the query context closed while this task was being created".to_owned(),
@@ -3170,14 +3947,29 @@ impl CreationTransaction<'_> {
                 .tasks
                 .insert(self.identity, TaskEntry::Live(Box::new(live)));
             if !closed {
-                // The acknowledgement is the linearization point, so the
-                // first snapshot becomes observable exactly here.
+                if self.cell.stop().is_none() {
+                    status.note_installed();
+                }
+                // Installed is published under the same Context fence as
+                // the Live record and before any runnable may start.
                 status.release_to_observers();
             }
         }
         // Completion can race ahead of the creation transaction. It may run
         // only after the task is findable as Live, so an immediate terminal
         // fact cannot make a creating task disappear behind the transaction.
+        match self.cell.stop() {
+            Some(PreparationStop::Cancel(reason)) => runnable.cancel(reason),
+            Some(PreparationStop::Abort(cause)) => runnable.abort(cause),
+            None if closed => {
+                let cause = self
+                    .registry
+                    .termination_cause(self.context)
+                    .unwrap_or(AbortCause::QueryFailed);
+                runnable.abort(cause);
+            }
+            None => {}
+        }
         runnable.commit_creation();
         if closed {
             // The context already revoked new work. Close the submitted
@@ -3207,7 +3999,9 @@ impl Drop for CreationTransaction<'_> {
         if self.committed {
             return;
         }
-        if self.capability_installed {
+        // Accepted already reserved the late-frame record, even when
+        // preparation failed before the inbound capability was installed.
+        if self.capability_installed || self.cell.accepted_status().is_some() {
             self.registry
                 .task_host
                 .remove_inbound_capability(&self.descriptor);
@@ -3219,7 +4013,61 @@ impl Drop for CreationTransaction<'_> {
             outcome: OperationOutcome::InvalidStateOrRequest,
             detail: "the creation transaction did not complete".to_owned(),
         });
-        self.cell.fail(failure);
+        let accepted = self.cell.accepted_status();
+        if let Some(status) = &accepted {
+            if self.failure.is_none() && self.stop.is_none() {
+                self.stop = self.cell.claim_failure(failure.clone());
+            }
+            let reporter = TaskStatusReporter::new(Arc::clone(status));
+            let stop = self.stop.or_else(|| {
+                if self.failure.is_some() {
+                    None
+                } else {
+                    self.cell.stop()
+                }
+            });
+            match stop {
+                Some(PreparationStop::Cancel(reason)) => {
+                    reporter.canceling(reason);
+                    reporter.canceled(reason);
+                }
+                Some(PreparationStop::Abort(cause)) => {
+                    reporter.aborting(cause);
+                    reporter.aborted(cause);
+                }
+                None => {
+                    let category = if failure.outcome == OperationOutcome::ResourceExhausted {
+                        TaskFailureCategory::ResourceExhausted
+                    } else {
+                        TaskFailureCategory::Protocol
+                    };
+                    let detail =
+                        novarocks_execution_contract::SafeDetail::new(failure.detail.clone())
+                            .unwrap_or_else(|_| {
+                                novarocks_execution_contract::SafeDetail::new(
+                                    "task preparation failed",
+                                )
+                                .expect("fixed preparation detail is bounded")
+                            });
+                    let failure = novarocks_execution_contract::TaskFailure::new_in_phase(
+                        category,
+                        detail,
+                        novarocks_execution_contract::TaskFailurePhase::Preparation,
+                    );
+                    reporter.failing(failure.clone());
+                    reporter.failed(failure);
+                }
+            }
+            reporter.release_output();
+            reporter.note_actual_stopped();
+            reporter.note_resources_converged();
+            status
+                .retire()
+                .expect("a failed preparation has physically stopped");
+        } else {
+            self.cell.fail(failure);
+        }
+        let mut terminal_retained = None;
         {
             let mut state = self.registry.state.lock().expect(REGISTRY_LOCK);
             let removed = matches!(
@@ -3231,21 +4079,117 @@ impl Drop for CreationTransaction<'_> {
             );
             if removed {
                 if let Some(entry) = state.contexts.get_mut(&self.context) {
-                    entry.tasks.remove(&self.identity);
+                    if let Some(status) = &accepted {
+                        let current = status.current();
+                        let final_info = status.final_info();
+                        let receipt =
+                            CreateTaskReceipt::new(self.identity, Vec::new(), current.clone());
+                        let bytes =
+                            estimate_retained_bytes(&receipt, &current, final_info.as_ref());
+                        entry.tasks.insert(
+                            self.identity,
+                            TaskEntry::Retired(Box::new(RetiredTask {
+                                receipt,
+                                creation_failure: None,
+                                status: current,
+                                final_info,
+                                result_owner: false,
+                                retired_at: self.registry.clock.now(),
+                                bytes,
+                            })),
+                        );
+                        state.retained_tasks += 1;
+                        state.retained_bytes += bytes;
+                        state
+                            .retired_task_order
+                            .push_back((self.context, self.identity));
+                        terminal_retained = Some((bytes, status.current().state()));
+                    } else {
+                        entry.tasks.remove(&self.identity);
+                    }
                 }
-                state.task_index.remove(&self.identity);
+                if accepted.is_none() {
+                    state.task_index.remove(&self.identity);
+                }
                 state.active_tasks = state.active_tasks.saturating_sub(1);
             }
         }
-        self.registry
-            .counters
-            .creations_rolled_back
-            .fetch_add(1, Ordering::Relaxed);
+        if let Some((bytes, state)) = terminal_retained {
+            self.registry.ports.retire_task_result(self.identity);
+            self.registry
+                .ports
+                .observe(TaskProtocolEvent::task_terminal_retained(
+                    self.identity,
+                    state,
+                    bytes,
+                ));
+        } else {
+            self.registry
+                .counters
+                .creations_rolled_back
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.registry.gate.notify_all();
     }
 }
 
 // ------------------------------------------------------------ free functions
+
+fn map_create_status(
+    receipt: CreateTaskOutcome,
+) -> OperationReceipt<novarocks_execution_contract::TaskStatus> {
+    match receipt.acknowledgement() {
+        Some(acknowledgement) => OperationReceipt::acknowledged(
+            receipt.operation_id(),
+            receipt.outcome(),
+            acknowledgement.current_status().clone(),
+        ),
+        None => OperationReceipt::rejected(
+            receipt.operation_id(),
+            receipt.outcome(),
+            receipt
+                .detail()
+                .map_or("create was rejected", |detail| detail.as_str()),
+        ),
+    }
+}
+
+fn create_request_structural_bytes(request: &CreateTask) -> usize {
+    let mut bytes = std::mem::size_of::<CreateTask>()
+        .saturating_add(std::mem::size_of_val(
+            request.descriptor().split_plan_nodes(),
+        ))
+        .saturating_add(std::mem::size_of_val(request.initial_domains()));
+    let topology = request.descriptor().topology();
+    bytes = bytes
+        .saturating_add(std::mem::size_of_val(topology.outbound()))
+        .saturating_add(std::mem::size_of_val(topology.inbound()));
+    for edge in topology.outbound() {
+        bytes = bytes.saturating_add(std::mem::size_of_val(edge.destinations()));
+    }
+    for inbound in topology.inbound() {
+        bytes = bytes.saturating_add(std::mem::size_of_val(inbound.sources()));
+    }
+    for domain in request.initial_domains() {
+        let extra = match domain {
+            novarocks_execution_contract::TaskDomainUpdate::SplitAssignment(intent) => {
+                intent.payload().encoded_len()
+            }
+            novarocks_execution_contract::TaskDomainUpdate::TaskDynamicFilter {
+                payload, ..
+            } => payload.encoded_len(),
+            novarocks_execution_contract::TaskDomainUpdate::OpenExchangeEdges { edges, .. } => {
+                std::mem::size_of_val(edges.as_slice())
+            }
+            novarocks_execution_contract::TaskDomainUpdate::CloseExchangeDestination { .. } => {
+                std::mem::size_of::<novarocks_execution_contract::TaskIdentity>()
+                    + std::mem::size_of::<novarocks_execution_contract::ExchangeEdgeId>()
+            }
+        };
+        bytes = bytes.saturating_add(extra);
+    }
+    bytes
+}
 
 fn effective_wait(
     caps: crate::OperationWaitCaps,

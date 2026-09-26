@@ -82,6 +82,7 @@ pub use nljoin::{NlJoinBuildSinkFactory, NlJoinProbeProcessorFactory};
 pub use noop_sink::NoopSinkFactory;
 pub use project_processor::ProjectProcessorFactory;
 pub use repeat_processor::RepeatProcessorFactory;
+pub(crate) use repeat_processor::repeat_output_chunk_schema;
 pub use result_buffer_sink::ResultBufferSinkFactory;
 #[cfg(test)]
 pub(crate) use result_sink::{ResultSinkFactory, ResultSinkHandle};

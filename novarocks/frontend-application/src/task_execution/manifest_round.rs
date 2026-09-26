@@ -24,28 +24,28 @@ use novarocks_query_application::api::{
     NativeAttemptConvergence, NativeAttemptPreparationFailure, NativeAttemptTerminal,
     NativeContextConvergence, QueryExecutionError, QueryExecutionErrorKind,
 };
-use novarocks_query_application::coordination::DispatchBudget;
 use novarocks_query_application::coordination::{
     AcceptedRootStatusSource, AttemptFailureClass, NativeAttemptDrive,
     ReplacementWorkerAdmissionEvidence,
 };
+use novarocks_query_application::coordination::{DispatchBudget, OperationDispatchResult};
 use novarocks_task_codec::TransportBudget;
 use novarocks_workload_control::{CancellationReason, CancellationView};
 
 use super::abort_effect::NativeAbortEffectIntake;
 use super::actor_gate::{ActorGateOwner, ActorGatedTaskOperationSink};
-use super::clock::ProcessMonotonicClock;
+use super::clock::{ProcessMonotonicClock, TaskProtocolClock};
 use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::QueryTaskExecution;
 use super::graph::build_task_graph_from_manifest;
 use super::intent::TaskOperationSink;
-use super::round::{AcknowledgementObserver, StatusSubscriptions, TaskRound, TurnPump};
+use super::round::{AcknowledgementObserver, TaskRound, TurnPump};
 use super::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
 use super::split_transport::SplitDeliveryBridge;
-use super::status_intake::{NotifyWake, StatusIntake, StatusIntakeWake};
+use super::status_intake::{NotifyWake, ObservationIntake, StatusIntake, StatusIntakeWake};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::task_transport::{
-    AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskStatusSubscriber,
+    AttemptWireFacts, CoveredTaskStatusSubscriber, NativeTaskOperationSink, TaskAckIntake,
 };
 use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmission};
 use crate::query_execution::split_assignment::TaskUpdateTransport;
@@ -89,6 +89,7 @@ pub(crate) struct ManifestAssembledRound {
     terminal: Option<NativeAttemptTerminal>,
     pending_terminal: Option<NativeAttemptTerminal>,
     convergence_started: bool,
+    convergence_cleanup_started: bool,
 }
 
 /// The completion fact this Task owner must wait for before it reports the
@@ -120,6 +121,7 @@ pub(crate) fn assemble_manifest_round(
 
     let mut backends = Vec::with_capacity(manifest.contexts().len());
     let mut admission_epochs = BTreeMap::new();
+    let mut preparing_positions = BTreeMap::new();
     let mut convergence_targets = Vec::with_capacity(manifest.contexts().len());
     for context in manifest.contexts() {
         let backend = context.backend();
@@ -130,6 +132,10 @@ pub(crate) fn assemble_manifest_round(
             )));
         }
         backends.push((backend.process_id(), backend.endpoint().clone()));
+        preparing_positions.insert(
+            backend.process_id(),
+            backend.target().descriptor().preparing_positions(),
+        );
         convergence_targets.push(ManifestConvergenceTarget {
             context: context.context(),
             process: backend.process_id(),
@@ -165,10 +171,20 @@ pub(crate) fn assemble_manifest_round(
     let sink = split_delivery.sink(Arc::new(actor_sink) as Arc<dyn TaskOperationSink>);
 
     let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
-    let subscriber = Arc::new(
-        TaskStatusSubscriber::new(
+    let clock = Arc::new(ProcessMonotonicClock::new()) as Arc<dyn TaskProtocolClock>;
+    let observation = Arc::new(
+        ObservationIntake::for_task_attempt(Arc::clone(&wake), Arc::clone(&clock)).map_err(
+            |error| {
+                TaskExecutionError::Schedule(format!(
+                    "covered observation capacity is invalid: {error:?}"
+                ))
+            },
+        )?,
+    );
+    let covered_subscriber = Arc::new(
+        CoveredTaskStatusSubscriber::new(
             &backends,
-            intake.handle(),
+            Arc::clone(&observation),
             transport.status_subscription_error_budget,
             transport.data_runtime,
         )
@@ -180,18 +196,20 @@ pub(crate) fn assemble_manifest_round(
         transport.transport_budget,
         transport.wire.native_compatibility_id,
         &admission_epochs,
-        Arc::new(ProcessMonotonicClock::new()),
+        &preparing_positions,
+        clock,
         sink,
         intake,
     )?;
     if let Some(admissions) = replacement_admissions {
         execution.adopt_replacement_admissions(admissions)?;
     }
-    let round = TaskRound::new(
+    let round = TaskRound::new_covered(
         execution,
         acks,
         Box::new(establish),
-        subscriber as Arc<dyn StatusSubscriptions>,
+        covered_subscriber,
+        observation,
     )
     .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>)
     .observing(actor_observer)
@@ -206,6 +224,7 @@ pub(crate) fn assemble_manifest_round(
         terminal: None,
         pending_terminal: None,
         convergence_started: false,
+        convergence_cleanup_started: false,
     })
 }
 
@@ -311,7 +330,22 @@ impl ManifestAssembledRound {
                     false
                 }
             };
-            if self.pending_terminal.is_some() {
+            let success_sealed = completion == ManifestAttemptCompletion::AcceptedRootSuccessSeal
+                && self.round.accepted_root_success_sealed();
+            if success_sealed {
+                if let Some(residual) = self.pending_terminal.take() {
+                    tracing::warn!(
+                        ?residual,
+                        "Task failure after the accepted root seal belongs to cleanup"
+                    );
+                }
+                if self.actor_gate.prepare_convergence() {
+                    let terminal = NativeAttemptTerminal::Completed;
+                    self.terminal = Some(terminal.clone());
+                    return terminal;
+                }
+            }
+            if !success_sealed && self.pending_terminal.is_some() {
                 // A Task-protocol failure is already an authoritative attempt
                 // terminal. Closing the actor gate prevents any further
                 // admission, but outstanding actor-owned transport effects
@@ -326,7 +360,7 @@ impl ManifestAssembledRound {
                 self.terminal = Some(terminal.clone());
                 return terminal;
             }
-            if let Some(detail) = self.round.failure_cause() {
+            if !success_sealed && let Some(detail) = self.round.failure_cause() {
                 // Derived peer failure is a placeholder. The same TaskRound
                 // remains live until the originating Worker publishes the
                 // authoritative cause, so recovery classification never fixes
@@ -357,7 +391,8 @@ impl ManifestAssembledRound {
                 self.terminal = Some(terminal.clone());
                 return terminal;
             }
-            if let Some(reason) = cancellation.reason()
+            if !success_sealed
+                && let Some(reason) = cancellation.reason()
                 && self.actor_gate.prepare_convergence()
             {
                 let terminal = cancellation_failure(reason);
@@ -369,7 +404,7 @@ impl ManifestAssembledRound {
             }
             tokio::select! {
                 _ = notified => {}
-                reason = cancellation.cancelled() => {
+                reason = cancellation.cancelled(), if !success_sealed => {
                     if self.actor_gate.prepare_convergence() {
                         let terminal = cancellation_failure(reason);
                         self.terminal = Some(terminal.clone());
@@ -387,15 +422,31 @@ impl ManifestAssembledRound {
     /// release. Cancellation and unobservability are never closure evidence.
     pub(crate) async fn converge(
         &mut self,
-        _cancellation: CancellationView,
+        cancellation: CancellationView,
     ) -> NativeAttemptConvergence {
         if !self.convergence_started {
-            self.round.begin_terminal_cleanup();
-            self.split_delivery
-                .abandon("Native attempt entered convergence");
+            begin_convergence(
+                &mut self.round,
+                &self.split_delivery,
+                self.terminal.as_ref(),
+            );
+            self.convergence_cleanup_started =
+                !matches!(self.terminal, Some(NativeAttemptTerminal::Completed));
             self.convergence_started = true;
         }
         loop {
+            if !self.convergence_cleanup_started
+                && (cancellation.reason().is_some() || self.round.failure_cause().is_some())
+            {
+                tracing::warn!(
+                    terminal = ?self.terminal,
+                    cancellation = ?cancellation.reason(),
+                    failure = ?self.round.failure_cause(),
+                    "Native convergence entered terminal cleanup after a late cancellation or Task failure"
+                );
+                begin_terminal_cleanup(&mut self.round, &self.split_delivery);
+                self.convergence_cleanup_started = true;
+            }
             if self.round.attempt_drained() {
                 return NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced();
             }
@@ -406,7 +457,23 @@ impl ManifestAssembledRound {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let moved = self.round.turn().is_ok_and(|report| !report.is_idle());
+            let moved = match self.round.turn() {
+                Ok(report) => !report.is_idle(),
+                Err(error) => {
+                    if !self.convergence_cleanup_started {
+                        tracing::warn!(
+                            terminal = ?self.terminal,
+                            error = %error,
+                            "Native convergence Task turn failed before cleanup"
+                        );
+                    }
+                    if !self.convergence_cleanup_started {
+                        begin_terminal_cleanup(&mut self.round, &self.split_delivery);
+                        self.convergence_cleanup_started = true;
+                    }
+                    false
+                }
+            };
             if moved {
                 continue;
             }
@@ -457,11 +524,46 @@ impl ManifestAssembledRound {
     }
 }
 
+/// Successful root sealing fixes the client-visible result before upstream
+/// tasks necessarily stop. Keep their status streams and context lifecycle
+/// live until the exact terminal statuses can authorize Release.
+pub(super) fn begin_convergence(
+    round: &mut TaskRound,
+    split_delivery: &SplitDeliveryBridge,
+    terminal: Option<&NativeAttemptTerminal>,
+) {
+    if matches!(terminal, Some(NativeAttemptTerminal::Completed)) {
+        round.begin_normal_drain();
+        split_delivery.abandon("Native attempt entered normal drain");
+    } else {
+        begin_terminal_cleanup(round, split_delivery);
+    }
+}
+
+fn begin_terminal_cleanup(round: &mut TaskRound, split_delivery: &SplitDeliveryBridge) {
+    round.begin_terminal_cleanup();
+    split_delivery.abandon("Native attempt entered convergence");
+}
+
 fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
     let (class, kind) = match &error {
         TaskExecutionError::Capacity(_) => (
             AttemptFailureClass::ResourceGovernance,
             QueryExecutionErrorKind::Rejected,
+        ),
+        TaskExecutionError::DispatchRejected {
+            result: OperationDispatchResult::IngressRejected(_),
+            ..
+        } => (
+            AttemptFailureClass::ResourceGovernance,
+            QueryExecutionErrorKind::Rejected,
+        ),
+        TaskExecutionError::DispatchRejected {
+            result: OperationDispatchResult::NonWorkerRejected,
+            ..
+        } => (
+            AttemptFailureClass::ContractViolation,
+            QueryExecutionErrorKind::InvalidRequest,
         ),
         TaskExecutionError::ParticipantUnobservable {
             state: ParticipantObservationFailure::IdentityViolation(_),
@@ -515,6 +617,244 @@ fn cancellation_failure(reason: CancellationReason) -> NativeAttemptTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct UnusedConvergenceSource;
+
+    impl novarocks_query_application::api::BackendProcessObservationPort for UnusedConvergenceSource {
+        fn observe_process_at_endpoint(
+            &self,
+            _: novarocks_types::BackendProcessId,
+            _: &novarocks_execution::runtime::endpoint::RuntimeEndpoint,
+        ) -> Result<BackendProcessObservation, novarocks_query_application::api::BackendTopologyError>
+        {
+            panic!("attempt terminal arbitration must not inspect residual convergence");
+        }
+    }
+
+    async fn terminal_regression_drive(
+        context: novarocks_execution_contract::QueryContextRef,
+    ) -> (
+        novarocks_query_application::test_support::LogicalExecutionTestHarness,
+        NativeAttemptDrive,
+        CancellationView,
+        novarocks_workload_control::WorkCancellationRequester,
+        super::super::abort_effect::NativeAbortEffectIntake,
+    ) {
+        use novarocks_query_application::coordination::{
+            AbortQueryContextEffectPort, ExecutionEffect, LogicalExecutionActorConfig,
+        };
+        use novarocks_query_application::test_support::LogicalExecutionTestHarness;
+        use novarocks_workload_control::{
+            ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        };
+        use std::num::NonZeroUsize;
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 10,
+                per_scope_bytes: (1 << 20) - (1 << 10),
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let governed = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let cancellation = governed.owner.scope().cancellation().unwrap();
+        let requester = governed.owner.cancellation_requester();
+        let execution_stage = governed
+            .owner
+            .scope()
+            .try_acquire(Stage::Execution)
+            .unwrap();
+        let (adapter, intake) = super::super::abort_effect::NativeAbortEffectAdapter::bounded(
+            NonZeroUsize::new(2).unwrap(),
+            Arc::new(super::super::status_intake::CountingWake::default()),
+        );
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
+            context.query_execution_id(),
+            ExecutionEffect::None,
+            NonZeroUsize::new(2).unwrap(),
+            vec![context],
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            governed.owner,
+            execution_stage,
+        )
+        .unwrap()
+        .with_abort_query_context_effect_port(
+            adapter as Arc<dyn AbortQueryContextEffectPort>,
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let mut logical = LogicalExecutionTestHarness::install(
+            tokio::runtime::Handle::current(),
+            config,
+            context.query_execution_id(),
+            vec![context],
+        )
+        .unwrap();
+        logical.activate_initial().await.unwrap();
+        let drive = logical.native_attempt_drive();
+        (logical, drive, cancellation, requester, intake)
+    }
+
+    #[derive(Debug)]
+    struct BackpressuredGateTransport;
+
+    impl TaskOperationSink for BackpressuredGateTransport {
+        fn try_reserve_queue(
+            &self,
+            _: super::super::intent::TaskOperationQueueRequest,
+        ) -> super::super::intent::TaskOperationQueueAdmission {
+            super::super::intent::TaskOperationQueueAdmission::Admitted(
+                super::super::intent::test_queue_permit(),
+            )
+        }
+
+        fn try_submit(
+            &self,
+            batch: super::super::intent::DispatchBatch,
+        ) -> super::super::intent::TaskOperationSubmit {
+            super::super::intent::TaskOperationSubmit::Backpressured(batch)
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_root_seal_wins_residual_native_advance_error_before_reply_consumption() {
+        use super::super::intent::OperationAcknowledgement;
+        use novarocks_execution::task_execution::{OperationKind, TaskOperationId};
+        for (accept_before_error, cancel_with_pending_gate) in
+            [(true, false), (false, false), (true, true)]
+        {
+            let (mut round, acks) = super::super::tests::manifest_terminal_regression_fixture();
+            let context = *round.execution().graph().contexts().next().unwrap();
+            let (mut logical, drive, cancellation, requester, _abort_intake) =
+                terminal_regression_drive(context).await;
+            let source = round.take_root_status_source().unwrap();
+            let mut reply = source.begin_success_seal_request().unwrap();
+            if accept_before_error {
+                round.turn().unwrap();
+                assert!(round.accepted_root_success_sealed());
+            }
+            // This Native ACK is deliberately not a sent operation. It takes
+            // the actual advance error path before run inspects the seal; the
+            // result pump still holds its unread seal reply throughout run.
+            acks.publish(OperationAcknowledgement::transport_unknown(
+                TaskOperationId::new_v7(),
+                OperationKind::UpdateTask,
+            ));
+            let (sink, actor_gate, _) = ActorGatedTaskOperationSink::pair(
+                Arc::new(BackpressuredGateTransport),
+                Arc::new(super::super::status_intake::CountingWake::default()),
+                novarocks_types::NativeCompatibilityId::new([0x41; 32]),
+            );
+            let cancellation_after_gate_closes = if cancel_with_pending_gate {
+                use super::super::intent::{DispatchBatch, OperationIntent, TaskOperationSubmit};
+                use novarocks_execution::task_execution::{
+                    AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
+                };
+                use novarocks_query_application::coordination::DispatchLane;
+                let operation = OperationIntent::AcquireQueryContextAdmissionTicket(
+                    AcquireQueryContextAdmissionTicket::new(
+                        TaskOperationId::new_v7(),
+                        context,
+                        LeaseValidFor::new(std::time::Duration::from_secs(30)).unwrap(),
+                        novarocks_types::NativeCompatibilityId::new([0x41; 32]),
+                        AdmissionEpochCapability::try_from_bytes([9; 16]).unwrap(),
+                    ),
+                );
+                let bytes = operation.queue_request().queued_bytes();
+                let batch = DispatchBatch::test_fixture(
+                    context.backend_process_id(),
+                    DispatchLane::Lifecycle,
+                    vec![operation],
+                    bytes,
+                );
+                let TaskOperationSubmit::Backpressured(mut retained) = sink.try_submit(batch)
+                else {
+                    panic!("actor authorization must retain the unsent carrier");
+                };
+                Some(tokio::spawn(async move {
+                    loop {
+                        tokio::task::yield_now().await;
+                        match sink.try_submit(retained) {
+                            TaskOperationSubmit::Backpressured(batch) => retained = batch,
+                            TaskOperationSubmit::Rejected { reason, .. } => {
+                                assert!(reason.contains("closing"));
+                                // This rejection removes the authorized carrier only
+                                // after run's first convergence attempt returned false.
+                                requester.request(CancellationReason::Requested).unwrap();
+                                break;
+                            }
+                            other => panic!("unsent carrier unexpectedly escaped: {other:?}"),
+                        }
+                    }
+                }))
+            } else {
+                None
+            };
+            let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
+            let mut assembled = ManifestAssembledRound {
+                round,
+                split_delivery,
+                actor_gate,
+                convergence_source: Arc::new(UnusedConvergenceSource),
+                convergence_targets: Box::new([]),
+                notify: Arc::new(tokio::sync::Notify::new()),
+                terminal: None,
+                pending_terminal: None,
+                convergence_started: false,
+                convergence_cleanup_started: false,
+            };
+            let terminal = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                assembled.run(
+                    &drive,
+                    cancellation,
+                    ManifestAttemptCompletion::AcceptedRootSuccessSeal,
+                ),
+            )
+            .await
+            .expect("terminal arbitration must finish without residual cleanup");
+            if let Some(release) = cancellation_after_gate_closes {
+                release.await.unwrap();
+            }
+            if accept_before_error {
+                assert!(matches!(terminal, NativeAttemptTerminal::Completed));
+                assert_eq!(reply.try_recv().unwrap(), Ok(()));
+            } else {
+                assert!(matches!(terminal, NativeAttemptTerminal::Failed(_)));
+                assert!(!assembled.round.accepted_root_success_sealed());
+                assert!(!matches!(reply.try_recv(), Ok(Ok(()))));
+            }
+            drop(assembled);
+            drop(drive);
+            logical.abandon_running_attempt();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while logical
+                    .stand_down_snapshot(context)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // This closes only the fixture actor's residual scope during
+            // explicit teardown, after the terminal assertions above.
+            logical
+                .observe_worker_process_replaced(context)
+                .await
+                .unwrap();
+            logical
+                .finish_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+        }
+    }
 
     #[test]
     fn foreign_status_identity_violation_refuses_attempt_recovery() {

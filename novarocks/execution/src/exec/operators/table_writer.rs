@@ -17,7 +17,7 @@
 
 //! The `TableWriter` operator: one writer per pipeline driver.
 //!
-//! `bind_runtime_state` starts a task-local actor which opens the driver's own
+//! `activate` starts a task-local actor which opens the driver's own
 //! [`ConnectorBatchWriter`](novarocks_spi::connector::write_stack::ConnectorBatchWriter)
 //! with a physical context that includes that driver's
 //! id. Nothing is shared between drivers: the append path takes no cross-driver
@@ -64,6 +64,7 @@ use crate::exec::node::table_write_relation::{
 };
 use crate::exec::node::table_writer::{
     TableWriterInputProjection, TableWriterNode, TableWriterPhysicalContextTemplate,
+    TableWriterRuntimeBinding,
 };
 use crate::exec::operators::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
@@ -107,6 +108,62 @@ pub struct TableWriterOperatorFactory {
 }
 
 impl TableWriterOperatorFactory {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "A local writer joins frozen facts and exact Task capabilities"
+    )]
+    pub(crate) fn try_new_local(
+        node_id: i32,
+        target: WriteTargetOrdinal,
+        expected_schema: arrow::datatypes::SchemaRef,
+        projection: TableWriterInputProjection,
+        writer_multiplex_schema: WriterMultiplexRelationSchema,
+        partial_aggregate_calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
+        binding: &TableWriterRuntimeBinding,
+        function_set: Arc<SealedExecutionFunctionSet>,
+    ) -> Result<Self, String> {
+        if binding.execution.catalog_handle() != binding.handle.binding().catalog_handle() {
+            return Err(
+                "table writer catalog handle does not match its query-leased write execution"
+                    .to_string(),
+            );
+        }
+        if projection.schema().as_ref() != expected_schema.as_ref() {
+            return Err(
+                "table writer input projection does not produce the expected writer schema"
+                    .to_string(),
+            );
+        }
+        let partial_aggregate_factory = build_partial_aggregate_factory(
+            node_id,
+            partial_aggregate_calls,
+            &writer_multiplex_schema,
+            function_set,
+        )?;
+        let name = if node_id >= 0 {
+            format!("TABLE_WRITER (id={node_id})")
+        } else {
+            "TABLE_WRITER".to_string()
+        };
+        Ok(Self {
+            name,
+            plan: Arc::new(TableWriterPlan {
+                handle: binding.handle.clone(),
+                target,
+                execution: Arc::clone(&binding.execution),
+                expected_schema,
+                projection,
+                physical_template: binding.physical_template,
+                request_context: binding.request_context.clone(),
+                fragment_encoder: Arc::clone(&binding.fragment_encoder),
+                writer_multiplex_schema,
+                partial_aggregate_factory,
+                #[cfg(debug_assertions)]
+                aggregate_guard: Arc::clone(&binding.aggregate_guard),
+            }),
+        })
+    }
+
     /// Construct a composite writer with the exact process function set used
     /// to bind every ordinary partial aggregate in its typed tail.
     pub fn try_new(
@@ -118,7 +175,12 @@ impl TableWriterOperatorFactory {
         } else {
             "TABLE_WRITER".to_string()
         };
-        let partial_aggregate_factory = build_partial_aggregate_factory(node, function_set)?;
+        let partial_aggregate_factory = build_partial_aggregate_factory(
+            node.node_id,
+            &node.partial_aggregate_plan().calls,
+            node.writer_multiplex_schema(),
+            function_set,
+        )?;
         Ok(Self {
             name,
             plan: Arc::new(TableWriterPlan {
@@ -140,10 +202,11 @@ impl TableWriterOperatorFactory {
 }
 
 fn build_partial_aggregate_factory(
-    node: &TableWriterNode,
+    node_id: i32,
+    calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
+    writer_multiplex_schema: &WriterMultiplexRelationSchema,
     function_set: Arc<SealedExecutionFunctionSet>,
 ) -> Result<Option<AggregateProcessorFactory>, String> {
-    let calls = &node.partial_aggregate_plan().calls;
     if calls.is_empty() {
         return Ok(None);
     }
@@ -178,8 +241,7 @@ fn build_partial_aggregate_factory(
             order: Default::default(),
         });
         resolved.push(call.resolved.clone());
-        let output_slot = node
-            .writer_multiplex_schema()
+        let output_slot = writer_multiplex_schema
             .chunk_schema()
             .slot(call.intermediate_slot_id)
             .cloned()
@@ -201,7 +263,7 @@ fn build_partial_aggregate_factory(
     }
     let output_chunk_schema = Arc::new(ChunkSchema::try_new(output_slots)?);
     AggregateProcessorFactory::new_native(
-        node.node_id,
+        node_id,
         Arc::new(arena),
         Vec::new(),
         functions,
@@ -477,6 +539,13 @@ impl Operator for TableWriterOperator {
             self.state = TableWriterState::Failed;
             return Err(error);
         }
+        Ok(())
+    }
+
+    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+        if let Some(partial) = self.partial_aggregate.as_mut() {
+            partial.activate(state)?;
+        }
         let result = state
             .sink_io_executor()
             .and_then(|executor| self.writer.bind(executor, state.error_state()));
@@ -534,10 +603,11 @@ impl Operator for TableWriterOperator {
             TableWriterState::Draining => {
                 self.partial_child_finished()
                     && !self.partial_output_available()
-                    && !self.writer.is_done()
+                    && (!self.writer.is_done() || !self.writer.actor_exited())
             }
-            TableWriterState::Aborting => !self.writer.is_done(),
-            _ => false,
+            TableWriterState::Aborting => !self.writer.is_done() || !self.writer.actor_exited(),
+            TableWriterState::Failed | TableWriterState::Finished => !self.writer.actor_exited(),
+            TableWriterState::Open | TableWriterState::Producing => false,
         }
     }
 
@@ -1372,7 +1442,8 @@ pub(crate) mod tests {
         operator.prepare().expect("prepare");
         operator
             .bind_runtime_state(state)
-            .expect("bind writer actor");
+            .expect("bind writer state");
+        operator.activate(state).expect("activate writer actor");
     }
 
     fn wait_for_output(
@@ -2093,6 +2164,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn prepared_writer_does_not_open_provider_until_activation() {
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
+        let factory = writer_factory(&writer_node(execution));
+        let mut operator = factory.create(1, 0);
+        let state = test_runtime_state();
+
+        operator.prepare().expect("prepare writer");
+        operator.bind_runtime_state(&state).expect("bind writer");
+        assert_eq!(stats.opened.load(Ordering::Acquire), 0);
+
+        operator.activate(&state).expect("activate writer");
+        assert!(poll_until(
+            || stats.opened.load(Ordering::Acquire) == 1,
+            Duration::from_secs(5)
+        ));
+        operator.cancel();
+        assert!(poll_until(
+            || !operator.pending_finish(),
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn prepared_writer_abort_does_not_wait_for_an_unstarted_actor() {
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
+        let factory = writer_factory(&writer_node(execution));
+        let mut operator = factory.create(1, 0);
+        let state = test_runtime_state();
+
+        operator.prepare().expect("prepare writer");
+        operator.bind_runtime_state(&state).expect("bind writer");
+        operator.cancel();
+
+        assert_eq!(stats.opened.load(Ordering::Acquire), 0);
+        assert!(operator.is_finished());
+        assert!(!operator.pending_finish());
+    }
+
+    #[test]
     fn table_writer_opens_one_independent_writer_per_driver() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
@@ -2162,6 +2274,7 @@ pub(crate) mod tests {
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
+        operator.activate(&state).expect("activate");
         ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![7, 11]))
             .expect("push projected page");
         assert_eq!(
@@ -2385,6 +2498,7 @@ pub(crate) mod tests {
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
+        operator.activate(&state).expect("activate");
 
         ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![1, 2]))
             .expect("first input page");
@@ -2503,6 +2617,7 @@ pub(crate) mod tests {
         let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
+        operator.activate(&state).expect("activate");
         assert!(poll_until(
             || stats.opened.load(Ordering::Relaxed) == 1,
             Duration::from_secs(5)
@@ -2588,6 +2703,7 @@ pub(crate) mod tests {
         let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
+        operator.activate(&state).expect("activate");
         assert!(poll_until(
             || stats.opened.load(Ordering::Relaxed) == 1,
             Duration::from_secs(5)
@@ -2832,6 +2948,7 @@ pub(crate) mod tests {
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
+        operator.activate(&state).expect("activate");
         ProcessorOperator::set_finishing(&mut operator, &state).expect("request finish");
 
         assert!(poll_until(
@@ -2973,6 +3090,7 @@ pub(crate) mod tests {
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
+        operator.activate(&state).expect("activate");
 
         ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![1]))
             .expect("first page");
@@ -3169,6 +3287,33 @@ pub(crate) mod tests {
         assert_eq!(error, "injected fragment cancellation");
         waiter.join().expect("completion waiter");
         assert_eq!(memory.current(), 0);
+    }
+
+    #[test]
+    fn terminal_writer_keeps_pending_finish_until_actor_handle_exits() {
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution = Arc::new(TestWriteExecution::new(stats));
+        let mut writer = writer_factory(&writer_node(execution)).create_operator(1, 0);
+        let runtime_state = test_runtime_state_with_mem(None);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let actor_gate = Arc::clone(&gate);
+        let actor = runtime_state
+            .sink_io_executor()
+            .expect("sink-I/O executor")
+            .spawn(async move {
+                let permit = actor_gate.acquire().await.expect("actor exit gate");
+                permit.forget();
+            });
+        writer.writer.install_terminal_actor_for_test(actor);
+        writer.state = TableWriterState::Finished;
+
+        assert!(writer.is_finished(), "semantic output has finished");
+        assert!(writer.pending_finish(), "live actor prevents actual stop");
+        gate.add_permits(1);
+        assert!(poll_until(
+            || !writer.pending_finish(),
+            Duration::from_secs(5)
+        ));
     }
 
     #[test]

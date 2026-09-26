@@ -17,9 +17,9 @@
 
 //! The Trino-aligned connector read stack.
 //!
-//! This module owns the transport-neutral vocabulary every provider read uses:
-//! typed values and predicates, handles, splits and their weights, lazy split
-//! enumeration, page production, dynamic filters, and system relations.
+//! Pure typed values and predicates come from `novarocks-connector-contract`.
+//! This module owns handles, splits and their weights, lazy split enumeration,
+//! page production, dynamic filters, and system relations.
 //!
 //! It deliberately contains no provider name, no generated wire DTO, no
 //! opaque payload, and no downcast. Concrete provider facts that cross the

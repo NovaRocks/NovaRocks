@@ -3129,6 +3129,7 @@ mod tests {
             "test-deployment",
             "test-build",
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            4096,
         )
         .expect("test descriptor");
         BackendTopologySnapshot::try_new(

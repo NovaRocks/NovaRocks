@@ -7,6 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-09-24
 provenance:
+  - "accepted design: UEA-5D v6, 2026-09-24; local implementation receipt pending"
   - "discussion: 2026-09-20 to 2026-09-23 frozen task creation carriers and identity replay"
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/1077"
 code-anchors:
@@ -47,7 +48,7 @@ Frontend 的创建载荷有独立于 Task 状态的生命周期（`CreationRepla
 | `Unfrozen` | move-only seed 与至多一次求得的精确长度 | 建图完成；等待期间多轮背压不再重算长度、不编码 |
 | `Frozen` | 一次冻结的 metadata bytes 与共享静态 bytes | 本次准入已为其精确长度预留容量；此后每次发送、未知结果后的重发都交出同一 `Arc` |
 | `Settled` | 无 | 准确关联的成功 ACK；载荷随之释放 |
-| `Closed` | 无 | Task 终态或创建失败关闭；先关派发再清理，迟到 ACK 以 `UnknownOperation` 结束，不能复活载荷 |
+| `Closed` | 无 | 正常局部 stand-down、Task 终态或拒绝后停止重投并释放无用途 replay body；保留有界身份清理责任，晚 Accepted 转正常停止，不能复活输入或 Create |
 
 准入轮按候选顺序进行：lifecycle 先于 create/update，create/update 按 stage 与 task 顺序。目标窗口满只跳过该目标的后续候选；process 窗口或 attempt 总量满结束本轮；被跳过的候选既不定价也不冻结，也不越过同目标的先行者。单请求固有上限（静态计划加 assignment 的描述符上限、单操作上限）在建图或准入时作为确定性错误出现，不是背压。
 
@@ -55,17 +56,21 @@ Backend 的选主只按 identity 与生命周期，不看请求体：
 
 | identity 状态 | 回答 |
 |---|---|
-| 不存在，Context 可准入 | 预留 `Creating`，本请求成为本轮 winner |
-| `Creating` | 在本请求自己的期限内等待该轮结果；不抢占、不提前回答 |
-| `Live` / `Retired`，已创建 | `Idempotent`，原实体 receipt，关联到本次 operation id |
-| `Live` / `Retired`，创建失败 | 该轮固定的创建失败 |
-| `Gone`、已 spent、Context 已关闭或已回收 | 终态回答，永不重新创建 |
+| 不存在，Context 为 Active 且短 preflight/单 Task 容量足够 | 原子登记 Accepted 身份、预留有界准备资源并进入 Context FIFO，随后才解码、lower、bind |
+| Accepted / Preparing | `Idempotent`，同一实体的当前单调状态；不等待昂贵准备、不重新解释请求 |
+| Installed / Live / Retired | `Idempotent`，原实体当前状态，关联本次 operation id |
+| Accepted 后准备失败 | 保留原身份与准备 phase 失败，`installed=false`；重放不重建 |
+| Gone / spent，或全新 identity 所在 Context 已关闭 | 终态拒绝，永不重新创建；已接管身份仍由保留记录回答 |
 
-只有 winner 被解释：初始 domain 的 membership 在 winner 取得预留之后、任何安装之前检查，失败走事务 abandon；静态计划只由 winner 的 Native host 解码一次，frozen header、DOP 域、scan 节点成员与 sink 边绑定在注册 receiver 前全部校验。被拒的一轮完整回滚，预留移除后，仍在等待的请求或后到请求可以赢得下一轮。`existing_create_reply` 是已存在 identity 的唯一回答函数，Live、Retired、Gone 与 Context 关闭后的保留记录都经它回答，改这类路径前先读它。
+Installed 是成功完成初始 domains、assignment、receiver/capability 安装的历史事实，Accepted ACK 只证明 Worker 已接管。只有 winner 解释载体；Accepted 之后失败不回退为 Absent。短期 PreparationBusy 和长期 ResourceExhausted 都发生在接管之前，具有不同重投语义。
+
+Quiesce 与 Accepted 在同一 Worker 同步边界排序，冻结有界、完整的累计接管身份集合；正常 Release 只在 Quiescing 且本地实际收敛后接受。Quiesce 不是 terminal、success 或 actual_stopped。FE 将集合内身份记为 Owned，集合外未知部署记为 FencedOut；从未取得实体的 Cancel 不建立 absent-Task tombstone。
+
+同一个 Context 只暴露带非零 generation 的覆盖观察流，按有界分页完成初始 cut，随后发布带 sequence、covered_prefix、source_cut 的书签。状态、安装、Task/Context convergence 与 Quiesce 由统一 source/control revision 排序。FE 使用同序无损 intake；书签到达不等于已应用，本地背压不换流，真实缺口才有界恢复。正常 destination 撤回立即关输入需求，身份清理和实际停止仍由原 owner 承担。
 
 内容判等为何在这里是错误来源（源码推导，未实跑复现）：旧判等对重编码后的 typed 对象取指纹，而其中实例参数的 map 使用 HashMap，同一原始请求解码后可能以不同顺序重编码，进而把合法重放判成冲突；同时 Frontend 在正常路径上只重发同一冻结字节，判等只可能捕获发送方自身缺陷，却要求 Creating/Live/Retired 各状态常驻指纹与初始 domain 快照。
 
-载体语义与重放语义随 `NATIVE_COMPAT_EPOCH` 一起切换（epoch 3）：epoch 2 进程既不理解新载体（它要求已退役的 `instance_params`，也不认识 `assignment`），又仍按内容判等回答重放，因此两者不在同一 compatibility island。
+此前两段载体与身份重放在 epoch 3 切换；本次 Accepted/Installed、正常 Quiesce、单一覆盖流及逐 destination 正常关闭在 epoch 4 一起硬切。完整 descriptor、Provider 私有合同、函数/执行语义材料与 epoch 共同构成兼容身份；旧 Ready ACK 不由新进程猜义，零 generation 旧观察请求明确拒绝。
 
 本 ADR 与现存 ADR 的关系：它替换 ADR-0146 背景中对两段创建载体的描述（metadata 携带 `InstanceParams`、创建判等覆盖两段内容、`FrozenFragment` 的 provider requirement 占位字段），以及把 Create 纳入 conflict verdict 的表述；替换 ADR-0153 的“提交关闭替换窗口”规则及其 `DispatchSeal` 行；替换 ADR-0157 规则 3 中“创建冲突”交给 owner 的表述（owner 分工不变，冲突判定已不存在）。ADR-0123 的 TaskUpdate 水位语义不变，本 ADR 只在其旁边说明 Create 属于另一种幂等。
 
@@ -89,8 +94,8 @@ Backend 的选主只按 identity 与生命周期，不看请求体：
 
 开发规则：
 
-1. **Identity-replay rule。** CreateTask 的选主键是准确 `TaskIdentity` 在准确 `QueryContextRef` 下的生命周期状态，任何状态都不比较请求体。重复请求由该 identity 已有记录回答：原 receipt、固定创建失败或终态；请求体原样丢弃，不解释、不应用、不续租、不推进初始 domain。
-2. **Winner-interprets rule。** 只解释赢得本轮创建的请求：membership 在其预留之后、安装之前检查；静态计划只由 winner 的 Native host 解码一次，全部交叉校验在注册 receiver 前完成。被拒的一轮必须完整回滚，之后同一 identity 的合法请求可以赢得新一轮。
+1. **Identity-replay rule。** CreateTask 的选主键是准确 `TaskIdentity` 在准确 `QueryContextRef` 下的生命周期状态，任何状态都不比较请求体。重复请求由该 identity 已有记录回答：原实体当前单调状态或终态；请求体原样丢弃，不解释、不应用、不续租、不推进初始 domain。
+2. **Winner-interprets rule。** 只解释赢得本轮创建的请求：membership 在其预留之后、安装之前检查；静态计划只由 winner 的 Native host 解码一次，全部交叉校验在注册 receiver 前完成。接管前的拒绝不产生实体；Accepted 后准备失败保留身份和失败 phase，不允许合法重放赢得另一轮。
 3. **Entity-versus-decision rule。** 以客户端铸造的 identity 创建实体（CreateTask）按 identity 与生命周期幂等；服务端决定或票据兑换（admission ticket）以及单调 domain（split 水位、edge version、credential epoch 等，见 ADR-0123 与 ADR-0146）保留各自的 token 语义。不得把更新、续期或兑换塞进创建分类，也不得让创建借用 domain 的水位比较。
 4. **Freeze-once rule。** 静态计划在完成计划编码时逐 fragment 冻结一次，由模板共享给所有 Task、重发与 attempt；创建 metadata 在等待中至多定价一次，获准入后冻结一次，重发复用同一 parts，准确关联的成功 ACK 后释放。Frontend 不解析自己冻结的字节。
 5. **One-owner-per-fact rule。** descriptor 拥有 identity、kernel key、DOP、split 节点与拓扑，sender ordinal 与 sender count 属于 producer 的边；Context 拥有 query-wide options；assignment 只拥有 ordinal、初始 scan ranges 与 sink 绑定；静态计划拥有计划、版本与 DOP 域。任何载体不得复制另一 owner 的事实。

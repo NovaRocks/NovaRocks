@@ -17,20 +17,23 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use crate::exec::chunk::ChunkSchemaRef;
+#[cfg(test)]
+use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::fragment::error::{
-    ExecPlanBuildError, ExecPlanInvariant, FragmentBindingError, FragmentBindingErrorKind,
-    FragmentBindingTarget,
+    FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
 };
+#[cfg(test)]
 use crate::exec::fragment::sink::FragmentSinkProgram;
-use crate::exec::node::{ExecNodeKind, ExecPlan};
 pub use novarocks_execution_contract::{FragmentContractVersion, FragmentNodeId, FragmentSinkKind};
 pub use novarocks_local_program::{
     CompileProfile, FragmentProgramOptions, FragmentSinkAssignmentKind,
     FragmentSinkAssignmentRequirement, RuntimeFilterContract, RuntimeFilterId, ScanAssignmentKind,
     ScanSourceContract,
 };
+use novarocks_local_program::{LocalProgram, StaticSinkProgram};
 
 #[derive(Clone, Debug)]
 pub struct ExchangeInputContract {
@@ -47,6 +50,7 @@ impl ExchangeInputContract {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct FragmentSinkSpec {
     program: FragmentSinkProgram,
@@ -54,6 +58,7 @@ pub struct FragmentSinkSpec {
     assignment_requirement: FragmentSinkAssignmentRequirement,
 }
 
+#[cfg(test)]
 impl FragmentSinkSpec {
     pub fn try_new(program: FragmentSinkProgram) -> Result<Self, FragmentBindingError> {
         use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
@@ -96,6 +101,10 @@ impl FragmentSinkSpec {
         &self.program
     }
 
+    pub fn into_program(self) -> FragmentSinkProgram {
+        self.program
+    }
+
     pub fn program_mut(&mut self) -> &mut FragmentSinkProgram {
         &mut self.program
     }
@@ -109,6 +118,7 @@ impl FragmentSinkSpec {
     }
 }
 
+#[cfg(test)]
 fn static_sink_binding_error(error: ExecPlanBuildError) -> FragmentBindingError {
     let kind = match error.invariant() {
         ExecPlanInvariant::Expression => FragmentBindingErrorKind::ExpressionMismatch,
@@ -130,56 +140,81 @@ fn non_empty_group_count(
     })
 }
 
-#[derive(Debug)]
 pub struct FragmentProgram {
     root_plan_node_id: FragmentNodeId,
-    plan: ExecPlan,
-    sink: FragmentSinkSpec,
+    local_program: Arc<LocalProgram>,
+    sink_kind: FragmentSinkKind,
+    sink_assignment_requirement: FragmentSinkAssignmentRequirement,
     program_options: FragmentProgramOptions,
     scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
     exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
     runtime_filters: RuntimeFilterContract,
 }
 
+impl std::fmt::Debug for FragmentProgram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FragmentProgram")
+            .field("root_plan_node_id", &self.root_plan_node_id)
+            .field("local_program", &self.local_program)
+            .field("sink_kind", &self.sink_kind)
+            .field("program_options", &self.program_options)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FragmentProgram {
-    pub fn new(
-        plan: ExecPlan,
-        sink: FragmentSinkSpec,
+    pub fn try_new(
+        local_program: Arc<LocalProgram>,
         program_options: FragmentProgramOptions,
         scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
         exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
         runtime_filters: RuntimeFilterContract,
-    ) -> Self {
-        let root_plan_node_id = FragmentNodeId::new(root_plan_node_id(&plan));
-        Self {
+    ) -> Result<Self, FragmentBindingError> {
+        let sink = local_program.sink().ok_or_else(|| {
+            FragmentBindingError::new(
+                FragmentBindingTarget::Sink,
+                FragmentBindingErrorKind::InvalidAssignment,
+                "local fragment program requires a static sink",
+            )
+        })?;
+        let (sink_kind, sink_assignment_requirement) = static_sink_spec(sink)?;
+        let root_plan_node_id = FragmentNodeId::new(
+            local_program.nodes()[local_program.root().index()].native_node_id(),
+        );
+        if root_plan_node_id.get() < 0 {
+            return Err(FragmentBindingError::new(
+                FragmentBindingTarget::Program,
+                FragmentBindingErrorKind::InvalidAssignment,
+                "fragment root requires a non-negative node id",
+            ));
+        }
+        Ok(Self {
             root_plan_node_id,
-            plan,
-            sink,
+            local_program,
+            sink_kind,
+            sink_assignment_requirement,
             program_options,
             scan_sources,
             exchange_inputs,
             runtime_filters,
-        }
+        })
     }
 
     pub const fn root_plan_node_id(&self) -> FragmentNodeId {
         self.root_plan_node_id
     }
 
-    pub fn plan(&self) -> &ExecPlan {
-        &self.plan
+    pub fn local_program(&self) -> &Arc<LocalProgram> {
+        &self.local_program
     }
 
-    pub fn plan_mut(&mut self) -> &mut ExecPlan {
-        &mut self.plan
+    pub const fn sink_kind(&self) -> FragmentSinkKind {
+        self.sink_kind
     }
 
-    pub const fn sink(&self) -> &FragmentSinkSpec {
-        &self.sink
-    }
-
-    pub fn sink_mut(&mut self) -> &mut FragmentSinkSpec {
-        &mut self.sink
+    pub const fn sink_assignment_requirement(&self) -> FragmentSinkAssignmentRequirement {
+        self.sink_assignment_requirement
     }
 
     pub const fn program_options(&self) -> &FragmentProgramOptions {
@@ -199,120 +234,44 @@ impl FragmentProgram {
     }
 }
 
-/// Builder for a sealed fragment program. Decoders may resolve and patch their
-/// transient dependencies before `finish`; runtime entry points receive only
-/// the immutable result.
-#[derive(Debug)]
-pub struct FragmentProgramBuilder {
-    plan: ExecPlan,
-    sink: FragmentSinkSpec,
-    program_options: FragmentProgramOptions,
-    scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
-    exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
-    runtime_filters: RuntimeFilterContract,
-}
+fn static_sink_spec(
+    sink: &StaticSinkProgram,
+) -> Result<(FragmentSinkKind, FragmentSinkAssignmentRequirement), FragmentBindingError> {
+    use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
+    use FragmentSinkAssignmentRequirement::{None, Required};
 
-impl FragmentProgramBuilder {
-    pub fn new(
-        plan: ExecPlan,
-        sink: FragmentSinkSpec,
-        program_options: FragmentProgramOptions,
-    ) -> Self {
-        Self {
-            plan,
-            sink,
-            program_options,
-            scan_sources: BTreeMap::new(),
-            exchange_inputs: BTreeMap::new(),
-            runtime_filters: RuntimeFilterContract::default(),
+    let spec = match sink {
+        StaticSinkProgram::Result => (FragmentSinkKind::Result, None),
+        StaticSinkProgram::Noop => (FragmentSinkKind::Noop, None),
+        StaticSinkProgram::DataStream { .. } => {
+            (FragmentSinkKind::DataStream, Required(StreamDestinations))
         }
-    }
-
-    pub fn scan_sources(
-        mut self,
-        scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
-    ) -> Self {
-        self.scan_sources = scan_sources;
-        self
-    }
-
-    pub fn exchange_inputs(
-        mut self,
-        exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
-    ) -> Self {
-        self.exchange_inputs = exchange_inputs;
-        self
-    }
-
-    pub fn runtime_filters(mut self, runtime_filters: RuntimeFilterContract) -> Self {
-        self.runtime_filters = runtime_filters;
-        self
-    }
-
-    /// Decoder-only patch point before `finish` seals the program.
-    pub fn plan_mut(&mut self) -> &mut ExecPlan {
-        &mut self.plan
-    }
-
-    /// Decoder-only patch point for sink-owned expression arenas before
-    /// `finish` seals the program.
-    pub fn sink_program_mut(&mut self) -> &mut FragmentSinkProgram {
-        self.sink.program_mut()
-    }
-
-    pub fn finish(self) -> Result<FragmentProgram, ExecPlanBuildError> {
-        let root_plan_node_id = root_plan_node_id(&self.plan);
-        if root_plan_node_id < 0 {
-            return Err(ExecPlanBuildError::new(
-                ExecPlanInvariant::Node,
-                "fragment root requires a non-negative node id",
-            ));
-        }
-        Ok(FragmentProgram {
-            root_plan_node_id: FragmentNodeId::new(root_plan_node_id),
-            plan: self.plan,
-            sink: self.sink,
-            program_options: self.program_options,
-            scan_sources: self.scan_sources,
-            exchange_inputs: self.exchange_inputs,
-            runtime_filters: self.runtime_filters,
-        })
-    }
-}
-
-fn root_plan_node_id(plan: &ExecPlan) -> i32 {
-    match &plan.root.kind {
-        ExecNodeKind::AssertNumRows(node) => node.node_id,
-        ExecNodeKind::Values(node) => node.node_id,
-        ExecNodeKind::Project(node) => node.node_id,
-        ExecNodeKind::Unpivot(node) => node.node_id,
-        ExecNodeKind::Filter(node) => node.node_id,
-        ExecNodeKind::Repeat(node) => node.node_id,
-        ExecNodeKind::ChangeEventExpand(node) => node.node_id,
-        ExecNodeKind::UnionAll(node) => node.node_id,
-        ExecNodeKind::Limit(node) => node.node_id,
-        ExecNodeKind::ExchangeSource(node) => node.node_id,
-        ExecNodeKind::Scan(node) => node.node_id().unwrap_or(-1),
-        ExecNodeKind::Aggregate(node) => node.node_id,
-        ExecNodeKind::Join(node) => node.node_id,
-        ExecNodeKind::NestedLoopJoin(node) => node.node_id,
-        ExecNodeKind::Sort(node) => node.node_id,
-        ExecNodeKind::TableFunction(node) => node.node_id,
-        ExecNodeKind::Analytic(node) => node.node_id,
-        ExecNodeKind::SetOp(node) => node.node_id,
-        ExecNodeKind::RuntimeFilterConsumer(node) => node.owner_node_id,
-        ExecNodeKind::TableWriter(node) => node.node_id,
-        ExecNodeKind::TableFinish(node) => node.node_id,
-    }
+        StaticSinkProgram::MultiCastDataStream { branches, .. } => (
+            FragmentSinkKind::MultiCastDataStream,
+            Required(DestinationGroups(non_empty_group_count(
+                FragmentSinkKind::MultiCastDataStream,
+                branches.len(),
+            )?)),
+        ),
+        StaticSinkProgram::SplitDataStream { branches, .. } => (
+            FragmentSinkKind::SplitDataStream,
+            Required(DestinationGroups(non_empty_group_count(
+                FragmentSinkKind::SplitDataStream,
+                branches.len(),
+            )?)),
+        ),
+    };
+    Ok(spec)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::expr::{ExprArena, ExprId};
+    use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
     use crate::exec::fragment::sink::DataStreamPartitionType;
     use crate::exec::fragment::sink::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
@@ -320,7 +279,7 @@ mod tests {
     };
     use crate::exec::node::filter::FilterNode;
     use crate::exec::node::values::ValuesNode;
-    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, ExternalSinkRequirement};
     use novarocks_types::SlotId;
 
     use super::*;
@@ -338,8 +297,13 @@ mod tests {
     }
 
     fn root_not_minimum_node_id_plan() -> ExecPlan {
+        let mut arena = ExprArena::default();
+        arena.push_typed(
+            ExprNode::Literal(LiteralValue::Bool(true)),
+            arrow::datatypes::DataType::Boolean,
+        );
         ExecPlan {
-            arena: ExprArena::default(),
+            arena,
             root: ExecNode {
                 kind: ExecNodeKind::Filter(FilterNode {
                     input: Box::new(ExecNode {
@@ -355,16 +319,32 @@ mod tests {
         }
     }
 
+    fn frozen(plan: ExecPlan, sink: StaticSinkProgram) -> Arc<LocalProgram> {
+        let profile = plan
+            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
+            .unwrap();
+        let requirements = if matches!(sink, StaticSinkProgram::Result) {
+            vec![ExternalSinkRequirement::Result]
+        } else {
+            Vec::new()
+        };
+        let (program, runtime) = plan
+            .into_local_program_and_bindings(profile, BTreeMap::new(), requirements, sink)
+            .unwrap();
+        assert_eq!(runtime.scan_count(), 0);
+        Arc::new(program)
+    }
+
     #[test]
     fn program_preserves_root_plan_node_id_instead_of_minimum_operator_id() {
-        let program = FragmentProgram::new(
-            root_not_minimum_node_id_plan(),
-            FragmentSinkSpec::try_new(FragmentSinkProgram::Noop).expect("noop sink"),
+        let program = FragmentProgram::try_new(
+            frozen(root_not_minimum_node_id_plan(), StaticSinkProgram::Noop),
             FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
             BTreeMap::new(),
             BTreeMap::new(),
             RuntimeFilterContract::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(program.root_plan_node_id(), FragmentNodeId::new(99));
     }
@@ -458,17 +438,20 @@ mod tests {
             BTreeSet::from([RuntimeFilterId::new(31)]),
         );
         let options = FragmentProgramOptions::new(FragmentContractVersion::CURRENT);
-        let program = FragmentProgram::new(
-            values_plan(),
-            FragmentSinkSpec::try_new(FragmentSinkProgram::Result).expect("result sink"),
+        let program = FragmentProgram::try_new(
+            frozen(values_plan(), StaticSinkProgram::Result),
             options,
             scan_sources,
             exchange_inputs,
             runtime_filters,
-        );
+        )
+        .unwrap();
 
-        assert!(matches!(program.plan().root.kind, ExecNodeKind::Values(_)));
-        assert_eq!(program.sink().kind(), FragmentSinkKind::Result);
+        assert!(matches!(
+            program.local_program().nodes()[program.local_program().root().index()].kind(),
+            novarocks_local_program::ProgramNodeKind::Values { .. }
+        ));
+        assert_eq!(program.sink_kind(), FragmentSinkKind::Result);
         assert_eq!(
             program.program_options().contract_version(),
             FragmentContractVersion::CURRENT

@@ -122,9 +122,9 @@ impl Pipeline {
                     op.set_profiles(profiles.clone());
                     operator_profiles.push(profiles);
                 }
-                // Preparation may create asynchronous workers which retain
-                // the event sink. Install the fragment-owned sink first so
-                // those workers cannot capture the default no-op recorder.
+                // Activation may create asynchronous workers which retain the
+                // event sink. Install the fragment-owned sink while preparing
+                // so they cannot capture the default no-op recorder later.
                 op.set_fragment_event_sink(ctx.event_sink());
                 op.prepare()?;
                 op.bind_runtime_state(ctx.runtime_state())?;

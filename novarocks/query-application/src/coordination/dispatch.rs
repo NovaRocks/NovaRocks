@@ -69,7 +69,9 @@ impl DispatchBudget {
 
     pub const fn lane_of(shape: OperationShape) -> DispatchLane {
         match shape {
-            OperationShape::CancelTask => DispatchLane::Control,
+            OperationShape::CancelTask | OperationShape::QuiesceQueryContext => {
+                DispatchLane::Control
+            }
             OperationShape::AcquireQueryContextAdmissionTicket
             | OperationShape::EstablishQueryContext
             | OperationShape::AdvanceQueryContextDomain

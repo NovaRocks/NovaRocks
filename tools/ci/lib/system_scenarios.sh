@@ -24,12 +24,12 @@
 # to `novarocks-cluster-harness`, reached through the
 # `novarocks-system-test-runner` frontend. Do not reimplement any of that here.
 
-# Discover the currently registered scenarios. The registry is the source of
+# Discover the currently registered default scenarios. The registry is the source of
 # truth; the stage never hardcodes scenario names or an expected count.
 ci_system_scenario_list() {
   local runner="$1"
 
-  "$runner" --list
+  "$runner" --list-default
 }
 
 # Build the two explicit native-compatibility fixtures without leaving the
@@ -86,7 +86,7 @@ ci_prepare_system_scenario_binaries() {
   SYSTEM_SCENARIO_OTHER_ISLAND_BINARY="$other_island"
 }
 
-# Run every registered scenario serially, one `--only` invocation each, and
+# Run every default registered scenario serially, one `--only` invocation each, and
 # record an independent summary row per scenario.
 #
 # Returns non-zero on the first failing scenario. The caller decides how to fail

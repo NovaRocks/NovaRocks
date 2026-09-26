@@ -89,6 +89,9 @@ use crate::sdk_control::{PaimonSdkExecutionResources, PaimonSdkReadControl};
 use crate::split_source::{PaimonSplitPlanningLimits, PaimonSplitSource, plan_splits};
 use crate::wire::read::PaimonReadWireCodec;
 
+mod recipe;
+pub use recipe::PaimonReadRecipeCompiler;
+
 const PAIMON_CATALOG_TYPE_KEY: &str = "paimon.catalog.type";
 const PAIMON_WAREHOUSE_KEY: &str = "warehouse";
 const PAIMON_FILESYSTEM_BINDING: &str = "filesystem";
@@ -945,7 +948,11 @@ impl ConnectorExecutionRoleBindingFactory for PaimonExecutionRoleBindingFactory 
                 async_runtime: self.async_runtime.clone(),
             }),
         ));
-        let read = ConnectorExecutionReadBinding::new(factory, decoder);
+        let read = ConnectorExecutionReadBinding::new(
+            factory,
+            decoder,
+            Arc::new(PaimonReadRecipeCompiler),
+        );
         ConnectorExecutionRoleBinding::try_new(properties.clone(), Some(read), None)
             .map_err(ConnectorMaterializationError::from)
     }

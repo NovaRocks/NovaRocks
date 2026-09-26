@@ -26,7 +26,7 @@ use novarocks_execution_contract::{
     DomainConflict, DomainProgression, DomainVersion, EdgeOpenVersion, EdgeSendPermission,
     ExchangeEdgeId, PlanNodeId, PlanNodeSplitReceipt, QueryContextDomainReceipt,
     QueryContextDomainUpdate, SplitOffer, SplitSequence, SplitWatermark, TaskDescriptor,
-    TaskDomainReceipt, TaskDomainUpdate,
+    TaskDomainReceipt, TaskDomainUpdate, TaskIdentity,
 };
 
 /// Accepted state for a scalar-versioned Worker domain.
@@ -270,6 +270,52 @@ struct ExchangeEdgeDomain {
     opened_sets: BTreeMap<EdgeOpenVersion, BTreeSet<ExchangeEdgeId>>,
 }
 
+/// One retained verdict per version and frozen destination. Each successful
+/// version consumes a previously open member, so this cannot outgrow the
+/// producer descriptor's destination count.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ExchangeDestinationClosureDomain {
+    accepted: BTreeMap<DomainVersion, (ExchangeEdgeId, TaskIdentity)>,
+    closed: BTreeSet<(ExchangeEdgeId, TaskIdentity)>,
+}
+
+impl ExchangeDestinationClosureDomain {
+    fn classify(
+        &self,
+        version: DomainVersion,
+        member: (ExchangeEdgeId, TaskIdentity),
+    ) -> DomainProgression {
+        if let Some(accepted) = self.accepted.get(&version) {
+            return if *accepted == member {
+                DomainProgression::Idempotent
+            } else {
+                DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+            };
+        }
+        if self
+            .accepted
+            .keys()
+            .next_back()
+            .is_some_and(|highest| version < *highest)
+        {
+            return DomainProgression::Older;
+        }
+        if self.closed.contains(&member) {
+            return DomainProgression::Conflict(DomainConflict::NotMonotonic);
+        }
+        DomainProgression::Apply
+    }
+
+    fn apply(&mut self, version: DomainVersion, member: (ExchangeEdgeId, TaskIdentity)) {
+        self.accepted.insert(version, member);
+        self.closed.insert(member);
+    }
+
+    fn accepted_version(&self) -> Option<DomainVersion> {
+        self.accepted.keys().next_back().copied()
+    }
+}
+
 impl ExchangeEdgeDomain {
     pub fn from_frozen_edges(edges: impl IntoIterator<Item = ExchangeEdgeId>) -> Self {
         Self {
@@ -345,6 +391,7 @@ pub struct TaskDomains {
     splits: SplitDomain,
     dynamic_filter: ScalarDomain,
     edges: ExchangeEdgeDomain,
+    closed_destinations: ExchangeDestinationClosureDomain,
 }
 
 impl TaskDomains {
@@ -353,6 +400,7 @@ impl TaskDomains {
             splits: SplitDomain::new(),
             dynamic_filter: ScalarDomain::empty(),
             edges: ExchangeEdgeDomain::from_frozen_edges(descriptor.topology().edge_ids()),
+            closed_destinations: ExchangeDestinationClosureDomain::default(),
         }
     }
 }
@@ -509,6 +557,22 @@ pub fn validate_task_domain_membership(
                     ));
                 }
             }
+            TaskDomainUpdate::CloseExchangeDestination {
+                edge, destination, ..
+            } => {
+                let frozen = descriptor.topology().edge(*edge).is_some_and(|outbound| {
+                    outbound
+                        .destinations()
+                        .iter()
+                        .any(|member| member.task() == *destination)
+                });
+                if !frozen {
+                    return Err(DomainPolicyRejection::new(
+                        DomainConflict::UnknownMember,
+                        format!("destination {destination} is not frozen on exchange edge {edge}"),
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -595,6 +659,18 @@ fn classify_task_domain_update(
             }
             progression
         }
+        TaskDomainUpdate::CloseExchangeDestination {
+            version,
+            edge,
+            destination,
+        } => {
+            let member = (*edge, *destination);
+            let progression = domains.closed_destinations.classify(*version, member);
+            if matches!(progression, DomainProgression::Apply) {
+                domains.closed_destinations.apply(*version, member);
+            }
+            progression
+        }
     };
     if let DomainProgression::Conflict(conflict) = progression {
         return Err(DomainPolicyRejection::new(
@@ -619,6 +695,16 @@ fn conflicting_token(update: &TaskDomainUpdate) -> String {
             "domain=open_exchange_edges version={} edges={:?}",
             version.get(),
             edges
+        ),
+        TaskDomainUpdate::CloseExchangeDestination {
+            version,
+            edge,
+            destination,
+        } => format!(
+            "domain=close_exchange_destination version={} edge={} destination={}",
+            version.get(),
+            edge,
+            destination
         ),
     }
 }
@@ -678,16 +764,40 @@ fn commit_task_domain_update(
                 progression,
             }
         }
+        TaskDomainUpdate::CloseExchangeDestination {
+            version,
+            edge,
+            destination,
+        } => {
+            if matches!(progression, DomainProgression::Apply) {
+                domains
+                    .closed_destinations
+                    .apply(*version, (*edge, *destination));
+            }
+            TaskDomainReceipt::CloseExchangeDestination {
+                accepted_version: domains
+                    .closed_destinations
+                    .accepted_version()
+                    .expect("an accepted destination close retains its version"),
+                progression,
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AcceptedSplitWatermark, CredentialDomain, ExchangeEdgeDomain, ScalarDomain};
+    use super::{
+        AcceptedSplitWatermark, CredentialDomain, ExchangeDestinationClosureDomain,
+        ExchangeEdgeDomain, ScalarDomain,
+    };
     use novarocks_execution_contract::{
         ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
         CredentialUpdate, DomainConflict, DomainProgression, DomainVersion, EdgeOpenVersion,
-        EdgeSendPermission, ExchangeEdgeId, SplitOffer, SplitSequence,
+        EdgeSendPermission, ExchangeEdgeId, SplitOffer, SplitSequence, TaskIdentity,
+    };
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use std::sync::Arc;
 
@@ -712,6 +822,55 @@ mod tests {
 
     fn secret(value: u8) -> Arc<dyn ConfidentialContent> {
         Arc::new(Secret(value))
+    }
+
+    fn destination(task: u32) -> TaskIdentity {
+        TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).expect("attempt"))
+                .expect("query"),
+            StageId::new(2).expect("stage"),
+            TaskId::new(task).expect("task"),
+            BackendProcessId::new_v7(),
+        )
+    }
+
+    #[test]
+    fn destination_close_versions_replay_exactly_and_have_a_frozen_member_bound() {
+        let edge = ExchangeEdgeId::new(7).expect("edge");
+        let first = (edge, destination(1));
+        let second = (edge, destination(2));
+        let version = |value| DomainVersion::new(value).expect("version");
+        let mut domain = ExchangeDestinationClosureDomain::default();
+
+        assert_eq!(domain.classify(version(1), first), DomainProgression::Apply);
+        domain.apply(version(1), first);
+        assert_eq!(
+            domain.classify(version(1), first),
+            DomainProgression::Idempotent
+        );
+        assert_eq!(
+            domain.classify(version(1), second),
+            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+        );
+        assert_eq!(
+            domain.classify(version(2), second),
+            DomainProgression::Apply
+        );
+        domain.apply(version(2), second);
+        assert_eq!(
+            domain.classify(version(1), first),
+            DomainProgression::Idempotent
+        );
+        assert_eq!(
+            domain.classify(version(1), second),
+            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+        );
+        assert_eq!(
+            domain.classify(version(3), first),
+            DomainProgression::Conflict(DomainConflict::NotMonotonic)
+        );
+        assert_eq!(domain.accepted.len(), 2);
+        assert_eq!(domain.closed.len(), 2);
     }
 
     #[test]

@@ -35,11 +35,14 @@ use novarocks_cluster_harness::ServerHandle;
 use serde_json::Value;
 use std::env;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FIXTURE_MANIFEST_ENV: &str = "NOVAROCKS_PAIMON_FIXTURE_MANIFEST";
 const FIXTURE_ENV_FILE_ENV: &str = "NOVA_ENV_REST_ENV_FILE";
@@ -48,6 +51,11 @@ const SPLIT_ACCEPTED: &str = "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED";
 const SPLIT_NO_MORE: &str = "NOVAROCKS_TASK_SPLIT_NO_MORE";
 const PAGE_SOURCE_OPEN: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN";
 const PAGE_SOURCE_CLOSE: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE";
+const ACCESS_KEY_ENV: &str = "AWS_S3_ACCESS_KEY_ID";
+const SECRET_KEY_ENV: &str = "AWS_S3_SECRET_ACCESS_KEY";
+const FIXTURE_SETUP_TIMEOUT: Duration = Duration::from_secs(600);
+const FIXTURE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
+const FIXTURE_PROCESS_POLL: Duration = Duration::from_millis(20);
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -72,7 +80,7 @@ impl Scenario for PaimonReadData {
     }
 
     fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        paimon_launch_config(&load_shared_fixture("schema")?)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -175,8 +183,10 @@ impl Scenario for PaimonSnapshotAndSchema {
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
         let fixture = prepare_owned_fixture(scenario_root, "s1")?;
+        let launch =
+            paimon_launch_config(&load_fixture(&fixture.root.join("manifest.json"), "s1")?)?;
         *self.fixture.lock().expect("Paimon fixture mutex poisoned") = Some(fixture);
-        Ok(connector_launch_config())
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -206,23 +216,37 @@ impl Scenario for PaimonSnapshotAndSchema {
 
         let (advance_tx, advance_done) = mpsc::sync_channel(1);
         let advance_fixture = owned.clone();
+        let fixture_deadline = context.deadline();
         let advance_thread = thread::spawn(move || -> Result<()> {
             advance_tx
-                .send(advance_owned_fixture(&advance_fixture, "s2"))
+                .send(advance_owned_fixture(
+                    &advance_fixture,
+                    "s2",
+                    fixture_deadline,
+                ))
                 .context("publish S2 fixture advance result")?;
             Ok(())
         });
-        wait_for_owned_fixture_stage(context, &owned.root, "s2", &advance_done)?;
+        if let Err(error) = wait_for_owned_fixture_stage(context, &owned.root, "s2", &advance_done)
+        {
+            // The exact deadline also belongs to the subprocess owner. Join
+            // its bounded cleanup before fixture teardown can remove inputs.
+            let _ = advance_thread.join();
+            return Err(error.context("external Paimon S2 fixture publication"));
+        }
         ensure!(
             matches!(held.done.try_recv(), Err(mpsc::TryRecvError::Empty)),
             "S1 query reached terminal before the S2 snapshot was published"
         );
-        advance_done
-            .recv_timeout(context.remaining("finish S2 fixture verification")?)
-            .context("S2 fixture verification did not finish before the scenario deadline")??;
+        let advanced: Result<()> = (|| {
+            advance_done
+                .recv_timeout(context.remaining("finish S2 fixture verification")?)
+                .context("external Paimon S2 fixture verification exceeded the scenario deadline")?
+        })();
         advance_thread
             .join()
             .map_err(|_| anyhow::anyhow!("S2 fixture advance actor panicked"))??;
+        advanced?;
         let s1 = held
             .done
             .recv_timeout(context.remaining("await frozen S1 query")?)
@@ -243,7 +267,8 @@ impl Scenario for PaimonSnapshotAndSchema {
             .context("read newly published Paimon S2")?;
         ensure!(s2 == [1, 2, 3], "fresh query did not observe S2: {s2:?}");
 
-        advance_owned_fixture(&owned, "schema")?;
+        advance_owned_fixture(&owned, "schema", context.deadline())?;
+        context.remaining("read Paimon schema after external fixture advance")?;
         let evolved: Vec<(i64, String, Option<String>)> = control
             .query(format!(
                 "SELECT id, name, added FROM {CATALOG}.fixture.schema_evolution ORDER BY id"
@@ -289,7 +314,7 @@ impl Scenario for PaimonMergeFilterCorrectness {
     }
 
     fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        paimon_launch_config(&load_shared_fixture("schema")?)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -385,7 +410,7 @@ impl Scenario for PaimonCancelAndBudget {
     }
 
     fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        paimon_launch_config(&load_shared_fixture("schema")?)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -459,7 +484,7 @@ impl Scenario for PaimonUnsupportedAndBinding {
     }
 
     fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        paimon_launch_config(&load_shared_fixture("schema")?)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -568,7 +593,7 @@ impl Scenario for IcebergPaimonRead {
     }
 
     fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        paimon_launch_config(&load_shared_fixture("schema")?)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -647,6 +672,60 @@ struct QueryActor {
     ready: mpsc::Receiver<u32>,
     done: mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
     thread: thread::JoinHandle<Result<()>>,
+}
+
+fn paimon_launch_config(fixture: &Fixture) -> Result<ScenarioLaunchConfig> {
+    let access = env::var(ACCESS_KEY_ENV).with_context(|| {
+        format!("Paimon fixture requires {ACCESS_KEY_ENV} for backend data access")
+    })?;
+    let secret = env::var(SECRET_KEY_ENV).with_context(|| {
+        format!("Paimon fixture requires {SECRET_KEY_ENV} for backend data access")
+    })?;
+    ensure!(
+        !access.is_empty() && !secret.is_empty(),
+        "Paimon fixture object-store credentials must be nonempty"
+    );
+    paimon_launch_config_with_credentials(fixture, access, secret)
+}
+
+fn paimon_launch_config_with_credentials(
+    fixture: &Fixture,
+    access: String,
+    secret: String,
+) -> Result<ScenarioLaunchConfig> {
+    for (label, value) in [
+        ("name", &fixture.credential_name),
+        ("generation", &fixture.credential_generation),
+    ] {
+        ensure!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+            "Paimon fixture credential {label} has characters outside its config-safe token alphabet"
+        );
+    }
+    let mut launch = connector_launch_config();
+    for child in [
+        &mut launch.child_environment.fe,
+        &mut launch.child_environment.be,
+    ] {
+        child.insert(ACCESS_KEY_ENV.to_owned(), access.clone());
+        child.insert(SECRET_KEY_ENV.to_owned(), secret.clone());
+    }
+    let existing = launch.config_overlay.be.take().unwrap_or_default();
+    launch.config_overlay.be = Some(format!(
+        r#"{existing}
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "{}"
+generation = "{}"
+kind = "s3"
+access_key_id = "${{ENV:{ACCESS_KEY_ENV}}}"
+access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
+"#,
+        fixture.credential_name, fixture.credential_generation
+    ));
+    Ok(launch)
 }
 
 fn connect(context: &ScenarioContext, operation: &str) -> Result<mysql::Conn> {
@@ -828,12 +907,21 @@ fn prepare_owned_fixture(scenario_root: &Path, stage: &str) -> Result<OwnedFixtu
         run_id: format!("pai1-snapshot-{}-{now:x}", std::process::id()),
         env_file: fixture_env_file(),
     };
-    advance_owned_fixture(&fixture, stage)?;
+    if let Err(error) =
+        advance_owned_fixture(&fixture, stage, Instant::now() + FIXTURE_SETUP_TIMEOUT)
+    {
+        let cleanup = cleanup_owned_fixture(&fixture);
+        return Err(match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => error.context(format!("Paimon setup cleanup also failed: {cleanup:#}")),
+        });
+    }
     Ok(fixture)
 }
 
-fn advance_owned_fixture(fixture: &OwnedFixture, stage: &str) -> Result<()> {
-    let output = Command::new(fixture_prepare_script())
+fn advance_owned_fixture(fixture: &OwnedFixture, stage: &str, deadline: Instant) -> Result<()> {
+    let mut command = Command::new(fixture_prepare_script());
+    command
         .arg("--env-file")
         .arg(&fixture.env_file)
         .arg("--run-id")
@@ -841,15 +929,83 @@ fn advance_owned_fixture(fixture: &OwnedFixture, stage: &str) -> Result<()> {
         .arg("--output-dir")
         .arg(&fixture.root)
         .arg("--stop-after")
-        .arg(stage)
-        .output()
-        .with_context(|| format!("prepare Paimon {stage} fixture"))?;
+        .arg(stage);
+    run_external_fixture_until(command, &fixture.root, stage, deadline)
+}
+
+/// External fixture work consumes the caller's remaining deadline. Captures
+/// are files so a descendant cannot keep a timed-out parent's pipe open.
+fn run_external_fixture_until(
+    mut command: Command,
+    root: &Path,
+    stage: &str,
+    deadline: Instant,
+) -> Result<()> {
     ensure!(
-        output.status.success(),
-        "prepare Paimon {stage} fixture failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        Instant::now() < deadline,
+        "external Paimon {stage} fixture has no remaining deadline"
+    );
+    fs::create_dir_all(root).context("create Paimon fixture command capture directory")?;
+    let stdout = fs::File::create(root.join(format!("advance-{stage}.stdout")))?;
+    let stderr = fs::File::create(root.join(format!("advance-{stage}.stderr")))?;
+    command.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start external Paimon {stage} fixture"))?;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("wait for external Paimon {stage} fixture"))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            {
+                let group = format!("-{}", child.id());
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", "--", &group])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                thread::sleep(Duration::from_millis(100));
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", "--", &group])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = child.kill();
+            child
+                .wait()
+                .context("reap timed-out Paimon fixture process")?;
+            bail!(
+                "external Paimon {stage} fixture exceeded its deadline and its subprocess was stopped"
+            );
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(FIXTURE_PROCESS_POLL),
+        );
+    };
+    ensure!(
+        status.success(),
+        "external Paimon {stage} fixture failed with {status}: {}",
+        fixture_capture_tail(&root.join(format!("advance-{stage}.stderr")))?
     );
     Ok(())
+}
+
+fn fixture_capture_tail(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(8192)))?;
+    let mut bytes = Vec::new();
+    file.take(8192).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn wait_for_owned_fixture_stage(
@@ -890,21 +1046,20 @@ fn wait_for_owned_fixture_stage(
 }
 
 fn cleanup_owned_fixture(fixture: &OwnedFixture) -> Result<()> {
-    let output = Command::new(fixture_cleanup_script())
+    let mut command = Command::new(fixture_cleanup_script());
+    command
         .arg("--env-file")
         .arg(&fixture.env_file)
         .arg("--run-id")
         .arg(&fixture.run_id)
         .arg("--output-dir")
-        .arg(&fixture.root)
-        .output()
-        .context("clean Paimon snapshot fixture")?;
-    ensure!(
-        output.status.success(),
-        "clean Paimon snapshot fixture failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
+        .arg(&fixture.root);
+    run_external_fixture_until(
+        command,
+        &fixture.root,
+        "cleanup",
+        Instant::now() + FIXTURE_CLEANUP_TIMEOUT,
+    )
 }
 
 fn fixture_root() -> PathBuf {
@@ -1067,4 +1222,147 @@ fn expect_error_any<T>(
         "{operation} failed with an unrelated error: {error}; expected one of {expected:?}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Fixture, paimon_launch_config_with_credentials, run_external_fixture_until};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn command_capture_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "novarocks-paimon-command-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn external_fixture_advance_respects_the_existing_deadline() {
+        let root = command_capture_root("timeout");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 600 & echo fixture-child=$!; wait"]);
+        let started = Instant::now();
+        let error = run_external_fixture_until(
+            command,
+            &root,
+            "probe",
+            started + Duration::from_millis(100),
+        )
+        .expect_err("external fixture must be bounded");
+        assert!(
+            format!("{error:#}").contains("external Paimon probe fixture exceeded its deadline")
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let capture = fs::read_to_string(root.join("advance-probe.stdout")).expect("capture");
+        let child = capture
+            .trim()
+            .strip_prefix("fixture-child=")
+            .expect("child identity");
+        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+        let child_exists = || {
+            Command::new("/bin/kill")
+                .args(["-0", child])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("probe exact child")
+                .success()
+        };
+        while child_exists() && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !child_exists(),
+            "the fixture descendant must not survive timeout"
+        );
+        fs::remove_dir_all(root).expect("remove command captures");
+    }
+
+    #[test]
+    fn external_fixture_advance_does_not_start_after_deadline() {
+        let root = command_capture_root("expired");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let error = run_external_fixture_until(command, &root, "probe", Instant::now())
+            .expect_err("expired deadline must refuse before spawn");
+        assert!(format!("{error:#}").contains("has no remaining deadline"));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn external_fixture_advance_reports_a_finished_command() {
+        let root = command_capture_root("success");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "echo fixture-ready"]);
+        run_external_fixture_until(
+            command,
+            &root,
+            "probe",
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("finished external fixture");
+        assert_eq!(
+            fs::read_to_string(root.join("advance-probe.stdout")).expect("capture"),
+            "fixture-ready\n"
+        );
+        fs::remove_dir_all(root).expect("remove command captures");
+    }
+
+    fn fixture() -> Fixture {
+        Fixture {
+            root: PathBuf::from("fixture"),
+            warehouse: "s3://bucket/fixture".to_owned(),
+            endpoint: "http://example.invalid".to_owned(),
+            region: "us-east-1".to_owned(),
+            credential_name: "fixture-data".to_owned(),
+            credential_generation: "v2".to_owned(),
+        }
+    }
+
+    #[test]
+    fn backend_data_binding_uses_fixture_identity_and_child_environment() {
+        let launch = paimon_launch_config_with_credentials(
+            &fixture(),
+            "test-access".to_owned(),
+            "test-secret".to_owned(),
+        )
+        .expect("fixture identity is config safe");
+        let backend = launch.config_overlay.be.expect("backend overlay");
+        assert!(backend.contains("purpose = \"object-store-data\""));
+        assert!(backend.contains("name = \"fixture-data\""));
+        assert!(backend.contains("generation = \"v2\""));
+        assert!(backend.contains("${ENV:AWS_S3_ACCESS_KEY_ID}"));
+        assert!(backend.contains("${ENV:AWS_S3_SECRET_ACCESS_KEY}"));
+        assert!(!backend.contains("test-access"));
+        assert!(!backend.contains("test-secret"));
+        assert_eq!(
+            launch.child_environment.be["AWS_S3_ACCESS_KEY_ID"],
+            "test-access"
+        );
+        assert_eq!(
+            launch.child_environment.be["AWS_S3_SECRET_ACCESS_KEY"],
+            "test-secret"
+        );
+    }
+
+    #[test]
+    fn fixture_credential_identity_cannot_inject_config() {
+        let mut fixture = fixture();
+        fixture.credential_name = "valid\"\n[server]".to_owned();
+        assert!(
+            paimon_launch_config_with_credentials(
+                &fixture,
+                "test-access".to_owned(),
+                "test-secret".to_owned(),
+            )
+            .is_err()
+        );
+    }
 }

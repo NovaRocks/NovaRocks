@@ -275,7 +275,7 @@ mod tests {
     }
 
     /// Ingress bounds the static fragment but never interprets it. The input
-    /// the codec hands on is the very backing that arrived, and only the
+    /// the codec hands on owns the exact bounded field bytes, and only the
     /// creation winner decodes it.
     #[test]
     fn a_create_carries_its_static_bytes_unread_to_the_creation_winner() {
@@ -289,15 +289,74 @@ mod tests {
         assert_eq!(decoded.descriptor().identity(), identity(2, 3, process));
         let (_, input) = decoded.into_parts();
         assert_eq!(input.static_fragment().bytes(), &received);
-        assert_eq!(
+        assert_ne!(
             input.static_fragment().bytes().as_ptr(),
             received.as_ptr(),
-            "the creation input shares the received backing instead of copying it"
+            "the creation input detaches the bounded field from its ingress backing"
         );
         assert!(
             decode_static_fragment(input.static_fragment(), FieldPath::root("fragment")).is_err(),
             "the winner refuses the bytes ingress never read"
         );
+    }
+
+    #[test]
+    fn multi_item_create_decode_retains_only_each_items_bounded_backing() {
+        let process = backend();
+        let operations = (0..2)
+            .map(|index| {
+                let mut request = create_request(process, context(process));
+                let mut metadata =
+                    novarocks::CreationMetadata::decode(request.creation_metadata.clone()).unwrap();
+                metadata.descriptor.as_mut().unwrap().identity =
+                    Some(encode_task_identity(identity(2, 3 + index, process)));
+                request.creation_metadata = metadata.encode_to_vec().into();
+                let (_, envelope) = envelope(OperationKind::CreateTask);
+                novarocks::TaskOperation {
+                    envelope: Some(envelope),
+                    operation: Some(novarocks::task_operation::Operation::CreateTask(request)),
+                }
+            })
+            .collect::<Vec<_>>();
+        let backing = prost::bytes::Bytes::from(
+            novarocks::ApplyTaskOperationsRequest { operations }.encode_to_vec(),
+        );
+        let start = backing.as_ptr() as usize;
+        let end = start + backing.len();
+        let batch = novarocks::ApplyTaskOperationsRequest::decode(backing.clone()).unwrap();
+        for operation in &batch.operations {
+            let Some(novarocks::task_operation::Operation::CreateTask(raw)) = &operation.operation
+            else {
+                panic!("expected create")
+            };
+            assert!(
+                (start..end).contains(&(raw.frozen_fragment.as_ptr() as usize)),
+                "the fixture must reproduce prost fields sharing the whole batch allocation"
+            );
+            assert!((start..end).contains(&(raw.creation_metadata.as_ptr() as usize)));
+        }
+        let decoded = super::operation::decode_operation_batch(
+            &batch,
+            TransportBudget::DEFAULT,
+            FieldPath::root("batch"),
+        )
+        .unwrap();
+        for (raw, decoded) in batch.operations.iter().zip(decoded) {
+            let Some(novarocks::task_operation::Operation::CreateTask(raw_create)) = &raw.operation
+            else {
+                panic!("expected create")
+            };
+            let DecodedOperation::CreateTask(decoded) = decoded else {
+                panic!("expected decoded create")
+            };
+            let (_, input, retained_bytes) = decoded.into_parts_with_retained_bytes();
+            assert_eq!(retained_bytes, raw.encoded_len());
+            assert_eq!(input.static_fragment().bytes(), &raw_create.frozen_fragment);
+            assert!(
+                !(start..end).contains(&(input.static_fragment().bytes().as_ptr() as usize)),
+                "a queued item must not retain the other item's ingress backing"
+            );
+        }
     }
 
     /// A create is identified by the task identity it names, never by the
@@ -371,7 +430,12 @@ mod tests {
         let (_, input) = decode_create(create).expect("legal create").into_parts();
         let (_, content) = input.into_parts();
         let recovered = take_task_assignment(content).expect("the codec's own assignment");
-        assert_eq!(recovered.wire(), &assignment);
+        assert_eq!(
+            recovered
+                .into_wire()
+                .expect("validated assignment restores"),
+            assignment
+        );
 
         let missing = novarocks::CreateTaskRequest {
             frozen_fragment: frozen_fragment(4).encode_to_vec().into(),
@@ -1030,6 +1094,8 @@ mod tests {
             OperationOutcome::Gone,
             OperationOutcome::ResourceExhausted,
             OperationOutcome::AdmissionTicketStillActive,
+            OperationOutcome::NotReady,
+            OperationOutcome::PreparationBusy,
         ] {
             assert_eq!(
                 decode_operation_outcome(
@@ -2507,6 +2573,129 @@ mod tests {
                 .expect("its own acknowledgement decodes");
         assert_eq!(receipt.state(), QueryContextState::Active);
         assert!(cause.is_none(), "an active context has no cause");
+    }
+
+    #[test]
+    fn quiesce_control_and_membership_round_trip() {
+        use super::operation::{
+            DecodedOperation, decode_control_operation_batch, decode_quiesce_ack,
+            encode_control_operation_batch, encode_quiesce_ack, encode_quiesce_query_context,
+        };
+        use novarocks_execution_contract::task_execution::operation::{
+            QuiesceQueryContext, QuiesceQueryContextReceipt,
+        };
+
+        let backend = backend();
+        let context = context(backend);
+        let request = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
+        let batch = encode_control_operation_batch(
+            vec![encode_quiesce_query_context(request)],
+            TransportBudget::DEFAULT,
+        )
+        .expect("quiesce is a small control");
+        let decoded = decode_control_operation_batch(
+            &batch,
+            TransportBudget::DEFAULT,
+            FieldPath::root("control"),
+        )
+        .expect("control decodes");
+        assert!(
+            matches!(&decoded[0], DecodedOperation::QuiesceQueryContext(value) if value.context() == context)
+        );
+
+        let receipt =
+            QuiesceQueryContextReceipt::new(context, 1, Vec::new(), QueryContextState::Quiescing);
+        let wire = encode_quiesce_ack(&receipt).expect("closing state encodes");
+        assert_eq!(
+            decode_quiesce_ack(&wire, FieldPath::root("ack")).expect("receipt decodes"),
+            receipt
+        );
+    }
+
+    #[test]
+    fn installed_history_and_preparation_failure_phase_are_required_wire_facts() {
+        let task = identity(2, 3, backend());
+        let accepted = TaskStatus::created(task);
+        let mut wire = encode_task_status(&accepted);
+        wire.installed = None;
+        assert!(decode_task_status(&wire, FieldPath::root("missing_installed")).is_err());
+        let failed = TaskStatus::try_new_with_installed(
+            task,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Failed,
+            Some(TerminationDetail::Failed(TaskFailure::new_in_phase(
+                TaskFailureCategory::Protocol,
+                SafeDetail::truncating("invalid preparation"),
+                novarocks_execution_contract::TaskFailurePhase::Preparation,
+            ))),
+            TaskOutputFacts::default(),
+            false,
+        )
+        .unwrap();
+        let mut wire = encode_task_status(&failed);
+        assert_eq!(
+            decode_task_status(&wire, FieldPath::root("failed")).unwrap(),
+            failed
+        );
+        let Some(novarocks::task_termination::Cause::Failed(failure)) =
+            wire.termination.as_mut().unwrap().cause.as_mut()
+        else {
+            panic!("expected failure")
+        };
+        failure.phase = 0;
+        assert!(decode_task_status(&wire, FieldPath::root("missing_phase")).is_err());
+        let Some(novarocks::task_termination::Cause::Failed(failure)) =
+            wire.termination.as_mut().unwrap().cause.as_mut()
+        else {
+            panic!("expected failure")
+        };
+        failure.phase = 99;
+        assert!(decode_task_status(&wire, FieldPath::root("unknown_phase")).is_err());
+        wire.installed = Some(true);
+        let Some(novarocks::task_termination::Cause::Failed(failure)) =
+            wire.termination.as_mut().unwrap().cause.as_mut()
+        else {
+            panic!("expected failure")
+        };
+        failure.phase = novarocks::TaskFailurePhase::Preparation as i32;
+        assert!(decode_task_status(&wire, FieldPath::root("inconsistent_history")).is_err());
+    }
+
+    #[test]
+    fn quiesce_wire_rejects_invalid_fence_state_and_membership() {
+        use super::operation::{decode_quiesce_ack, encode_quiesce_ack};
+        use novarocks_execution_contract::task_execution::operation::QuiesceQueryContextReceipt;
+        let process = backend();
+        let ctx = context(process);
+        let task = identity(2, 3, process);
+        let wire = encode_quiesce_ack(&QuiesceQueryContextReceipt::new(
+            ctx,
+            1,
+            vec![task],
+            QueryContextState::Quiescing,
+        ))
+        .unwrap();
+        assert!(decode_quiesce_ack(&wire, FieldPath::root("valid")).is_ok());
+        let mut invalid = wire.clone();
+        invalid.fence_version = 0;
+        assert!(decode_quiesce_ack(&invalid, FieldPath::root("zero_fence")).is_err());
+        invalid = wire.clone();
+        invalid.state = novarocks::QueryContextState::Active as i32;
+        assert!(decode_quiesce_ack(&invalid, FieldPath::root("active_fence")).is_err());
+        invalid = wire.clone();
+        invalid
+            .accepted_tasks
+            .push(invalid.accepted_tasks[0].clone());
+        assert!(decode_quiesce_ack(&invalid, FieldPath::root("duplicate")).is_err());
+        invalid = wire.clone();
+        invalid.accepted_tasks[0] = encode_task_identity(identity(2, 3, backend()));
+        assert!(decode_quiesce_ack(&invalid, FieldPath::root("foreign_member")).is_err());
+        invalid = wire;
+        invalid.accepted_tasks = vec![
+            invalid.accepted_tasks[0].clone();
+            TransportBudget::DEFAULT.max_tasks_per_context() + 1
+        ];
+        assert!(decode_quiesce_ack(&invalid, FieldPath::root("oversized_membership")).is_err());
     }
 
     #[test]

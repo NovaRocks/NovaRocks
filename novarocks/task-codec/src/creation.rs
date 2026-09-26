@@ -64,28 +64,29 @@ pub const MAX_INITIAL_SCAN_NODES: usize = 1024;
 /// request that never wins drops it. Nothing compares it.
 #[derive(Debug)]
 pub struct DecodedTaskAssignment {
-    wire: novarocks::TaskAssignment,
-    encoded_len: usize,
+    instance_ordinal: u32,
+    encoded: Box<[u8]>,
 }
 
 impl DecodedTaskAssignment {
     /// This task's position among its fragment's instances.
     pub const fn instance_ordinal(&self) -> u32 {
-        self.wire.instance_ordinal
+        self.instance_ordinal
     }
 
-    pub const fn wire(&self) -> &novarocks::TaskAssignment {
-        &self.wire
-    }
-
-    pub fn into_wire(self) -> novarocks::TaskAssignment {
-        self.wire
+    /// Restores the validated private assignment only when its winner prepares.
+    pub fn into_wire(self) -> Result<novarocks::TaskAssignment, prost::DecodeError> {
+        novarocks::TaskAssignment::decode(self.encoded.as_ref())
     }
 }
 
 impl CreationContent for DecodedTaskAssignment {
     fn encoded_len(&self) -> usize {
-        self.encoded_len
+        self.encoded.len()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.encoded.len())
     }
 
     fn into_stored(self: Box<Self>) -> Box<dyn Any + Send> {
@@ -180,10 +181,15 @@ pub fn decode_task_assignment(
         }
     }
 
-    let encoded_len = src.encoded_len();
+    // This private carrier has no fingerprint and never participates in replay
+    // comparison. One bounded encode drops the transient DTO (including its
+    // opaque HashMap allocations) before Accepted retains the assignment.
+    // Boxed bytes have an exact allocation length; decoding belongs to prepare.
+    let instance_ordinal = src.instance_ordinal;
+    let encoded = src.encode_to_vec().into_boxed_slice();
     Ok(DecodedTaskAssignment {
-        wire: src,
-        encoded_len,
+        instance_ordinal,
+        encoded,
     })
 }
 
@@ -411,6 +417,40 @@ mod tests {
     }
 
     #[test]
+    fn assignment_retains_exact_owned_bytes_and_restores_nested_scan_facts() {
+        let file = novarocks::FileScanRange {
+            full_path: Some("s3://warehouse/file.parquet".to_owned()),
+            included_positions: vec![1, 2, 3],
+            file_pruning_min_max_values: (0..128)
+                .map(|key| (key, novarocks::FilePruningMinMaxValue::default()))
+                .collect(),
+            ..Default::default()
+        };
+        let assignment = novarocks::TaskAssignment {
+            instance_ordinal: 0,
+            initial_scan_ranges: vec![novarocks::TaskScanRanges {
+                plan_node_id: 1,
+                ranges: vec![novarocks::ScanRangeParams {
+                    range: Some(novarocks::ScanRange {
+                        kind: Some(novarocks::scan_range::Kind::File(file)),
+                    }),
+                    ..Default::default()
+                }],
+            }],
+            sink_edge_ids: Vec::new(),
+        };
+        let decoded =
+            decode_task_assignment(assignment.clone(), &descriptor(), FieldPath::root("a"))
+                .unwrap();
+        assert_eq!(decoded.encoded_len(), assignment.encoded_len());
+        assert_eq!(
+            decoded.retained_bytes(),
+            std::mem::size_of::<DecodedTaskAssignment>() + decoded.encoded_len()
+        );
+        assert_eq!(decoded.into_wire().unwrap(), assignment);
+    }
+
+    #[test]
     fn an_assignment_orders_its_scan_nodes_and_binds_every_outbound_edge() {
         let descriptor = descriptor();
         let legal = novarocks::TaskAssignment {
@@ -456,6 +496,9 @@ mod tests {
         #[derive(Debug)]
         struct Foreign;
         impl CreationContent for Foreign {
+            fn retained_bytes(&self) -> usize {
+                std::mem::size_of::<Self>()
+            }
             fn encoded_len(&self) -> usize {
                 0
             }

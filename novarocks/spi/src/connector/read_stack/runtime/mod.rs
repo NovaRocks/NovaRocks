@@ -999,6 +999,9 @@ pub trait ConnectorReadSystemTableProvider: Send + Sync {
 /// let _ = factory.create_system_table_provider(request, request.clone());
 /// ```
 pub trait ConnectorAdmittedReadProviderFactory: Send + Sync {
+    /// Exact catalog generation whose task-owned provider this factory opens.
+    fn binding(&self) -> &ConnectorReadBinding;
+
     fn create_page_source_provider(
         &self,
         request: &ConnectorRequestContext,

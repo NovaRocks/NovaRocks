@@ -11,7 +11,15 @@ workspace = true
 doctest = false
 
 [dependencies]
-arrow-schema.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
 novarocks-connector-contract.workspace = true
 novarocks-execution-contract.workspace = true
+novarocks-functions.workspace = true
 novarocks-types.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true

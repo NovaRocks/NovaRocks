@@ -17,9 +17,9 @@
 
 //! Send permission of a push exchange producer's outbound edges.
 //!
-//! Every edge frozen by a task descriptor starts closed, and the producer's
+//! Every destination frozen by a task descriptor starts closed, and the producer's
 //! sink asks this module on every enqueue whether it may send. The opener runs
-//! on another thread, so each edge's live answer is one atomic word rather
+//! on another thread, so each destination's live answer is one atomic word rather
 //! than a lock the send path has to take.
 //!
 //! The runtime owns the private grant state that classifies edge-open
@@ -30,7 +30,7 @@
 //! One runtime fact has no descriptor equivalent: a destination that withdrew
 //! its ingress capability because it no longer needs this output. That is the
 //! destination's normal departure, not this producer's failure, so it closes
-//! exactly one edge and is recorded for a status producer to report.
+//! exactly that destination and leaves its edge's other destinations usable.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -45,18 +45,18 @@ use crate::task_execution::domain::{
     DomainConflict, EdgeOpenVersion, EdgeSendPermission, ExchangeEdgeId,
 };
 
-/// What a producer may do on one outbound edge right now.
+/// What a producer may do for one outbound destination right now.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum EdgeSendState {
     /// Send permission has not been granted yet. The sink sends nothing and
     /// holds what it has under the send queue's existing bounded
     /// backpressure.
     AwaitingPermission,
-    /// Every frozen destination of this edge acknowledged its creation, so
-    /// the producer may send.
+    /// The edge received its complete open grant and this destination still
+    /// needs input, so the producer may send.
     Open,
     /// A destination withdrew its ingress capability because it no longer
-    /// needs this output. Nothing further is sent on this edge and its
+    /// needs this output. Nothing further is sent to this destination and its
     /// pending frames are discarded.
     NormallyCanceled,
 }
@@ -85,7 +85,7 @@ const STATE_AWAITING_PERMISSION: u8 = 0;
 const STATE_OPEN: u8 = 1;
 const STATE_NORMALLY_CANCELED: u8 = 2;
 
-/// The live send permission of one outbound exchange edge.
+/// The live send permission of one outbound exchange destination.
 ///
 /// The sink reads it on every enqueue while the opener and the send workers
 /// write it from other threads, which is why the whole state is a single
@@ -93,19 +93,25 @@ const STATE_NORMALLY_CANCELED: u8 = 2;
 #[derive(Debug)]
 pub struct EdgeSendGate {
     edge_id: ExchangeEdgeId,
+    destination: ExchangeDestinationKey,
     state: AtomicU8,
 }
 
 impl EdgeSendGate {
-    fn closed(edge_id: ExchangeEdgeId) -> Self {
+    fn closed(edge_id: ExchangeEdgeId, destination: ExchangeDestinationKey) -> Self {
         Self {
             edge_id,
+            destination,
             state: AtomicU8::new(STATE_AWAITING_PERMISSION),
         }
     }
 
     pub const fn edge_id(&self) -> ExchangeEdgeId {
         self.edge_id
+    }
+
+    pub const fn destination(&self) -> ExchangeDestinationKey {
+        self.destination
     }
 
     pub fn state(&self) -> EdgeSendState {
@@ -127,8 +133,7 @@ impl EdgeSendGate {
     /// Publishes an open that [`ExchangeEdgeGates::open`] already accepted.
     ///
     /// Only `AwaitingPermission -> Open` moves. A grant that was already in
-    /// flight when the destination departed must not resurrect the edge, so a
-    /// withdrawn edge stays withdrawn.
+    /// flight when the destination departed must not resurrect it.
     fn grant_send_permission(&self) {
         let _ = self.state.compare_exchange(
             STATE_AWAITING_PERMISSION,
@@ -142,10 +147,9 @@ impl EdgeSendGate {
     /// capability for the one normal reason
     /// (`CancelReason::UpstreamNoLongerNeeded`).
     ///
-    /// Returns whether this call is the one that closed the edge, so its
-    /// abandoned frames are discarded exactly once. It is a latch: a repeat,
-    /// or a second destination of the same edge reporting the same thing,
-    /// converges on the same state whatever the order.
+    /// Returns whether this call is the one that closed this destination, so
+    /// its abandoned frames are discarded exactly once. A second destination
+    /// of the same edge owns a different latch.
     pub(crate) fn close_for_normal_cancellation(&self) -> bool {
         self.state.swap(STATE_NORMALLY_CANCELED, Ordering::AcqRel) != STATE_NORMALLY_CANCELED
     }
@@ -316,7 +320,7 @@ impl EdgeGrantState {
 /// monotonic: this release has no close, reopen, or reconfigure operation.
 #[derive(Debug)]
 pub struct ExchangeEdgeGates {
-    gates: BTreeMap<ExchangeEdgeId, Arc<EdgeSendGate>>,
+    edge_destinations: BTreeMap<ExchangeEdgeId, Vec<Arc<EdgeSendGate>>>,
     destinations: HashMap<ExchangeDestinationKey, Arc<EdgeSendGate>>,
     granted: Mutex<EdgeGrantState>,
     /// Every producer driver that must be woken when an edge opens.
@@ -341,25 +345,28 @@ impl ExchangeEdgeGates {
     pub fn try_new(
         edges: impl IntoIterator<Item = (ExchangeEdgeId, Vec<ExchangeDestinationKey>)>,
     ) -> Result<Arc<Self>, ExchangeEdgeGateError> {
-        let mut gates: BTreeMap<ExchangeEdgeId, Arc<EdgeSendGate>> = BTreeMap::new();
+        let mut edge_destinations = BTreeMap::new();
         let mut destinations: HashMap<ExchangeDestinationKey, Arc<EdgeSendGate>> = HashMap::new();
         for (edge_id, keys) in edges {
             if keys.is_empty() {
                 return Err(ExchangeEdgeGateError::EdgeWithoutDestinations(edge_id));
             }
-            let gate = Arc::new(EdgeSendGate::closed(edge_id));
-            if gates.insert(edge_id, Arc::clone(&gate)).is_some() {
+            if edge_destinations.contains_key(&edge_id) {
                 return Err(ExchangeEdgeGateError::DuplicateEdge(edge_id));
             }
+            let mut frozen = Vec::with_capacity(keys.len());
             for key in keys {
+                let gate = Arc::new(EdgeSendGate::closed(edge_id, key));
                 if destinations.insert(key, Arc::clone(&gate)).is_some() {
                     return Err(ExchangeEdgeGateError::DestinationClaimedTwice(key));
                 }
+                frozen.push(gate);
             }
+            edge_destinations.insert(edge_id, frozen);
         }
-        let granted = EdgeGrantState::from_frozen_edges(gates.keys().copied());
+        let granted = EdgeGrantState::from_frozen_edges(edge_destinations.keys().copied());
         Ok(Arc::new(Self {
-            gates,
+            edge_destinations,
             destinations,
             granted: Mutex::new(granted),
             open_waiters: Mutex::new(Vec::new()),
@@ -419,11 +426,17 @@ impl ExchangeEdgeGates {
         }
     }
 
-    pub fn gate(&self, edge: ExchangeEdgeId) -> Option<&Arc<EdgeSendGate>> {
-        self.gates.get(&edge)
+    /// A helper for existing tests that freeze exactly one destination per
+    /// edge. A multi-destination edge has no representative destination gate.
+    #[cfg(test)]
+    pub(crate) fn gate(&self, edge: ExchangeEdgeId) -> Option<&Arc<EdgeSendGate>> {
+        self.edge_destinations
+            .get(&edge)
+            .filter(|gates| gates.len() == 1)
+            .and_then(|gates| gates.first())
     }
 
-    /// The gate of the edge that froze `key`, or `None` for a destination
+    /// The independent gate for `key`, or `None` for a destination
     /// this producer does not have. An absent attribution is never an
     /// implicit permission: the caller must fail closed.
     pub fn gate_for_destination(&self, key: ExchangeDestinationKey) -> Option<&Arc<EdgeSendGate>> {
@@ -431,7 +444,19 @@ impl ExchangeEdgeGates {
     }
 
     pub fn edges(&self) -> impl Iterator<Item = (ExchangeEdgeId, EdgeSendState)> + '_ {
-        self.gates.iter().map(|(edge, gate)| (*edge, gate.state()))
+        self.edge_destinations
+            .iter()
+            .map(|(edge, gates)| (*edge, Self::aggregate_edge_state(gates)))
+    }
+
+    fn aggregate_edge_state(gates: &[Arc<EdgeSendGate>]) -> EdgeSendState {
+        if gates.iter().all(|gate| gate.is_normally_canceled()) {
+            EdgeSendState::NormallyCanceled
+        } else if gates.iter().any(|gate| gate.may_send()) {
+            EdgeSendState::Open
+        } else {
+            EdgeSendState::AwaitingPermission
+        }
     }
 
     /// The permission the frontend granted, which is monotonic and is never
@@ -458,8 +483,10 @@ impl ExchangeEdgeGates {
         match granted.grant(version, edges) {
             Ok(EdgeOpenAccepted::Applied) => {
                 for edge in edges {
-                    if let Some(gate) = self.gates.get(edge) {
-                        gate.grant_send_permission();
+                    if let Some(gates) = self.edge_destinations.get(edge) {
+                        for gate in gates {
+                            gate.grant_send_permission();
+                        }
                     }
                 }
                 // Released before the wake, so a woken driver reads the open
@@ -473,13 +500,24 @@ impl ExchangeEdgeGates {
         }
     }
 
-    /// Every edge a destination's normal cancellation closed, lowest id
-    /// first. This is the fact a status producer needs to report normal
-    /// downstream cancellation instead of a failure.
-    pub fn normally_canceled_edges(&self) -> Vec<ExchangeEdgeId> {
-        self.gates
+    /// Exact destinations that closed normally, in key order. A partially
+    /// closed edge must not be reported as wholly closed.
+    pub fn normally_canceled_destinations(&self) -> Vec<ExchangeDestinationKey> {
+        let mut result = self
+            .destinations
             .iter()
             .filter(|(_, gate)| gate.is_normally_canceled())
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        result.sort();
+        result
+    }
+
+    /// Edges whose every destination closed normally, lowest id first.
+    pub fn normally_canceled_edges(&self) -> Vec<ExchangeEdgeId> {
+        self.edge_destinations
+            .iter()
+            .filter(|(_, gates)| gates.iter().all(|gate| gate.is_normally_canceled()))
             .map(|(edge, _)| *edge)
             .collect()
     }
@@ -488,10 +526,7 @@ impl ExchangeEdgeGates {
     /// latch is set once per edge, so this counts edges and cancellation
     /// reports alike.
     pub fn normally_canceled_edge_count(&self) -> usize {
-        self.gates
-            .values()
-            .filter(|gate| gate.is_normally_canceled())
-            .count()
+        self.normally_canceled_edges().len()
     }
 }
 
@@ -592,7 +627,10 @@ mod tests {
     fn every_frozen_edge_starts_closed_and_opens_exactly_once() {
         let gates = two_edges();
         assert_eq!(
-            gates.gate(edge(1)).expect("edge one").state(),
+            gates
+                .gate_for_destination(key(1))
+                .expect("destination one")
+                .state(),
             EdgeSendState::AwaitingPermission
         );
         assert_eq!(
@@ -605,7 +643,18 @@ mod tests {
             gates.open(EdgeOpenVersion::FIRST, &[edge(1)]),
             Ok(EdgeOpenAccepted::Applied)
         );
-        assert!(gates.gate(edge(1)).expect("edge one").may_send());
+        assert!(
+            gates
+                .gate_for_destination(key(1))
+                .expect("destination one")
+                .may_send()
+        );
+        assert!(
+            gates
+                .gate_for_destination(key(2))
+                .expect("destination two")
+                .may_send()
+        );
         assert_eq!(
             gates.granted_permission(edge(1)),
             Some(EdgeSendPermission::Open)
@@ -640,7 +689,10 @@ mod tests {
             Err(DomainConflict::SameTokenDifferentContent)
         );
         assert_eq!(
-            gates.gate(edge(1)).expect("edge one").state(),
+            gates
+                .gate_for_destination(key(1))
+                .expect("destination one")
+                .state(),
             EdgeSendState::AwaitingPermission,
             "a rejected open must leave the edge closed"
         );
@@ -693,6 +745,10 @@ mod tests {
     #[test]
     fn a_destination_is_attributed_to_exactly_one_edge() {
         let gates = two_edges();
+        assert!(
+            gates.gate(edge(1)).is_none(),
+            "a multi-destination edge has no representative gate"
+        );
         assert_eq!(
             gates
                 .gate_for_destination(key(2))
@@ -740,26 +796,29 @@ mod tests {
     }
 
     #[test]
-    fn a_normal_cancellation_closes_only_its_own_edge_and_never_reopens_it() {
+    fn a_normal_cancellation_closes_only_its_destination_and_never_reopens_it() {
         let gates = two_edges();
         gates
             .open(EdgeOpenVersion::FIRST, &[edge(1), edge(2)])
             .expect("open both");
 
-        let first = gates.gate(edge(1)).expect("edge one");
+        let first = gates.gate_for_destination(key(1)).expect("destination one");
         assert!(first.close_for_normal_cancellation());
         assert_eq!(first.state(), EdgeSendState::NormallyCanceled);
         assert!(!first.may_send());
         assert!(
             !first.close_for_normal_cancellation(),
-            "only the first report closes the edge, so frames are discarded once"
+            "only the first report closes the destination, so frames are discarded once"
         );
 
+        let sibling = gates.gate_for_destination(key(2)).expect("destination two");
+        assert!(sibling.may_send(), "the same edge's sibling keeps sending");
         let second = gates.gate(edge(2)).expect("edge two");
         assert!(second.may_send(), "the other edge keeps sending");
 
-        assert_eq!(gates.normally_canceled_edges(), vec![edge(1)]);
-        assert_eq!(gates.normally_canceled_edge_count(), 1);
+        assert_eq!(gates.normally_canceled_destinations(), vec![key(1)]);
+        assert!(gates.normally_canceled_edges().is_empty());
+        assert_eq!(gates.normally_canceled_edge_count(), 0);
         assert_eq!(
             gates.granted_permission(edge(1)),
             Some(EdgeSendPermission::Open),
@@ -776,6 +835,10 @@ mod tests {
             EdgeSendState::NormallyCanceled,
             "a grant may never resurrect a destination that already left"
         );
+        assert!(sibling.may_send());
+        assert!(sibling.close_for_normal_cancellation());
+        assert_eq!(gates.normally_canceled_edges(), vec![edge(1)]);
+        assert_eq!(gates.normally_canceled_edge_count(), 1);
     }
 
     #[test]
@@ -794,13 +857,20 @@ mod tests {
         // reported in an order no producer controls.
         let third = gates.gate(edge(3)).expect("edge three");
         assert!(third.close_for_normal_cancellation());
-        let first = gates.gate(edge(1)).expect("edge one");
+        let first = gates.gate_for_destination(key(1)).expect("destination one");
         assert!(first.close_for_normal_cancellation());
         assert!(!first.close_for_normal_cancellation());
         assert!(!third.close_for_normal_cancellation());
 
-        assert_eq!(gates.normally_canceled_edges(), vec![edge(1), edge(3)]);
-        assert_eq!(gates.normally_canceled_edge_count(), 2);
+        assert_eq!(gates.normally_canceled_destinations(), vec![key(1), key(4)]);
+        assert_eq!(gates.normally_canceled_edges(), vec![edge(3)]);
+        assert_eq!(gates.normally_canceled_edge_count(), 1);
+        assert!(
+            gates
+                .gate_for_destination(key(2))
+                .expect("sibling")
+                .may_send()
+        );
         assert_eq!(
             gates.gate(edge(2)).expect("edge two").state(),
             EdgeSendState::AwaitingPermission,
@@ -811,7 +881,34 @@ mod tests {
                 .edges()
                 .filter(|(_, state)| *state == EdgeSendState::NormallyCanceled)
                 .count(),
-            2
+            1
+        );
+    }
+
+    #[test]
+    fn close_before_open_never_revives_one_destination_or_blocks_its_sibling() {
+        let gates = two_edges();
+        let closed = gates
+            .gate_for_destination(key(1))
+            .expect("first destination");
+        let sibling = gates
+            .gate_for_destination(key(2))
+            .expect("second destination");
+        assert!(!Arc::ptr_eq(closed, sibling));
+        assert!(closed.close_for_normal_cancellation());
+        assert_eq!(closed.state(), EdgeSendState::NormallyCanceled);
+        assert_eq!(sibling.state(), EdgeSendState::AwaitingPermission);
+
+        gates
+            .open(EdgeOpenVersion::FIRST, &[edge(1)])
+            .expect("edge grant");
+        assert_eq!(closed.state(), EdgeSendState::NormallyCanceled);
+        assert_eq!(sibling.state(), EdgeSendState::Open);
+        assert_eq!(gates.normally_canceled_destinations(), vec![key(1)]);
+        assert!(gates.normally_canceled_edges().is_empty());
+        assert_eq!(
+            gates.edges().find(|(id, _)| *id == edge(1)).unwrap().1,
+            EdgeSendState::Open
         );
     }
 
@@ -859,7 +956,10 @@ mod tests {
             edge(1)
         );
         assert_eq!(
-            gates.gate(edge(1)).expect("edge one").state(),
+            gates
+                .gate_for_destination(key(1))
+                .expect("destination one")
+                .state(),
             EdgeSendState::AwaitingPermission,
             "a frozen descriptor grants no send permission by itself"
         );

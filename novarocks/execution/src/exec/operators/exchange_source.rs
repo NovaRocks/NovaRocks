@@ -326,6 +326,11 @@ impl Operator for ExchangeSourceOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        let _ = state;
+        Ok(())
+    }
+
+    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
         if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
             consumers.bind(state)?;
         }
@@ -1246,6 +1251,7 @@ mod tests {
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
         source.bind_runtime_state(&state).unwrap();
+        source.activate(&state).unwrap();
         binding_receiver_port(&factory).push_local(
             receiver_key(key),
             0,
@@ -1292,6 +1298,7 @@ mod tests {
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
         source.bind_runtime_state(&state).unwrap();
+        source.activate(&state).unwrap();
         binding_receiver_port(&factory).push_local(
             receiver_key(key),
             0,

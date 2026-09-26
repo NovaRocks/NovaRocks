@@ -32,6 +32,7 @@ use novarocks_execution::runtime::fragment::ExchangeInputAssignment;
 use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentInstanceId};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_functions::EngineFunctionCatalog;
+use novarocks_local_program::StaticConnectorScan;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_spi::connector::ConnectorStopView;
 use novarocks_types::QueryId;
@@ -52,6 +53,7 @@ pub struct NativePlanDecodeContext {
     exchange_inputs: ExchangeInputAssignments,
     raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
     captured_scan_ranges: RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
+    captured_static_scans: RefCell<BTreeMap<i32, StaticConnectorScan>>,
     query_options: Option<QueryOptions>,
     connector_stop: Option<ConnectorStopView>,
     query_id: Option<QueryId>,
@@ -70,6 +72,7 @@ impl Default for NativePlanDecodeContext {
             exchange_inputs: ExchangeInputAssignments::default(),
             raw_scan_ranges: BTreeMap::new(),
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
+            captured_static_scans: RefCell::new(BTreeMap::new()),
             query_options: None,
             connector_stop: None,
             query_id: None,
@@ -100,6 +103,7 @@ impl NativePlanDecodeContext {
             exchange_inputs,
             raw_scan_ranges,
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
+            captured_static_scans: RefCell::new(BTreeMap::new()),
             query_options: Some(query_options),
             connector_stop: Some(connector_stop),
             query_id: Some(query_id),
@@ -146,6 +150,30 @@ impl NativePlanDecodeContext {
 
     pub fn take_captured_scan_ranges(&self) -> BTreeMap<FragmentNodeId, BoundScanRanges> {
         std::mem::take(&mut self.captured_scan_ranges.borrow_mut())
+    }
+
+    pub fn capture_static_scan(
+        &self,
+        node_id: i32,
+        scan: StaticConnectorScan,
+    ) -> Result<(), NativeFragmentLeafDecodeError> {
+        if self
+            .captured_static_scans
+            .borrow_mut()
+            .insert(node_id, scan)
+            .is_some()
+        {
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                novarocks_proto_codec::ProtocolErrorKind::Conflict,
+                "typed_connector_read",
+                format!("duplicate static scan node_id={node_id}"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn take_captured_static_scans(&self) -> BTreeMap<i32, StaticConnectorScan> {
+        std::mem::take(&mut self.captured_static_scans.borrow_mut())
     }
 
     #[cfg(any(test, feature = "test-support"))]

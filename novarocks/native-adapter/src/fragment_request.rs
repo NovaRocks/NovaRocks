@@ -132,12 +132,12 @@ impl NativeFragmentRequest {
         self.submission.program().runtime_filters().has_bindings()
     }
     pub fn uses_result_sink(&self) -> bool {
-        self.submission.program().sink().kind()
+        self.submission.program().sink_kind()
             == novarocks_execution::exec::fragment::program::FragmentSinkKind::Result
     }
     /// What the decoded program's sink does.
     pub fn sink_kind(&self) -> novarocks_execution::exec::fragment::program::FragmentSinkKind {
-        self.submission.program().sink().kind()
+        self.submission.program().sink_kind()
     }
     pub fn root_plan_node_id(&self) -> i32 {
         self.submission.program().root_plan_node_id().get()

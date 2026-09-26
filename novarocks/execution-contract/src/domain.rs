@@ -81,6 +81,7 @@ pub enum TaskDomainKind {
     SplitAssignment,
     TaskDynamicFilter,
     OpenExchangeEdges,
+    CloseExchangeDestination,
 }
 
 /// Query-context domains, advanced only by `UpdateQueryContext`.

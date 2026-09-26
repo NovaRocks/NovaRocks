@@ -34,7 +34,7 @@ use novarocks_query_application::coordination::{
     AdmissionIssueReceipt, AdmissionIssueSettlement, EstablishIssueError, EstablishIssueSubmit,
     EstablishTransportAdmission, EstablishTransportReservation, EstablishTransportSink,
     EstablishTransportSubmission, LateEstablishWorkerSettlement, LogicalExecutionActorError,
-    NativeAttemptDrive,
+    NativeAttemptDrive, OperationDispatchResult,
 };
 use novarocks_types::NativeCompatibilityId;
 
@@ -228,6 +228,7 @@ impl ActorGatedTaskOperationSink {
             shared: Arc::clone(&shared),
             native_compatibility_id,
             admission_issues: BTreeMap::new(),
+            admission_transport_unknowns: BTreeSet::new(),
             establish_authorization_attempted: BTreeSet::new(),
             establish_submissions: BTreeMap::new(),
             late_establish_settlements: BTreeMap::new(),
@@ -301,6 +302,7 @@ pub(crate) struct ActorGateOwner {
     shared: Arc<ActorGateShared>,
     native_compatibility_id: NativeCompatibilityId,
     admission_issues: BTreeMap<TaskOperationId, AdmissionIssueReceipt>,
+    admission_transport_unknowns: BTreeSet<TaskOperationId>,
     establish_authorization_attempted: BTreeSet<TaskOperationId>,
     establish_submissions: BTreeMap<TaskOperationId, EstablishTransportSubmission>,
     late_establish_settlements: BTreeMap<TaskOperationId, VecDeque<LateEstablishWorkerSettlement>>,
@@ -313,6 +315,10 @@ impl std::fmt::Debug for ActorGateOwner {
         formatter
             .debug_struct("ActorGateOwner")
             .field("admission_issues", &self.admission_issues.len())
+            .field(
+                "admission_transport_unknowns",
+                &self.admission_transport_unknowns.len(),
+            )
             .field("establish_submissions", &self.establish_submissions.len())
             .field(
                 "late_establish_settlements",
@@ -386,6 +392,7 @@ impl ActorGateOwner {
             return false;
         }
         self.admission_issues.clear();
+        self.admission_transport_unknowns.clear();
         self.late_establish_settlements.clear();
         true
     }
@@ -535,23 +542,36 @@ impl ActorGateOwner {
         let Some(&issue) = self.admission_issues.get(&operation_id) else {
             return Ok(0);
         };
-        let Some(outcome) = acknowledgement.worker_outcome() else {
-            // The same Task protocol request is retained for exact replay. Its
-            // first-send receipt remains the actor ledger's authority.
-            return Ok(0);
-        };
-        let settlement = match acknowledgement.payload() {
-            AckPayload::AdmissionTicket(ticket) => {
-                AdmissionIssueSettlement::applied(operation_id, outcome, *ticket)
+        let settlement = match acknowledgement.dispatch_result() {
+            OperationDispatchResult::TransportUnknown => {
+                // The exact request remains owned for replay.
+                self.admission_transport_unknowns.insert(operation_id);
+                return Ok(0);
             }
-            _ => AdmissionIssueSettlement::rejected(operation_id, outcome),
-        }
-        .map_err(actor_establish_error)?;
+            OperationDispatchResult::WorkerReceipt(receipt) => {
+                let outcome = receipt.outcome();
+                match acknowledgement.payload() {
+                    AckPayload::AdmissionTicket(ticket) => {
+                        AdmissionIssueSettlement::applied(operation_id, outcome, *ticket)
+                    }
+                    _ => AdmissionIssueSettlement::rejected(operation_id, outcome),
+                }
+                .map_err(actor_establish_error)?
+            }
+            OperationDispatchResult::IngressRejected(_)
+            | OperationDispatchResult::NonWorkerRejected => {
+                AdmissionIssueSettlement::pre_worker_rejected_with_prior_unknown(
+                    operation_id,
+                    self.admission_transport_unknowns.contains(&operation_id),
+                )
+            }
+        };
         drive
             .settle_admission_issue(issue, settlement)
             .await
             .map_err(actor_error)?;
         self.admission_issues.remove(&operation_id);
+        self.admission_transport_unknowns.remove(&operation_id);
         Ok(1)
     }
 
@@ -561,6 +581,26 @@ impl ActorGateOwner {
     ) -> Result<usize, TaskExecutionError> {
         let operation_id = acknowledgement.operation_id();
         let Some(outcome) = acknowledgement.worker_outcome() else {
+            if acknowledgement.dispatch_result() != OperationDispatchResult::TransportUnknown {
+                // An ingress refusal is definitive for this dispatch, but it
+                // cannot settle a different generation whose response was
+                // already lost. Retain those late unknown guards for Abort.
+                if let Some(submission) = self.establish_submissions.remove(&operation_id) {
+                    submission
+                        .pre_worker_rejected()
+                        .map_err(actor_establish_error)?;
+                    return Ok(1);
+                }
+                if let Some(late) = self
+                    .late_establish_settlements
+                    .get_mut(&operation_id)
+                    .and_then(VecDeque::pop_front)
+                {
+                    late.pre_worker_rejected().map_err(actor_establish_error)?;
+                    return Ok(1);
+                }
+                return Ok(0);
+            }
             let Some(submission) = self.establish_submissions.remove(&operation_id) else {
                 return Ok(0);
             };
@@ -1085,6 +1125,89 @@ mod tests {
         assert_eq!(harness.owner.drive(&harness.drive).await.unwrap(), 2);
         assert!(harness.owner.prepare_convergence());
         harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn ingress_rejected_establish_keeps_the_granted_context_for_abort() {
+        let mut harness = EstablishReplayHarness::new().await;
+        let acknowledgement = OperationAcknowledgement::from_dispatch_result(
+            harness.request.envelope().operation_id(),
+            OperationKind::UpdateQueryContext,
+            OperationDispatchResult::IngressRejected(
+                novarocks_query_application::coordination::IngressRejection::WaitingCapacity,
+            ),
+            AckPayload::None,
+        );
+        harness
+            .observer
+            .observe_acknowledgement(&acknowledgement)
+            .unwrap();
+        assert!(matches!(
+            harness.context_owner.on_context_ack(&acknowledgement),
+            Err(TaskExecutionError::DispatchRejected {
+                kind: OperationKind::UpdateQueryContext,
+                ..
+            })
+        ));
+        assert!(!harness.context_owner.is_released());
+        assert_eq!(harness.owner.drive(&harness.drive).await.unwrap(), 1);
+        assert!(harness.owner.establish_submissions.is_empty());
+        assert!(harness.owner.prepare_convergence());
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn ingress_refusal_after_unknown_admission_keeps_context_abort_owner() {
+        let context = context(BackendProcessId::new_v7());
+        let mut owner = QueryContextOwner::new(
+            context,
+            0,
+            NativeCompatibilityId::new([31; 32]),
+            AdmissionEpochCapability::try_from_bytes([9; 16]).unwrap(),
+        );
+        let OperationIntent::AcquireQueryContextAdmissionTicket(request) = owner
+            .admission_intent(MonotonicInstant::ORIGIN)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("the context must begin admission");
+        };
+        owner
+            .on_admission_ack(
+                &OperationAcknowledgement::transport_unknown(
+                    request.envelope().operation_id(),
+                    OperationKind::AcquireQueryContextAdmissionTicket,
+                ),
+                MonotonicInstant::ORIGIN,
+            )
+            .unwrap();
+        assert!(
+            owner
+                .admission_intent(MonotonicInstant::ORIGIN)
+                .unwrap()
+                .is_some()
+        );
+        let refusal = OperationAcknowledgement::from_dispatch_result(
+            request.envelope().operation_id(),
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            OperationDispatchResult::IngressRejected(
+                novarocks_query_application::coordination::IngressRejection::WaitingCapacity,
+            ),
+            AckPayload::None,
+        );
+        assert!(matches!(
+            owner.on_admission_ack(&refusal, MonotonicInstant::ORIGIN),
+            Err(TaskExecutionError::DispatchRejected {
+                kind: OperationKind::AcquireQueryContextAdmissionTicket,
+                ..
+            })
+        ));
+        assert!(!owner.is_released());
+        assert!(
+            owner
+                .abort_intent(novarocks_execution::task_execution::AbortCause::QueryFailed)
+                .is_some()
+        );
     }
 
     #[tokio::test]

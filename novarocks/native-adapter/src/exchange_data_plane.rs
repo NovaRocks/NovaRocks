@@ -24,7 +24,7 @@ use novarocks_execution::runtime::fragment::io::{
 use novarocks_execution_contract::FragmentNodeId;
 use novarocks_proto_models as proto;
 use novarocks_types::UniqueId;
-use novarocks_worker::{InboundFrameClaim, TaskInboundCapabilities};
+use novarocks_worker::{InboundFrameClaim, NormalClosedInbound, TaskInboundCapabilities};
 
 /// Exactly the addressing fields one inbound exchange frame carries.
 ///
@@ -56,13 +56,23 @@ pub enum ExchangeRouteClaim {
     NotHeld,
     /// This authority holds the destination and the frame's route is legal.
     Authorized,
+    NormallyClosed(NormalClosedInbound),
     /// This authority holds the destination and the frame's route is illegal.
+    Refused(String),
+}
+
+pub enum ExchangeRouteDelivery {
+    Delivered,
+    NormallyClosed(NormalClosedInbound),
     Refused(String),
 }
 
 impl ExchangeRouteClaim {
     const fn claims_destination(&self) -> bool {
-        matches!(self, Self::Authorized | Self::Refused(_))
+        matches!(
+            self,
+            Self::Authorized | Self::NormallyClosed(_) | Self::Refused(_)
+        )
     }
 }
 
@@ -77,6 +87,30 @@ pub trait ExchangeRouteAuthority: Send + Sync + 'static {
     fn authority_name(&self) -> &'static str;
 
     fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim;
+
+    fn deliver_exchange_route(
+        &self,
+        query: ExchangeRouteQuery,
+        receiver_port: &dyn ExchangeReceiverPort,
+        key: ExchangeReceiverKey,
+        frame: ExchangeReceiverFrame,
+    ) -> ExchangeRouteDelivery {
+        match self.claim_exchange_route(query) {
+            ExchangeRouteClaim::Authorized => match receiver_port.push(key, frame) {
+                Ok(()) => ExchangeRouteDelivery::Delivered,
+                Err(error) => {
+                    ExchangeRouteDelivery::Refused(format!("exchange ingress failed: {error}"))
+                }
+            },
+            ExchangeRouteClaim::NormallyClosed(proof) => {
+                ExchangeRouteDelivery::NormallyClosed(proof)
+            }
+            ExchangeRouteClaim::Refused(detail) => ExchangeRouteDelivery::Refused(detail),
+            ExchangeRouteClaim::NotHeld => ExchangeRouteDelivery::Refused(
+                "destination owner withdrew its route before delivery".to_owned(),
+            ),
+        }
+    }
 }
 
 /// Native projection of the Worker-owned task inbound-capability verdict.
@@ -108,7 +142,38 @@ impl ExchangeRouteAuthority for TaskInboundCapabilitiesRouteAuthority {
         ) {
             InboundFrameClaim::NotHeld => ExchangeRouteClaim::NotHeld,
             InboundFrameClaim::Authorized => ExchangeRouteClaim::Authorized,
+            InboundFrameClaim::NormallyClosed(proof) => ExchangeRouteClaim::NormallyClosed(proof),
             InboundFrameClaim::Refused(detail) => ExchangeRouteClaim::Refused(detail),
+        }
+    }
+
+    fn deliver_exchange_route(
+        &self,
+        query: ExchangeRouteQuery,
+        receiver_port: &dyn ExchangeReceiverPort,
+        key: ExchangeReceiverKey,
+        frame: ExchangeReceiverFrame,
+    ) -> ExchangeRouteDelivery {
+        match self.0.deliver_frame(
+            query.destination_fragment_instance_id,
+            FragmentNodeId::new(query.destination_node_id),
+            query.source_fragment_instance_id,
+            query.sender_ordinal,
+            query.sender_count,
+            || {
+                receiver_port
+                    .push(key, frame)
+                    .map_err(|error| error.to_string())
+            },
+        ) {
+            InboundFrameClaim::Authorized => ExchangeRouteDelivery::Delivered,
+            InboundFrameClaim::NormallyClosed(proof) => {
+                ExchangeRouteDelivery::NormallyClosed(proof)
+            }
+            InboundFrameClaim::Refused(detail) => ExchangeRouteDelivery::Refused(detail),
+            InboundFrameClaim::NotHeld => ExchangeRouteDelivery::Refused(
+                "task destination was withdrawn before delivery".to_owned(),
+            ),
         }
     }
 }
@@ -194,30 +259,32 @@ impl fmt::Display for ExchangeRouteRefusal {
 fn settle_exchange_route(
     authorities: &[&dyn ExchangeRouteAuthority],
     query: ExchangeRouteQuery,
-) -> Result<(), ExchangeRouteRefusal> {
+) -> Result<usize, ExchangeRouteRefusal> {
     if authorities.is_empty() {
         return Err(ExchangeRouteRefusal::NoAuthority);
     }
-    let mut claimants: Vec<(&'static str, ExchangeRouteClaim)> = Vec::new();
-    for authority in authorities {
+    let mut claimants: Vec<(usize, &'static str, ExchangeRouteClaim)> = Vec::new();
+    for (index, authority) in authorities.iter().enumerate() {
         let claim = authority.claim_exchange_route(query);
         if claim.claims_destination() {
-            claimants.push((authority.authority_name(), claim));
+            claimants.push((index, authority.authority_name(), claim));
         }
     }
     match claimants.len() {
         0 => Err(ExchangeRouteRefusal::NoOwner),
         1 => match claimants.pop().expect("one claimant") {
-            (_, ExchangeRouteClaim::Authorized) => Ok(()),
-            (authority, ExchangeRouteClaim::Refused(detail)) => {
+            (index, _, ExchangeRouteClaim::Authorized | ExchangeRouteClaim::NormallyClosed(_)) => {
+                Ok(index)
+            }
+            (_, authority, ExchangeRouteClaim::Refused(detail)) => {
                 Err(ExchangeRouteRefusal::Refused { authority, detail })
             }
-            (_, ExchangeRouteClaim::NotHeld) => {
+            (_, _, ExchangeRouteClaim::NotHeld) => {
                 unreachable!("a disclaimed route is not collected as a claimant")
             }
         },
         _ => Err(ExchangeRouteRefusal::Conflict {
-            authorities: claimants.into_iter().map(|(name, _)| name).collect(),
+            authorities: claimants.into_iter().map(|(_, name, _)| name).collect(),
         }),
     }
 }
@@ -244,6 +311,7 @@ pub fn handle_transmit_chunk(
     let mut response = proto::novarocks::ExchangeResponse {
         ack_sequence: params.sequence,
         status: Some(ok_common_status()),
+        normal_closed: None,
     };
 
     let destination_fragment_instance_id = UniqueId::new(params.finst_id_hi, params.finst_id_lo);
@@ -269,21 +337,22 @@ pub fn handle_transmit_chunk(
         ));
         return response;
     }
-    if let Err(refusal) = settle_exchange_route(
-        authorities,
-        ExchangeRouteQuery {
-            destination_fragment_instance_id,
-            destination_node_id: params.node_id,
-            source_fragment_instance_id,
-            sender_ordinal: params.sender_ordinal,
-            sender_count: params.sender_count,
-        },
-    ) {
-        response.status = Some(error_common_status(format!(
-            "exchange ingress route rejected: {refusal}"
-        )));
-        return response;
-    }
+    let query = ExchangeRouteQuery {
+        destination_fragment_instance_id,
+        destination_node_id: params.node_id,
+        source_fragment_instance_id,
+        sender_ordinal: params.sender_ordinal,
+        sender_count: params.sender_count,
+    };
+    let owner = match settle_exchange_route(authorities, query) {
+        Ok(index) => index,
+        Err(refusal) => {
+            response.status = Some(error_common_status(format!(
+                "exchange ingress route rejected: {refusal}"
+            )));
+            return response;
+        }
+    };
 
     let key = ExchangeReceiverKey {
         fragment_instance_id: destination_fragment_instance_id,
@@ -299,10 +368,27 @@ pub fn handle_transmit_chunk(
         eos: params.eos,
         payload: params.payload,
     };
-    if let Err(err) = receiver_port.push(key, frame) {
-        response.status = Some(error_common_status(format!(
-            "exchange ingress failed: {err}"
-        )));
+    match authorities[owner].deliver_exchange_route(query, receiver_port, key, frame) {
+        ExchangeRouteDelivery::Delivered => {}
+        ExchangeRouteDelivery::NormallyClosed(proof) => {
+            response.normal_closed = Some(proto::novarocks::ExchangeNormalClosed {
+                destination_task: Some(novarocks_task_codec::identity::encode_task_identity(
+                    proof.destination(),
+                )),
+                destination_finst_id_hi: proof.destination_kernel_key().high(),
+                destination_finst_id_lo: proof.destination_kernel_key().low(),
+                destination_node_id: proof.destination_node_id().get(),
+                source_finst_id_hi: proof.source().fragment_instance_id().high(),
+                source_finst_id_lo: proof.source().fragment_instance_id().low(),
+                sender_ordinal: proof.source().sender_ordinal(),
+                sender_count: proof.sender_count(),
+            });
+        }
+        ExchangeRouteDelivery::Refused(detail) => {
+            response.status = Some(error_common_status(format!(
+                "exchange ingress failed: {detail}"
+            )));
+        }
     }
     response
 }

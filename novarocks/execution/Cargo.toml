@@ -51,6 +51,7 @@ parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 prometheus.workspace = true
 threadpool = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util.workspace = true
 tracing.workspace = true
 twox-hash = "2.1"
 url.workspace = true
@@ -58,6 +59,7 @@ uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
 libc.workspace = true
+novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
 novarocks-sql.workspace = true
 tempfile.workspace = true

@@ -91,6 +91,9 @@ const STREAM_SINK: u8 = 0xee;
 struct FakeAssignment;
 
 impl CreationContent for FakeAssignment {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
     fn encoded_len(&self) -> usize {
         16
     }

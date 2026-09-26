@@ -28,6 +28,7 @@
 //! markers it prints; the frontend half through the task-creation gauges it
 //! exports, which fall only when a payload's last holder drops it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -41,7 +42,7 @@ use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
 use crate::actors::mysql as mysql_actor;
 use crate::actors::mysql_stream::MysqlStream;
-use crate::scenario::{Scenario, ScenarioContext};
+use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 
 use super::native_compatibility::{
     HEARTBEAT_PATH, RawUnaryResponse, authorization_header, decode_hex_32, only_successful_receipt,
@@ -57,8 +58,7 @@ use super::query_lifecycle::{
 const REQUIRED_BACKENDS: usize = 3;
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-/// A release is a small control operation, which only the control method
-/// carries.
+/// Normal context fencing and release are small control operations.
 const CONTROL_PATH: &str = "/novarocks.NovaRocksGrpc/ApplyTaskControlOperations";
 
 const CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
@@ -77,6 +77,11 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(FrozenReplayAndMembership),
         Box::new(CreationPayloadLifetime),
         Box::new(FixedPlanRecovery),
+        Box::new(NormalCloseCapacity {
+            byte_limited: false,
+        }),
+        Box::new(NormalCloseCapacity { byte_limited: true }),
+        Box::new(AcceptedPreparationControlRaces),
     ]
 }
 
@@ -100,11 +105,11 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
 /// One backend receives, over its own Native listener, a legal create, the
 /// identical create again, and a create for the same identity whose every
 /// body fact differs. The first wins; both replays are answered with the
-/// winner's original receipt and nothing is applied, interpreted or renewed a
+/// winner's identity and a current status, without interpreting the replay a
 /// second time. A request under another frontend process, another attempt or
 /// another backend's identity never reads that receipt. A create whose initial
-/// domain names a member its descriptor never froze is refused without
-/// holding its identity, so the next legal create of that identity wins. After
+/// domain names a member its descriptor never froze is accepted, then fails
+/// preparation while retaining its identity. After
 /// the context is released, a replay still cannot bring a task back.
 struct FrozenReplayAndMembership;
 
@@ -159,8 +164,11 @@ impl Scenario for FrozenReplayAndMembership {
                 "an {label} replay of a created identity must be idempotent, got {replay:?}"
             );
             ensure!(
-                replay.ack.as_ref() == Some(&original),
-                "an {label} replay must carry the winner's original receipt, got {replay:?}"
+                replay
+                    .ack
+                    .as_ref()
+                    .is_some_and(|ack| same_create_entity(&original, ack)),
+                "an {label} replay must retain the winner's entity with a current status, got {replay:?}"
             );
         }
         await_count(context, "both replays' idempotent markers", 2, idempotent)?;
@@ -173,7 +181,7 @@ impl Scenario for FrozenReplayAndMembership {
             "a create replay renewed the context lease"
         );
         context.action(
-            "exact and changed-body replays both returned the original receipt; nothing was applied, interpreted or renewed again",
+            "exact and changed-body replays retained the original entity; nothing was applied, interpreted or renewed again",
         );
 
         // Another scope never reads this identity's receipt.
@@ -211,8 +219,8 @@ impl Scenario for FrozenReplayAndMembership {
             scope_outcomes.join(", ")
         ));
 
-        // Membership is the winner's own check, and a refused round holds
-        // nothing: a later legal create of the same identity wins.
+        // Membership is checked by the accepted preparation. Failure retains
+        // the spent identity, so a later legal body cannot replace it.
         let mut refused = RawCreate::values(&session, 2);
         refused.initial_domains = vec![proto::TaskDomainUpdate {
             domain: Some(proto::task_domain_update::Domain::OpenExchangeEdges(
@@ -224,20 +232,37 @@ impl Scenario for FrozenReplayAndMembership {
         }];
         let refusal = session.apply(refused.operation(), "CreateTask naming an unfrozen edge")?;
         ensure!(
-            outcome(&refusal) == proto::TaskOperationOutcome::InvalidStateOrRequest
-                && refusal.ack.is_none(),
-            "an initial domain naming an edge the descriptor never froze must be refused, got {refusal:?}"
+            outcome(&refusal) == proto::TaskOperationOutcome::Accepted,
+            "the task is accepted before its initial domain is interpreted, got {refusal:?}"
         );
+        await_count(
+            context,
+            "the failed preparation's terminal marker",
+            2,
+            |context| session.marker_count(context, "NOVAROCKS_TASK_TERMINAL_RETAINED"),
+        )?;
         let mut legal = refused.clone();
         legal.initial_domains.clear();
-        let won = session.apply(legal.operation(), "legal CreateTask after a refused round")?;
+        let won = session.apply(
+            legal.operation(),
+            "legal body replay after failed preparation",
+        )?;
         ensure!(
-            outcome(&won) == proto::TaskOperationOutcome::Accepted,
-            "a legal create after a refused round must win, got {won:?}"
+            outcome(&won) == proto::TaskOperationOutcome::Idempotent
+                && won.ack.as_ref().is_some_and(|ack| {
+                    refusal
+                        .ack
+                        .as_ref()
+                        .is_some_and(|first| same_create_entity(first, ack))
+                }),
+            "a failed accepted identity cannot be replaced by another body, got {won:?}"
         );
-        await_count(context, "the second identity's create marker", 2, applied)?;
+        ensure!(
+            applied(context)? == 2,
+            "the second identity must be accepted only once"
+        );
         context.action(
-            "an initial domain naming an unfrozen edge was refused, and the next legal create of that identity won",
+            "an initial domain naming an unfrozen edge failed after acceptance, and the same identity remained spent",
         );
 
         // After release nothing is created again.
@@ -250,8 +275,11 @@ impl Scenario for FrozenReplayAndMembership {
         );
         if verdict == proto::TaskOperationOutcome::Idempotent {
             ensure!(
-                after.ack.as_ref() == Some(&original),
-                "a retained answer after release must be the original receipt, got {after:?}"
+                after
+                    .ack
+                    .as_ref()
+                    .is_some_and(|ack| same_create_entity(&original, ack)),
+                "a retained answer after release must name the original entity, got {after:?}"
             );
         }
         ensure!(
@@ -267,17 +295,35 @@ impl Scenario for FrozenReplayAndMembership {
 
 /// One raw, authenticated Native session against one backend, holding an
 /// established query context of its own.
-struct RawBackendSession {
-    index: usize,
-    connector: NativeEndpointConnector,
-    authorization: String,
-    backend: BackendProcessId,
-    frontend: FrontendProcessId,
-    query_id: common::UniqueId,
+pub(super) struct RawBackendSession {
+    pub(super) index: usize,
+    pub(super) connector: NativeEndpointConnector,
+    pub(super) authorization: String,
+    pub(super) backend: BackendProcessId,
+    pub(super) frontend: FrontendProcessId,
+    pub(super) query_id: common::UniqueId,
+    pub(super) establish_request: Option<proto::TaskOperation>,
 }
 
 impl RawBackendSession {
-    fn establish(context: &mut ScenarioContext, index: usize) -> Result<Self> {
+    pub(super) fn establish(context: &mut ScenarioContext, index: usize) -> Result<Self> {
+        Self::establish_with_identity(context, index, None)
+    }
+
+    /// Establish another backend Context for the same frozen first attempt.
+    pub(super) fn establish_same_attempt(
+        context: &mut ScenarioContext,
+        index: usize,
+        owner: &Self,
+    ) -> Result<Self> {
+        Self::establish_with_identity(context, index, Some((owner.query_id, owner.frontend)))
+    }
+
+    fn establish_with_identity(
+        context: &mut ScenarioContext,
+        index: usize,
+        shared: Option<(common::UniqueId, FrontendProcessId)>,
+    ) -> Result<Self> {
         let port = context.handle().runtime().be[index].grpc;
         let rows = context.handle().frontend_backend_topology()?;
         let row = rows
@@ -311,7 +357,7 @@ impl RawBackendSession {
         let admission_epoch = heartbeat
             .admission_epoch_capability
             .context("the target heartbeat omitted its admission epoch capability")?;
-        let session = Self {
+        let mut session = Self {
             index,
             connector,
             authorization,
@@ -319,11 +365,20 @@ impl RawBackendSession {
             frontend: FrontendProcessId::new_v7(),
             // A query id of this scenario's own, so every marker it counts is
             // this session's and no other case's.
+            establish_request: None,
             query_id: common::UniqueId {
                 hi: 0x5b5b,
-                lo: i64::from(std::process::id()),
+                lo: {
+                    static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+                    ((u64::from(std::process::id()) << 32)
+                        | NEXT_SESSION.fetch_add(1, Ordering::Relaxed)) as i64
+                },
             },
         };
+        if let Some((query_id, frontend)) = shared {
+            session.query_id = query_id;
+            session.frontend = frontend;
+        }
         let query_context = session.context_under(session.frontend, 1);
         let acquisition = session.apply(
             raw_acquire_admission_ticket(query_context.clone(), compatibility, admission_epoch),
@@ -340,10 +395,9 @@ impl RawBackendSession {
         let ticket = ticket
             .ticket_id
             .context("the admission acknowledgement omitted its ticket id")?;
-        let establish = session.apply(
-            raw_establish(query_context, ticket, Some(compatibility.to_vec())),
-            "Establish",
-        )?;
+        let establish_request = raw_establish(query_context, ticket, Some(compatibility.to_vec()));
+        let establish = session.apply(establish_request.clone(), "Establish")?;
+        session.establish_request = Some(establish_request);
         ensure!(
             outcome(&establish) == proto::TaskOperationOutcome::Accepted,
             "the raw Establish must be accepted, got {establish:?}"
@@ -352,7 +406,11 @@ impl RawBackendSession {
     }
 
     /// This session's query context, under `frontend` and `attempt`.
-    fn context_under(&self, frontend: FrontendProcessId, attempt: u64) -> proto::QueryContextRef {
+    pub(super) fn context_under(
+        &self,
+        frontend: FrontendProcessId,
+        attempt: u64,
+    ) -> proto::QueryContextRef {
         proto::QueryContextRef {
             query_execution_id: Some(proto::QueryExecutionId {
                 query_id: Some(self.query_id),
@@ -378,7 +436,7 @@ impl RawBackendSession {
         context.handle().be_log_count(self.index, &needle)
     }
 
-    fn apply(
+    pub(super) fn apply(
         &self,
         operation: proto::TaskOperation,
         subject: &str,
@@ -389,11 +447,39 @@ impl RawBackendSession {
         )
     }
 
-    /// Releases this session's context once every local task is terminal.
-    fn release_when_ready(
+    /// Fences new identities, then releases once every local task is terminal.
+    pub(super) fn release_when_ready(
         &self,
         context: &mut ScenarioContext,
     ) -> Result<proto::ReleaseQueryContextOutcome> {
+        let quiesce: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
+            &self.connector,
+            CONTROL_PATH,
+            &self.authorization,
+            proto::ApplyTaskControlOperationsRequest {
+                operations: vec![proto::TaskControlOperation {
+                    envelope: Some(raw_operation_envelope(999)),
+                    control: Some(proto::task_control_operation::Control::QuiesceQueryContext(
+                        proto::QuiesceQueryContextRequest {
+                            query_context: Some(self.context_under(self.frontend, 1)),
+                        },
+                    )),
+                }],
+            },
+        )?;
+        let receipt = only_successful_receipt(quiesce, "QuiesceQueryContext")?;
+        let Some(proto::task_operation_receipt::Ack::QuiesceQueryContext(fence)) = receipt.ack
+        else {
+            bail!("normal context fence returned no Quiesce acknowledgement: {receipt:?}");
+        };
+        ensure!(
+            fence.fence_version != 0,
+            "normal context fence returned a zero version"
+        );
+        context.action(format!(
+            "normal context fence froze {} accepted task identities",
+            fence.accepted_tasks.len()
+        ));
         loop {
             let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> =
                 raw_unary_response(
@@ -432,36 +518,42 @@ impl RawBackendSession {
 /// Every fact one raw create carries, so a test can vary exactly one body
 /// fact and keep the identity.
 #[derive(Clone)]
-struct RawCreate {
-    context: proto::QueryContextRef,
-    task_id: u32,
-    backend_override: Option<BackendProcessId>,
-    kernel_key_low: i64,
-    pipeline_dop: u32,
-    sink: plan::data_sink::Kind,
-    instance_ordinal: u32,
-    initial_domains: Vec<proto::TaskDomainUpdate>,
-    max_wait_millis: u64,
+pub(super) struct RawCreate {
+    pub(super) context: proto::QueryContextRef,
+    pub(super) task_id: u32,
+    pub(super) backend_override: Option<BackendProcessId>,
+    pub(super) kernel_key_low: i64,
+    pub(super) pipeline_dop: u32,
+    pub(super) sink: plan::data_sink::Kind,
+    pub(super) instance_ordinal: u32,
+    pub(super) initial_domains: Vec<proto::TaskDomainUpdate>,
+    pub(super) max_wait_millis: u64,
+    pub(super) exchange_input: bool,
 }
 
 impl RawCreate {
     /// A decodable, self-contained task: one VALUES node into a NOOP sink,
     /// frozen for exactly its own parallelism.
-    fn values(session: &RawBackendSession, task_id: u32) -> Self {
+    pub(super) fn values(session: &RawBackendSession, task_id: u32) -> Self {
         Self {
             context: session.context_under(session.frontend, 1),
             task_id,
             backend_override: None,
-            kernel_key_low: i64::from(task_id) * 100 + 1,
+            kernel_key_low: session
+                .query_id
+                .lo
+                .wrapping_mul(1024)
+                .wrapping_add(i64::from(task_id) * 100 + 1),
             pipeline_dop: 2,
             sink: plan::data_sink::Kind::Noop(true),
             instance_ordinal: 0,
             initial_domains: Vec::new(),
             max_wait_millis: 15_000,
+            exchange_input: false,
         }
     }
 
-    fn operation(&self) -> proto::TaskOperation {
+    pub(super) fn operation(&self) -> proto::TaskOperation {
         use prost::Message;
 
         let execution = self
@@ -497,13 +589,24 @@ impl RawCreate {
                     node_id: 10,
                     fragment_id: 1,
                     limit: -1,
-                    payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                        output_columns: Vec::new(),
-                        kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
-                            rows: Vec::new(),
-                            columns: Vec::new(),
-                        })),
-                    })),
+                    payload: Some(if self.exchange_input {
+                        plan::distributed_node::Payload::Exchange(plan::ExchangeReceiver {
+                            partition_type: plan::PartitionType::Unpartitioned as i32,
+                            source_fragment_id: 2,
+                            flavor: Some(plan::ExchangeFlavor {
+                                kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
+                            }),
+                            ..Default::default()
+                        })
+                    } else {
+                        plan::distributed_node::Payload::Physical(plan::PlanNode {
+                            output_columns: Vec::new(),
+                            kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
+                                rows: Vec::new(),
+                                columns: Vec::new(),
+                            })),
+                        })
+                    }),
                     ..Default::default()
                 }),
                 sink: Some(plan::DataSink {
@@ -531,7 +634,29 @@ impl RawCreate {
                 }),
                 pipeline_dop: self.pipeline_dop,
                 split_plan_nodes: Vec::new(),
-                topology: Some(Default::default()),
+                topology: Some(proto::TaskExchangeTopology {
+                    outbound: Vec::new(),
+                    inbound: if self.exchange_input {
+                        vec![proto::TaskExchangeInbound {
+                            destination_node_id: 10,
+                            sources: vec![proto::TaskExchangeSource {
+                                task: Some(proto::TaskIdentity {
+                                    query_execution_id: Some(execution),
+                                    stage_id: 2,
+                                    task_id: self.task_id,
+                                    backend_process_id: self.context.backend_process_id.clone(),
+                                }),
+                                fragment_instance_id: Some(common::UniqueId {
+                                    hi: 0x5c,
+                                    lo: self.kernel_key_low,
+                                }),
+                                sender_ordinal: 0,
+                            }],
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                }),
             }),
             initial_domains: self.initial_domains.clone(),
             assignment: Some(proto::TaskAssignment {
@@ -552,9 +677,32 @@ impl RawCreate {
     }
 }
 
-fn outcome(receipt: &proto::TaskOperationReceipt) -> proto::TaskOperationOutcome {
+pub(super) fn outcome(receipt: &proto::TaskOperationReceipt) -> proto::TaskOperationOutcome {
     proto::TaskOperationOutcome::try_from(receipt.outcome)
         .unwrap_or(proto::TaskOperationOutcome::Unspecified)
+}
+
+fn same_create_entity(
+    original: &proto::task_operation_receipt::Ack,
+    replay: &proto::task_operation_receipt::Ack,
+) -> bool {
+    let (
+        proto::task_operation_receipt::Ack::CreateTask(original),
+        proto::task_operation_receipt::Ack::CreateTask(replay),
+    ) = (original, replay)
+    else {
+        return false;
+    };
+    let (Some(first_status), Some(current_status)) = (
+        original.current_status.as_ref(),
+        replay.current_status.as_ref(),
+    ) else {
+        return false;
+    };
+    original.identity == replay.identity
+        && original.accepted_domains == replay.accepted_domains
+        && first_status.identity == current_status.identity
+        && current_status.status_version >= first_status.status_version
 }
 
 /// Polls `count` until it reaches `expected`: backend output reaches the
@@ -586,7 +734,7 @@ fn await_count(
 /// Where the frontend's creation payloads are, through the real statement
 /// path.
 ///
-/// An exactly answered create is released while its statement still runs;
+/// An exactly answered create releases its FE replay payload while the statement runs;
 /// the statement's static plans stay until the statement ends. A create
 /// whose acknowledgement is lost keeps its payload, is resent as the same
 /// frozen bytes, is answered by its identity, and is never frozen or applied
@@ -947,4 +1095,763 @@ impl Scenario for FixedPlanRecovery {
             .with_context(|| format!("restore BE[{target}]"))?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Native normal-close capacity: Accepted reservations remain charged through
+// active execution and the legal late-frame retention horizon.
+// ---------------------------------------------------------------------------
+
+struct NormalCloseCapacity {
+    byte_limited: bool,
+}
+
+impl Scenario for NormalCloseCapacity {
+    fn name(&self) -> &'static str {
+        if self.byte_limited {
+            "native-creation/normal-close-byte-capacity"
+        } else {
+            "native-creation/normal-close-count-capacity"
+        }
+    }
+
+    fn launch_config(&self, _root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut launch = ScenarioLaunchConfig::default();
+        let (records, bytes) = if self.byte_limited {
+            (32, 2048)
+        } else {
+            (2, 64 * 1024 * 1024)
+        };
+        launch.config_overlay.be = Some(format!(
+            "[runtime]\ntask_normal_close_max_records = {records}\ntask_normal_close_max_bytes = {bytes}\n"
+        ));
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let retained = RawBackendSession::establish(context, 0)?;
+        let live = RawBackendSession::establish(context, 0)?;
+        let receiver = |session: &RawBackendSession, id| {
+            let mut create = RawCreate::values(session, id);
+            create.pipeline_dop = 1;
+            create.exchange_input = true;
+            create
+        };
+        let first = receiver(&retained, 1);
+        ensure_accepted(&retained, &first)?;
+        await_installed(context, &retained, &first)?;
+        let mut active = Vec::new();
+        let refused = loop {
+            let create = receiver(&live, active.len() as u32 + 1);
+            let receipt = live.apply(create.operation(), "fill normal-close capacity")?;
+            match outcome(&receipt) {
+                proto::TaskOperationOutcome::Accepted => {
+                    await_installed(context, &live, &create)?;
+                    active.push(create);
+                    ensure!(
+                        active.len() < 32,
+                        "byte capacity did not reject before the independent record limit"
+                    );
+                }
+                proto::TaskOperationOutcome::ResourceExhausted => break create,
+                verdict => bail!("capacity probe returned {verdict:?}: {receipt:?}"),
+            }
+        };
+        let occupied = active.len() + 1;
+        ensure!(
+            !active.is_empty(),
+            "capacity fixture must hold a second live receiver"
+        );
+        if self.byte_limited {
+            ensure!(
+                occupied < 32,
+                "record limit could explain the supposed byte rejection"
+            );
+        } else {
+            ensure!(occupied == 2, "record cap 2 accepted {occupied} receivers");
+        }
+        context.action(format!("real Native Create accepted {occupied} installed inbound receivers, then returned ResourceExhausted at the configured {} bound", if self.byte_limited { "byte" } else { "record" }));
+
+        retained.release_when_ready(context)?;
+        assert_normal_close(&retained, &first)?;
+        ensure_capacity_refused(&live, &refused)?;
+        // A still-live exact receiver accepts EOS after another Context has
+        // moved its reservation from active into retained; capacity pressure
+        // neither evicts that route nor lets a new Create overtake it.
+        let response = exchange_probe(&live, &active[0], true)?;
+        ensure!(
+            response
+                .status
+                .as_ref()
+                .is_some_and(|status| status.code == 0)
+                && response.normal_closed.is_none(),
+            "active receiver was evicted or closed under capacity pressure: {response:?}"
+        );
+        context.action("one Context retained exact typed normal-close evidence while another active receiver still accepted its exact sender EOS; new admission stayed refused");
+        live.release_when_ready(context)?;
+        // The retained Context itself cannot admit tasks after Quiesce. Use a
+        // third Context to prove retained reservations still occupy the cap.
+        let blocked = RawBackendSession::establish(context, 0)?;
+        let blocked_create = receiver(&blocked, 1);
+        ensure_capacity_refused(&blocked, &blocked_create)?;
+        blocked.release_when_ready(context)?;
+        assert_normal_close(&retained, &first)?;
+        context.action("both receiver Contexts released, but their retained normal-close reservations still refused a fresh Context");
+
+        let horizon = Duration::from_secs(120);
+        let deadline = std::time::Instant::now() + horizon;
+        while std::time::Instant::now() < deadline {
+            let remaining =
+                context.remaining("wait the legal 120 second normal-close retention horizon")?;
+            thread::sleep(
+                remaining
+                    .min(Duration::from_secs(1))
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
+        }
+        let recovered = RawBackendSession::establish(context, 0)?;
+        let recovered_create = receiver(&recovered, 1);
+        loop {
+            let receipt = recovered.apply(
+                recovered_create.operation(),
+                "admission after normal-close horizon",
+            )?;
+            match outcome(&receipt) {
+                proto::TaskOperationOutcome::Accepted => break,
+                proto::TaskOperationOutcome::ResourceExhausted => {
+                    thread::sleep(
+                        context
+                            .remaining("await normal-close horizon sweep")?
+                            .min(POLL_INTERVAL),
+                    );
+                }
+                verdict => bail!("post-horizon admission returned {verdict:?}: {receipt:?}"),
+            }
+        }
+        await_installed(context, &recovered, &recovered_create)?;
+        let forgotten = exchange_probe(&retained, &first, false)?;
+        ensure!(
+            forgotten.normal_closed.is_none()
+                && forgotten
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.code != 0),
+            "expired Context still retained normal-close evidence: {forgotten:?}"
+        );
+        recovered.release_when_ready(context)?;
+        context.action("after the legal horizon, the old exact late frame no longer received closure evidence and a fresh receiver installed successfully; retained capacity returned at Context Gone");
+        Ok(())
+    }
+}
+
+pub(super) fn ensure_accepted(session: &RawBackendSession, create: &RawCreate) -> Result<()> {
+    let receipt = session.apply(create.operation(), "accept the capacity receiver")?;
+    ensure!(
+        outcome(&receipt) == proto::TaskOperationOutcome::Accepted,
+        "receiver Create was not accepted: {receipt:?}"
+    );
+    Ok(())
+}
+
+fn ensure_capacity_refused(session: &RawBackendSession, create: &RawCreate) -> Result<()> {
+    let receipt = session.apply(
+        create.operation(),
+        "refuse admission at occupied normal-close capacity",
+    )?;
+    ensure!(
+        outcome(&receipt) == proto::TaskOperationOutcome::ResourceExhausted
+            && receipt.ack.is_none(),
+        "occupied normal-close capacity must reject before Accepted: {receipt:?}"
+    );
+    Ok(())
+}
+
+pub(super) fn await_installed(
+    context: &mut ScenarioContext,
+    session: &RawBackendSession,
+    create: &RawCreate,
+) -> Result<()> {
+    loop {
+        let receipt = session.apply(create.operation(), "observe exact receiver installation")?;
+        let Some(proto::task_operation_receipt::Ack::CreateTask(ack)) = receipt.ack else {
+            bail!("accepted receiver replay omitted its Create acknowledgement: {receipt:?}");
+        };
+        let status = ack
+            .current_status
+            .context("receiver acknowledgement omitted status")?;
+        ensure!(
+            status.state != proto::TaskState::Failed as i32,
+            "receiver preparation failed: {status:?}"
+        );
+        if status.installed == Some(true) {
+            return Ok(());
+        }
+        thread::sleep(
+            context
+                .remaining("await capacity receiver installation")?
+                .min(POLL_INTERVAL),
+        );
+    }
+}
+
+fn exchange_probe(
+    session: &RawBackendSession,
+    create: &RawCreate,
+    eos: bool,
+) -> Result<proto::ExchangeResponse> {
+    raw_unary(
+        session.connector.clone(),
+        "/novarocks.NovaRocksGrpc/Exchange",
+        &session.authorization,
+        proto::ExchangeRequest {
+            finst_id_hi: 0x5b,
+            finst_id_lo: create.kernel_key_low,
+            node_id: 10,
+            sender_id: 0,
+            be_number: 0,
+            eos,
+            sequence: 0,
+            payload: Vec::new().into(),
+            source_finst_id_hi: 0x5c,
+            source_finst_id_lo: create.kernel_key_low,
+            sender_ordinal: 0,
+            sender_count: 1,
+        },
+    )
+}
+
+fn assert_normal_close(session: &RawBackendSession, create: &RawCreate) -> Result<()> {
+    let response = exchange_probe(session, create, false)?;
+    ensure!(
+        response
+            .status
+            .as_ref()
+            .is_some_and(|status| status.code == 0),
+        "late frame normal close failed: {response:?}"
+    );
+    let proof = response
+        .normal_closed
+        .context("late frame omitted typed normal close")?;
+    ensure!(
+        proof
+            .destination_task
+            .as_ref()
+            .is_some_and(
+                |task| task.query_execution_id == create.context.query_execution_id
+                    && task.stage_id == 1
+                    && task.task_id == create.task_id
+                    && task.backend_process_id == create.context.backend_process_id
+            )
+            && proof.destination_finst_id_hi == 0x5b
+            && proof.destination_finst_id_lo == create.kernel_key_low
+            && proof.destination_node_id == 10
+            && proof.source_finst_id_hi == 0x5c
+            && proof.source_finst_id_lo == create.kernel_key_low
+            && proof.sender_ordinal == 0
+            && proof.sender_count == 1,
+        "normal close proof disagrees with the frozen exact route: {proof:?}"
+    );
+    Ok(())
+}
+
+/// A real Accepted-to-Quiesce schedule. Preparation can legitimately finish
+/// first: no test delay is installed, and this scenario does not claim that
+/// any particular instruction ran while the backend was Preparing.
+struct AcceptedPreparationControlRaces;
+
+impl Scenario for AcceptedPreparationControlRaces {
+    fn name(&self) -> &'static str {
+        "native-creation/accepted-preparation-control-races"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let session = RawBackendSession::establish(context, 0)?;
+        let mut failed = RawCreate::values(&session, 1);
+        failed.initial_domains = vec![proto::TaskDomainUpdate {
+            domain: Some(proto::task_domain_update::Domain::OpenExchangeEdges(
+                proto::OpenExchangeEdgesDomain {
+                    version: 1,
+                    edge_ids: vec![7],
+                },
+            )),
+        }];
+        ensure_accepted(&session, &failed)?;
+        loop {
+            let receipt =
+                session.apply(failed.operation(), "observe retained preparation failure")?;
+            let Some(proto::task_operation_receipt::Ack::CreateTask(ack)) = receipt.ack else {
+                bail!("failed accepted identity lost its Create acknowledgement: {receipt:?}");
+            };
+            let status = ack
+                .current_status
+                .context("preparation failure replay omitted status")?;
+            if status.state == proto::TaskState::Failed as i32 {
+                ensure!(
+                    status.installed == Some(false)
+                        && matches!(status.termination.as_ref().and_then(|termination| termination.cause.as_ref()), Some(proto::task_termination::Cause::Failed(failure)) if failure.phase == proto::TaskFailurePhase::Preparation as i32),
+                    "invalid initial domain did not retain a preparation failure: {status:?}"
+                );
+                break;
+            }
+            thread::sleep(
+                context
+                    .remaining("await accepted preparation failure")?
+                    .min(POLL_INTERVAL),
+            );
+        }
+        let mut legal_replay = failed.clone();
+        legal_replay.initial_domains.clear();
+        let replay = session.apply(
+            legal_replay.operation(),
+            "legal replay of failed accepted identity",
+        )?;
+        ensure!(
+            outcome(&replay) == proto::TaskOperationOutcome::Idempotent,
+            "a failed accepted identity was replaced: {replay:?}"
+        );
+        context.action("an invalid initial domain was Accepted, then retained an explicit preparation failure; a later legal body replay was Idempotent for the spent identity");
+
+        let receiver = |id| {
+            let mut create = RawCreate::values(&session, id);
+            create.pipeline_dop = 1;
+            create.exchange_input = true;
+            create
+        };
+        let canceled = receiver(2);
+        ensure_accepted(&session, &canceled)?;
+        await_installed(context, &session, &canceled)?;
+        let cancel = session_control(
+            &session,
+            proto::task_control_operation::Control::CancelTask(proto::CancelTaskRequest {
+                identity: Some(raw_create_identity(&canceled)),
+                reason: proto::TaskCancelReason::UpstreamNoLongerNeeded as i32,
+            }),
+        )?;
+        ensure!(
+            matches!(
+                outcome(&cancel),
+                proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::Idempotent
+            ),
+            "normal Cancel of the installed receiver was not accepted: {cancel:?}"
+        );
+        let racing = receiver(3);
+        ensure_accepted(&session, &racing)?;
+        // Intentionally perform no poll or wait between the Accepted receipt
+        // and this exact admission fence.
+        let fence = quiesce_session(&session)?;
+        let expected = vec![
+            raw_create_identity(&failed),
+            raw_create_identity(&canceled),
+            raw_create_identity(&racing),
+        ];
+        ensure!(
+            fence.fence_version != 0 && fence.accepted_tasks == expected,
+            "Quiesce did not freeze the exact accumulated Accepted membership: {fence:?}"
+        );
+        let replay_fence = quiesce_session(&session)?;
+        ensure!(
+            replay_fence.query_context == fence.query_context
+                && replay_fence.fence_version == fence.fence_version
+                && replay_fence.accepted_tasks == expected,
+            "Quiesce replay changed its cut or membership: {fence:?} -> {replay_fence:?}"
+        );
+        context.action("exact normal Cancel progressed; a third receiver's Accepted receipt was immediately followed by Quiesce, which froze and replayed all three exact identities without a Preparing hold");
+
+        let late = receiver(4);
+        let rejected = session.apply(late.operation(), "late Create after Quiesce")?;
+        ensure!(
+            outcome(&rejected) == proto::TaskOperationOutcome::ContextTerminalReceipt
+                && rejected.ack.is_none(),
+            "Quiesce admitted a late identity: {rejected:?}"
+        );
+        for _ in 0..2 {
+            let duplicate = session.apply(
+                session
+                    .establish_request
+                    .clone()
+                    .context("raw session lost its original Establish")?,
+                "duplicate original Establish after Quiesce",
+            )?;
+            ensure!(
+                !matches!(
+                    outcome(&duplicate),
+                    proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::NotReady
+                ),
+                "duplicate Establish reopened admission: {duplicate:?}"
+            );
+            if let Some(proto::task_operation_receipt::Ack::QueryContext(ack)) = duplicate.ack {
+                ensure!(
+                    ack.state != proto::QueryContextState::Active as i32
+                        && ack.state != proto::QueryContextState::Establishing as i32,
+                    "duplicate Establish returned an open Context: {ack:?}"
+                );
+            }
+            let rejected =
+                session.apply(late.operation(), "late Create after duplicate Establish")?;
+            ensure!(
+                outcome(&rejected) == proto::TaskOperationOutcome::ContextTerminalReceipt
+                    && rejected.ack.is_none(),
+                "duplicate Establish revived late Create: {rejected:?}"
+            );
+        }
+        context.action("late Create returned ContextTerminalReceipt; two original Establish replays left the Context fenced and could not reopen admission");
+        observe_terminal_stop_and_fence(context, &session, &fence, &expected)?;
+        reject_invalid_covered_subscriptions(context, &session, &expected)?;
+        let released = session.release_when_ready(context)?;
+        ensure!(
+            released == proto::ReleaseQueryContextOutcome::Released,
+            "normally fenced Context did not release: {released:?}"
+        );
+        let late_establish = session.apply(
+            session
+                .establish_request
+                .clone()
+                .context("raw session lost its original Establish")?,
+            "original Establish after normal Release",
+        )?;
+        ensure!(
+            outcome(&late_establish) == proto::TaskOperationOutcome::ContextTerminalReceipt,
+            "late Establish revived a released Context: {late_establish:?}"
+        );
+        let late_create = session.apply(late.operation(), "late Create after normal Release")?;
+        ensure!(
+            outcome(&late_create) == proto::TaskOperationOutcome::ContextTerminalReceipt
+                && late_create.ack.is_none(),
+            "late Create revived a released Context: {late_create:?}"
+        );
+        let after_release = quiesce_session(&session)?;
+        ensure!(
+            after_release.fence_version == fence.fence_version
+                && after_release.accepted_tasks == expected,
+            "Release discarded the retained exact admission cut: {after_release:?}"
+        );
+        context.action("real covered stream provided terminal status and actual_stopped for each exact Task plus the exact fence, CatchUpComplete and covered Bookmark; normal Release then completed and retained the fence");
+        Ok(())
+    }
+}
+
+pub(super) fn raw_create_identity(create: &RawCreate) -> proto::TaskIdentity {
+    proto::TaskIdentity {
+        query_execution_id: create.context.query_execution_id,
+        stage_id: 1,
+        task_id: create.task_id,
+        backend_process_id: create.context.backend_process_id.clone(),
+    }
+}
+
+pub(super) fn session_control(
+    session: &RawBackendSession,
+    control: proto::task_control_operation::Control,
+) -> Result<proto::TaskOperationReceipt> {
+    only_successful_receipt(
+        raw_unary_response(
+            &session.connector,
+            CONTROL_PATH,
+            &session.authorization,
+            proto::ApplyTaskControlOperationsRequest {
+                operations: vec![proto::TaskControlOperation {
+                    envelope: Some(raw_operation_envelope(1_000)),
+                    control: Some(control),
+                }],
+            },
+        )?,
+        "native control probe",
+    )
+}
+
+pub(super) fn quiesce_session(
+    session: &RawBackendSession,
+) -> Result<proto::QuiesceQueryContextAck> {
+    let receipt = session_control(
+        session,
+        proto::task_control_operation::Control::QuiesceQueryContext(
+            proto::QuiesceQueryContextRequest {
+                query_context: Some(session.context_under(session.frontend, 1)),
+            },
+        ),
+    )?;
+    let Some(proto::task_operation_receipt::Ack::QuiesceQueryContext(ack)) = receipt.ack else {
+        bail!("Quiesce omitted the exact fence acknowledgement: {receipt:?}");
+    };
+    Ok(ack)
+}
+
+/// Reject invalid requests at the authenticated server-streaming RPC boundary.
+/// A server that accidentally admits a legacy stream fails this bounded probe
+/// rather than hanging the scenario while waiting for its infinite stream.
+fn reject_invalid_covered_subscriptions(
+    context: &mut ScenarioContext,
+    session: &RawBackendSession,
+    identities: &[proto::TaskIdentity],
+) -> Result<()> {
+    use prost::Message;
+    let query_context = session.context_under(session.frontend, 1);
+    let base = proto::SubscribeTaskStatusRequest {
+        query_context: Some(query_context.clone()),
+        generation: 1,
+        required_identities: identities.to_vec(),
+        ..Default::default()
+    };
+    let mut missing_generation = base.clone();
+    missing_generation.generation = 0;
+    let cursor_only = proto::SubscribeTaskStatusRequest {
+        query_context: Some(query_context.clone()),
+        ..Default::default()
+    };
+    let mut future_task = base.clone();
+    future_task.task_convergence_cursors = vec![proto::TaskConvergenceCursor {
+        identity: Some(identities[0].clone()),
+        current_version: u64::MAX,
+    }];
+    let mut future_context = base.clone();
+    future_context.context_convergence_cursor = Some(proto::QueryContextConvergenceCursor {
+        query_context: Some(query_context),
+        current_version: u64::MAX,
+    });
+    let mut foreign_context = base;
+    foreign_context.context_convergence_cursor = Some(proto::QueryContextConvergenceCursor {
+        query_context: Some(session.context_under(session.frontend, 2)),
+        current_version: 0,
+    });
+    let requests = [
+        ("missing generation", missing_generation),
+        ("cursor-only legacy mode", cursor_only),
+        ("future Task convergence cursor", future_task),
+        ("future Context convergence cursor", future_context),
+        ("cross-Context convergence cursor", foreign_context),
+    ];
+    let connector = session.connector.clone();
+    let authorization = session.authorization.clone();
+    let budget = context.remaining("reject malformed covered subscriptions")?;
+    tokio::runtime::Runtime::new()?.block_on(async move {
+        tokio::time::timeout(budget, async move {
+            for (name, request) in requests {
+                let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
+                let (mut sender, connection) = h2::client::handshake(stream).await?;
+                let driver = tokio::spawn(connection);
+                let result = async {
+                    let headers = http::Request::builder()
+                        .method("POST")
+                        .uri("/novarocks.NovaRocksGrpc/SubscribeTaskStatus")
+                        .header(http::header::CONTENT_TYPE, "application/grpc")
+                        .header("te", "trailers")
+                        .header(http::header::AUTHORIZATION, &authorization)
+                        .body(())?;
+                    let (response, mut send) = sender.send_request(headers, false)?;
+                    let payload = request.encode_to_vec();
+                    let mut frame = vec![0];
+                    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                    frame.extend_from_slice(&payload);
+                    send.send_data(bytes::Bytes::from(frame), true)?;
+                    let response = response.await?;
+                    ensure!(
+                        response.status().as_u16() == 200,
+                        "{name}: HTTP {}",
+                        response.status()
+                    );
+                    let header_status = response
+                        .headers()
+                        .get("grpc-status")
+                        .map(|value| value.to_str().map(str::to_owned))
+                        .transpose()?;
+                    let mut body = response.into_body();
+                    let mut received_bytes = 0usize;
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk?;
+                        received_bytes += chunk.len();
+                        body.flow_control().release_capacity(chunk.len())?;
+                        ensure!(
+                            received_bytes == 0,
+                            "{name}: invalid request received stream data"
+                        );
+                    }
+                    let trailers = body.trailers().await?;
+                    let status = header_status.or_else(|| {
+                        trailers
+                            .as_ref()
+                            .and_then(|values| values.get("grpc-status"))
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned)
+                    });
+                    ensure!(
+                        status.as_deref() == Some("3"),
+                        "{name}: expected InvalidArgument, got {status:?}"
+                    );
+                    anyhow::Ok(())
+                }
+                .await;
+                driver.abort();
+                let _ = driver.await;
+                result?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .context(
+            "invalid covered subscription was admitted or did not settle within its deadline",
+        )?
+    })?;
+    context.action("authenticated Native SubscribeTaskStatus rejected missing generation, legacy cursor-only mode, future Task/Context convergence cursors and cross-Context cursor, without producing stream facts");
+    Ok(())
+}
+
+/// Reads the production covered stream through the same authenticated Native
+/// listener. Full snapshots and real actual-stop facts are required; a Gone,
+/// Unknown, bookmark, or RPC Release receipt cannot substitute for either.
+pub(super) fn observe_terminal_stop_and_fence(
+    context: &mut ScenarioContext,
+    session: &RawBackendSession,
+    fence: &proto::QuiesceQueryContextAck,
+    identities: &[proto::TaskIdentity],
+) -> Result<()> {
+    observe_terminal_stop_and_fence_with_failure(
+        context,
+        session,
+        Some(fence),
+        identities,
+        true,
+        None,
+    )
+}
+
+pub(super) fn observe_all_canceled_and_stopped(
+    context: &mut ScenarioContext,
+    session: &RawBackendSession,
+    fence: &proto::QuiesceQueryContextAck,
+    identities: &[proto::TaskIdentity],
+) -> Result<()> {
+    observe_terminal_stop_and_fence_with_failure(
+        context,
+        session,
+        Some(fence),
+        identities,
+        false,
+        None,
+    )
+}
+
+/// Require real covered terminal and stop facts without fencing a sibling Task.
+pub(super) fn observe_task_terminal_and_stopped(
+    context: &mut ScenarioContext,
+    session: &RawBackendSession,
+    identity: &proto::TaskIdentity,
+    state: proto::TaskState,
+) -> Result<()> {
+    observe_terminal_stop_and_fence_with_failure(
+        context,
+        session,
+        None,
+        std::slice::from_ref(identity),
+        false,
+        Some(vec![state as i32]),
+    )
+}
+
+fn observe_terminal_stop_and_fence_with_failure(
+    context: &mut ScenarioContext,
+    session: &RawBackendSession,
+    fence: Option<&proto::QuiesceQueryContextAck>,
+    identities: &[proto::TaskIdentity],
+    first_is_failed: bool,
+    expected_states: Option<Vec<i32>>,
+) -> Result<()> {
+    use prost::Message;
+    let connector = session.connector.clone();
+    let authorization = session.authorization.clone();
+    let expected = identities.to_vec();
+    let fence = fence.cloned();
+    let request = proto::SubscribeTaskStatusRequest {
+        query_context: Some(session.context_under(session.frontend, 1)),
+        generation: 1,
+        required_identities: expected.clone(),
+        ..Default::default()
+    };
+    let budget = context.remaining("observe real covered terminal and actual-stop facts")?;
+    tokio::runtime::Runtime::new()?.block_on(async move {
+        tokio::time::timeout(budget, async move {
+            let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
+            let (mut sender, connection) = h2::client::handshake(stream).await?;
+            let driver = tokio::spawn(async move { connection.await });
+            let result = async {
+                let request_headers = http::Request::builder().method("POST")
+                    .uri("/novarocks.NovaRocksGrpc/SubscribeTaskStatus")
+                    .header(http::header::CONTENT_TYPE, "application/grpc")
+                    .header("te", "trailers")
+                    .header(http::header::AUTHORIZATION, authorization).body(())?;
+                let (response, mut send) = sender.send_request(request_headers, false)?;
+                let payload = request.encode_to_vec();
+                let mut frame = vec![0];
+                frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                frame.extend_from_slice(&payload);
+                send.send_data(bytes::Bytes::from(frame), true)?;
+                let response = response.await?;
+                ensure!(response.status().as_u16() == 200, "covered stream returned HTTP {}", response.status());
+                let mut body = response.into_body();
+                let mut pending = Vec::new();
+                let mut terminal = vec![false; expected.len()];
+                let mut stopped = vec![false; expected.len()];
+                let mut fence_seen = fence.is_none();
+                let mut complete = false;
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk?;
+                    body.flow_control().release_capacity(chunk.len())?;
+                    pending.extend_from_slice(&chunk);
+                    while pending.len() >= 5 {
+                        ensure!(pending[0] == 0, "covered stream unexpectedly compressed a frame");
+                        let length = u32::from_be_bytes(pending[1..5].try_into().expect("gRPC header width")) as usize;
+                        ensure!(length <= 8 * 1024 * 1024, "covered probe frame exceeded its bounded buffer");
+                        if pending.len() < length + 5 { break; }
+                        let event = proto::TaskStatusStreamEvent::decode(&pending[5..length + 5])?;
+                        pending.drain(..length + 5);
+                        match event.event.context("covered stream omitted event")? {
+                            proto::task_status_stream_event::Event::TaskStatus(status) => {
+                                let index = expected.iter().position(|identity| status.identity.as_ref() == Some(identity)).context("covered status named another identity")?;
+                                if matches!(proto::TaskState::try_from(status.state)?, proto::TaskState::Finished | proto::TaskState::Canceled | proto::TaskState::Aborted | proto::TaskState::Failed) {
+                                    if let Some(states) = &expected_states {
+                                        ensure!(status.state == states[index], "exact Task terminal changed: {status:?}");
+                                    } else if first_is_failed && index == 0 {
+                                        ensure!(status.state == proto::TaskState::Failed as i32 && status.installed == Some(false), "preparation failure history changed: {status:?}");
+                                    } else {
+                                        ensure!(status.state == proto::TaskState::Canceled as i32, "normal Cancel/Quiesce became failure or abort: {status:?}");
+                                    }
+                                    terminal[index] = true;
+                                }
+                            }
+                            proto::task_status_stream_event::Event::TaskConvergence(receipt) => {
+                                let index = expected.iter().position(|identity| receipt.identity.as_ref() == Some(identity)).context("covered actual-stop named another identity")?;
+                                ensure!(receipt.version != 0, "covered actual-stop version was zero");
+                                stopped[index] = true;
+                            }
+                            proto::task_status_stream_event::Event::Quiesce(receipt) => {
+                                if let Some(fence) = &fence {
+                                    ensure!(receipt.query_context == fence.query_context && receipt.fence_version == fence.fence_version && receipt.accepted_tasks == expected, "covered Quiesce changed the exact fence: {receipt:?}");
+                                    fence_seen = true;
+                                }
+                            }
+                            proto::task_status_stream_event::Event::CatchUpComplete(receipt) => {
+                                ensure!(receipt.generation == 1, "covered catch-up names another generation");
+                                complete = true;
+                            }
+                            proto::task_status_stream_event::Event::Bookmark(receipt) => {
+                                ensure!(receipt.generation == 1 && receipt.sequence != 0 && receipt.covered_prefix <= receipt.source_cut, "covered bookmark is invalid: {receipt:?}");
+                                if complete && fence_seen && terminal.iter().all(|fact| *fact) && stopped.iter().all(|fact| *fact) && receipt.covered_prefix == receipt.source_cut {
+                                    return Ok(());
+                                }
+                            }
+                            proto::task_status_stream_event::Event::TaskGone(receipt) => bail!("required terminal/stop evidence was reclaimed: {receipt:?}"),
+                            proto::task_status_stream_event::Event::TaskUnknown(receipt) => bail!("required accepted identity was unknown: {receipt:?}"),
+                            proto::task_status_stream_event::Event::TaskStatusUnchanged(_) | proto::task_status_stream_event::Event::TaskConvergenceUnchanged(_) => bail!("zero-cursor probe unexpectedly received Unchanged"),
+                            proto::task_status_stream_event::Event::ContextConvergence(_) => {}
+                        }
+                    }
+                }
+                bail!("covered stream ended before exact terminal/stop/fence evidence; trailers={:?}", body.trailers().await?)
+            }.await;
+            driver.abort();
+            let _ = driver.await;
+            result
+        }).await.context("covered terminal/actual-stop probe exhausted its scenario deadline")?
+    })
 }

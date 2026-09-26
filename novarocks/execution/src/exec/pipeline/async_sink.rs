@@ -31,6 +31,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use futures::FutureExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -181,6 +182,14 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        let _ = state;
+        Ok(())
+    }
+
+    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+        if self.join.is_some() {
+            return Ok(());
+        }
         let sink_io: IoExecutor = state.sink_io_executor()?;
         let error_state = state.error_state();
         let backend_ref = self
@@ -198,9 +207,27 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
             .ok_or_else(|| "async sink receiver already bound".to_string())?;
         let shared = Arc::clone(&self.shared);
         let join = sink_io.spawn(async move {
-            // drain_loop reports any failure via RuntimeErrorState before returning;
-            // its Err is informational only, so discarding it here loses no error.
-            let _ = drain_loop(backend, rx, shared, error_state).await;
+            let outcome = std::panic::AssertUnwindSafe(drain_loop(
+                backend,
+                rx,
+                Arc::clone(&shared),
+                Arc::clone(&error_state),
+            ))
+            .catch_unwind()
+            .await;
+            if let Err(payload) = outcome {
+                let message = if let Some(message) = payload.downcast_ref::<&str>() {
+                    *message
+                } else if let Some(message) = payload.downcast_ref::<String>() {
+                    message.as_str()
+                } else {
+                    "unknown panic payload"
+                };
+                error_state.set_error(format!("async sink actor panicked: {message}"));
+                shared.errored.store(true, Ordering::Release);
+                shared.finished.store(true, Ordering::Release);
+                shared.wake();
+            }
         });
         self.join = Some(join);
         Ok(())
@@ -211,12 +238,14 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
     }
 
     fn pending_finish(&self) -> bool {
-        self.finishing && !self.shared.finished.load(Ordering::Acquire)
+        (self.finishing && !self.shared.finished.load(Ordering::Acquire))
+            || ((self.finishing || self.shared.finished.load(Ordering::Acquire))
+                && self.join.as_ref().is_some_and(|join| !join.is_finished()))
     }
 
     fn cancel(&mut self) {
         self.sender = None; // close the channel
-        if let Some(join) = self.join.take() {
+        if let Some(join) = self.join.as_ref() {
             join.abort();
         }
         self.shared.errored.store(true, Ordering::Release);
@@ -279,6 +308,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     use arrow::array::Int32Array;
@@ -364,6 +394,140 @@ mod tests {
         }
     }
 
+    struct ExitGate {
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl ExitGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: AtomicBool::new(false),
+                released: Mutex::new(false),
+                cv: Condvar::new(),
+            })
+        }
+
+        fn release(&self) {
+            *self.released.lock().expect("exit gate lock") = true;
+            self.cv.notify_all();
+        }
+    }
+
+    struct ExitGatedSink {
+        gate: Arc<ExitGate>,
+        fail_write: bool,
+    }
+
+    impl Drop for ExitGatedSink {
+        fn drop(&mut self) {
+            self.gate.entered.store(true, Ordering::Release);
+            let mut released = self.gate.released.lock().expect("exit gate lock");
+            while !*released {
+                released = self.gate.cv.wait(released).expect("exit gate wait");
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncSinkBackend for ExitGatedSink {
+        type Output = ();
+
+        async fn write_chunk(&mut self, _chunk: Chunk) -> Result<(), String> {
+            if self.fail_write {
+                Err("injected write failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn finish(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct PanickingSink;
+
+    #[async_trait::async_trait]
+    impl AsyncSinkBackend for PanickingSink {
+        type Output = ();
+
+        async fn write_chunk(&mut self, _chunk: Chunk) -> Result<(), String> {
+            panic!("injected sink panic")
+        }
+
+        async fn finish(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn backend_panic_latches_failure_and_releases_pending_finish() {
+        let state = test_runtime_state();
+        let mut op = AsyncSinkOperator::new("panic_sink", PanickingSink, 1);
+        op.activate(&state).expect("activate sink");
+        op.push_chunk(&state, make_chunk(1)).expect("push chunk");
+
+        assert!(
+            poll_until(
+                || state.error().is_some() && !op.pending_finish(),
+                Duration::from_secs(5)
+            ),
+            "panic must become a terminal error after the actor exits"
+        );
+        assert!(
+            state
+                .error()
+                .expect("panic error")
+                .contains("async sink actor panicked: injected sink panic")
+        );
+        assert!(op.is_finished());
+        assert!(op.join.as_ref().is_some_and(JoinHandle::is_finished));
+    }
+
+    #[test]
+    fn pending_finish_waits_for_backend_drop_after_normal_failure_and_cancel() {
+        for path in ["normal", "failure", "cancel"] {
+            let state = test_runtime_state();
+            let gate = ExitGate::new();
+            let backend = ExitGatedSink {
+                gate: Arc::clone(&gate),
+                fail_write: path == "failure",
+            };
+            let mut op = AsyncSinkOperator::new(path, backend, 1);
+            op.activate(&state).expect("activate sink");
+            match path {
+                "normal" => op.set_finishing(&state).expect("finish sink"),
+                "failure" => op.push_chunk(&state, make_chunk(1)).expect("push chunk"),
+                "cancel" => op.cancel(),
+                _ => unreachable!(),
+            }
+            let entered = poll_until(
+                || gate.entered.load(Ordering::Acquire),
+                Duration::from_secs(5),
+            );
+            let finished = op.is_finished();
+            let pending = op.pending_finish();
+            let handle_live = !op
+                .join
+                .as_ref()
+                .expect("actor handle retained")
+                .is_finished();
+            gate.release();
+            assert!(entered, "{path}: backend destructor did not start");
+            assert!(finished, "{path}: semantic terminal state must be visible");
+            assert!(
+                pending && handle_live,
+                "{path}: live actor must hold PendingFinish"
+            );
+            assert!(
+                poll_until(|| !op.pending_finish(), Duration::from_secs(5)),
+                "{path}: actor did not exit after release"
+            );
+        }
+    }
+
     fn poll_until<F: Fn() -> bool>(pred: F, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -427,6 +591,7 @@ mod tests {
         let (backend, rows, chunks, _binds) = TestAsyncSink::new(1_000);
         let mut op = AsyncSinkOperator::new("test_async_sink", backend, 2);
         op.bind_runtime_state(&state).expect("bind");
+        op.activate(&state).expect("activate");
 
         // Push 5 chunks of 3 rows each, respecting need_input backpressure.
         let mut pushed = 0;
@@ -462,6 +627,7 @@ mod tests {
         let gate = Arc::clone(&backend.gate);
         let mut op = AsyncSinkOperator::new("bp_sink", backend, 2);
         op.bind_runtime_state(&state).expect("bind");
+        op.activate(&state).expect("activate");
 
         // Fill the queue: capacity=2, plus 1 in-flight pulled by the bg task.
         // Push until need_input() reports full.
@@ -499,6 +665,7 @@ mod tests {
         backend.finish_delay = Duration::from_millis(200);
         let mut op = AsyncSinkOperator::new("finish_sink", backend, 4);
         op.bind_runtime_state(&state).expect("bind");
+        op.activate(&state).expect("activate");
 
         op.push_chunk(&state, make_chunk(2)).expect("push");
         op.set_finishing(&state).expect("finish");
@@ -535,6 +702,7 @@ mod tests {
         backend.fail_at = Some(1); // second chunk fails
         let mut op = AsyncSinkOperator::new("err_sink", backend, 4);
         op.bind_runtime_state(&state).expect("bind");
+        op.activate(&state).expect("activate");
 
         // Push a few chunks; one of them triggers the failure in the bg task.
         for _ in 0..3 {
@@ -569,6 +737,7 @@ mod tests {
         let (backend, _rows, chunks, _binds) = TestAsyncSink::new(0);
         let mut op = AsyncSinkOperator::new("cancel_sink", backend, 4);
         op.bind_runtime_state(&state).expect("bind");
+        op.activate(&state).expect("activate");
 
         op.push_chunk(&state, make_chunk(1)).expect("push");
         // Give the bg task a moment to dequeue the chunk and park at the closed gate.
@@ -603,17 +772,19 @@ mod tests {
     }
 
     #[test]
-    fn bind_runtime_state_reaches_backend_before_drain_task_starts() {
+    fn backend_binding_and_drain_start_wait_for_activation() {
         let state = test_runtime_state();
         let (backend, _rows, _chunks, binds) = TestAsyncSink::new(1_000);
         let mut op = AsyncSinkOperator::new("bind_sink", backend, 2);
 
         op.bind_runtime_state(&state).expect("bind");
+        assert_eq!(binds.load(Ordering::Acquire), 0);
+        op.activate(&state).expect("activate");
 
         assert_eq!(
             binds.load(Ordering::Acquire),
             1,
-            "backend must observe runtime state during operator bind"
+            "backend must observe runtime state during activation"
         );
     }
 
@@ -683,11 +854,10 @@ mod tests {
         backend.finish_delay = Duration::from_millis(150);
         let gate = Arc::clone(&backend.gate);
         let mut sink = AsyncSinkOperator::new("driver_sink", backend, 2);
-        // A directly-constructed PipelineDriver does NOT call bind_runtime_state
-        // (only the pipeline builder does). Bind here — with the SAME RuntimeState
-        // the driver uses — so the sink's drain task spawns; otherwise the queue
-        // never drains and the driver would hang on OutputFull forever.
+        // A directly-constructed PipelineDriver does not bind runtime state.
+        // Activate with the same state so its drain task can serve the driver.
         sink.bind_runtime_state(&runtime_state).expect("bind sink");
+        sink.activate(&runtime_state).expect("activate sink");
 
         let driver_state = Arc::clone(&runtime_state);
         let mut driver = PipelineDriver::new(

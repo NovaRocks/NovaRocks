@@ -29,7 +29,8 @@ use novarocks_execution::task_execution::{
     OperationOutcome, RequestError, TaskOperationId, TaskState,
 };
 use novarocks_query_application::coordination::{
-    DispatchLane, FinalInfoDisagreement, ResultPacketVerdict, StatusObservation,
+    DispatchLane, FinalInfoDisagreement, OperationDispatchResult, ResultPacketVerdict,
+    StatusObservation,
 };
 use novarocks_types::identity::{BackendProcessId, TaskId};
 
@@ -129,6 +130,11 @@ pub enum TaskExecutionError {
         /// engine's own message -- a CAST field-count mismatch, a bitmap
         /// aggregate's argument rule -- is lost on the way out.
         detail: Option<String>,
+    },
+    /// A settled local or native-ingress failure has no Worker receipt.
+    DispatchRejected {
+        kind: OperationKind,
+        result: OperationDispatchResult,
     },
     /// The root result stream lost, repeated, or overran a packet, so the
     /// result this frontend holds is not provably the whole result.
@@ -314,6 +320,12 @@ impl fmt::Display for TaskExecutionError {
                 Some(detail) => write!(formatter, "{kind} failed closed: {detail}"),
                 None => write!(formatter, "{kind} failed closed with {outcome:?}"),
             },
+            Self::DispatchRejected { kind, result } => {
+                write!(
+                    formatter,
+                    "{kind} failed before a Worker receipt: {result:?}"
+                )
+            }
             Self::ResultStream(verdict) => {
                 write!(formatter, "root result stream is not intact: {verdict}")
             }

@@ -879,9 +879,10 @@ fn worker_closure(state: QueryContextState) -> Option<ContextClosureState> {
         QueryContextState::Releasing => Some(ContextClosureState::Releasing),
         QueryContextState::TerminalRetained => Some(ContextClosureState::TerminalRetained),
         QueryContextState::Gone => Some(ContextClosureState::Gone),
-        QueryContextState::Absent | QueryContextState::Establishing | QueryContextState::Active => {
-            None
-        }
+        QueryContextState::Absent
+        | QueryContextState::Establishing
+        | QueryContextState::Active
+        | QueryContextState::Quiescing => None,
     }
 }
 

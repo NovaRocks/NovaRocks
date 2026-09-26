@@ -104,6 +104,15 @@ struct LocalExchangeSourceOperator {
     blocked_empty: bool,
 }
 
+impl LocalExchangeSourceOperator {
+    fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.exchanger.finish_source(self.partition);
+        }
+    }
+}
+
 impl Operator for LocalExchangeSourceOperator {
     fn name(&self) -> &str {
         &self.name
@@ -119,6 +128,15 @@ impl Operator for LocalExchangeSourceOperator {
 
     fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        self.finish();
+        Ok(())
+    }
+
+    fn cancel(&mut self) {
+        self.finish();
     }
 }
 
@@ -179,8 +197,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
             return Ok(Some(chunk));
         }
         if self.exchanger.is_done(self.partition) {
-            self.finished = true;
-            self.exchanger.finish_source();
+            self.finish();
             let stats = self.exchanger.stats_snapshot();
             if let Some(part) = stats
                 .partitions
@@ -223,6 +240,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        self.finish();
         Ok(())
     }
 

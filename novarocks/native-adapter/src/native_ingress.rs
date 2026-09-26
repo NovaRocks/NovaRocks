@@ -41,6 +41,15 @@ use crate::native_server::NativeIngressConfig;
 const LOCAL_ENTRY_CAP: Duration = Duration::from_secs(300);
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
 
+fn ingress_capacity_status(detail: &'static str, reason: &'static str) -> Status {
+    let mut status = Status::resource_exhausted(detail);
+    status.metadata_mut().insert(
+        "x-novarocks-ingress-rejection",
+        tonic::metadata::MetadataValue::from_static(reason),
+    );
+    status
+}
+
 /// A request's original arrival and its locally bounded header deadline.
 /// The permit follows every clone held by a handler, closure, or response.
 pub struct NativeIngressOwnership {
@@ -109,7 +118,10 @@ impl Gate {
         }
         let wait_permit = Arc::clone(&self.waiting).try_acquire_owned().map_err(|_| {
             self.reject("waiting_capacity");
-            Status::resource_exhausted("native ingress waiting capacity exhausted")
+            ingress_capacity_status(
+                "native ingress waiting capacity exhausted",
+                "waiting_capacity",
+            )
         })?;
         let _wait = WaitingPermit::new(wait_permit, self.clone());
         let permit =
@@ -352,8 +364,9 @@ where
                     .is_some_and(|length| length > total_limit)
                 {
                     gate.reject("body_limit");
-                    return Ok(Status::resource_exhausted(
+                    return Ok(ingress_capacity_status(
                         "native request body exceeds method limit",
+                        "body_limit",
                     )
                     .into_http());
                 }
@@ -502,8 +515,9 @@ impl HttpBody for LimitedRequestBody {
                         if self.metrics {
                             backend_metrics::native_ingress_rejected(self.class, "body_limit");
                         }
-                        return Poll::Ready(Some(Err(Status::resource_exhausted(
+                        return Poll::Ready(Some(Err(ingress_capacity_status(
                             "native request body exceeds method limit",
+                            "body_limit",
                         ))));
                     }
                     self.remaining -= data.len();

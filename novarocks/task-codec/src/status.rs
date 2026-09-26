@@ -24,9 +24,9 @@ use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS,
     FinalTaskInfo, OPERATOR_COUNTER_BUDGET, OperatorCounter, OperatorStatistics,
-    SAFE_DETAIL_MAX_BYTES, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
-    TaskResourceFacts, TaskState, TaskStatus, TaskStatusCursor, TaskStatusVersion, TaskWriterFacts,
-    TerminationDetail,
+    SAFE_DETAIL_MAX_BYTES, SafeDetail, TaskFailure, TaskFailureCategory, TaskFailurePhase,
+    TaskOutputFacts, TaskResourceFacts, TaskState, TaskStatus, TaskStatusCursor, TaskStatusVersion,
+    TaskWriterFacts, TerminationDetail,
 };
 use novarocks_proto_models::novarocks;
 
@@ -146,6 +146,23 @@ fn encode_failure_category(value: TaskFailureCategory) -> i32 {
     encoded as i32
 }
 
+fn decode_failure_phase(value: i32, path: FieldPath) -> Result<TaskFailurePhase, ProtocolError> {
+    match novarocks::TaskFailurePhase::try_from(value) {
+        Ok(novarocks::TaskFailurePhase::Preparation) => Ok(TaskFailurePhase::Preparation),
+        Ok(novarocks::TaskFailurePhase::Execution) => Ok(TaskFailurePhase::Execution),
+        Ok(novarocks::TaskFailurePhase::Unspecified) | Err(_) => {
+            Err(invalid_enum(path, "task failure phase must be specified"))
+        }
+    }
+}
+
+fn encode_failure_phase(value: TaskFailurePhase) -> i32 {
+    match value {
+        TaskFailurePhase::Preparation => novarocks::TaskFailurePhase::Preparation as i32,
+        TaskFailurePhase::Execution => novarocks::TaskFailurePhase::Execution as i32,
+    }
+}
+
 /// Decodes bounded, already-redacted diagnostic text.
 pub(crate) fn decode_safe_detail(
     value: &str,
@@ -179,9 +196,12 @@ fn decode_termination(
             let failure_path = path.field("failed");
             let category =
                 decode_failure_category(failure.category, failure_path.clone().field("category"))?;
-            let detail =
-                decode_safe_detail(&failure.safe_detail, failure_path.field("safe_detail"))?;
-            TerminationDetail::Failed(TaskFailure::new(category, detail))
+            let detail = decode_safe_detail(
+                &failure.safe_detail,
+                failure_path.clone().field("safe_detail"),
+            )?;
+            let phase = decode_failure_phase(failure.phase, failure_path.field("phase"))?;
+            TerminationDetail::Failed(TaskFailure::new_in_phase(category, detail, phase))
         }
     })
 }
@@ -198,6 +218,7 @@ fn encode_termination(value: &TerminationDetail) -> novarocks::TaskTermination {
             novarocks::task_termination::Cause::Failed(novarocks::TaskFailure {
                 category: encode_failure_category(failure.category()),
                 safe_detail: failure.detail().as_str().to_owned(),
+                phase: encode_failure_phase(failure.phase()),
             })
         }
     };
@@ -242,8 +263,15 @@ pub fn decode_task_status(
         ));
     }
 
-    let status = TaskStatus::try_new(identity, version, state, termination, facts)
-        .map_err(|error| inconsistent(path.clone(), error.to_string()))?;
+    let installed = src.installed.ok_or_else(|| {
+        missing(
+            path.clone().field("installed"),
+            "task status requires an installed history fact",
+        )
+    })?;
+    let status =
+        TaskStatus::try_new_with_installed(identity, version, state, termination, facts, installed)
+            .map_err(|error| inconsistent(path.clone(), error.to_string()))?;
 
     let status = match (src.dynamic_filter_version, src.dynamic_filter_domain_count) {
         (Some(version), Some(count)) => {
@@ -341,6 +369,7 @@ pub fn encode_task_status(value: &TaskStatus) -> novarocks::TaskStatus {
             written_bytes: writer.written_bytes(),
             prepared_write_entries: writer.prepared_write_entries(),
         }),
+        installed: Some(value.installed()),
     }
 }
 

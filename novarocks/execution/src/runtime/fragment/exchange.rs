@@ -85,22 +85,35 @@ mod tests {
     fn values_program(
         exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
     ) -> FragmentProgram {
-        FragmentProgram::new(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode {
-                        chunk: Chunk::default(),
-                        node_id: 1,
-                    }),
-                },
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk: Chunk::default(),
+                    node_id: 1,
+                }),
             },
-            FragmentSinkSpec::try_new(FragmentSinkProgram::Noop).expect("noop sink"),
+        };
+        let profile = plan
+            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
+            .unwrap();
+        let (local, runtime) = plan
+            .into_local_program_and_bindings(
+                profile,
+                BTreeMap::new(),
+                Vec::new(),
+                novarocks_local_program::StaticSinkProgram::Noop,
+            )
+            .unwrap();
+        assert_eq!(runtime.scan_count(), 0);
+        FragmentProgram::try_new(
+            Arc::new(local),
             FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
             BTreeMap::new(),
             exchange_inputs,
             RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
         )
+        .unwrap()
     }
 
     fn instance_with_exchange(

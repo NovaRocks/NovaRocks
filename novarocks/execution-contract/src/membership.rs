@@ -45,6 +45,7 @@ pub struct BackendProcessDescriptor {
     deployment_id: String,
     build_identity: String,
     native_compatibility_id: NativeCompatibilityId,
+    preparing_positions: usize,
 }
 
 impl BackendProcessDescriptor {
@@ -54,7 +55,11 @@ impl BackendProcessDescriptor {
         deployment_id: impl Into<String>,
         build_identity: impl Into<String>,
         native_compatibility_id: NativeCompatibilityId,
+        preparing_positions: usize,
     ) -> Result<Self, BackendProcessDescriptorError> {
+        if preparing_positions == 0 {
+            return Err(BackendProcessDescriptorError::PreparingPositions);
+        }
         let deployment_id = deployment_id.into();
         validate_text(
             &deployment_id,
@@ -73,6 +78,7 @@ impl BackendProcessDescriptor {
             deployment_id,
             build_identity,
             native_compatibility_id,
+            preparing_positions,
         })
     }
 
@@ -92,6 +98,11 @@ impl BackendProcessDescriptor {
         &self.build_identity
     }
 
+    /// Immutable per-Context preparation positions advertised by this process.
+    pub const fn preparing_positions(&self) -> usize {
+        self.preparing_positions
+    }
+
     pub const fn native_compatibility_id(&self) -> NativeCompatibilityId {
         self.native_compatibility_id
     }
@@ -99,6 +110,7 @@ impl BackendProcessDescriptor {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendProcessDescriptorError {
+    PreparingPositions,
     DeploymentId,
     BuildIdentity,
 }
@@ -106,6 +118,9 @@ pub enum BackendProcessDescriptorError {
 impl fmt::Display for BackendProcessDescriptorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PreparingPositions => {
+                formatter.write_str("backend preparation positions must be positive")
+            }
             Self::DeploymentId => {
                 formatter.write_str("deployment id must be non-empty and at most 256 bytes")
             }
@@ -145,6 +160,7 @@ mod tests {
                 "",
                 "build",
                 NativeCompatibilityId::new([7; 32]),
+                4096,
             ),
             Err(BackendProcessDescriptorError::DeploymentId)
         );
@@ -155,6 +171,7 @@ mod tests {
                 "deployment",
                 "b".repeat(257),
                 NativeCompatibilityId::new([7; 32]),
+                4096,
             ),
             Err(BackendProcessDescriptorError::BuildIdentity)
         );

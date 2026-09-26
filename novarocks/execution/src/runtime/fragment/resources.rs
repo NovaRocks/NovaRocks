@@ -315,7 +315,7 @@ impl FragmentResources {
         writer: &Arc<dyn FragmentResultWriter>,
         spec: ResultWriteSpec,
     ) -> Result<(), FragmentLaunchError> {
-        if program.sink().kind() != FragmentSinkKind::Result {
+        if program.sink_kind() != FragmentSinkKind::Result {
             return Ok(());
         }
         self.result = Some(ResultRegistration::acquire(

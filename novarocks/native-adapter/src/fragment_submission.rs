@@ -380,6 +380,7 @@ fn decode_edge_destinations(
                 edge.sender_ordinal(),
                 edge.sender_count().get(),
             )
+            .map(|value| value.with_task_identity(destination.task()))
             .map_err(|detail| error(path, ProtocolErrorKind::InvalidValue, detail))
         })
         .collect()

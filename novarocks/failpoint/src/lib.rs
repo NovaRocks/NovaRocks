@@ -59,6 +59,8 @@ pub enum QueryLifecycleFaultKind {
     /// separate Stage and Start acknowledgements, because `CreateTask` is the
     /// task protocol's single admission point rather than two phases.
     CreateTaskAckDrop,
+    /// Holds an exact ordinary Create before Worker admission for the runner.
+    CreateTaskBeforeWorkerHold,
     /// Drops one `SubscribeTaskStatus` stream after the subscription is
     /// established. Cursors are unconsumed, so the observation is recovered by
     /// resubscribing rather than by re-running anything.
@@ -162,7 +164,7 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::TerminalAckDrop,
         Self::TerminalSnapshotConflict,
         Self::RuntimeFilterContributionAckDrop,
@@ -172,6 +174,7 @@ impl QueryLifecycleFaultKind {
         Self::TaskUpdateTerminalAckDrop,
         Self::EstablishContextAckDrop,
         Self::CreateTaskAckDrop,
+        Self::CreateTaskBeforeWorkerHold,
         Self::TaskStatusSubscriptionDrop,
         Self::LeaseRenewalAckDrop,
         Self::LeaseRenewalStop,
@@ -205,6 +208,7 @@ impl QueryLifecycleFaultKind {
             Self::TaskUpdateTerminalAckDrop => "task-update-terminal-ack-drop",
             Self::EstablishContextAckDrop => "establish-context-ack-drop",
             Self::CreateTaskAckDrop => "create-task-ack-drop",
+            Self::CreateTaskBeforeWorkerHold => "create-task-before-worker-hold",
             Self::TaskStatusSubscriptionDrop => "task-status-subscription-drop",
             Self::LeaseRenewalAckDrop => "lease-renewal-ack-drop",
             Self::LeaseRenewalStop => "lease-renewal-stop",
@@ -242,7 +246,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 23] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 24] = [
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
@@ -264,6 +268,9 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 23] = [
     // is not what the case is about.
     QueryLifecycleFaultKind::TaskExecutionFailure,
     QueryLifecycleFaultKind::RestartAfterEstablishContext,
+    // The exact ordinary Create remains outside Worker admission until the
+    // runner releases it, proving unknown ownership during root completion.
+    QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold,
     // The task protocol's three identity-fencing faults, successors of the
     // retired protocol's `stage-conflict-after-apply`, `start-digest-corrupt`
     // and `observation-foreign-participant`. Each misstates one fact on the
@@ -313,6 +320,12 @@ pub fn arm_path(root: &Path, backend_index: usize, kind: QueryLifecycleFaultKind
 
 pub fn trigger_path(root: &Path, backend_index: usize, kind: QueryLifecycleFaultKind) -> PathBuf {
     root.join(format!("be-{backend_index}.{}.trigger", kind.file_stem()))
+}
+
+/// Token-scoped socket for the runner's exact pre-Worker Create hold.
+pub fn create_before_worker_rendezvous_socket_path(token: &str) -> Result<PathBuf, String> {
+    let path = restart_after_establish_rendezvous_socket_path(token)?;
+    Ok(path.with_file_name(format!("nr-cbw-{token}.sock")))
 }
 
 /// Returns the short, token-scoped Unix socket name used by the debug-only
@@ -789,6 +802,21 @@ pub use typed::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn create_before_worker_socket_has_a_distinct_validated_token_scope() {
+        assert_eq!(
+            create_before_worker_rendezvous_socket_path("abc-123").unwrap(),
+            PathBuf::from("/tmp/nr-cbw-abc-123.sock"),
+        );
+        for invalid in ["", "../escape", "space token"] {
+            assert!(create_before_worker_rendezvous_socket_path(invalid).is_err());
+        }
+        assert!(
+            QueryLifecycleFaultKind::parse("create-task-before-worker-hold")
+                .is_some_and(|kind| RUNNER_RFO_KINDS.contains(&kind))
+        );
+    }
+
     #[test]
     fn native_ingress_hold_socket_accepts_only_short_safe_tokens() {
         assert_eq!(

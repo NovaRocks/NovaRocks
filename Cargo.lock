@@ -378,6 +378,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "18aa020f6bc8e5201dcd2d4b7f98c68f8a410ef37128263243e6ff2a47a67d4f"
 dependencies = [
  "bitflags 2.10.0",
+ "serde",
  "serde_core",
  "serde_json",
 ]
@@ -3669,6 +3670,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
+ "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
  "novarocks-fs",
  "novarocks-proto-codec",
@@ -3714,6 +3716,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "novarocks-connector-contract",
  "novarocks-fs",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -3793,6 +3796,7 @@ dependencies = [
  "libc",
  "libm",
  "md-5 0.10.6",
+ "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
  "novarocks-execution-contract",
  "novarocks-functions",
@@ -3817,6 +3821,7 @@ dependencies = [
  "tempfile",
  "threadpool",
  "tokio",
+ "tokio-util",
  "tracing",
  "twox-hash 2.1.2",
  "url",
@@ -3941,10 +3946,16 @@ dependencies = [
 name = "novarocks-local-program"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
+ "bytes",
  "novarocks-connector-contract",
  "novarocks-execution-contract",
+ "novarocks-functions",
  "novarocks-types",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -4023,10 +4034,12 @@ dependencies = [
  "h2",
  "hyper",
  "hyper-util",
+ "novarocks-connector-contract",
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-functions",
+ "novarocks-local-program",
  "novarocks-memory",
  "novarocks-native-trust",
  "novarocks-physical-plan",
@@ -4048,6 +4061,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-build",
  "tower 0.5.2",
@@ -4397,12 +4411,14 @@ name = "novarocks-system-test-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
  "bytes",
  "h2",
  "http",
  "mysql",
  "novarocks-cluster-harness",
  "novarocks-connector-iceberg",
+ "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-native-trust",

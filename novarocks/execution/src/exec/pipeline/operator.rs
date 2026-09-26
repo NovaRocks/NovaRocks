@@ -96,6 +96,12 @@ pub trait Operator: Send {
         Ok(())
     }
 
+    /// Start task-owned activity after the driver has been admitted for execution.
+    /// Preparation and binding must leave providers and subscriptions dormant.
+    fn activate(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        Ok(())
+    }
+
     fn set_fragment_event_sink(&mut self, _sink: Arc<dyn FragmentEventSink>) {}
 
     fn close(&mut self) -> Result<(), String> {

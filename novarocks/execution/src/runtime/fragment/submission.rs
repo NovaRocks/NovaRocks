@@ -28,19 +28,34 @@ use crate::exec::fragment::error::{
 use crate::exec::fragment::program::{
     FragmentNodeId, FragmentProgram, FragmentSinkAssignmentKind, FragmentSinkAssignmentRequirement,
 };
-use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+use crate::exec::node::LocalRuntimeBindings;
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
+use novarocks_local_program::{BindingRequirement, LocalProgram, ProgramNodeKind, StaticLayout};
 use novarocks_types::SlotId;
 
-#[derive(Debug)]
 pub struct FragmentSubmission {
     program: Arc<FragmentProgram>,
+    runtime_bindings: LocalRuntimeBindings,
     instance: FragmentInstanceSpec,
+}
+
+impl std::fmt::Debug for FragmentSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FragmentSubmission")
+            .field("program", &self.program)
+            .field("scan_bindings", &self.runtime_bindings.scan_count())
+            .field("writer_bindings", &self.runtime_bindings.writer_count())
+            .field("finish_bindings", &self.runtime_bindings.finish_count())
+            .field("instance", &self.instance)
+            .finish()
+    }
 }
 
 impl FragmentSubmission {
     pub fn try_new(
         program: Arc<FragmentProgram>,
+        runtime_bindings: LocalRuntimeBindings,
         instance: FragmentInstanceSpec,
     ) -> Result<Self, FragmentBindingError> {
         let expected_version = program.program_options().contract_version();
@@ -56,17 +71,38 @@ impl FragmentSubmission {
                 ),
             ));
         }
-        let inventory = ProgramInventory::try_collect(program.plan())?;
+        let expected_dop = program.local_program().profile().pipeline_dop();
+        if expected_dop != instance.pipeline_dop() {
+            return Err(FragmentBindingError::new(
+                FragmentBindingTarget::Instance,
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!(
+                    "local program compiled for pipeline DOP {}, got {}",
+                    expected_dop.get(),
+                    instance.pipeline_dop().get()
+                ),
+            ));
+        }
+        let inventory = ProgramInventory::try_collect(program.local_program())?;
+        validate_runtime_bindings(program.local_program(), &runtime_bindings)?;
         validate_scan_contracts(&program, &inventory)?;
         validate_exchange_contracts(&program, &inventory)?;
         validate_scan_assignments(&inventory, &instance)?;
         validate_exchange_assignments(&program, &instance)?;
         validate_sink_assignment(&program, &instance)?;
-        Ok(Self { program, instance })
+        Ok(Self {
+            program,
+            runtime_bindings,
+            instance,
+        })
     }
 
     pub fn program(&self) -> &Arc<FragmentProgram> {
         &self.program
+    }
+
+    pub fn runtime_bindings(&self) -> &LocalRuntimeBindings {
+        &self.runtime_bindings
     }
 
     pub const fn instance(&self) -> &FragmentInstanceSpec {
@@ -75,7 +111,11 @@ impl FragmentSubmission {
 
     pub fn incremental_scan_contracts(&self) -> HashMap<i32, Option<SlotId>> {
         let mut contracts = HashMap::new();
-        collect_incremental_scan_contracts(&self.program.plan().root, &mut contracts);
+        for node in self.program.local_program().nodes() {
+            if matches!(node.kind(), ProgramNodeKind::Scan { .. }) {
+                contracts.insert(node.native_node_id(), None);
+            }
+        }
         contracts
     }
 
@@ -100,148 +140,52 @@ impl FragmentSubmission {
     }
 
     pub fn uses_split_data_stream_sink(&self) -> bool {
-        self.program.sink().kind()
+        self.program.sink_kind()
             == crate::exec::fragment::program::FragmentSinkKind::SplitDataStream
     }
 }
 
-fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32, Option<SlotId>>) {
-    match &node.kind {
-        ExecNodeKind::Scan(scan) => {
-            if let Some(node_id) = scan.node_id() {
-                output.insert(node_id, None);
-            }
-        }
-        ExecNodeKind::AssertNumRows(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::Project(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Unpivot(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Filter(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Repeat(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::ChangeEventExpand(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::UnionAll(value) => {
-            for input in &value.inputs {
-                collect_incremental_scan_contracts(input, output);
-            }
-        }
-        ExecNodeKind::Limit(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Aggregate(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Join(value) => {
-            collect_incremental_scan_contracts(&value.left, output);
-            collect_incremental_scan_contracts(&value.right, output);
-        }
-        ExecNodeKind::NestedLoopJoin(value) => {
-            collect_incremental_scan_contracts(&value.left, output);
-            collect_incremental_scan_contracts(&value.right, output);
-        }
-        ExecNodeKind::Sort(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::TableFunction(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::Analytic(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::SetOp(value) => {
-            for input in &value.inputs {
-                collect_incremental_scan_contracts(input, output);
-            }
-        }
-        ExecNodeKind::RuntimeFilterConsumer(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::TableWriter(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
-        }
-        ExecNodeKind::TableFinish(value) => {
-            for input in &value.inputs {
-                collect_incremental_scan_contracts(input, output);
-            }
-        }
-        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) => {}
-    }
-}
-
 struct ProgramInventory {
-    /// All scan-shaped plan nodes (`ExecNodeKind::Scan`).
+    /// All pure scan nodes in the frozen LocalProgram.
     /// Used to cross-check the static `scan_sources` contracts.
     scan_nodes: BTreeSet<FragmentNodeId>,
-    /// `ExecNodeKind::Scan` nodes are materialized by `materialize_scan_bindings`
-    /// and therefore require an instance `ScanAssignment`.
+    /// Pure scan nodes are materialized by `materialize_scan_bindings` and
+    /// therefore require an instance `ScanAssignment`.
     materializable_scan_nodes: BTreeSet<FragmentNodeId>,
-    exchange_nodes: BTreeMap<FragmentNodeId, ChunkSchemaRef>,
+    exchange_nodes: BTreeMap<FragmentNodeId, StaticLayout>,
 }
 
 impl ProgramInventory {
-    fn try_collect(plan: &ExecPlan) -> Result<Self, FragmentBindingError> {
+    fn try_collect(plan: &LocalProgram) -> Result<Self, FragmentBindingError> {
         let mut inventory = Self {
             scan_nodes: BTreeSet::new(),
             materializable_scan_nodes: BTreeSet::new(),
             exchange_nodes: BTreeMap::new(),
         };
-        inventory.visit(&plan.root)?;
+        for node in plan.nodes() {
+            let id = FragmentNodeId::new(node.native_node_id());
+            match node.kind() {
+                ProgramNodeKind::ExchangeSource { .. } => {
+                    if inventory
+                        .exchange_nodes
+                        .insert(id, node.output_layout().clone())
+                        .is_some()
+                    {
+                        return Err(FragmentBindingError::new(
+                            FragmentBindingTarget::ExchangeNode(id.get()),
+                            FragmentBindingErrorKind::InvalidAssignment,
+                            format!("duplicate exchange node id {}", id.get()),
+                        ));
+                    }
+                }
+                ProgramNodeKind::Scan { .. } => {
+                    inventory.insert_scan(id)?;
+                    inventory.materializable_scan_nodes.insert(id);
+                }
+                _ => {}
+            }
+        }
         Ok(inventory)
-    }
-
-    fn visit(&mut self, node: &ExecNode) -> Result<(), FragmentBindingError> {
-        match &node.kind {
-            ExecNodeKind::AssertNumRows(node) => self.visit(&node.input),
-            ExecNodeKind::Values(_) => Ok(()),
-            ExecNodeKind::Project(node) => self.visit(&node.input),
-            ExecNodeKind::Unpivot(node) => self.visit(&node.input),
-            ExecNodeKind::Filter(node) => self.visit(&node.input),
-            ExecNodeKind::Repeat(node) => self.visit(&node.input),
-            ExecNodeKind::ChangeEventExpand(node) => self.visit(&node.input),
-            ExecNodeKind::UnionAll(node) => self.visit_inputs(&node.inputs),
-            ExecNodeKind::Limit(node) => self.visit(&node.input),
-            ExecNodeKind::ExchangeSource(node) => {
-                let id = FragmentNodeId::new(node.node_id);
-                if self
-                    .exchange_nodes
-                    .insert(id, Arc::clone(&node.expected_chunk_schema))
-                    .is_some()
-                {
-                    return Err(FragmentBindingError::new(
-                        FragmentBindingTarget::ExchangeNode(id.get()),
-                        FragmentBindingErrorKind::InvalidAssignment,
-                        format!("duplicate exchange node id {}", id.get()),
-                    ));
-                }
-                Ok(())
-            }
-            ExecNodeKind::Scan(node) => {
-                if let Some(raw_id) = node.node_id() {
-                    let id = FragmentNodeId::new(raw_id);
-                    self.insert_scan(id)?;
-                    // Only real ScanSource-backed scans are materialized/bound.
-                    self.materializable_scan_nodes.insert(id);
-                }
-                Ok(())
-            }
-            ExecNodeKind::Aggregate(node) => self.visit(&node.input),
-            ExecNodeKind::Join(node) => {
-                self.visit(&node.left)?;
-                self.visit(&node.right)
-            }
-            ExecNodeKind::NestedLoopJoin(node) => {
-                self.visit(&node.left)?;
-                self.visit(&node.right)
-            }
-            ExecNodeKind::Sort(node) => self.visit(&node.input),
-            ExecNodeKind::TableFunction(node) => self.visit(&node.input),
-            ExecNodeKind::Analytic(node) => self.visit(&node.input),
-            ExecNodeKind::SetOp(node) => self.visit_inputs(&node.inputs),
-            ExecNodeKind::RuntimeFilterConsumer(node) => self.visit(&node.input),
-            ExecNodeKind::TableWriter(node) => self.visit(&node.input),
-            ExecNodeKind::TableFinish(node) => self.visit_inputs(&node.inputs),
-        }
-    }
-
-    fn visit_inputs(&mut self, inputs: &[ExecNode]) -> Result<(), FragmentBindingError> {
-        for input in inputs {
-            self.visit(input)?;
-        }
-        Ok(())
     }
 
     fn insert_scan(&mut self, id: FragmentNodeId) -> Result<(), FragmentBindingError> {
@@ -254,6 +198,42 @@ impl ProgramInventory {
         }
         Ok(())
     }
+}
+
+fn validate_runtime_bindings(
+    program: &LocalProgram,
+    runtime: &LocalRuntimeBindings,
+) -> Result<(), FragmentBindingError> {
+    let mut scans = BTreeSet::new();
+    let mut writers = BTreeSet::new();
+    let mut finishers = BTreeSet::new();
+    for requirement in program.requirements().entries() {
+        match requirement {
+            BindingRequirement::Scan { node, .. } => {
+                scans.insert(*node);
+            }
+            BindingRequirement::TableWriter { node, .. } => {
+                writers.insert(*node);
+            }
+            BindingRequirement::TableFinish { node, .. } => {
+                finishers.insert(*node);
+            }
+            _ => {}
+        }
+    }
+    let actual_scans = runtime.scans.keys().copied().collect::<BTreeSet<_>>();
+    let actual_writers = runtime.writers.keys().copied().collect::<BTreeSet<_>>();
+    let actual_finishers = runtime.finishers.keys().copied().collect::<BTreeSet<_>>();
+    if scans != actual_scans || writers != actual_writers || finishers != actual_finishers {
+        return Err(FragmentBindingError::new(
+            FragmentBindingTarget::Instance,
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!(
+                "local runtime sidecar mismatch: scans={scans:?}/{actual_scans:?}, writers={writers:?}/{actual_writers:?}, finishers={finishers:?}/{actual_finishers:?}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_scan_contracts(
@@ -269,6 +249,15 @@ fn validate_scan_contracts(
                     "declared scan contract {} does not resolve to a scan-shaped plan node",
                     id.get()
                 ),
+            ));
+        }
+    }
+    for id in &inventory.scan_nodes {
+        if !program.scan_sources().contains_key(id) {
+            return Err(FragmentBindingError::new(
+                FragmentBindingTarget::ScanNode(id.get()),
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!("local scan node {} has no static scan contract", id.get()),
             ));
         }
     }
@@ -300,6 +289,39 @@ fn schema_summary(schema: &ChunkSchemaRef) -> String {
     let schema_metadata = schema.arrow_schema_ref();
     let schema_metadata = metadata_suffix(schema_metadata.metadata());
     format!("[{slots}]{schema_metadata}")
+}
+
+fn static_schema_summary(layout: &StaticLayout) -> String {
+    let slots = layout
+        .slots()
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            let field = layout.schema().field(index);
+            let (field_schema, unique_id) = match layout.slot_metadata_at(index) {
+                Some((schema, id)) => (
+                    format!(
+                        "{:?}",
+                        crate::exec::expr::static_program::thaw_field_schema(schema)
+                    ),
+                    id.map_or_else(|| "none".to_string(), |id| id.to_string()),
+                ),
+                None => ("unspecified".to_string(), "unspecified".to_string()),
+            };
+            format!(
+                "slot={},name={},type={},nullable={},unique_id={},field_schema={}{}",
+                slot,
+                field.name(),
+                data_type_summary(field.data_type()),
+                field.is_nullable(),
+                unique_id,
+                field_schema,
+                metadata_suffix(field.metadata()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!("[{slots}]{}", metadata_suffix(layout.schema().metadata()))
 }
 
 fn field_schema_summary(field_schema: &ChunkFieldSchema) -> String {
@@ -409,7 +431,7 @@ fn validate_exchange_contracts(
             .exchange_nodes
             .get(id)
             .expect("exchange key sets were validated");
-        if contract.expected_schema().slot_ids() != actual.slot_ids() {
+        if contract.expected_schema().slot_ids() != actual.slots() {
             return Err(FragmentBindingError::new(
                 FragmentBindingTarget::ExchangeNode(id.get()),
                 FragmentBindingErrorKind::LayoutMismatch,
@@ -417,11 +439,11 @@ fn validate_exchange_contracts(
                     "exchange node {} expected slots {:?}, got {:?}",
                     id.get(),
                     contract.expected_schema().slot_ids(),
-                    actual.slot_ids()
+                    actual.slots()
                 ),
             ));
         }
-        if contract.expected_schema().as_ref() != actual.as_ref() {
+        if contract.expected_schema().arrow_schema_ref().as_ref() != actual.schema().as_ref() {
             return Err(FragmentBindingError::new(
                 FragmentBindingTarget::ExchangeNode(id.get()),
                 FragmentBindingErrorKind::SchemaMismatch,
@@ -429,25 +451,40 @@ fn validate_exchange_contracts(
                     "exchange node {} expected schema {}, got {}",
                     id.get(),
                     schema_summary(contract.expected_schema()),
-                    schema_summary(actual)
+                    static_schema_summary(actual)
                 ),
             ));
+        }
+        for (index, slot) in contract.expected_schema().slots().iter().enumerate() {
+            let expected = (
+                crate::exec::expr::static_program::freeze_field_schema(slot.field_schema().clone()),
+                slot.unique_id(),
+            );
+            let observed = actual.slot_metadata_at(index);
+            if observed != Some((&expected.0, expected.1)) {
+                return Err(FragmentBindingError::new(
+                    FragmentBindingTarget::ExchangeNode(id.get()),
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    format!(
+                        "exchange node {} expected schema {}, got {}",
+                        id.get(),
+                        schema_summary(contract.expected_schema()),
+                        static_schema_summary(actual),
+                    ),
+                ));
+            }
         }
     }
     Ok(())
 }
 
-/// Presence-only cross-check between the plan's materializable scan nodes
-/// (`ExecNodeKind::Scan`) and the instance's scan assignments (mirrors
+/// Presence-only cross-check between the LocalProgram scan nodes and the
+/// instance's scan assignments (mirrors
 /// `validate_exchange_assignments`).
 ///
-/// This is checked against the plan's `ExecNodeKind::Scan` set rather than the
-/// static `scan_sources` contract set, because JDBC/MySQL scans are
-/// materializable `Scan` nodes with no `ScanAssignmentKind` (hence not in
-/// `scan_sources`). Every materializable scan must have an instance assignment
-/// (so `materialize_scan_bindings` never misses), and no assignment may lack a
-/// materializable node. The old strict kind match is gone: variant-vs-source
-/// correctness is enforced at materialize time by `ScanSource::bind`.
+/// Every materializable scan must have an instance assignment, and no
+/// assignment may lack a scan node. The source checks the range variant at
+/// materialization.
 fn validate_scan_assignments(
     inventory: &ProgramInventory,
     instance: &FragmentInstanceSpec,
@@ -510,7 +547,7 @@ fn validate_sink_assignment(
 ) -> Result<(), FragmentBindingError> {
     use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
     use FragmentSinkAssignmentRequirement as Requirement;
-    let requirement = program.sink().assignment_requirement();
+    let requirement = program.sink_assignment_requirement();
     let assignment = instance.sink_assignment();
     match (requirement, assignment) {
         (Requirement::None, FragmentSinkAssignment::None)
@@ -575,9 +612,9 @@ fn sink_assignment_summary(assignment: &FragmentSinkAssignment) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU64, NonZeroUsize};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -611,7 +648,17 @@ mod tests {
     use crate::exec::node::set_op::{SetOpKind, SetOpNode};
     use crate::exec::node::union_all::UnionAllNode;
     use crate::exec::node::values::ValuesNode;
-    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, ExternalSinkRequirement};
+    use novarocks_connector_contract::{
+        CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+        ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding,
+        ConnectorReadRecipeSplitDraft, ConnectorReadRelationKind, ConnectorReadRelationPayload,
+        ConnectorReadRelationRecipe, ConnectorReadRelationRecipeCompiler,
+        ConnectorReadRelationRecipeDraft, ConnectorReadRelationRecipeError,
+        ConnectorReadWorkSource, ConnectorValueType, TupleDomain,
+    };
+    use novarocks_local_program::{StaticConnectorScan, StaticScanAssignment, StaticSinkProgram};
 
     use crate::runtime::exchange::ExchangeKey;
     use crate::runtime::fragment::instance::{
@@ -735,7 +782,7 @@ mod tests {
                 Vec::new(),
                 DataStreamPartitionType::Unpartitioned,
                 Vec::new(),
-                vec![SlotId::new(1)],
+                vec![],
                 None,
                 ExprArena::default(),
             )
@@ -752,7 +799,7 @@ mod tests {
                     Vec::new(),
                     DataStreamPartitionType::Unpartitioned,
                     Vec::new(),
-                    vec![SlotId::new(1)],
+                    vec![],
                     None,
                 )
                 .expect("data stream branch")
@@ -782,7 +829,7 @@ mod tests {
                     Vec::new(),
                     DataStreamPartitionType::Unpartitioned,
                     Vec::new(),
-                    vec![SlotId::new(1)],
+                    vec![],
                     None,
                 )
                 .expect("split stream branch")
@@ -795,6 +842,131 @@ mod tests {
         .expect("split stream sink")
     }
 
+    struct IdentityRecipeCompiler;
+
+    impl ConnectorReadRelationRecipeCompiler for IdentityRecipeCompiler {
+        type Error = ConnectorReadRelationRecipeError;
+
+        fn compile_private(
+            &self,
+            draft: &ConnectorReadRelationRecipeDraft,
+        ) -> Result<ConnectorReadRelationRecipeDraft, Self::Error> {
+            Ok(draft.clone())
+        }
+
+        fn compile_split_private(
+            &self,
+            _binding: &ConnectorReadBinding,
+            draft: &ConnectorReadRecipeSplitDraft,
+        ) -> Result<ConnectorReadRecipeSplitDraft, Self::Error> {
+            Ok(draft.clone())
+        }
+    }
+
+    pub(crate) fn static_scan_for_test() -> StaticConnectorScan {
+        let instance = ConnectorInstanceId::try_from_canonical("test_lake").unwrap();
+        let binding = ConnectorReadBinding::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: instance.clone(),
+            },
+            CatalogHandle::new(instance, CatalogVersion::from_bytes([1; 32])),
+        );
+        let payload = |category| {
+            ConnectorEncodedPayload::new(
+                ConnectorEnvelopeHeader::new(
+                    binding.descriptor().provider_id.clone(),
+                    binding.catalog_handle().clone(),
+                    category,
+                    ConnectorCodecRevision::try_new(1).unwrap(),
+                ),
+                bytes::Bytes::from_static(b"test"),
+            )
+        };
+        let draft = ConnectorReadRelationRecipeDraft::try_new(
+            binding.clone(),
+            ConnectorReadRelationPayload::new(
+                ConnectorReadRelationKind::Table,
+                payload(ConnectorCodecCategory::ReadTable),
+                payload(ConnectorCodecCategory::ReadView),
+            ),
+            vec![payload(ConnectorCodecCategory::ReadColumn)],
+        )
+        .unwrap();
+        let recipe =
+            ConnectorReadRelationRecipe::try_compile_with_provider(&draft, &IdentityRecipeCompiler)
+                .unwrap();
+        StaticConnectorScan::try_new(
+            recipe,
+            vec![StaticScanAssignment::new(
+                Arc::from("v"),
+                ConnectorValueType::BigInt,
+            )],
+            TupleDomain::all(),
+            TupleDomain::all(),
+            None,
+            vec![],
+            NonZeroU64::new(1024).unwrap(),
+            NonZeroU64::new(1024 * 1024).unwrap(),
+            ConnectorReadWorkSource::RuntimeSplits,
+        )
+        .unwrap()
+    }
+
+    fn scan_ids(node: &ExecNode, ids: &mut Vec<i32>) {
+        match &node.kind {
+            ExecNodeKind::Scan(scan) => {
+                if let Some(id) = scan.node_id() {
+                    ids.push(id);
+                }
+            }
+            ExecNodeKind::AssertNumRows(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::Project(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::Unpivot(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::Filter(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::Repeat(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::ChangeEventExpand(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::Limit(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::Aggregate(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::Sort(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::TableFunction(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::Analytic(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::RuntimeFilterConsumer(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::TableWriter(n) => scan_ids(&n.input, ids),
+            ExecNodeKind::Join(n) => {
+                scan_ids(&n.left, ids);
+                scan_ids(&n.right, ids);
+            }
+            ExecNodeKind::NestedLoopJoin(n) => {
+                scan_ids(&n.left, ids);
+                scan_ids(&n.right, ids);
+            }
+            ExecNodeKind::UnionAll(n) => n.inputs.iter().for_each(|input| scan_ids(input, ids)),
+            ExecNodeKind::SetOp(n) => n.inputs.iter().for_each(|input| scan_ids(input, ids)),
+            ExecNodeKind::TableFinish(n) => n.inputs.iter().for_each(|input| scan_ids(input, ids)),
+            ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) => {}
+        }
+    }
+
+    fn lower_result_for_test(
+        plan: ExecPlan,
+    ) -> Result<(LocalProgram, LocalRuntimeBindings), crate::exec::node::LocalProgramLoweringError>
+    {
+        let mut ids = Vec::new();
+        scan_ids(&plan.root, &mut ids);
+        let static_scans = ids
+            .into_iter()
+            .map(|id| (id, static_scan_for_test()))
+            .collect();
+        let profile = plan.local_compile_profile(NonZeroUsize::new(1).unwrap(), None)?;
+        plan.into_local_program_and_bindings(
+            profile,
+            static_scans,
+            vec![ExternalSinkRequirement::Result],
+            StaticSinkProgram::Result,
+        )
+    }
+
     fn program_with(
         plan: ExecPlan,
         sink: FragmentSinkSpec,
@@ -802,6 +974,26 @@ mod tests {
         exchanges: BTreeMap<FragmentNodeId, ChunkSchemaRef>,
         build_filters: BTreeSet<RuntimeFilterId>,
     ) -> Arc<FragmentProgram> {
+        let mut ids = Vec::new();
+        scan_ids(&plan.root, &mut ids);
+        let static_scans = ids
+            .into_iter()
+            .map(|id| (id, static_scan_for_test()))
+            .collect();
+        let profile = plan
+            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
+            .expect("test compile profile");
+        let static_sink = sink.into_program().into_static().expect("static test sink");
+        let sink_requirements = match &static_sink {
+            StaticSinkProgram::Result => vec![ExternalSinkRequirement::Result],
+            StaticSinkProgram::Noop => vec![],
+            _ => (0..static_sink.branches().len())
+                .map(|branch| ExternalSinkRequirement::ExchangeOutput { branch })
+                .collect(),
+        };
+        let (local_program, _runtime) = plan
+            .into_local_program_and_bindings(profile, static_scans, sink_requirements, static_sink)
+            .expect("lower test local program");
         let scans = scans
             .into_iter()
             .map(|(id, kind)| (id, ScanSourceContract::new(kind)))
@@ -810,14 +1002,36 @@ mod tests {
             .into_iter()
             .map(|(id, schema)| (id, ExchangeInputContract::new(schema)))
             .collect();
-        Arc::new(FragmentProgram::new(
-            plan,
-            sink,
-            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-            scans,
-            exchanges,
-            RuntimeFilterContract::new(build_filters, BTreeSet::new()),
-        ))
+        Arc::new(
+            FragmentProgram::try_new(
+                Arc::new(local_program),
+                FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+                scans,
+                exchanges,
+                RuntimeFilterContract::new(build_filters, BTreeSet::new()),
+            )
+            .expect("test fragment program"),
+        )
+    }
+
+    fn test_submission(
+        program: Arc<FragmentProgram>,
+        instance: FragmentInstanceSpec,
+    ) -> Result<FragmentSubmission, FragmentBindingError> {
+        let mut runtime_bindings = LocalRuntimeBindings {
+            scans: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            finishers: BTreeMap::new(),
+        };
+        for requirement in program.local_program().requirements().entries() {
+            if let BindingRequirement::Scan { node, .. } = requirement {
+                runtime_bindings.scans.insert(
+                    *node,
+                    ScanNode::new_for_test(Arc::new(DummyScanOp)).source(),
+                );
+            }
+        }
+        FragmentSubmission::try_new(program, runtime_bindings, instance)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -911,7 +1125,7 @@ mod tests {
             BTreeMap::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::Instance,
             FragmentBindingErrorKind::ContractVersionMismatch,
         );
@@ -926,13 +1140,96 @@ mod tests {
             BTreeMap::new(),
             BTreeSet::new(),
         );
-        let submission = FragmentSubmission::try_new(Arc::clone(&program), empty_instance(11))
-            .expect("empty submission");
+        let submission =
+            test_submission(Arc::clone(&program), empty_instance(11)).expect("empty submission");
         assert!(Arc::ptr_eq(submission.program(), &program));
         assert_eq!(submission.instance().query_id(), query_id(1, 2));
         assert_eq!(
             submission.instance().fragment_instance_id().get(),
             uid(1, 11)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_task_scan_capability_even_with_assignment() {
+        let id = FragmentNodeId::new(10);
+        let program = program_with(
+            scan_plan(Some(10)),
+            result_sink(),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let instance = instance_with(
+            FragmentContractVersion::CURRENT,
+            query_id(1, 2),
+            uid(1, 13),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            FragmentSinkAssignment::None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let empty_sidecar = LocalRuntimeBindings {
+            scans: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            finishers: BTreeMap::new(),
+        };
+        assert_error(
+            FragmentSubmission::try_new(program, empty_sidecar, instance),
+            FragmentBindingTarget::Instance,
+            FragmentBindingErrorKind::InvalidAssignment,
+        );
+    }
+
+    #[test]
+    fn rejects_extra_task_scan_capability_for_values_program() {
+        let program = program_with(
+            values_plan(7),
+            result_sink(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let sidecar = LocalRuntimeBindings {
+            scans: BTreeMap::from([(
+                novarocks_local_program::ProgramNodeId::new(0),
+                ScanNode::new_for_test(Arc::new(DummyScanOp)).source(),
+            )]),
+            writers: BTreeMap::new(),
+            finishers: BTreeMap::new(),
+        };
+        assert_error(
+            FragmentSubmission::try_new(program, sidecar, empty_instance(14)),
+            FragmentBindingTarget::Instance,
+            FragmentBindingErrorKind::InvalidAssignment,
+        );
+    }
+
+    #[test]
+    fn rejects_instance_dop_different_from_static_compile_profile() {
+        let program = program_with(
+            values_plan(7),
+            result_sink(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let instance = FragmentInstanceSpec::new_native(
+            FragmentContractVersion::CURRENT,
+            query_id(1, 2),
+            FragmentInstanceId::new(uid(1, 15)),
+            ScanAssignments::default(),
+            ExchangeInputAssignments::default(),
+            FragmentSinkAssignment::None,
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
+            NonZeroUsize::new(2).unwrap(),
+            BackendNum::try_new(0).unwrap(),
+        );
+        assert_error(
+            test_submission(program, instance),
+            FragmentBindingTarget::Instance,
+            FragmentBindingErrorKind::InvalidAssignment,
         );
     }
 
@@ -945,10 +1242,10 @@ mod tests {
             BTreeMap::new(),
             BTreeSet::new(),
         );
-        let first = FragmentSubmission::try_new(Arc::clone(&program), empty_instance(11))
-            .expect("first submission");
-        let second = FragmentSubmission::try_new(Arc::clone(&program), empty_instance(12))
-            .expect("second submission");
+        let first =
+            test_submission(Arc::clone(&program), empty_instance(11)).expect("first submission");
+        let second =
+            test_submission(Arc::clone(&program), empty_instance(12)).expect("second submission");
         assert!(Arc::ptr_eq(first.program(), &program));
         assert!(Arc::ptr_eq(second.program(), &program));
         assert_ne!(
@@ -959,15 +1256,20 @@ mod tests {
     }
 
     #[test]
-    fn accepts_uncontracted_scan_without_node_id() {
-        let program = program_with(
-            scan_plan(None),
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeSet::new(),
+    fn rejects_scan_without_node_id_during_local_lowering() {
+        let plan = scan_plan(None);
+        let profile = plan
+            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
+            .expect("profile");
+        assert!(
+            plan.into_local_program_and_bindings(
+                profile,
+                BTreeMap::new(),
+                vec![ExternalSinkRequirement::Result],
+                StaticSinkProgram::Result,
+            )
+            .is_err()
         );
-        FragmentSubmission::try_new(program, empty_instance(20)).expect("uncontracted scan");
     }
 
     #[test]
@@ -991,7 +1293,7 @@ mod tests {
             BTreeMap::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::ScanNode(10),
             FragmentBindingErrorKind::InvalidAssignment,
         );
@@ -999,28 +1301,9 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_scan_node_identity() {
-        let id = FragmentNodeId::new(10);
-        let program = program_with(
-            union_plan(vec![scan_node(Some(10)), scan_node(Some(10))]),
-            result_sink(),
-            BTreeMap::from([(id, ScanAssignmentKind::File)]),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        );
-        let instance = instance_with(
-            FragmentContractVersion::CURRENT,
-            query_id(1, 2),
-            uid(1, 22),
-            BTreeMap::from([(id, ScanAssignmentKind::File)]),
-            BTreeMap::new(),
-            FragmentSinkAssignment::None,
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
-        assert_error(
-            FragmentSubmission::try_new(program, instance),
-            FragmentBindingTarget::ScanNode(10),
-            FragmentBindingErrorKind::InvalidAssignment,
+        assert!(
+            lower_result_for_test(union_plan(vec![scan_node(Some(10)), scan_node(Some(10)),]))
+                .is_err()
         );
     }
 
@@ -1035,7 +1318,7 @@ mod tests {
             BTreeSet::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, empty_instance(23)),
+            test_submission(program, empty_instance(23)),
             FragmentBindingTarget::ScanNode(10),
             FragmentBindingErrorKind::MissingAssignment,
         );
@@ -1062,7 +1345,7 @@ mod tests {
             BTreeMap::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::ScanNode(12),
             FragmentBindingErrorKind::ExtraAssignment,
         );
@@ -1088,7 +1371,7 @@ mod tests {
             BTreeSet::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, empty_instance(26)),
+            test_submission(program, empty_instance(26)),
             FragmentBindingTarget::ScanNode(10),
             FragmentBindingErrorKind::MissingAssignment,
         );
@@ -1107,7 +1390,7 @@ mod tests {
             BTreeSet::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, empty_instance(30)),
+            test_submission(program, empty_instance(30)),
             FragmentBindingTarget::ExchangeNode(20),
             FragmentBindingErrorKind::InvalidAssignment,
         );
@@ -1135,7 +1418,7 @@ mod tests {
             BTreeMap::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::ExchangeNode(20),
             FragmentBindingErrorKind::InvalidAssignment,
         );
@@ -1143,32 +1426,13 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_exchange_node_identity() {
-        let id = FragmentNodeId::new(20);
         let expected = schema(1, true);
-        let program = program_with(
-            union_plan(vec![
+        assert!(
+            lower_result_for_test(union_plan(vec![
                 exchange_node(20, Arc::clone(&expected), uid(5, 8)),
                 exchange_node(20, Arc::clone(&expected), uid(5, 9)),
-            ]),
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::from([(id, expected)]),
-            BTreeSet::new(),
-        );
-        let instance = instance_with(
-            FragmentContractVersion::CURRENT,
-            query_id(1, 2),
-            uid(1, 32),
-            BTreeMap::new(),
-            BTreeMap::from([(id, 1)]),
-            FragmentSinkAssignment::None,
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
-        assert_error(
-            FragmentSubmission::try_new(program, instance),
-            FragmentBindingTarget::ExchangeNode(20),
-            FragmentBindingErrorKind::InvalidAssignment,
+            ]))
+            .is_err()
         );
     }
 
@@ -1196,7 +1460,7 @@ mod tests {
             BTreeMap::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::ExchangeNode(20),
             FragmentBindingErrorKind::LayoutMismatch,
         );
@@ -1226,7 +1490,7 @@ mod tests {
             BTreeMap::new(),
         );
         let error = assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::ExchangeNode(20),
             FragmentBindingErrorKind::SchemaMismatch,
         );
@@ -1266,7 +1530,7 @@ mod tests {
             BTreeSet::new(),
         );
         let error = assert_error(
-            FragmentSubmission::try_new(
+            test_submission(
                 program,
                 instance_with(
                     FragmentContractVersion::CURRENT,
@@ -1322,7 +1586,7 @@ mod tests {
             BTreeSet::new(),
         );
         let error = assert_error(
-            FragmentSubmission::try_new(
+            test_submission(
                 program,
                 instance_with(
                     FragmentContractVersion::CURRENT,
@@ -1374,7 +1638,7 @@ mod tests {
             BTreeSet::new(),
         );
         let error = assert_error(
-            FragmentSubmission::try_new(
+            test_submission(
                 program,
                 instance_with(
                     FragmentContractVersion::CURRENT,
@@ -1420,7 +1684,7 @@ mod tests {
             BTreeSet::new(),
         );
         let error = assert_error(
-            FragmentSubmission::try_new(
+            test_submission(
                 program,
                 instance_with(
                     FragmentContractVersion::CURRENT,
@@ -1457,7 +1721,7 @@ mod tests {
             BTreeSet::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, empty_instance(35)),
+            test_submission(program, empty_instance(35)),
             FragmentBindingTarget::ExchangeNode(20),
             FragmentBindingErrorKind::MissingAssignment,
         );
@@ -1484,7 +1748,7 @@ mod tests {
             BTreeMap::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::ExchangeNode(21),
             FragmentBindingErrorKind::ExtraAssignment,
         );
@@ -1504,7 +1768,7 @@ mod tests {
             BTreeMap::from([(id, expected)]),
             BTreeSet::new(),
         );
-        let submission = FragmentSubmission::try_new(
+        let submission = test_submission(
             program,
             instance_with(
                 FragmentContractVersion::CURRENT,
@@ -1557,7 +1821,7 @@ mod tests {
         );
         assert!(!program.exchange_inputs().contains_key(&plan_id));
         assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::ExchangeNode(10),
             FragmentBindingErrorKind::InvalidAssignment,
         );
@@ -1586,7 +1850,7 @@ mod tests {
             BTreeMap::new(),
         );
         let error = assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::WrongAssignmentKind,
         );
@@ -1606,7 +1870,7 @@ mod tests {
             BTreeSet::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, empty_instance(41)),
+            test_submission(program, empty_instance(41)),
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::MissingAssignment,
         );
@@ -1621,7 +1885,7 @@ mod tests {
             BTreeMap::new(),
             BTreeSet::new(),
         );
-        let submission = FragmentSubmission::try_new(
+        let submission = test_submission(
             program,
             instance_with(
                 FragmentContractVersion::CURRENT,
@@ -1670,7 +1934,7 @@ mod tests {
             BTreeMap::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::InvalidAssignment,
         );
@@ -1685,7 +1949,7 @@ mod tests {
             BTreeMap::new(),
             BTreeSet::new(),
         );
-        FragmentSubmission::try_new(
+        test_submission(
             program,
             instance_with(
                 FragmentContractVersion::CURRENT,
@@ -1727,7 +1991,7 @@ mod tests {
             BTreeMap::new(),
         );
         let error = assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::WrongAssignmentKind,
         );
@@ -1748,12 +2012,12 @@ mod tests {
         );
 
         assert_error(
-            FragmentSubmission::try_new(Arc::clone(&program), empty_instance(46)),
+            test_submission(Arc::clone(&program), empty_instance(46)),
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::MissingAssignment,
         );
         assert_error(
-            FragmentSubmission::try_new(
+            test_submission(
                 Arc::clone(&program),
                 instance_with(
                     FragmentContractVersion::CURRENT,
@@ -1773,7 +2037,7 @@ mod tests {
             FragmentBindingErrorKind::InvalidAssignment,
         );
         assert_error(
-            FragmentSubmission::try_new(
+            test_submission(
                 Arc::clone(&program),
                 instance_with(
                     FragmentContractVersion::CURRENT,
@@ -1792,7 +2056,7 @@ mod tests {
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::WrongAssignmentKind,
         );
-        FragmentSubmission::try_new(
+        test_submission(
             program,
             instance_with(
                 FragmentContractVersion::CURRENT,
@@ -1826,7 +2090,7 @@ mod tests {
             BTreeSet::new(),
         );
         assert_error(
-            FragmentSubmission::try_new(program, empty_instance(60)),
+            test_submission(program, empty_instance(60)),
             FragmentBindingTarget::ExchangeNode(20),
             FragmentBindingErrorKind::LayoutMismatch,
         );
@@ -1861,7 +2125,7 @@ mod tests {
             BTreeMap::from([(11, 0)]),
         );
         assert_error(
-            FragmentSubmission::try_new(program, instance),
+            test_submission(program, instance),
             FragmentBindingTarget::ScanNode(10),
             FragmentBindingErrorKind::MissingAssignment,
         );
@@ -1870,9 +2134,14 @@ mod tests {
     #[test]
     fn regular_unary_wrapper_is_traversed() {
         let id = FragmentNodeId::new(10);
+        let mut arena = ExprArena::default();
+        arena.push_typed(
+            ExprNode::Literal(LiteralValue::Bool(true)),
+            DataType::Boolean,
+        );
         let program = program_with(
             ExecPlan {
-                arena: ExprArena::default(),
+                arena,
                 root: ExecNode {
                     kind: ExecNodeKind::Filter(FilterNode {
                         input: Box::new(scan_node(Some(10))),
@@ -1896,7 +2165,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
         );
-        FragmentSubmission::try_new(program, instance).expect("filter child scan");
+        test_submission(program, instance).expect("filter child scan");
     }
 
     #[test]
@@ -1929,8 +2198,7 @@ mod tests {
             BTreeMap::new(),
         );
 
-        FragmentSubmission::try_new(program, instance)
-            .expect("native runtime filter consumer child scan");
+        test_submission(program, instance).expect("native runtime filter consumer child scan");
     }
 
     #[test]
@@ -1975,7 +2243,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
         );
-        FragmentSubmission::try_new(program, instance).expect("join right child scan");
+        test_submission(program, instance).expect("join right child scan");
     }
 
     #[test]
@@ -2008,7 +2276,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
         );
-        FragmentSubmission::try_new(program, instance).expect("set op child scan");
+        test_submission(program, instance).expect("set op child scan");
     }
 
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -2060,7 +2328,7 @@ mod tests {
         assert_runtime_state_absent(query, finst, exchange_key, rf_key);
         let before = Arc::strong_count(&program);
         assert_error(
-            FragmentSubmission::try_new(Arc::clone(&program), instance),
+            test_submission(Arc::clone(&program), instance),
             FragmentBindingTarget::ExchangeNode(exchange_id.get()),
             FragmentBindingErrorKind::MissingAssignment,
         );

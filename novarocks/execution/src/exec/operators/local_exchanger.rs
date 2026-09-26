@@ -76,6 +76,7 @@ fn should_notify_on_push() -> bool {
 
 struct LocalExchangerState {
     partitions: Vec<VecDeque<Chunk>>,
+    closed_partitions: Vec<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +218,7 @@ impl LocalExchanger {
         Arc::new(Self {
             inner: Arc::new(Mutex::new(LocalExchangerState {
                 partitions: (0..partition_count).map(|_| VecDeque::new()).collect(),
+                closed_partitions: vec![false; partition_count],
             })),
             exchange_id,
             partition_count,
@@ -248,8 +250,33 @@ impl LocalExchanger {
         self.finished_sources.load(Ordering::Acquire) >= self.partition_count
     }
 
-    pub(crate) fn finish_source(&self) {
+    pub(crate) fn finish_source(&self, partition: usize) {
+        let notify = self.sink_observable.defer_notify();
+        let mut guard = self.inner.lock().expect("local exchanger lock");
+        if guard.closed_partitions[partition] {
+            return;
+        }
+        guard.closed_partitions[partition] = true;
+        for chunk in guard.partitions[partition].drain(..) {
+            self.memory_manager.update_memory_usage(
+                -i64::try_from(chunk.estimated_bytes()).unwrap_or(i64::MAX),
+                -i64::try_from(chunk.len()).unwrap_or(i64::MAX),
+            );
+        }
         self.finished_sources.fetch_add(1, Ordering::AcqRel);
+        // Serialize queued and in-flight spill publication with partition closure.
+        let retired_files = if let Some(spill) = self.spill_state() {
+            let mut files = spill.spill_files.lock().expect("spill files lock");
+            files[partition].drain(..).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        drop(guard);
+        notify.arm();
+        drop(notify);
+        for entry in retired_files {
+            let _ = std::fs::remove_file(entry.file.path);
+        }
     }
 
     pub(crate) fn finish_producer(&self) -> bool {
@@ -697,11 +724,20 @@ impl LocalExchanger {
         }
 
         if !spilled_files.is_empty() {
-            let mut guard = spill_state.spill_files.lock().expect("spill files lock");
-            for (partition, entry) in spilled_files {
-                if let Some(queue) = guard.get_mut(partition) {
-                    queue.push_back(entry);
+            let mut retired_files = Vec::new();
+            {
+                let state = self.inner.lock().expect("local exchanger lock");
+                let mut guard = spill_state.spill_files.lock().expect("spill files lock");
+                for (partition, entry) in spilled_files {
+                    if state.closed_partitions[partition] {
+                        retired_files.push(entry);
+                    } else if let Some(queue) = guard.get_mut(partition) {
+                        queue.push_back(entry);
+                    }
                 }
+            }
+            for entry in retired_files {
+                let _ = std::fs::remove_file(entry.file.path);
             }
         }
 
@@ -728,6 +764,14 @@ impl LocalExchanger {
     }
 
     fn maybe_schedule_restore(self: &Arc<Self>, state: &RuntimeState, partition: usize) {
+        if self
+            .inner
+            .lock()
+            .expect("local exchanger lock")
+            .closed_partitions[partition]
+        {
+            return;
+        }
         let Some(spill) = self.spill_state() else {
             return;
         };
@@ -841,6 +885,12 @@ impl LocalExchanger {
         partition: usize,
         entry: SpillFileEntry,
     ) {
+        let state = self.inner.lock().expect("local exchanger lock");
+        if state.closed_partitions[partition] {
+            drop(state);
+            let _ = std::fs::remove_file(entry.file.path);
+            return;
+        }
         let mut guard = spill_state.spill_files.lock().expect("spill files lock");
         if let Some(queue) = guard.get_mut(partition) {
             queue.push_front(entry);
@@ -943,18 +993,21 @@ impl LocalExchanger {
         let notify = self.source_observable.defer_notify();
         let rows = chunk.len();
         let bytes = chunk.estimated_bytes();
-        if count_stats {
-            if let Some(counter) = self.pushed_rows.get(partition) {
-                counter.fetch_add(rows as u64, Ordering::Relaxed);
-            }
-            if let Some(counter) = self.pushed_chunks.get(partition) {
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
         let rows = i64::try_from(rows).unwrap_or(i64::MAX);
         let (notify_source, buffered_after) = {
             let mut guard = self.inner.lock().expect("local exchanger lock");
+            if guard.closed_partitions[partition] {
+                return;
+            }
+            if count_stats {
+                if let Some(counter) = self.pushed_rows.get(partition) {
+                    counter.fetch_add(rows as u64, Ordering::Relaxed);
+                }
+                if let Some(counter) = self.pushed_chunks.get(partition) {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let queue = guard
                 .partitions
                 .get_mut(partition)

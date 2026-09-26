@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use crate::native_fragment_query::NativeFragmentQueryRuntime;
@@ -64,6 +64,50 @@ mod tests {
             .into_iter()
             .filter(|child| child.label() == label)
             .collect()
+    }
+
+    #[test]
+    fn dropping_a_pre_ready_registration_republishes_removed_resources() {
+        let manager = QueryContextManager::new_for_test();
+        let last_publication = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&last_publication);
+        let runtime = NativeFragmentQueryRuntime::new_for_test(
+            manager.clone(),
+            crate::backend_test_support::test_memory_authority(),
+        )
+        .observe_resource_publication_for_test(Arc::new(move |snapshot| {
+            *observed.lock().expect("publication observer") = Some(snapshot);
+        }));
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(91_401, 91_402),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("valid execution id");
+        let fragment = UniqueId::new(91_403, 1);
+        let lease = runtime
+            .register_fragment_execution(
+                execution_id,
+                fragment,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+            .expect("register fragment");
+        assert_eq!(
+            manager
+                .native_execution_resource_snapshot()
+                .active_fragments,
+            1
+        );
+
+        drop(lease);
+        let snapshot = manager.native_execution_resource_snapshot();
+        assert_eq!(snapshot.active_contexts, 0);
+        assert_eq!(snapshot.active_fragments, 0);
+        assert_eq!(
+            *last_publication.lock().expect("publication observer"),
+            Some(snapshot),
+            "rollback must publish the removed owner state"
+        );
     }
 
     #[test]

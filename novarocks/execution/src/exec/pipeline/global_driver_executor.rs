@@ -33,7 +33,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,7 @@ use super::schedule::event_scheduler::EventDispatcher;
 use crate::exec::pipeline::schedule::observer::Observable;
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REJECTED_PENDING_DRIVERS: usize = 256;
 
 /// Completion result payload reported when a fragment finishes execution.
 pub struct FragmentCompletion {
@@ -335,16 +336,14 @@ impl DriverTask {
         None
     }
 
-    pub(crate) fn reject_due_to_executor_shutdown(mut self) {
+    pub(crate) fn reject_due_to_executor_shutdown(mut self) -> Option<Self> {
         self.fail("driver executor is shutting down".to_string());
         if self.driver.cancel_for_fragment_abort() == DriverState::PendingFinish {
-            // This driver was never admitted, so the stopped fact must remain
-            // unavailable while an asynchronous operator still owns cleanup.
-            // Dropping the rejected task releases its local handles without
-            // forging the completion counter.
-            return;
+            // Keep ownership until asynchronous operator cleanup actually exits.
+            return Some(self);
         }
         self.driver_finished();
+        None
     }
 
     pub(crate) fn fail(&self, err: String) {
@@ -434,6 +433,7 @@ struct ExecutorLifecycleOwner {
 /// Global executor that schedules and runs pipeline driver tasks across worker threads.
 pub struct GlobalDriverExecutor {
     shared: Arc<ExecutorShared>,
+    admission_gate: Mutex<()>,
     event_dispatcher: EventDispatcher,
     poller: BlockedDriverPoller,
     lifecycle: Arc<ExecutorLifecycleOwner>,
@@ -474,6 +474,7 @@ impl GlobalDriverExecutor {
 
         Self {
             shared,
+            admission_gate: Mutex::new(()),
             event_dispatcher,
             poller,
             lifecycle: Arc::new(ExecutorLifecycleOwner {
@@ -496,26 +497,31 @@ impl GlobalDriverExecutor {
             return true;
         }
 
-        // Scheduler attachment may start its notification thread, so keep it
-        // outside the global worker queue critical section. Observable
+        // Keep the admission verdict atomic with scheduler attachment and
+        // enqueue. A rejected task must not register any runtime activity.
+        let admission = self
+            .admission_gate
+            .lock()
+            .expect("global executor admission gate lock");
+        if self.shared.admission_closed.load(Ordering::Acquire) {
+            drop(admission);
+            abort_tasks(tasks);
+            return false;
+        }
+        // Attachment stays outside the worker queue lock. Observable
         // registration belongs to the worker's exact blocked transition.
         for task in &tasks {
             let scheduler = task.fragment_ctx().event_scheduler();
             scheduler.attach_executor(Arc::clone(&self.shared), &self.event_dispatcher);
             task.driver.print_pipeline_structure();
         }
-        let mut queue = self
-            .shared
+        self.shared
             .queue
             .lock()
-            .expect("global executor queue lock");
-        if self.shared.admission_closed.load(Ordering::Acquire) {
-            drop(queue);
-            abort_tasks(tasks);
-            return false;
-        }
-        queue.extend(tasks);
+            .expect("global executor queue lock")
+            .extend(tasks);
         self.shared.cv.notify_all();
+        drop(admission);
         true
     }
 
@@ -602,7 +608,13 @@ impl GlobalDriverExecutor {
     }
 
     fn begin_shutdown(&self) {
-        self.shared.admission_closed.store(true, Ordering::Release);
+        {
+            let _admission = self
+                .admission_gate
+                .lock()
+                .expect("global executor admission gate lock");
+            self.shared.admission_closed.store(true, Ordering::Release);
+        }
         let blocked = self.event_dispatcher.close_and_drain();
         if !blocked.is_empty() {
             for task in &blocked {
@@ -640,7 +652,93 @@ impl Drop for GlobalDriverExecutor {
 
 fn abort_tasks(tasks: Vec<DriverTask>) {
     for task in tasks {
-        task.reject_due_to_executor_shutdown();
+        if let Some(task) = task.reject_due_to_executor_shutdown() {
+            rejected_driver_reaper().enqueue(task);
+        }
+    }
+}
+
+struct RejectedDriverReaperState {
+    pending: VecDeque<DriverTask>,
+    retained: usize,
+}
+
+struct RejectedDriverReaper {
+    state: Mutex<RejectedDriverReaperState>,
+    wake: Condvar,
+    capacity: Condvar,
+    #[cfg(test)]
+    threads_started: AtomicUsize,
+}
+
+impl RejectedDriverReaper {
+    fn enqueue(&self, task: DriverTask) {
+        let mut state = self.state.lock().expect("rejected driver reaper lock");
+        while state.retained >= MAX_REJECTED_PENDING_DRIVERS {
+            state = self
+                .capacity
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        state.retained += 1;
+        state.pending.push_back(task);
+        self.wake.notify_one();
+    }
+}
+
+fn rejected_driver_reaper() -> &'static Arc<RejectedDriverReaper> {
+    static REAPER: OnceLock<Arc<RejectedDriverReaper>> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let reaper = Arc::new(RejectedDriverReaper {
+            state: Mutex::new(RejectedDriverReaperState {
+                pending: VecDeque::new(),
+                retained: 0,
+            }),
+            wake: Condvar::new(),
+            capacity: Condvar::new(),
+            #[cfg(test)]
+            threads_started: AtomicUsize::new(0),
+        });
+        let owner = Arc::clone(&reaper);
+        thread::Builder::new()
+            .name("rejected_driver_reaper".to_string())
+            .spawn(move || run_rejected_driver_reaper(owner))
+            .expect("spawn rejected driver reaper");
+        reaper
+    })
+}
+
+fn run_rejected_driver_reaper(reaper: Arc<RejectedDriverReaper>) {
+    #[cfg(test)]
+    reaper.threads_started.fetch_add(1, Ordering::AcqRel);
+    loop {
+        let mut pending = {
+            let mut state = reaper.state.lock().expect("rejected driver reaper lock");
+            while state.pending.is_empty() {
+                state = reaper
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+            std::mem::take(&mut state.pending)
+        };
+        let mut still_pending = VecDeque::new();
+        while let Some(task) = pending.pop_front() {
+            if task.pending_finish_complete() {
+                task.driver_finished();
+                let mut state = reaper.state.lock().expect("rejected driver reaper lock");
+                state.retained -= 1;
+                reaper.capacity.notify_one();
+            } else {
+                still_pending.push_back(task);
+            }
+        }
+        let mut state = reaper.state.lock().expect("rejected driver reaper lock");
+        state.pending.extend(still_pending);
+        if !state.pending.is_empty() {
+            drop(state);
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -687,7 +785,9 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
             } else {
                 "unknown panic payload".to_string()
             };
-            DriverState::Failed(format!("panic in driver execution: {msg}"))
+            let error = format!("panic in driver execution: {msg}");
+            task.fail(error.clone());
+            task.driver.fail_after_panic(error)
         });
 
         if shared.admission_closed.load(Ordering::Acquire) || task.completion.should_abort() {
@@ -841,6 +941,7 @@ mod tests {
         pending: Arc<AtomicBool>,
         observed: Arc<AtomicBool>,
         cancel_requested: Arc<AtomicBool>,
+        only_after_cancel: bool,
     }
 
     impl Operator for PendingAbortOperator {
@@ -853,6 +954,9 @@ mod tests {
         }
 
         fn pending_finish(&self) -> bool {
+            if self.only_after_cancel && !self.cancel_requested.load(Ordering::Acquire) {
+                return false;
+            }
             self.observed.store(true, Ordering::Release);
             self.pending.load(Ordering::Acquire)
         }
@@ -898,6 +1002,48 @@ mod tests {
 
         fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
             Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct PanickingSource;
+
+    impl Operator for PanickingSource {
+        fn name(&self) -> &str {
+            "panicking_source"
+        }
+
+        fn activate(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            panic!("injected driver panic")
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for PanickingSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            panic!("injected driver panic")
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            unreachable!("panicking source receives no input")
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            unreachable!("panicking source produces no output")
         }
 
         fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
@@ -1149,6 +1295,7 @@ mod tests {
                     pending: Arc::clone(&pending),
                     observed: Arc::clone(&observed),
                     cancel_requested: Arc::clone(&cancel_requested),
+                    only_after_cancel: false,
                 })],
                 None,
                 Vec::new(),
@@ -1239,6 +1386,7 @@ mod tests {
             None,
         ));
         let completion = FragmentCompletion::new(1);
+        let shared_owners_before_submit = Arc::strong_count(&executor.shared);
         let task = DriverTask::new(
             PipelineDriver::new(
                 1,
@@ -1249,11 +1397,16 @@ mod tests {
                 Some((31_001, 31_002)),
             ),
             Arc::clone(&completion),
-            fragment_ctx,
+            Arc::clone(&fragment_ctx),
             Duration::from_millis(1),
         );
 
         assert!(!executor.submit(vec![task]));
+        assert_eq!(
+            Arc::strong_count(&executor.shared),
+            shared_owners_before_submit,
+            "rejected submission must not attach its event scheduler"
+        );
 
         let stopped = completion
             .stopped_fact()
@@ -1265,7 +1418,68 @@ mod tests {
     }
 
     #[test]
-    fn rejected_pending_finish_does_not_forge_actual_stop() {
+    fn driver_panic_waits_for_operator_cleanup_before_actual_stop() {
+        let executor = GlobalDriverExecutor::new(1);
+        let pending = Arc::new(AtomicBool::new(true));
+        let observed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let runtime_state = Arc::new(RuntimeState::default());
+        let fragment_ctx = Arc::new(FragmentContext::new(
+            None,
+            Arc::clone(&runtime_state),
+            Some((33_001, 33_002)),
+            None,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(1);
+        let task = DriverTask::new(
+            PipelineDriver::new(
+                1,
+                vec![
+                    Box::new(PanickingSource),
+                    Box::new(PendingAbortOperator {
+                        pending: Arc::clone(&pending),
+                        observed: Arc::clone(&observed),
+                        cancel_requested: Arc::clone(&cancel_requested),
+                        only_after_cancel: true,
+                    }),
+                ],
+                None,
+                Vec::new(),
+                runtime_state,
+                Some((33_001, 33_002)),
+            ),
+            Arc::clone(&completion),
+            fragment_ctx,
+            Duration::from_secs(1),
+        );
+        assert!(executor.submit(vec![task]));
+
+        assert!(wait_until(Duration::from_secs(1), || {
+            cancel_requested.load(Ordering::Acquire)
+                && observed.load(Ordering::Acquire)
+                && completion.conclusion().is_some()
+        }));
+        assert_eq!(completion.stopped_fact(), None);
+        assert_eq!(completion.remaining_drivers(), 1);
+        pending.store(false, Ordering::Release);
+        assert!(wait_until(Duration::from_secs(1), || completion
+            .stopped_fact()
+            .is_some()));
+        assert_eq!(completion.remaining_drivers(), 0);
+        assert!(
+            completion
+                .stopped_fact()
+                .expect("driver stopped after cleanup")
+                .conclusion()
+                .expect_err("panic is a failure")
+                .contains("panic in driver execution: injected driver panic")
+        );
+    }
+
+    #[test]
+    fn rejected_pending_finish_waits_for_actual_stop() {
         let executor = GlobalDriverExecutor::new(1);
         executor.shutdown().expect("executor shutdown");
         let pending = Arc::new(AtomicBool::new(true));
@@ -1285,9 +1499,10 @@ mod tests {
             PipelineDriver::new(
                 1,
                 vec![Box::new(PendingAbortOperator {
-                    pending,
+                    pending: Arc::clone(&pending),
                     observed: Arc::clone(&observed),
                     cancel_requested: Arc::clone(&cancel_requested),
+                    only_after_cancel: false,
                 })],
                 None,
                 Vec::new(),
@@ -1309,5 +1524,98 @@ mod tests {
         );
         assert_eq!(completion.stopped_fact(), None);
         assert_eq!(completion.remaining_drivers(), 1);
+        pending.store(false, Ordering::Release);
+        assert!(wait_until(Duration::from_secs(1), || completion
+            .stopped_fact()
+            .is_some()));
+        assert_eq!(completion.remaining_drivers(), 0);
+        assert_eq!(
+            completion
+                .stopped_fact()
+                .expect("rejected driver stopped")
+                .conclusion(),
+            Err("driver executor is shutting down".to_string())
+        );
+    }
+
+    #[test]
+    fn concurrent_rejected_drivers_share_one_bounded_cleanup_owner() {
+        let executor = Arc::new(GlobalDriverExecutor::new(1));
+        executor.shutdown().expect("executor shutdown");
+        let pending = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let mut submitters = Vec::new();
+        for group in 0..8 {
+            let executor = Arc::clone(&executor);
+            let pending = Arc::clone(&pending);
+            let tx = tx.clone();
+            submitters.push(thread::spawn(move || {
+                for ordinal in 0..8 {
+                    let identity = group * 8 + ordinal;
+                    let runtime_state = Arc::new(RuntimeState::default());
+                    let fragment_ctx = Arc::new(FragmentContext::new(
+                        None,
+                        Arc::clone(&runtime_state),
+                        Some((34_001, identity)),
+                        None,
+                        None,
+                        None,
+                    ));
+                    let completion = FragmentCompletion::new(1);
+                    let observed = Arc::new(AtomicBool::new(false));
+                    let cancel_requested = Arc::new(AtomicBool::new(false));
+                    let task = DriverTask::new(
+                        PipelineDriver::new(
+                            1,
+                            vec![Box::new(PendingAbortOperator {
+                                pending: Arc::clone(&pending),
+                                observed: Arc::clone(&observed),
+                                cancel_requested: Arc::clone(&cancel_requested),
+                                only_after_cancel: false,
+                            })],
+                            None,
+                            Vec::new(),
+                            runtime_state,
+                            Some((34_001, identity)),
+                        ),
+                        Arc::clone(&completion),
+                        fragment_ctx,
+                        Duration::from_millis(1),
+                    );
+                    assert!(!executor.submit(vec![task]));
+                    tx.send((completion, observed, cancel_requested))
+                        .expect("test receives rejection");
+                }
+            }));
+        }
+        drop(tx);
+        for submitter in submitters {
+            submitter.join().expect("rejection submitter");
+        }
+        let completions = rx.into_iter().collect::<Vec<_>>();
+        assert_eq!(completions.len(), 64);
+        for (completion, observed, cancel_requested) in &completions {
+            assert!(cancel_requested.load(Ordering::Acquire));
+            assert!(observed.load(Ordering::Acquire));
+            assert_eq!(completion.stopped_fact(), None);
+        }
+        assert!(wait_until(Duration::from_secs(1), || {
+            rejected_driver_reaper()
+                .threads_started
+                .load(Ordering::Acquire)
+                == 1
+        }));
+
+        pending.store(false, Ordering::Release);
+        assert!(wait_until(Duration::from_secs(3), || completions
+            .iter()
+            .all(|(completion, _, _)| completion.stopped_fact().is_some())));
+        assert_eq!(
+            rejected_driver_reaper()
+                .threads_started
+                .load(Ordering::Acquire),
+            1,
+            "concurrent rejections must not create per-task cleanup threads"
+        );
     }
 }

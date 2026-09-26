@@ -707,12 +707,26 @@ fn create_runtime_filter_tables(
             tables.catalog, tables.database, tables.probe
         ))
         .context("analyze Runtime Filter probe table")?;
+    wait_for_statistics_job_success(
+        context,
+        control,
+        &tables.catalog,
+        &tables.database,
+        &tables.probe,
+    )?;
     control
         .query_drop(format!(
             "ANALYZE TABLE {}.{}.{}",
             tables.catalog, tables.database, tables.build
         ))
         .context("analyze Runtime Filter build table")?;
+    wait_for_statistics_job_success(
+        context,
+        control,
+        &tables.catalog,
+        &tables.database,
+        &tables.build,
+    )?;
     context.action("created and analyzed a local Iceberg Runtime Filter join fixture");
     Ok(tables)
 }

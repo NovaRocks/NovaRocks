@@ -516,6 +516,10 @@ run_cargo_gates() {
     python3 tools/ci/check-physical-plan-dependency-boundary.py --manifest-path Cargo.toml
   run_fail_fast_stage "physical plan dependency boundary mutations" "physical-plan-dependency-boundary-test.log" \
     tools/ci/tests/physical-plan-dependency-boundary-test.sh
+  run_fail_fast_stage "local program dependency boundary" "local-program-dependency-boundary.log" \
+    python3 tools/ci/check-local-program-dependency-boundary.py --manifest-path Cargo.toml
+  run_fail_fast_stage "local program dependency boundary mutations" "local-program-dependency-boundary-test.log" \
+    python3 tools/ci/tests/local-program-dependency-boundary-test.py
   run_fail_fast_stage "NCP-8 statistics boundary" "ncp8-statistics-boundary.log" \
     tools/ci/check-ncp8-statistics-boundary.py
   run_fail_fast_stage "NCP-8 statistics boundary mutations" "ncp8-statistics-boundary-test.log" \

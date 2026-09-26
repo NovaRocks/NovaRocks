@@ -817,6 +817,7 @@ impl FrontendDistributedQueryCoordinator {
             .collect::<BTreeMap<usize, BackendProcessId>>();
         let mut backends = Vec::with_capacity(backend_process_ids.len());
         let mut admission_epochs = BTreeMap::new();
+        let mut preparing_positions = BTreeMap::new();
         for target in &backend_services.live_backends {
             let Some(&process_id) = backend_process_ids.get(&target.backend_idx()) else {
                 // Live but not scheduled. Freezing it would let an operation
@@ -828,6 +829,7 @@ impl FrontendDistributedQueryCoordinator {
                 .map_err(|error| failed(error.to_string()))?;
             backends.push((process_id, endpoint));
             admission_epochs.insert(process_id, target.admission_epoch_capability());
+            preparing_positions.insert(process_id, target.descriptor().preparing_positions());
         }
         if backends.len() != backend_process_ids.len() {
             return Err(failed(
@@ -926,6 +928,7 @@ impl FrontendDistributedQueryCoordinator {
             prepared.fragment_edges(),
             &backend_process_ids,
             &admission_epochs,
+            &preparing_positions,
             &backends,
             submissions,
             establish,
@@ -950,6 +953,20 @@ impl FrontendDistributedQueryCoordinator {
             .map_err(failed)?,
         );
         let root_task = round.root_task();
+        let root_status_source = if intent == DistributedQueryIntent::Result {
+            Some(
+                round
+                    .take_root_status_source()
+                    .ok_or_else(|| failed("result attempt has no root status source"))?,
+            )
+        } else {
+            None
+        };
+        let mut root_seal_reply: Option<
+            tokio::sync::oneshot::Receiver<
+                Result<(), novarocks_query_application::api::QueryExecutionError>,
+            >,
+        > = None;
 
         // Split enumeration is another per-attempt owner on the same serial
         // turn. Its synchronous Connector calls run under process admission,
@@ -1089,7 +1106,14 @@ impl FrontendDistributedQueryCoordinator {
                 ));
             }
 
-            let mut moved = match advance_task_round(&mut round, &split_delivery) {
+            let advanced = advance_task_round(&mut round, &split_delivery);
+            if intent == DistributedQueryIntent::Result && round.accepted_root_success_sealed() {
+                if let Err(error) = &advanced {
+                    tracing::warn!(%error, "Task failure after the accepted root seal belongs to cleanup");
+                }
+                break Ok(());
+            }
+            let mut moved = match advanced {
                 Ok(report) => !report.is_idle(),
                 Err(error) => {
                     break Err(self.fail_task_round(
@@ -1102,6 +1126,29 @@ impl FrontendDistributedQueryCoordinator {
                     ));
                 }
             };
+            if let Some(reply) = root_seal_reply.as_mut() {
+                let refusal = match reply.try_recv() {
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        Some("root success-seal owner closed without a verdict".to_owned())
+                    }
+                    Ok(Ok(())) => Some(
+                        "root success-seal reply arrived without the owner's accepted seal"
+                            .to_owned(),
+                    ),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                };
+                if let Some(detail) = refusal {
+                    break Err(self.fail_task_round(
+                        query_id,
+                        &mut round,
+                        &split_delivery,
+                        classification,
+                        QueryFailureCause::FrontendExecution,
+                        detail,
+                    ));
+                }
+            }
             final_task_info.observe(&round);
             if !contexts_established && round.contexts_established() {
                 contexts_established = true;
@@ -1175,12 +1222,12 @@ impl FrontendDistributedQueryCoordinator {
             // races the last answer -- and losing that answer leaves the read
             // waiting for an end of stream nothing will send again.
             //
-            // Its creation being acknowledged is still what starts the first
-            // poll, because the result plane refuses a poll for a task it
-            // does not hold yet.
+            // The first poll waits for Installed. Accepted proves the Worker
+            // owns the create, but preparation may still be in progress and
+            // the result plane cannot serve the task yet.
             if observed_result_eof {
                 root_result_polls = None;
-            } else if root_result_polls.is_none() && task_is_created(&round, root_task) {
+            } else if root_result_polls.is_none() && round.result_pump_ready() {
                 match RootResultPolls::start(
                     Arc::clone(&result_transport) as Arc<dyn TaskResultTransport>,
                     root_task,
@@ -1347,8 +1394,26 @@ impl FrontendDistributedQueryCoordinator {
                         moved = true;
                     }
                     Ok(RootResultOutcome::EndOfStream { packet_sequence }) => {
-                        if let Err(error) = round.consume_root_result_packet(packet_sequence, true)
-                        {
+                        let required_terminals = if let Some(tracker) = write_completion.as_ref() {
+                            tracker.writers().copied().collect::<Vec<_>>()
+                        } else if intent == DistributedQueryIntent::Statistics {
+                            round
+                                .execution()
+                                .graph()
+                                .tasks()
+                                .map(|task| task.identity())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let consumed = round
+                            .consume_root_result_packet(packet_sequence, true)
+                            .and_then(|()| {
+                                round
+                                    .execution_mut()
+                                    .require_terminal_evidence(required_terminals)
+                            });
+                        if let Err(error) = consumed {
                             emit_distributed_write_phase_marker(
                                 intent,
                                 execution_id,
@@ -1482,7 +1547,7 @@ impl FrontendDistributedQueryCoordinator {
                 Instant::now(),
             );
 
-            if round.client_visible_completion() {
+            if round.client_visible_completion() && round.covered_observation_ready() {
                 match write_completion.as_mut() {
                     // A write's completion is not the read's. Every declared
                     // writer must reach a success-compatible terminal and the
@@ -1517,6 +1582,20 @@ impl FrontendDistributedQueryCoordinator {
                         // task set to reach terminals before classifying those
                         // terminals as success-compatible or failed.
                     }
+                    None if intent == DistributedQueryIntent::Result => {
+                        if root_seal_reply.is_none() {
+                            let source = root_status_source
+                                .as_ref()
+                                .expect("result attempt owns its root status source");
+                            match source.begin_success_seal_request() {
+                                Ok(reply) => {
+                                    root_seal_reply = Some(reply);
+                                    moved = true;
+                                }
+                                Err(error) => break Err(failed(error.to_string())),
+                            }
+                        }
+                    }
                     None => break Ok(()),
                 }
             }
@@ -1534,6 +1613,89 @@ impl FrontendDistributedQueryCoordinator {
         // attempt with no reader left starts nothing (CAD-1 D3).
         feedback_state.close();
         outcome?;
+
+        // A write cannot stop its Worker producers until the Root stream has
+        // yielded a complete, committable prepared set. Freeze that evidence
+        // locally before Quiesce; the external commit still runs after drain
+        // so the normal TaskRound can keep its leases live during closure.
+        let mut prepared_write_set = if intent == DistributedQueryIntent::Write {
+            let prepared = (|| {
+                let tracker = write_completion.as_mut().ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "distributed write execution has no write completion tracker",
+                    )
+                })?;
+                let decoder = write_decoder.take().ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "distributed write execution lost its Root decoder",
+                    )
+                })?;
+                let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
+                observe_write_statuses(&round, tracker);
+                let execution_verdict = tracker.execution_verdict(round.failure_cause().is_some());
+                emit_distributed_write_phase_marker(
+                    intent,
+                    execution_id,
+                    "write_decoder_finish_enter",
+                    execution_started,
+                    None,
+                );
+                let prepared = decoder.finish().map_err(|error| {
+                    emit_distributed_write_phase_marker(
+                        intent,
+                        execution_id,
+                        "root_failure",
+                        execution_started,
+                        Some((root_batch_count, root_row_count)),
+                    );
+                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+                })?;
+                emit_distributed_write_phase_marker(
+                    intent,
+                    execution_id,
+                    "write_decoder_finish_exit",
+                    execution_started,
+                    Some((root_batch_count, root_row_count)),
+                );
+                barrier.observe_prepared_write_set(prepared);
+                barrier.observe_task_execution(execution_verdict);
+                if cancellation.is_cancelled() {
+                    barrier.observe_cancelled();
+                }
+                if Instant::now() >= statement_deadline {
+                    barrier.observe_deadline_expired();
+                }
+                barrier.into_committable().map_err(|blocked| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        blocked.as_str(),
+                    )
+                })
+            })();
+            match prepared {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    split_delivery.abandon("distributed write prepared set was not committable");
+                    abort_task_round(
+                        &mut round,
+                        "distributed write prepared set was not committable",
+                    );
+                    return Err(self.fail_and_cancel(query_id, error.to_string()));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Profile keeps every task running until its terminal status can be
+        // observed and its final info read. Other intents can stop upstream
+        // work as soon as their result is complete.
+        let profile_waits_for_terminals = intent == DistributedQueryIntent::Profile;
+        if !profile_waits_for_terminals {
+            round.begin_normal_drain();
+        }
 
         // The client-visible completion is linearized. Draining closes this
         // attempt's internal resources and releases every query context; it
@@ -1556,6 +1718,7 @@ impl FrontendDistributedQueryCoordinator {
             self.transport_budget.frontend_queue_residence(),
             execution_id,
             &mut final_task_info,
+            profile_waits_for_terminals,
         );
         emit_distributed_write_phase_marker(
             intent,
@@ -1635,59 +1798,10 @@ impl FrontendDistributedQueryCoordinator {
                         "distributed write execution has no connector write session",
                     )
                 })?;
-                let tracker = write_completion.as_mut().ok_or_else(|| {
+                let prepared_set = prepared_write_set.take().ok_or_else(|| {
                     DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
-                        "distributed write execution has no write completion tracker",
-                    )
-                })?;
-                let decoder = write_decoder.take().ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "distributed write execution lost its Root decoder",
-                    )
-                })?;
-
-                let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
-                observe_write_statuses(&round, tracker);
-                let execution_verdict = tracker.execution_verdict(round.failure_cause().is_some());
-                emit_distributed_write_phase_marker(
-                    intent,
-                    execution_id,
-                    "write_decoder_finish_enter",
-                    execution_started,
-                    None,
-                );
-                let prepared_write_set = decoder.finish().map_err(|error| {
-                    emit_distributed_write_phase_marker(
-                        intent,
-                        execution_id,
-                        "root_failure",
-                        execution_started,
-                        Some((root_batch_count, root_row_count)),
-                    );
-                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-                })?;
-                emit_distributed_write_phase_marker(
-                    intent,
-                    execution_id,
-                    "write_decoder_finish_exit",
-                    execution_started,
-                    Some((root_batch_count, root_row_count)),
-                );
-                barrier.observe_prepared_write_set(prepared_write_set);
-                barrier.observe_task_execution(execution_verdict);
-                if cancellation.is_cancelled() {
-                    barrier.observe_cancelled();
-                }
-                if Instant::now() >= statement_deadline {
-                    barrier.observe_deadline_expired();
-                }
-
-                let prepared_set = barrier.into_committable().map_err(|blocked| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        blocked.as_str(),
+                        "distributed write lost its validated prepared set before commit",
                     )
                 })?;
                 completion.write_session_outcome(session, prepared_set)
@@ -2739,6 +2853,7 @@ mod tests {
             "test-deployment",
             native_build_identity(),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            4096,
         )
         .expect("test descriptor")
     }
@@ -3457,18 +3572,6 @@ fn judge_pre_ready_task_round_failure(
         .then_some(classified)
 }
 
-/// Whether this task's creation has been acknowledged.
-///
-/// The root result plane refuses a poll for a task whose creation transaction
-/// has not committed, so polling before this is true would turn a normal
-/// startup race into a query failure.
-fn task_is_created(round: &TaskRound, identity: TaskIdentity) -> bool {
-    round
-        .execution()
-        .task(identity.task_id())
-        .is_some_and(|task| matches!(task.state(), RemoteTaskState::Created))
-}
-
 /// The wait one root result poll asks for, bounded by the statement deadline.
 fn max_root_result_wait(now: Instant, deadline: Instant) -> MaxWait {
     let remaining = deadline.saturating_duration_since(now);
@@ -3509,9 +3612,8 @@ struct RootResultPolls {
 impl RootResultPolls {
     /// Starts polling `root_task`.
     ///
-    /// The caller has already observed that this task's creation was
-    /// acknowledged: the result plane refuses a poll for a task it does not
-    /// hold yet, and that refusal fails the attempt.
+    /// The caller has observed this task's Installed status, so the result
+    /// plane can route the poll to its live result buffer.
     fn start(
         transport: Arc<dyn TaskResultTransport>,
         root_task: TaskIdentity,
@@ -3738,6 +3840,7 @@ fn drain_task_round(
     drain_budget: Duration,
     execution_id: QueryExecutionId,
     final_task_info: &mut FinalTaskInfoCollector<'_>,
+    profile_waits_for_terminals: bool,
 ) {
     // The drain gets a budget of its own rather than the statement's. The
     // client-visible answer is already linearized, so every moment spent here
@@ -3751,7 +3854,17 @@ fn drain_task_round(
     // is not going to be answered. The statement deadline still caps it: a
     // statement already past its deadline has no time left to lend.
     let deadline = drain_deadline(statement_deadline, drain_budget, Instant::now());
+    let mut profile_waits_for_terminals = profile_waits_for_terminals;
     loop {
+        if profile_waits_for_terminals
+            && round.execution().attempt_drain_facts().all_tasks_terminal()
+        {
+            // Release can reclaim retained terminal records, so read every
+            // final info before Quiesce can make Release eligible.
+            final_task_info.observe(round);
+            round.begin_normal_drain();
+            profile_waits_for_terminals = false;
+        }
         let split_worker_stopped =
             split_assignment.is_none_or(SplitAssignmentRoundGuard::is_finished);
         if round.attempt_drained() && split_worker_stopped {

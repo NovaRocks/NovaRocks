@@ -757,6 +757,72 @@ pub fn task_update_terminal_ack_dropped(
     ))
 }
 
+/// Holds only a runner-armed exact Create before the Worker accepts it.
+/// Establishment and status subscription remain ordinary independent paths.
+pub fn create_task_before_worker_hold(
+    identity: TaskIdentity,
+    outbound_edges: usize,
+) -> Result<(), tonic::Status> {
+    #[cfg(debug_assertions)]
+    {
+        let execution = identity.query_execution_id();
+        let Some(scope) = match_persistent(
+            QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold,
+            execution,
+            identity.backend_process_id(),
+        )?
+        else {
+            return Ok(());
+        };
+        let payload = format!(
+            "token={} execution_id={}:{}:{} stage={} task={} backend_index={} process_id={} outbound_edges={}\n",
+            scope.token,
+            execution.query_id().high(),
+            execution.query_id().low(),
+            execution.attempt_id().get(),
+            identity.stage_id().get(),
+            identity.task_id().get(),
+            scope.backend_index,
+            identity.backend_process_id(),
+            outbound_edges,
+        );
+        eprintln!(
+            "NOVAROCKS_TASK_CREATE_BEFORE_WORKER_HELD {}",
+            payload.trim_end()
+        );
+        let path = novarocks_failpoint::create_before_worker_rendezvous_socket_path(&scope.token)
+            .map_err(tonic::Status::failed_precondition)?;
+        let mut stream = UnixStream::connect(&path).map_err(|error| {
+            tonic::Status::failed_precondition(format!(
+                "connect pre-Worker Create rendezvous: {error}"
+            ))
+        })?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .map_err(|error| {
+                tonic::Status::internal(format!("set pre-Worker Create hold deadline: {error}"))
+            })?;
+        stream.write_all(payload.as_bytes()).map_err(|error| {
+            tonic::Status::internal(format!("write pre-Worker Create identity: {error}"))
+        })?;
+        stream.shutdown(Shutdown::Write).map_err(|error| {
+            tonic::Status::internal(format!("close pre-Worker Create identity write: {error}"))
+        })?;
+        let mut release = [0_u8; 1];
+        match stream.read(&mut release) {
+            Ok(1) if release == [b'R'] => Ok(()),
+            _ => Err(tonic::Status::deadline_exceeded(
+                "runner pre-Worker Create hold ended without release",
+            )),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (identity, outbound_edges);
+        Ok(())
+    }
+}
+
 pub fn create_task_ack_dropped(
     identity: TaskIdentity,
     outcome: OperationOutcome,
@@ -991,7 +1057,20 @@ fn wire_status_identity(
     match encoded.event.as_mut()? {
         proto::task_status_stream_event::Event::TaskStatus(status) => status.identity.as_mut(),
         proto::task_status_stream_event::Event::TaskGone(gone) => gone.identity.as_mut(),
-        proto::task_status_stream_event::Event::ContextConvergence(_) => None,
+        proto::task_status_stream_event::Event::TaskConvergence(receipt) => {
+            receipt.identity.as_mut()
+        }
+        proto::task_status_stream_event::Event::TaskStatusUnchanged(answer) => {
+            answer.identity.as_mut()
+        }
+        proto::task_status_stream_event::Event::TaskConvergenceUnchanged(answer) => {
+            answer.identity.as_mut()
+        }
+        proto::task_status_stream_event::Event::TaskUnknown(answer) => answer.identity.as_mut(),
+        proto::task_status_stream_event::Event::ContextConvergence(_)
+        | proto::task_status_stream_event::Event::Quiesce(_)
+        | proto::task_status_stream_event::Event::CatchUpComplete(_)
+        | proto::task_status_stream_event::Event::Bookmark(_) => None,
     }
 }
 
@@ -1329,4 +1408,55 @@ mod tests {
         restart_after_establish_rendezvous_disarm(held);
         assert!(!restart_after_establish_rendezvous_is_held(held));
     }
+}
+
+/// Parks one exact accepted preparation at its Native host boundary. The
+/// Worker already owns the queued/running position and backing charge; no
+/// registry lock or RPC ingress permit is held by this rendezvous.
+#[cfg(debug_assertions)]
+pub fn hold_native_task_preparation(identity: TaskIdentity) -> Result<(), String> {
+    let Ok(token) = std::env::var("NOVAROCKS_SQL_TEST_TASK_PREPARATION_HOLD_TOKEN") else {
+        return Ok(());
+    };
+    let path = novarocks_failpoint::native_registry_hold_socket_path(&token)?;
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|error| format!("preparation hold runner is unavailable: {error}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|error| format!("set preparation hold write timeout: {error}"))?;
+    let execution = identity.query_execution_id();
+    let marker = format!(
+        "NTP1 {} {} {} {} {} {} {token}\n",
+        identity.backend_process_id(),
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        identity.stage_id().get(),
+        identity.task_id().get()
+    );
+    stream
+        .write_all(marker.as_bytes())
+        .map_err(|error| format!("write preparation hold marker: {error}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|error| format!("finish preparation hold marker: {error}"))?;
+    stream
+        .set_read_timeout(Some(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ))
+        .map_err(|error| format!("set preparation hold read timeout: {error}"))?;
+    let mut release = [0_u8; 1];
+    stream
+        .read_exact(&mut release)
+        .map_err(|error| format!("preparation hold runner disconnected or timed out: {error}"))?;
+    if release != *b"R" {
+        return Err("preparation hold runner sent an invalid release byte".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+pub fn hold_native_task_preparation(_identity: TaskIdentity) -> Result<(), String> {
+    Ok(())
 }

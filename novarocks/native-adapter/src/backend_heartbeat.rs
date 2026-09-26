@@ -129,6 +129,7 @@ mod tests {
             "warehouse-a",
             "build-identity",
             NativeCompatibilityId::new([7; 32]),
+            4096,
         )
         .expect("descriptor");
         let epoch = AdmissionEpochCapability::try_from_bytes([9; 16]).expect("epoch");

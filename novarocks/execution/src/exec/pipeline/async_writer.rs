@@ -311,6 +311,9 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         executor: IoExecutor,
         runtime_error: Arc<RuntimeErrorState>,
     ) -> Result<(), String> {
+        if self.join.is_some() {
+            return Ok(());
+        }
         let start = self
             .start
             .take()
@@ -538,6 +541,12 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         }
         self.shared.abort_requests.fetch_add(1, Ordering::Relaxed);
         self.sender = None;
+        if self.start.take().is_some() {
+            // No actor was admitted. Dropping the unopened provider request is
+            // already a complete abort and must not strand PendingFinish.
+            self.shared.set_done();
+            return;
+        }
         self.shared.abort_notify.notify_one();
         self.shared.wake();
     }
@@ -548,6 +557,22 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
 
     pub(crate) fn is_done(&self) -> bool {
         self.shared.done.load(Ordering::Acquire)
+    }
+
+    /// A terminal result can be published before the sink-I/O task returns.
+    /// Keep the task owned by the driver until its wrapper has actually exited.
+    pub(crate) fn actor_exited(&self) -> bool {
+        self.join.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_terminal_actor_for_test(&mut self, handle: JoinHandle<()>) {
+        assert!(
+            self.join.is_none(),
+            "test actor must be installed only once"
+        );
+        self.join = Some(handle);
+        self.shared.set_done();
     }
 
     pub(crate) fn has_output(&self) -> bool {
@@ -1193,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_terminal_latch_does_not_wait_for_executor_wrapper_completion() {
+    fn semantic_terminal_latch_does_not_prove_executor_wrapper_exit() {
         let calls = Arc::new(Calls::default());
         let execution = Arc::new(ControlledExecution {
             catalog_handle: catalog_handle(),
@@ -1221,7 +1246,11 @@ mod tests {
         );
         assert!(
             owner.is_done(),
-            "semantic writer completion must not depend on an unobservable JoinHandle transition"
+            "semantic writer completion remains observable before wrapper exit"
+        );
+        assert!(
+            !owner.actor_exited(),
+            "the writer task still owns its wrapper"
         );
         owner.join.take().expect("test join handle").abort();
     }

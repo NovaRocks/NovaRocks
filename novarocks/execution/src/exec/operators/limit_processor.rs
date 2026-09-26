@@ -70,12 +70,16 @@ impl OperatorFactory for LimitProcessorFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+        // A zero row budget is complete before any upstream input exists,
+        // including when OFFSET is nonzero. The driver observes this terminal
+        // state and stands down the input without waiting for its first chunk.
+        let finished = self.state.lock().expect("limit state lock").remaining_limit == Some(0);
         Box::new(LimitProcessorOperator {
             name: self.name.clone(),
             state: Arc::clone(&self.state),
             pending_output: None,
             finishing: false,
-            finished: false,
+            finished,
         })
     }
 }
@@ -230,6 +234,31 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("int32 column");
         (0..arr.len()).map(|i| arr.value(i)).collect()
+    }
+
+    #[test]
+    fn zero_limit_is_finished_without_upstream_input_even_with_offset() {
+        for offset in [0, 7, usize::MAX] {
+            let mut op = LimitProcessorFactory::new(1, Some(0), offset).create(1, 0);
+            assert!(
+                op.is_finished(),
+                "zero limit must not wait for offset {offset}"
+            );
+            let processor = op.as_processor_mut().expect("processor op");
+            assert!(!processor.need_input());
+            assert!(!processor.has_output());
+            assert!(
+                processor
+                    .pull_chunk(&RuntimeState::default())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for limit in [None, Some(1), Some(4)] {
+            let op = LimitProcessorFactory::new(1, limit, 7).create(1, 0);
+            assert!(!op.is_finished());
+            assert!(op.as_processor_ref().unwrap().need_input());
+        }
     }
 
     #[test]

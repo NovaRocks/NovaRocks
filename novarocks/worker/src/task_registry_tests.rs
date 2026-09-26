@@ -28,8 +28,8 @@ use novarocks_execution_contract::task_execution::creation::{
     CreationContent, FrozenBytes, PreparedTaskFacts, TaskCreationInput,
 };
 use novarocks_execution_contract::task_execution::descriptor::{
-    DataStreamPartitionType, ExchangeDestination, ExchangeEdge, ExchangeTopology, FragmentNodeId,
-    FragmentSinkKind, RuntimeEndpoint, TaskDescriptor,
+    DataStreamPartitionType, ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource,
+    ExchangeTopology, FragmentNodeId, FragmentSinkKind, RuntimeEndpoint, TaskDescriptor,
 };
 use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
@@ -40,12 +40,13 @@ use novarocks_execution_contract::task_execution::identity::{
 };
 use novarocks_execution_contract::task_execution::lease::{LeaseSequence, LeaseValidFor};
 use novarocks_execution_contract::task_execution::operation::{
-    AcquireQueryContextAdmissionTicket, CancelTask, CreateTask, CredentialUpdate,
-    EstablishQueryContext, OperationOutcome, RenewQueryExecutionLease, SplitAssignmentIntent,
-    TaskDomainUpdate, UpdateQueryContext, UpdateTask,
+    AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTask,
+    CredentialUpdate, EstablishQueryContext, OperationOutcome, QuiesceQueryContext,
+    ReleaseQueryContext, RenewQueryExecutionLease, SplitAssignmentIntent, TaskDomainUpdate,
+    UpdateQueryContext, UpdateTask,
 };
 use novarocks_execution_contract::task_execution::status::{
-    AbortCause, CancelReason, TaskFailureCategory,
+    AbortCause, CancelReason, TaskFailureCategory, TaskFailurePhase, TaskState, TerminationDetail,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{
@@ -56,8 +57,9 @@ use novarocks_types::{NativeCompatibilityId, UniqueId};
 use crate::{
     HostRejection, ManualClock, QueryContextHost, ReleasedContextEvidence, RootResultRoute,
     RunnableTask, SharedFactsRequest, TaskCreationGate, TaskExecutionHost, TaskExecutionMetrics,
-    TaskExecutionPorts, TaskExecutionRegistry, TaskExecutionRegistryConfig, TaskProtocolEvent,
-    TaskProtocolObserver, TaskResultLifecycle, TaskStatusReporter, WorkerMonotonicClock,
+    TaskExecutionPorts, TaskExecutionRegistry, TaskExecutionRegistryConfig,
+    TaskInboundCapabilities, TaskProtocolEvent, TaskProtocolObserver, TaskResultLifecycle,
+    TaskStatusReporter, WorkerMonotonicClock,
 };
 
 /// The static half of a creation this test host prepares a result sink from.
@@ -75,6 +77,9 @@ const REFUSED_PLAN: &[u8] = b"refused-plan";
 struct TestAssignment;
 
 impl CreationContent for TestAssignment {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
     fn encoded_len(&self) -> usize {
         8
     }
@@ -137,6 +142,29 @@ impl QueryContextHost for TestContextHost {
     }
 }
 
+struct BlockingContextHost {
+    gate: Arc<InstallGate>,
+}
+
+impl QueryContextHost for BlockingContextHost {
+    fn materialize(&self, _request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+        self.gate.wait_for_release();
+        Ok(())
+    }
+
+    fn release(&self, _context: QueryContextRef) -> ReleasedContextEvidence {
+        ReleasedContextEvidence::none()
+    }
+
+    fn advance_shared_domain(
+        &self,
+        _context: QueryContextRef,
+        _domain: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
+    ) -> Result<(), HostRejection> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct TestRunnable {
     cancel_calls: Arc<AtomicUsize>,
@@ -160,6 +188,8 @@ impl RunnableTask for TestRunnable {
 /// replay, and always with the winner's own body.
 #[derive(Default)]
 struct TestTaskHost {
+    retain_normal_close: bool,
+    inbound_capabilities: Option<Arc<TaskInboundCapabilities>>,
     install_gate: Option<Arc<InstallGate>>,
     prepared_bodies: Mutex<Vec<Bytes>>,
     receivers_installed: AtomicUsize,
@@ -182,7 +212,15 @@ impl TestTaskHost {
 impl TaskExecutionHost for TestTaskHost {
     fn close_context_admission(&self, _context: QueryContextRef) {}
 
-    fn forget_context_admission(&self, _context: QueryContextRef) {}
+    fn forget_context_admission(&self, context: QueryContextRef) {
+        if let Some(capabilities) = &self.inbound_capabilities {
+            capabilities.forget_context(context);
+        }
+    }
+
+    fn retains_normal_close(&self, _context: QueryContextRef) -> bool {
+        self.retain_normal_close
+    }
 
     fn install_receiver(
         &self,
@@ -219,15 +257,29 @@ impl TaskExecutionHost for TestTaskHost {
         self.receivers_removed.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn install_inbound_capability(
-        &self,
-        _descriptor: &TaskDescriptor,
-    ) -> Result<(), HostRejection> {
+    fn install_inbound_capability(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+        if let Some(capabilities) = &self.inbound_capabilities {
+            capabilities.install(Arc::new(descriptor.clone()))?;
+        }
         self.capabilities_installed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    fn remove_inbound_capability(&self, _descriptor: &TaskDescriptor) {}
+    fn reserve_inbound_close_capacity(
+        &self,
+        descriptor: &TaskDescriptor,
+    ) -> Result<(), HostRejection> {
+        if let Some(capabilities) = &self.inbound_capabilities {
+            capabilities.reserve_normal_close(descriptor)?;
+        }
+        Ok(())
+    }
+
+    fn remove_inbound_capability(&self, descriptor: &TaskDescriptor) {
+        if let Some(capabilities) = &self.inbound_capabilities {
+            capabilities.remove(descriptor);
+        }
+    }
 
     fn submit_runnable(
         &self,
@@ -462,6 +514,7 @@ struct Fixture {
     task_host: Arc<TestTaskHost>,
     backend: BackendProcessId,
     frontend: FrontendProcessId,
+    clock: Arc<ManualClock>,
 }
 
 impl Fixture {
@@ -477,9 +530,10 @@ impl Fixture {
         let mut config = TaskExecutionRegistryConfig::for_process(backend, 17, 9);
         adjust(&mut config);
         let task_host = Arc::new(task_host);
+        let clock = Arc::new(ManualClock::new());
         let registry = TaskExecutionRegistry::new(
             config,
-            Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
+            Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::new(TestContextHost),
             Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
             test_ports(),
@@ -489,6 +543,7 @@ impl Fixture {
             task_host,
             backend,
             frontend: FrontendProcessId::new_v7(),
+            clock,
         }
     }
 
@@ -742,6 +797,118 @@ fn lost_create_acknowledgement_replays_without_resubmitting_the_runnable() {
         1
     );
     assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cumulative_context_capacity_rejects_a_new_identity_without_reinterpreting_a_replay() {
+    let fixture = Fixture::with_config(TestTaskHost::default(), |config| {
+        config.max_tasks_per_context = 1;
+    });
+    let execution = execution(52);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let first = task(execution, fixture.backend);
+    let first_request = fixture.create(descriptor(first), Vec::new());
+    let accepted = fixture
+        .registry
+        .create_task(&first_request, body(RESULT_PLAN));
+    assert_eq!(
+        accepted.outcome(),
+        OperationOutcome::Accepted,
+        "{accepted:?}"
+    );
+
+    let second = TaskIdentity::new(
+        execution,
+        StageId::new(1).expect("nonzero stage"),
+        TaskId::new(2).expect("nonzero task"),
+        fixture.backend,
+    );
+    let rejected = fixture.registry.create_task(
+        &fixture.create(descriptor(second), Vec::new()),
+        body(STREAM_PLAN),
+    );
+    assert_eq!(
+        rejected.outcome(),
+        OperationOutcome::ResourceExhausted,
+        "{rejected:?}"
+    );
+    assert!(rejected.acknowledgement().is_none());
+    assert_eq!(
+        fixture
+            .registry
+            .create_task(&first_request, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::Idempotent,
+        "the occupied capacity must not change an existing identity's answer"
+    );
+    assert_eq!(
+        fixture.task_host.prepared_bodies(),
+        vec![Bytes::from_static(RESULT_PLAN)],
+        "the rejected body and replay body must not reach the host"
+    );
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Active
+    );
+}
+
+#[test]
+fn backend_active_capacity_rejects_another_context_before_host_preparation() {
+    let fixture = Fixture::with_config(TestTaskHost::default(), |config| {
+        config.max_active_tasks_per_backend = 1;
+    });
+    let first_execution = execution(53);
+    let second_execution = execution(54);
+    let first_context = fixture.context(first_execution);
+    let second_context = fixture.context(second_execution);
+    establish(&fixture.registry, first_context);
+    establish(&fixture.registry, second_context);
+
+    let first = task(first_execution, fixture.backend);
+    let accepted = fixture.registry.create_task(
+        &fixture.create(descriptor(first), Vec::new()),
+        body(RESULT_PLAN),
+    );
+    assert_eq!(
+        accepted.outcome(),
+        OperationOutcome::Accepted,
+        "{accepted:?}"
+    );
+
+    let abort = fixture
+        .registry
+        .abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            first_context,
+            AbortCause::QueryFailed,
+        ));
+    assert_eq!(abort.outcome(), OperationOutcome::Accepted, "{abort:?}");
+    assert!(
+        fixture.registry.has_live_task(first),
+        "aborting an old attempt cannot release its task slot before physical convergence"
+    );
+
+    let second = task(second_execution, fixture.backend);
+    let rejected = fixture.registry.create_task(
+        &fixture.create(descriptor(second), Vec::new()),
+        body(STREAM_PLAN),
+    );
+    assert_eq!(
+        rejected.outcome(),
+        OperationOutcome::ResourceExhausted,
+        "{rejected:?}"
+    );
+    assert!(rejected.acknowledgement().is_none());
+    assert_eq!(
+        fixture.registry.context_state(second_context),
+        QueryContextState::Active
+    );
+    assert_eq!(
+        fixture.task_host.prepared_bodies(),
+        vec![Bytes::from_static(RESULT_PLAN)],
+        "a hard capacity rejection cannot own a runnable or interpret its body"
+    );
 }
 
 #[test]
@@ -1355,4 +1522,1368 @@ fn a_replay_after_domains_advanced_redelivers_nothing_and_renews_nothing() {
     );
     assert_eq!(next.outcome(), OperationOutcome::Accepted, "{next:?}");
     assert_eq!(fixture.task_host.prepared_bodies().len(), 1);
+}
+
+#[test]
+fn accepted_create_replays_before_preparation_and_cancel_stops_before_submit() {
+    let gate = Arc::new(InstallGate::held());
+    let fixture = Fixture::new(TestTaskHost {
+        install_gate: Some(Arc::clone(&gate)),
+        ..TestTaskHost::default()
+    });
+    let execution = execution(991);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let request = fixture.create(descriptor(identity), Vec::new());
+
+    let accepted = fixture
+        .registry
+        .accept_create_task(&request, body(RESULT_PLAN));
+    assert_eq!(
+        accepted.outcome(),
+        OperationOutcome::Accepted,
+        "{accepted:?}"
+    );
+    assert_eq!(
+        accepted.acknowledgement().expect("accepted status").state(),
+        TaskState::Planned
+    );
+    gate.wait_until_entered();
+    let replay = fixture
+        .registry
+        .accept_create_task(&request, body(STREAM_PLAN));
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
+    assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
+
+    let stopped = fixture.registry.cancel_task(&CancelTask::new(
+        TaskOperationId::new_v7(),
+        identity,
+        CancelReason::UpstreamNoLongerNeeded,
+    ));
+    assert_eq!(stopped.outcome(), OperationOutcome::Accepted, "{stopped:?}");
+    gate.release();
+    wait_for_accepted_state(&fixture.registry, &request, TaskState::Canceled);
+    assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.task_host.prepared_bodies(),
+        vec![Bytes::from_static(RESULT_PLAN)]
+    );
+}
+
+#[test]
+fn quiesce_fences_absent_context_before_establish() {
+    let fixture = Fixture::new(TestTaskHost::default());
+    let context = fixture.context(execution(1101));
+    let source = fixture.registry.status_source(context);
+    let quiesce = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
+    let first = fixture.registry.quiesce_query_context(&quiesce);
+    assert_eq!(first.outcome(), OperationOutcome::Accepted);
+    let cut = first.acknowledgement().expect("quiesce cut");
+    assert_eq!(cut.state(), QueryContextState::Quiescing);
+    assert!(cut.accepted_tasks().is_empty());
+    assert_eq!(cut.fence_version(), 1);
+    let source = fixture
+        .registry
+        .status_source(context)
+        .or(source)
+        .expect("quiesce source");
+    let subscription = source
+        .begin_covered_subscription(context, 1, &[], &[], None, &[], 1)
+        .unwrap();
+    let selected = subscription.select_next(4096, |_| 1).unwrap().unwrap();
+    assert!(
+        matches!(&selected.frame, crate::observation::CoveredObservationFrame::CatchUp(crate::observation::CoveredObservationFact::Quiesce(receipt)) if receipt == cut)
+    );
+    subscription.note_delivered(selected.delivery_id).unwrap();
+    let replay = fixture.registry.quiesce_query_context(&quiesce);
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
+    assert_eq!(replay.acknowledgement(), Some(cut));
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Quiescing
+    );
+}
+
+#[test]
+fn first_quiesce_is_published_to_an_existing_covered_subscription() {
+    let fixture = Fixture::new(TestTaskHost::default());
+    let context = fixture.context(execution(1110));
+    establish(&fixture.registry, context);
+    let source = fixture
+        .registry
+        .status_source(context)
+        .expect("established source");
+    let subscription = source
+        .begin_covered_subscription(context, 1, &[], &[], None, &[], 1)
+        .unwrap();
+    let initial = subscription.select_next(4096, |_| 1).unwrap().unwrap();
+    assert!(matches!(
+        initial.frame,
+        crate::observation::CoveredObservationFrame::CatchUpComplete { .. }
+    ));
+    subscription.note_delivered(initial.delivery_id).unwrap();
+    let request = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
+    let receipt = fixture.registry.quiesce_query_context(&request);
+    assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+    let selected = subscription.select_next(4096, |_| 1).unwrap().unwrap();
+    assert!(
+        matches!(&selected.frame, crate::observation::CoveredObservationFrame::Live { fact: crate::observation::CoveredObservationFact::Quiesce(cut), .. } if Some(cut) == receipt.acknowledgement())
+    );
+    subscription.note_delivered(selected.delivery_id).unwrap();
+    assert_eq!(
+        fixture.registry.quiesce_query_context(&request).outcome(),
+        OperationOutcome::Idempotent
+    );
+    assert!(
+        subscription.select_next(4096, |_| 1).unwrap().is_none(),
+        "replay must not publish another control fact"
+    );
+}
+
+#[test]
+fn normal_close_record_survives_retained_context_capacity_pressure_until_horizon() {
+    let fixture = Fixture::with_config(
+        TestTaskHost {
+            retain_normal_close: true,
+            ..TestTaskHost::default()
+        },
+        |config| config.retained_context_capacity = 1,
+    );
+    let first = fixture.context(execution(1120));
+    let second = fixture.context(execution(1121));
+    for context in [first, second] {
+        establish(&fixture.registry, context);
+        let quiesce = fixture
+            .registry
+            .quiesce_query_context(&QuiesceQueryContext::new(
+                TaskOperationId::new_v7(),
+                context,
+            ));
+        assert_eq!(quiesce.outcome(), OperationOutcome::Accepted);
+        let release = fixture
+            .registry
+            .release_query_context(&ReleaseQueryContext::new(
+                TaskOperationId::new_v7(),
+                context,
+            ));
+        assert_eq!(release.outcome(), OperationOutcome::Accepted);
+    }
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(first),
+        QueryContextState::TerminalRetained
+    );
+    assert_eq!(
+        fixture.registry.context_state(second),
+        QueryContextState::TerminalRetained
+    );
+    fixture
+        .clock
+        .advance(crate::RequestHorizon::DEFAULT.total());
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(first),
+        QueryContextState::Gone
+    );
+    assert_eq!(
+        fixture.registry.context_state(second),
+        QueryContextState::Gone
+    );
+}
+
+#[test]
+fn quiesce_wins_over_inflight_establish_without_failure_latch() {
+    let backend = BackendProcessId::new_v7();
+    let context = QueryContextRef::new(execution(1104), FrontendProcessId::new_v7(), backend);
+    let gate = Arc::new(InstallGate::held());
+    let registry = TaskExecutionRegistry::new(
+        TaskExecutionRegistryConfig::for_process(backend, 17, 9),
+        Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
+        Arc::new(BlockingContextHost {
+            gate: Arc::clone(&gate),
+        }),
+        Arc::new(TestTaskHost::default()),
+        test_ports(),
+    );
+    let ticket = registry
+        .acquire_query_context_admission_ticket(AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context,
+            LeaseValidFor::new(Duration::from_secs(10)).expect("ticket lease"),
+            NativeCompatibilityId::new([0x71; 32]),
+            registry.admission_epoch_capability(),
+        ))
+        .acknowledgement()
+        .expect("ticket")
+        .ticket_id();
+    let request = UpdateQueryContext::Establish(EstablishQueryContext::new(
+        TaskOperationId::new_v7(),
+        context,
+        ticket,
+        Arc::new(TestContent(1)),
+        Arc::new(TestContent(2)),
+        Arc::new(TestContent(3)),
+        CredentialUpdate::new(
+            CredentialLeaseId::new(1),
+            CredentialEpoch::FIRST,
+            Arc::new(TestSecret),
+        ),
+        LeaseValidFor::new(Duration::from_secs(10)).expect("context lease"),
+    ));
+    let running = Arc::clone(&registry);
+    let handle = std::thread::spawn(move || running.update_query_context(&request));
+    gate.wait_until_entered();
+    let cut = registry.quiesce_query_context(&QuiesceQueryContext::new(
+        TaskOperationId::new_v7(),
+        context,
+    ));
+    assert_eq!(cut.outcome(), OperationOutcome::Accepted);
+    assert!(
+        cut.acknowledgement()
+            .expect("cut")
+            .accepted_tasks()
+            .is_empty()
+    );
+    gate.release();
+    let establish = handle.join().expect("establish thread");
+    assert_eq!(
+        establish.outcome(),
+        OperationOutcome::ContextTerminalReceipt
+    );
+    assert_eq!(
+        registry.context_state(context),
+        QueryContextState::Quiescing
+    );
+    assert_eq!(registry.termination_cause(context), None);
+}
+
+#[test]
+fn quiesce_membership_includes_accepted_preparation_and_stops_it() {
+    let gate = Arc::new(InstallGate::held());
+    let fixture = Fixture::new(TestTaskHost {
+        install_gate: Some(Arc::clone(&gate)),
+        ..TestTaskHost::default()
+    });
+    let execution = execution(1102);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let create = fixture.create(descriptor(identity), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&create, body(RESULT_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    gate.wait_until_entered();
+    let request = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
+    let first = fixture.registry.quiesce_query_context(&request);
+    assert_eq!(first.outcome(), OperationOutcome::Accepted);
+    assert_eq!(
+        first.acknowledgement().expect("cut").accepted_tasks(),
+        &[identity]
+    );
+    assert_eq!(fixture.registry.termination_cause(context), None);
+    gate.release();
+    wait_for_accepted_state(&fixture.registry, &create, TaskState::Canceled);
+    assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
+    let replay = fixture.registry.quiesce_query_context(&request);
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
+    assert_eq!(
+        replay.acknowledgement().expect("replay").accepted_tasks(),
+        &[identity]
+    );
+    let abort = fixture
+        .registry
+        .abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            AbortCause::QueryFailed,
+        ));
+    assert_eq!(abort.outcome(), OperationOutcome::Accepted);
+    let after_abort = fixture.registry.quiesce_query_context(&request);
+    assert_eq!(
+        after_abort
+            .acknowledgement()
+            .expect("retained cut")
+            .accepted_tasks(),
+        &[identity]
+    );
+}
+
+#[test]
+fn normal_release_requires_quiesce_and_keeps_lease_until_release() {
+    let fixture = Fixture::new(TestTaskHost::default());
+    let context = fixture.context(execution(1103));
+    establish(&fixture.registry, context);
+    let release = ReleaseQueryContext::new(TaskOperationId::new_v7(), context);
+    assert_eq!(
+        fixture.registry.release_query_context(&release).outcome(),
+        OperationOutcome::InvalidStateOrRequest
+    );
+    let lease = fixture
+        .registry
+        .installed_lease(context)
+        .expect("active lease");
+    let quiesce = fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    assert_eq!(quiesce.outcome(), OperationOutcome::Accepted);
+    assert_eq!(fixture.registry.installed_lease(context), Some(lease));
+    let released = fixture.registry.release_query_context(&release);
+    assert_eq!(
+        released.outcome(),
+        OperationOutcome::Accepted,
+        "{released:?}"
+    );
+    assert_eq!(fixture.registry.termination_cause(context), None);
+}
+
+#[test]
+fn quiesce_ack_precedes_live_stop_fanout() {
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(1105);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let create = fixture.create(descriptor(identity), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .create_task(&create, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    let cut = fixture
+        .registry
+        .quiesce_query_context(&QuiesceQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    assert_eq!(cut.outcome(), OperationOutcome::Accepted);
+    assert_eq!(
+        cut.acknowledgement().expect("cut").accepted_tasks(),
+        &[identity]
+    );
+    assert_eq!(fixture.task_host.cancel_calls.load(Ordering::SeqCst), 0);
+    fixture.registry.advance_deadlines();
+    assert_eq!(fixture.task_host.cancel_calls.load(Ordering::SeqCst), 1);
+    fixture.registry.advance_deadlines();
+    assert_eq!(fixture.task_host.cancel_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn abort_of_accepted_preparation_stops_before_submit_and_keeps_identity() {
+    let gate = Arc::new(InstallGate::held());
+    let fixture = Fixture::new(TestTaskHost {
+        install_gate: Some(Arc::clone(&gate)),
+        ..TestTaskHost::default()
+    });
+    let execution = execution(997);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let request = fixture.create(descriptor(identity), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&request, body(RESULT_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    gate.wait_until_entered();
+    let abort = fixture
+        .registry
+        .abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            AbortCause::QueryFailed,
+        ));
+    assert_eq!(abort.outcome(), OperationOutcome::Accepted, "{abort:?}");
+    gate.release();
+    wait_for_accepted_state(&fixture.registry, &request, TaskState::Aborted);
+    assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn accepted_preparation_capacity_rejects_before_a_second_task_is_owned() {
+    let gate = Arc::new(InstallGate::held());
+    let fixture = Fixture::with_config(
+        TestTaskHost {
+            install_gate: Some(Arc::clone(&gate)),
+            ..TestTaskHost::default()
+        },
+        |config| {
+            config.max_preparing_tasks = 1;
+            config.max_preparing_bytes = 1024;
+        },
+    );
+    let execution = execution(992);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let first = fixture.create(descriptor(task(execution, fixture.backend)), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&first, body(RESULT_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    gate.wait_until_entered();
+    let second_identity = TaskIdentity::new(
+        execution,
+        StageId::new(1).expect("stage"),
+        TaskId::new(2).expect("task"),
+        fixture.backend,
+    );
+    let second = fixture.create(descriptor(second_identity), Vec::new());
+    let rejected = fixture
+        .registry
+        .accept_create_task(&second, body(STREAM_PLAN));
+    assert_eq!(
+        rejected.outcome(),
+        OperationOutcome::PreparationBusy,
+        "{rejected:?}"
+    );
+    gate.release();
+    wait_for_accepted_installed(&fixture.registry, &first);
+    assert_eq!(
+        fixture.task_host.prepared_bodies(),
+        vec![Bytes::from_static(RESULT_PLAN)]
+    );
+}
+
+#[test]
+fn accepted_preparation_preserves_context_fifo() {
+    let gate = Arc::new(InstallGate::held());
+    let fixture = Fixture::with_config(
+        TestTaskHost {
+            install_gate: Some(Arc::clone(&gate)),
+            ..TestTaskHost::default()
+        },
+        |config| config.max_prepare_workers = 2,
+    );
+    let execution = execution(994);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let first = fixture.create(descriptor(task(execution, fixture.backend)), Vec::new());
+    let second_identity = TaskIdentity::new(
+        execution,
+        StageId::new(1).expect("stage"),
+        TaskId::new(2).expect("task"),
+        fixture.backend,
+    );
+    let second = fixture.create(descriptor(second_identity), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&first, body(RESULT_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    gate.wait_until_entered();
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&second, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
+    gate.release();
+    for _ in 0..1000 {
+        if fixture.task_host.prepared_bodies().len() == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        fixture.task_host.prepared_bodies(),
+        vec![
+            Bytes::from_static(RESULT_PLAN),
+            Bytes::from_static(STREAM_PLAN)
+        ]
+    );
+}
+
+#[test]
+fn accepted_preparation_failure_remains_the_same_terminal_identity() {
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(993);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let request = fixture.create(descriptor(identity), Vec::new());
+    let accepted = fixture
+        .registry
+        .accept_create_task(&request, body(REFUSED_PLAN));
+    assert_eq!(
+        accepted.outcome(),
+        OperationOutcome::Accepted,
+        "{accepted:?}"
+    );
+    wait_for_accepted_state(&fixture.registry, &request, TaskState::Failed);
+    let replay = fixture
+        .registry
+        .accept_create_task(&request, body(RESULT_PLAN));
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
+    assert!(matches!(
+        replay.acknowledgement().expect("terminal replay").termination(),
+        Some(TerminationDetail::Failed(failure)) if failure.phase() == TaskFailurePhase::Preparation
+    ));
+    assert_eq!(
+        fixture.task_host.prepared_bodies(),
+        vec![Bytes::from_static(REFUSED_PLAN)]
+    );
+}
+
+#[test]
+fn failed_accepted_preparation_returns_uninstalled_normal_close_reservation() {
+    let capabilities = TaskInboundCapabilities::with_limits(1, 4096);
+    let fixture = Fixture::new(TestTaskHost {
+        inbound_capabilities: Some(Arc::clone(&capabilities)),
+        ..TestTaskHost::default()
+    });
+    let execution = execution(994);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let source = TaskIdentity::new(
+        execution,
+        StageId::new(2).expect("nonzero stage"),
+        TaskId::new(1).expect("nonzero task"),
+        fixture.backend,
+    );
+    let inbound = ExchangeTopology::try_new(
+        Vec::new(),
+        vec![
+            ExchangeInbound::try_new(
+                FragmentNodeId::new(7),
+                vec![ExchangeSource::new(source, UniqueId::new(30, 31), 0)],
+            )
+            .expect("frozen inbound"),
+        ],
+    )
+    .expect("frozen topology");
+    let make_descriptor = |task_number, kernel| {
+        TaskDescriptor::try_new(
+            TaskIdentity::new(
+                execution,
+                StageId::new(1).expect("nonzero stage"),
+                TaskId::new(task_number).expect("nonzero task"),
+                fixture.backend,
+            ),
+            kernel,
+            std::num::NonZeroUsize::new(1).expect("nonzero dop"),
+            Vec::new(),
+            inbound.clone(),
+        )
+        .expect("legal descriptor")
+    };
+    let failed = fixture.create(make_descriptor(1, UniqueId::new(10, 11)), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&failed, body(REFUSED_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    wait_for_accepted_state(&fixture.registry, &failed, TaskState::Failed);
+    assert_eq!(capabilities.len(), 0);
+
+    let next = fixture.create(make_descriptor(2, UniqueId::new(20, 21)), Vec::new());
+    let accepted = fixture
+        .registry
+        .accept_create_task(&next, body(RESULT_PLAN));
+    assert_eq!(
+        accepted.outcome(),
+        OperationOutcome::Accepted,
+        "{accepted:?}"
+    );
+    wait_for_accepted_installed(&fixture.registry, &next);
+}
+
+#[test]
+fn accepted_create_requires_active_context_without_waiting_or_owning_identity() {
+    let fixture = Fixture::new(TestTaskHost::default());
+    let execution = execution(995);
+    let context = fixture.context(execution);
+    let identity = task(execution, fixture.backend);
+    let request = fixture.create(descriptor(identity), Vec::new());
+    let not_ready = fixture
+        .registry
+        .accept_create_task(&request, body(RESULT_PLAN));
+    assert_eq!(
+        not_ready.outcome(),
+        OperationOutcome::NotReady,
+        "{not_ready:?}"
+    );
+    assert!(not_ready.acknowledgement().is_none());
+    establish(&fixture.registry, context);
+    let accepted = fixture
+        .registry
+        .accept_create_task(&request, body(RESULT_PLAN));
+    assert_eq!(
+        accepted.outcome(),
+        OperationOutcome::Accepted,
+        "{accepted:?}"
+    );
+}
+
+#[test]
+fn one_oversized_preparation_is_long_lived_rejection() {
+    let fixture = Fixture::with_config(TestTaskHost::default(), |config| {
+        config.max_preparing_bytes = 1;
+    });
+    let execution = execution(996);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let request = fixture.create(descriptor(identity), Vec::new());
+    let rejected = fixture
+        .registry
+        .accept_create_task(&request, body(RESULT_PLAN));
+    assert_eq!(
+        rejected.outcome(),
+        OperationOutcome::ResourceExhausted,
+        "{rejected:?}"
+    );
+    assert!(fixture.task_host.prepared_bodies().is_empty());
+}
+
+fn wait_for_accepted_state(
+    registry: &Arc<TaskExecutionRegistry>,
+    request: &CreateTask,
+    expected: TaskState,
+) {
+    for _ in 0..1000 {
+        let current = registry.accept_create_task(request, body(RESULT_PLAN));
+        if current
+            .acknowledgement()
+            .is_some_and(|status| status.state() == expected)
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("accepted task did not reach {expected:?}");
+}
+
+fn wait_for_accepted_installed(registry: &Arc<TaskExecutionRegistry>, request: &CreateTask) {
+    for _ in 0..1000 {
+        let current = registry.accept_create_task(request, body(RESULT_PLAN));
+        if current
+            .acknowledgement()
+            .is_some_and(|status| status.installed())
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("accepted task did not publish Installed");
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptedFenceEvent {
+    AdmitSecond,
+    Quiesce,
+    CancelFirst,
+    ReplayFirst,
+    LateEstablish,
+    ExpireLease,
+}
+
+fn accepted_fence_permutations(events: &[AcceptedFenceEvent]) -> Vec<Vec<AcceptedFenceEvent>> {
+    fn visit(
+        events: &mut [AcceptedFenceEvent],
+        next: usize,
+        traces: &mut Vec<Vec<AcceptedFenceEvent>>,
+    ) {
+        if next == events.len() {
+            traces.push(events.to_vec());
+            return;
+        }
+        for selected in next..events.len() {
+            events.swap(next, selected);
+            visit(events, next + 1, traces);
+            events.swap(next, selected);
+        }
+    }
+    let mut traces = Vec::new();
+    visit(&mut events.to_vec(), 0, &mut traces);
+    traces
+}
+
+// A failed assertion still releases the real preparation worker's rendezvous.
+struct PreparationGateRelease(Arc<InstallGate>);
+
+impl Drop for PreparationGateRelease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+fn establish_for_replay(
+    registry: &TaskExecutionRegistry,
+    context: QueryContextRef,
+) -> UpdateQueryContext {
+    let ticket = registry
+        .acquire_query_context_admission_ticket(AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context,
+            LeaseValidFor::new(Duration::from_secs(10)).expect("ticket lease"),
+            NativeCompatibilityId::new([0x71; 32]),
+            registry.admission_epoch_capability(),
+        ))
+        .acknowledgement()
+        .expect("admission ticket")
+        .ticket_id();
+    let request = UpdateQueryContext::Establish(EstablishQueryContext::new(
+        TaskOperationId::new_v7(),
+        context,
+        ticket,
+        Arc::new(TestContent(1)),
+        Arc::new(TestContent(2)),
+        Arc::new(TestContent(3)),
+        CredentialUpdate::new(
+            CredentialLeaseId::new(1),
+            CredentialEpoch::FIRST,
+            Arc::new(TestSecret),
+        ),
+        LeaseValidFor::new(Duration::from_secs(10)).expect("context lease"),
+    ));
+    assert_eq!(
+        registry.update_query_context(&request).outcome(),
+        OperationOutcome::Accepted
+    );
+    request
+}
+
+fn wait_for_terminal_record(registry: &TaskExecutionRegistry, identity: TaskIdentity) {
+    for _ in 0..1000 {
+        if matches!(
+            registry.root_result_route(identity),
+            RootResultRoute::Terminal(_) | RootResultRoute::TerminalResultOwner(_)
+        ) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("accepted task did not retire its actual preparation worker");
+}
+
+#[test]
+fn bounded_accepted_quiesce_interleavings_freeze_membership_without_repreparing() {
+    use AcceptedFenceEvent::*;
+    // All 5! serial orders after the first real worker entered preparation.
+    // Worker completion is held until the end: this explores control ordering,
+    // not arbitrary OS scheduling or more than two accepted identities.
+    let traces = accepted_fence_permutations(&[
+        AdmitSecond,
+        Quiesce,
+        CancelFirst,
+        ReplayFirst,
+        LateEstablish,
+    ]);
+    let mut second_accepted = 0;
+    let mut second_fenced = 0;
+    let mut observed_cuts = 0;
+    for (case, trace) in traces.iter().enumerate() {
+        let gate = Arc::new(InstallGate::held());
+        let _release = PreparationGateRelease(Arc::clone(&gate));
+        let fixture = Fixture::new(TestTaskHost {
+            install_gate: Some(Arc::clone(&gate)),
+            ..TestTaskHost::default()
+        });
+        let execution = execution(20_000 + case as i64);
+        let context = fixture.context(execution);
+        let late_establish = establish_for_replay(&fixture.registry, context);
+        let first_identity = task(execution, fixture.backend);
+        let first = fixture.create(descriptor(first_identity), Vec::new());
+        let second_identity = TaskIdentity::new(
+            execution,
+            StageId::new(1).unwrap(),
+            TaskId::new(2).unwrap(),
+            fixture.backend,
+        );
+        let second = fixture.create(
+            descriptor_with(second_identity, UniqueId::new(2, 2), 1, 1),
+            Vec::new(),
+        );
+        assert_eq!(
+            fixture
+                .registry
+                .accept_create_task(&first, body(RESULT_PLAN))
+                .outcome(),
+            OperationOutcome::Accepted,
+            "{trace:?} initial acceptance"
+        );
+        gate.wait_until_entered();
+        let quiesce = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
+        let mut accepted = vec![first_identity];
+        let mut fenced = false;
+        for event in trace {
+            match event {
+                AdmitSecond => {
+                    let receipt = fixture
+                        .registry
+                        .accept_create_task(&second, body(STREAM_PLAN));
+                    if fenced {
+                        assert_eq!(
+                            receipt.outcome(),
+                            OperationOutcome::ContextTerminalReceipt,
+                            "{trace:?} after {event:?}"
+                        );
+                        assert!(receipt.acknowledgement().is_none(), "{trace:?}");
+                        second_fenced += 1;
+                    } else {
+                        assert_eq!(
+                            receipt.outcome(),
+                            OperationOutcome::Accepted,
+                            "{trace:?} after {event:?}"
+                        );
+                        accepted.push(second_identity);
+                        second_accepted += 1;
+                    }
+                }
+                Quiesce => {
+                    let receipt = fixture.registry.quiesce_query_context(&quiesce);
+                    assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{trace:?}");
+                    assert_eq!(
+                        receipt.acknowledgement().unwrap().accepted_tasks(),
+                        accepted,
+                        "{trace:?}"
+                    );
+                    fenced = true;
+                    observed_cuts += 1;
+                }
+                CancelFirst => {
+                    let receipt = fixture.registry.cancel_task(&CancelTask::new(
+                        TaskOperationId::new_v7(),
+                        first_identity,
+                        CancelReason::UpstreamNoLongerNeeded,
+                    ));
+                    assert!(
+                        matches!(
+                            receipt.outcome(),
+                            OperationOutcome::Accepted | OperationOutcome::Idempotent
+                        ),
+                        "{trace:?}: {receipt:?}"
+                    );
+                }
+                ReplayFirst => {
+                    let receipt = fixture
+                        .registry
+                        .accept_create_task(&first, body(STREAM_PLAN));
+                    assert_eq!(receipt.outcome(), OperationOutcome::Idempotent, "{trace:?}");
+                    assert_eq!(
+                        receipt.acknowledgement().unwrap().identity(),
+                        first_identity,
+                        "{trace:?}"
+                    );
+                }
+                LateEstablish => {
+                    let receipt = fixture.registry.update_query_context(&late_establish);
+                    assert_eq!(
+                        receipt.outcome(),
+                        if fenced {
+                            OperationOutcome::ContextTerminalReceipt
+                        } else {
+                            OperationOutcome::Idempotent
+                        },
+                        "{trace:?}"
+                    );
+                }
+                ExpireLease => unreachable!("normal traces do not expire the lease"),
+            }
+            assert_eq!(
+                fixture.registry.termination_cause(context),
+                None,
+                "{trace:?} after {event:?}"
+            );
+            assert_eq!(
+                fixture.task_host.submitted.load(Ordering::SeqCst),
+                0,
+                "{trace:?}"
+            );
+            assert_eq!(
+                fixture.registry.counters().contexts_established,
+                1,
+                "{trace:?}"
+            );
+        }
+        let replay = fixture.registry.quiesce_query_context(&quiesce);
+        assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{trace:?}");
+        assert_eq!(
+            replay.acknowledgement().unwrap().accepted_tasks(),
+            accepted,
+            "{trace:?}"
+        );
+        gate.release();
+        for identity in &accepted {
+            wait_for_terminal_record(&fixture.registry, *identity);
+            assert!(
+                matches!(
+                    fixture.registry.root_result_route(*identity),
+                    RootResultRoute::Terminal(TaskState::Canceled)
+                ),
+                "{trace:?}: normal preparation stop must retain Canceled"
+            );
+        }
+        assert_eq!(
+            fixture.task_host.submitted.load(Ordering::SeqCst),
+            0,
+            "{trace:?}"
+        );
+        assert_eq!(
+            fixture.task_host.prepared_bodies(),
+            vec![Bytes::from_static(RESULT_PLAN)],
+            "{trace:?}: replay or queued canceled body was prepared"
+        );
+        assert_eq!(
+            fixture.registry.termination_cause(context),
+            None,
+            "{trace:?}"
+        );
+    }
+    assert_eq!(
+        (traces.len(), observed_cuts, second_accepted, second_fenced),
+        (120, 120, 60, 60)
+    );
+    eprintln!(
+        "accepted/quiesce bounded exploration: traces={} events={} cuts={observed_cuts} second_accepted={second_accepted} second_fenced={second_fenced}",
+        traces.len(),
+        traces.len() * 5
+    );
+}
+
+#[test]
+fn bounded_preparing_stop_interleavings_keep_capacity_until_actual_exit() {
+    use AcceptedFenceEvent::*;
+    let traces = accepted_fence_permutations(&[
+        Quiesce,
+        CancelFirst,
+        ReplayFirst,
+        LateEstablish,
+        ExpireLease,
+    ]);
+    let mut normal_cuts = 0;
+    let mut late_cuts_rejected = 0;
+    let mut capacity_rejections = 0;
+    for (case, trace) in traces.iter().enumerate() {
+        let gate = Arc::new(InstallGate::held());
+        let _release = PreparationGateRelease(Arc::clone(&gate));
+        let fixture = Fixture::with_config(
+            TestTaskHost {
+                install_gate: Some(Arc::clone(&gate)),
+                ..TestTaskHost::default()
+            },
+            |config| {
+                config.max_preparing_tasks = 1;
+                config.max_prepare_workers = 1;
+            },
+        );
+        let query_execution = execution(21_000 + case as i64);
+        let context = fixture.context(query_execution);
+        let late_establish = establish_for_replay(&fixture.registry, context);
+        let identity = task(query_execution, fixture.backend);
+        let first = fixture.create(descriptor(identity), Vec::new());
+        assert_eq!(
+            fixture
+                .registry
+                .accept_create_task(&first, body(RESULT_PLAN))
+                .outcome(),
+            OperationOutcome::Accepted,
+            "{trace:?}"
+        );
+        gate.wait_until_entered();
+        let quiesce = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
+        let mut expired = false;
+        let mut fenced = false;
+        for event in trace {
+            match event {
+                Quiesce => {
+                    let receipt = fixture.registry.quiesce_query_context(&quiesce);
+                    if expired {
+                        assert_eq!(
+                            receipt.outcome(),
+                            OperationOutcome::ContextTerminalReceipt,
+                            "{trace:?}"
+                        );
+                        late_cuts_rejected += 1;
+                    } else {
+                        assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{trace:?}");
+                        assert_eq!(
+                            receipt.acknowledgement().unwrap().accepted_tasks(),
+                            &[identity],
+                            "{trace:?}"
+                        );
+                        fenced = true;
+                        normal_cuts += 1;
+                    }
+                }
+                CancelFirst => {
+                    let receipt = fixture.registry.cancel_task(&CancelTask::new(
+                        TaskOperationId::new_v7(),
+                        identity,
+                        CancelReason::UpstreamNoLongerNeeded,
+                    ));
+                    assert!(
+                        matches!(
+                            receipt.outcome(),
+                            OperationOutcome::Accepted | OperationOutcome::Idempotent
+                        ),
+                        "{trace:?}: {receipt:?}"
+                    );
+                }
+                ReplayFirst => {
+                    let receipt = fixture
+                        .registry
+                        .accept_create_task(&first, body(STREAM_PLAN));
+                    assert_eq!(receipt.outcome(), OperationOutcome::Idempotent, "{trace:?}");
+                    assert_eq!(
+                        receipt.acknowledgement().unwrap().identity(),
+                        identity,
+                        "{trace:?}"
+                    );
+                }
+                LateEstablish => {
+                    let receipt = fixture.registry.update_query_context(&late_establish);
+                    assert_eq!(
+                        receipt.outcome(),
+                        if expired {
+                            OperationOutcome::InvalidStateOrRequest
+                        } else if fenced {
+                            OperationOutcome::ContextTerminalReceipt
+                        } else {
+                            OperationOutcome::Idempotent
+                        },
+                        "{trace:?}"
+                    );
+                }
+                ExpireLease => {
+                    fixture.clock.advance(Duration::from_secs(10));
+                    assert_eq!(
+                        fixture.registry.advance_deadlines().leases_expired,
+                        1,
+                        "{trace:?}"
+                    );
+                    expired = true;
+                }
+                AdmitSecond => {
+                    unreachable!("capacity traces admit a fresh probe after all controls")
+                }
+            }
+            assert_eq!(
+                fixture.registry.termination_cause(context),
+                expired.then_some(AbortCause::LeaseExpired),
+                "{trace:?} after {event:?}"
+            );
+            assert_eq!(
+                fixture.task_host.submitted.load(Ordering::SeqCst),
+                0,
+                "{trace:?}"
+            );
+            assert!(
+                matches!(
+                    fixture.registry.root_result_route(identity),
+                    RootResultRoute::Creating
+                ),
+                "{trace:?}: control verdict must not manufacture physical exit"
+            );
+        }
+        assert_eq!(fixture.registry.counters().lease_expiries, 1, "{trace:?}");
+        assert_eq!(
+            fixture.registry.counters().contexts_established,
+            1,
+            "{trace:?}"
+        );
+        let probe_execution = execution(22_000 + case as i64);
+        let probe_context = fixture.context(probe_execution);
+        establish(&fixture.registry, probe_context);
+        let probe = fixture.create(
+            descriptor_with(
+                task(probe_execution, fixture.backend),
+                UniqueId::new(3, 3),
+                1,
+                1,
+            ),
+            Vec::new(),
+        );
+        let busy = fixture
+            .registry
+            .accept_create_task(&probe, body(STREAM_PLAN));
+        assert_eq!(
+            busy.outcome(),
+            OperationOutcome::PreparationBusy,
+            "{trace:?}: held preparation must stay charged"
+        );
+        capacity_rejections += 1;
+        gate.release();
+        wait_for_terminal_record(&fixture.registry, identity);
+        wait_for_preparation_exit(&fixture.registry, identity);
+        assert_eq!(
+            fixture.task_host.submitted.load(Ordering::SeqCst),
+            0,
+            "{trace:?}: stopped preparation must not submit"
+        );
+        let admitted = fixture
+            .registry
+            .accept_create_task(&probe, body(STREAM_PLAN));
+        assert_eq!(
+            admitted.outcome(),
+            OperationOutcome::Accepted,
+            "{trace:?}: actual exit must return capacity"
+        );
+        wait_for_accepted_installed(&fixture.registry, &probe);
+        assert_eq!(
+            fixture.task_host.prepared_bodies(),
+            vec![
+                Bytes::from_static(RESULT_PLAN),
+                Bytes::from_static(STREAM_PLAN)
+            ],
+            "{trace:?}"
+        );
+        if fenced {
+            let cut = fixture.registry.quiesce_query_context(&quiesce);
+            assert_eq!(cut.outcome(), OperationOutcome::Idempotent, "{trace:?}");
+            assert_eq!(
+                cut.acknowledgement().unwrap().accepted_tasks(),
+                &[identity],
+                "{trace:?}: lease expiry must not rewrite an accepted fence"
+            );
+        }
+    }
+    assert_eq!(
+        (
+            traces.len(),
+            normal_cuts,
+            late_cuts_rejected,
+            capacity_rejections
+        ),
+        (120, 60, 60, 120)
+    );
+    eprintln!(
+        "preparing-stop bounded exploration: traces={} events={} normal_cuts={normal_cuts} expired_before_cut={late_cuts_rejected} held_capacity_rejections={capacity_rejections}",
+        traces.len(),
+        traces.len() * 5
+    );
+}
+
+fn wait_for_preparation_exit(registry: &Arc<TaskExecutionRegistry>, identity: TaskIdentity) {
+    for _ in 0..1000 {
+        if !registry.has_preparation_charge(identity) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("preparation retained its charge after the job should have exited");
+}
+
+#[test]
+fn preparation_exit_returns_temporary_capacity_while_installed_tasks_stay_active() {
+    let fixture = Fixture::with_config(TestTaskHost::default(), |config| {
+        config.max_preparing_tasks = 1;
+        config.max_preparing_tasks_per_context = 1;
+        config.max_preparing_bytes = 1024;
+        config.max_prepare_workers = 1;
+    });
+    let query_execution = execution(30_001);
+    let context = fixture.context(query_execution);
+    establish(&fixture.registry, context);
+    let first_identity = task(query_execution, fixture.backend);
+    let first = fixture.create(descriptor(first_identity), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&first, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    wait_for_accepted_installed(&fixture.registry, &first);
+    wait_for_preparation_exit(&fixture.registry, first_identity);
+    let second_identity = TaskIdentity::new(
+        query_execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(2).unwrap(),
+        fixture.backend,
+    );
+    let second = fixture.create(
+        descriptor_with(second_identity, UniqueId::new(30, 2), 1, 1),
+        Vec::new(),
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&second, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted,
+        "a live installed predecessor must not monopolize temporary preparation capacity"
+    );
+    wait_for_accepted_installed(&fixture.registry, &second);
+    wait_for_preparation_exit(&fixture.registry, second_identity);
+    let state = fixture.registry.preparation_snapshot();
+    assert_eq!(state.bytes, 0);
+    assert_eq!(state.positions, 0);
+    assert_eq!(state.context_positions, 0);
+    assert_eq!(state.workers, 0);
+    wait_for_accepted_installed(&fixture.registry, &first);
+    wait_for_accepted_installed(&fixture.registry, &second);
+}
+
+#[test]
+fn preparation_positions_preserve_per_context_fifo_and_global_conservation_until_exit() {
+    let gate = Arc::new(InstallGate::held());
+    let _release = PreparationGateRelease(Arc::clone(&gate));
+    let fixture = Fixture::with_config(
+        TestTaskHost {
+            install_gate: Some(Arc::clone(&gate)),
+            ..TestTaskHost::default()
+        },
+        |config| {
+            config.max_preparing_tasks = 2;
+            config.max_preparing_tasks_per_context = 1;
+            config.max_preparing_bytes = 2048;
+            config.max_prepare_workers = 1;
+        },
+    );
+    let a = execution(30_002);
+    let b = execution(30_003);
+    let ca = fixture.context(a);
+    let cb = fixture.context(b);
+    establish(&fixture.registry, ca);
+    establish(&fixture.registry, cb);
+    let ai = task(a, fixture.backend);
+    let first = fixture.create(descriptor(ai), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&first, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    gate.wait_until_entered();
+    let second_identity = TaskIdentity::new(
+        a,
+        StageId::new(1).unwrap(),
+        TaskId::new(2).unwrap(),
+        fixture.backend,
+    );
+    let same_context = fixture.create(
+        descriptor_with(second_identity, UniqueId::new(30, 4), 1, 1),
+        Vec::new(),
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&same_context, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::PreparationBusy,
+        "the exact Context preparation window is full"
+    );
+    let bi = task(b, fixture.backend);
+    let other_context = fixture.create(descriptor_with(bi, UniqueId::new(30, 3), 1, 1), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&other_context, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted,
+        "another Context may occupy the independent global position"
+    );
+    let charged = fixture.registry.preparation_snapshot().bytes;
+    assert!(charged > 0 && charged <= 2048);
+    assert_eq!(
+        fixture
+            .registry
+            .cancel_task(&CancelTask::new(
+                TaskOperationId::new_v7(),
+                ai,
+                CancelReason::UpstreamNoLongerNeeded
+            ))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    {
+        let state = fixture.registry.preparation_snapshot();
+        assert_eq!(
+            state.bytes, charged,
+            "normal cancellation does not return a still-running preparation's backing"
+        );
+        assert_eq!(state.positions, 2);
+        assert_eq!(state.workers, 1);
+        assert_eq!(state.queued_positions, 1);
+    }
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&same_context, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::PreparationBusy
+    );
+    gate.release();
+    wait_for_terminal_record(&fixture.registry, ai);
+    wait_for_preparation_exit(&fixture.registry, ai);
+    wait_for_accepted_installed(&fixture.registry, &other_context);
+    wait_for_preparation_exit(&fixture.registry, bi);
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&same_context, body(STREAM_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted,
+        "the actual exited job returns its exact Context preparation position"
+    );
+    wait_for_accepted_installed(&fixture.registry, &same_context);
+    wait_for_preparation_exit(&fixture.registry, second_identity);
+    let state = fixture.registry.preparation_snapshot();
+    assert_eq!(state.bytes, 0);
+    assert_eq!(state.positions, 0);
+    assert_eq!(state.context_positions, 0);
+    wait_for_accepted_installed(&fixture.registry, &other_context);
+    wait_for_accepted_installed(&fixture.registry, &same_context);
+}
+
+#[test]
+fn preparation_charge_adds_private_input_to_incoming_domain_backing_bound() {
+    let gate = Arc::new(InstallGate::held());
+    let _release = PreparationGateRelease(Arc::clone(&gate));
+    let fixture = Fixture::with_config(
+        TestTaskHost {
+            install_gate: Some(Arc::clone(&gate)),
+            ..TestTaskHost::default()
+        },
+        |config| {
+            config.max_preparing_bytes = 4096;
+        },
+    );
+    let execution = execution(30_004);
+    let context = fixture.context(execution);
+    establish(&fixture.registry, context);
+    let identity = task(execution, fixture.backend);
+    let request = fixture.create(descriptor(identity), Vec::new());
+    let input = body(STREAM_PLAN);
+    let input_owned = input.retained_bytes();
+    let incoming_domain_backing = 400;
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task_with_retained_bytes(&request, input, incoming_domain_backing)
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    gate.wait_until_entered();
+    let charged = fixture.registry.preparation_snapshot().bytes;
+    assert!(
+        charged >= incoming_domain_backing + input_owned,
+        "concurrent private input and incoming domain backing must both be charged"
+    );
+    gate.release();
+    wait_for_accepted_installed(&fixture.registry, &request);
+    wait_for_preparation_exit(&fixture.registry, identity);
+    assert_eq!(fixture.registry.preparation_snapshot().bytes, 0);
 }

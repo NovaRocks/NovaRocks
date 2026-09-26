@@ -69,10 +69,13 @@ use novarocks_execution::exec::node::scan::{
 use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
+use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::read_stack::{
+    ConnectorPageSource, ConnectorPreparationControl, ConnectorPreparationProgress,
     ConnectorPreparationStart, ConnectorPreparedPageSource, ConnectorReadDynamicFilter,
     ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider, ConnectorSession,
+    PageSourceMetrics, SourcePage,
 };
 use novarocks_types::SlotId;
 
@@ -221,6 +224,102 @@ fn emit_page_source_marker(
         None => println!("{marker} plan_node={plan_node_id}"),
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+/// Keep the page-source evidence with the source that the registered slot closes.
+/// The iterator can outlive terminal group cleanup, so its Drop is not the
+/// resource-close boundary.
+struct ObservedPageSource {
+    source: Box<dyn ConnectorPageSource>,
+    emit_marker: bool,
+    plan_node_id: i32,
+    closed: bool,
+}
+
+impl ObservedPageSource {
+    fn open(
+        source: Box<dyn ConnectorPageSource>,
+        emit_marker: bool,
+        plan_node_id: i32,
+        sequence_id: Option<u64>,
+    ) -> Box<dyn ConnectorPageSource> {
+        emit_page_source_marker(
+            emit_marker,
+            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
+            plan_node_id,
+            sequence_id,
+        );
+        Box::new(Self {
+            source,
+            emit_marker,
+            plan_node_id,
+            closed: false,
+        })
+    }
+}
+
+impl ConnectorPageSource for ObservedPageSource {
+    fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
+        self.source.next_source_page()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.source.is_finished()
+    }
+
+    fn is_blocked(&self) -> bool {
+        self.source.is_blocked()
+    }
+
+    fn advance_successor_preparation(
+        &mut self,
+        remaining_input_bytes: u64,
+        remaining_candidates: usize,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+        self.source
+            .advance_successor_preparation(remaining_input_bytes, remaining_candidates)
+    }
+
+    fn successor_preparation_input_bytes(&self) -> u64 {
+        self.source.successor_preparation_input_bytes()
+    }
+
+    fn successor_preparation_candidate_count(&self) -> usize {
+        self.source.successor_preparation_candidate_count()
+    }
+
+    fn successor_preparation_control(&self) -> Option<Arc<dyn ConnectorPreparationControl>> {
+        self.source.successor_preparation_control()
+    }
+
+    fn metrics(&self) -> PageSourceMetrics {
+        self.source.metrics()
+    }
+
+    fn memory_usage_bytes(&self) -> u64 {
+        self.source.memory_usage_bytes()
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let result = self.source.close();
+        emit_page_source_marker(
+            self.emit_marker,
+            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
+            self.plan_node_id,
+            None,
+        );
+        result
+    }
+}
+
+impl Drop for ObservedPageSource {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
 }
 
 /// A physical source for one typed connector scan node of one task attempt.
@@ -684,22 +783,19 @@ impl TypedConnectorSplitIter {
     fn install_page_source(
         &mut self,
         split: &ReceivedReadSplit,
-        page_source: Box<dyn novarocks_spi::connector::read_stack::ConnectorPageSource>,
+        page_source: Box<dyn ConnectorPageSource>,
     ) -> Result<(), String> {
+        let page_source = ObservedPageSource::open(
+            page_source,
+            self.shared.emit_reader_markers,
+            self.shared.plan_node_id,
+            Some(split.sequence_id()),
+        );
         let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
         let marker = TypedConnectorReaderMarker::for_split(split, self.shared.emit_reader_markers);
         self.current = Some(
             self.sources
                 .register(adapter, marker, self.profile.clone())?,
-        );
-        // Acceptance evidence: a distributed run proves a page source was
-        // opened on this backend for this exact scheduled split, which a
-        // result-only assertion cannot show.
-        emit_page_source_marker(
-            self.shared.emit_reader_markers,
-            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
-            self.shared.plan_node_id,
-            Some(split.sequence_id()),
         );
         if let Some(profile) = self.profile.as_ref() {
             profile.counter_add("TypedConnectorPageSourcesOpened", ProfileUnit::Unit, 1);
@@ -868,16 +964,7 @@ impl TypedConnectorSplitIter {
             self.flow.unregister(id);
         }
         match self.current.take() {
-            Some(source) => {
-                let closed = source.close();
-                emit_page_source_marker(
-                    self.shared.emit_reader_markers,
-                    "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
-                    self.shared.plan_node_id,
-                    None,
-                );
-                closed
-            }
+            Some(source) => source.close(),
             None => Ok(()),
         }
     }
@@ -1279,17 +1366,14 @@ impl TypedSystemTableIter {
                 self.shared.descriptor.assignments(),
             )
             .map_err(|error| format!("create typed system relation page source: {error}"))?;
-        let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
-        self.current = Some(self.sources.register(adapter, None, self.profile.clone())?);
-        // No sequence: a system relation read has no split, and printing one
-        // would be the first step toward asserting scheduling identity it does
-        // not have.
-        emit_page_source_marker(
+        let page_source = ObservedPageSource::open(
+            page_source,
             self.shared.emit_reader_markers,
-            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
             self.shared.plan_node_id,
             None,
         );
+        let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
+        self.current = Some(self.sources.register(adapter, None, self.profile.clone())?);
         if let Some(profile) = self.profile.as_ref() {
             profile.counter_add("TypedSystemTablePageSourcesOpened", ProfileUnit::Unit, 1);
         }
@@ -1298,16 +1382,7 @@ impl TypedSystemTableIter {
 
     fn close_current(&mut self) -> Result<(), String> {
         match self.current.take() {
-            Some(source) => {
-                let closed = source.close();
-                emit_page_source_marker(
-                    self.shared.emit_reader_markers,
-                    "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
-                    self.shared.plan_node_id,
-                    None,
-                );
-                closed
-            }
+            Some(source) => source.close(),
             None => Ok(()),
         }
     }
@@ -1370,5 +1445,73 @@ impl Iterator for TypedSystemTableIter {
 impl Drop for TypedSystemTableIter {
     fn drop(&mut self) {
         let _ = self.close_current();
+    }
+}
+
+#[cfg(test)]
+mod page_source_evidence_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct CountingPageSource(Arc<AtomicUsize>);
+
+    impl ConnectorPageSource for CountingPageSource {
+        fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn metrics(&self) -> PageSourceMetrics {
+            PageSourceMetrics::default()
+        }
+
+        fn memory_usage_bytes(&self) -> u64 {
+            0
+        }
+
+        fn close(&mut self) -> Result<(), ConnectorError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn terminal_group_close_releases_page_source_before_registered_handle_drop() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let observed = ObservedPageSource::open(
+            Box::new(CountingPageSource(Arc::clone(&closes))),
+            false,
+            7,
+            Some(1),
+        );
+        let group = Arc::new(TypedPageSourceGroup::default());
+        let registered = group
+            .register(ConnectorPageAdapter::new(Vec::new(), observed), None, None)
+            .expect("register page source");
+
+        group.terminate().expect("terminate page sources");
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        group.terminate().expect("repeat termination");
+        registered.close().expect("late iterator close");
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dropped_observed_source_closes_once() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut observed = ObservedPageSource::open(
+            Box::new(CountingPageSource(Arc::clone(&closes))),
+            false,
+            7,
+            None,
+        );
+        observed.close().expect("explicit close");
+        observed.close().expect("repeat close");
+        drop(observed);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
     }
 }

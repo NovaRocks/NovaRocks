@@ -45,8 +45,9 @@ pub const SAFE_FIELD_PATH_MAX_BYTES: usize = 256;
 /// cancellation is a different terminal state from failure and from abort.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TaskState {
-    /// Identity and descriptor were accepted; execution has not started. This
-    /// is only ever a very short internally observable window.
+    /// Worker accepted the identity; preparation or installed-but-not-running
+    /// work has not started execution. `TaskStatus.installed` distinguishes the
+    /// two phases without inventing another terminal family.
     Planned,
     /// The pipeline is consuming input or running operators.
     Running,
@@ -251,16 +252,36 @@ impl fmt::Display for TaskFailureCategory {
     }
 }
 
+/// The lifecycle phase that produced a task's own failure.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum TaskFailurePhase {
+    Preparation,
+    Execution,
+}
+
 /// A task's own bounded, redacted failure cause.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskFailure {
     category: TaskFailureCategory,
     detail: SafeDetail,
+    phase: TaskFailurePhase,
 }
 
 impl TaskFailure {
     pub const fn new(category: TaskFailureCategory, detail: SafeDetail) -> Self {
-        Self { category, detail }
+        Self::new_in_phase(category, detail, TaskFailurePhase::Execution)
+    }
+
+    pub const fn new_in_phase(
+        category: TaskFailureCategory,
+        detail: SafeDetail,
+        phase: TaskFailurePhase,
+    ) -> Self {
+        Self {
+            category,
+            detail,
+            phase,
+        }
     }
 
     pub const fn category(&self) -> TaskFailureCategory {
@@ -269,6 +290,10 @@ impl TaskFailure {
 
     pub const fn detail(&self) -> &SafeDetail {
         &self.detail
+    }
+
+    pub const fn phase(&self) -> TaskFailurePhase {
+        self.phase
     }
 }
 
@@ -594,6 +619,10 @@ pub enum TaskStatusError {
     UnexpectedTerminationDetail(TaskState),
     /// `FINISHED` without a complete output responsibility.
     FinishedWithoutOutputCompletion,
+    /// Execution cannot run or finish before its input capability is installed.
+    UninstalledExecutionState(TaskState),
+    /// Preparation never committed successful installation.
+    InstalledPreparationFailure,
 }
 
 impl fmt::Display for TaskStatusError {
@@ -610,6 +639,11 @@ impl fmt::Display for TaskStatusError {
             }
             Self::FinishedWithoutOutputCompletion => formatter
                 .write_str("FINISHED requires this task's output responsibility to be complete"),
+            Self::UninstalledExecutionState(state) => {
+                write!(formatter, "{state} requires the task to be installed")
+            }
+            Self::InstalledPreparationFailure => formatter
+                .write_str("a preparation failure cannot report successful installation history"),
         }
     }
 }
@@ -626,6 +660,7 @@ pub struct TaskStatus {
     identity: TaskIdentity,
     version: TaskStatusVersion,
     state: TaskState,
+    installed: bool,
     termination: Option<TerminationDetail>,
     dynamic_filters: Option<DynamicFilterAdvertisement>,
     output: TaskOutputFacts,
@@ -640,6 +675,7 @@ impl TaskStatus {
             identity,
             version: TaskStatusVersion::FIRST,
             state: TaskState::Planned,
+            installed: false,
             termination: None,
             dynamic_filters: None,
             output: TaskOutputFacts::default(),
@@ -657,6 +693,40 @@ impl TaskStatus {
         termination: Option<TerminationDetail>,
         output: TaskOutputFacts,
     ) -> Result<Self, TaskStatusError> {
+        Self::try_new_with_installed(
+            identity,
+            version,
+            state,
+            termination,
+            output,
+            state != TaskState::Planned,
+        )
+    }
+
+    /// Construct an exact snapshot, including whether installation ever
+    /// committed. A terminal preparation failure retains `installed=false`.
+    pub fn try_new_with_installed(
+        identity: TaskIdentity,
+        version: TaskStatusVersion,
+        state: TaskState,
+        termination: Option<TerminationDetail>,
+        output: TaskOutputFacts,
+        installed: bool,
+    ) -> Result<Self, TaskStatusError> {
+        if installed
+            && matches!(termination.as_ref(), Some(TerminationDetail::Failed(failure))
+            if failure.phase() == TaskFailurePhase::Preparation)
+        {
+            return Err(TaskStatusError::InstalledPreparationFailure);
+        }
+        if !installed
+            && matches!(
+                state,
+                TaskState::Running | TaskState::Flushing | TaskState::Finished
+            )
+        {
+            return Err(TaskStatusError::UninstalledExecutionState(state));
+        }
         match (state, &termination) {
             (TaskState::Finished, None) => {
                 if !output.responsibility_complete() {
@@ -691,6 +761,7 @@ impl TaskStatus {
             identity,
             version,
             state,
+            installed,
             termination,
             dynamic_filters: None,
             output,
@@ -701,6 +772,11 @@ impl TaskStatus {
 
     pub fn with_dynamic_filters(mut self, value: DynamicFilterAdvertisement) -> Self {
         self.dynamic_filters = Some(value);
+        self
+    }
+
+    pub const fn with_installed(mut self) -> Self {
+        self.installed = true;
         self
     }
 
@@ -724,6 +800,10 @@ impl TaskStatus {
 
     pub const fn state(&self) -> TaskState {
         self.state
+    }
+
+    pub const fn installed(&self) -> bool {
+        self.installed
     }
 
     pub const fn termination(&self) -> Option<&TerminationDetail> {
@@ -1045,7 +1125,9 @@ mod tests {
         SAFE_DETAIL_MAX_BYTES, SafeDetail, SafeFieldPath, TaskOutputFacts, TaskState, TaskStatus,
         TaskStatusError, TaskStatusVersion,
     };
-    use crate::TaskIdentity;
+    use crate::{
+        TaskFailure, TaskFailureCategory, TaskFailurePhase, TaskIdentity, TerminationDetail,
+    };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
@@ -1067,6 +1149,69 @@ mod tests {
         assert!(TaskState::Canceled.is_cancellation());
         assert!(TaskState::Aborted.is_abort());
         assert!(!TaskState::Flushing.is_terminal());
+    }
+
+    #[test]
+    fn installation_history_is_explicit_and_running_requires_it() {
+        let task = identity();
+        let first = TaskStatus::created(task);
+        assert!(!first.installed());
+        let installed = TaskStatus::try_new_with_installed(
+            task,
+            first.version().next().unwrap(),
+            TaskState::Planned,
+            None,
+            TaskOutputFacts::default(),
+            true,
+        )
+        .unwrap();
+        assert!(installed.installed());
+        assert!(matches!(
+            TaskStatus::try_new_with_installed(
+                task,
+                installed.version().next().unwrap(),
+                TaskState::Running,
+                None,
+                TaskOutputFacts::default(),
+                false,
+            ),
+            Err(TaskStatusError::UninstalledExecutionState(
+                TaskState::Running
+            ))
+        ));
+    }
+
+    #[test]
+    fn preparation_failure_cannot_claim_installation_history() {
+        for state in [TaskState::Failing, TaskState::Failed] {
+            let failure = Some(TerminationDetail::Failed(TaskFailure::new_in_phase(
+                TaskFailureCategory::Protocol,
+                SafeDetail::truncating("preparation failed"),
+                TaskFailurePhase::Preparation,
+            )));
+            assert!(
+                TaskStatus::try_new_with_installed(
+                    identity(),
+                    TaskStatusVersion::FIRST,
+                    state,
+                    failure.clone(),
+                    TaskOutputFacts::default(),
+                    false
+                )
+                .is_ok()
+            );
+            assert_eq!(
+                TaskStatus::try_new_with_installed(
+                    identity(),
+                    TaskStatusVersion::FIRST,
+                    state,
+                    failure,
+                    TaskOutputFacts::default(),
+                    true
+                ),
+                Err(TaskStatusError::InstalledPreparationFailure)
+            );
+        }
     }
 
     #[test]

@@ -289,6 +289,7 @@ mod tests {
                         "test-deployment",
                         "test-build",
                         novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                        4096,
                     )
                     .expect("valid test descriptor"),
                     AdmissionEpochCapability::try_from_bytes(
@@ -314,6 +315,7 @@ mod tests {
                     "test-deployment",
                     "test-build",
                     novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                    4096,
                 )
                 .expect("valid test descriptor"),
                 AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("nonzero epoch"),

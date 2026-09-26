@@ -60,7 +60,9 @@ use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::fragment_transport::{
     NativeTaskResultTransport, TaskReadGrace, native_root_result_pump_binding,
 };
-use crate::native::task_transport::{AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake};
+use crate::native::task_transport::{
+    AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskOperationIntakeEvent,
+};
 use crate::query_execution::artifact::{
     ManifestBoundNativeAttemptInputs, PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
     SnapshotBoundDormantAttemptInputs, TaskExecutionPreparedQuery, TaskManifestBinding,
@@ -697,8 +699,12 @@ async fn acquire_replacement_admissions(
                 }
                 let acknowledgement = loop {
                     if let Some(ack) = acks
-                        .drain()
+                        .drain_events()
                         .into_iter()
+                        .filter_map(|event| match event {
+                            TaskOperationIntakeEvent::Acknowledgement(ack) => Some(ack),
+                            TaskOperationIntakeEvent::EstablishSendStarted { .. } => None,
+                        })
                         .find(|ack| ack.operation_id() == request.envelope().operation_id())
                     {
                         break ack;

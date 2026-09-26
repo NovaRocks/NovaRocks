@@ -694,7 +694,10 @@ impl AcceptedRootStatusSource {
         }
     }
 
-    fn begin_success_seal_request(
+    /// Requests the serialized attempt owner's decision after the result owner
+    /// consumed exact EOS. This request carries no authority to seal success.
+    #[doc(hidden)]
+    pub fn begin_success_seal_request(
         &self,
     ) -> Result<oneshot::Receiver<Result<(), QueryExecutionError>>, QueryExecutionError> {
         let Some(port) = self.success_seal_port.as_ref() else {
@@ -995,8 +998,9 @@ impl PumpRuntime {
 
     /// Waits until the serialized Task owner has accepted at least one status
     /// for the exact root. The Frontend publishes this projection only after
-    /// the root CreateTask acknowledgement, so crossing this gate proves that
-    /// a result fetch cannot overtake root-task creation on its owning Worker.
+    /// Installed proves result capability, or a terminal preparation failure
+    /// makes a fetch unnecessary. A result fetch therefore cannot overtake
+    /// root installation on its owning Worker.
     async fn await_initial_root_status(&mut self) -> Result<(), PumpInterruption> {
         loop {
             tokio::select! {

@@ -1279,6 +1279,7 @@ mod tests {
             "test",
             build_identity,
             native_compatibility_id,
+            4096,
         )
         .unwrap()
     }

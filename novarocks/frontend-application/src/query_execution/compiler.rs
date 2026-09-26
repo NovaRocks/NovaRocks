@@ -975,6 +975,7 @@ fn test_request_context_with_role(
                         "test-deployment",
                         "test-build",
                         novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                        4096,
                     )
                     .expect("valid test descriptor"),
                     novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(

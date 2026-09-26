@@ -5,6 +5,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
     pub list: bool,
+    pub list_default: bool,
     pub only: Vec<String>,
     pub binary: Option<PathBuf>,
     pub compatible_binary: Option<PathBuf>,
@@ -24,6 +25,7 @@ impl Cli {
     pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut cli = Self {
             list: false,
+            list_default: false,
             only: Vec::new(),
             binary: None,
             compatible_binary: None,
@@ -44,6 +46,7 @@ impl Cli {
             };
             match argument.as_str() {
                 "--list" => cli.list = true,
+                "--list-default" => cli.list_default = true,
                 "--only" => cli.only.push(value("--only")?),
                 "--binary" => cli.binary = Some(PathBuf::from(value("--binary")?)),
                 "--compatible-binary" => {
@@ -79,6 +82,9 @@ impl Cli {
                 _ => bail!("unknown option {argument}\n{}", Self::usage()),
             }
         }
+        if cli.list && cli.list_default {
+            bail!("--list and --list-default are mutually exclusive");
+        }
         if cli.cluster_size == 0 {
             bail!("--cluster-size must be >= 1");
         }
@@ -90,7 +96,7 @@ impl Cli {
 
     pub const fn usage() -> &'static str {
         concat!(
-            "usage: novarocks-system-tests [--list] [--only <exact-name>]... ",
+            "usage: novarocks-system-tests [--list | --list-default] [--only <exact-name>]... ",
             "[--binary <path> [--compatible-binary <path>] ",
             "[--other-island-binary <path>] --config <path> ",
             "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] ",
@@ -110,6 +116,15 @@ mod tests {
         assert_eq!(cli.cluster_size, 3);
         assert_eq!(cli.timeout_secs, 300);
         assert_eq!(cli.launch_profile, LaunchProfile::FaultScenario);
+    }
+
+    #[test]
+    fn parses_distinct_registry_list_modes() {
+        let all = Cli::parse(vec!["--list".to_string()]).expect("list all");
+        assert!(all.list && !all.list_default);
+        let defaults = Cli::parse(vec!["--list-default".to_string()]).expect("list defaults");
+        assert!(!defaults.list && defaults.list_default);
+        assert!(Cli::parse(vec!["--list".to_string(), "--list-default".to_string()]).is_err());
     }
 
     #[test]

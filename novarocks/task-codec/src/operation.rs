@@ -22,10 +22,15 @@
 //! atomicity, no shared revision, and no batch-global success, and this codec
 //! never collapses their outcomes.
 
+use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+use novarocks_execution_contract::task_execution::context_convergence::{
+    QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
+};
 use novarocks_execution_contract::task_execution::creation::{FrozenBytes, TaskCreationInput};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::{
@@ -41,8 +46,13 @@ use novarocks_execution_contract::task_execution::operation::{
     CreateTask, CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters,
     GetFinalTaskInfo, MaxWait, OperationEnvelope, OperationKind, OperationOutcome,
     QueryContextAdmissionTicketReceipt, QueryContextDomainReceipt, QueryContextReceipt,
-    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, ResultByteLimit,
-    ResultPacketSequence, TaskDomainReceipt, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
+    RenewQueryExecutionLease, ResultByteLimit, ResultPacketSequence, TaskDomainReceipt,
+    UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+};
+use novarocks_execution_contract::task_execution::status::{TaskStatus, TaskStatusCursor};
+use novarocks_execution_contract::task_execution::task_convergence::{
+    TaskConvergenceCursor, TaskConvergenceReceipt, TaskConvergenceVersion,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_proto_models::novarocks;
@@ -80,8 +90,9 @@ pub const NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES: u64 =
     (NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES - 1024) as u64;
 use crate::identity::{
-    decode_admission_ticket_id, decode_query_context_ref, decode_task_operation_id,
-    encode_admission_ticket_id, encode_query_context_ref, encode_task_operation_id,
+    decode_admission_ticket_id, decode_query_context_ref, decode_task_identity,
+    decode_task_operation_id, encode_admission_ticket_id, encode_query_context_ref,
+    encode_task_identity, encode_task_operation_id,
 };
 use crate::lease::decode_duration_millis;
 use crate::status::{
@@ -132,6 +143,7 @@ pub struct DecodedCreateTask {
     request: CreateTask,
     input: TaskCreationInput,
     initial_domains: Vec<DecodedTaskDomain>,
+    retained_bytes: usize,
 }
 
 impl DecodedCreateTask {
@@ -156,6 +168,30 @@ impl DecodedCreateTask {
     pub fn into_parts(self) -> (CreateTask, TaskCreationInput) {
         (self.request, self.input)
     }
+
+    /// The exact encoded Create item size, before ownership moves to Worker.
+    pub fn into_parts_with_retained_bytes(self) -> (CreateTask, TaskCreationInput, usize) {
+        (self.request, self.input, self.retained_bytes)
+    }
+}
+
+/// Checks the private canonical carrier before its codec owner allocates it.
+fn check_canonical_assignment_size(
+    assignment: &novarocks::TaskAssignment,
+    frozen_bytes: usize,
+    budget: TransportBudget,
+    path: FieldPath,
+) -> Result<(), ProtocolError> {
+    if frozen_bytes
+        .checked_add(assignment.encoded_len())
+        .is_none_or(|total| total > budget.max_descriptor_encoded_bytes())
+    {
+        return Err(out_of_range(
+            path,
+            "canonical creation plan carriers exceed the hard limit",
+        ));
+    }
+    Ok(())
 }
 
 /// A decoded update request, with its typed domain content retained.
@@ -333,6 +369,7 @@ pub enum DecodedOperation {
     UpdateQueryContext(DecodedUpdateQueryContext),
     CancelTask(CancelTask),
     AbortQueryContext(AbortQueryContext),
+    QuiesceQueryContext(QuiesceQueryContext),
     ReleaseQueryContext(ReleaseQueryContext),
 }
 
@@ -359,6 +396,7 @@ impl DecodedOperation {
             Self::UpdateQueryContext(request) => request.envelope(),
             Self::CancelTask(request) => request.envelope(),
             Self::AbortQueryContext(request) => request.envelope(),
+            Self::QuiesceQueryContext(request) => request.envelope(),
             Self::ReleaseQueryContext(request) => request.envelope(),
         }
     }
@@ -491,13 +529,17 @@ pub fn decode_operation(
             // The static fragment is bounded above but deliberately not
             // decoded here: only the backend that wins this identity's
             // creation interprets it.
-            let metadata = novarocks::CreationMetadata::decode(create.creation_metadata.clone())
-                .map_err(|error| {
-                    invalid(
-                        create_path.clone().field("creation_metadata"),
-                        format!("invalid creation metadata: {error}"),
-                    )
-                })?;
+            // Each retained item owns only its bounded fields. Prost Bytes can
+            // otherwise keep a whole multi-item request allocation alive.
+            let metadata = novarocks::CreationMetadata::decode(
+                prost::bytes::Bytes::copy_from_slice(create.creation_metadata.as_ref()),
+            )
+            .map_err(|error| {
+                invalid(
+                    create_path.clone().field("creation_metadata"),
+                    format!("invalid creation metadata: {error}"),
+                )
+            })?;
             let context = metadata.query_context.as_ref().ok_or_else(|| {
                 missing(
                     create_path
@@ -539,6 +581,15 @@ pub fn decode_operation(
                     "create requires a task assignment",
                 )
             })?;
+            check_canonical_assignment_size(
+                &assignment,
+                create.frozen_fragment.len(),
+                TransportBudget::DEFAULT,
+                create_path
+                    .clone()
+                    .field("creation_metadata")
+                    .field("assignment"),
+            )?;
             let assignment = decode_task_assignment(
                 assignment,
                 &descriptor,
@@ -565,13 +616,16 @@ pub fn decode_operation(
             )
             .map_err(|error| invalid(create_path, error.to_string()))?;
             let input = TaskCreationInput::new(
-                FrozenBytes::freeze(create.frozen_fragment.clone()),
+                FrozenBytes::freeze(prost::bytes::Bytes::copy_from_slice(
+                    create.frozen_fragment.as_ref(),
+                )),
                 Box::new(assignment),
             );
             Ok(DecodedOperation::CreateTask(DecodedCreateTask {
                 request,
                 input,
                 initial_domains,
+                retained_bytes: src.encoded_len(),
             }))
         }
         novarocks::task_operation::Operation::UpdateTask(update) => {
@@ -666,6 +720,24 @@ pub fn decode_operation(
             let context = decode_query_context_ref(context, release_path)?;
             Ok(DecodedOperation::ReleaseQueryContext(
                 ReleaseQueryContext::new(envelope.operation_id(), context),
+            ))
+        }
+        novarocks::task_operation::Operation::QuiesceQueryContext(quiesce) => {
+            let request_path = path.clone().field("quiesce_query_context");
+            let envelope = decode_envelope(
+                envelope_src,
+                OperationKind::QuiesceQueryContext,
+                path.field("envelope"),
+            )?;
+            let context = quiesce.query_context.as_ref().ok_or_else(|| {
+                missing(
+                    request_path.clone().field("query_context"),
+                    "quiesce requires a query context reference",
+                )
+            })?;
+            let context = decode_query_context_ref(context, request_path.field("query_context"))?;
+            Ok(DecodedOperation::QuiesceQueryContext(
+                QuiesceQueryContext::new(envelope.operation_id(), context),
             ))
         }
     }
@@ -1026,6 +1098,7 @@ fn is_small_control(operation: &DecodedOperation) -> bool {
         },
         DecodedOperation::CancelTask(_)
         | DecodedOperation::AbortQueryContext(_)
+        | DecodedOperation::QuiesceQueryContext(_)
         | DecodedOperation::ReleaseQueryContext(_) => true,
     }
 }
@@ -1072,6 +1145,9 @@ pub fn decode_control_operation_batch(
             }
             novarocks::task_control_operation::Control::ReleaseQueryContext(request) => {
                 novarocks::task_operation::Operation::ReleaseQueryContext(request.clone())
+            }
+            novarocks::task_control_operation::Control::QuiesceQueryContext(request) => {
+                novarocks::task_operation::Operation::QuiesceQueryContext(request.clone())
             }
         };
         operations.push(decode_operation(
@@ -1122,6 +1198,10 @@ fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, Proto
         Ok(novarocks::TaskOperationOutcome::ResourceExhausted) => {
             Ok(OperationOutcome::ResourceExhausted)
         }
+        Ok(novarocks::TaskOperationOutcome::NotReady) => Ok(OperationOutcome::NotReady),
+        Ok(novarocks::TaskOperationOutcome::PreparationBusy) => {
+            Ok(OperationOutcome::PreparationBusy)
+        }
         Ok(novarocks::TaskOperationOutcome::AdmissionTicketStillActive) => {
             Ok(OperationOutcome::AdmissionTicketStillActive)
         }
@@ -1161,6 +1241,8 @@ fn encode_outcome(value: OperationOutcome) -> i32 {
         OperationOutcome::TerminalRejected => novarocks::TaskOperationOutcome::TerminalRejected,
         OperationOutcome::Gone => novarocks::TaskOperationOutcome::Gone,
         OperationOutcome::ResourceExhausted => novarocks::TaskOperationOutcome::ResourceExhausted,
+        OperationOutcome::NotReady => novarocks::TaskOperationOutcome::NotReady,
+        OperationOutcome::PreparationBusy => novarocks::TaskOperationOutcome::PreparationBusy,
         OperationOutcome::AdmissionTicketStillActive => {
             novarocks::TaskOperationOutcome::AdmissionTicketStillActive
         }
@@ -1172,6 +1254,7 @@ fn decode_context_state(value: i32, path: FieldPath) -> Result<QueryContextState
     match novarocks::QueryContextState::try_from(value) {
         Ok(novarocks::QueryContextState::Establishing) => Ok(QueryContextState::Establishing),
         Ok(novarocks::QueryContextState::Active) => Ok(QueryContextState::Active),
+        Ok(novarocks::QueryContextState::Quiescing) => Ok(QueryContextState::Quiescing),
         Ok(novarocks::QueryContextState::Releasing) => Ok(QueryContextState::Releasing),
         Ok(novarocks::QueryContextState::Aborting) => Ok(QueryContextState::Aborting),
         Ok(novarocks::QueryContextState::TerminalRetained) => {
@@ -1195,6 +1278,7 @@ fn encode_context_state(value: QueryContextState) -> Option<i32> {
         QueryContextState::Absent => return None,
         QueryContextState::Establishing => novarocks::QueryContextState::Establishing,
         QueryContextState::Active => novarocks::QueryContextState::Active,
+        QueryContextState::Quiescing => novarocks::QueryContextState::Quiescing,
         QueryContextState::Releasing => novarocks::QueryContextState::Releasing,
         QueryContextState::Aborting => novarocks::QueryContextState::Aborting,
         QueryContextState::TerminalRetained => novarocks::QueryContextState::TerminalRetained,
@@ -1484,6 +1568,89 @@ pub fn encode_credential_receipt(
 /// the projection belongs to the participant's owner, and this codec's job is
 /// to carry the value it produced without inventing an empty one for a
 /// release that had nothing to seal.
+pub fn encode_quiesce_ack(
+    value: &QuiesceQueryContextReceipt,
+) -> Option<novarocks::QuiesceQueryContextAck> {
+    Some(novarocks::QuiesceQueryContextAck {
+        query_context: Some(encode_query_context_ref(value.context())),
+        fence_version: value.fence_version(),
+        accepted_tasks: value
+            .accepted_tasks()
+            .iter()
+            .copied()
+            .map(encode_task_identity)
+            .collect(),
+        state: encode_context_state(value.state())?,
+    })
+}
+
+pub fn decode_quiesce_ack(
+    src: &novarocks::QuiesceQueryContextAck,
+    path: FieldPath,
+) -> Result<QuiesceQueryContextReceipt, ProtocolError> {
+    let context = src.query_context.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("query_context"),
+            "quiesce acknowledgement requires a query context reference",
+        )
+    })?;
+    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
+    if src.fence_version == 0 {
+        return Err(out_of_range(
+            path.clone().field("fence_version"),
+            "quiesce fence version must be positive",
+        ));
+    }
+    if src.accepted_tasks.len() > TransportBudget::DEFAULT.max_tasks_per_context() {
+        return Err(out_of_range(
+            path.clone().field("accepted_tasks"),
+            "quiesce membership exceeds the context task bound",
+        ));
+    }
+    let tasks = src
+        .accepted_tasks
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            decode_task_identity(value, path.clone().field("accepted_tasks").index(index))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if tasks.iter().any(|identity| {
+        identity.query_execution_id() != context.query_execution_id()
+            || identity.backend_process_id() != context.backend_process_id()
+    }) {
+        return Err(invalid(
+            path.clone().field("accepted_tasks"),
+            "quiesce task identity belongs to another context",
+        ));
+    }
+    if tasks.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(invalid(
+            path.clone().field("accepted_tasks"),
+            "quiesce membership must be sorted and unique",
+        ));
+    }
+    let state = decode_context_state(src.state, path.clone().field("state"))?;
+    if !matches!(
+        state,
+        QueryContextState::Quiescing
+            | QueryContextState::Releasing
+            | QueryContextState::Aborting
+            | QueryContextState::TerminalRetained
+    ) {
+        return Err(invalid(
+            path.field("state"),
+            "quiesce acknowledgement requires a closing state",
+        ));
+    }
+    Ok(QuiesceQueryContextReceipt::new(
+        context,
+        src.fence_version,
+        tasks,
+        state,
+    ))
+}
+
 pub fn encode_release_ack(
     context: QueryContextRef,
     outcome: ReleaseOutcome,
@@ -1670,6 +1837,17 @@ pub fn encode_release_query_context(request: ReleaseQueryContext) -> novarocks::
     }
 }
 
+pub fn encode_quiesce_query_context(request: QuiesceQueryContext) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(novarocks::task_operation::Operation::QuiesceQueryContext(
+            novarocks::QuiesceQueryContextRequest {
+                query_context: Some(encode_query_context_ref(request.context())),
+            },
+        )),
+    }
+}
+
 /// Encodes one worker admission ticket acquisition.
 pub fn encode_acquire_query_context_admission_ticket(
     request: AcquireQueryContextAdmissionTicket,
@@ -1831,6 +2009,9 @@ pub fn encode_control_operation_batch(
             Some(novarocks::task_operation::Operation::ReleaseQueryContext(request)) => {
                 novarocks::task_control_operation::Control::ReleaseQueryContext(request)
             }
+            Some(novarocks::task_operation::Operation::QuiesceQueryContext(request)) => {
+                novarocks::task_control_operation::Control::QuiesceQueryContext(request)
+            }
             Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(_))
             | Some(novarocks::task_operation::Operation::CreateTask(_))
             | Some(novarocks::task_operation::Operation::UpdateTask(_))
@@ -1957,6 +2138,20 @@ pub fn decode_task_domain_receipt(
                 progression,
             })
         }
+        novarocks::task_domain_receipt::Receipt::CloseExchangeDestination(scalar) => {
+            let accepted_version =
+                DomainVersion::new(scalar.accepted_version).map_err(|error| {
+                    invalid(
+                        path.field("close_exchange_destination")
+                            .field("accepted_version"),
+                        error.to_string(),
+                    )
+                })?;
+            Ok(TaskDomainReceipt::CloseExchangeDestination {
+                accepted_version,
+                progression,
+            })
+        }
     }
 }
 
@@ -2013,7 +2208,8 @@ pub fn encode_task_domain_receipt(
     let progression = encode_accepted_progression(match value {
         Receipt::SplitAssignment { progression, .. }
         | Receipt::TaskDynamicFilter { progression, .. }
-        | Receipt::OpenExchangeEdges { progression, .. } => *progression,
+        | Receipt::OpenExchangeEdges { progression, .. }
+        | Receipt::CloseExchangeDestination { progression, .. } => *progression,
     })?;
     let receipt = match value {
         Receipt::SplitAssignment { nodes, .. } => {
@@ -2041,6 +2237,13 @@ pub fn encode_task_domain_receipt(
         } => novarocks::task_domain_receipt::Receipt::OpenExchangeEdges(
             novarocks::OpenExchangeEdgesReceipt {
                 opened_edge_ids: opened.iter().map(|edge| edge.get()).collect(),
+                accepted_version: accepted_version.get(),
+            },
+        ),
+        Receipt::CloseExchangeDestination {
+            accepted_version, ..
+        } => novarocks::task_domain_receipt::Receipt::CloseExchangeDestination(
+            novarocks::ScalarDomainReceipt {
                 accepted_version: accepted_version.get(),
             },
         ),
@@ -2373,6 +2576,7 @@ pub fn encode_status_event(
         event: Some(novarocks::task_status_stream_event::Event::TaskStatus(
             crate::status::encode_task_status(value),
         )),
+        source_revision: None,
     }
 }
 
@@ -2386,6 +2590,7 @@ pub fn encode_context_convergence_event(
                 crate::context_convergence::encode_query_context_convergence_receipt(value),
             ),
         ),
+        source_revision: None,
     }
 }
 
@@ -2397,6 +2602,7 @@ pub fn encode_task_gone_event(identity: TaskIdentity) -> novarocks::TaskStatusSt
                 identity: Some(crate::identity::encode_task_identity(identity)),
             },
         )),
+        source_revision: None,
     }
 }
 
@@ -2405,6 +2611,12 @@ pub fn decode_status_event(
     src: &novarocks::TaskStatusStreamEvent,
     path: FieldPath,
 ) -> Result<StatusStreamEvent, ProtocolError> {
+    if src.source_revision.is_some() {
+        return Err(invalid(
+            path.clone().field("source_revision"),
+            "covered observations require the covered decoder",
+        ));
+    }
     let event = src
         .event
         .as_ref()
@@ -2427,6 +2639,10 @@ pub fn decode_status_event(
         novarocks::task_status_stream_event::Event::ContextConvergence(_) => Err(invalid(
             path.field("context_convergence"),
             "context convergence events require the convergence-aware decoder",
+        )),
+        _ => Err(invalid(
+            path,
+            "covered observations require the covered decoder",
         )),
     }
 }
@@ -2453,6 +2669,12 @@ pub fn decode_context_aware_status_event(
     src: &novarocks::TaskStatusStreamEvent,
     path: FieldPath,
 ) -> Result<ContextAwareStatusStreamEvent, ProtocolError> {
+    if src.source_revision.is_some() {
+        return Err(invalid(
+            path.clone().field("source_revision"),
+            "covered observations require the covered decoder",
+        ));
+    }
     let event = src
         .event
         .as_ref()
@@ -2480,6 +2702,10 @@ pub fn decode_context_aware_status_event(
                 )?,
             ))
         }
+        _ => Err(invalid(
+            path,
+            "covered observations require the covered decoder",
+        )),
     }
 }
 
@@ -2502,6 +2728,10 @@ pub fn encode_subscribe_task_status(
             .map(crate::status::encode_task_status_cursor)
             .collect(),
         context_convergence_cursor: None,
+        generation: 0,
+        task_convergence_cursors: Vec::new(),
+        required_identities: Vec::new(),
+        quiesce_cursor: None,
     })
 }
 
@@ -2554,6 +2784,16 @@ pub fn decode_context_aware_subscribe_task_status(
     ),
     ProtocolError,
 >{
+    if src.generation != 0
+        || !src.task_convergence_cursors.is_empty()
+        || !src.required_identities.is_empty()
+        || src.quiesce_cursor.is_some()
+    {
+        return Err(invalid(
+            path.clone(),
+            "covered subscription fields require the covered decoder",
+        ));
+    }
     let context = src.query_context.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("query_context"),
@@ -2585,4 +2825,673 @@ pub fn decode_context_aware_subscribe_task_status(
         })
         .transpose()?;
     Ok((context, cursors, context_convergence_cursor))
+}
+
+/// The optional quiesce fence already observed by one reconnecting FE.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct QuiesceObservationCursor {
+    pub context: QueryContextRef,
+    pub fence_version: Option<NonZeroU64>,
+}
+
+/// A validated covered subscription request. Future versions are checked by
+/// the Worker source against its latest retained facts after decoding.
+#[derive(Clone, Debug)]
+pub struct DecodedCoveredSubscription {
+    pub context: QueryContextRef,
+    pub generation: NonZeroU64,
+    pub status_cursors: Vec<TaskStatusCursor>,
+    pub task_convergence_cursors: Vec<TaskConvergenceCursor>,
+    pub context_cursor: Option<QueryContextConvergenceCursor>,
+    pub quiesce_cursor: Option<QuiesceObservationCursor>,
+    pub required_identities: Vec<TaskIdentity>,
+}
+
+fn check_covered_identity(
+    context: QueryContextRef,
+    identity: TaskIdentity,
+    path: FieldPath,
+) -> Result<(), ProtocolError> {
+    identity
+        .verify_query_context(context)
+        .map_err(|error| invalid(path, error.to_string()))
+}
+
+/// Decodes the covered mode of the existing subscription RPC.
+pub fn decode_covered_subscribe_task_status(
+    src: &novarocks::SubscribeTaskStatusRequest,
+    path: FieldPath,
+) -> Result<DecodedCoveredSubscription, ProtocolError> {
+    let context = src.query_context.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("query_context"),
+            "subscription requires a context",
+        )
+    })?;
+    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
+    let generation = NonZeroU64::new(src.generation).ok_or_else(|| {
+        invalid(
+            path.clone().field("generation"),
+            "covered generation must be nonzero",
+        )
+    })?;
+    let bound = crate::status::MAX_SUBSCRIPTION_CURSORS;
+    if src.cursors.len() > bound
+        || src.task_convergence_cursors.len() > bound
+        || src.required_identities.len() > bound
+    {
+        return Err(out_of_range(
+            path.clone(),
+            "covered subscription exceeds task bound",
+        ));
+    }
+    let mut union = BTreeSet::new();
+    let mut status_seen = BTreeSet::new();
+    let mut status_cursors = Vec::with_capacity(src.cursors.len());
+    for (index, wire) in src.cursors.iter().enumerate() {
+        let item_path = path.clone().field("cursors").index(index);
+        let cursor = crate::status::decode_task_status_cursor(wire, item_path.clone())?;
+        check_covered_identity(context, cursor.identity(), item_path.clone())?;
+        if !status_seen.insert(cursor.identity()) {
+            return Err(invalid(item_path, "duplicate task status cursor"));
+        }
+        union.insert(cursor.identity());
+        status_cursors.push(cursor);
+    }
+    let mut convergence_seen = BTreeSet::new();
+    let mut task_convergence_cursors = Vec::with_capacity(src.task_convergence_cursors.len());
+    for (index, wire) in src.task_convergence_cursors.iter().enumerate() {
+        let item_path = path.clone().field("task_convergence_cursors").index(index);
+        let identity = wire.identity.as_ref().ok_or_else(|| {
+            missing(
+                item_path.clone().field("identity"),
+                "convergence cursor requires identity",
+            )
+        })?;
+        let identity = decode_task_identity(identity, item_path.clone().field("identity"))?;
+        check_covered_identity(context, identity, item_path.clone())?;
+        if !convergence_seen.insert(identity) {
+            return Err(invalid(item_path, "duplicate task convergence cursor"));
+        }
+        let cursor = if wire.current_version == 0 {
+            TaskConvergenceCursor::unobserved(identity)
+        } else {
+            let version = TaskConvergenceVersion::new(wire.current_version).map_err(|error| {
+                invalid(
+                    item_path.clone().field("current_version"),
+                    error.to_string(),
+                )
+            })?;
+            TaskConvergenceCursor::at(identity, version)
+        };
+        union.insert(identity);
+        task_convergence_cursors.push(cursor);
+    }
+    let mut required_seen = BTreeSet::new();
+    let mut required_identities = Vec::with_capacity(src.required_identities.len());
+    for (index, wire) in src.required_identities.iter().enumerate() {
+        let item_path = path.clone().field("required_identities").index(index);
+        let identity = decode_task_identity(wire, item_path.clone())?;
+        check_covered_identity(context, identity, item_path.clone())?;
+        if !required_seen.insert(identity) {
+            return Err(invalid(item_path, "duplicate required identity"));
+        }
+        union.insert(identity);
+        required_identities.push(identity);
+    }
+    if union.len() > bound {
+        return Err(out_of_range(
+            path.clone(),
+            "covered target union exceeds task bound",
+        ));
+    }
+    let context_cursor = src
+        .context_convergence_cursor
+        .as_ref()
+        .map(|wire| {
+            crate::context_convergence::decode_query_context_convergence_cursor(
+                wire,
+                path.clone().field("context_convergence_cursor"),
+            )
+        })
+        .transpose()?;
+    if context_cursor.is_some_and(|cursor| cursor.context() != context) {
+        return Err(invalid(
+            path.clone().field("context_convergence_cursor"),
+            "context convergence cursor names another context",
+        ));
+    }
+    let quiesce_cursor = src
+        .quiesce_cursor
+        .as_ref()
+        .map(|wire| {
+            let cursor_path = path.clone().field("quiesce_cursor");
+            let cursor_context = wire.query_context.as_ref().ok_or_else(|| {
+                missing(
+                    cursor_path.clone().field("query_context"),
+                    "quiesce cursor requires context",
+                )
+            })?;
+            let cursor_context = decode_query_context_ref(
+                cursor_context,
+                cursor_path.clone().field("query_context"),
+            )?;
+            if cursor_context != context {
+                return Err(invalid(cursor_path, "quiesce cursor names another context"));
+            }
+            Ok(QuiesceObservationCursor {
+                context: cursor_context,
+                fence_version: NonZeroU64::new(wire.fence_version),
+            })
+        })
+        .transpose()?;
+    Ok(DecodedCoveredSubscription {
+        context,
+        generation,
+        status_cursors,
+        task_convergence_cursors,
+        context_cursor,
+        quiesce_cursor,
+        required_identities,
+    })
+}
+
+/// Encodes a typed covered request and revalidates its identity relationships.
+pub fn encode_covered_subscribe_task_status(
+    request: &DecodedCoveredSubscription,
+) -> Result<novarocks::SubscribeTaskStatusRequest, ProtocolError> {
+    let wire = novarocks::SubscribeTaskStatusRequest {
+        query_context: Some(encode_query_context_ref(request.context)),
+        cursors: request
+            .status_cursors
+            .iter()
+            .copied()
+            .map(crate::status::encode_task_status_cursor)
+            .collect(),
+        context_convergence_cursor: request
+            .context_cursor
+            .map(crate::context_convergence::encode_query_context_convergence_cursor),
+        generation: request.generation.get(),
+        task_convergence_cursors: request
+            .task_convergence_cursors
+            .iter()
+            .map(|cursor| novarocks::TaskConvergenceCursor {
+                identity: Some(encode_task_identity(cursor.identity())),
+                current_version: cursor
+                    .current_version()
+                    .map_or(0, TaskConvergenceVersion::get),
+            })
+            .collect(),
+        required_identities: request
+            .required_identities
+            .iter()
+            .copied()
+            .map(encode_task_identity)
+            .collect(),
+        quiesce_cursor: request
+            .quiesce_cursor
+            .map(|cursor| novarocks::QuiesceQueryContextCursor {
+                query_context: Some(encode_query_context_ref(cursor.context)),
+                fence_version: cursor.fence_version.map_or(0, NonZeroU64::get),
+            }),
+    };
+    decode_covered_subscribe_task_status(&wire, FieldPath::root("covered_subscribe_task_status"))?;
+    Ok(wire)
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct CoveredCatchUpComplete {
+    pub generation: u64,
+    pub initial_cut: u64,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct CoveredObservationBookmark {
+    pub generation: u64,
+    pub sequence: u64,
+    pub covered_prefix: u64,
+    pub source_cut: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoveredStatusStreamFact {
+    Status(TaskStatus),
+    Gone(TaskIdentity),
+    ContextConvergence(QueryContextConvergenceReceipt),
+    TaskConvergence(TaskConvergenceReceipt),
+    Quiesce(QuiesceQueryContextReceipt),
+    StatusUnchanged(TaskIdentity),
+    TaskConvergenceUnchanged(TaskIdentity),
+    Unknown(TaskIdentity),
+    CatchUpComplete(CoveredCatchUpComplete),
+    Bookmark(CoveredObservationBookmark),
+}
+
+/// `source_revision` is present only for a live fact. A catch-up fact has no
+/// revision of its own; CatchUpComplete and Bookmark carry their explicit cut.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoveredStatusStreamEvent {
+    pub fact: CoveredStatusStreamFact,
+    pub source_revision: Option<u64>,
+}
+
+fn decode_covered_identity(
+    wire: Option<&novarocks::TaskIdentity>,
+    path: FieldPath,
+) -> Result<TaskIdentity, ProtocolError> {
+    let wire = wire.ok_or_else(|| missing(path.clone(), "observation requires task identity"))?;
+    decode_task_identity(wire, path)
+}
+
+/// Decodes a covered observation without accepting zero/default evidence.
+pub fn decode_covered_status_event(
+    src: &novarocks::TaskStatusStreamEvent,
+    path: FieldPath,
+) -> Result<CoveredStatusStreamEvent, ProtocolError> {
+    let event = src
+        .event
+        .as_ref()
+        .ok_or_else(|| missing(path.clone(), "covered observation requires a body"))?;
+    if src.source_revision == Some(0) {
+        return Err(invalid(
+            path.clone().field("source_revision"),
+            "live revision must be nonzero",
+        ));
+    }
+    let fact = match event {
+        novarocks::task_status_stream_event::Event::TaskStatus(value) => {
+            CoveredStatusStreamFact::Status(crate::status::decode_task_status(
+                value,
+                path.clone().field("task_status"),
+            )?)
+        }
+        novarocks::task_status_stream_event::Event::TaskGone(value) => {
+            CoveredStatusStreamFact::Gone(decode_covered_identity(
+                value.identity.as_ref(),
+                path.clone().field("task_gone").field("identity"),
+            )?)
+        }
+        novarocks::task_status_stream_event::Event::ContextConvergence(value) => {
+            CoveredStatusStreamFact::ContextConvergence(
+                crate::context_convergence::decode_query_context_convergence_receipt(
+                    value,
+                    path.clone().field("context_convergence"),
+                )?,
+            )
+        }
+        novarocks::task_status_stream_event::Event::TaskConvergence(value) => {
+            let item_path = path.clone().field("task_convergence");
+            let identity = decode_covered_identity(
+                value.identity.as_ref(),
+                item_path.clone().field("identity"),
+            )?;
+            let version = TaskConvergenceVersion::new(value.version)
+                .map_err(|error| invalid(item_path.field("version"), error.to_string()))?;
+            CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
+                identity, version,
+            ))
+        }
+        novarocks::task_status_stream_event::Event::Quiesce(value) => {
+            let ack = novarocks::QuiesceQueryContextAck {
+                query_context: value.query_context.clone(),
+                fence_version: value.fence_version,
+                accepted_tasks: value.accepted_tasks.clone(),
+                state: value.state,
+            };
+            CoveredStatusStreamFact::Quiesce(decode_quiesce_ack(
+                &ack,
+                path.clone().field("quiesce"),
+            )?)
+        }
+        novarocks::task_status_stream_event::Event::TaskStatusUnchanged(value) => {
+            CoveredStatusStreamFact::StatusUnchanged(decode_covered_identity(
+                value.identity.as_ref(),
+                path.clone()
+                    .field("task_status_unchanged")
+                    .field("identity"),
+            )?)
+        }
+        novarocks::task_status_stream_event::Event::TaskConvergenceUnchanged(value) => {
+            CoveredStatusStreamFact::TaskConvergenceUnchanged(decode_covered_identity(
+                value.identity.as_ref(),
+                path.clone()
+                    .field("task_convergence_unchanged")
+                    .field("identity"),
+            )?)
+        }
+        novarocks::task_status_stream_event::Event::TaskUnknown(value) => {
+            CoveredStatusStreamFact::Unknown(decode_covered_identity(
+                value.identity.as_ref(),
+                path.clone().field("task_unknown").field("identity"),
+            )?)
+        }
+        novarocks::task_status_stream_event::Event::CatchUpComplete(value) => {
+            if value.generation == 0 {
+                return Err(invalid(
+                    path.clone().field("catch_up_complete").field("generation"),
+                    "catch-up generation must be nonzero",
+                ));
+            }
+            CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
+                generation: value.generation,
+                initial_cut: value.initial_cut,
+            })
+        }
+        novarocks::task_status_stream_event::Event::Bookmark(value) => {
+            if value.generation == 0
+                || value.sequence == 0
+                || value.covered_prefix > value.source_cut
+            {
+                return Err(invalid(
+                    path.clone().field("bookmark"),
+                    "bookmark requires nonzero generation and sequence, with covered prefix at or below cut",
+                ));
+            }
+            CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
+                generation: value.generation,
+                sequence: value.sequence,
+                covered_prefix: value.covered_prefix,
+                source_cut: value.source_cut,
+            })
+        }
+    };
+    if matches!(
+        fact,
+        CoveredStatusStreamFact::StatusUnchanged(_)
+            | CoveredStatusStreamFact::TaskConvergenceUnchanged(_)
+            | CoveredStatusStreamFact::Unknown(_)
+            | CoveredStatusStreamFact::CatchUpComplete(_)
+            | CoveredStatusStreamFact::Bookmark(_)
+    ) && src.source_revision.is_some()
+    {
+        return Err(invalid(
+            path.field("source_revision"),
+            "catch-up marker and bookmark frames cannot carry a live revision",
+        ));
+    }
+    Ok(CoveredStatusStreamEvent {
+        fact,
+        source_revision: src.source_revision,
+    })
+}
+
+/// Encodes a covered frame and validates the result through the same decoder.
+pub fn encode_covered_status_event(
+    value: &CoveredStatusStreamEvent,
+) -> Result<novarocks::TaskStatusStreamEvent, ProtocolError> {
+    use novarocks::task_status_stream_event::Event;
+    let event = match &value.fact {
+        CoveredStatusStreamFact::Status(status) => {
+            Event::TaskStatus(crate::status::encode_task_status(status))
+        }
+        CoveredStatusStreamFact::Gone(identity) => Event::TaskGone(novarocks::TaskGone {
+            identity: Some(encode_task_identity(*identity)),
+        }),
+        CoveredStatusStreamFact::ContextConvergence(receipt) => Event::ContextConvergence(
+            crate::context_convergence::encode_query_context_convergence_receipt(*receipt),
+        ),
+        CoveredStatusStreamFact::TaskConvergence(receipt) => {
+            Event::TaskConvergence(novarocks::TaskConvergenceReceipt {
+                identity: Some(encode_task_identity(receipt.identity())),
+                version: receipt.version().get(),
+            })
+        }
+        CoveredStatusStreamFact::Quiesce(receipt) => {
+            let ack = encode_quiesce_ack(receipt).ok_or_else(|| {
+                invalid(
+                    FieldPath::root("covered_status_event").field("quiesce"),
+                    "quiesce requires a closing state",
+                )
+            })?;
+            Event::Quiesce(novarocks::QuiesceQueryContextObservation {
+                query_context: ack.query_context,
+                fence_version: ack.fence_version,
+                accepted_tasks: ack.accepted_tasks,
+                state: ack.state,
+            })
+        }
+        CoveredStatusStreamFact::StatusUnchanged(identity) => {
+            Event::TaskStatusUnchanged(novarocks::TaskStatusUnchanged {
+                identity: Some(encode_task_identity(*identity)),
+            })
+        }
+        CoveredStatusStreamFact::TaskConvergenceUnchanged(identity) => {
+            Event::TaskConvergenceUnchanged(novarocks::TaskConvergenceUnchanged {
+                identity: Some(encode_task_identity(*identity)),
+            })
+        }
+        CoveredStatusStreamFact::Unknown(identity) => Event::TaskUnknown(novarocks::TaskUnknown {
+            identity: Some(encode_task_identity(*identity)),
+        }),
+        CoveredStatusStreamFact::CatchUpComplete(value) => {
+            Event::CatchUpComplete(novarocks::CatchUpComplete {
+                generation: value.generation,
+                initial_cut: value.initial_cut,
+            })
+        }
+        CoveredStatusStreamFact::Bookmark(value) => {
+            Event::Bookmark(novarocks::ObservationBookmark {
+                generation: value.generation,
+                sequence: value.sequence,
+                covered_prefix: value.covered_prefix,
+                source_cut: value.source_cut,
+            })
+        }
+    };
+    let wire = novarocks::TaskStatusStreamEvent {
+        event: Some(event),
+        source_revision: value.source_revision,
+    };
+    decode_covered_status_event(&wire, FieldPath::root("covered_status_event"))?;
+    Ok(wire)
+}
+
+#[cfg(test)]
+mod covered_wire_tests {
+    use super::*;
+    use novarocks_execution_contract::task_execution::context_convergence::{
+        QueryContextConvergenceState, QueryContextConvergenceVersion,
+    };
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+
+    fn context_and_task() -> (QueryContextRef, TaskIdentity) {
+        let execution =
+            QueryExecutionId::new(QueryId::new(13, 14), AttemptId::new(1).unwrap()).unwrap();
+        let backend = BackendProcessId::new_v7();
+        (
+            QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend),
+            TaskIdentity::new(
+                execution,
+                StageId::new(1).unwrap(),
+                TaskId::new(2).unwrap(),
+                backend,
+            ),
+        )
+    }
+
+    fn request(context: QueryContextRef, task: TaskIdentity) -> DecodedCoveredSubscription {
+        DecodedCoveredSubscription {
+            context,
+            generation: NonZeroU64::new(7).unwrap(),
+            status_cursors: vec![TaskStatusCursor::unobserved(task)],
+            task_convergence_cursors: vec![TaskConvergenceCursor::unobserved(task)],
+            context_cursor: Some(QueryContextConvergenceCursor::unobserved(context)),
+            quiesce_cursor: Some(QuiesceObservationCursor {
+                context,
+                fence_version: None,
+            }),
+            required_identities: vec![task],
+        }
+    }
+
+    #[test]
+    fn covered_request_roundtrip_and_hybrid_rejection() {
+        let (context, task) = context_and_task();
+        let wire = encode_covered_subscribe_task_status(&request(context, task)).unwrap();
+        let decoded =
+            decode_covered_subscribe_task_status(&wire, FieldPath::root("covered_request"))
+                .unwrap();
+        assert_eq!(decoded.generation.get(), 7);
+        assert_eq!(decoded.status_cursors[0].identity(), task);
+        assert_eq!(decoded.task_convergence_cursors[0].identity(), task);
+        assert_eq!(decoded.quiesce_cursor.unwrap().context, context);
+        assert!(
+            decode_context_aware_subscribe_task_status(&wire, FieldPath::root("legacy_request"),)
+                .is_err()
+        );
+        let mut zero = wire.clone();
+        zero.generation = 0;
+        assert!(decode_covered_subscribe_task_status(&zero, FieldPath::root("zero")).is_err());
+        let legacy = encode_subscribe_task_status(context, &[]).unwrap();
+        assert!(decode_covered_subscribe_task_status(&legacy, FieldPath::root("legacy")).is_err());
+    }
+
+    #[test]
+    fn covered_request_rejects_identity_context_and_duplicate_targets() {
+        let (context, task) = context_and_task();
+        let (other_context, other_task) = context_and_task();
+        let mut wire = encode_covered_subscribe_task_status(&request(context, task)).unwrap();
+        wire.required_identities
+            .push(encode_task_identity(other_task));
+        assert!(decode_covered_subscribe_task_status(&wire, FieldPath::root("mismatch")).is_err());
+        wire.required_identities.pop();
+        wire.required_identities.push(encode_task_identity(task));
+        assert!(decode_covered_subscribe_task_status(&wire, FieldPath::root("duplicate")).is_err());
+        wire.required_identities.pop();
+        wire.quiesce_cursor.as_mut().unwrap().query_context =
+            Some(encode_query_context_ref(other_context));
+        assert!(
+            decode_covered_subscribe_task_status(&wire, FieldPath::root("quiesce_mismatch"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn covered_frame_roundtrip_and_nonzero_rejections() {
+        let (context, task) = context_and_task();
+        let frames = [
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::Status(TaskStatus::created(task)),
+                source_revision: Some(1),
+            },
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::TaskConvergence(
+                    TaskConvergenceReceipt::actual_stopped(task, TaskConvergenceVersion::FIRST),
+                ),
+                source_revision: Some(2),
+            },
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::ContextConvergence(
+                    QueryContextConvergenceReceipt::new(
+                        context,
+                        QueryContextConvergenceVersion::FIRST,
+                        QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                    ),
+                ),
+                source_revision: Some(3),
+            },
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::Quiesce(QuiesceQueryContextReceipt::new(
+                    context,
+                    1,
+                    vec![task],
+                    QueryContextState::Quiescing,
+                )),
+                source_revision: Some(4),
+            },
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::StatusUnchanged(task),
+                source_revision: None,
+            },
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::TaskConvergenceUnchanged(task),
+                source_revision: None,
+            },
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::Unknown(task),
+                source_revision: None,
+            },
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::Gone(task),
+                source_revision: Some(5),
+            },
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
+                    generation: 7,
+                    initial_cut: 4,
+                }),
+                source_revision: None,
+            },
+            CoveredStatusStreamEvent {
+                fact: CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
+                    generation: 7,
+                    sequence: 1,
+                    covered_prefix: 4,
+                    source_cut: 5,
+                }),
+                source_revision: None,
+            },
+        ];
+        for frame in &frames {
+            let wire = encode_covered_status_event(frame).unwrap();
+            let decoded = decode_covered_status_event(&wire, FieldPath::root("frame")).unwrap();
+            assert_eq!(&decoded, frame);
+        }
+        let mut zero_revision = encode_covered_status_event(&frames[0]).unwrap();
+        zero_revision.source_revision = Some(0);
+        assert!(decode_covered_status_event(&zero_revision, FieldPath::root("zero_rev")).is_err());
+        let mut bad_bookmark = encode_covered_status_event(frames.last().unwrap()).unwrap();
+        bad_bookmark.source_revision = Some(6);
+        assert!(
+            decode_covered_status_event(&bad_bookmark, FieldPath::root("bad_bookmark")).is_err()
+        );
+        let bad_prefix = CoveredStatusStreamEvent {
+            fact: CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
+                generation: 7,
+                sequence: 1,
+                covered_prefix: 6,
+                source_cut: 5,
+            }),
+            source_revision: None,
+        };
+        assert!(encode_covered_status_event(&bad_prefix).is_err());
+    }
+}
+
+#[cfg(test)]
+mod canonical_assignment_size_tests {
+    use super::*;
+
+    #[test]
+    fn noncanonical_unpacked_single_value_cannot_expand_past_plan_carrier_bound() {
+        // Legal unpacked field 3 uses two bytes; canonical packed encoding needs three.
+        let raw_assignment = [0x18, 0x07];
+        let assignment = novarocks::TaskAssignment::decode(raw_assignment.as_slice()).unwrap();
+        let budget = TransportBudget::new(
+            1,
+            16,
+            8,
+            2,
+            32,
+            4,
+            64,
+            1,
+            1,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(6 + raw_assignment.len() <= budget.max_descriptor_encoded_bytes());
+        assert_eq!(assignment.encoded_len(), 3);
+        let path = FieldPath::root("assignment");
+        assert_eq!(
+            check_canonical_assignment_size(&assignment, 6, budget, path.clone())
+                .unwrap_err()
+                .kind(),
+            novarocks_proto_codec::ProtocolErrorKind::OutOfRange
+        );
+        assert!(check_canonical_assignment_size(&assignment, 5, budget, path.clone()).is_ok());
+        assert!(check_canonical_assignment_size(&assignment, usize::MAX, budget, path).is_err());
+    }
 }

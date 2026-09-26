@@ -35,15 +35,27 @@ impl WorkerReceiptOutcome {
     }
 }
 
-/// The two possible results of dispatching one immutable Worker operation.
+/// A rejection before Worker admission has no Worker verdict for this send.
+/// An earlier send of the same operation may still have an unknown outcome.
+/// Its category is carried by native ingress metadata.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum IngressRejection {
+    WaitingCapacity,
+    BodyLimit,
+    UnclassifiedCapacity,
+}
+
+/// The results of dispatching one immutable Worker operation.
 ///
-/// A settled RPC carries a validated Worker verdict. Losing the transport
-/// response leaves the remote effect unknown and authorizes replaying only
-/// that exact request. Observation and destination delivery have separate
-/// event types and cannot enter this decision.
+/// A Worker receipt carries a validated Worker verdict. An ingress refusal
+/// settles only its own send. Losing the transport response leaves the remote
+/// effect unknown and authorizes replaying only that exact request.
+/// Observation and destination delivery have separate event types.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum OperationDispatchResult {
     WorkerReceipt(WorkerReceiptOutcome),
+    IngressRejected(IngressRejection),
+    NonWorkerRejected,
     TransportUnknown,
 }
 
@@ -58,15 +70,21 @@ pub enum FrontendAction {
 }
 
 pub fn frontend_action(result: OperationDispatchResult) -> FrontendAction {
-    let OperationDispatchResult::WorkerReceipt(receipt) = result else {
-        return FrontendAction::RetryExactRequest;
+    let receipt = match result {
+        OperationDispatchResult::WorkerReceipt(receipt) => receipt,
+        // Current Task admission fails this attempt closed. D06 may retry a
+        // provably pre-admission busy response only with a bounded owner.
+        OperationDispatchResult::IngressRejected(_) => return FrontendAction::FailAttempt,
+        OperationDispatchResult::NonWorkerRejected => return FrontendAction::FailAttempt,
+        OperationDispatchResult::TransportUnknown => return FrontendAction::RetryExactRequest,
     };
     match receipt.outcome() {
         OperationOutcome::Accepted | OperationOutcome::Idempotent => FrontendAction::Settled,
         OperationOutcome::OperationTimedOut => FrontendAction::FailOperationClosed,
-        OperationOutcome::ReleaseNotReady | OperationOutcome::AdmissionTicketStillActive => {
-            FrontendAction::RetryAfterProgress
-        }
+        OperationOutcome::ReleaseNotReady
+        | OperationOutcome::AdmissionTicketStillActive
+        | OperationOutcome::NotReady
+        | OperationOutcome::PreparationBusy => FrontendAction::RetryAfterProgress,
         OperationOutcome::ContextTerminalReceipt
         | OperationOutcome::Gone
         | OperationOutcome::TerminalRejected => FrontendAction::StopSendingAndReconcile,
@@ -108,6 +126,16 @@ mod tests {
         );
         assert_eq!(
             frontend_action(receipt(OperationOutcome::ResourceExhausted)),
+            FrontendAction::FailAttempt
+        );
+        assert_eq!(
+            frontend_action(OperationDispatchResult::IngressRejected(
+                IngressRejection::WaitingCapacity,
+            )),
+            FrontendAction::FailAttempt
+        );
+        assert_eq!(
+            frontend_action(OperationDispatchResult::NonWorkerRejected),
             FrontendAction::FailAttempt
         );
         assert_eq!(

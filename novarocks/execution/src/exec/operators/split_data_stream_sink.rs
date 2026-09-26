@@ -241,6 +241,13 @@ impl Operator for SplitDataStreamSinkOperator {
         Ok(())
     }
 
+    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+        for sink in &mut self.sinks {
+            sink.op.activate(state)?;
+        }
+        Ok(())
+    }
+
     fn prepare(&mut self) -> Result<(), String> {
         for sink in &mut self.sinks {
             sink.op.prepare()?;

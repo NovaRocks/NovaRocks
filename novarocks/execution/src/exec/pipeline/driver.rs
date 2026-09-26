@@ -197,8 +197,10 @@ pub struct PipelineDriver {
     state: DriverState,
     blocked_since: Option<(Instant, DriverBlockedKind)>,
     closed: bool,
+    activated: bool,
     schedule_state: Arc<DriverScheduleState>,
     blocked_observable: Option<(Arc<Observable>, u64, Option<DriverBlockDeadline>)>,
+    input_wait_observables: Option<(Arc<Observable>, Arc<Observable>, Arc<Observable>)>,
     pending_finish_state: Option<DriverState>,
     operator_terminal_signal: Option<DriverState>,
 
@@ -451,8 +453,10 @@ impl PipelineDriver {
             state: DriverState::Ready,
             blocked_since: None,
             closed: false,
+            activated: false,
             schedule_state: Arc::new(DriverScheduleState::new()),
             blocked_observable: None,
+            input_wait_observables: None,
             pending_finish_state: None,
             operator_terminal_signal: None,
 
@@ -533,6 +537,12 @@ impl PipelineDriver {
         self.finish_with_state(DriverState::Canceled)
     }
 
+    /// The executor catches a panic around `process`. Route it through the
+    /// same operator cleanup and PendingFinish latch as an ordinary failure.
+    pub(crate) fn fail_after_panic(&mut self, error: String) -> DriverState {
+        self.finish_with_state(DriverState::Failed(error))
+    }
+
     fn fail_operators(&mut self) {
         for op in self.operators.iter_mut() {
             op.on_driver_failure();
@@ -576,6 +586,17 @@ impl PipelineDriver {
                 self.state = DriverState::Running;
             } else {
                 return self.finish_with_state_after_operator_signal(final_state);
+            }
+        }
+
+        if !self.activated {
+            // A queued driver has passed executor admission. Never activate a
+            // prepared driver which was rejected, failed, or cancelled first.
+            self.activated = true;
+            for operator in &mut self.operators {
+                if let Err(error) = operator.activate(&self.runtime_state) {
+                    return self.finish_with_state(DriverState::Failed(error));
+                }
             }
         }
 
@@ -798,15 +819,58 @@ impl PipelineDriver {
         })
     }
 
-    fn source_block_decision_on_worker(&self) -> Result<WorkerBlockDecision, String> {
+    fn source_block_decision_on_worker(&mut self) -> Result<WorkerBlockDecision, String> {
         let before = self.source_observable_on_worker();
-        let generation = before.as_ref().map(|observable| observable.generation());
-        if self.source_ready_on_worker() {
+        let sink = self.terminal_sink_observable_on_worker();
+        let wait = match (&before, &sink) {
+            (Some(source), Some(sink)) if !Arc::ptr_eq(source, sink) => {
+                let reuse = self.input_wait_observables.as_ref().is_some_and(
+                    |(old_source, old_sink, _)| {
+                        Arc::ptr_eq(source, old_source) && Arc::ptr_eq(sink, old_sink)
+                    },
+                );
+                if !reuse {
+                    let combined = Arc::new(Observable::new());
+                    // Forwarding owns only a weak wake target, never the driver.
+                    // Install both callbacks before taking the generation bracket.
+                    for event in [source, sink] {
+                        let weak = Arc::downgrade(&combined);
+                        event.add_observer(Arc::new(move || {
+                            if let Some(combined) = weak.upgrade() {
+                                combined.notify_observers();
+                            }
+                        }));
+                    }
+                    self.input_wait_observables =
+                        Some((Arc::clone(source), Arc::clone(sink), combined));
+                }
+                Some(Arc::clone(
+                    &self.input_wait_observables.as_ref().expect("input wait").2,
+                ))
+            }
+            _ => before.clone(),
+        };
+        let generation = wait.as_ref().map(|observable| observable.generation());
+        let source_generation = before.as_ref().map(|observable| observable.generation());
+        if self.is_finished() || self.source_ready_on_worker() {
             return Ok(WorkerBlockDecision::Runnable);
         }
         let after = self.source_observable_on_worker();
-        match stable_observable_snapshot(before, generation, after) {
-            StableObservableSnapshot::Stable(observable, generation) => {
+        let sink_after = self.terminal_sink_observable_on_worker();
+        if !match (&sink, &sink_after) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        } {
+            return Ok(WorkerBlockDecision::Retry);
+        }
+        match stable_observable_snapshot(before, source_generation, after) {
+            StableObservableSnapshot::Stable(_, _) => {
+                let observable = wait.expect("stable source wait");
+                let generation = generation.expect("stable source generation");
+                if observable.generation() != generation {
+                    return Ok(WorkerBlockDecision::Retry);
+                }
                 let deadline = self
                     .operators
                     .first()
@@ -2422,7 +2486,7 @@ mod terminal_signal_tests {
     fn worker_retries_when_readiness_generation_changes_during_the_check() {
         let source_observable = Arc::new(Observable::new());
         let terminal_observable = Arc::new(Observable::new());
-        let driver = PipelineDriver::new(
+        let mut driver = PipelineDriver::new(
             5,
             vec![
                 Box::new(GenerationChangingSource {
@@ -2616,6 +2680,44 @@ mod terminal_signal_tests {
         assert_eq!(generation, source_observable.generation());
         source_observable.notify_observers();
         assert_ne!(generation, source_observable.generation());
+    }
+
+    #[test]
+    fn activation_runs_once_on_first_driver_turn_and_never_on_prestart_abort() {
+        struct ActivationProbe(Arc<AtomicUsize>);
+
+        impl Operator for ActivationProbe {
+            fn name(&self) -> &str {
+                "ACTIVATION_PROBE"
+            }
+
+            fn activate(&mut self, _state: &RuntimeState) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let new_driver = || {
+            PipelineDriver::new(
+                1,
+                vec![Box::new(ActivationProbe(Arc::clone(&count)))],
+                None,
+                Vec::new(),
+                Arc::new(RuntimeState::default()),
+                None,
+            )
+        };
+
+        let mut admitted = new_driver();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(admitted.process(Duration::ZERO), DriverState::Ready);
+        assert_eq!(admitted.process(Duration::ZERO), DriverState::Ready);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        let mut rejected = new_driver();
+        assert_eq!(rejected.cancel_for_fragment_abort(), DriverState::Canceled);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

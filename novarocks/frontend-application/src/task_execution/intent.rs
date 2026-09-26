@@ -29,8 +29,9 @@ use novarocks_execution::task_execution::{
     AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTaskReceipt,
     EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo, OperationKind,
     OperationOutcome, OperationShape, QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate,
-    QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext, TaskDomainUpdate, TaskOperationId,
-    UpdateQueryContext, UpdateTask, UpdateTaskReceipt, status::SafeDetail,
+    QueryContextReceipt, QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome,
+    ReleaseQueryContext, TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask,
+    UpdateTaskReceipt, status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::{
@@ -59,6 +60,7 @@ pub enum OperationIntent {
     UpdateTask(Arc<UpdateTask>),
     UpdateQueryContext(Arc<UpdateQueryContext>),
     CancelTask(CancelTask),
+    QuiesceQueryContext(QuiesceQueryContext),
     AbortQueryContext(AbortQueryContext),
     ReleaseQueryContext(ReleaseQueryContext),
     FetchTaskDynamicFilters(FetchTaskDynamicFilters),
@@ -74,6 +76,7 @@ impl OperationIntent {
             Self::UpdateTask(request) => request.envelope().kind(),
             Self::UpdateQueryContext(request) => request.envelope().kind(),
             Self::CancelTask(request) => request.envelope().kind(),
+            Self::QuiesceQueryContext(request) => request.envelope().kind(),
             Self::AbortQueryContext(request) => request.envelope().kind(),
             Self::ReleaseQueryContext(request) => request.envelope().kind(),
             Self::FetchTaskDynamicFilters(request) => request.envelope().kind(),
@@ -89,6 +92,7 @@ impl OperationIntent {
             Self::UpdateTask(request) => request.envelope().operation_id(),
             Self::UpdateQueryContext(request) => request.envelope().operation_id(),
             Self::CancelTask(request) => request.envelope().operation_id(),
+            Self::QuiesceQueryContext(request) => request.envelope().operation_id(),
             Self::AbortQueryContext(request) => request.envelope().operation_id(),
             Self::ReleaseQueryContext(request) => request.envelope().operation_id(),
             Self::FetchTaskDynamicFilters(request) => request.envelope().operation_id(),
@@ -110,6 +114,7 @@ impl OperationIntent {
             Self::UpdateTask(_) => OperationShape::UpdateTask,
             Self::UpdateQueryContext(request) => request.shape(),
             Self::CancelTask(_) => OperationShape::CancelTask,
+            Self::QuiesceQueryContext(_) => OperationShape::QuiesceQueryContext,
             Self::AbortQueryContext(_) => OperationShape::AbortQueryContext,
             Self::ReleaseQueryContext(_) => OperationShape::ReleaseQueryContext,
             Self::FetchTaskDynamicFilters(_) => OperationShape::FetchTaskDynamicFilters,
@@ -122,13 +127,19 @@ impl OperationIntent {
     ///
     /// Lifecycle operations and `CancelTask` consume the process transport's
     /// control reserve even though they retain independent dispatcher lanes.
+    /// Exact destination closes keep the Task's one-at-a-time Update lane.
     pub(crate) fn requires_control_progress(&self) -> bool {
+        if let Self::UpdateTask(request) = self {
+            return !request.domains().is_empty()
+                && request.domains().iter().all(task_domain_requires_control);
+        }
         match self.shape() {
             OperationShape::AcquireQueryContextAdmissionTicket
             | OperationShape::EstablishQueryContext
             | OperationShape::AdvanceQueryContextDomain
             | OperationShape::RenewQueryExecutionLease
             | OperationShape::CancelTask
+            | OperationShape::QuiesceQueryContext
             | OperationShape::AbortQueryContext
             | OperationShape::ReleaseQueryContext => true,
             OperationShape::CreateTask
@@ -149,6 +160,7 @@ impl OperationIntent {
             Self::UpdateTask(request) => request.identity().backend_process_id(),
             Self::UpdateQueryContext(request) => request.context().backend_process_id(),
             Self::CancelTask(request) => request.identity().backend_process_id(),
+            Self::QuiesceQueryContext(request) => request.context().backend_process_id(),
             Self::AbortQueryContext(request) => request.context().backend_process_id(),
             Self::ReleaseQueryContext(request) => request.context().backend_process_id(),
             Self::FetchTaskDynamicFilters(request) => request.identity().backend_process_id(),
@@ -184,6 +196,7 @@ impl OperationIntent {
                 UpdateQueryContext::RenewLease(_) => 0,
             },
             Self::CancelTask(_)
+            | Self::QuiesceQueryContext(_)
             | Self::AbortQueryContext(_)
             | Self::ReleaseQueryContext(_)
             | Self::FetchTaskDynamicFilters(_)
@@ -209,7 +222,14 @@ fn task_domain_bytes(domain: &TaskDomainUpdate) -> usize {
         TaskDomainUpdate::SplitAssignment(intent) => intent.payload().encoded_len(),
         TaskDomainUpdate::TaskDynamicFilter { payload, .. } => payload.encoded_len(),
         TaskDomainUpdate::OpenExchangeEdges { edges, .. } => edges.len() * size_of::<u32>(),
+        TaskDomainUpdate::CloseExchangeDestination { .. } => {
+            size_of::<novarocks_execution::task_execution::TaskIdentity>() + size_of::<u32>()
+        }
     }
+}
+
+fn task_domain_requires_control(domain: &TaskDomainUpdate) -> bool {
+    matches!(domain, TaskDomainUpdate::CloseExchangeDestination { .. })
 }
 
 fn context_domain_bytes(domain: &QueryContextDomainUpdate) -> usize {
@@ -252,7 +272,7 @@ impl TaskOperationQueueRequest {
         Self {
             backend,
             lane: DispatchLane::Update,
-            control_progress: false,
+            control_progress: task_domain_requires_control(update),
             queued_bytes: task_domain_bytes(update).saturating_add(OPERATION_FIXED_BYTES),
         }
     }
@@ -288,6 +308,7 @@ pub enum AckPayload {
     Create(CreateTaskReceipt),
     Update(UpdateTaskReceipt),
     Context(QueryContextReceipt),
+    Quiesce(QuiesceQueryContextReceipt),
     Release {
         receipt: QueryContextReceipt,
         outcome: ReleaseOutcome,
@@ -383,7 +404,9 @@ impl OperationAcknowledgement {
     pub const fn worker_outcome(&self) -> Option<OperationOutcome> {
         match self.dispatch_result {
             OperationDispatchResult::WorkerReceipt(receipt) => Some(receipt.outcome()),
-            OperationDispatchResult::TransportUnknown => None,
+            OperationDispatchResult::IngressRejected(_)
+            | OperationDispatchResult::NonWorkerRejected
+            | OperationDispatchResult::TransportUnknown => None,
         }
     }
 

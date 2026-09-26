@@ -113,7 +113,7 @@ impl Scenario for OuterPreflightRejection {
             "invalid",
         )?;
         ensure!(
-            bad_timeout == tonic::Code::InvalidArgument as u16,
+            bad_timeout.code() == tonic::Code::InvalidArgument,
             "malformed grpc-timeout must fail before body read, got {bad_timeout}"
         );
         context.action("malformed grpc-timeout rejected without sending a request body");
@@ -126,8 +126,13 @@ impl Scenario for OuterPreflightRejection {
             &(CONTROL_FRAME_MAX + 6).to_string(),
         )?;
         ensure!(
-            over_control == tonic::Code::ResourceExhausted as u16,
+            over_control.code() == tonic::Code::ResourceExhausted,
             "oversized control Content-Length must fail before body read, got {over_control}"
+        );
+        ensure!(
+            over_control.metadata().get("x-novarocks-ingress-rejection")
+                == Some(&tonic::metadata::MetadataValue::from_static("body_limit")),
+            "control body limit rejection lost its typed ingress category"
         );
         context.action("control method Content-Length rejected without sending a request body");
 
@@ -139,8 +144,15 @@ impl Scenario for OuterPreflightRejection {
             &(ORDINARY_FRAME_MAX + 6).to_string(),
         )?;
         ensure!(
-            over_ordinary == tonic::Code::ResourceExhausted as u16,
+            over_ordinary.code() == tonic::Code::ResourceExhausted,
             "oversized ordinary Content-Length must fail before body read, got {over_ordinary}"
+        );
+        ensure!(
+            over_ordinary
+                .metadata()
+                .get("x-novarocks-ingress-rejection")
+                == Some(&tonic::metadata::MetadataValue::from_static("body_limit")),
+            "ordinary body limit rejection lost its typed ingress category"
         );
         context.action("ordinary method 64 MiB Content-Length rejected before reading DATA");
 
@@ -293,6 +305,14 @@ impl Scenario for QueryMessageBounds {
             ));
         }
         let streamed_status = streamed_control_over_limit(&connector, &authorization)?;
+        ensure!(
+            streamed_status.code() == tonic::Code::ResourceExhausted
+                && streamed_status
+                    .metadata()
+                    .get("x-novarocks-ingress-rejection")
+                    == Some(&tonic::metadata::MetadataValue::from_static("body_limit")),
+            "control DATA body gate did not return its typed ingress rejection: {streamed_status}"
+        );
         context.action(format!(
             "control over-limit DATA with legal frame length returned grpc_status={streamed_status}"
         ));
@@ -1593,7 +1613,7 @@ fn header_rejection(
     authorization: &str,
     extra_name: &str,
     extra_value: &str,
-) -> Result<u16> {
+) -> Result<tonic::Status> {
     let connector = connector.clone();
     let path = path.to_owned();
     let authorization = authorization.to_owned();
@@ -1615,12 +1635,8 @@ fn header_rejection(
         let response = tokio::time::timeout(Duration::from_secs(10), response)
             .await
             .context("Native ingress did not reject headers before reading the body")??;
-        let status = response
-            .headers()
-            .get("grpc-status")
-            .context("early Native ingress rejection omitted grpc-status")?
-            .to_str()?
-            .parse::<u16>()?;
+        let status = tonic::Status::from_header_map(response.headers())
+            .context("early Native ingress rejection omitted grpc-status")?;
         driver.abort();
         let _ = driver.await;
         Ok(status)
@@ -1630,7 +1646,7 @@ fn header_rejection(
 fn streamed_control_over_limit(
     connector: &NativeEndpointConnector,
     authorization: &str,
-) -> Result<u16> {
+) -> Result<tonic::Status> {
     let connector = connector.clone();
     let authorization = authorization.to_owned();
     tokio::runtime::Runtime::new()?.block_on(async move {
@@ -1649,24 +1665,14 @@ fn streamed_control_over_limit(
         bytes[1..5].copy_from_slice(&(CONTROL_FRAME_MAX as u32).to_be_bytes());
         send_stream.send_data(Bytes::from(bytes), true)?;
         let response = tokio::time::timeout(Duration::from_secs(10), response).await??;
-        let header_status = response
-            .headers()
-            .get("grpc-status")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u16>().ok());
+        let header_status = tonic::Status::from_header_map(response.headers());
         let mut body = response.into_body();
         while let Some(chunk) = body.data().await {
             let _ = chunk?;
         }
         let trailers = body.trailers().await?;
         let status = header_status
-            .or_else(|| {
-                trailers
-                    .as_ref()
-                    .and_then(|headers| headers.get("grpc-status"))
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse().ok())
-            })
+            .or_else(|| trailers.as_ref().and_then(tonic::Status::from_header_map))
             .context("streaming size rejection omitted grpc-status")?;
         driver.abort();
         let _ = driver.await;

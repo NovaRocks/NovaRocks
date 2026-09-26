@@ -28,6 +28,7 @@ use std::fmt;
 use novarocks_execution_contract::{
     ContentFingerprint, DomainConflict, DomainProgression, DomainVersion, EdgeOpenVersion,
     ExchangeEdgeId, PlanNodeId, SplitOffer, SplitSequence, TaskDomainReceipt, TaskDomainUpdate,
+    TaskIdentity,
 };
 
 /// The query-side watermark of split intents issued for one plan node.
@@ -131,6 +132,9 @@ pub struct TaskDomainIntentTracker {
     edge_members: BTreeSet<ExchangeEdgeId>,
     opened_edges: BTreeSet<ExchangeEdgeId>,
     opened_sets: BTreeMap<EdgeOpenVersion, BTreeSet<ExchangeEdgeId>>,
+    destination_members: BTreeSet<(ExchangeEdgeId, TaskIdentity)>,
+    closed_destinations: BTreeSet<(ExchangeEdgeId, TaskIdentity)>,
+    destination_close_versions: BTreeMap<DomainVersion, (ExchangeEdgeId, TaskIdentity)>,
 }
 
 /// The exact Worker receipt facts expected for one recorded task-domain
@@ -149,6 +153,11 @@ pub enum TaskDomainReceiptExpectation {
         version: EdgeOpenVersion,
         edges: BTreeSet<ExchangeEdgeId>,
     },
+    CloseExchangeDestination {
+        version: DomainVersion,
+        edge: ExchangeEdgeId,
+        destination: TaskIdentity,
+    },
 }
 
 impl TaskDomainIntentTracker {
@@ -165,6 +174,22 @@ impl TaskDomainIntentTracker {
 
     pub fn split_watermark(&self, node: PlanNodeId) -> SentSplitWatermark {
         self.splits.get(&node).copied().unwrap_or_default()
+    }
+
+    /// Installs the exact outbound members frozen by the task descriptor.
+    pub fn with_exchange_destinations(
+        mut self,
+        members: impl IntoIterator<Item = (ExchangeEdgeId, TaskIdentity)>,
+    ) -> Self {
+        self.destination_members = members.into_iter().collect();
+        self
+    }
+
+    pub fn next_destination_close_version(&self) -> Option<DomainVersion> {
+        match self.destination_close_versions.keys().next_back() {
+            Some(highest) => DomainVersion::new(highest.get().checked_add(1)?).ok(),
+            None => Some(DomainVersion::FIRST),
+        }
     }
 
     /// The next edge-open version that has not been assigned to an intent.
@@ -213,6 +238,11 @@ impl TaskDomainIntentTracker {
             TaskDomainUpdate::OpenExchangeEdges { version, edges } => {
                 self.record_edge_open(*version, edges)
             }
+            TaskDomainUpdate::CloseExchangeDestination {
+                version,
+                edge,
+                destination,
+            } => self.record_destination_close(*version, (*edge, *destination)),
         }
     }
 
@@ -238,6 +268,15 @@ impl TaskDomainIntentTracker {
                     edges: edges.iter().copied().collect(),
                 }
             }
+            TaskDomainUpdate::CloseExchangeDestination {
+                version,
+                edge,
+                destination,
+            } => TaskDomainReceiptExpectation::CloseExchangeDestination {
+                version: *version,
+                edge: *edge,
+                destination: *destination,
+            },
         }
     }
 
@@ -276,6 +315,37 @@ impl TaskDomainIntentTracker {
         }
         self.opened_edges.extend(requested.iter().copied());
         self.opened_sets.insert(version, requested);
+        DomainProgression::Apply
+    }
+
+    fn record_destination_close(
+        &mut self,
+        version: DomainVersion,
+        member: (ExchangeEdgeId, TaskIdentity),
+    ) -> DomainProgression {
+        if !self.destination_members.contains(&member) {
+            return DomainProgression::Conflict(DomainConflict::UnknownMember);
+        }
+        if let Some(held) = self.destination_close_versions.get(&version) {
+            return if *held == member {
+                DomainProgression::Idempotent
+            } else {
+                DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+            };
+        }
+        if self
+            .destination_close_versions
+            .keys()
+            .next_back()
+            .is_some_and(|held| version < *held)
+        {
+            return DomainProgression::Older;
+        }
+        if self.closed_destinations.contains(&member) {
+            return DomainProgression::Conflict(DomainConflict::NotMonotonic);
+        }
+        self.closed_destinations.insert(member);
+        self.destination_close_versions.insert(version, member);
         DomainProgression::Apply
     }
 }
@@ -374,6 +444,27 @@ pub fn verify_task_domain_receipt(
         {
             Ok(())
         }
+        (
+            TaskDomainUpdate::CloseExchangeDestination {
+                version,
+                edge,
+                destination,
+            },
+            TaskDomainReceiptExpectation::CloseExchangeDestination {
+                version: expected_version,
+                edge: expected_edge,
+                destination: expected_destination,
+            },
+            TaskDomainReceipt::CloseExchangeDestination {
+                accepted_version, ..
+            },
+        ) if version == expected_version
+            && edge == expected_edge
+            && destination == expected_destination
+            && accepted_version >= expected_version =>
+        {
+            Ok(())
+        }
         _ => Err(DomainReceiptMismatch::new(
             "the Worker receipt does not match the sent domain token or members",
         )),
@@ -418,6 +509,9 @@ mod tests {
     use std::sync::Arc;
 
     use novarocks_execution_contract::SplitWatermark;
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
 
     use super::*;
 
@@ -444,6 +538,60 @@ mod tests {
 
     fn version(value: u64) -> DomainVersion {
         DomainVersion::new(value).expect("valid version")
+    }
+
+    fn destination(task: u32) -> TaskIdentity {
+        TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(4, 5), AttemptId::new(1).expect("attempt"))
+                .expect("query"),
+            StageId::new(2).expect("stage"),
+            TaskId::new(task).expect("task"),
+            BackendProcessId::new_v7(),
+        )
+    }
+
+    #[test]
+    fn destination_close_uses_exact_members_and_worker_receipt_version() {
+        let target = destination(1);
+        let sibling = destination(2);
+        let mut tracker = TaskDomainIntentTracker::new([], [edge(1)])
+            .with_exchange_destinations([(edge(1), target), (edge(1), sibling)]);
+        let close = |token, destination| TaskDomainUpdate::CloseExchangeDestination {
+            version: version(token),
+            edge: edge(1),
+            destination,
+        };
+        let first = close(1, target);
+        assert_eq!(tracker.record(&first), DomainProgression::Apply);
+        assert_eq!(tracker.record(&first), DomainProgression::Idempotent);
+        assert_eq!(
+            tracker.record(&close(1, sibling)),
+            DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent)
+        );
+        let replacement = TaskIdentity::new(
+            target.query_execution_id(),
+            target.stage_id(),
+            target.task_id(),
+            BackendProcessId::new_v7(),
+        );
+        assert_eq!(
+            tracker.record(&close(2, replacement)),
+            DomainProgression::Conflict(DomainConflict::UnknownMember)
+        );
+        assert_eq!(tracker.record(&close(2, sibling)), DomainProgression::Apply);
+        let expected = tracker.receipt_expectation(&first);
+        assert!(
+            verify_task_domain_receipt(
+                &first,
+                &expected,
+                &[TaskDomainReceipt::CloseExchangeDestination {
+                    accepted_version: version(2),
+                    progression: DomainProgression::Idempotent,
+                }]
+            )
+            .is_ok()
+        );
+        assert_eq!(tracker.next_destination_close_version(), Some(version(3)));
     }
 
     fn sequence(value: u64) -> SplitSequence {

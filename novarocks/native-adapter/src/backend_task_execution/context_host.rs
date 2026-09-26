@@ -228,6 +228,7 @@ pub struct NativeQueryContextHost {
     runtime_filter_installer: Arc<RuntimeFilterParticipantInstaller>,
     catalog_install_runtime: BackendDataRuntime,
     contexts: Mutex<HostContexts>,
+    catalog_metrics_publish: Mutex<()>,
 }
 
 impl BackendRuntimeFilterParticipantAuthority for NativeQueryContextHost {
@@ -274,6 +275,7 @@ impl NativeQueryContextHost {
             runtime_filter_installer,
             catalog_install_runtime,
             contexts: Mutex::new(HostContexts::default()),
+            catalog_metrics_publish: Mutex::new(()),
         }
     }
 
@@ -497,6 +499,13 @@ impl NativeQueryContextHost {
     /// called after each event that changes the count rather than on a timer:
     /// the manager holds the numbers and nothing else observes them.
     fn publish_catalog_lease_metrics(&self) {
+        // Install and release can finish on different threads. Keep the
+        // manager snapshot and both gauge writes in one publication order,
+        // otherwise an older snapshot may overwrite a later release's zero.
+        let _publication = self
+            .catalog_metrics_publish
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let snapshot = self.catalog_manager.lease_snapshot();
         novarocks_native_adapter::backend_metrics::publish_backend_query_execution_resource(
             "catalog_query_leases",

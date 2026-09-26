@@ -6,13 +6,23 @@ failure reporting. `novarocks-cluster-harness` remains the only owner of
 1FE+NBE configuration, spawn, readiness, topology, faults, restart, logs and
 cleanup.
 
-List registered scenarios:
+List all registered scenarios (including explicit stages):
 
 ```bash
 cargo run -p novarocks-system-test-runner -- --list
 ```
 
-Run one or all scenarios against the native 1FE+3BE default:
+List the default functional baseline:
+
+```bash
+cargo run -p novarocks-system-test-runner -- --list-default
+```
+
+The default list uses the same registry classification as a run without
+`--only`. Explicit stages, including performance baselines and external
+fixtures, remain discoverable through `--list` and selectable by exact `--only`.
+
+Run one scenario against the native 1FE+3BE default:
 
 ```bash
 cargo build --workspace --profile dev-opt
@@ -53,7 +63,7 @@ remove the generated runtime directory.
 
 `tools/ci/local-full-ci.sh` runs this registry as its own stable stage,
 between the server binary smoke and the SQL suites. The stage discovers
-scenarios through `--list` and runs each one with a single `--only`
+default scenarios through `--list-default` and runs each one with a single `--only`
 invocation, so every scenario gets an independent summary row, log and
 artifact directory. It selects and reports only — `tools/ci/lib/system_scenarios.sh`
 holds no cluster lifecycle of its own.
@@ -94,22 +104,35 @@ the scenario must execute at least one probe to count as passed. These are
 correctness and coarse regression checks, not throughput benchmarks.
 
 The `native-creation/*` scenarios also require the real 1FE+3BE launch and
-check frozen task creation across the process boundary.
+check frozen task creation across the process boundary. An Accepted receipt
+proves Worker ownership; Installed is a separate runtime-installation fact.
+The `accepted-preparation-control-races` case checks preparation/control races
+and authenticated covered-observation refusals. Native subscriptions require
+nonzero generations; cursor-only requests cannot enter the production stream.
+Preparation count, byte and per-context position charges remain until the job
+actually exits. FE deployment positions remain occupied after Accepted or an
+unknown RPC outcome, and its window W must fit the exact backend's advertised
+per-context preparation capacity P. These are scenario and implementation
+contracts; a listed scenario does not establish a passing acceptance gate.
 `frozen-replay-and-membership` sends authenticated raw creates to one BE: a
 legal create, the identical request, and the same task identity with every
-body fact changed. Both replays must return the winner's original receipt
-with no second apply marker and no lease renewal. Creates under another
+body fact changed. Both replays must retain the winner's exact entity and
+return its current monotonic status, with no second apply marker and no lease
+renewal. Creates under another
 frontend process, another attempt or another backend's identity must read no
-receipt. An initial domain naming an edge the descriptor never froze is
-refused, and the next legal create of that identity must still win. A replay
-after the context is released must apply nothing.
+receipt. An initial domain naming an edge the descriptor never froze fails
+preparation after Accepted; that spent identity remains retained, so a later
+legal body cannot replace it. A replay after the context is released must
+apply nothing.
 `creation-payload-lifetime` reads the FE task-creation gauges, which fall only
-when a payload's last holder drops it. An answered create must release its
-payload while its statement still runs, and the static plans must stay until
+when a payload's last holder drops it. An answered create must release its FE
+replay payload while its statement still runs, and the static plans must stay until
 the statement ends. With `create-task-ack-drop` armed, the lost
 acknowledgement must be resent as the same frozen create and answered by
 identity; every task must be priced, frozen and applied exactly once. A
-cancelled statement must release everything it froze.
+cancelled statement must release everything it froze. BE preparation input and
+its P/count/bytes charge remain owned until the actual preparation job exits;
+these FE gauges do not prove BE budget release.
 `fixed-plan-recovery` runs one delayed read cleanly and once with its admitted
 BE killed before any row is read. The recovered run must complete on attempt
 2 and freeze exactly as many static plans as the clean run, so the recovery

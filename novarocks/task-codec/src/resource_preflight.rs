@@ -39,6 +39,11 @@ const MAX_PLAN_TREE_DEPTH: usize = 64;
 // any useful executable fragment, independently of the fragment's byte cap.
 const MAX_PLAN_TREE_NODES: usize = 65_536;
 const MAX_STATUS_CURSORS: usize = 4096;
+// Three distinct repeated target projections may legitimately name the same
+// 4096 tasks. The typed decoder checks the exact identity union after prost.
+const MAX_STATUS_SUBSCRIPTION_OBJECTS: usize = MAX_STATUS_CURSORS * 3;
+const MAX_STATUS_SUBSCRIPTION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_QUIESCE_CURSOR_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourcePreflightError(&'static str);
@@ -85,14 +90,59 @@ pub fn check_control_operation_batch(raw: &[u8]) -> Result<(), ResourcePreflight
     finish(scan_batch(raw, true))
 }
 
-/// Checks a status subscription's repeated cursors before allocation.
+/// Checks every repeated covered target before prost allocates its objects.
 pub fn check_status_subscription(raw: &[u8]) -> Result<(), ResourcePreflightError> {
-    finish(scan_repeated_message_field(
-        raw,
-        2,
-        MAX_STATUS_CURSORS,
-        "status subscription exceeds 4096 cursors",
-    ))
+    if raw.len() > MAX_STATUS_SUBSCRIPTION_BYTES {
+        return Err(ResourcePreflightError("status subscription exceeds 16 MiB"));
+    }
+    finish(scan_status_subscription(raw))
+}
+
+fn scan_status_subscription(raw: &[u8]) -> ScanResult {
+    let mut status_cursors = 0;
+    let mut convergence_cursors = 0;
+    let mut required_identities = 0;
+    let mut quiesce_cursors = 0;
+    let mut combined = 0;
+    for_fields(raw, |field, value| {
+        let Value::Bytes(bytes) = value else {
+            return Ok(());
+        };
+        let (count, message) = match field {
+            2 => (
+                &mut status_cursors,
+                "status subscription exceeds 4096 cursors",
+            ),
+            5 => (
+                &mut convergence_cursors,
+                "status subscription exceeds 4096 convergence cursors",
+            ),
+            6 => (
+                &mut required_identities,
+                "status subscription exceeds 4096 required identities",
+            ),
+            7 => {
+                checked_increment(
+                    &mut quiesce_cursors,
+                    1,
+                    "status subscription repeats quiesce cursor",
+                )?;
+                if bytes.len() > MAX_QUIESCE_CURSOR_BYTES {
+                    return Err(limit(
+                        "status subscription quiesce cursor exceeds 4096 bytes",
+                    ));
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        checked_increment(count, MAX_STATUS_CURSORS, message)?;
+        checked_increment(
+            &mut combined,
+            MAX_STATUS_SUBSCRIPTION_OBJECTS,
+            "status subscription exceeds combined target object bound",
+        )
+    })
 }
 
 /// Checks the static creation carrier before decoding its protobuf object.
@@ -769,6 +819,64 @@ mod tests {
         }
         .encode_to_vec();
         assert!(check_status_subscription(&subscription).is_err());
+    }
+
+    #[test]
+    fn covered_subscription_preflight_bounds_every_repeated_target() {
+        for (field, error) in [
+            (2, "status subscription exceeds 4096 cursors"),
+            (5, "status subscription exceeds 4096 convergence cursors"),
+            (6, "status subscription exceeds 4096 required identities"),
+        ] {
+            let mut raw = Vec::new();
+            for _ in 0..MAX_STATUS_CURSORS {
+                write_bytes_field(&mut raw, field, &[]);
+            }
+            assert!(check_status_subscription(&raw).is_ok());
+            write_bytes_field(&mut raw, field, &[]);
+            assert_eq!(
+                check_status_subscription(&raw).unwrap_err().to_string(),
+                error
+            );
+        }
+
+        // All three projections may name the same legal 4096 identities. The
+        // typed decoder, after prost, checks the exact distinct union.
+        let mut raw = Vec::new();
+        for field in [2, 5, 6] {
+            for _ in 0..MAX_STATUS_CURSORS {
+                write_bytes_field(&mut raw, field, &[]);
+            }
+        }
+        assert!(check_status_subscription(&raw).is_ok());
+    }
+
+    #[test]
+    fn covered_subscription_preflight_bounds_quiesce_and_total_bytes() {
+        let mut quiesce = Vec::new();
+        write_bytes_field(&mut quiesce, 7, &vec![0; MAX_QUIESCE_CURSOR_BYTES]);
+        assert!(check_status_subscription(&quiesce).is_ok());
+        let mut too_large = Vec::new();
+        write_bytes_field(&mut too_large, 7, &vec![0; MAX_QUIESCE_CURSOR_BYTES + 1]);
+        assert_eq!(
+            check_status_subscription(&too_large)
+                .unwrap_err()
+                .to_string(),
+            "status subscription quiesce cursor exceeds 4096 bytes"
+        );
+        write_bytes_field(&mut quiesce, 7, &[]);
+        assert_eq!(
+            check_status_subscription(&quiesce).unwrap_err().to_string(),
+            "status subscription repeats quiesce cursor"
+        );
+
+        let oversize = vec![0; MAX_STATUS_SUBSCRIPTION_BYTES + 1];
+        assert_eq!(
+            check_status_subscription(&oversize)
+                .unwrap_err()
+                .to_string(),
+            "status subscription exceeds 16 MiB"
+        );
     }
 
     #[test]

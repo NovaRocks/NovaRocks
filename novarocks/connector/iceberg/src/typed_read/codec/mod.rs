@@ -37,6 +37,9 @@ use crate::provider_types::{IcebergReadTypes, IcebergReadView};
 
 use super::{HiveTransactionHandle, IcebergColumnHandle, IcebergReadSplit, IcebergRuntimeRelation};
 
+mod recipe;
+pub use recipe::IcebergReadRecipeCompiler;
+
 pub(crate) const ICEBERG_READ_CODEC_REVISION: u32 = 1;
 const MAX_PRIVATE_READ_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PRIVATE_RETAINED_BYTES: usize = 64 * 1024 * 1024;

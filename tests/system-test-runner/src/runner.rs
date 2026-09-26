@@ -10,8 +10,8 @@ use std::fs;
 
 pub fn run(cli: Cli) -> Result<()> {
     let scenarios = scenarios::all();
-    if cli.list {
-        for scenario in &scenarios {
+    if cli.list || cli.list_default {
+        for scenario in list_scenarios(&scenarios, cli.list_default)? {
             println!("{}", scenario.name());
         }
         return Ok(());
@@ -31,6 +31,17 @@ pub fn run(cli: Cli) -> Result<()> {
         run_one(scenario, &config)?;
     }
     Ok(())
+}
+
+fn list_scenarios(
+    scenarios: &[Box<dyn Scenario>],
+    defaults_only: bool,
+) -> Result<Vec<&dyn Scenario>> {
+    if defaults_only {
+        select(scenarios, &[])
+    } else {
+        Ok(scenarios.iter().map(|scenario| scenario.as_ref()).collect())
+    }
 }
 
 fn select<'a>(
@@ -225,6 +236,48 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_listing_preserves_default_selection_and_explicit_opt_in() {
+        let scenarios = crate::scenarios::all();
+        let all = list_scenarios(&scenarios, false).expect("list all scenarios");
+        let defaults = list_scenarios(&scenarios, true).expect("list default scenarios");
+        let names = |selected: &[&dyn Scenario]| {
+            selected
+                .iter()
+                .map(|scenario| scenario.name())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&defaults),
+            names(&select(&scenarios, &[]).expect("default selection"))
+        );
+        assert_eq!(
+            names(&all),
+            scenarios
+                .iter()
+                .map(|scenario| scenario.name())
+                .collect::<Vec<_>>()
+        );
+        assert!(!defaults.is_empty());
+        assert!(
+            defaults
+                .iter()
+                .all(|scenario| !scenario.is_explicit_stage())
+        );
+        let explicit = all
+            .iter()
+            .filter(|scenario| scenario.is_explicit_stage())
+            .collect::<Vec<_>>();
+        assert!(!explicit.is_empty());
+        assert_eq!(all.len(), defaults.len() + explicit.len());
+        for scenario in explicit {
+            assert!(!names(&defaults).contains(&scenario.name()));
+            let selected =
+                select(&scenarios, &[scenario.name().to_string()]).expect("explicit opt-in");
+            assert_eq!(names(&selected), vec![scenario.name()]);
+        }
+    }
 
     #[test]
     fn empty_registry_rejects_unknown_selector() {

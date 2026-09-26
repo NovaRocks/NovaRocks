@@ -37,7 +37,7 @@ use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::write_stack::{
     ConnectorCommitFragment, ROOT_WRITE_RESULT_COLUMN_COUNT, RootWriteResultSchema,
     WRITE_RELATION_FRAGMENT_INDEX, WRITE_RELATION_KIND_INDEX, WRITE_RELATION_ROW_COUNT_INDEX,
-    WRITE_RELATION_TARGET_INDEX, WriteTargetOrdinal, WriterMultiplexSchema,
+    WRITE_RELATION_TARGET_INDEX, WriteTargetOrdinal, WriterAuxiliaryChannel, WriterMultiplexSchema,
     write_relation_column_id,
 };
 use novarocks_types::SlotId;
@@ -110,6 +110,42 @@ pub struct WriterMultiplexRelationSchema {
 }
 
 impl WriterMultiplexRelationSchema {
+    pub(crate) fn try_from_static_layout(
+        layout: &novarocks_local_program::StaticLayout,
+    ) -> Result<Self, String> {
+        if layout.slots().len() < WRITE_RELATION_FRAGMENT_INDEX + 1 {
+            return Err("writer multiplex layout lacks fixed prefix".to_string());
+        }
+        let auxiliary = layout
+            .slots()
+            .iter()
+            .zip(layout.schema().fields())
+            .skip(WRITE_RELATION_FRAGMENT_INDEX + 1)
+            .map(|(slot, field)| {
+                WriterAuxiliaryChannel::try_new(slot.0, field.name(), field.data_type().clone())
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let contract =
+            WriterMultiplexSchema::try_new(auxiliary).map_err(|error| error.to_string())?;
+        contract
+            .validate_exact_arrow_schema(layout.schema())
+            .map_err(|error| error.to_string())?;
+        if contract
+            .slot_ids()
+            .into_iter()
+            .map(SlotId::new)
+            .collect::<Vec<_>>()
+            != layout.slots()
+        {
+            return Err("writer multiplex slot order differs from static layout".to_string());
+        }
+        Ok(Self {
+            contract,
+            chunk_schema: ChunkSchema::from_static_layout(layout)?,
+        })
+    }
+
     pub fn try_new(contract: WriterMultiplexSchema) -> Result<Self, String> {
         let slot_ids = contract
             .slot_ids()
@@ -148,6 +184,22 @@ pub struct RootWriteResultRelationSchema {
 }
 
 impl RootWriteResultRelationSchema {
+    pub(crate) fn try_from_static_layout(
+        layout: &novarocks_local_program::StaticLayout,
+    ) -> Result<Self, String> {
+        let contract = RootWriteResultSchema::new();
+        contract
+            .validate_exact_arrow_schema(layout.schema())
+            .map_err(|error| error.to_string())?;
+        if contract.slot_ids().map(SlotId::new).as_slice() != layout.slots() {
+            return Err("root write result slot order differs from static layout".to_string());
+        }
+        Ok(Self {
+            contract,
+            chunk_schema: ChunkSchema::from_static_layout(layout)?,
+        })
+    }
+
     pub fn try_new(contract: RootWriteResultSchema) -> Result<Self, String> {
         let slot_ids = contract.slot_ids().map(SlotId::new);
         let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(

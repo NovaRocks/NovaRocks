@@ -44,6 +44,9 @@ use novarocks_execution_contract::task_execution::status::{
     FinalTaskInfo, OperatorStatistics, TaskFailure, TaskOutputFacts, TaskResourceFacts, TaskState,
     TaskStatus, TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
 };
+use novarocks_execution_contract::task_execution::task_convergence::{
+    TaskConvergenceReceipt, TaskConvergenceVersion,
+};
 use novarocks_types::UniqueId;
 
 use crate::observation::TaskStatusSource;
@@ -105,6 +108,7 @@ struct OwnedStatus {
     /// creation that rolls back never leaves an observable task behind.
     released_to_observers: bool,
     buffered: Option<TaskStatus>,
+    buffered_convergence: Option<TaskConvergenceReceipt>,
 }
 
 /// The serializer of one task's status.
@@ -159,6 +163,7 @@ impl TaskStatusOwner {
                 convergence: TaskConvergence::new(),
                 released_to_observers: false,
                 buffered: Some(current),
+                buffered_convergence: None,
             }),
         }
     }
@@ -171,6 +176,9 @@ impl TaskStatusOwner {
         if let Some(status) = state.buffered.take() {
             self.source.publish(status);
         }
+        if let Some(receipt) = state.buffered_convergence.take() {
+            self.source.publish_task_convergence(receipt);
+        }
     }
 
     pub const fn identity(&self) -> TaskIdentity {
@@ -179,6 +187,34 @@ impl TaskStatusOwner {
 
     pub fn current(&self) -> TaskStatus {
         self.state.lock().expect("task status lock").current.clone()
+    }
+
+    /// Publishes the irreversible installation fact at the Context commit.
+    /// This control fact bypasses metric throttling and remains present in
+    /// every later snapshot, including terminal snapshots.
+    pub fn note_installed(&self) -> StatusAdvance {
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect("task status lock");
+        if state.current.installed() {
+            return StatusAdvance::Published(state.current.version());
+        }
+        if state.current.is_terminal() {
+            return StatusAdvance::AlreadyTerminal(state.current.state());
+        }
+        let Some(version) = state.current.version().next() else {
+            return StatusAdvance::VersionExhausted;
+        };
+        let next = match self.compose(
+            &state,
+            version,
+            state.current.state(),
+            state.current.termination().cloned(),
+        ) {
+            Ok(next) => next.with_installed(),
+            Err(error) => return StatusAdvance::Rejected(error),
+        };
+        self.commit_locked(&mut state, next, now);
+        StatusAdvance::Published(version)
     }
 
     pub fn state(&self) -> TaskState {
@@ -503,18 +539,29 @@ impl TaskStatusOwner {
     }
 
     fn note_actual_stopped(&self) {
-        let progressed = {
+        let receipt = {
             let mut state = self.state.lock().expect("task status lock");
-            matches!(
-                state
-                    .convergence
-                    .note_actual_stopped()
-                    .expect("a live task accepts actual-stop evidence"),
-                TaskConvergenceAdvance::Advanced(_)
-            )
+            match state
+                .convergence
+                .note_actual_stopped()
+                .expect("a live task accepts actual-stop evidence")
+            {
+                TaskConvergenceAdvance::Advanced(snapshot) => {
+                    let version = TaskConvergenceVersion::new(snapshot.version())
+                        .expect("advanced convergence has a nonzero version");
+                    let receipt = TaskConvergenceReceipt::actual_stopped(self.identity, version);
+                    if state.released_to_observers {
+                        Some(receipt)
+                    } else {
+                        state.buffered_convergence = Some(receipt);
+                        None
+                    }
+                }
+                TaskConvergenceAdvance::Idempotent(_) => None,
+            }
         };
-        if progressed {
-            self.source.note_progress();
+        if let Some(receipt) = receipt {
+            self.source.publish_task_convergence(receipt);
         }
     }
 
@@ -541,12 +588,13 @@ impl TaskStatusOwner {
         task_state: TaskState,
         termination: Option<TerminationDetail>,
     ) -> Result<TaskStatus, TaskStatusError> {
-        let mut status = TaskStatus::try_new(
+        let mut status = TaskStatus::try_new_with_installed(
             self.identity,
             version,
             task_state,
             termination,
             state.output,
+            state.current.installed(),
         )?
         .with_resources(state.resources);
         if let Some(filters) = state.filters {
@@ -846,5 +894,46 @@ impl RootResultRoute {
             )),
             Self::Gone => Some("result poll reached a reclaimed task record".to_owned()),
         }
+    }
+}
+
+#[cfg(test)]
+mod task_convergence_tests {
+    use super::*;
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+
+    #[test]
+    fn actual_stop_before_creation_commit_becomes_replayable_only_after_commit() {
+        let execution = QueryExecutionId::new(
+            QueryId::new(21, 22),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("nonzero query id");
+        let identity = TaskIdentity::new(
+            execution,
+            StageId::new(1).expect("nonzero stage"),
+            TaskId::new(1).expect("nonzero task"),
+            BackendProcessId::new_v7(),
+        );
+        let source = Arc::new(TaskStatusSource::new());
+        let owner = TaskStatusOwner::new(
+            identity,
+            Arc::clone(&source),
+            Arc::new(crate::ManualClock::new()),
+            Duration::from_millis(250),
+        );
+
+        owner.note_actual_stopped();
+        assert_eq!(source.latest_task_convergence(identity), None);
+        owner.release_to_observers();
+        let receipt = source
+            .latest_task_convergence(identity)
+            .expect("committed task retains actual-stop fact");
+        assert_eq!(receipt.identity(), identity);
+        assert_eq!(receipt.version().get(), 1);
+        owner.note_actual_stopped();
+        assert_eq!(source.latest_task_convergence(identity), Some(receipt));
     }
 }

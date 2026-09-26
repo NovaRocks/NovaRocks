@@ -590,27 +590,39 @@ impl Operator for ScanSourceOperator {
     }
 
     fn prepare(&mut self) -> Result<(), String> {
-        if self.dispatch.is_some() {
-            return Ok(());
-        }
+        // Scan dispatch calls the provider to build morsels. Keep preparation
+        // passive; the admitted driver initializes it in `activate`.
+        Ok(())
+    }
 
-        let Some(state) = self.ensure_dispatch_initialized()? else {
-            return Ok(());
-        };
-        self.dispatch = Some(Arc::clone(&state));
-        let node_id = self.scan.node_id().unwrap_or(-1);
-        debug!(
-            "ScanSource prepared: node_id={} driver_id={} original_morsels={} queue_empty={} has_more={} queue_observers={} inflight_observers={}",
-            node_id,
-            self.driver_id,
-            state.num_original_morsels(),
-            state.queue_empty(),
-            state.has_more(),
-            state.queue_observable().num_observers(),
-            state.inflight_observable().num_observers()
-        );
-        // Defer scheduling until the driver runs so downstream dependencies
-        // (e.g., broadcast join build) can gate scan task submission.
+    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+        if self.dispatch.is_none() {
+            let Some(dispatch) = self.ensure_dispatch_initialized()? else {
+                return Ok(());
+            };
+            self.dispatch = Some(Arc::clone(&dispatch));
+            let node_id = self.scan.node_id().unwrap_or(-1);
+            debug!(
+                "ScanSource activated: node_id={} driver_id={} original_morsels={} queue_empty={} has_more={} queue_observers={} inflight_observers={}",
+                node_id,
+                self.driver_id,
+                dispatch.num_original_morsels(),
+                dispatch.queue_empty(),
+                dispatch.has_more(),
+                dispatch.queue_observable().num_observers(),
+                dispatch.inflight_observable().num_observers()
+            );
+        }
+        if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
+            consumers.bind(state)?;
+        }
+        if let Some(consumers) = self.native_ordered_live_consumers.as_ref() {
+            consumers.bind(state)?;
+        }
+        self.propagate_native_ordered_live_consumers();
+        self.register_incremental_dispatch(state)?;
+        // Scan tasks remain demand-driven so downstream dependencies can gate
+        // task submission.
         Ok(())
     }
 
@@ -637,13 +649,8 @@ impl Operator for ScanSourceOperator {
                     .or_else(|| state.runtime_filter_wait_timeout())
                     .unwrap_or(Duration::from_secs(1)),
             );
-            consumers.bind(state)?;
         }
-        if let Some(consumers) = self.native_ordered_live_consumers.as_ref() {
-            consumers.bind(state)?;
-        }
-        self.propagate_native_ordered_live_consumers();
-        self.register_incremental_dispatch(state)
+        Ok(())
     }
 
     fn cancel(&mut self) {
@@ -1010,6 +1017,7 @@ mod tests {
 
     #[test]
     fn non_runtime_materialized_scan_keeps_plain_build_morsels() {
+        let rt = test_runtime_state();
         let op = Arc::new(PlainScanOp::new());
         let scan = ScanNode::new_for_test(op.clone())
             .with_node_id(11)
@@ -1019,7 +1027,10 @@ mod tests {
 
         let mut source = factory.create(1, 0);
         source.prepare().expect("prepare source");
-
+        source.bind_runtime_state(&rt).expect("bind runtime");
+        assert_eq!(op.build_plain_calls(), 0);
+        source.activate(&rt).expect("activate source");
+        source.activate(&rt).expect("repeat activation");
         assert_eq!(op.build_plain_calls(), 1);
     }
 
@@ -1041,6 +1052,7 @@ mod tests {
         for d in drivers.iter_mut() {
             d.bind_runtime_state(&rt).expect("bind runtime");
             d.prepare().expect("prepare");
+            d.activate(&rt).expect("activate");
         }
 
         let mut values = Vec::new();
@@ -1101,6 +1113,7 @@ mod tests {
         let mut source = factory.create(1, 0);
         source.bind_runtime_state(&rt).expect("bind runtime");
         source.prepare().expect("prepare source");
+        source.activate(&rt).expect("activate source");
         let processor = source.as_processor_mut().expect("scan processor");
 
         let until = std::time::Instant::now() + Duration::from_secs(1);
@@ -1184,6 +1197,7 @@ mod tests {
         let mut active = factory.create(2, 0);
         active.bind_runtime_state(&rt).expect("bind active runtime");
         active.prepare().expect("prepare active source");
+        active.activate(&rt).expect("activate active source");
         let active_processor = active.as_processor_mut().expect("active processor");
         let until = std::time::Instant::now() + Duration::from_secs(1);
         while !active_processor.has_output() && std::time::Instant::now() < until {
@@ -1196,6 +1210,7 @@ mod tests {
             .bind_runtime_state(&rt)
             .expect("bind sibling runtime");
         sibling.prepare().expect("prepare sibling source");
+        sibling.activate(&rt).expect("activate sibling source");
         let sibling_processor = sibling.as_processor_mut().expect("sibling processor");
         for _ in 0..10 {
             assert!(!sibling_processor.has_output());
@@ -1228,6 +1243,7 @@ mod tests {
         let mut driver = factory.create(2, 0);
         driver.bind_runtime_state(&rt).expect("bind runtime");
         driver.prepare().expect("prepare scan source");
+        driver.activate(&rt).expect("activate scan source");
         let proc = driver.as_processor_mut().expect("scan source processor");
 
         let start = std::time::Instant::now();
@@ -1273,6 +1289,7 @@ mod tests {
         for d in drivers.iter_mut() {
             d.bind_runtime_state(&rt).expect("bind runtime");
             d.prepare().expect("prepare");
+            d.activate(&rt).expect("activate");
         }
 
         let mut total_rows = 0;
@@ -1339,6 +1356,7 @@ mod tests {
         for d in drivers.iter_mut() {
             d.bind_runtime_state(&rt).expect("bind runtime");
             d.prepare().expect("prepare");
+            d.activate(&rt).expect("activate");
         }
 
         let mut total_rows = 0;
