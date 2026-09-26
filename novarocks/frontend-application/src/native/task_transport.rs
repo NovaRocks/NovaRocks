@@ -2238,71 +2238,127 @@ impl CoveredRequestedVersions {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CoveredEventValidationError {
+    ProcessMismatch,
+    QueryMismatch,
+    Protocol(&'static str),
+}
+
+impl CoveredEventValidationError {
+    const fn subscription_state(self) -> SubscriptionState {
+        match self {
+            Self::ProcessMismatch => SubscriptionState::ProcessMismatch,
+            Self::QueryMismatch => SubscriptionState::QueryMismatch,
+            Self::Protocol(_) => SubscriptionState::Rejected,
+        }
+    }
+}
+
+impl fmt::Display for CoveredEventValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProcessMismatch => {
+                formatter.write_str("covered observation addresses another backend process")
+            }
+            Self::QueryMismatch => {
+                formatter.write_str("covered observation addresses another query context")
+            }
+            Self::Protocol(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+fn validate_covered_task_context(
+    identity: TaskIdentity,
+    context: QueryContextRef,
+) -> Result<(), CoveredEventValidationError> {
+    if identity.query_execution_id() != context.query_execution_id() {
+        return Err(CoveredEventValidationError::QueryMismatch);
+    }
+    if identity.backend_process_id() != context.backend_process_id() {
+        return Err(CoveredEventValidationError::ProcessMismatch);
+    }
+    Ok(())
+}
+
+fn validate_covered_receipt_context(
+    observed: QueryContextRef,
+    expected: QueryContextRef,
+) -> Result<(), CoveredEventValidationError> {
+    if observed.query_execution_id() != expected.query_execution_id()
+        || observed.frontend_process_id() != expected.frontend_process_id()
+    {
+        return Err(CoveredEventValidationError::QueryMismatch);
+    }
+    if observed.backend_process_id() != expected.backend_process_id() {
+        return Err(CoveredEventValidationError::ProcessMismatch);
+    }
+    Ok(())
+}
+
 fn validate_covered_event_context(
     request: &DecodedCoveredSubscription,
     requested_versions: &CoveredRequestedVersions,
     event: &CoveredStatusStreamEvent,
-) -> Result<(), String> {
+) -> Result<(), CoveredEventValidationError> {
     let context = request.context;
-    let generation = request.generation;
-    let identity = match &event.fact {
-        CoveredStatusStreamFact::Status(status) => Some(status.identity()),
-        CoveredStatusStreamFact::Gone(identity) | CoveredStatusStreamFact::Unknown(identity) => {
-            Some(*identity)
+    // Classify identity before version prerequisites: a foreign Unchanged
+    // frame is an identity violation even though no foreign cursor was sent.
+    match &event.fact {
+        CoveredStatusStreamFact::Status(status) => {
+            validate_covered_task_context(status.identity(), context)?
         }
-        CoveredStatusStreamFact::StatusUnchanged(identity) => {
-            if !requested_versions.statuses.contains(identity) {
-                return Err(
-                    "covered StatusUnchanged has no version in this subscription request"
-                        .to_owned(),
-                );
-            }
-            Some(*identity)
+        CoveredStatusStreamFact::Gone(identity)
+        | CoveredStatusStreamFact::Unknown(identity)
+        | CoveredStatusStreamFact::StatusUnchanged(identity)
+        | CoveredStatusStreamFact::TaskConvergenceUnchanged(identity) => {
+            validate_covered_task_context(*identity, context)?
         }
-        CoveredStatusStreamFact::TaskConvergenceUnchanged(identity) => {
-            if !requested_versions.task_convergence.contains(identity) {
-                return Err(
-                    "covered TaskConvergenceUnchanged has no version in this subscription request"
-                        .to_owned(),
-                );
-            }
-            Some(*identity)
+        CoveredStatusStreamFact::TaskConvergence(receipt) => {
+            validate_covered_task_context(receipt.identity(), context)?
         }
-        CoveredStatusStreamFact::TaskConvergence(receipt) => Some(receipt.identity()),
         CoveredStatusStreamFact::ContextConvergence(receipt) => {
-            if receipt.context() != context {
-                return Err("covered context convergence addresses another context".to_owned());
-            }
-            None
+            validate_covered_receipt_context(receipt.context(), context)?
         }
         CoveredStatusStreamFact::Quiesce(receipt) => {
-            if receipt.context() != context {
-                return Err("covered Quiesce addresses another context".to_owned());
-            }
+            validate_covered_receipt_context(receipt.context(), context)?;
             for identity in receipt.accepted_tasks() {
-                identity
-                    .verify_query_context(context)
-                    .map_err(|error| error.to_string())?;
+                validate_covered_task_context(*identity, context)?;
             }
-            None
         }
-        CoveredStatusStreamFact::CatchUpComplete(marker) => {
-            if marker.generation != generation.get() {
-                return Err("covered catch-up names another stream generation".to_owned());
-            }
-            None
+        CoveredStatusStreamFact::CatchUpComplete(_) | CoveredStatusStreamFact::Bookmark(_) => {}
+    }
+    match &event.fact {
+        CoveredStatusStreamFact::StatusUnchanged(identity)
+            if !requested_versions.statuses.contains(identity) =>
+        {
+            return Err(CoveredEventValidationError::Protocol(
+                "covered StatusUnchanged has no version in this subscription request",
+            ));
         }
-        CoveredStatusStreamFact::Bookmark(marker) => {
-            if marker.generation != generation.get() {
-                return Err("covered bookmark names another stream generation".to_owned());
-            }
-            None
+        CoveredStatusStreamFact::TaskConvergenceUnchanged(identity)
+            if !requested_versions.task_convergence.contains(identity) =>
+        {
+            return Err(CoveredEventValidationError::Protocol(
+                "covered TaskConvergenceUnchanged has no version in this subscription request",
+            ));
         }
-    };
-    if let Some(identity) = identity {
-        identity
-            .verify_query_context(context)
-            .map_err(|error| error.to_string())?;
+        CoveredStatusStreamFact::CatchUpComplete(marker)
+            if marker.generation != request.generation.get() =>
+        {
+            return Err(CoveredEventValidationError::Protocol(
+                "covered catch-up names another stream generation",
+            ));
+        }
+        CoveredStatusStreamFact::Bookmark(marker)
+            if marker.generation != request.generation.get() =>
+        {
+            return Err(CoveredEventValidationError::Protocol(
+                "covered bookmark names another stream generation",
+            ));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2425,7 +2481,7 @@ async fn run_covered_subscription(
                                 &event,
                             ) {
                                 tracing::warn!(%context, detail = %error, "covered observation frame conflicts with its stream");
-                                set_state(&state, SubscriptionState::Rejected);
+                                set_state(&state, error.subscription_state());
                                 return;
                             }
                             let new_liveness = match &event.fact {
@@ -4648,6 +4704,253 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    /// Real H2 validates the foreign frame before the actual serial Task
+    /// owner receives it. This is FE transport/owner integration evidence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn covered_foreign_status_process_reaches_actual_round_as_identity_violation() {
+        use crate::task_execution::clock::TaskProtocolClock;
+        use crate::task_execution::error::{ParticipantObservationFailure, TaskExecutionError};
+
+        let (mut round, clock, context, task) =
+            crate::task_execution::tests::covered_loopback_recovery_round();
+        let foreign = TaskIdentity::new(
+            task.query_execution_id(),
+            task.stage_id(),
+            task.task_id(),
+            BackendProcessId::new_v7(),
+        );
+        let loopback = Loopback::start().await;
+        loopback
+            .peer
+            .expect_subscribe(SubscribeAnswer::EventsThenHold(vec![
+                encode_covered_status_event(&CoveredStatusStreamEvent {
+                    fact: CoveredStatusStreamFact::Status(status_at(
+                        foreign,
+                        TaskStatusVersion::FIRST,
+                    )),
+                    source_revision: None,
+                })
+                .unwrap(),
+            ]));
+        let intake = Arc::new(
+            ObservationIntake::new_with_clock(
+                1,
+                3,
+                3 * 4096,
+                4096,
+                Arc::new(CountingWake::default()),
+                clock as Arc<dyn TaskProtocolClock>,
+            )
+            .unwrap(),
+        );
+        let subscriber = Arc::new(
+            CoveredTaskStatusSubscriber::new(
+                &[(context.backend_process_id(), loopback.endpoint.clone())],
+                Arc::clone(&intake),
+                2,
+                FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            )
+            .unwrap(),
+        );
+        round.install_covered_observation(Arc::clone(&subscriber), Arc::clone(&intake));
+        subscriber
+            .ensure(
+                round
+                    .execution()
+                    .covered_subscription_request(context, NonZeroU64::new(2).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while subscriber.state(context) != Some(SubscriptionState::ProcessMismatch) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the H2 foreign frame fixes an exact identity violation");
+        {
+            let mut runner = intake.try_enter().unwrap();
+            assert!(
+                runner.drain_ordered(1).is_empty(),
+                "foreign status never reaches the reducer"
+            );
+        }
+        intake.acknowledge_applied();
+        let error = round
+            .turn()
+            .expect_err("the actual Task owner must fail closed");
+        assert!(
+            matches!(error, TaskExecutionError::ParticipantUnobservable {
+            backend, state: ParticipantObservationFailure::IdentityViolation("process_mismatch")
+        } if backend == context.backend_process_id()),
+            "{error:?}"
+        );
+        assert_eq!(
+            loopback.peer.subscribed().len(),
+            1,
+            "identity violations cannot reopen the source as transport recovery"
+        );
+        subscriber.stop(context);
+    }
+
+    fn covered_validation_request(
+        context: QueryContextRef,
+        task: TaskIdentity,
+    ) -> DecodedCoveredSubscription {
+        DecodedCoveredSubscription {
+            context,
+            generation: NonZeroU64::new(3).unwrap(),
+            status_cursors: vec![TaskStatusCursor::at(task, TaskStatusVersion::FIRST)],
+            task_convergence_cursors: vec![TaskConvergenceCursor::at(
+                task,
+                TaskConvergenceVersion::FIRST,
+            )],
+            context_cursor: None,
+            quiesce_cursor: None,
+            required_identities: vec![task],
+        }
+    }
+
+    #[test]
+    fn covered_identity_violations_retain_their_typed_failure_for_every_carrier() {
+        let backend = BackendProcessId::new_v7();
+        let exact_context = context(backend);
+        let exact_task = identity(1, backend);
+        let request = covered_validation_request(exact_context, exact_task);
+        let requested_versions = CoveredRequestedVersions::from_request(&request);
+        let other_query =
+            QueryExecutionId::new(QueryId::new(91, 92), AttemptId::new(1).unwrap()).unwrap();
+        for (query, process, expected) in [
+            (
+                exact_context.query_execution_id(),
+                BackendProcessId::new_v7(),
+                SubscriptionState::ProcessMismatch,
+            ),
+            (other_query, backend, SubscriptionState::QueryMismatch),
+        ] {
+            let foreign_task =
+                TaskIdentity::new(query, exact_task.stage_id(), exact_task.task_id(), process);
+            let foreign_context =
+                QueryContextRef::new(query, exact_context.frontend_process_id(), process);
+            let facts = [
+                CoveredStatusStreamFact::Status(status_at(foreign_task, TaskStatusVersion::FIRST)),
+                CoveredStatusStreamFact::Gone(foreign_task),
+                CoveredStatusStreamFact::Unknown(foreign_task),
+                CoveredStatusStreamFact::StatusUnchanged(foreign_task),
+                CoveredStatusStreamFact::TaskConvergenceUnchanged(foreign_task),
+                CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
+                    foreign_task,
+                    TaskConvergenceVersion::FIRST,
+                )),
+                CoveredStatusStreamFact::ContextConvergence(convergence_receipt(foreign_context)),
+                CoveredStatusStreamFact::Quiesce(QuiesceQueryContextReceipt::new(
+                    foreign_context,
+                    1,
+                    vec![exact_task],
+                    QueryContextState::Quiescing,
+                )),
+                // A correct Context cannot launder a foreign accepted member.
+                CoveredStatusStreamFact::Quiesce(QuiesceQueryContextReceipt::new(
+                    exact_context,
+                    1,
+                    vec![foreign_task],
+                    QueryContextState::Quiescing,
+                )),
+            ];
+            for fact in facts {
+                let event = CoveredStatusStreamEvent {
+                    fact,
+                    source_revision: None,
+                };
+                let error = validate_covered_event_context(&request, &requested_versions, &event)
+                    .expect_err("foreign identity must be rejected");
+                assert_eq!(error.subscription_state(), expected, "{event:?}");
+            }
+        }
+        let foreign_frontend = QueryContextRef::new(
+            exact_context.query_execution_id(),
+            FrontendProcessId::new_v7(),
+            backend,
+        );
+        for fact in [
+            CoveredStatusStreamFact::ContextConvergence(convergence_receipt(foreign_frontend)),
+            CoveredStatusStreamFact::Quiesce(QuiesceQueryContextReceipt::new(
+                foreign_frontend,
+                1,
+                vec![exact_task],
+                QueryContextState::Quiescing,
+            )),
+        ] {
+            assert_eq!(
+                validate_covered_event_context(
+                    &request,
+                    &requested_versions,
+                    &CoveredStatusStreamEvent {
+                        fact,
+                        source_revision: None
+                    }
+                )
+                .unwrap_err()
+                .subscription_state(),
+                SubscriptionState::QueryMismatch
+            );
+        }
+    }
+
+    #[test]
+    fn covered_version_and_generation_violations_remain_protocol_rejections() {
+        let backend = BackendProcessId::new_v7();
+        let request = covered_validation_request(context(backend), identity(1, backend));
+        let versions = CoveredRequestedVersions::from_request(&request);
+        for fact in [
+            CoveredStatusStreamFact::StatusUnchanged(identity(2, backend)),
+            CoveredStatusStreamFact::TaskConvergenceUnchanged(identity(2, backend)),
+            CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
+                generation: 4,
+                initial_cut: 1,
+            }),
+            CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
+                generation: 4,
+                sequence: 1,
+                covered_prefix: 0,
+                source_cut: 1,
+            }),
+        ] {
+            let event = CoveredStatusStreamEvent {
+                fact,
+                source_revision: None,
+            };
+            assert_eq!(
+                validate_covered_event_context(&request, &versions, &event)
+                    .unwrap_err()
+                    .subscription_state(),
+                SubscriptionState::Rejected,
+                "{event:?}"
+            );
+        }
+        for fact in [
+            CoveredStatusStreamFact::StatusUnchanged(identity(1, backend)),
+            CoveredStatusStreamFact::TaskConvergenceUnchanged(identity(1, backend)),
+            CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
+                generation: 3,
+                initial_cut: 1,
+            }),
+            CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
+                generation: 3,
+                sequence: 1,
+                covered_prefix: 0,
+                source_cut: 1,
+            }),
+        ] {
+            let event = CoveredStatusStreamEvent {
+                fact,
+                source_revision: None,
+            };
+            validate_covered_event_context(&request, &versions, &event)
+                .expect("exact version and generation remain valid");
         }
     }
 
