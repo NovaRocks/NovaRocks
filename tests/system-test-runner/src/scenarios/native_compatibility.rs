@@ -260,8 +260,8 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             only_successful_receipt(create_response, "CreateTask after foreign Establish")?;
         ensure!(
             proto::TaskOperationOutcome::try_from(create_receipt.outcome)
-                == Ok(proto::TaskOperationOutcome::OperationTimedOut),
-            "CreateTask after foreign Establish must time out on the context creation gate, got {create_receipt:?}"
+                == Ok(proto::TaskOperationOutcome::NotReady),
+            "CreateTask after foreign Establish must immediately require an active context, got {create_receipt:?}"
         );
         ensure!(
             create_receipt.ack.is_none(),
@@ -275,11 +275,11 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             "refused CreateTask must not establish the context"
         );
         context.action(
-            "foreign 32-byte compatibility identity returned CompatibilityMismatch; a following valid CreateTask timed out on the untouched context creation gate",
+            "foreign 32-byte compatibility identity returned CompatibilityMismatch; a following valid CreateTask returned NotReady without establishing the context",
         );
 
-        // The absent-context CreateTask waits only for its own operation
-        // deadline. Observe the Worker's released reservation before asking
+        // The absent-context CreateTask does not consume the admission ticket.
+        // Observe the Worker's released reservation before asking
         // for a new ticket; rejected acquisitions remain in its replay ledger.
         wait_for_admission_ticket_expiry(&metrics_client, context, metrics_port)?;
         context.action(
