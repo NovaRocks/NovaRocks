@@ -383,3 +383,257 @@ fn test_variant_get_null_input_row_is_null() {
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert!(out.is_null(0), "NULL variant input row yields NULL");
 }
+
+// ---------------------------------------------------------------------------
+// Multi-row JSON path evaluation: constant and per-row paths, NULLs, and
+// unparsable paths over JSON text and VARIANT inputs
+// ---------------------------------------------------------------------------
+
+fn json_text_column(values: Vec<Option<&str>>) -> ArrayRef {
+    Arc::new(StringArray::from(values)) as ArrayRef
+}
+
+/// Encode each JSON text as an engine VARIANT value.
+fn variant_column(values: Vec<Option<&str>>) -> ArrayRef {
+    use novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes;
+    let encoded = values
+        .iter()
+        .map(|value| value.map(|json| encode_json_text_to_variant_bytes(json).unwrap()))
+        .collect::<Vec<_>>();
+    Arc::new(LargeBinaryArray::from(
+        encoded
+            .iter()
+            .map(|value| value.as_deref())
+            .collect::<Vec<_>>(),
+    )) as ArrayRef
+}
+
+fn eval_path_rows(name: &str, arena: &ExprArena, args: &[ExprId], chunk: &Chunk) -> ArrayRef {
+    eval_variant_function(name, arena, args[0], args, chunk).unwrap()
+}
+
+#[test]
+fn test_get_json_string_constant_path_applies_to_every_row() {
+    let chunk = common::chunk_from_columns(vec![json_text_column(vec![
+        Some(r#"{"a":"x"}"#),
+        Some(r#"{"a":1}"#),
+        None,
+        Some(r#"{"b":2}"#),
+        Some("not json"),
+    ])]);
+    let mut arena = ExprArena::default();
+    let json = common::slot_ref(&mut arena, 1, DataType::Utf8);
+    let path = utf8_lit(&mut arena, "$.a");
+
+    let out = eval_path_rows("get_json_string", &arena, &[json, path], &chunk);
+    let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        out.iter().collect::<Vec<_>>(),
+        vec![Some("x"), Some("1"), None, None, None]
+    );
+}
+
+#[test]
+fn test_get_variant_string_constant_path_applies_to_every_row() {
+    let chunk = common::chunk_from_columns(vec![variant_column(vec![
+        Some(r#"{"a":"x"}"#),
+        Some(r#"{"a":1}"#),
+        None,
+        Some(r#"{"b":2}"#),
+    ])]);
+    let mut arena = ExprArena::default();
+    let variant = common::slot_ref(&mut arena, 1, DataType::LargeBinary);
+    let path = utf8_lit(&mut arena, "$.a");
+
+    let out = eval_path_rows("get_variant_string", &arena, &[variant, path], &chunk);
+    let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        out.iter().collect::<Vec<_>>(),
+        vec![Some("x"), Some("1"), None, None]
+    );
+}
+
+#[test]
+fn test_get_json_int_per_row_paths_use_each_rows_own_path() {
+    let doc = r#"{"a":1,"b":[5,6]}"#;
+    let chunk = common::chunk_from_columns(vec![
+        json_text_column(vec![Some(doc); 6]),
+        json_text_column(vec![
+            Some("$.a"),
+            Some("$.b[1]"),
+            Some("$.a"),
+            None,
+            Some("$x"),
+            Some("b[0]"),
+        ]),
+    ]);
+    let mut arena = ExprArena::default();
+    let json = common::slot_ref(&mut arena, 1, DataType::Utf8);
+    let path = common::slot_ref(&mut arena, 2, DataType::Utf8);
+
+    let out = eval_path_rows("get_json_int", &arena, &[json, path], &chunk);
+    let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        out.iter().collect::<Vec<_>>(),
+        vec![Some(1), Some(6), Some(1), None, None, Some(5)]
+    );
+}
+
+#[test]
+fn test_get_variant_int_per_row_paths_use_each_rows_own_path() {
+    let chunk = common::chunk_from_columns(vec![
+        variant_column(vec![
+            Some(r#"{"a":1,"b":{"c":7}}"#),
+            Some(r#"{"a":2}"#),
+            None,
+            Some(r#"{"a":3}"#),
+            Some(r#"{"a":4}"#),
+            Some(r#"{"a":5}"#),
+        ]),
+        json_text_column(vec![
+            Some("$.b.c"),
+            Some("$.a"),
+            Some("$.a"),
+            Some("$.a"),
+            Some("$["),
+            Some("$.b.c"),
+        ]),
+    ]);
+    let mut arena = ExprArena::default();
+    let variant = common::slot_ref(&mut arena, 1, DataType::LargeBinary);
+    let path = common::slot_ref(&mut arena, 2, DataType::Utf8);
+
+    let out = eval_path_rows("get_variant_int", &arena, &[variant, path], &chunk);
+    let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        out.iter().collect::<Vec<_>>(),
+        vec![Some(7), Some(2), None, Some(3), None, None]
+    );
+}
+
+#[test]
+fn test_json_exists_and_json_length_treat_unparsable_path_as_missing() {
+    // An unparsable path answers like a missing one (false / 0), not an
+    // error, while a NULL path is NULL, for JSON text and VARIANT alike.
+    let docs = vec![Some(r#"{"a":[1,2,3]}"#); 4];
+    let paths = json_text_column(vec![Some("$.a"), Some("$x"), None, Some("$.missing")]);
+    for input in [json_text_column(docs.clone()), variant_column(docs)] {
+        let input_type = input.data_type().clone();
+        let chunk = common::chunk_from_columns(vec![input, paths.clone()]);
+        let mut arena = ExprArena::default();
+        let doc = common::slot_ref(&mut arena, 1, input_type.clone());
+        let path = common::slot_ref(&mut arena, 2, DataType::Utf8);
+
+        let exists = eval_path_rows("json_exists", &arena, &[doc, path], &chunk);
+        let exists = exists.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(
+            exists.iter().collect::<Vec<_>>(),
+            vec![Some(true), Some(false), None, Some(false)],
+            "json_exists over {input_type}"
+        );
+        let length = eval_path_rows("json_length", &arena, &[doc, path], &chunk);
+        let length = length
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert_eq!(
+            length.iter().collect::<Vec<_>>(),
+            vec![Some(3), Some(0), None, Some(0)],
+            "json_length over {input_type}"
+        );
+    }
+}
+
+#[test]
+fn test_json_path_functions_with_many_distinct_paths_match_row_by_row_evaluation() {
+    // More than 100 distinct paths (valid, unparsable and NULL), most of them
+    // recurring, which is more than one evaluation retains. Evaluating one row
+    // per chunk reproduces per-row path parsing, so multi-row results must be
+    // identical to it.
+    let rows = 300;
+    let docs = (0..rows)
+        .map(|i| {
+            (i % 17 != 0).then(|| {
+                format!(
+                    r#"{{"k{}": {i}, "s": "v{}", "arr": [{i}, true, 1.5], "o": {{"x": null}}}}"#,
+                    i % 100,
+                    i % 9
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let paths = (0..rows)
+        .map(|i| match i % 13 {
+            0 => None,
+            1 => Some(format!("$x{}", i % 40)),
+            2 => Some("$.s".to_string()),
+            3 => Some("$.arr[1]".to_string()),
+            4 => Some("$.o.x".to_string()),
+            _ => Some(format!("$.k{}", i % 100)),
+        })
+        .collect::<Vec<_>>();
+    let docs = docs.iter().map(|doc| doc.as_deref()).collect::<Vec<_>>();
+    let path_column = json_text_column(paths.iter().map(|path| path.as_deref()).collect());
+
+    let text_functions = [
+        "json_query",
+        "get_variant_bool",
+        "get_variant_int",
+        "get_variant_double",
+        "get_variant_string",
+        "json_exists",
+        "json_length",
+    ];
+    // Date and time conversions need typed variant primitives that JSON text
+    // never encodes, so they only check that NULL results line up.
+    let variant_only_functions = [
+        "variant_query",
+        "get_variant_date",
+        "get_variant_datetime",
+        "get_variant_time",
+    ];
+    let inputs = [
+        (json_text_column(docs.clone()), &text_functions[..], &[][..]),
+        (
+            variant_column(docs),
+            &text_functions[..],
+            &variant_only_functions[..],
+        ),
+    ];
+    for (input, value_functions, null_only_functions) in inputs {
+        let columns = vec![input.clone(), path_column.clone()];
+        let mut arena = ExprArena::default();
+        let doc = common::slot_ref(&mut arena, 1, input.data_type().clone());
+        let path = common::slot_ref(&mut arena, 2, DataType::Utf8);
+        let multi_row_chunk = common::chunk_from_columns(columns.clone());
+        let single_row_chunks = common::single_row_chunks(&columns);
+
+        for name in value_functions.iter().chain(null_only_functions) {
+            let multi_row = eval_path_rows(name, &arena, &[doc, path], &multi_row_chunk);
+            let single_rows = single_row_chunks
+                .iter()
+                .map(|chunk| eval_path_rows(name, &arena, &[doc, path], chunk))
+                .collect::<Vec<_>>();
+            let row_by_row = arrow::compute::concat(
+                &single_rows
+                    .iter()
+                    .map(|array| array.as_ref())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert_eq!(
+                multi_row.to_data(),
+                row_by_row.to_data(),
+                "{name} over {}",
+                input.data_type()
+            );
+            if value_functions.contains(name) {
+                assert!(
+                    multi_row.null_count() < rows,
+                    "{name} over {} produced only NULLs",
+                    input.data_type()
+                );
+            }
+        }
+    }
+}

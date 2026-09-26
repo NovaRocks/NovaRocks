@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::function::pattern_memo::PatternMemo;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use regex::Regex;
@@ -40,6 +41,7 @@ pub fn eval_regexp_count(
         Some(ExprNode::Literal(LiteralValue::Utf8(_)))
     );
 
+    let mut patterns = PatternMemo::new();
     let mut out = Vec::with_capacity(len);
     for row in 0..len {
         let Some(s_arr) = s_arr_opt else {
@@ -62,7 +64,7 @@ pub fn eval_regexp_count(
             continue;
         }
 
-        let re = match Regex::new(pattern) {
+        let re = match patterns.get_or_compile(pattern, Regex::new) {
             Ok(re) => re,
             Err(err) if pattern_is_constant => {
                 return Err(format!(

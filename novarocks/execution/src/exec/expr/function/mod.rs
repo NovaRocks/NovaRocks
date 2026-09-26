@@ -29,6 +29,7 @@ pub mod matching;
 pub mod math;
 pub mod mv_state;
 pub mod object;
+mod pattern_memo;
 pub mod string;
 pub mod struct_fn;
 pub mod variant;

@@ -162,3 +162,52 @@ pub fn typed_null(
     use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
     arena.push_typed(ExprNode::Literal(LiteralValue::Null), data_type)
 }
+
+/// Create a Chunk whose columns are bound to slot ids `1..=columns.len()` in order.
+pub fn chunk_from_columns(
+    columns: Vec<arrow::array::ArrayRef>,
+) -> novarocks_execution::exec::chunk::Chunk {
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_execution::exec::chunk::ChunkSchema;
+    use novarocks_types::SlotId;
+    use std::sync::Arc;
+
+    let fields = columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| Field::new(format!("c{}", idx + 1), column.data_type().clone(), true))
+        .collect::<Vec<_>>();
+    let slot_ids = (1..=columns.len())
+        .map(|slot| SlotId::new(slot as u32))
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)
+            .expect("chunk schema");
+    novarocks_execution::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
+}
+
+/// Push a reference to column `slot` of a `chunk_from_columns` chunk.
+pub fn slot_ref(
+    arena: &mut novarocks_execution::exec::expr::ExprArena,
+    slot: u32,
+    data_type: arrow::datatypes::DataType,
+) -> novarocks_execution::exec::expr::ExprId {
+    use novarocks_execution::exec::expr::ExprNode;
+    use novarocks_types::SlotId;
+    arena.push_typed(ExprNode::SlotId(SlotId::new(slot)), data_type)
+}
+
+/// Split every column of `columns` into single-row chunks, one per row.
+///
+/// Evaluating a function once per row this way reproduces per-row semantics,
+/// which multi-row evaluation must match.
+pub fn single_row_chunks(
+    columns: &[arrow::array::ArrayRef],
+) -> Vec<novarocks_execution::exec::chunk::Chunk> {
+    let rows = columns.first().map_or(0, |column| column.len());
+    (0..rows)
+        .map(|row| chunk_from_columns(columns.iter().map(|column| column.slice(row, 1)).collect()))
+        .collect()
+}

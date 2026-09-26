@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::function::pattern_memo::PatternMemo;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
 use regex::Regex;
@@ -40,13 +41,16 @@ pub fn eval_regexp_extract(
         .ok_or_else(|| "regexp_extract expects string".to_string())?;
     let idx_arr = super::common::downcast_int_arg_array(&idx_arr, "regexp_extract")?;
     let len = s_arr.len();
+    let mut patterns = PatternMemo::new();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
         if s_arr.is_null(i) || p_arr.is_null(i) || idx_arr.is_null(i) {
             out.push(None);
             continue;
         }
-        let re = Regex::new(p_arr.value(i)).map_err(|e| e.to_string())?;
+        let re = patterns
+            .get_or_compile(p_arr.value(i), Regex::new)
+            .map_err(|e| e.to_string())?;
         let idx = idx_arr.value(i) as usize;
         let caps = re.captures(s_arr.value(i));
         let val = caps

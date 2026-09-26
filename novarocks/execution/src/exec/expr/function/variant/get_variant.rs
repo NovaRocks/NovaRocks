@@ -24,12 +24,16 @@ use chrono::{Local, Offset};
 use serde_json::Value as JsonValue;
 
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::function::pattern_memo::PatternMemo;
 use crate::exec::expr::{ExprArena, ExprId};
 use novarocks_types::value::variant::{
-    VariantValue, is_variant_null, parse_variant_path, variant_query, variant_to_bool,
+    VariantPath, VariantValue, is_variant_null, parse_variant_path, variant_query, variant_to_bool,
     variant_to_date_days, variant_to_datetime_micros, variant_to_f64, variant_to_i64,
     variant_to_string, variant_to_time_micros,
 };
+
+/// Parsed path arguments of one evaluation, keyed by path text.
+type PathMemo<'a> = PatternMemo<'a, VariantPath, String>;
 
 fn eval_variant_path_args(
     arena: &ExprArena,
@@ -65,17 +69,20 @@ fn downcast_variant_path_args<'a>(
     Ok((variant_arr, path_arr))
 }
 
-fn resolve_variant_value(
+fn resolve_variant_value<'a>(
     variant_arr: &LargeBinaryArray,
-    path_arr: &StringArray,
+    path_arr: &'a StringArray,
     row: usize,
+    paths: &mut PathMemo<'a>,
 ) -> Option<VariantValue> {
     if variant_arr.is_null(row) || path_arr.is_null(row) {
         return None;
     }
-    let path = parse_variant_path(path_arr.value(row)).ok()?;
+    let path = paths
+        .get_or_compile(path_arr.value(row), parse_variant_path)
+        .ok()?;
     VariantValue::from_serialized(variant_arr.value(row))
-        .and_then(|v| variant_query(&v, &path))
+        .and_then(|v| variant_query(&v, path))
         .ok()
 }
 
@@ -285,9 +292,10 @@ pub fn eval_json_query(
         .ok_or_else(|| "json_query expects Utf8 for path argument".to_string())?;
 
     let mut builder = StringBuilder::new();
+    let mut paths = PathMemo::new();
     if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
         for row in 0..chunk.len() {
-            let value = match resolve_variant_value(variant_arr, path_arr, row) {
+            let value = match resolve_variant_value(variant_arr, path_arr, row, &mut paths) {
                 Some(v) => v,
                 None => {
                     builder.append_null();
@@ -313,7 +321,7 @@ pub fn eval_json_query(
             builder.append_null();
             continue;
         }
-        let path = match parse_variant_path(path_arr.value(row)) {
+        let path = match paths.get_or_compile(path_arr.value(row), parse_variant_path) {
             Ok(path) => path,
             Err(_) => {
                 builder.append_null();
@@ -347,8 +355,9 @@ pub fn eval_variant_query(
         downcast_variant_path_args(&variant_array, &path_array, "variant_query")?;
 
     let mut builder = LargeBinaryBuilder::new();
+    let mut paths = PathMemo::new();
     for row in 0..chunk.len() {
-        let value = match resolve_variant_value(variant_arr, path_arr, row) {
+        let value = match resolve_variant_value(variant_arr, path_arr, row, &mut paths) {
             Some(v) => v,
             None => {
                 builder.append_null();
@@ -376,9 +385,10 @@ pub fn eval_get_variant_bool(
         .ok_or_else(|| "get_variant_bool expects Utf8 for path argument".to_string())?;
 
     let mut builder = BooleanBuilder::new();
+    let mut paths = PathMemo::new();
     if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
         for row in 0..chunk.len() {
-            let value = match resolve_variant_value(variant_arr, path_arr, row) {
+            let value = match resolve_variant_value(variant_arr, path_arr, row, &mut paths) {
                 Some(v) => v,
                 None => {
                     builder.append_null();
@@ -408,7 +418,7 @@ pub fn eval_get_variant_bool(
             builder.append_null();
             continue;
         }
-        let path = match parse_variant_path(path_arr.value(row)) {
+        let path = match paths.get_or_compile(path_arr.value(row), parse_variant_path) {
             Ok(path) => path,
             Err(_) => {
                 builder.append_null();
@@ -444,9 +454,10 @@ pub fn eval_get_variant_int(
         .ok_or_else(|| "get_variant_int expects Utf8 for path argument".to_string())?;
 
     let mut builder = Int64Builder::new();
+    let mut paths = PathMemo::new();
     if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
         for row in 0..chunk.len() {
-            let value = match resolve_variant_value(variant_arr, path_arr, row) {
+            let value = match resolve_variant_value(variant_arr, path_arr, row, &mut paths) {
                 Some(v) => v,
                 None => {
                     builder.append_null();
@@ -476,7 +487,7 @@ pub fn eval_get_variant_int(
             builder.append_null();
             continue;
         }
-        let path = match parse_variant_path(path_arr.value(row)) {
+        let path = match paths.get_or_compile(path_arr.value(row), parse_variant_path) {
             Ok(path) => path,
             Err(_) => {
                 builder.append_null();
@@ -512,9 +523,10 @@ pub fn eval_get_variant_double(
         .ok_or_else(|| "get_variant_double expects Utf8 for path argument".to_string())?;
 
     let mut builder = Float64Builder::new();
+    let mut paths = PathMemo::new();
     if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
         for row in 0..chunk.len() {
-            let value = match resolve_variant_value(variant_arr, path_arr, row) {
+            let value = match resolve_variant_value(variant_arr, path_arr, row, &mut paths) {
                 Some(v) => v,
                 None => {
                     builder.append_null();
@@ -544,7 +556,7 @@ pub fn eval_get_variant_double(
             builder.append_null();
             continue;
         }
-        let path = match parse_variant_path(path_arr.value(row)) {
+        let path = match paths.get_or_compile(path_arr.value(row), parse_variant_path) {
             Ok(path) => path,
             Err(_) => {
                 builder.append_null();
@@ -580,9 +592,10 @@ pub fn eval_get_variant_string(
         .ok_or_else(|| "get_variant_string expects Utf8 for path argument".to_string())?;
 
     let mut builder = StringBuilder::new();
+    let mut paths = PathMemo::new();
     if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
         for row in 0..chunk.len() {
-            let value = match resolve_variant_value(variant_arr, path_arr, row) {
+            let value = match resolve_variant_value(variant_arr, path_arr, row, &mut paths) {
                 Some(v) => v,
                 None => {
                     builder.append_null();
@@ -612,7 +625,7 @@ pub fn eval_get_variant_string(
             builder.append_null();
             continue;
         }
-        let path = match parse_variant_path(path_arr.value(row)) {
+        let path = match paths.get_or_compile(path_arr.value(row), parse_variant_path) {
             Ok(path) => path,
             Err(_) => {
                 builder.append_null();
@@ -657,13 +670,14 @@ pub fn eval_json_exists(
         .ok_or_else(|| "json_exists expects Utf8 for path argument".to_string())?;
 
     let mut builder = BooleanBuilder::new();
+    let mut paths = PathMemo::new();
     if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
         for row in 0..chunk.len() {
             if variant_arr.is_null(row) || path_arr.is_null(row) {
                 builder.append_null();
                 continue;
             }
-            let path = match parse_variant_path(path_arr.value(row)) {
+            let path = match paths.get_or_compile(path_arr.value(row), parse_variant_path) {
                 Ok(path) => path,
                 Err(_) => {
                     builder.append_value(false);
@@ -677,7 +691,7 @@ pub fn eval_json_exists(
                     continue;
                 }
             };
-            builder.append_value(variant_query(&value, &path).is_ok());
+            builder.append_value(variant_query(&value, path).is_ok());
         }
         return Ok(Arc::new(builder.finish()) as ArrayRef);
     }
@@ -693,7 +707,7 @@ pub fn eval_json_exists(
             builder.append_null();
             continue;
         }
-        let path = match parse_variant_path(path_arr.value(row)) {
+        let path = match paths.get_or_compile(path_arr.value(row), parse_variant_path) {
             Ok(path) => path,
             Err(_) => {
                 builder.append_value(false);
@@ -725,13 +739,14 @@ pub fn eval_json_length(
         .ok_or_else(|| "json_length expects Utf8 for path argument".to_string())?;
 
     let mut builder = Int32Builder::new();
+    let mut paths = PathMemo::new();
     if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
         for row in 0..chunk.len() {
             if variant_arr.is_null(row) || path_arr.is_null(row) {
                 builder.append_null();
                 continue;
             }
-            let path = match parse_variant_path(path_arr.value(row)) {
+            let path = match paths.get_or_compile(path_arr.value(row), parse_variant_path) {
                 Ok(path) => path,
                 Err(_) => {
                     builder.append_value(0);
@@ -745,7 +760,7 @@ pub fn eval_json_length(
                     continue;
                 }
             };
-            let queried = match variant_query(&value, &path) {
+            let queried = match variant_query(&value, path) {
                 Ok(value) => value,
                 Err(_) => {
                     builder.append_value(0);
@@ -779,7 +794,7 @@ pub fn eval_json_length(
             builder.append_null();
             continue;
         }
-        let path = match parse_variant_path(path_arr.value(row)) {
+        let path = match paths.get_or_compile(path_arr.value(row), parse_variant_path) {
             Ok(path) => path,
             Err(_) => {
                 builder.append_value(0);
@@ -814,8 +829,9 @@ pub fn eval_get_variant_date(
 
     let tz = Local::now().offset().fix();
     let mut builder = Date32Builder::new();
+    let mut paths = PathMemo::new();
     for row in 0..chunk.len() {
-        let value = match resolve_variant_value(variant_arr, path_arr, row) {
+        let value = match resolve_variant_value(variant_arr, path_arr, row, &mut paths) {
             Some(v) => v,
             None => {
                 builder.append_null();
@@ -847,8 +863,9 @@ pub fn eval_get_variant_datetime(
 
     let tz = Local::now().offset().fix();
     let mut builder = TimestampMicrosecondBuilder::new();
+    let mut paths = PathMemo::new();
     for row in 0..chunk.len() {
-        let value = match resolve_variant_value(variant_arr, path_arr, row) {
+        let value = match resolve_variant_value(variant_arr, path_arr, row, &mut paths) {
             Some(v) => v,
             None => {
                 builder.append_null();
@@ -880,8 +897,9 @@ pub fn eval_get_variant_time(
 
     let tz = Local::now().offset().fix();
     let mut builder = TimestampMicrosecondBuilder::new();
+    let mut paths = PathMemo::new();
     for row in 0..chunk.len() {
-        let value = match resolve_variant_value(variant_arr, path_arr, row) {
+        let value = match resolve_variant_value(variant_arr, path_arr, row, &mut paths) {
             Some(v) => v,
             None => {
                 builder.append_null();

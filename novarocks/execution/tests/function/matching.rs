@@ -16,12 +16,15 @@
 // under the License.
 
 use crate::common;
-use arrow::array::BooleanArray;
+use arrow::array::{ArrayRef, BooleanArray, StringArray};
 use arrow::datatypes::DataType;
-use novarocks_execution::exec::expr::ExprArena;
+use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::expr::function::matching::{
     eval_ilike, eval_like, eval_regexp, register,
 };
+use novarocks_execution::exec::expr::{ExprArena, ExprId};
+use regex::Regex;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // like tests (testing like_match via public eval_like)
@@ -152,6 +155,190 @@ fn test_regexp_partial_match() {
     let out = eval_regexp(&arena, expr, &[a, p], &common::chunk_len_1()).unwrap();
     let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out.value(0));
+}
+
+fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
+    Arc::new(StringArray::from(values)) as ArrayRef
+}
+
+/// The error `regexp` reports for a pattern the regex engine rejects.
+fn invalid_pattern_error(pattern: &str) -> String {
+    format!(
+        "regexp: invalid pattern: {}",
+        Regex::new(pattern).unwrap_err()
+    )
+}
+
+/// Evaluate `regexp(input, pattern)` over `chunk` and collect its rows.
+fn regexp_rows(
+    arena: &ExprArena,
+    input: ExprId,
+    pattern: ExprId,
+    chunk: &Chunk,
+) -> Result<Vec<Option<bool>>, String> {
+    let out = eval_regexp(arena, input, &[input, pattern], chunk)?;
+    let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+    Ok(out.iter().collect())
+}
+
+#[test]
+fn test_regexp_constant_pattern_applies_to_every_row() {
+    let chunk = common::chunk_from_columns(vec![string_column(vec![
+        Some("abc1"),
+        Some("xyz"),
+        None,
+        Some("zzabcz"),
+        Some(""),
+    ])]);
+    let mut arena = ExprArena::default();
+    let input = common::slot_ref(&mut arena, 1, DataType::Utf8);
+    let pattern = common::literal_string(&mut arena, "abc.*");
+
+    assert_eq!(
+        regexp_rows(&arena, input, pattern, &chunk).unwrap(),
+        vec![Some(true), Some(false), None, Some(true), Some(false)]
+    );
+}
+
+#[test]
+fn test_regexp_per_row_patterns_use_each_rows_own_pattern() {
+    let chunk = common::chunk_from_columns(vec![
+        string_column(vec![
+            Some("abc"),
+            Some("abc"),
+            Some("xyz"),
+            Some("123"),
+            Some("abc"),
+            Some("zz"),
+        ]),
+        string_column(vec![
+            Some("^a"),
+            Some("^z"),
+            Some("y"),
+            Some("\\d+"),
+            Some("^a"),
+            Some("^z"),
+        ]),
+    ]);
+    let mut arena = ExprArena::default();
+    let input = common::slot_ref(&mut arena, 1, DataType::Utf8);
+    let pattern = common::slot_ref(&mut arena, 2, DataType::Utf8);
+
+    assert_eq!(
+        regexp_rows(&arena, input, pattern, &chunk).unwrap(),
+        vec![
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true)
+        ]
+    );
+}
+
+#[test]
+fn test_regexp_many_distinct_per_row_patterns_match_row_by_row_evaluation() {
+    // About 200 distinct patterns, each recurring, which is more than one
+    // evaluation retains: both retained and recompiled patterns are exercised.
+    // Every third row carries a pattern that cannot match its input.
+    let inputs = (0..300).map(|i| (i % 100).to_string()).collect::<Vec<_>>();
+    let patterns = (0..300)
+        .map(|i| {
+            if i % 3 == 0 {
+                format!("^x{}$", i % 100)
+            } else {
+                format!("^{}$", i % 100)
+            }
+        })
+        .collect::<Vec<_>>();
+    let columns = vec![
+        string_column(inputs.iter().map(|s| Some(s.as_str())).collect()),
+        string_column(patterns.iter().map(|s| Some(s.as_str())).collect()),
+    ];
+    let mut arena = ExprArena::default();
+    let input = common::slot_ref(&mut arena, 1, DataType::Utf8);
+    let pattern = common::slot_ref(&mut arena, 2, DataType::Utf8);
+
+    let multi_row = regexp_rows(
+        &arena,
+        input,
+        pattern,
+        &common::chunk_from_columns(columns.clone()),
+    )
+    .unwrap();
+    let row_by_row = common::single_row_chunks(&columns)
+        .iter()
+        .flat_map(|chunk| regexp_rows(&arena, input, pattern, chunk).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(multi_row, row_by_row);
+    assert_eq!(
+        multi_row
+            .iter()
+            .filter(|matched| **matched == Some(true))
+            .count(),
+        200
+    );
+}
+
+#[test]
+fn test_regexp_null_input_or_pattern_yields_null() {
+    let chunk = common::chunk_from_columns(vec![
+        string_column(vec![None, Some("abc"), None, Some("abc")]),
+        string_column(vec![Some("a"), None, None, Some("a")]),
+    ]);
+    let mut arena = ExprArena::default();
+    let input = common::slot_ref(&mut arena, 1, DataType::Utf8);
+    let pattern = common::slot_ref(&mut arena, 2, DataType::Utf8);
+
+    assert_eq!(
+        regexp_rows(&arena, input, pattern, &chunk).unwrap(),
+        vec![None, None, None, Some(true)]
+    );
+}
+
+#[test]
+fn test_regexp_invalid_constant_pattern_errors() {
+    let chunk = common::chunk_from_columns(vec![string_column(vec![Some("a"), Some("b")])]);
+    let mut arena = ExprArena::default();
+    let input = common::slot_ref(&mut arena, 1, DataType::Utf8);
+    let pattern = common::literal_string(&mut arena, "(unclosed");
+
+    assert_eq!(
+        regexp_rows(&arena, input, pattern, &chunk).unwrap_err(),
+        invalid_pattern_error("(unclosed")
+    );
+}
+
+#[test]
+fn test_regexp_invalid_pattern_on_null_rows_only_is_not_an_error() {
+    let chunk = common::chunk_from_columns(vec![string_column(vec![None, None])]);
+    let mut arena = ExprArena::default();
+    let input = common::slot_ref(&mut arena, 1, DataType::Utf8);
+    let pattern = common::literal_string(&mut arena, "(unclosed");
+
+    assert_eq!(
+        regexp_rows(&arena, input, pattern, &chunk).unwrap(),
+        vec![None, None]
+    );
+}
+
+#[test]
+fn test_regexp_invalid_per_row_pattern_errors_at_first_row_that_needs_it() {
+    // Row 1 carries an invalid pattern but a NULL input, so the first
+    // pattern actually compiled and rejected is row 2's.
+    let chunk = common::chunk_from_columns(vec![
+        string_column(vec![Some("a"), None, Some("x"), Some("y")]),
+        string_column(vec![Some("a"), Some("(bad"), Some("[bad"), Some("(bad")]),
+    ]);
+    let mut arena = ExprArena::default();
+    let input = common::slot_ref(&mut arena, 1, DataType::Utf8);
+    let pattern = common::slot_ref(&mut arena, 2, DataType::Utf8);
+
+    assert_eq!(
+        regexp_rows(&arena, input, pattern, &chunk).unwrap_err(),
+        invalid_pattern_error("[bad")
+    );
 }
 
 // ---------------------------------------------------------------------------

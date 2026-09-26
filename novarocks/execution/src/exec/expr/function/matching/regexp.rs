@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::function::pattern_memo::PatternMemo;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use regex::Regex;
@@ -39,6 +40,7 @@ pub fn eval_regexp(
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "regexp expects VARCHAR as second argument".to_string())?;
 
+    let mut patterns = PatternMemo::new();
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
         if left.is_null(row) || right.is_null(row) {
@@ -46,8 +48,9 @@ pub fn eval_regexp(
             continue;
         }
 
-        let pattern = right.value(row);
-        let regex = Regex::new(pattern).map_err(|e| format!("regexp: invalid pattern: {}", e))?;
+        let regex = patterns
+            .get_or_compile(right.value(row), Regex::new)
+            .map_err(|e| format!("regexp: invalid pattern: {}", e))?;
         out.push(Some(regex.is_match(left.value(row))));
     }
 

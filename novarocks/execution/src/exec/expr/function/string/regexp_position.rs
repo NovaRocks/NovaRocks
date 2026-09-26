@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::function::pattern_memo::PatternMemo;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
 use regex::Regex;
@@ -61,6 +62,7 @@ pub fn eval_regexp_position(
     let start_is_null = args.len() >= 3 && start_arr.is_none();
     let occurrence_is_null = args.len() >= 4 && occurrence_arr.is_none();
 
+    let mut patterns = PatternMemo::new();
     let mut out = Vec::with_capacity(len);
     for row in 0..len {
         let Some(s) = string_value_at(&s_arr, row) else {
@@ -84,7 +86,7 @@ pub fn eval_regexp_position(
 
         let start_pos = start_arr.as_ref().map_or(1, |arr| arr.value(row));
         let occurrence = occurrence_arr.as_ref().map_or(1, |arr| arr.value(row));
-        let pos = eval_row(s, p, start_pos, occurrence)?;
+        let pos = eval_row(s, p, start_pos, occurrence, &mut patterns)?;
         out.push(Some(pos as i32));
     }
 
@@ -114,7 +116,13 @@ fn string_value_at<'a>(arr: &Option<&'a StringArray>, row: usize) -> Option<&'a 
     }
 }
 
-fn eval_row(input: &str, pattern: &str, start_pos: i64, occurrence: i64) -> Result<i64, String> {
+fn eval_row<'a>(
+    input: &str,
+    pattern: &'a str,
+    start_pos: i64,
+    occurrence: i64,
+    patterns: &mut PatternMemo<'a, Regex, regex::Error>,
+) -> Result<i64, String> {
     if start_pos <= 0 || occurrence <= 0 {
         return Ok(-1);
     }
@@ -136,7 +144,8 @@ fn eval_row(input: &str, pattern: &str, start_pos: i64, occurrence: i64) -> Resu
         None => return Ok(-1),
     };
 
-    let re = Regex::new(pattern)
+    let re = patterns
+        .get_or_compile(pattern, Regex::new)
         .map_err(|e| format!("Invalid regex expression: {pattern}. Detail message: {e}"))?;
     let suffix = &input[start_byte..];
 
