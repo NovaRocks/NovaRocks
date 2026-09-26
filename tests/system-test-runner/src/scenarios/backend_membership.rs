@@ -324,6 +324,11 @@ impl Scenario for PreReadyReplan {
         });
 
         let restart_ack = rendezvous.wait_for_trigger(context.deadline())?;
+        // The rendezvous establishes that this token has fired. Read its exact
+        // FE binding afterwards; the log is attribution, not synchronization.
+        let expected_attempt =
+            bound_replan_attempt(&context.handle().fe_log_contents()?, &token, target)?;
+
         let deadline = context.deadline();
         context
             .handle()
@@ -351,18 +356,74 @@ impl Scenario for PreReadyReplan {
         let deadline = context.deadline();
         let terminal = context
             .handle()
-            .await_query_lifecycle_structured_snapshot_after(before_execution.as_deref(), deadline)
+            .await_query_lifecycle_structured_snapshot_for_attempt(
+                expected_attempt,
+                before_execution.as_deref(),
+                deadline,
+            )
             .context("read terminal snapshot for re-planned statement")?;
         ensure!(
             terminal.attempt_id == 2,
-            "pre-ready replacement must complete as statement attempt 2, got attempt {}",
-            terminal.attempt_id
+            "pre-ready replacement snapshot mismatch: candidate={terminal:?}, before={before_execution:?}, target={expected_attempt:?}"
         );
         context.action(format!(
             "replaced BE[{target}] after EstablishQueryContext and observed successful statement attempt=2 completion with new_process_id={replacement_process_id}"
         ));
         Ok(())
     }
+}
+
+fn bound_replan_attempt(
+    log: &str,
+    token: &str,
+    backend_index: usize,
+) -> Result<novarocks_cluster_harness::QueryLifecycleAttemptTarget> {
+    let mut bindings = Vec::new();
+    for line in log
+        .lines()
+        .filter(|line| line.starts_with("NOVAROCKS_QUERY_FAULT_BOUND "))
+    {
+        let fields = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|field| field.split_once('='))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if fields.get("token").copied() != Some(token)
+            || fields.get("kind").copied() != Some(RESTART_AFTER_ESTABLISH_CONTEXT)
+            || fields.get("backend_index").copied() != Some(backend_index.to_string().as_str())
+        {
+            continue;
+        }
+        let execution = fields
+            .get("execution_id")
+            .context("bound restart fault omitted execution identity")?;
+        let parts = execution.split(':').collect::<Vec<_>>();
+        ensure!(
+            parts.len() == 3,
+            "invalid bound execution identity {execution}"
+        );
+        let namespace: i64 = parts[0]
+            .parse()
+            .context("decode bound query process namespace")?;
+        let local_sequence: u64 = parts[1]
+            .parse()
+            .context("decode bound query local sequence")?;
+        let first_attempt: u64 = parts[2].parse().context("decode bound query attempt")?;
+        ensure!(
+            local_sequence > 0 && first_attempt == 1,
+            "restart fault must bind the first statement attempt, got {execution}"
+        );
+        bindings.push(novarocks_cluster_harness::QueryLifecycleAttemptTarget {
+            process_namespace: u64::from_ne_bytes(namespace.to_ne_bytes()),
+            local_sequence,
+            attempt_id: 2,
+        });
+    }
+    ensure!(
+        bindings.len() == 1,
+        "expected one synchronized restart query binding for token={token} BE[{backend_index}], got {bindings:?}"
+    );
+    Ok(bindings[0])
 }
 
 struct PreReadyDmlNoRecovery;
@@ -495,5 +556,24 @@ impl Scenario for PreReadyDmlNoRecovery {
             "replaced BE[{target}] after DML EstablishQueryContext; the first attempt returned KnownUncommitted without published data, then an explicit client statement retry published once; new_process_id={replacement_process_id}"
         ));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::bound_replan_attempt;
+
+    #[test]
+    fn replan_binding_uses_the_exact_fired_token_backend_and_signed_namespace() {
+        let log = "NOVAROCKS_QUERY_FAULT_BOUND kind=restart-after-establish-context execution_id=41:1:1 backend_index=0 token=seed\nNOVAROCKS_QUERY_FAULT_BOUND kind=restart-after-establish-context execution_id=-11:12:1 backend_index=1 token=fired\n";
+        let target = bound_replan_attempt(log, "fired", 1).expect("exact binding");
+        assert_eq!(
+            target.process_namespace,
+            u64::from_ne_bytes((-11_i64).to_ne_bytes())
+        );
+        assert_eq!(target.local_sequence, 12);
+        assert_eq!(target.attempt_id, 2);
+        assert!(bound_replan_attempt(log, "fired", 0).is_err());
+        assert!(bound_replan_attempt(&(log.to_owned() + log), "fired", 1).is_err());
     }
 }

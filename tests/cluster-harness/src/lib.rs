@@ -817,6 +817,25 @@ pub struct QueryLifecycleStructuredSnapshot {
     pub runtime_filter: RuntimeFilterTerminalRollup,
 }
 
+/// Exact statement attempt selected by a synchronized scenario fault binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLifecycleAttemptTarget {
+    pub process_namespace: u64,
+    pub local_sequence: u64,
+    pub attempt_id: u64,
+}
+
+impl QueryLifecycleAttemptTarget {
+    fn execution_id(self) -> String {
+        format!(
+            "{}:{}:{}",
+            i64::from_ne_bytes(self.process_namespace.to_ne_bytes()),
+            self.local_sequence,
+            self.attempt_id
+        )
+    }
+}
+
 /// Runtime Filter telemetry availability for a completed query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
@@ -1946,6 +1965,52 @@ where
     }
 }
 
+fn await_query_lifecycle_structured_snapshot_for_attempt<F>(
+    target: QueryLifecycleAttemptTarget,
+    before_execution_id: Option<&str>,
+    deadline: Instant,
+    mut snapshot: F,
+) -> Result<QueryLifecycleStructuredSnapshot>
+where
+    F: FnMut() -> Result<Option<QueryLifecycleStructuredSnapshot>>,
+{
+    ensure!(
+        target.local_sequence > 0 && target.attempt_id > 0,
+        "invalid exact lifecycle target: {target:?}"
+    );
+    let expected_execution_id = target.execution_id();
+    let mut latest_candidate = None;
+    let mut latest_error = None;
+    loop {
+        match snapshot() {
+            Ok(Some(candidate)) => {
+                let matches = candidate.execution_id.as_deref()
+                    == Some(expected_execution_id.as_str())
+                    && candidate.process_namespace == target.process_namespace
+                    && candidate.local_sequence == target.local_sequence
+                    && candidate.attempt_id == target.attempt_id
+                    && candidate.error_source.is_none();
+                if matches {
+                    return Ok(candidate);
+                }
+                latest_candidate = Some(candidate);
+            }
+            Ok(None) => {}
+            Err(error) => latest_error = Some(format!("{error:#}")),
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for successful exact lifecycle target={target:?} execution_id={expected_execution_id}; before={before_execution_id:?}; latest_candidate={latest_candidate:?}; latest_error={latest_error:?}"
+            );
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(LIFECYCLE_CONVERGENCE_POLL_INTERVAL),
+        );
+    }
+}
+
 /// Detachable, immutable sources for a bounded failed-run diagnostic snapshot.
 ///
 /// A server owner constructs this value while its lifecycle lock is held. The
@@ -2306,6 +2371,20 @@ pub trait ServerHandle: Send {
         await_query_lifecycle_structured_snapshot_after(before_execution_id, deadline, || {
             self.query_lifecycle_structured_snapshot()
         })
+    }
+    /// Wait for the successful projection of this exact, externally bound attempt.
+    fn await_query_lifecycle_structured_snapshot_for_attempt(
+        &mut self,
+        target: QueryLifecycleAttemptTarget,
+        before_execution_id: Option<&str>,
+        deadline: Instant,
+    ) -> Result<QueryLifecycleStructuredSnapshot> {
+        await_query_lifecycle_structured_snapshot_for_attempt(
+            target,
+            before_execution_id,
+            deadline,
+            || self.query_lifecycle_structured_snapshot(),
+        )
     }
     fn release_query_lifecycle_phase_fault(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
@@ -5521,6 +5600,80 @@ mod tests {
         )
         .expect("new execution identity must be returned");
         assert_eq!(snapshot.execution_id.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn lifecycle_exact_attempt_wait_rejects_seed_old_attempt_and_foreign_success() {
+        let target = QueryLifecycleAttemptTarget {
+            process_namespace: u64::MAX - 10,
+            local_sequence: 12,
+            attempt_id: 2,
+        };
+        let snapshot = |namespace: u64, sequence: u64, attempt: u64| {
+            let selected = QueryLifecycleAttemptTarget {
+                process_namespace: namespace,
+                local_sequence: sequence,
+                attempt_id: attempt,
+            };
+            let mut value =
+                decode_lifecycle_debug_json(lifecycle_debug_json(&selected.execution_id()));
+            value.process_namespace = namespace;
+            value.local_sequence = sequence;
+            value.attempt_id = attempt;
+            value
+        };
+        let mut candidates = VecDeque::from([
+            None,
+            Some(snapshot(41, 1, 1)),
+            Some(snapshot(target.process_namespace, target.local_sequence, 1)),
+            Some(snapshot(41, target.local_sequence, 2)),
+            Some(snapshot(
+                target.process_namespace,
+                target.local_sequence + 1,
+                2,
+            )),
+            Some(snapshot(target.process_namespace, target.local_sequence, 2)),
+        ]);
+        let result = await_query_lifecycle_structured_snapshot_for_attempt(
+            target,
+            None,
+            Instant::now() + Duration::from_secs(1),
+            || Ok(candidates.pop_front().expect("candidate")),
+        )
+        .expect("only the exact target succeeds");
+        assert!(
+            candidates.is_empty(),
+            "foreign attempt 2 cannot satisfy the wait"
+        );
+        assert_eq!(
+            result.execution_id.as_deref(),
+            Some(target.execution_id().as_str())
+        );
+    }
+
+    #[test]
+    fn lifecycle_exact_attempt_timeout_reports_target_before_and_full_candidate() {
+        let target = QueryLifecycleAttemptTarget {
+            process_namespace: 11,
+            local_sequence: 12,
+            attempt_id: 2,
+        };
+        let mut candidate = decode_lifecycle_debug_json(lifecycle_debug_json("11:12:1"));
+        candidate.attempt_id = 1;
+        let error = await_query_lifecycle_structured_snapshot_for_attempt(
+            target,
+            Some("seed:1:1"),
+            Instant::now(),
+            || Ok(Some(candidate.clone())),
+        )
+        .expect_err("old attempt remains unmatched");
+        let message = format!("{error:#}");
+        assert!(message.contains("execution_id=11:12:2"), "{message}");
+        assert!(message.contains("before=Some(\"seed:1:1\")"), "{message}");
+        assert!(
+            message.contains("11:12:1") && message.contains("attempt_id: 1"),
+            "{message}"
+        );
     }
 
     #[test]
