@@ -60,6 +60,9 @@ impl std::fmt::Debug for RuntimeState {
 #[derive(Debug, Default)]
 pub struct RuntimeErrorState {
     error: std::sync::Mutex<Option<String>>,
+    stopped: std::sync::Condvar,
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl RuntimeErrorState {
@@ -67,11 +70,36 @@ impl RuntimeErrorState {
         let mut guard = self.error.lock().expect("runtime error lock");
         if guard.is_none() {
             *guard = Some(err);
+            self.stopped.notify_all();
         }
     }
 
     pub fn error(&self) -> Option<String> {
         self.error.lock().expect("runtime error lock").clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting_count(&self) -> usize {
+        self.waiting.load(Ordering::Acquire)
+    }
+
+    /// Wait without holding execution after this exact fragment stops.
+    /// The predicate and notification share the error lock, including an error
+    /// published before registration and spurious condition-variable wakes.
+    pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> Result<(), String> {
+        let guard = self.error.lock().expect("runtime error lock");
+        #[cfg(test)]
+        self.waiting.fetch_add(1, Ordering::Release);
+        let (guard, _) = self
+            .stopped
+            .wait_timeout_while(guard, duration, |error| error.is_none())
+            .expect("runtime stop wait");
+        #[cfg(test)]
+        self.waiting.fetch_sub(1, Ordering::Release);
+        match guard.as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 }
 

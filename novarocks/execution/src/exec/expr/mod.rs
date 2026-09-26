@@ -142,9 +142,40 @@ pub struct ExprArena {
     allow_throw_exception: bool,
     query_global_dicts: HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>,
     session_time_zone: Option<String>,
+    runtime_error: Option<Arc<crate::runtime::runtime_state::RuntimeErrorState>>,
 }
 
 impl ExprArena {
+    /// Bind only the runtime arena, after static program materialization.
+    pub(crate) fn bind_runtime_error(
+        &mut self,
+        runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+    ) {
+        self.runtime_error = Some(runtime_error);
+    }
+
+    pub(crate) fn runtime_error_binding(
+        &self,
+    ) -> Result<Arc<crate::runtime::runtime_state::RuntimeErrorState>, String> {
+        self.runtime_error
+            .clone()
+            .ok_or_else(|| "expression arena has no exact fragment runtime binding".to_string())
+    }
+
+    pub(crate) fn check_runtime_error(&self) -> Result<(), String> {
+        match self.runtime_error.as_ref().and_then(|error| error.error()) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> Result<(), String> {
+        match &self.runtime_error {
+            Some(error) => error.wait_interruptibly(duration),
+            None => Err("SLEEP requires an exact fragment runtime binding".to_string()),
+        }
+    }
+
     pub fn push(&mut self, node: ExprNode) -> ExprId {
         self.push_typed(node, DataType::Null)
     }

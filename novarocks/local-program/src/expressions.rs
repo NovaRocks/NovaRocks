@@ -292,6 +292,7 @@ pub struct ImmutableExpressions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticExpressionError {
+    RuntimeBoundArena,
     TooManyNodes,
     InvalidReference,
     TooDeep,

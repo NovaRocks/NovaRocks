@@ -32,6 +32,9 @@ impl ExprArena {
     /// Consume the decoder-owned arena once. Static nodes and dictionaries are
     /// frozen before any Task or driver state is created.
     pub fn into_immutable(self) -> Result<ImmutableExpressions, StaticExpressionError> {
+        if self.runtime_error.is_some() {
+            return Err(StaticExpressionError::RuntimeBoundArena);
+        }
         let ExprArena {
             nodes,
             types,
@@ -39,6 +42,7 @@ impl ExprArena {
             allow_throw_exception,
             query_global_dicts,
             session_time_zone,
+            runtime_error: _,
         } = self;
         if nodes.len() != types.len() || nodes.len() != field_schemas.len() {
             return Err(StaticExpressionError::InvalidMetadataArity);
@@ -411,6 +415,18 @@ mod tests {
     use novarocks_types::SlotId;
 
     use super::*;
+
+    #[test]
+    fn runtime_bound_arena_cannot_be_frozen_again() {
+        let mut arena = ExprArena::default();
+        arena.bind_runtime_error(Arc::new(
+            crate::runtime::runtime_state::RuntimeErrorState::default(),
+        ));
+        assert!(matches!(
+            arena.into_immutable(),
+            Err(StaticExpressionError::RuntimeBoundArena)
+        ));
+    }
 
     #[test]
     fn freeze_preserves_options_and_shared_dictionary_values() {

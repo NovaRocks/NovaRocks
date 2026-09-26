@@ -108,8 +108,10 @@ pub struct TableWriterInputProjection {
 impl TableWriterInputProjection {
     pub(crate) fn from_static(
         projection: &novarocks_local_program::StaticWriterProjection,
+        runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     ) -> Result<Self, String> {
-        let arena = ExprArena::from_immutable(&projection.arena);
+        let mut arena = ExprArena::from_immutable(&projection.arena);
+        arena.bind_runtime_error(runtime_error);
         let exprs = projection
             .expressions
             .iter()
@@ -468,5 +470,66 @@ impl std::fmt::Debug for TableWriterNode {
             .field("expected_schema", &self.expected_schema)
             .field("physical_template", &self.physical_template)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod runtime_projection_tests {
+    use super::*;
+    use crate::exec::expr::function::FunctionKind;
+    use crate::exec::expr::{ExprNode, LiteralValue};
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn static_writer_projection_binds_its_exact_fragment_stop_owner() {
+        let mut arena = ExprArena::default();
+        let seconds = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(0)), DataType::Int64);
+        let sleep = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Object("sleep"),
+                args: vec![seconds],
+            },
+            DataType::Boolean,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "sleep",
+            DataType::Boolean,
+            false,
+        )]));
+        let frozen = TableWriterInputProjection::try_new(arena, vec![sleep], schema)
+            .unwrap()
+            .into_static()
+            .unwrap();
+        let first = Arc::new(RuntimeErrorState::default());
+        let sibling = Arc::new(RuntimeErrorState::default());
+        let projection =
+            TableWriterInputProjection::from_static(&frozen, Arc::clone(&first)).unwrap();
+        let sibling_projection = TableWriterInputProjection::from_static(&frozen, sibling).unwrap();
+        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(&input_schema, &[SlotId::new(1)])
+                .unwrap();
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
+        assert!(projection.project(&chunk).is_ok());
+        first.set_error("writer fragment cancelled".to_string());
+        assert_eq!(
+            projection.project(&chunk).unwrap_err(),
+            "writer fragment cancelled"
+        );
+        assert!(sibling_projection.project(&chunk).is_ok());
+        assert!(
+            projection
+                .into_static()
+                .unwrap_err()
+                .contains("RuntimeBoundArena")
+        );
     }
 }

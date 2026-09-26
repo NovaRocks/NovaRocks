@@ -182,6 +182,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
         1,
         1,
         i64::MAX,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     )
 }
 
@@ -251,6 +252,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
         1,
         1,
         i64::MAX,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     )
 }
 
@@ -273,6 +275,8 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
+
+    runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<PipelineGraph, String> {
     build_pipeline_graph_in_mode(
         plan,
@@ -288,6 +292,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
         operator_buffer_chunks.max(1),
         local_exchange_buffer_mem_limit_per_driver.max(1),
         local_exchange_max_buffered_rows,
+        runtime_error,
     )
 }
 
@@ -324,6 +329,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_sess
         1,
         1,
         i64::MAX,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     )
 }
 
@@ -345,8 +351,12 @@ fn build_pipeline_graph_in_mode(
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
+
+    runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Result<PipelineGraph, String> {
-    let arena = Arc::new(plan.arena.clone());
+    let mut arena = plan.arena.clone();
+    arena.bind_runtime_error(runtime_error);
+    let arena = Arc::new(arena);
     let mut ctx = PipelineBuildContext {
         arena,
         function_set,
@@ -2020,11 +2030,15 @@ fn build_pipeline_for_node(
                 let partitions = build.pipeline.dop.max(1) as usize;
                 build = shuffle_by_hash(build, ctx, node.node_id, hash_key, partitions);
             }
+            let mut runtime_node = node.clone();
+            runtime_node
+                .projection_arena_mut()
+                .bind_runtime_error(ctx.arena.runtime_error_binding()?);
             build
                 .pipeline
                 .factories
                 .push(Box::new(TableWriterOperatorFactory::try_new(
-                    node,
+                    &runtime_node,
                     Arc::clone(&ctx.function_set),
                 )?));
             build.stream = StreamDesc::any(build.pipeline.dop);

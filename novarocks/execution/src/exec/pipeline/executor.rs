@@ -437,6 +437,7 @@ fn prepare_pipeline_execution_inner(
             .execution_runtime()
             .map(|runtime| runtime.config().local_exchange_max_buffered_rows)
             .unwrap_or(-1),
+        runtime_state.error_state(),
     )?;
 
     prepare_pipeline_execution_from_graph(
@@ -513,6 +514,7 @@ pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
         root_sink_dop,
         runtime_filter_session,
         execution_runtime.function_set().clone(),
+        runtime_state.error_state(),
         execution_runtime.config().operator_buffer_chunks,
         execution_runtime
             .config()
@@ -981,6 +983,166 @@ mod tests {
 
         assert_eq!(
             handle.take_chunks().iter().map(Chunk::len).sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn cancelled_sleep_physically_joins_before_the_next_single_thread_pipeline() {
+        use crate::exec::expr::LiteralValue;
+        use crate::exec::expr::function::FunctionKind;
+        use crate::exec::fragment::sink::FragmentSinkProgram;
+        use crate::exec::node::ExternalSinkRequirement;
+        use crate::exec::node::project::ProjectNode;
+        use novarocks_local_program as lp;
+        use std::collections::BTreeMap;
+        use std::num::NonZeroUsize;
+
+        // This dedicated executor has exactly one physical execution thread.
+        let runtime = Arc::new(
+            ExecutionRuntime::new(
+                test_execution_runtime().config().clone(),
+                crate::runtime::execution_runtime::test_execution_function_set(),
+                crate::runtime::execution_runtime::test_memory_authority(),
+            )
+            .unwrap(),
+        );
+        let slot = SlotId::new(1);
+        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::new(Int64Array::from(vec![1; 4096]))],
+        )
+        .unwrap();
+        let chunk =
+            Chunk::try_new_with_chunk_schema(batch, chunk_schema_of(&input_schema, &[slot]))
+                .unwrap();
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "sleep",
+            DataType::Boolean,
+            false,
+        )]));
+        let mut arena = ExprArena::default();
+        let seconds = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(60)), DataType::Int64);
+        let sleep = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Object("sleep"),
+                args: vec![seconds],
+            },
+            DataType::Boolean,
+        );
+        let plan = ExecPlan {
+            arena,
+            root: ExecNode {
+                kind: ExecNodeKind::Project(ProjectNode {
+                    input: Box::new(ExecNode {
+                        kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 1 }),
+                    }),
+                    node_id: 2,
+                    is_subordinate: false,
+                    exprs: vec![sleep],
+                    expr_slot_ids: vec![slot],
+                    expr_slot_schemas: None,
+                    output_indices: None,
+                    output_chunk_schema: chunk_schema_of(&output_schema, &[slot]),
+                }),
+            },
+        };
+        let prepare = |plan: ExecPlan, schema: Arc<Schema>| {
+            let layout = lp::StaticLayout::try_new_exact(
+                schema,
+                Arc::from([slot]),
+                vec![(lp::StaticFieldSchema::new(None, vec![]), None)],
+            )
+            .unwrap();
+            let profile = lp::CompileProfile::new(
+                NonZeroUsize::new(1).unwrap(),
+                None,
+                layout.identity().unwrap(),
+                lp::KernelAbiVersion::CURRENT,
+            );
+            let (program, bindings) = plan
+                .into_local_program_and_bindings(
+                    profile,
+                    BTreeMap::new(),
+                    vec![ExternalSinkRequirement::Result],
+                    FragmentSinkProgram::Result.into_static().unwrap(),
+                )
+                .unwrap();
+            let state = Arc::new(RuntimeState::new(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Arc::clone(&runtime)),
+                None,
+            ));
+            let output = ResultSinkHandle::new();
+            let prepared = super::prepare_report_neutral_local_program_pipeline_execution(
+                &program,
+                &bindings,
+                false,
+                Duration::from_millis(10),
+                Box::new(ResultSinkFactory::new(output.clone())),
+                ExchangeBindings::default(),
+                ScanBindings::default(),
+                None,
+                None,
+                1,
+                Arc::clone(&state),
+                None,
+                None,
+                Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
+            )
+            .unwrap();
+            (prepared, state, output)
+        };
+        let (prepared, state, output) = prepare(plan, output_schema);
+        let running = prepared.start();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.error_state().waiting_count() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let entered_sleep = state.error_state().waiting_count() == 1;
+        assert!(running.cancel("cancel actual SLEEP".to_string()));
+        let (tx, rx) = mpsc::channel();
+        let join = std::thread::spawn(move || tx.send(running.join()).unwrap());
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancel must drain the physical SLEEP driver");
+        join.join().unwrap();
+        assert!(
+            entered_sleep,
+            "the single execution thread must enter SLEEP before cancellation"
+        );
+        assert_eq!(result, Err("cancel actual SLEEP".to_string()));
+        assert_eq!(state.error_state().waiting_count(), 0);
+        assert!(
+            output.take_chunks().is_empty(),
+            "cancelled expression must publish no partial chunk"
+        );
+
+        let next = single_values_plan();
+        let schema = match &next.root.kind {
+            ExecNodeKind::Values(values) => values.chunk.batch.schema(),
+            _ => unreachable!(),
+        };
+        let (prepared, _, output) = prepare(next, schema);
+        let running = prepared.start();
+        let (tx, rx) = mpsc::channel();
+        let join = std::thread::spawn(move || tx.send(running.join()).unwrap());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("the freed single execution thread must run the next pipeline"),
+            Ok(())
+        );
+        join.join().unwrap();
+        assert_eq!(
+            output.take_chunks().iter().map(Chunk::len).sum::<usize>(),
             1
         );
     }

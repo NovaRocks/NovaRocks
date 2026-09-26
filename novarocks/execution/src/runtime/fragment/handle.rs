@@ -1218,6 +1218,7 @@ pub fn prepare_fragment(
             Arc::clone(&context.exchange_transmitter),
             resources.result_session(),
             context.edge_gates.clone(),
+            runtime_state.error_state(),
         )?;
         let sink = materialized_sink.factory;
         let _group_execution_scan_dop = context.group_execution_scan_dop;

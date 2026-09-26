@@ -82,13 +82,16 @@ pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_setting
     root_sink_dop: Option<i32>,
     runtime_filter_session: Option<execution::RuntimeFilterSessionRef>,
     function_set: Arc<SealedExecutionFunctionSet>,
+    runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
 ) -> Result<PipelineGraph, String> {
     validate_runtime_binding_shape(program, bindings)?;
+    let mut arena = ExprArena::from_immutable(program.expressions());
+    arena.bind_runtime_error(runtime_error);
     let mut ctx = PipelineBuildContext {
-        arena: Arc::new(ExprArena::from_immutable(program.expressions())),
+        arena: Arc::new(arena),
         function_set,
         dep_manager,
         runtime_filter_execution: PipelineRuntimeFilterExecution {
@@ -870,7 +873,10 @@ fn build_pipeline_for_program_node(
                 .ok_or_else(|| format!("missing runtime writer binding for node {node_id}"))?;
             let relation =
                 WriterMultiplexRelationSchema::try_from_static_layout(writer_multiplex_layout)?;
-            let projection = TableWriterInputProjection::from_static(projection)?;
+            let projection = TableWriterInputProjection::from_static(
+                projection,
+                ctx.arena.runtime_error_binding()?,
+            )?;
             let partial_calls = partial_aggregates
                 .iter()
                 .map(|call| RuntimeWriterPartialAggregateCall {
@@ -2179,6 +2185,7 @@ mod tests {
             None,
             None,
             crate::exec::expr::agg::test_builtin_execution_function_set(),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
             1,
             1,
             i64::MAX,
@@ -2314,6 +2321,7 @@ mod tests {
             None,
             None,
             crate::exec::expr::agg::test_builtin_execution_function_set(),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
             1,
             1,
             i64::MAX,
