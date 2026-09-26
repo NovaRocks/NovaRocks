@@ -3144,7 +3144,7 @@ mod tests {
 
     // ------------------------------------------------------ end-to-end submit
 
-    fn reporter_for(identity: TaskIdentity) -> (Arc<TaskStatusOwner>, TaskStatusReporter) {
+    fn planned_reporter_for(identity: TaskIdentity) -> (Arc<TaskStatusOwner>, TaskStatusReporter) {
         let owner = Arc::new(TaskStatusOwner::new(
             identity,
             Arc::new(TaskStatusSource::new()),
@@ -3153,6 +3153,18 @@ mod tests {
         ));
         owner.release_to_observers();
         (Arc::clone(&owner), TaskStatusReporter::new(owner))
+    }
+
+    fn reporter_for(identity: TaskIdentity) -> (Arc<TaskStatusOwner>, TaskStatusReporter) {
+        let (owner, reporter) = planned_reporter_for(identity);
+        // Direct Host tests bypass the registry's creation commit. Reproduce
+        // its irreversible Installed fact before the runnable may start.
+        assert!(matches!(
+            owner.note_installed(),
+            StatusAdvance::Published(_)
+        ));
+        assert!(owner.current().installed());
+        (owner, reporter)
     }
 
     /// Waits for a task to reach a terminal status, or gives up.
@@ -3187,7 +3199,7 @@ mod tests {
         let host = host(Arc::clone(&facts));
         let task = identity(23, 1, 1);
         let descriptor = consistent_descriptor(task, UniqueId::new(189, 190));
-        let (owner, reporter) = reporter_for(task);
+        let (owner, reporter) = planned_reporter_for(task);
 
         install(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
@@ -3196,8 +3208,16 @@ mod tests {
             .submit_runnable(&descriptor, reporter)
             .expect("reserves completion without starting drivers");
         assert_eq!(owner.state(), TaskState::Planned);
+        assert!(!owner.current().installed());
         assert!(!owner.convergence().actual_stopped());
 
+        // Worker publishes Installed while the kernel remains dormant.
+        assert!(matches!(
+            owner.note_installed(),
+            StatusAdvance::Published(_)
+        ));
+        assert_eq!(owner.state(), TaskState::Planned);
+        assert!(!owner.convergence().actual_stopped());
         runnable.commit_creation();
         assert_eq!(await_terminal(&owner), TaskState::Finished);
         await_runtime_convergence(&owner);
@@ -3211,7 +3231,7 @@ mod tests {
         let host = host(Arc::clone(&facts));
         let task = identity(231, 1, 1);
         let descriptor = consistent_descriptor(task, UniqueId::new(1891, 1901));
-        let (owner, reporter) = reporter_for(task);
+        let (owner, reporter) = planned_reporter_for(task);
 
         install(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)

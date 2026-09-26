@@ -370,9 +370,14 @@ mod tests {
         // never be served. The frontend widens the channel instead.
         let identity = identity();
         let (status, reporter) = owner(identity);
+        status.note_installed();
         reporter.running();
         reporter.finished(
             novarocks_execution_contract::task_execution::status::TaskOutputFacts::new(true),
+        );
+        assert!(
+            status.current().is_terminal(),
+            "the carrier really finished"
         );
         let egress = TaskRuntimeFilterFeedbackEgress::new(identity, reporter);
 

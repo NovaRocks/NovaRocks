@@ -989,7 +989,7 @@ message ApplyTaskOperationsRequest {
   repeated TaskOperation operations = 1;  // 1..=32, <= 48 MiB encoded
 }
 
-// Only the four bounded control mutations may use the small Native method.
+// Only bounded control mutations may use the small Native method.
 // Each item keeps its own operation identity and relative wait budget.
 message TaskControlOperation {
   TaskOperationEnvelope envelope = 1;

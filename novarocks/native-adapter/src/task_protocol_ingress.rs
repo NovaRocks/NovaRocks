@@ -2672,6 +2672,7 @@ mod tests {
             outcome_of(&response.receipts[1]),
             proto::TaskOperationOutcome::Accepted
         );
+        fixture.wait_installed(identity);
 
         let replaced = QueryContextRef::new(
             fixture.execution(),

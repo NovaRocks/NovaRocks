@@ -1472,10 +1472,20 @@ mod tests {
         let mut operators = Vec::new();
         for driver_id in 0..4 {
             let mut operator = factory.create(4, driver_id);
+            operator.prepare().expect("prepare writer actor");
             operator
                 .bind_runtime_state(&runtime_state)
                 .expect("bind writer actor");
             operators.push(operator);
+        }
+        assert!(
+            execution.opened().is_empty(),
+            "prepared and bound writers remain dormant until activation"
+        );
+        for operator in &mut operators {
+            operator
+                .activate(&runtime_state)
+                .expect("activate writer actor");
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         while execution.opened().len() != 4 && Instant::now() < deadline {
@@ -1484,6 +1494,19 @@ mod tests {
         assert_eq!(
             execution.opened(),
             vec![(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)]
+        );
+        for operator in &mut operators {
+            operator.cancel();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while operators.iter().any(|operator| operator.pending_finish())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            operators.iter().all(|operator| !operator.pending_finish()),
+            "every activated writer exits before its test runtime is released"
         );
     }
 

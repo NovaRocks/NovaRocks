@@ -1332,6 +1332,31 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
                 "abort_query_context",
                 "release_query_context",
                 "acquire_query_context_admission_ticket",
+                "quiesce_query_context",
+            ][..],
+        ),
+        (
+            "novarocks.TaskControlOperation",
+            "control",
+            &[
+                "renew_lease",
+                "cancel_task",
+                "abort_query_context",
+                "release_query_context",
+                "quiesce_query_context",
+            ][..],
+        ),
+        (
+            "novarocks.TaskOperationReceipt",
+            "ack",
+            &[
+                "create_task",
+                "update_task",
+                "query_context",
+                "release_query_context",
+                "cancel_task",
+                "query_context_admission_ticket",
+                "quiesce_query_context",
             ][..],
         ),
         (
@@ -1342,7 +1367,12 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
         (
             "novarocks.TaskDomainUpdate",
             "domain",
-            &["split_assignment", "dynamic_filter", "open_exchange_edges"][..],
+            &[
+                "split_assignment",
+                "dynamic_filter",
+                "open_exchange_edges",
+                "close_exchange_destination",
+            ][..],
         ),
         (
             "novarocks.QueryContextDomainUpdate",
@@ -1357,12 +1387,28 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
         (
             "novarocks.TaskStatusStreamEvent",
             "event",
-            &["task_status", "task_gone", "context_convergence"][..],
+            &[
+                "task_status",
+                "task_gone",
+                "context_convergence",
+                "task_convergence",
+                "quiesce",
+                "task_status_unchanged",
+                "task_convergence_unchanged",
+                "task_unknown",
+                "catch_up_complete",
+                "bookmark",
+            ][..],
         ),
         (
             "novarocks.TaskDomainReceipt",
             "receipt",
-            &["split_assignment", "dynamic_filter", "open_exchange_edges"][..],
+            &[
+                "split_assignment",
+                "dynamic_filter",
+                "open_exchange_edges",
+                "close_exchange_destination",
+            ][..],
         ),
         (
             "novarocks.QueryContextDomainReceipt",

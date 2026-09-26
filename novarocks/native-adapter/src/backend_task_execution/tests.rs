@@ -49,9 +49,9 @@ use novarocks_execution_contract::task_execution::lease::{LeaseSequence, LeaseVa
 use novarocks_execution_contract::task_execution::operation::{
     AbortQueryContext, AcquireQueryContextAdmissionTicket, AdvanceQueryContextDomain, CancelTask,
     CreateTask, CredentialUpdate, EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo,
-    OperationOutcome, QueryContextDomainUpdate, ReleaseOutcome, ReleaseQueryContext,
-    RenewQueryExecutionLease, SplitAssignmentIntent, TaskDomainUpdate, UpdateQueryContext,
-    UpdateTask,
+    OperationOutcome, QueryContextDomainUpdate, QuiesceQueryContext, ReleaseOutcome,
+    ReleaseQueryContext, RenewQueryExecutionLease, SplitAssignmentIntent, TaskDomainUpdate,
+    UpdateQueryContext, UpdateTask,
 };
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
@@ -695,6 +695,19 @@ impl Fixture {
             .create_task(&self.create_request(identity), body(plan));
         assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
         self.task_host.reporter(identity)
+    }
+
+    /// Closes admission through the production fence and verifies its exact cut.
+    fn quiesce(&self, context: QueryContextRef, accepted_tasks: &[TaskIdentity]) {
+        let request = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
+        let outcome = self.registry.quiesce_query_context(&request);
+        assert_eq!(outcome.operation_id(), request.envelope().operation_id());
+        assert_eq!(outcome.outcome(), OperationOutcome::Accepted, "{outcome:?}");
+        let receipt = outcome.acknowledgement().expect("quiesce receipt");
+        assert_eq!(receipt.context(), context);
+        assert_eq!(receipt.fence_version(), 1);
+        assert_eq!(receipt.accepted_tasks(), accepted_tasks);
+        assert_eq!(receipt.state(), QueryContextState::Quiescing);
     }
 
     /// Finishes one task the way a healthy read task does.
@@ -1552,6 +1565,7 @@ fn a_terminal_status_and_output_release_do_not_prove_actual_stop() {
     ));
     reporter.release_output();
 
+    fixture.quiesce(context, &[reporter.identity()]);
     let release = fixture
         .registry
         .release_query_context(&ReleaseQueryContext::new(
@@ -1605,16 +1619,10 @@ fn release_reports_not_ready_before_it_succeeds() {
     let reporter = fixture.create(identity, 5);
     let request = ReleaseQueryContext::new(TaskOperationId::new_v7(), context);
 
-    // A running task is not drained.
+    // Admission is still open, so release cannot substitute for a fence.
     let first = fixture.registry.release_query_context(&request);
-    assert_eq!(first.outcome(), OperationOutcome::ReleaseNotReady);
-    assert_eq!(
-        first
-            .acknowledgement()
-            .expect("release carries an acknowledgement")
-            .release(),
-        ReleaseOutcome::NotReady
-    );
+    assert_eq!(first.outcome(), OperationOutcome::InvalidStateOrRequest);
+    assert!(first.acknowledgement().is_none());
     assert_eq!(
         fixture.registry.context_state(context),
         QueryContextState::Active
@@ -1622,12 +1630,20 @@ fn release_reports_not_ready_before_it_succeeds() {
 
     // Terminal but its output has not drained: still not ready.
     fixture.finish(&reporter);
+    fixture.quiesce(context, &[identity]);
     fixture.registry.advance_deadlines();
     let second = fixture.registry.release_query_context(&request);
     assert_eq!(second.outcome(), OperationOutcome::ReleaseNotReady);
     assert_eq!(
+        second
+            .acknowledgement()
+            .expect("release acknowledgement")
+            .release(),
+        ReleaseOutcome::NotReady
+    );
+    assert_eq!(
         fixture.registry.context_state(context),
-        QueryContextState::Active
+        QueryContextState::Quiescing
     );
     assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 0);
 
@@ -1658,6 +1674,7 @@ fn release_then_abort_reports_the_normal_terminal() {
     reporter.release_output();
     fixture.registry.advance_deadlines();
 
+    fixture.quiesce(context, &[reporter.identity()]);
     let release = fixture
         .registry
         .release_query_context(&ReleaseQueryContext::new(
@@ -1730,6 +1747,7 @@ fn a_release_reports_the_evidence_the_host_sealed() {
         "an active context has sealed nothing"
     );
 
+    fixture.quiesce(context, &[]);
     let release = fixture
         .registry
         .release_query_context(&ReleaseQueryContext::new(
@@ -1784,15 +1802,15 @@ fn a_terminal_task_never_auto_releases_its_context() {
             "no sweep may release a context on its own"
         );
     }
-    // An explicit release is not ready either, because the create is in
-    // flight — the backend never guesses that its task set is closed.
+    // Release cannot close admission implicitly while a legal sibling create
+    // is in flight; only Quiesce can establish that cut.
     let release = fixture
         .registry
         .release_query_context(&ReleaseQueryContext::new(
             TaskOperationId::new_v7(),
             context,
         ));
-    assert_eq!(release.outcome(), OperationOutcome::ReleaseNotReady);
+    assert_eq!(release.outcome(), OperationOutcome::InvalidStateOrRequest);
 
     fixture.task_host.install_gate.open();
     let created = creating.join().expect("creating thread");
@@ -3017,6 +3035,7 @@ fn final_eos_ack_replays_after_task_retirement_until_context_release() {
     assert_eq!(fetch_status(&replayed), FetchStatus::Eof);
     assert_eq!(replayed.packet_seq, first_ack.packet_seq);
 
+    fixture.quiesce(context, &[root]);
     let released = fixture
         .registry
         .release_query_context(&ReleaseQueryContext::new(
@@ -3250,12 +3269,14 @@ fn a_reclaimed_context_answers_gone_rather_than_absent() {
     fixture.finish(&reporter);
     reporter.release_output();
     fixture.registry.advance_deadlines();
-    fixture
+    fixture.quiesce(context, &[reporter.identity()]);
+    let release = fixture
         .registry
         .release_query_context(&ReleaseQueryContext::new(
             TaskOperationId::new_v7(),
             context,
         ));
+    assert_eq!(release.outcome(), OperationOutcome::Accepted);
 
     let horizon = TaskExecutionRegistryConfig::for_process(
         fixture.backend,
@@ -3535,7 +3556,10 @@ fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
         HostLedger::get(&fixture.ledger.capabilities_removed)
     );
     assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-    assert_eq!(HostLedger::get(&fixture.ledger.aborts), 1);
+    // The losing commit and the closing-context sweep may both signal abort.
+    // Those signals do not prove that the single submitted worker has exited.
+    let abort_signals = HostLedger::get(&fixture.ledger.aborts);
+    assert!(abort_signals >= 1);
     assert_eq!(fixture.registry.counters().creations_rolled_back, 1);
     assert_eq!(fixture.registry.counters().tasks_created, 0);
     assert_eq!(fixture.registry.admission_reservation_count(), 0);
@@ -3552,6 +3576,11 @@ fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
     assert_eq!(terminal_replay.outcome(), created.outcome());
     assert_eq!(terminal_replay.detail(), created.detail());
     assert!(terminal_replay.acknowledgement().is_none());
+    assert_eq!(
+        HostLedger::get(&fixture.ledger.aborts),
+        abort_signals,
+        "a retired creation replay must not signal a worker again"
+    );
     assert_eq!(
         HostLedger::get(&fixture.ledger.installs_attempted),
         1,
