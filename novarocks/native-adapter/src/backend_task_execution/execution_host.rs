@@ -235,8 +235,8 @@ struct TaskRuntime {
     edges: Arc<ExchangeEdgeGates>,
     splits: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
     read_context: Arc<TypedReadAttemptContext>,
-    delivery_expire: Duration,
-    query_expire: Duration,
+    /// Retains preparation accounting until activation or receiver rollback.
+    registration: Mutex<Option<NativeFragmentRegistrationLease>>,
     /// This task's metrics owner, retained so `submit_runnable` can hand it
     /// the status reporter that only exists once the task is runnable.
     operator_statistics: Arc<TaskOperatorStatisticsSink>,
@@ -814,6 +814,14 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let runtime_filter =
             self.context_facts
                 .runtime_filter_session(execution, kernel_key, expects_bindings)?;
+        // Resource ownership starts with preparation. This registration does
+        // not activate drivers; its lease rolls back every pre-submit exit.
+        let registration = self
+            .queries
+            .register_fragment_execution(execution, kernel_key, delivery_expire, query_expire)
+            .map_err(|error| {
+                resource_exhausted(format!("task {identity} could not be registered: {error}"))
+            })?;
         let admission = self
             .queries
             .prepare_admission_execution(
@@ -874,8 +882,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 edges,
                 splits,
                 read_context,
-                delivery_expire,
-                query_expire,
+                registration: Mutex::new(Some(registration)),
                 operator_statistics,
             }),
         );
@@ -951,17 +958,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .take()
             .ok_or_else(|| internal(format!("task {identity} was submitted twice")))?;
 
-        let registration = self
-            .queries
-            .register_fragment_execution(
-                execution,
-                kernel_key,
-                runtime.delivery_expire,
-                runtime.query_expire,
-            )
-            .map_err(|error| {
-                resource_exhausted(format!("task {identity} could not be registered: {error}"))
-            })?;
+        let registration = runtime
+            .registration
+            .lock()
+            .expect(DORMANT_LOCK)
+            .take()
+            .ok_or_else(|| internal(format!("task {identity} has no preparation registration")))?;
         // A split may arrive the moment this create is acknowledged, so the
         // decoded read bindings become resolvable exactly here — after
         // preparation proved every plan node decodes, and before any worker
@@ -2818,6 +2820,87 @@ mod tests {
     }
 
     // ----------------------------------------------------- prepared lifecycle
+
+    fn isolated_resource_host() -> (
+        NativeTaskExecutionHost,
+        Arc<novarocks_worker::query_context::QueryContextManager>,
+    ) {
+        let manager = novarocks_worker::query_context::QueryContextManager::new_for_test();
+        let mut host = host(Arc::new(StubContextFacts::default()));
+        host.queries = NativeFragmentQueryRuntime::new_for_test(
+            Arc::clone(&manager),
+            novarocks_native_adapter::backend_test_support::test_memory_authority(),
+        );
+        (host, manager)
+    }
+
+    #[test]
+    fn preparation_registration_rolls_back_when_a_prepared_receiver_is_removed() {
+        let (host, manager) = isolated_resource_host();
+        let descriptor = consistent_descriptor(identity(521, 1, 1), UniqueId::new(521, 522));
+        install(&host, &descriptor).expect("prepares without submitting drivers");
+        let prepared = manager.native_execution_resource_snapshot();
+        assert_eq!(prepared.active_contexts, 1);
+        assert_eq!(prepared.active_fragments, 1);
+        host.remove_receiver(&descriptor);
+        host.remove_receiver(&descriptor);
+        let removed = manager.native_execution_resource_snapshot();
+        assert_eq!(removed.active_contexts, 0);
+        assert_eq!(removed.active_fragments, 0);
+    }
+
+    #[test]
+    fn preparation_registration_rollback_preserves_a_submitted_sibling() {
+        let (host, manager) = isolated_resource_host();
+        let first = identity(523, 1, 1);
+        let sibling = TaskIdentity::new(
+            first.query_execution_id(),
+            first.stage_id(),
+            TaskId::new(2).expect("task"),
+            first.backend_process_id(),
+        );
+        let first_descriptor = consistent_descriptor(first, UniqueId::new(523, 524));
+        let sibling_descriptor = consistent_descriptor(sibling, UniqueId::new(525, 526));
+        install(&host, &first_descriptor).expect("first prepares");
+        let (owner, reporter) = reporter_for(first);
+        // Submission retains the registration in PreparedNativeStart. No
+        // commit has occurred, so this test cannot accidentally run drivers.
+        let runnable = host
+            .submit_runnable(&first_descriptor, reporter)
+            .expect("submits");
+        install(&host, &sibling_descriptor).expect("sibling prepares");
+        assert_eq!(
+            manager
+                .native_execution_resource_snapshot()
+                .active_fragments,
+            2
+        );
+        host.remove_receiver(&sibling_descriptor);
+        let retained = manager.native_execution_resource_snapshot();
+        assert_eq!(retained.active_contexts, 1);
+        assert_eq!(retained.active_fragments, 1);
+        host.remove_receiver(&first_descriptor);
+        assert_eq!(
+            manager
+                .native_execution_resource_snapshot()
+                .active_fragments,
+            1,
+            "the submitted start owns its registration independently of receiver removal"
+        );
+        runnable.commit_creation();
+        assert_eq!(await_terminal(&owner), TaskState::Finished);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while manager.native_execution_resource_snapshot().active_contexts != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "completion must release runtime accounting"
+            );
+            std::thread::yield_now();
+        }
+        let removed = manager.native_execution_resource_snapshot();
+        assert_eq!(removed.active_contexts, 0);
+        assert_eq!(removed.active_fragments, 0);
+    }
 
     #[test]
     fn a_prepared_task_opens_only_the_edges_its_descriptor_froze() {

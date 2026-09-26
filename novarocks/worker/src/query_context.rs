@@ -1018,13 +1018,20 @@ impl QueryContextManager {
                 return false;
             }
             guard.finst_to_query.remove(&finst_id);
+            guard.exchange_receiver_ports.remove(&finst_id);
+            guard.incremental_scan_nodes.remove(&finst_id);
+            guard.pending_incremental_scan_ranges.remove(&finst_id);
+            guard.incremental_change_op_slots.remove(&finst_id);
             let remove_empty_context = {
                 let context = guard
                     .active
                     .get_mut(&query_id)
                     .expect("checked active context");
                 context.rollback_inc_fragments();
-                context.num_fragments == 0 && context.num_active_fragments == 0
+                // Completed siblings no longer own this native attempt. The
+                // final preparation rollback must release its context even if
+                // earlier fragments contributed to the cumulative count.
+                context.num_active_fragments == 0
             };
             remove_empty_context.then(|| {
                 guard

@@ -111,6 +111,49 @@ mod tests {
     }
 
     #[test]
+    fn preparation_rollback_preserves_live_siblings_and_releases_after_completed_siblings() {
+        let manager = QueryContextManager::new_for_test();
+        let runtime = NativeFragmentQueryRuntime::new_for_test(
+            manager.clone(),
+            crate::backend_test_support::test_memory_authority(),
+        );
+        let execution = QueryExecutionId::new(
+            QueryId::new(91_411, 91_412),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("valid execution");
+        let register = |fragment| {
+            runtime
+                .register_fragment_execution(
+                    execution,
+                    fragment,
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .expect("register native responsibility")
+        };
+        let running = UniqueId::new(91_413, 1);
+        register(running).into_running();
+        let first_preparation = register(UniqueId::new(91_413, 2));
+        let last_preparation = register(UniqueId::new(91_413, 3));
+
+        drop(first_preparation);
+        let snapshot = manager.native_execution_resource_snapshot();
+        assert_eq!(snapshot.active_contexts, 1);
+        assert_eq!(snapshot.active_fragments, 2);
+        runtime.unregister_fragment_execution(execution, running);
+        runtime.finish_fragment(execution);
+        let snapshot = manager.native_execution_resource_snapshot();
+        assert_eq!(snapshot.active_contexts, 1);
+        assert_eq!(snapshot.active_fragments, 1);
+
+        drop(last_preparation);
+        let snapshot = manager.native_execution_resource_snapshot();
+        assert_eq!(snapshot.active_contexts, 0);
+        assert_eq!(snapshot.active_fragments, 0);
+    }
+
+    #[test]
     fn native_admission_installs_one_query_memory_limit() {
         let manager = QueryContextManager::new_for_test();
         let runtime = NativeFragmentQueryRuntime::new_for_test(
