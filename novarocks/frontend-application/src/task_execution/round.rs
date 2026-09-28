@@ -352,11 +352,34 @@ impl TaskRound {
     }
 
     fn covered_subscription_failure(&self, context: QueryContextRef) -> Option<SubscriptionState> {
-        match self.covered_subscriber.as_ref()?.state(context)? {
-            // A plain disconnect cannot erase an applied result or create a
-            // local observation gap. Missing required evidence retains its
-            // own deadline rather than failing an unrelated read seal.
-            SubscriptionState::BudgetExhausted => None,
+        let state = self.covered_subscriber.as_ref()?.state(context)?;
+        self.classify_covered_subscription_state(context, state)
+    }
+
+    /// Exhausted transport recovery matters only while this Context still
+    /// owes required Task evidence. Plain disconnection never erases an
+    /// accepted fact or creates an application gap. Retired input demand and
+    /// an accepted success cut leave residual observation to the drain owner.
+    pub(super) fn classify_covered_subscription_state(
+        &self,
+        context: QueryContextRef,
+        state: SubscriptionState,
+    ) -> Option<SubscriptionState> {
+        match state {
+            SubscriptionState::BudgetExhausted => {
+                if self.success_sealed || self.terminal_cleanup_started {
+                    return None;
+                }
+                self.execution
+                    .graph()
+                    .tasks()
+                    .filter(|task| task.context() == context)
+                    .filter_map(|task| self.execution.task(task.identity().task_id()))
+                    .any(|task| {
+                        !task.normally_stood_down() && !task.fenced_out() && !task.is_terminal()
+                    })
+                    .then_some(state)
+            }
             state if state.is_fatal() => Some(state),
             _ => None,
         }

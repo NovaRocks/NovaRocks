@@ -8244,12 +8244,176 @@ fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
         .expect("the seal cut freezes ordinary pumps before the rest of its turn");
     assert_eq!(reply.try_recv().unwrap(), Ok(()));
     assert!(round.root_success_sealed());
+    for &context in round.execution().graph().contexts() {
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                crate::native::task_transport::SubscriptionState::BudgetExhausted
+            ),
+            None,
+            "an accepted root seal cannot be revoked by residual observation exhaustion"
+        );
+    }
     assert!(
         round
             .execution_mut()
             .enqueue_task_update(root.task_id(), split_update(SCAN_NODE, 1, false))
             .is_err()
     );
+}
+
+#[test]
+fn covered_exhaustion_fails_only_still_required_work_without_timing_healthy_tasks() {
+    use crate::native::task_transport::SubscriptionState;
+
+    let harness = Harness::new(&[1], &[0], 64);
+    let leaf = harness.stage_tasks(1)[0];
+    let leaf_context = harness.execution.task(leaf).unwrap().context();
+    let clock = Arc::clone(&harness.clock);
+    let (mut round, _, acks, creates) = round_waiting_on_creates(harness);
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    round.turn().unwrap();
+    clock.advance(Duration::from_secs(600));
+    for state in [
+        SubscriptionState::Opening,
+        SubscriptionState::Live,
+        SubscriptionState::Resubscribing,
+    ] {
+        assert_eq!(
+            round.classify_covered_subscription_state(leaf_context, state),
+            None
+        );
+    }
+    assert!(!round.execution().root_end_of_stream_observed());
+    assert!(!round.execution().required_root_evidence_expired());
+    assert_eq!(
+        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        Some(SubscriptionState::BudgetExhausted),
+        "a still-required leaf losing bounded transport recovery must reach the original failure owner"
+    );
+    for state in [
+        SubscriptionState::Rejected,
+        SubscriptionState::ProcessMismatch,
+        SubscriptionState::QueryMismatch,
+    ] {
+        assert_eq!(
+            round.classify_covered_subscription_state(leaf_context, state),
+            Some(state)
+        );
+    }
+}
+
+#[test]
+fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
+    use crate::native::task_transport::SubscriptionState;
+
+    let harness = Harness::new(&[1], &[0], 64);
+    let leaf = harness.stage_tasks(1)[0];
+    let leaf_identity = harness.execution.task(leaf).unwrap().identity();
+    let leaf_context = harness.execution.task(leaf).unwrap().context();
+    let (mut round, _, _, _) = round_waiting_on_creates(harness);
+    assert!(
+        !round
+            .execution()
+            .task(leaf)
+            .unwrap()
+            .create_ownership_proven()
+    );
+    assert_eq!(
+        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        Some(SubscriptionState::BudgetExhausted)
+    );
+    round
+        .execution_mut()
+        .stand_down_task_normally(leaf_identity)
+        .unwrap();
+    assert!(
+        !round.execution().task(leaf).unwrap().is_terminal(),
+        "stand-down is not synthetic Worker-stop evidence"
+    );
+    assert_eq!(
+        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        None
+    );
+    let root_context = round
+        .execution()
+        .task(round.root_task().task_id())
+        .unwrap()
+        .context();
+    assert_eq!(
+        round.classify_covered_subscription_state(root_context, SubscriptionState::BudgetExhausted),
+        Some(SubscriptionState::BudgetExhausted)
+    );
+    round.begin_terminal_cleanup();
+    assert_eq!(
+        round.classify_covered_subscription_state(root_context, SubscriptionState::BudgetExhausted),
+        None
+    );
+}
+
+#[test]
+fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
+    use crate::native::task_transport::SubscriptionState;
+
+    for eos_first in [false, true] {
+        let harness = Harness::new(&[1], &[0], 64);
+        let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+        for create in &creates {
+            acks.publish(accepted_create_ack(create));
+        }
+        round.turn().unwrap();
+        let root = round.root_task();
+        let context = round.execution().task(root.task_id()).unwrap().context();
+        for (version, state, output) in [
+            (2, TaskState::Running, false),
+            (3, TaskState::Flushing, false),
+        ] {
+            status.publish(StatusEvent::Published(
+                TaskStatus::try_new(
+                    root,
+                    TaskStatusVersion::new(version).unwrap(),
+                    state,
+                    None,
+                    TaskOutputFacts::new(output),
+                )
+                .unwrap(),
+            ));
+        }
+        round.turn().unwrap();
+        if eos_first {
+            round.consume_root_result_packet(0, true).unwrap();
+        }
+        assert_eq!(
+            round.classify_covered_subscription_state(context, SubscriptionState::BudgetExhausted),
+            Some(SubscriptionState::BudgetExhausted),
+            "EOS alone cannot replace missing root terminal evidence"
+        );
+        status.publish(StatusEvent::Published(
+            TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(4).unwrap(),
+                TaskState::Finished,
+                None,
+                TaskOutputFacts::new(true),
+            )
+            .unwrap(),
+        ));
+        round.turn().unwrap();
+        if !eos_first {
+            assert!(!round.execution().client_visible_completion());
+        }
+        assert_eq!(
+            round.classify_covered_subscription_state(context, SubscriptionState::BudgetExhausted),
+            None,
+            "observed complete root evidence survives a status-stream disconnect; outstanding data-plane fetch has its own owner"
+        );
+        if !eos_first {
+            round.consume_root_result_packet(0, true).unwrap();
+        }
+        assert!(round.execution().client_visible_completion());
+    }
 }
 
 #[test]
