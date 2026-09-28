@@ -1858,6 +1858,7 @@ struct FrontendNativeAttemptPreparationState<F> {
     topology: BackendTopologyService,
     dormant_factory: F,
     last_topology_revision: Option<u64>,
+    observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 
 impl<F> std::fmt::Debug for FrontendNativeAttemptPreparationPort<F>
@@ -1886,6 +1887,7 @@ where
                 topology,
                 dormant_factory,
                 last_topology_revision: None,
+                observation: crate::preparation_diagnostics::capture_statement_observation(),
             })),
         }
     }
@@ -1914,6 +1916,12 @@ where
                 }
                 state = state.lock() => state,
             };
+            if let Some(observation) = &state.observation {
+                crate::preparation_diagnostics::bind_observed_attempt(
+                    observation,
+                    request.execution(),
+                );
+            }
             let snapshot = match state.last_topology_revision {
                 None => state.topology.snapshot().map_err(|error| {
                     attempt_failure(

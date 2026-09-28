@@ -479,20 +479,17 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
         tokio::pin!(reservation);
         tokio::select! {
             biased;
-            error = failure.wait() => {
+            error = wait_terminal_result_failure(&mut failure, &cancellation) => {
                 schema_delivery.fail(error.clone());
-                let _ = result.fail();
+                let kind = if is_terminal_cancellation(&error) {
+                    let _ = result.settle_cancellation();
+                    ErrorKind::ER_QUERY_INTERRUPTED
+                } else {
+                    let _ = result.fail();
+                    ErrorKind::ER_UNKNOWN_ERROR
+                };
                 return results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
-                    .await
-                    .map(|_| MysqlStatementWriteOutcome::Terminated);
-            }
-            reason = cancellation.cancelled() => {
-                let error = cancelled_query_result_delivery(reason);
-                schema_delivery.fail(error.clone());
-                let _ = result.settle_cancellation();
-                return results
-                    .error(ErrorKind::ER_QUERY_INTERRUPTED, error.to_string().as_bytes())
+                    .error(kind, error.to_string().as_bytes())
                     .await
                     .map(|_| MysqlStatementWriteOutcome::Terminated);
             }
@@ -530,11 +527,17 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
     {
         Ok(writer) => writer,
         Err(crate::MysqlBatchWriteError::Native(error)) => {
+            let error = normalize_terminal_cancellation(error, result.cancellation().reason());
             schema_delivery.fail(error.clone());
+            if is_terminal_cancellation(&error) {
+                let _ = result.settle_cancellation();
+                return Err(interrupted_error(error.to_string()));
+            }
             let _ = result.fail();
             return Err(invalid_data_error(error.to_string()));
         }
         Err(crate::MysqlBatchWriteError::Cancelled(error)) => {
+            let error = normalize_terminal_cancellation(error, result.cancellation().reason());
             schema_delivery.fail(error.clone());
             let _ = result.settle_cancellation();
             return Err(interrupted_error(error.to_string()));
@@ -563,10 +566,7 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
             tokio::pin!(next);
             tokio::select! {
                 biased;
-                error = failure.wait() => Err(error),
-                reason = cancellation.cancelled() => {
-                    Err(cancelled_query_result_delivery(reason))
-                }
+                error = wait_terminal_result_failure(&mut failure, &cancellation) => Err(error),
                 delivery = &mut next => delivery.and_then(|delivery| {
                     delivery.ok_or_else(|| failed_query_result_delivery(
                         "streaming query result ended without an acknowledged success EOF",
@@ -577,7 +577,7 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
         let delivery = match next {
             Ok(delivery) => delivery,
             Err(error) => {
-                let error = normalize_terminal_cancellation(error);
+                let error = normalize_terminal_cancellation(error, result.cancellation().reason());
                 let kind = if is_terminal_cancellation(&error) {
                     ErrorKind::ER_QUERY_INTERRUPTED
                 } else {
@@ -618,10 +618,7 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
                     tokio::pin!(reserve);
                     let interrupt = tokio::select! {
                         biased;
-                        error = failure.wait() => Some(error),
-                        reason = cancellation.cancelled() => {
-                            Some(cancelled_query_result_delivery(reason))
-                        }
+                        error = wait_terminal_result_failure(&mut failure, &cancellation) => Some(error),
                         reserved = &mut reserve => break 'reservation match reserved {
                             Ok(delivery) => Ok(delivery),
                             Err(rejection) => {
@@ -650,7 +647,6 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
                 let delivery = match reserved {
                     Ok(delivery) => delivery,
                     Err(error) => {
-                        let error = normalize_terminal_cancellation(error);
                         let kind = if is_terminal_cancellation(&error) {
                             ErrorKind::ER_QUERY_INTERRUPTED
                         } else {
@@ -738,10 +734,7 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
                 tokio::pin!(reserve);
                 let terminal_reservation = match tokio::select! {
                     biased;
-                    error = failure.wait() => Err(error),
-                    reason = cancellation.cancelled() => {
-                        Err(cancelled_query_result_delivery(reason))
-                    }
+                    error = wait_terminal_result_failure(&mut failure, &cancellation) => Err(error),
                     reservation = &mut reserve => reservation.map_err(|error| {
                         failed_query_result_delivery(format!(
                             "reserve MySQL result EOF bytes: {error}"
@@ -750,7 +743,6 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
                 } {
                     Ok(reservation) => reservation,
                     Err(error) => {
-                        let error = normalize_terminal_cancellation(error);
                         let kind = if is_terminal_cancellation(&error) {
                             ErrorKind::ER_QUERY_INTERRUPTED
                         } else {
@@ -768,7 +760,10 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
                 match result.seal_success_visibility() {
                     GovernedStatementVisibilitySealOutcome::Sealed => {}
                     GovernedStatementVisibilitySealOutcome::Cancelled(reason) => {
-                        let error = governed_cancelled_query_result_delivery(reason);
+                        let error = normalize_terminal_cancellation(
+                            governed_cancelled_query_result_delivery(reason),
+                            result.cancellation().reason(),
+                        );
                         delivery.fail(error.clone());
                         let _ = result.settle_cancellation();
                         return finish_stream_error_terminated(
@@ -802,7 +797,13 @@ pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
                     }
                     Err(crate::MysqlResultFinishError::Native(error)) => {
                         drop(terminal_reservation);
+                        let error =
+                            normalize_terminal_cancellation(error, result.cancellation().reason());
                         delivery.fail(error.clone());
+                        if is_terminal_cancellation(&error) {
+                            let _ = result.settle_cancellation();
+                            return Err(interrupted_error(error.to_string()));
+                        }
                         let _ = result.fail();
                         return Err(invalid_data_error(error.to_string()));
                     }
@@ -883,11 +884,18 @@ async fn write_streaming_batch<W: AsyncWrite + Unpin>(
     cancellation: QueryCancellationView,
     failure: ResultFailureView,
 ) -> Result<(), ProtocolWriteFailure> {
-    crate::write_streaming_batch(writer, batch, columns, cancellation, failure)
+    crate::write_streaming_batch(writer, batch, columns, cancellation.clone(), failure)
         .await
         .map_err(|error| match error {
-            crate::MysqlBatchWriteError::Cancelled(error) => ProtocolWriteFailure::Cancelled(error),
-            crate::MysqlBatchWriteError::Native(error) => ProtocolWriteFailure::Native(error),
+            crate::MysqlBatchWriteError::Cancelled(error)
+            | crate::MysqlBatchWriteError::Native(error) => {
+                let error = normalize_terminal_cancellation(error, cancellation.reason());
+                if is_terminal_cancellation(&error) {
+                    ProtocolWriteFailure::Cancelled(error)
+                } else {
+                    ProtocolWriteFailure::Native(error)
+                }
+            }
             crate::MysqlBatchWriteError::Encoding(error) => ProtocolWriteFailure::Encoding(error),
             crate::MysqlBatchWriteError::Io(error) => ProtocolWriteFailure::Io(error),
         })
@@ -1365,11 +1373,30 @@ fn is_terminal_cancellation(error: &QueryExecutionError) -> bool {
     )
 }
 
-fn normalize_terminal_cancellation(error: QueryExecutionError) -> QueryExecutionError {
-    if error.kind() == QueryExecutionErrorKind::DeadlineExceeded {
-        QueryExecutionError::new(QueryExecutionErrorKind::DeadlineExceeded, "query timed out")
-    } else {
-        error
+async fn wait_terminal_result_failure(
+    failure: &mut ResultFailureView,
+    cancellation: &QueryCancellationView,
+) -> QueryExecutionError {
+    tokio::select! {
+        biased;
+        error = failure.wait() => normalize_terminal_cancellation(error, cancellation.reason()),
+        reason = cancellation.cancelled() => cancelled_query_result_delivery(reason),
+    }
+}
+
+fn normalize_terminal_cancellation(
+    error: QueryExecutionError,
+    reason: Option<QueryCancellationReason>,
+) -> QueryExecutionError {
+    match error.kind() {
+        QueryExecutionErrorKind::DeadlineExceeded => {
+            QueryExecutionError::new(QueryExecutionErrorKind::DeadlineExceeded, "query timed out")
+        }
+        QueryExecutionErrorKind::Cancelled => match reason {
+            Some(reason) => cancelled_query_result_delivery(reason),
+            None => error,
+        },
+        _ => error,
     }
 }
 
@@ -1462,6 +1489,10 @@ mod streaming_result_tests {
     }
 
     fn fixture(fields: Vec<ResultField>) -> Fixture {
+        fixture_with_timeout(fields, None)
+    }
+
+    fn fixture_with_timeout(fields: Vec<ResultField>, timeout_ms: Option<u64>) -> Fixture {
         let execution_id = QueryExecutionId::new(
             QueryId::new(71, 1),
             AttemptId::new(1).expect("test attempt"),
@@ -1502,7 +1533,7 @@ mod streaming_result_tests {
                 session.token(),
                 &governance.root_admission(),
                 None,
-                None,
+                timeout_ms,
                 None,
             )
             .expect("begin governed statement");
@@ -1652,10 +1683,13 @@ mod streaming_result_tests {
 
     #[test]
     fn actor_deadline_terminal_is_settled_as_a_mysql_timeout() {
-        let error = normalize_terminal_cancellation(QueryExecutionError::new(
-            QueryExecutionErrorKind::DeadlineExceeded,
-            "logical execution deadline expired before success EOF",
-        ));
+        let error = normalize_terminal_cancellation(
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::DeadlineExceeded,
+                "logical execution deadline expired before success EOF",
+            ),
+            None,
+        );
 
         assert!(is_terminal_cancellation(&error));
         assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
@@ -1669,6 +1703,130 @@ mod streaming_result_tests {
         });
         assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
         assert_eq!(error.to_string(), "Query execution was interrupted");
+    }
+
+    async fn observe_ready_actor_failure(
+        error: QueryExecutionError,
+        reason: Option<QueryCancellationReason>,
+    ) -> QueryExecutionError {
+        let timeout_ms = match reason.as_ref() {
+            Some(QueryCancellationReason::DeadlineExceeded { timeout_ms })
+            | Some(QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms }) => {
+                Some(*timeout_ms)
+            }
+            _ => None,
+        };
+        let mut fixture = fixture_with_timeout(string_fields(), timeout_ms);
+        let cancellation = fixture.result.as_ref().unwrap().cancellation();
+        let mut failure = fixture.result.as_ref().unwrap().failure_view().unwrap();
+        if let Some(reason) = reason {
+            assert!(matches!(
+                fixture
+                    .control
+                    .cancel_session_statement(fixture.session.token(), reason),
+                QueryCancelOutcome::Requested
+            ));
+        }
+        // Both observations are ready before the production selector is polled.
+        fixture.producer.fail(error);
+        let observed = wait_terminal_result_failure(&mut failure, &cancellation).await;
+        if is_terminal_cancellation(&observed) {
+            fixture.result.take().unwrap().settle_cancellation();
+        } else {
+            fixture.result.take().unwrap().fail();
+        }
+        assert!(matches!(
+            fixture.control.cancel_session_statement(
+                fixture.session.token(),
+                QueryCancellationReason::ClientDisconnected,
+            ),
+            QueryCancelOutcome::NoActiveStatement
+        ));
+        fixture.producer.finish();
+        observed
+    }
+
+    #[tokio::test]
+    async fn ready_actor_cancellation_and_explicit_kill_use_the_statement_message() {
+        let error = observe_ready_actor_failure(
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::Cancelled,
+                "logical execution was cancelled before success EOF",
+            ),
+            Some(QueryCancellationReason::ExplicitKill {
+                requester_connection_id: 7,
+            }),
+        )
+        .await;
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+        assert_eq!(error.to_string(), "Query execution was interrupted");
+    }
+
+    #[tokio::test]
+    async fn ready_actor_cancellation_uses_each_exact_statement_reason() {
+        for reason in [
+            QueryCancellationReason::ExecutionCancellationRequested,
+            QueryCancellationReason::ExecutionOwnerDropped,
+            QueryCancellationReason::ExplicitKillConnection {
+                requester_connection_id: 7,
+            },
+            QueryCancellationReason::ClientDisconnected,
+            QueryCancellationReason::DeadlineExceeded { timeout_ms: 1_000 },
+            QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms: 2_000 },
+            QueryCancellationReason::ServerShutdown,
+        ] {
+            let expected = cancelled_query_result_delivery(reason.clone());
+            let error = observe_ready_actor_failure(
+                QueryExecutionError::new(QueryExecutionErrorKind::Cancelled, "actor cancellation"),
+                Some(reason),
+            )
+            .await;
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_cancellation_without_a_statement_reason_is_not_invented() {
+        let expected =
+            QueryExecutionError::new(QueryExecutionErrorKind::Cancelled, "actor cancellation");
+        assert_eq!(
+            observe_ready_actor_failure(expected.clone(), None).await,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_actor_failures_are_not_retagged_by_a_statement_kill() {
+        for kind in [
+            QueryExecutionErrorKind::Failed,
+            QueryExecutionErrorKind::InvalidRequest,
+        ] {
+            let expected = QueryExecutionError::new(kind, "original actor failure");
+            let error = observe_ready_actor_failure(
+                expected.clone(),
+                Some(QueryCancellationReason::ExplicitKill {
+                    requester_connection_id: 7,
+                }),
+            )
+            .await;
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_actor_deadline_keeps_its_typed_origin_despite_a_statement_kill() {
+        let error = observe_ready_actor_failure(
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::DeadlineExceeded,
+                "logical execution deadline expired before success EOF",
+            ),
+            Some(QueryCancellationReason::ExplicitKill {
+                requester_connection_id: 7,
+            }),
+        )
+        .await;
+        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
+        assert_eq!(error.to_string(), "query timed out");
     }
 
     #[test]

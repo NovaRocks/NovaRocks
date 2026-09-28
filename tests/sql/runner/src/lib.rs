@@ -1319,42 +1319,81 @@ fn run_be_log_directives_for_successful_step(
     }
 }
 
-fn capture_lifecycle_structured_snapshot(
-    meta: &QueryMeta,
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
-) -> Result<Option<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>> {
-    if meta.query_lifecycle_structured_assertion.is_none() {
-        return Ok(None);
-    }
-    let mut server = server_handle
-        .lock()
-        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-    server
-        .query_lifecycle_structured_snapshot()?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "@expect_lifecycle_* requires a query-scoped structured lifecycle snapshot; diagnostic text is not a substitute"
-            )
-        })
-        .map(Some)
+struct LifecycleStatementObservationGuard {
+    server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    observation: novarocks_cluster_harness::QueryLifecycleStatementObservation,
+    drained: bool,
 }
 
-fn await_lifecycle_structured_snapshot_after(
+impl LifecycleStatementObservationGuard {
+    fn drain(&mut self) -> Result<()> {
+        self.server_handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
+            .drain_query_lifecycle_statement_observation(&self.observation)?;
+        self.drained = true;
+        Ok(())
+    }
+}
+
+impl Drop for LifecycleStatementObservationGuard {
+    fn drop(&mut self) {
+        if self.drained {
+            return;
+        }
+        match self.server_handle.lock() {
+            Ok(mut server) => {
+                if let Err(error) =
+                    server.drain_query_lifecycle_statement_observation(&self.observation)
+                {
+                    eprintln!("failed to drain statement lifecycle observation: {error:#}");
+                }
+            }
+            Err(_) => eprintln!(
+                "server handle mutex is poisoned while draining statement lifecycle observation"
+            ),
+        }
+    }
+}
+
+fn arm_lifecycle_statement_observation(
     meta: &QueryMeta,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
-    before: Option<&novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>,
-    deadline: Instant,
-) -> Result<Option<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>> {
+    connection_id: u32,
+    sql: &str,
+) -> Result<Option<LifecycleStatementObservationGuard>> {
     if meta.query_lifecycle_structured_assertion.is_none() {
         return Ok(None);
     }
-    let before_execution_id = before.and_then(|snapshot| snapshot.execution_id.as_deref());
-    let mut server = server_handle
+    let statements = session::split_sql_statements(sql)?;
+    if statements.len() != 1 {
+        bail!("structured lifecycle assertions require exactly one submitted SQL statement");
+    }
+    let observation = server_handle
         .lock()
-        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-    server
-        .await_query_lifecycle_structured_snapshot_after(before_execution_id, deadline)
-        .map(Some)
+        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
+        .arm_query_lifecycle_statement_observation(connection_id, &statements[0])?;
+    Ok(Some(LifecycleStatementObservationGuard {
+        server_handle: Arc::clone(server_handle),
+        observation,
+        drained: false,
+    }))
+}
+
+fn await_lifecycle_statement_observation(
+    meta: &QueryMeta,
+    guard: &LifecycleStatementObservationGuard,
+    deadline: Instant,
+) -> Result<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot> {
+    let require_success = meta
+        .query_lifecycle_structured_assertion
+        .as_ref()
+        .is_none_or(|assertion| assertion.error_source.is_none());
+    guard
+        .server_handle
+        .lock()
+        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
+        .await_query_lifecycle_statement_observation(&guard.observation, require_success, deadline)
 }
 
 fn runtime_filter_details(
@@ -2599,16 +2638,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         } else {
             None
         };
-        let structured_lifecycle_baseline = match capture_lifecycle_structured_snapshot(
+        let mut structured_lifecycle_observation = match arm_lifecycle_statement_observation(
             &step.meta,
             &ctx.server_handle,
+            target_session.connection_id(),
+            &step.sql,
         ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 case_failed = true;
                 let _ = writeln!(
                     log,
-                    "    ❌ failed to capture structured lifecycle assertion baseline: {error:#}"
+                    "    ❌ failed to arm exact statement lifecycle assertion: {error:#}"
                 );
                 break;
             }
@@ -3738,21 +3779,22 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
 
         if step.meta.query_lifecycle_structured_assertion.is_some() {
             let assertion_deadline = Instant::now() + Duration::from_secs(ctx.query_timeout);
-            let assertion_result = await_lifecycle_structured_snapshot_after(
-                &step.meta,
-                &ctx.server_handle,
-                structured_lifecycle_baseline.as_ref(),
-                assertion_deadline,
-            )
-            .and_then(|after| {
-                let after = after.context(
-                    "structured lifecycle assertion snapshot disappeared after the step",
-                )?;
-                verify_lifecycle_structured_assertion(&step.meta, &after)
-            });
+            let assertion_result = structured_lifecycle_observation
+                .as_ref()
+                .context("exact statement lifecycle observation disappeared after the step")
+                .and_then(|guard| {
+                    await_lifecycle_statement_observation(&step.meta, guard, assertion_deadline)
+                })
+                .and_then(|after| {
+                    verify_lifecycle_structured_assertion(&step.meta, &after)?;
+                    Ok(after.execution_id)
+                });
             match assertion_result {
-                Ok(()) => {
-                    let _ = writeln!(log, "    ✅ structured lifecycle assertion passed");
+                Ok(execution_id) => {
+                    let _ = writeln!(
+                        log,
+                        "    ✅ structured lifecycle assertion passed execution_id={execution_id:?}"
+                    );
                 }
                 Err(error) => {
                     case_failed = true;
@@ -3761,6 +3803,15 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         "    ❌ structured lifecycle assertion failed: {error:#}"
                     );
                 }
+            }
+            if let Some(guard) = structured_lifecycle_observation.as_mut()
+                && let Err(error) = guard.drain()
+            {
+                case_failed = true;
+                let _ = writeln!(
+                    log,
+                    "    ❌ exact statement lifecycle observation cleanup failed: {error:#}"
+                );
             }
         }
 

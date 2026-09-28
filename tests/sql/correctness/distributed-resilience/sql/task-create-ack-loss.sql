@@ -17,20 +17,15 @@
 
 -- @sequential=true
 
--- One dropped CreateTask acknowledgement must cost nothing but a resend. The
--- task is admitted on the backend and the frontend never learns of it, so the
--- resend must be recognised as an identical replay -- not admitted a second
--- time, which would double the task, and not refused as a conflict, which
--- would fail a query that had already succeeded.
+-- A dropped CreateTask acknowledgement leaves the RPC outcome unknown. The
+-- Worker independently publishes Installed/terminal facts through the covered
+-- status stream. Either a positive fact or an identical replay can prove
+-- ownership; the frontend must stop replaying once ownership is known.
 --
--- CreateTask is the protocol's single admission point, so this one fault
--- covers what the retired protocol needed two for: its Stage and Start phases
--- each had an acknowledgement that could be lost independently.
---
--- Both halves are asserted because either alone passes for the wrong reason.
--- Counting only APPLIED across three backends would also pass if the fault
--- never fired, and counting only IDEMPOTENT would pass if a backend that owed
--- a task never created one.
+-- Require the real ACK-drop fault to fire, each participating backend to
+-- apply its tasks, and both query results to remain correct. Exact-request
+-- idempotence is tested by native-creation/frozen-replay-and-membership, which
+-- deliberately sends the replay instead of racing it against Installed.
 
 -- query 1
 -- @skip_result_check=true
@@ -59,7 +54,7 @@ INSERT INTO ${case_db}.create_ack_loss VALUES (3, 30);
 -- @result_contains=3	30
 -- @be_log_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
--- @be_log_count_at_least=NOVAROCKS_TASK_CREATE_IDEMPOTENT,1
+-- @be_log_count_at_least=NOVAROCKS_TASK_CREATE_ACK_DROPPED,1
 SELECT id, payload
 FROM ${case_db}.create_ack_loss
 ORDER BY id;
@@ -69,7 +64,7 @@ ORDER BY id;
 -- @result_contains=60
 -- @be_log_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
--- @be_log_count_at_least=NOVAROCKS_TASK_CREATE_IDEMPOTENT,1
+-- @be_log_count_at_least=NOVAROCKS_TASK_CREATE_ACK_DROPPED,1
 SELECT SUM(left_side.payload) AS total
 FROM ${case_db}.create_ack_loss left_side
 JOIN ${case_db}.create_ack_loss right_side

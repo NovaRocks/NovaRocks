@@ -199,6 +199,18 @@ pub(crate) fn frontend_management_router_with_readers(
                 "/v1/diagnostics/preparation/drain",
                 post(drain_preparation_diagnostics),
             )
+            .route(
+                "/v1/diagnostics/preparation/statement/arm",
+                post(arm_statement_observation),
+            )
+            .route(
+                "/v1/diagnostics/preparation/statement/peek",
+                post(peek_statement_observation),
+            )
+            .route(
+                "/v1/diagnostics/preparation/statement/drain",
+                post(drain_statement_observation),
+            )
     } else {
         router
     };
@@ -226,6 +238,45 @@ async fn drain_preparation_diagnostics(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match crate::preparation_diagnostics::drain(&request.run_token) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error).into_response(),
+    }
+}
+
+async fn arm_statement_observation(
+    headers: HeaderMap,
+    Json(request): Json<crate::preparation_diagnostics::StatementObservationArmRequest>,
+) -> axum::response::Response {
+    if !preparation_diagnostic_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match crate::preparation_diagnostics::arm_statement_observation(request) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error).into_response(),
+    }
+}
+
+async fn peek_statement_observation(
+    headers: HeaderMap,
+    Json(request): Json<crate::preparation_diagnostics::ControlRequest>,
+) -> axum::response::Response {
+    if !preparation_diagnostic_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match crate::preparation_diagnostics::peek_statement_observation(&request.run_token) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error).into_response(),
+    }
+}
+
+async fn drain_statement_observation(
+    headers: HeaderMap,
+    Json(request): Json<crate::preparation_diagnostics::ControlRequest>,
+) -> axum::response::Response {
+    if !preparation_diagnostic_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match crate::preparation_diagnostics::drain_statement_observation(&request.run_token) {
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
     }

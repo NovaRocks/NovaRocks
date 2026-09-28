@@ -72,7 +72,11 @@ pub(crate) fn launch_server(
                 cluster_size,
                 launch_profile,
                 startup_timeout: startup_timeout(),
-                child_environment: Default::default(),
+                child_environment: if launch_profile == LaunchProfile::FaultScenario {
+                    novarocks_cluster_harness::statement_lifecycle_observation_environment()?
+                } else {
+                    Default::default()
+                },
                 config_overlay: resolve_role_scoped_connector_overlay()?,
                 native_trust_fixture: Default::default(),
             },

@@ -73,6 +73,7 @@ pub(crate) struct FrontendLifecycleDiagnostics {
 
 impl FrontendLifecycleDiagnostics {
     pub(crate) fn publish(&self, snapshot: QueryLifecycleConvergenceSnapshot) {
+        crate::preparation_diagnostics::publish_observed_convergence(&snapshot);
         *self
             .latest
             .lock()

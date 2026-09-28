@@ -736,9 +736,9 @@ fn await_count(
 ///
 /// An exactly answered create releases its FE replay payload while the statement runs;
 /// the statement's static plans stay until the statement ends. A create
-/// whose acknowledgement is lost keeps its payload, is resent as the same
-/// frozen bytes, is answered by its identity, and is never frozen or applied
-/// twice. A cancelled statement releases everything it froze.
+/// whose acknowledgement is lost retains its payload until ownership is
+/// proved by covered Installed/terminal facts or an exact replay; it is never
+/// frozen or applied twice. A cancelled statement releases everything it froze.
 struct CreationPayloadLifetime;
 
 impl Scenario for CreationPayloadLifetime {
@@ -789,8 +789,8 @@ impl Scenario for CreationPayloadLifetime {
         await_idle_gauges(context, &idle, "a completed statement")?;
         context.action("the completed statement released its static plans");
 
-        // A lost acknowledgement: the exact bytes are resent and answered by
-        // identity; nothing is frozen or applied twice.
+        // A lost acknowledgement can settle through covered Installed/terminal
+        // facts or an exact replay; nothing is frozen or applied twice.
         let before = FrontendCreationGauges::scrape(context)?;
         let applied_before = backend_marker_total(context, CREATE_APPLIED)?;
         let idempotent_before = backend_marker_total(context, CREATE_IDEMPOTENT)?;
@@ -809,10 +809,6 @@ impl Scenario for CreationPayloadLifetime {
         let frozen = after.creates_frozen - before.creates_frozen;
         let priced = after.creates_priced - before.creates_priced;
         ensure!(
-            replayed >= 1,
-            "a create whose acknowledgement was dropped was never answered by its identity"
-        );
-        ensure!(
             frozen == i64::try_from(applied)? && priced == frozen,
             "every task must be priced, frozen and applied exactly once despite a lost \
              acknowledgement: priced={priced} frozen={frozen} applied={applied}"
@@ -823,9 +819,9 @@ impl Scenario for CreationPayloadLifetime {
             "a statement whose create acknowledgement was lost",
         )?;
         context.action(format!(
-            "BE[{dropped_on}] dropped a create acknowledgement; the frontend resent the same frozen \
-             create, {replayed} replay(s) were answered idempotently, and {applied} task(s) were \
-             priced, frozen and applied once each"
+            "BE[{dropped_on}] dropped a create acknowledgement; ownership settled through covered \
+             facts or exact replay, {replayed} replay(s) were answered idempotently, and \
+             {applied} task(s) were priced, frozen and applied once each"
         ));
 
         // Cancellation releases everything the statement froze.

@@ -1264,12 +1264,17 @@ impl FrontendQuerySession {
         );
         let compiler = self.service.query_compiler.clone();
         let preparation_scope = preparation_scope.clone();
+        let observed_sql =
+            crate::preparation_diagnostics::statement_observations_active().then(|| sql.to_owned());
         let prepared = self
             .service
             .query_cpu_executor
             .run_cancellable(cancellation, move || {
                 let _diagnostic_scope =
                     crate::preparation_diagnostics::enter_statement(statement_token);
+                let _observation_scope = observed_sql.as_deref().and_then(|sql| {
+                    crate::preparation_diagnostics::enter_statement_for_sql(statement_token, sql)
+                });
                 compiler.prepare_statement(
                     &parsed_statement,
                     &context,
@@ -1446,7 +1451,12 @@ impl FrontendQuerySession {
                 result
             }
             PreparedQueryOperation::LogicalRead(read) => {
-                let started = self.service.logical_read_launcher.start(read, child).await;
+                let start = {
+                    let _observation_scope =
+                        crate::preparation_diagnostics::enter_bound_statement(statement.token());
+                    self.service.logical_read_launcher.start(read, child)
+                };
+                let started = start.await;
                 let mut execution = match started {
                     Ok(execution) => execution,
                     Err(error) => return Err(governed_query_execution_error(error)),
@@ -1559,7 +1569,12 @@ impl FrontendQuerySession {
         let owner = statement
             .take_execution_owner()
             .expect("governed query start transfers its root owner exactly once");
-        let execution = match self.service.logical_read_launcher.start(read, owner).await {
+        let start = {
+            let _observation_scope =
+                crate::preparation_diagnostics::enter_bound_statement(statement.token());
+            self.service.logical_read_launcher.start(read, owner)
+        };
+        let execution = match start.await {
             Ok(execution) => execution,
             Err(error) => {
                 let completion = statement.finish();

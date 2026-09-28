@@ -294,7 +294,7 @@ fn format_statement_failure(
     )
 }
 
-fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
+pub(crate) fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Normal,

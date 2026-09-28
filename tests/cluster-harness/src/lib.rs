@@ -49,6 +49,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     PKCS_ED25519,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -65,6 +66,76 @@ const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 const SYSTEM_NATIVE_TRUST_DEPLOYMENT_ID: &str = "novarocks-system-tests";
 const SYSTEM_NATIVE_TRUST_SECRET_ENV: &str = "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET";
 const MAX_FAILURE_LOG_REDACTION_VALUE_BYTES: usize = 64 * 1024;
+const PREPARATION_DIAGNOSTIC_SECRET_ENV: &str = "NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET";
+
+/// Explicitly enable authenticated statement observations for an SQL-test FE.
+/// The secret is child-local and uses fresh key material; no process-global
+/// environment is changed by the harness consumer.
+pub fn statement_lifecycle_observation_environment() -> Result<CrossProcessChildEnvironment> {
+    let key =
+        rcgen::KeyPair::generate().context("generate statement observation control secret")?;
+    let secret = format!("{:x}", Sha256::digest(key.serialize_der()));
+    Ok(CrossProcessChildEnvironment {
+        fe: BTreeMap::from([(PREPARATION_DIAGNOSTIC_SECRET_ENV.to_string(), secret)]),
+        ..Default::default()
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct StatementLifecycleObservationWire {
+    schema_version: u8,
+    run_token: String,
+    work_id: Option<String>,
+    logical_execution_id: Option<String>,
+    execution_id: Option<String>,
+    query_process_namespace: Option<String>,
+    query_local_sequence: Option<u64>,
+    attempt_id: Option<u64>,
+    snapshot: Option<LifecycleConvergenceWireSnapshot>,
+}
+
+fn decode_statement_lifecycle_observation(
+    token: &str,
+    connection_id: u32,
+    wire: StatementLifecycleObservationWire,
+) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
+    ensure!(
+        wire.schema_version == 1 && wire.run_token == token,
+        "statement observation returned a foreign token or schema"
+    );
+    let Some(snapshot) = wire.snapshot else {
+        return Ok(None);
+    };
+    let work_id = wire
+        .work_id
+        .context("statement observation omitted its exact statement token")?;
+    let parts = work_id.split(':').collect::<Vec<_>>();
+    ensure!(
+        parts.len() == 4
+            && parts[0] == "statement"
+            && parts[1].parse::<u32>()? == connection_id
+            && parts[2].parse::<u64>()? > 0
+            && parts[3].parse::<u64>()? > 0,
+        "statement observation returned a foreign or invalid statement token: {work_id}"
+    );
+    ensure!(
+        snapshot
+            .execution_id
+            .rsplit_once(':')
+            .map(|(logical, _)| logical)
+            == wire.logical_execution_id.as_deref(),
+        "statement observation snapshot does not belong to its logical query binding"
+    );
+    ensure!(
+        wire.execution_id.as_deref() == Some(snapshot.execution_id.as_str())
+            && wire.query_process_namespace.as_deref()
+                == Some(snapshot.query_process_namespace.as_str())
+            && wire.query_local_sequence == Some(snapshot.query_local_sequence)
+            && wire.attempt_id == Some(snapshot.query_attempt_id),
+        "statement observation snapshot does not belong to its bound attempt"
+    );
+    decode_query_lifecycle_structured_snapshot(snapshot)
+}
 
 #[derive(serde::Deserialize)]
 struct LifecycleConvergenceWireSnapshot {
@@ -823,6 +894,14 @@ pub struct QueryLifecycleAttemptTarget {
     pub process_namespace: u64,
     pub local_sequence: u64,
     pub attempt_id: u64,
+}
+
+/// A runner arm scoped to one connection and the exact submitted SQL bytes.
+/// Its identity is bound by the real statement and attempt owners in the FE.
+#[derive(Debug, Clone)]
+pub struct QueryLifecycleStatementObservation {
+    token: String,
+    connection_id: u32,
 }
 
 impl QueryLifecycleAttemptTarget {
@@ -2359,10 +2438,31 @@ pub trait ServerHandle: Send {
     ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
         Ok(None)
     }
-    /// Wait for the retained terminal record created by the query that started
-    /// after `before_execution_id`. The debug endpoint intentionally exposes
-    /// only `latest`, so accepting the pre-query identity would associate a
-    /// test with a different query's terminal facts.
+    fn arm_query_lifecycle_statement_observation(
+        &mut self,
+        _connection_id: u32,
+        _sql: &str,
+    ) -> Result<QueryLifecycleStatementObservation> {
+        bail!("exact statement lifecycle observation is unsupported by this server mode")
+    }
+    fn await_query_lifecycle_statement_observation(
+        &mut self,
+        _observation: &QueryLifecycleStatementObservation,
+        _require_success: bool,
+        _deadline: Instant,
+    ) -> Result<QueryLifecycleStructuredSnapshot> {
+        bail!("exact statement lifecycle observation is unsupported by this server mode")
+    }
+    fn drain_query_lifecycle_statement_observation(
+        &mut self,
+        _observation: &QueryLifecycleStatementObservation,
+    ) -> Result<()> {
+        bail!("exact statement lifecycle observation is unsupported by this server mode")
+    }
+    /// Wait for a changed terminal record. This does not identify a statement:
+    /// callers must already exclude unrelated or earlier pending completions
+    /// through their scenario barrier. SQL assertions use an exact statement
+    /// observation, and fault-bound scenarios can select an exact attempt.
     fn await_query_lifecycle_structured_snapshot_after(
         &mut self,
         before_execution_id: Option<&str>,
@@ -3058,6 +3158,49 @@ impl Drop for RuntimeDirGuard {
 }
 
 impl CrossProcessServerHandle {
+    fn statement_observation_control(
+        &self,
+        operation: &str,
+        request: &serde_json::Value,
+        deadline: Instant,
+    ) -> Result<Option<serde_json::Value>> {
+        let secret = self
+            .fe_environment
+            .get(PREPARATION_DIAGNOSTIC_SECRET_ENV)
+            .context("statement observations require an explicit FE diagnostic control secret")?;
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP);
+        ensure!(
+            !timeout.is_zero(),
+            "statement observation control deadline expired"
+        );
+        let response = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("build statement observation client")?
+            .post(format!(
+                "http://127.0.0.1:{}/v1/diagnostics/preparation/statement/{operation}",
+                self.runtime.fe_http_port
+            ))
+            .bearer_auth(secret)
+            .json(request)
+            .send()
+            .context("request statement observation control")?;
+        ensure!(
+            response.status().is_success(),
+            "statement observation {operation} returned non-success status: {}",
+            response.status()
+        );
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        response
+            .json()
+            .context("decode statement observation control JSON")
+            .map(Some)
+    }
+
     /// Launch one normal ephemeral cross-process cluster from resolved inputs.
     pub fn launch(options: CrossProcessClusterOptions) -> Result<Self> {
         Self::launch_with_native_fault_proxies(
@@ -3931,6 +4074,96 @@ impl ServerHandle for CrossProcessServerHandle {
         &mut self,
     ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
         query_lifecycle_structured_snapshot_from_fe(self.runtime.fe_http_port)
+    }
+
+    fn arm_query_lifecycle_statement_observation(
+        &mut self,
+        connection_id: u32,
+        sql: &str,
+    ) -> Result<QueryLifecycleStatementObservation> {
+        ensure!(
+            connection_id > 0 && !sql.is_empty(),
+            "invalid statement observation target"
+        );
+        let observation = QueryLifecycleStatementObservation {
+            token: next_fragment_failure_token(connection_id as usize),
+            connection_id,
+        };
+        self.statement_observation_control(
+            "arm",
+            &serde_json::json!({
+                "run_token": observation.token,
+                "connection_id": connection_id,
+                "sql_sha256": format!("{:x}", Sha256::digest(sql.as_bytes())),
+            }),
+            Instant::now() + TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+        )?;
+        Ok(observation)
+    }
+
+    fn await_query_lifecycle_statement_observation(
+        &mut self,
+        observation: &QueryLifecycleStatementObservation,
+        require_success: bool,
+        deadline: Instant,
+    ) -> Result<QueryLifecycleStructuredSnapshot> {
+        let mut latest = None;
+        let mut last_binding = None;
+        loop {
+            ensure!(
+                Instant::now() < deadline,
+                "timed out waiting for exact statement observation token={} connection_id={} binding={last_binding:?} latest={latest:?}",
+                observation.token,
+                observation.connection_id
+            );
+            let value = self
+                .statement_observation_control(
+                    "peek",
+                    &serde_json::json!({"run_token": observation.token}),
+                    deadline,
+                )?
+                .context("statement observation peek returned no document")?;
+            last_binding = Some(serde_json::json!({
+                "work_id": value.get("work_id"),
+                "logical_execution_id": value.get("logical_execution_id"),
+                "execution_id": value.get("execution_id"),
+            }));
+            let wire =
+                serde_json::from_value(value).context("decode exact statement observation")?;
+            if let Some(snapshot) = decode_statement_lifecycle_observation(
+                &observation.token,
+                observation.connection_id,
+                wire,
+            )? {
+                if !require_success || snapshot.error_source.is_none() {
+                    return Ok(snapshot);
+                }
+                latest = Some(snapshot);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "timed out waiting for exact statement observation token={} connection_id={} latest={latest:?}",
+                observation.token,
+                observation.connection_id
+            );
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(LIFECYCLE_CONVERGENCE_POLL_INTERVAL),
+            );
+        }
+    }
+
+    fn drain_query_lifecycle_statement_observation(
+        &mut self,
+        observation: &QueryLifecycleStatementObservation,
+    ) -> Result<()> {
+        self.statement_observation_control(
+            "drain",
+            &serde_json::json!({"run_token": observation.token}),
+            Instant::now() + TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+        )?;
+        Ok(())
     }
 
     fn be_count(&self) -> usize {
@@ -5439,6 +5672,65 @@ mod tests {
         decode_query_lifecycle_structured_snapshot(wire)
             .expect("decode lifecycle debug snapshot")
             .expect("debug endpoint returns a snapshot")
+    }
+
+    fn statement_observation_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "run_token": "query-on",
+            "work_id": "statement:7:1:5",
+            "logical_execution_id": "11:12",
+            "execution_id": "11:12:13",
+            "query_process_namespace": "0x000000000000000b",
+            "query_local_sequence": 12,
+            "attempt_id": 13,
+            "snapshot": lifecycle_debug_json("11:12:13"),
+        })
+    }
+
+    #[test]
+    fn statement_observation_uses_the_bound_attempt_instead_of_a_late_prior_receipt() {
+        let value = statement_observation_json();
+        let snapshot = decode_statement_lifecycle_observation(
+            "query-on",
+            7,
+            serde_json::from_value(value.clone()).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot.execution_id.as_deref(), Some("11:12:13"));
+        let mut previous = value;
+        previous["snapshot"]["execution_id"] = serde_json::json!("11:11:13");
+        previous["snapshot"]["query_local_sequence"] = serde_json::json!(11);
+        let error = decode_statement_lifecycle_observation(
+            "query-on",
+            7,
+            serde_json::from_value(previous).unwrap(),
+        )
+        .expect_err("a delayed preceding query must never satisfy the observation");
+        assert!(format!("{error:#}").contains("does not belong"));
+    }
+
+    #[test]
+    fn statement_observation_rejects_foreign_tokens_connections_and_logical_queries() {
+        for (field, replacement) in [
+            ("run_token", serde_json::json!("other-query")),
+            ("work_id", serde_json::json!("statement:8:1:5")),
+            ("logical_execution_id", serde_json::json!("11:11")),
+            ("attempt_id", serde_json::json!(12)),
+        ] {
+            let mut value = statement_observation_json();
+            value[field] = replacement;
+            assert!(
+                decode_statement_lifecycle_observation(
+                    "query-on",
+                    7,
+                    serde_json::from_value(value).unwrap(),
+                )
+                .is_err(),
+                "foreign {field} must be refused"
+            );
+        }
     }
 
     #[test]

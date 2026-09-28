@@ -8915,6 +8915,166 @@ fn registered_gap_inherits_old_debt_but_settled_debt_does_not_age_new_requiremen
     }
 }
 
+fn exercise_covered_installed_retiring_unknown_create(unknown_first: bool) {
+    let processes = backends(2);
+    let schedule = chain_schedule(&[1; 3], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 512).unwrap();
+    let mut harness = Harness::from_graph_with_preparing_positions(graph, 2);
+    harness.execution.activate_covered_observation();
+    let leaf_tasks = harness.stage_tasks(1);
+    let target = harness.identity(leaf_tasks[0]);
+    let backend = target.backend_process_id();
+    let context = harness.execution.task(target.task_id()).unwrap().context();
+    let initial = creates_of(harness.establish_all(Duration::from_secs(10)));
+    assert_eq!(
+        initial
+            .iter()
+            .filter(|intent| create_identity(intent).backend_process_id() == backend)
+            .count(),
+        2,
+        "the exact backend deployment window must initially be full"
+    );
+    let mut target_create = None;
+    for create in initial {
+        if create_identity(&create) == target {
+            target_create = Some(create);
+        } else {
+            // Accepted frees the transport permit while retaining the
+            // deployment position until this sibling is Installed.
+            harness
+                .execution
+                .acknowledge(&accepted_create_ack(&create))
+                .unwrap();
+        }
+    }
+    let target_create = target_create.expect("the target's first Create was released");
+    let (frozen, parts) = {
+        let OperationIntent::CreateTask(request) = &target_create else {
+            unreachable!("the target operation is a Create");
+        };
+        assert!(!request.parts().metadata().is_empty());
+        (Arc::downgrade(request), Arc::downgrade(request.parts()))
+    };
+    assert!(
+        harness
+            .execution
+            .task(target.task_id())
+            .unwrap()
+            .holds_create_payload()
+    );
+    assert!(
+        harness
+            .execution
+            .task(target.task_id())
+            .unwrap()
+            .needs_deployment_window()
+    );
+    if unknown_first {
+        harness.transport_unknown_ack(&target_create).unwrap();
+        let task = harness.execution.task(target.task_id()).unwrap();
+        assert!(!task.create_ownership_proven());
+        assert!(task.holds_create_payload());
+        assert!(task.needs_deployment_window());
+    }
+
+    // A positive initial covered fact can settle ownership independently of
+    // the RPC answer and of the stream's later catch-up boundary.
+    let installed = TaskStatus::try_new_with_installed(
+        target,
+        TaskStatusVersion::new(2).unwrap(),
+        TaskState::Planned,
+        None,
+        TaskOutputFacts::default(),
+        true,
+    )
+    .unwrap();
+    harness
+        .execution
+        .apply_covered_entries(vec![covered_frame(
+            context,
+            1,
+            CoveredStatusStreamFact::Status(installed),
+        )])
+        .unwrap();
+    let task = harness.execution.task(target.task_id()).unwrap();
+    assert!(task.create_ownership_proven());
+    assert!(task.installed());
+    assert!(!task.holds_create_payload());
+    assert!(!task.needs_deployment_window());
+    assert!(
+        parts.upgrade().is_some(),
+        "the physical first-send carrier still owns its retained body"
+    );
+    if !unknown_first {
+        harness.transport_unknown_ack(&target_create).unwrap();
+    }
+    let task = harness.execution.task(target.task_id()).unwrap();
+    assert!(task.create_ownership_proven());
+    assert!(task.installed());
+    assert!(!task.holds_create_payload());
+    assert!(!task.needs_deployment_window());
+    assert_eq!(
+        harness
+            .execution
+            .dispatcher()
+            .lane_in_flight(backend, DispatchLane::Create),
+        0,
+        "the actual unknown RPC answer must settle its transport permit"
+    );
+    drop(target_create);
+    assert!(
+        frozen.upgrade().is_none(),
+        "neither the Task owner nor a transport/test carrier may retain the frozen Create"
+    );
+    assert!(
+        parts.upgrade().is_none(),
+        "the last real body owner must return its retained metadata charge"
+    );
+
+    let released = harness.released();
+    assert!(
+        released.iter().all(|intent| {
+            !matches!(intent, OperationIntent::CreateTask(request) if request.identity() == target)
+        }),
+        "an Installed fact must suppress an unnecessary exact Create replay"
+    );
+    let next = creates_of(released)
+        .into_iter()
+        .filter(|intent| create_identity(intent).backend_process_id() == backend)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        next.len(),
+        1,
+        "Installed must return exactly one deployment position for the waiting leaf"
+    );
+    assert!(
+        leaf_tasks
+            .iter()
+            .any(|&task| harness.identity(task) == create_identity(&next[0]))
+    );
+    harness
+        .execution
+        .acknowledge(&accepted_create_ack(&next[0]))
+        .unwrap();
+    drop(next);
+    assert!(
+        harness.released().iter().all(|intent| {
+            !matches!(intent, OperationIntent::CreateTask(request) if request.identity() == target)
+        }),
+        "a later pump must not revive the settled Create"
+    );
+}
+
+#[test]
+fn covered_installed_after_unknown_create_ack_retires_replay_and_deployment_position() {
+    exercise_covered_installed_retiring_unknown_create(true);
+}
+
+#[test]
+fn covered_installed_before_late_unknown_create_ack_retires_replay_and_deployment_position() {
+    exercise_covered_installed_retiring_unknown_create(false);
+}
+
 #[test]
 fn accepted_preparing_tasks_retain_deployment_window_after_rpc_settlement() {
     for preparing_positions in [2, 4096] {
