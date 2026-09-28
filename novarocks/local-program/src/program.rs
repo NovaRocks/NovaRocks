@@ -1156,7 +1156,11 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
         ProgramNodeKind::SetOp { inputs, .. } if inputs.len() < 2 => {
             return Err(LocalProgramError::InvalidNodeShape);
         }
-        ProgramNodeKind::Sort { order_by, .. } if order_by.is_empty() => {
+        ProgramNodeKind::Sort {
+            order_by,
+            partition_exprs,
+            ..
+        } if order_by.is_empty() && partition_exprs.is_empty() => {
             return Err(LocalProgramError::InvalidNodeShape);
         }
         ProgramNodeKind::TableFunction { function_name, .. } if function_name.is_empty() => {
@@ -1281,6 +1285,67 @@ mod tests {
             layout.identity().unwrap(),
             KernelAbiVersion::new(NonZeroU32::new(1).unwrap()),
         )
+    }
+
+    #[test]
+    fn partition_only_sort_requires_a_valid_partition_expression() {
+        let make_program = |partition_exprs: Vec<SortExpression>| {
+            let partition_limit = (!partition_exprs.is_empty()).then_some(2);
+            let (values, layout) = values();
+            let expressions = Arc::new(
+                ImmutableExpressions::try_new(
+                    vec![StaticExprNode::new(
+                        StaticExprKind::SlotId(SlotId::new(1)),
+                        DataType::Int64,
+                        None,
+                    )],
+                    false,
+                    HashMap::new(),
+                    None,
+                )
+                .unwrap(),
+            );
+            LocalProgram::try_new(
+                vec![
+                    ProgramNode::new(1, ProgramNodeKind::Values { values }, layout.clone()),
+                    ProgramNode::new(
+                        2,
+                        ProgramNodeKind::Sort {
+                            input: ProgramNodeId::new(0),
+                            use_top_n: partition_limit.is_some(),
+                            order_by: vec![],
+                            limit: None,
+                            offset: 0,
+                            topn_type: SortTopNType::RowNumber,
+                            max_buffered_rows: None,
+                            max_buffered_bytes: None,
+                            partition_exprs,
+                            partition_limit,
+                        },
+                        layout.clone(),
+                    ),
+                ],
+                ProgramNodeId::new(1),
+                expressions,
+                profile(&layout),
+                BindingRequirements::try_new(vec![BindingRequirement::ResultSink { layout }])
+                    .unwrap(),
+            )
+        };
+        let partition = |index| SortExpression {
+            expr: ProgramExprId::new(index),
+            asc: true,
+            nulls_first: true,
+        };
+        assert!(make_program(vec![partition(0)]).is_ok());
+        assert!(matches!(
+            make_program(vec![]),
+            Err(LocalProgramError::InvalidNodeShape)
+        ));
+        assert!(matches!(
+            make_program(vec![partition(1)]),
+            Err(LocalProgramError::InvalidExpression)
+        ));
     }
 
     #[test]

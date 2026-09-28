@@ -1225,6 +1225,128 @@ mod tests {
     }
 
     #[test]
+    fn partition_only_topn_survives_lowering_and_caps_each_partition() {
+        use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
+        use crate::exec::operators::SortProcessorFactory;
+        use crate::exec::pipeline::operator_factory::OperatorFactory;
+        use arrow::array::Array;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("partition", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![2, 1, 2, 1, 2, 1])),
+                Arc::new(Int64Array::from(vec![20, 10, 21, 11, 22, 12])),
+            ],
+        )
+        .unwrap();
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            schema.as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .unwrap();
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
+        let layout = super::layout(&chunk.chunk_schema_ref()).unwrap();
+        let mut arena = ExprArena::default();
+        let partition = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let plan = ExecPlan {
+            arena,
+            root: ExecNode {
+                kind: ExecNodeKind::Sort(SortNode {
+                    input: Box::new(ExecNode {
+                        kind: ExecNodeKind::Values(ValuesNode {
+                            chunk: chunk.clone(),
+                            node_id: 1,
+                        }),
+                    }),
+                    node_id: 2,
+                    use_top_n: true,
+                    order_by: vec![],
+                    limit: None,
+                    offset: 0,
+                    topn_type: SortTopNType::RowNumber,
+                    max_buffered_rows: None,
+                    max_buffered_bytes: None,
+                    partition_exprs: vec![SortExpression {
+                        expr: partition,
+                        asc: true,
+                        nulls_first: true,
+                    }],
+                    partition_limit: Some(2),
+                }),
+            },
+        };
+        let program = plan
+            .into_local_program(
+                profile(&layout),
+                BTreeMap::new(),
+                vec![ExternalSinkRequirement::Result],
+            )
+            .unwrap();
+        let lp::ProgramNodeKind::Sort {
+            order_by,
+            partition_exprs,
+            partition_limit,
+            limit,
+            offset,
+            ..
+        } = program.nodes()[1].kind()
+        else {
+            panic!("expected frozen Sort");
+        };
+        assert!(order_by.is_empty());
+        assert_eq!(*partition_limit, Some(2));
+        let runtime_partition_exprs = partition_exprs
+            .iter()
+            .map(|key| SortExpression {
+                expr: ExprId(key.expr.index()),
+                asc: key.asc,
+                nulls_first: key.nulls_first,
+            })
+            .collect();
+        let runtime_arena = Arc::new(ExprArena::from_immutable(program.expressions()));
+        let factory = SortProcessorFactory::new_topn(
+            2,
+            runtime_arena,
+            vec![],
+            *limit,
+            *offset,
+            SortTopNType::RowNumber,
+            None,
+            None,
+            runtime_partition_exprs,
+            *partition_limit,
+        );
+        let mut op = factory.create(1, 0);
+        let processor = op.as_processor_mut().unwrap();
+        let state = crate::runtime::runtime_state::RuntimeState::default();
+        processor.push_chunk(&state, chunk).unwrap();
+        processor.set_finishing(&state).unwrap();
+        let output = processor.pull_chunk(&state).unwrap().unwrap();
+        assert_eq!(output.len(), 4);
+        let partitions = output.columns()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let values = output.columns()[1]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let rows: BTreeSet<_> = (0..output.len())
+            .map(|row| {
+                assert!(!partitions.is_null(row));
+                assert!(!values.is_null(row));
+                (partitions.value(row), values.value(row))
+            })
+            .collect();
+        assert_eq!(rows, BTreeSet::from([(1, 10), (1, 11), (2, 20), (2, 21)]));
+        assert!(processor.pull_chunk(&state).unwrap().is_none());
+    }
+
+    #[test]
     fn lowering_consumes_values_and_keeps_expression_and_sink_exact() {
         let (input, layout) = values();
         let mut arena = ExprArena::default();
