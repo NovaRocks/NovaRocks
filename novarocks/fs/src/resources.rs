@@ -132,6 +132,25 @@ impl FsAccessResources {
         }
     }
 
+    /// Derive a file I/O view of the same process-local storage owner.
+    ///
+    /// Reads may use a dedicated I/O runtime while writes use the role runtime.
+    /// Both views retain the same provider pool, authority registry and refresh
+    /// executor, so changing I/O runtimes does not create another authority.
+    pub fn with_file_io(
+        &self,
+        file_runtime: Arc<dyn FileIoRuntime>,
+        file_task_spawner: Arc<dyn FileTaskSpawner>,
+    ) -> Self {
+        Self {
+            object_store_provider_pool: Arc::clone(&self.object_store_provider_pool),
+            storage_authority_registry: Arc::clone(&self.storage_authority_registry),
+            access_resolver: self.access_resolver,
+            file_runtime,
+            file_task_spawner,
+        }
+    }
+
     pub fn object_store_provider_pool(&self) -> &Arc<ObjectStoreProviderPool> {
         &self.object_store_provider_pool
     }
@@ -160,9 +179,147 @@ impl FsAccessResources {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceId, StaticCredentialReference,
+        StorageCredentialScopePrefix,
+    };
 
     use super::*;
-    use crate::{TokioFileIoRuntime, TokioFileTaskSpawner};
+    use crate::{
+        AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,
+        FileResult, FileTask, FileTaskFuture, SecretValue, StorageAuthorityId, TokioFileIoRuntime,
+        TokioFileTaskSpawner,
+    };
+
+    struct CountingSpawner {
+        inner: TokioFileTaskSpawner,
+        refreshes: AtomicUsize,
+    }
+
+    impl FileTaskSpawner for CountingSpawner {
+        fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+            self.inner.spawn(task)
+        }
+
+        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+            self.refreshes.fetch_add(1, Ordering::Relaxed);
+            self.inner.spawn_detached_blocking(job);
+        }
+    }
+
+    struct CountingSource {
+        acquisitions: AtomicUsize,
+    }
+
+    impl AuthorityMaterialSource for CountingSource {
+        fn acquire(&self, _deadline: Instant) -> Result<AuthorityMaterial, AcquisitionFailure> {
+            self.acquisitions.fetch_add(1, Ordering::Relaxed);
+            Ok(AuthorityMaterial::new(
+                SecretValue::new("access-key"),
+                SecretValue::new("secret-key"),
+                Some(SecretValue::new("session-token")),
+                Instant::now() + Duration::from_secs(3600),
+            ))
+        }
+    }
+
+    #[test]
+    fn file_io_views_share_one_authority_and_its_original_refresh_executor() {
+        let owner_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("owner runtime");
+        let scan_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("scan runtime");
+        let owner_io: Arc<dyn FileIoRuntime> =
+            Arc::new(TokioFileIoRuntime::new(owner_runtime.handle().clone()));
+        let scan_io: Arc<dyn FileIoRuntime> =
+            Arc::new(TokioFileIoRuntime::new(scan_runtime.handle().clone()));
+        let owner_spawner = Arc::new(CountingSpawner {
+            inner: TokioFileTaskSpawner::new(owner_runtime.handle().clone()),
+            refreshes: AtomicUsize::new(0),
+        });
+        let scan_spawner = Arc::new(CountingSpawner {
+            inner: TokioFileTaskSpawner::new(scan_runtime.handle().clone()),
+            refreshes: AtomicUsize::new(0),
+        });
+        let owner_tasks: Arc<dyn FileTaskSpawner> = owner_spawner.clone();
+        let scan_tasks: Arc<dyn FileTaskSpawner> = scan_spawner.clone();
+        let write = FsAccessResources::new(
+            Arc::new(
+                ObjectStoreProviderPool::new(crate::ObjectStoreProviderPoolOptions::default())
+                    .expect("provider pool"),
+            ),
+            FsAccessResolver::new(),
+            Arc::clone(&owner_io),
+            Arc::clone(&owner_tasks),
+        );
+        let read = write.with_file_io(Arc::clone(&scan_io), Arc::clone(&scan_tasks));
+        assert!(Arc::ptr_eq(write.file_runtime(), &owner_io));
+        assert!(Arc::ptr_eq(read.file_runtime(), &scan_io));
+        assert!(Arc::ptr_eq(write.file_task_spawner(), &owner_tasks));
+        assert!(Arc::ptr_eq(read.file_task_spawner(), &scan_tasks));
+        assert!(!Arc::ptr_eq(write.file_runtime(), read.file_runtime()));
+        assert!(Arc::ptr_eq(
+            write.object_store_provider_pool(),
+            read.object_store_provider_pool()
+        ));
+        assert!(Arc::ptr_eq(
+            write.storage_authority_registry(),
+            read.storage_authority_registry()
+        ));
+
+        let id = StorageAuthorityId::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("lake").expect("catalog name"),
+                CatalogVersion::from_bytes([7; 32]),
+            ),
+            StorageCredentialScopePrefix::try_from_normalized("s3://warehouse/")
+                .expect("scope prefix"),
+            AuthorityCapabilityPath::CredentialsEndpoint {
+                principal: StaticCredentialReference::try_new("vending", "g1")
+                    .expect("vending principal"),
+                endpoint: Arc::from("https://catalog.example/credentials"),
+            },
+        );
+        let source = Arc::new(CountingSource {
+            acquisitions: AtomicUsize::new(0),
+        });
+        let read_authority =
+            read.storage_authority_registry()
+                .authority(&id, Instant::now(), || source.clone());
+        let write_authority =
+            write
+                .storage_authority_registry()
+                .authority(&id, Instant::now(), || {
+                    panic!("the second I/O view must reuse the resident authority")
+                });
+        assert!(Arc::ptr_eq(&read_authority, &write_authority));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        owner_runtime.block_on(async {
+            read_authority
+                .material_for_request(Instant::now(), deadline)
+                .await
+                .expect("first view acquires material");
+            write_authority
+                .material_for_request(Instant::now(), deadline)
+                .await
+                .expect("second view reuses material");
+        });
+        assert_eq!(source.acquisitions.load(Ordering::Relaxed), 1);
+        assert_eq!(owner_spawner.refreshes.load(Ordering::Relaxed), 1);
+        assert_eq!(scan_spawner.refreshes.load(Ordering::Relaxed), 0);
+        assert_eq!(write.storage_authority_registry().metrics().misses, 1);
+        assert_eq!(write.storage_authority_registry().metrics().hits, 1);
+        assert_eq!(read_authority.metrics().refreshes_applied, 1);
+    }
 
     #[test]
     fn retains_the_explicitly_composed_runtime_services() {

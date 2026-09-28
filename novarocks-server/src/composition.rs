@@ -1033,15 +1033,14 @@ pub fn compose_iceberg_execution_resources(
     runtime: tokio::runtime::Handle,
     scan_io: &ScanIoServices,
 ) -> anyhow::Result<IcebergExecutionResources> {
-    let read_binding = compose_iceberg_access_template_from_resources(
-        config,
-        compose_connector_file_scan_resources(config, runtime.clone(), scan_io)?,
-    )?
-    .with_range_service(scan_io.range_service());
-    let write_binding = compose_iceberg_access_template_from_resources(
-        config,
-        compose_connector_file_planning_resources(config, runtime.clone())?,
-    )?;
+    let write_resources = compose_connector_file_planning_resources(config, runtime.clone())?;
+    // Read and write are I/O views of the same BE storage authority. Moving
+    // reads onto scan I/O must not mint another credential registry or pool.
+    let read_resources =
+        write_resources.with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
+    let read_binding = compose_iceberg_access_template_from_resources(config, read_resources)?
+        .with_range_service(scan_io.range_service());
+    let write_binding = compose_iceberg_access_template_from_resources(config, write_resources)?;
     Ok(IcebergExecutionResources::new(
         read_binding,
         write_binding,
@@ -1107,24 +1106,6 @@ fn compose_paimon_access_factory_with_resources(
         resources,
         credentials,
     )))
-}
-
-fn compose_connector_file_scan_resources(
-    _config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
-    scan_io: &ScanIoServices,
-) -> anyhow::Result<FsAccessResources> {
-    let pool = std::sync::Arc::new(
-        ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())
-            .map_err(|error| anyhow::anyhow!("construct object-store provider pool: {error}"))?,
-    );
-    Ok(FsAccessResources::new_with_refresh_spawner(
-        pool,
-        FsAccessResolver::new(),
-        scan_io.file_runtime(),
-        scan_io.file_task_spawner(),
-        std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
-    ))
 }
 
 pub fn compose_connector_file_planning_resources(
