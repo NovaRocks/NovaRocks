@@ -248,7 +248,18 @@ impl CancellationView {
             if let Some(reason) = self.reason() {
                 return reason;
             }
-            if let Some(deadline) = self.deadline() {
+            let deadline = {
+                let state = self.inner.state.lock().unwrap();
+                // A sealed success cannot acquire a cancellation reason. Its
+                // original deadline remains a fact, but must no longer wake
+                // this observer repeatedly after that deadline has elapsed.
+                if state.success_sealed {
+                    None
+                } else {
+                    self.deadline()
+                }
+            };
+            if let Some(deadline) = deadline {
                 tokio::select! {
                     _ = notified => {},
                     _ = tokio::time::sleep_until(deadline) => {},
@@ -265,9 +276,97 @@ mod tests {
     use super::*;
     use std::{
         future::Future,
-        sync::{Barrier, mpsc},
+        sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
         task::{Context, Wake, Waker},
     };
+
+    #[derive(Default)]
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_success_observer_does_not_spin_after_its_original_deadline() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let cancellation = Cancellation::root(Some(deadline));
+        let view = cancellation.view();
+        let mut observer = Box::pin(view.cancelled());
+        let wakes = Arc::new(CountWakes::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        assert!(
+            observer
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(
+            cancellation.seal_success(),
+            CancellationSuccessSealOutcome::Sealed
+        );
+
+        // The already-registered timer may wake once when sealing races its
+        // wait. The retained observer must then park without rearming it.
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        wakes.0.store(0, Ordering::Relaxed);
+        assert!(
+            observer
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        assert_eq!(view.reason(), None);
+        assert_eq!(view.deadline(), Some(deadline));
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            cancellation.request(CancellationReason::ServerShutdown),
+            CancellationRequestOutcome::SuccessSealed
+        );
+        assert!(
+            observer
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsealed_observer_keeps_deadline_cancellation() {
+        let cancellation =
+            Cancellation::root(Some(Instant::now() + std::time::Duration::from_secs(10)));
+        let view = cancellation.view();
+        let mut observer = Box::pin(view.cancelled());
+        let waker = Waker::from(Arc::new(CountWakes::default()));
+        assert!(
+            observer
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        assert_eq!(
+            observer.as_mut().poll(&mut Context::from_waker(&waker)),
+            std::task::Poll::Ready(CancellationReason::DeadlineExceeded)
+        );
+        assert_eq!(
+            cancellation.seal_success(),
+            CancellationSuccessSealOutcome::Cancelled(CancellationReason::DeadlineExceeded)
+        );
+    }
 
     struct PausePropagation {
         entered: mpsc::SyncSender<()>,
