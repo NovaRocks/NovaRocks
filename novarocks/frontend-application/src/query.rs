@@ -745,6 +745,43 @@ where
     }
 }
 
+/// The profile coordinator waits synchronously for native task progress. Keep
+/// that wait on the bounded blocking executor so the data runtime can poll its
+/// admission and observation RPCs, including a single backend's first send.
+async fn execute_prepared_explain_statement<P, Execute>(
+    executor: QueryBlockingExecutor,
+    cancellation: QueryCancellationView,
+    diagnostic_statement: StatementToken,
+    execution_owner: WorkOwner,
+    prepared: Result<P, RoutedExecutionError>,
+    execute: Execute,
+) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
+where
+    P: Send + 'static,
+    Execute: FnOnce(P) -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
+{
+    match prepared {
+        Ok(prepared) => {
+            executor
+                .execute(move || {
+                    let _diagnostic_scope =
+                        crate::preparation_diagnostics::enter_statement(diagnostic_statement);
+                    let result = if cancellation.is_cancelled() {
+                        Err(RoutedExecutionError::Engine(
+                            "typed statement was cancelled before prepared query execution began"
+                                .to_owned(),
+                        ))
+                    } else {
+                        execute(prepared)
+                    };
+                    (result, execution_owner)
+                })
+                .await
+        }
+        Err(error) => Ok((Err(error), execution_owner)),
+    }
+}
+
 async fn execute_product_statement(
     router: ProductCommandRouter,
     command: ProductSqlCommand,
@@ -1727,18 +1764,18 @@ impl FrontendQuerySession {
                         (result, execution_owner)
                     })
                     .await?;
-                let result = prepared.and_then(|operation| {
-                    if execution_cancellation.is_cancelled() {
-                        Err(RoutedExecutionError::Engine(
-                            "typed statement was cancelled before prepared query execution began"
-                                .to_owned(),
-                        ))
-                    } else {
+                execute_prepared_explain_statement(
+                    synchronous_command_executor,
+                    execution_cancellation,
+                    diagnostic_statement,
+                    execution_owner,
+                    prepared,
+                    move |operation| {
                         execute_prepared_query(operation, &query_execution)
                             .map_err(RoutedExecutionError::Engine)
-                    }
-                });
-                Ok((result, execution_owner))
+                    },
+                )
+                .await
             }),
             ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(statement)) => {
                 let prepare_dml = Arc::clone(&dml);
@@ -3169,6 +3206,103 @@ mod tests {
             None,
         );
         (workload, root, cancellation)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn prepared_explain_wait_leaves_native_runtime_free_to_poll_first_send() {
+        use novarocks_query_application::cpu::{
+            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+        };
+        let mut blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(2).unwrap(),
+        ))
+        .expect("open bounded profile execution edge");
+        let executor = blocking.executor();
+        let runtime = tokio::runtime::Handle::current();
+        let (_workload, root, cancellation) = test_governed_cancellation();
+        let business = root.business;
+        let returned = tokio::spawn(async move {
+            execute_prepared_explain_statement(
+                executor,
+                cancellation,
+                StatementToken::new(SessionToken::new(91, 1), 1),
+                root.owner,
+                Ok(()),
+                move |()| {
+                    let signal = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+                    let delivered = Arc::clone(&signal);
+                    // A single asynchronous send is sufficient. On a scheduler
+                    // worker it can stay in that worker's unstealable LIFO slot.
+                    runtime.spawn(async move {
+                        let (ready, changed) = &*delivered;
+                        *ready.lock().unwrap() = true;
+                        changed.notify_all();
+                    });
+                    let (ready, changed) = &*signal;
+                    let (ready, _) = changed
+                        .wait_timeout_while(
+                            ready.lock().unwrap(),
+                            Duration::from_secs(2),
+                            |ready| !*ready,
+                        )
+                        .unwrap();
+                    if !*ready {
+                        return Err(RoutedExecutionError::Engine(
+                            "the profile wait prevented its first native send from being polled"
+                                .to_owned(),
+                        ));
+                    }
+                    Ok(StatementResult::Ok)
+                },
+            )
+            .await
+        })
+        .await
+        .expect("profile execution caller joins")
+        .expect("profile edge returns its execution owner");
+        let (result, execution_owner) = returned;
+        assert!(matches!(result, Ok(StatementResult::Ok)));
+        execution_owner.complete();
+        business.release();
+        blocking
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("join profile execution worker");
+    }
+
+    #[tokio::test]
+    async fn prepared_explain_checks_cancellation_before_dispatch() {
+        use novarocks_query_application::cpu::{
+            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+        };
+        let mut blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        ))
+        .expect("open profile execution edge");
+        let (_workload, root, cancellation) = test_governed_cancellation();
+        root.owner.cancel(WorkCancellationReason::ExplicitKill {
+            requester_connection_id: 91,
+        });
+        let (result, execution_owner) = execute_prepared_explain_statement(
+            blocking.executor(),
+            cancellation,
+            StatementToken::new(SessionToken::new(91, 1), 1),
+            root.owner,
+            Ok(()),
+            |()| panic!("cancelled profile must not dispatch prepared execution"),
+        )
+        .await
+        .expect("cancelled profile returns its execution owner");
+        assert!(matches!(result, Err(RoutedExecutionError::Engine(message))
+            if message == "typed statement was cancelled before prepared query execution began"));
+        execution_owner.complete();
+        root.business.release();
+        blocking
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("join profile execution worker");
     }
 
     #[tokio::test]

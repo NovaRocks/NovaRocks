@@ -933,19 +933,17 @@ impl TaskOperationSink for NativeTaskOperationSink {
         // A submission never blocks on a round trip: the batch leaves on the
         // role's runtime and its receipts come back through the intake, which
         // is what lets the frontend keep one serial runner.
-        self.data_runtime.spawn(async move {
-            apply_operations(
-                ApplySend {
-                    client,
-                    receipts: AcceptedOperationReceipts::new(acks, sent),
-                    _queue_permits: queue_permits,
-                    _encoding_permit: encoding_permit,
-                },
-                requests,
-                submitted_at,
-            )
-            .await;
-        });
+        // Construct the settlement owner before spawning: the runtime can
+        // drop a task before its first poll, and that must still settle every
+        // accepted operation before returning its reservations.
+        let send = ApplySend {
+            client,
+            receipts: AcceptedOperationReceipts::new(acks, sent),
+            _queue_permits: queue_permits,
+            _encoding_permit: encoding_permit,
+        };
+        self.data_runtime
+            .spawn(apply_operations(send, requests, submitted_at));
         TaskOperationSubmit::Accepted
     }
 }
@@ -3727,6 +3725,93 @@ mod tests {
             fixture.acks.drain_events().is_empty(),
             "an expired preflight cannot report send start"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submitting_to_a_closed_runtime_settles_once_and_returns_reservations() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build a runtime to close before submission");
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+        let mut sink = NativeTaskOperationSink::new(
+            &[(backend, fixture.loopback.endpoint.clone())],
+            TransportBudget::DEFAULT,
+            test_attempt_facts(),
+            fixture.acks.handle(),
+            FrontendDataRuntime::new(handle),
+        )
+        .expect("one frozen backend target on the closed runtime");
+        // Keep the actual wire client on the live test runtime. Only the
+        // production send scheduling capability has been shut down.
+        sink.targets
+            .get_mut(&backend)
+            .expect("frozen target")
+            .client = fixture.sink.targets[&backend].client.clone();
+        let supervisor = sink.data_runtime.task_transport_supervisor();
+        let before = supervisor.snapshot();
+        let mut batch = released_batch(
+            backend,
+            vec![cancel_intent(1, backend), cancel_intent(2, backend)],
+        );
+        let expected_ids = batch
+            .operations()
+            .iter()
+            .map(OperationIntent::operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(expected_ids.len(), 2);
+        let permits = batch
+            .operations()
+            .iter()
+            .map(
+                |intent| match sink.try_reserve_queue(intent.queue_request()) {
+                    TaskOperationQueueAdmission::Admitted(permit) => permit,
+                    TaskOperationQueueAdmission::TargetFull
+                    | TaskOperationQueueAdmission::ProcessFull => panic!("two cancels fit"),
+                },
+            )
+            .collect();
+        batch.replace_fixture_permits(permits);
+        assert_eq!(
+            supervisor.snapshot().retained_items,
+            before.retained_items + 2
+        );
+        assert!(
+            supervisor.snapshot().retained_queued_and_encoded_bytes
+                > before.retained_queued_and_encoded_bytes
+        );
+        assert!(fixture.acks.drain_events().is_empty());
+
+        // Exercise the actual sink: a closed runtime drops its accepted
+        // spawned future before the first poll, including its encoding permit.
+        assert!(matches!(
+            sink.try_submit(batch),
+            TaskOperationSubmit::Accepted
+        ));
+
+        let acknowledgements = fixture.acks.drain();
+        assert_eq!(
+            acknowledgements
+                .iter()
+                .map(OperationAcknowledgement::operation_id)
+                .collect::<Vec<_>>(),
+            expected_ids,
+        );
+        assert!(acknowledgements.iter().all(|ack| matches!(
+            ack.dispatch_result(),
+            OperationDispatchResult::TransportUnknown
+        )));
+        assert!(
+            fixture.acks.drain_events().is_empty(),
+            "settled exactly once"
+        );
+        assert_eq!(supervisor.snapshot(), before, "all reservations returned");
+        assert!(fixture.loopback.peer.applied().is_empty());
+        assert_eq!(fixture.loopback.peer.control_requests(), 0);
     }
 
     #[test]
