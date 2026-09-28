@@ -3167,8 +3167,8 @@ impl Scenario for CatalogVersionDrain {
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
         let mut launch = connector_launch_config();
-        // The old reader's scan-side filter holds its scan worker in SLEEP.
-        // Reserve a second scan worker so the replacement query can run before
+        // The old reader's scan-side filter holds its pipeline driver in SLEEP.
+        // Reserve a second driver worker so the replacement query can run before
         // cancellation; this scenario verifies concurrent catalog versions.
         let overlay = launch
             .config_overlay
@@ -3177,7 +3177,7 @@ impl Scenario for CatalogVersionDrain {
             .expect("connector BE overlay");
         *overlay = overlay.replacen(
             "[runtime]",
-            "[runtime]\npipeline_scan_thread_pool_thread_num = 2",
+            "[runtime]\npipeline_exec_thread_pool_thread_num = 2",
             1,
         );
         Ok(launch)
