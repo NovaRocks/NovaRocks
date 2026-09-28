@@ -456,7 +456,12 @@ mod tests {
             Ok(self.files.contains_key(path))
         }
 
-        async fn read(&self, path: &str, range: Range<u64>) -> crate::Result<Bytes> {
+        async fn read(
+            &self,
+            path: &str,
+            range: Range<u64>,
+            _known_size: Option<u64>,
+        ) -> crate::Result<Bytes> {
             tokio::task::yield_now().await;
             let bytes = self
                 .files
@@ -688,7 +693,10 @@ mod tests {
             retained0 + retained1
         );
 
-        let owned_clone = loaded0.as_ref().clone();
+        // An owned `TableSchema` copy is plain data: the lease lives in the
+        // returned execution schema, and a host that keeps a copy charges it
+        // itself.
+        let owned_copy = TableSchema::clone(&loaded0);
         drop((manager, clone));
         assert_eq!(
             control.retained.load(Ordering::SeqCst),
@@ -697,9 +705,8 @@ mod tests {
         drop(loaded1);
         assert_eq!(control.retained.load(Ordering::SeqCst), retained0);
         drop(loaded0);
-        assert_eq!(control.retained.load(Ordering::SeqCst), retained0);
-        drop(owned_clone);
         assert_eq!(control.retained.load(Ordering::SeqCst), 0);
+        assert_eq!(owned_copy.id(), 0);
     }
 
     #[tokio::test]

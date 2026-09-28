@@ -440,4 +440,56 @@ mod tests {
     fn duplicate_request_completes_its_own_paused_propagation() {
         check_paused_propagation(false);
     }
+
+    #[derive(Default)]
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sealed_success_waits_without_a_timer_once_its_deadline_passed() {
+        let root = Cancellation::root(Some(Instant::now() + std::time::Duration::from_millis(10)));
+        assert_eq!(root.seal_success(), CancellationSuccessSealOutcome::Sealed);
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        let view = root.view();
+        assert_eq!(view.reason(), None, "a sealed success is never cancelled");
+
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cancelled = Box::pin(view.cancelled());
+        assert!(
+            cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        // Neither an elapsed timer nor a cooperative-budget yield may wake a
+        // wait that nothing can ever end.
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unsealed_wait_still_ends_at_its_deadline() {
+        let root = Cancellation::root(Some(Instant::now() + std::time::Duration::from_millis(10)));
+        let view = root.view();
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(1), view.cancelled())
+            .await
+            .expect("the deadline ends the wait");
+        assert_eq!(reason, CancellationReason::DeadlineExceeded);
+    }
 }

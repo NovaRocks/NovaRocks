@@ -811,7 +811,7 @@ impl Drop for LogicalExecutionActorConfig {
     fn drop(&mut self) {
         self.execution_stage.take();
         if let Some(owner) = self.work_owner.take() {
-            owner.complete();
+            owner.complete_after_terminal_cancel_settled();
         }
     }
 }
@@ -1488,6 +1488,18 @@ enum ActorCommand {
     },
 }
 
+/// Why the Registry closes an actor's ingress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegistryClose {
+    /// The supervisor retires an actor after its logical conclusion. The
+    /// conclusion is the client-visible outcome, so this close never cancels
+    /// work that has concluded; it only lets the actor finish delivering and
+    /// exit.
+    Retire,
+    /// The process is shutting down: work still in flight is cancelled.
+    Shutdown,
+}
+
 /// Cloneable bounded mailbox handle. Authority-bearing commands wait
 /// asynchronously for capacity; abandoning their future drops the exact
 /// permit and wakes the actor through a separate coalesced signal.
@@ -1495,7 +1507,7 @@ enum ActorCommand {
 pub struct LogicalExecutionActor {
     id: LogicalExecutionActorId,
     sender: mpsc::Sender<ActorCommand>,
-    registry_close_requested: watch::Sender<bool>,
+    registry_close_requested: watch::Sender<Option<RegistryClose>>,
     registry_ingress_closed: watch::Receiver<bool>,
 }
 
@@ -1530,15 +1542,24 @@ impl LogicalExecutionActor {
         .await
     }
 
-    pub(crate) fn request_registry_close_for_join(&self) -> watch::Receiver<bool> {
+    pub(crate) fn request_registry_close_for_join(
+        &self,
+        cause: RegistryClose,
+    ) -> watch::Receiver<bool> {
         // This signal is independent of ordinary mailbox capacity. Once set,
         // dropping the returned waiter never retracts cancellation or ingress
-        // closure.
+        // closure, and a shutdown is never downgraded to a retirement.
         let closed = self.registry_ingress_closed.clone();
         if *closed.borrow() {
             return closed;
         }
-        self.registry_close_requested.send_replace(true);
+        self.registry_close_requested.send_if_modified(|requested| {
+            if *requested == Some(RegistryClose::Shutdown) || *requested == Some(cause) {
+                return false;
+            }
+            *requested = Some(cause);
+            true
+        });
         closed
     }
 
@@ -1549,7 +1570,7 @@ impl LogicalExecutionActor {
 
     #[cfg(test)]
     pub(crate) fn registry_close_was_requested(&self) -> bool {
-        *self.registry_close_requested.borrow()
+        self.registry_close_requested.borrow().is_some()
     }
 
     pub async fn activate(
@@ -1990,7 +2011,7 @@ pub(crate) fn spawn_logical_execution_actor(
         settled: AtomicBool::new(false),
     });
     let (sender, receiver) = mpsc::channel(config.mailbox_capacity.get());
-    let (registry_close_requested, registry_close_requested_rx) = watch::channel(false);
+    let (registry_close_requested, registry_close_requested_rx) = watch::channel(None);
     let (registry_ingress_closed, registry_ingress_closed_rx) = watch::channel(false);
     let required_contexts: BTreeSet<_> =
         config.required_establish_contexts.iter().copied().collect();
@@ -2169,7 +2190,7 @@ async fn run_actor(
     max_abort_authorizations_per_context: NonZeroUsize,
     mut result_runtime: Option<ResultRuntime>,
     clock: Arc<dyn LogicalExecutionClock>,
-    mut registry_close_requested_rx: watch::Receiver<bool>,
+    mut registry_close_requested_rx: watch::Receiver<Option<RegistryClose>>,
     registry_ingress_closed: watch::Sender<bool>,
 ) {
     let mut establish_error = None;
@@ -2179,6 +2200,7 @@ async fn run_actor(
     let mut execution_stage = Some(execution_stage);
     let mut receiver_open = true;
     let mut registry_close_requested = false;
+    let mut registry_close_cancelled = false;
     let mut registry_close_signal_open = true;
     let mut root_terminal_receiver = None;
     loop {
@@ -2195,10 +2217,14 @@ async fn run_actor(
             );
             lifetime.settle();
         }
-        if !registry_close_requested && *registry_close_requested_rx.borrow() {
-            registry_close_requested = true;
-            work_owner.cancel(CancellationReason::ServerShutdown);
-        }
+        let requested_close = *registry_close_requested_rx.borrow();
+        observe_registry_close(
+            requested_close,
+            state.conclusion().is_some(),
+            &mut registry_close_requested,
+            &mut registry_close_cancelled,
+            &work_owner,
+        );
         expire_replacement_reservation(state, replacement.as_mut(), &mut replacement_error, now);
         if *abandoned.borrow() {
             revoke_all_establish_authority(&mut attempts);
@@ -2306,11 +2332,17 @@ async fn run_actor(
         let root_terminal_pending = root_terminal_receiver.is_some();
         tokio::select! {
             biased;
-            changed = registry_close_requested_rx.changed(), if !registry_close_requested && registry_close_signal_open => {
-                if changed.is_ok() && *registry_close_requested_rx.borrow() {
-                    registry_close_requested = true;
-                    work_owner.cancel(CancellationReason::ServerShutdown);
-                } else if changed.is_err() {
+            changed = registry_close_requested_rx.changed(), if !registry_close_cancelled && registry_close_signal_open => {
+                if changed.is_ok() {
+                    let requested_close = *registry_close_requested_rx.borrow();
+                    observe_registry_close(
+                        requested_close,
+                        state.conclusion().is_some(),
+                        &mut registry_close_requested,
+                        &mut registry_close_cancelled,
+                        &work_owner,
+                    );
+                } else {
                     registry_close_signal_open = false;
                 }
             }
@@ -2595,6 +2627,27 @@ fn apply_attempt_ledger_event(
             }
         }
         AttemptLedgerEvent::StandDown(_, Ok(())) => {}
+    }
+}
+
+/// Applies a Registry close request. A shutdown cancels work still in flight;
+/// a retirement cancels only work that has not concluded, because the
+/// conclusion is the client-visible outcome and the actor still owns its
+/// delivery until the result runtime is idle.
+fn observe_registry_close(
+    requested: Option<RegistryClose>,
+    concluded: bool,
+    close_requested: &mut bool,
+    close_cancelled: &mut bool,
+    work_owner: &WorkOwner,
+) {
+    let Some(cause) = requested else {
+        return;
+    };
+    *close_requested = true;
+    if !*close_cancelled && (cause == RegistryClose::Shutdown || !concluded) {
+        *close_cancelled = true;
+        work_owner.cancel(CancellationReason::ServerShutdown);
     }
 }
 

@@ -46,8 +46,6 @@ pub fn decode_query_options_at(
             .then_some(src.runtime_profile_report_interval),
         pipeline_dop: (src.pipeline_dop > 0).then_some(src.pipeline_dop),
         exec_mem_limit: (src.query_mem_limit > 0).then_some(src.query_mem_limit),
-        connector_io_tasks_per_scan_operator: (src.connector_io_tasks_per_scan_operator > 0)
-            .then_some(src.connector_io_tasks_per_scan_operator),
         orc_use_column_names: src.orc_use_column_names,
         enable_file_metacache: src.enable_file_metacache,
         enable_file_pagecache: src.enable_file_pagecache,

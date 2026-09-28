@@ -222,7 +222,12 @@ mod tests {
             Ok(false)
         }
 
-        async fn read(&self, _path: &str, _range: Range<u64>) -> paimon::Result<Bytes> {
+        async fn read(
+            &self,
+            _path: &str,
+            _range: Range<u64>,
+            _known_size: Option<u64>,
+        ) -> paimon::Result<Bytes> {
             Err(paimon::Error::IoUnsupported {
                 message: "test backend has no read path".to_string(),
             })

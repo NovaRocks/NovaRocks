@@ -35,5 +35,5 @@ group_concat(DISTINCT name SEPARATOR ',')
 Tom
 
 -- query 26
-group_concat(concat(name, ':', score) SEPARATOR ',')
+ordered_scores
 Tom:90,Tom:80

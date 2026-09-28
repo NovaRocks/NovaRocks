@@ -20,7 +20,6 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
@@ -879,121 +878,6 @@ impl ConnectorSplitPlanningResult {
         let mut result = Self::try_new(splits, metrics)?;
         result.session = Some(session);
         Ok(result)
-    }
-}
-
-#[derive(Clone)]
-pub struct ConnectorOpenReaderRequest {
-    pub expected_schema: SchemaRef,
-    pub batch: ConnectorBatchBudget,
-    pub options: ConnectorReaderOptions,
-    pub context: ConnectorRequestContext,
-}
-
-/// Reader-open policy carried through the provider-neutral read contract.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ConnectorReaderOptions {
-    pub enable_parquet_reader_page_index: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ConnectorReaderMetricsSnapshot {
-    pub bytes_read: u64,
-    pub read_requests: u64,
-    pub rows_decoded: u64,
-    pub batches_delivered: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub io_time_ns: u64,
-    pub decode_time_ns: u64,
-    pub row_groups_read: u64,
-    pub row_groups_pruned: u64,
-    pub delayed_materialization_ranges: u64,
-    pub page_index_attempts: u64,
-    pub page_index_fallbacks: u64,
-    pub page_index_rows_considered: u64,
-    pub page_index_rows_pruned: u64,
-}
-
-impl ConnectorReaderMetricsSnapshot {
-    pub fn saturating_add(self, other: Self) -> Self {
-        Self {
-            bytes_read: self.bytes_read.saturating_add(other.bytes_read),
-            read_requests: self.read_requests.saturating_add(other.read_requests),
-            rows_decoded: self.rows_decoded.saturating_add(other.rows_decoded),
-            batches_delivered: self
-                .batches_delivered
-                .saturating_add(other.batches_delivered),
-            cache_hits: self.cache_hits.saturating_add(other.cache_hits),
-            cache_misses: self.cache_misses.saturating_add(other.cache_misses),
-            io_time_ns: self.io_time_ns.saturating_add(other.io_time_ns),
-            decode_time_ns: self.decode_time_ns.saturating_add(other.decode_time_ns),
-            row_groups_read: self.row_groups_read.saturating_add(other.row_groups_read),
-            row_groups_pruned: self
-                .row_groups_pruned
-                .saturating_add(other.row_groups_pruned),
-            delayed_materialization_ranges: self
-                .delayed_materialization_ranges
-                .saturating_add(other.delayed_materialization_ranges),
-            page_index_attempts: self
-                .page_index_attempts
-                .saturating_add(other.page_index_attempts),
-            page_index_fallbacks: self
-                .page_index_fallbacks
-                .saturating_add(other.page_index_fallbacks),
-            page_index_rows_considered: self
-                .page_index_rows_considered
-                .saturating_add(other.page_index_rows_considered),
-            page_index_rows_pruned: self
-                .page_index_rows_pruned
-                .saturating_add(other.page_index_rows_pruned),
-        }
-    }
-
-    pub fn saturating_delta_since(self, previous: Self) -> Self {
-        Self {
-            bytes_read: self.bytes_read.saturating_sub(previous.bytes_read),
-            read_requests: self.read_requests.saturating_sub(previous.read_requests),
-            rows_decoded: self.rows_decoded.saturating_sub(previous.rows_decoded),
-            batches_delivered: self
-                .batches_delivered
-                .saturating_sub(previous.batches_delivered),
-            cache_hits: self.cache_hits.saturating_sub(previous.cache_hits),
-            cache_misses: self.cache_misses.saturating_sub(previous.cache_misses),
-            io_time_ns: self.io_time_ns.saturating_sub(previous.io_time_ns),
-            decode_time_ns: self.decode_time_ns.saturating_sub(previous.decode_time_ns),
-            row_groups_read: self
-                .row_groups_read
-                .saturating_sub(previous.row_groups_read),
-            row_groups_pruned: self
-                .row_groups_pruned
-                .saturating_sub(previous.row_groups_pruned),
-            delayed_materialization_ranges: self
-                .delayed_materialization_ranges
-                .saturating_sub(previous.delayed_materialization_ranges),
-            page_index_attempts: self
-                .page_index_attempts
-                .saturating_sub(previous.page_index_attempts),
-            page_index_fallbacks: self
-                .page_index_fallbacks
-                .saturating_sub(previous.page_index_fallbacks),
-            page_index_rows_considered: self
-                .page_index_rows_considered
-                .saturating_sub(previous.page_index_rows_considered),
-            page_index_rows_pruned: self
-                .page_index_rows_pruned
-                .saturating_sub(previous.page_index_rows_pruned),
-        }
-    }
-}
-
-pub trait ConnectorBatchReader: Send {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError>;
-
-    fn close(&mut self) -> Result<(), ConnectorError>;
-
-    fn metrics_snapshot(&self) -> ConnectorReaderMetricsSnapshot {
-        ConnectorReaderMetricsSnapshot::default()
     }
 }
 

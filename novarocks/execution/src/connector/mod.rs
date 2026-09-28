@@ -34,8 +34,7 @@ pub mod page_adapter;
 pub mod scan_queue;
 
 pub use page_adapter::{
-    ConnectorPageAdapter, PageAdapterError, PageAdapterErrorKind, PageConversion,
-    source_page_to_chunk,
+    PageAdapterError, PageAdapterErrorKind, SourcePageConverter, source_page_to_chunk,
 };
 pub use scan_queue::{
     ScheduledSplitFacts, SplitOfferOutcome, SplitPoll, SplitQueue, SplitQueueConfig,

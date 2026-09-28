@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::FutureExt;
 use novarocks_fs::{
-    BoundFile, FileCancellation, FileRangeClass, FileRangeControl, FileRangeScope,
-    FileRangeService, FileRangeStart, FileReadContext, FileReadRange, FileTask, PreparedFileInput,
+    BoundFile, FileCancellation, FileRangeBinding, FileRangeClass, FileRangeControl,
+    FileRangeStart, FileReadContext, FileReadRange, FileTask, PreparedFileInput,
 };
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
@@ -355,8 +355,7 @@ impl ConnectorPreparationControl for Shared {
 /// active source and allows the same immutable planner to re-arm later.
 pub(super) struct PreparedRangeCandidate {
     context: FileReadContext,
-    scope: FileRangeScope,
-    service: Arc<FileRangeService>,
+    range: FileRangeBinding,
     planner: Arc<Planner>,
     allow_partial: bool,
     shared: Arc<Shared>,
@@ -376,8 +375,7 @@ impl PreparedRangeCandidate {
         let mut state = State::default();
         state.present_input = present_input;
         Some(Self {
-            scope: context.range_scope?,
-            service: Arc::clone(context.range_service.as_ref()?),
+            range: context.range.clone()?,
             context,
             planner,
             allow_partial,
@@ -391,10 +389,6 @@ impl PreparedRangeCandidate {
 
     pub fn control(&self) -> Arc<dyn ConnectorPreparationControl> {
         Arc::clone(&self.shared) as Arc<dyn ConnectorPreparationControl>
-    }
-
-    pub fn retained_input_bytes(&self) -> u64 {
-        self.shared.retained_input_bytes()
     }
 
     pub fn advance(
@@ -459,9 +453,8 @@ impl PreparedRangeCandidate {
                 // `try_start_with_present` finishes its bounded copy.
                 state.reserved_bytes = length;
                 let start = self
-                    .service
+                    .range
                     .try_start_with_present(
-                        self.scope,
                         FileRangeClass::Prefetch,
                         file,
                         range,
@@ -591,8 +584,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_fs::{
-        FileIdentity, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileIdentity, FileIoRuntime, FileRangeScope, FileRangeService, FileTaskSpawner,
+        FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
     };
     use novarocks_spi::connector::StorageAccessDomainId;
 
@@ -629,8 +622,10 @@ mod tests {
             runtime: Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current()))
                 as Arc<dyn FileIoRuntime>,
             task_spawner,
-            range_service: Some(service),
-            range_scope: Some(FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap()),
+            range: Some(service.bind(
+                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+            )),
         };
         let planner = Arc::new(move |_context: FileReadContext| {
             Ok(Some(PlannedInput {
@@ -643,7 +638,7 @@ mod tests {
         let input = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let progress = candidate.advance(4).expect("advance candidate");
-                assert!(candidate.retained_input_bytes() <= 4);
+                assert!(candidate.control().retained_input_bytes() <= 4);
                 if progress == ConnectorPreparationProgress::Ready {
                     return candidate.take_ready().expect("ready input");
                 }
@@ -671,7 +666,7 @@ mod tests {
         .expect("physical prepared input");
         assert_eq!(input.range(), 0..4);
         assert_eq!(input.retained_backing_capacity(), 4);
-        assert_eq!(candidate.retained_input_bytes(), 0);
+        assert_eq!(candidate.control().retained_input_bytes(), 0);
         drop(candidate);
         control.wait_drained().await;
         assert!(control.is_drained());

@@ -2819,9 +2819,6 @@ impl FragmentEventSink for ContextRuntimeFilterEventSink {
             FragmentEvent::RuntimeFilterRowEffect(effect) => {
                 participant.record_row_effect(self.fragment_instance_id, effect);
             }
-            FragmentEvent::RuntimeFilterScanUnitOutcome(outcome) => {
-                participant.record_scan_unit_outcome(self.fragment_instance_id, outcome);
-            }
             FragmentEvent::Progress(_) | FragmentEvent::ProfileSnapshot(_) => {}
         }
     }

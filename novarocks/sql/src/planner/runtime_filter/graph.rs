@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 use crate::analysis::TypedExpr;
-use crate::column_id::ColumnId;
 
 use super::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
@@ -60,22 +59,8 @@ pub enum ProducerBindingTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConsumerBindingTarget {
-    DirectInput {
-        input_ordinal: usize,
-    },
-    SourceBoundary {
-        /// Present only when SQL proved that this source boundary is an exact
-        /// scan-column reference.  FE preparation later resolves this
-        /// semantic identity against the same pinned provider read.
-        scan_domain: Option<RuntimeFilterSemanticScanDomainTarget>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeFilterSemanticScanDomainTarget {
-    pub column_id: ColumnId,
-    pub data_type: arrow::datatypes::DataType,
-    pub nullable: bool,
+    DirectInput { input_ordinal: usize },
+    SourceBoundary,
 }
 
 #[derive(Clone, Debug)]
@@ -502,7 +487,7 @@ pub(super) mod tests {
             role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
                 capabilities,
                 activation,
-                target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
+                target: ConsumerBindingTarget::SourceBoundary,
             }),
         }
     }
@@ -583,7 +568,7 @@ pub(super) mod tests {
                         ArtifactCapability::EmptyDomain,
                     ]),
                     activation,
-                    target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
+                    target: ConsumerBindingTarget::SourceBoundary,
                 }),
             })
             .unwrap();
@@ -635,7 +620,7 @@ pub(super) mod tests {
                 role: RuntimeFilterBindingRoleData::Consumer(ConsumerRequirementData {
                     capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
                     activation,
-                    target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
+                    target: ConsumerBindingTarget::SourceBoundary,
                 }),
             })
             .unwrap();
@@ -696,39 +681,6 @@ pub(super) mod tests {
             consumer.role,
             RuntimeFilterBindingRole::Consumer(_)
         ));
-    }
-
-    #[test]
-    fn scan_domain_target_must_match_the_consumer_expression_contract() {
-        let mut graph = RuntimeFilterGraph::default();
-        graph
-            .insert_channel(join_channel(ChannelId::new(1)))
-            .unwrap();
-        graph
-            .insert_binding(join_producer_binding(
-                BindingId::new(1),
-                ChannelId::new(1),
-                CoverageWitnessId::new(1),
-            ))
-            .unwrap();
-        let mut consumer = join_consumer_binding(BindingId::new(2), ChannelId::new(1));
-        let RuntimeFilterBindingRole::Consumer(requirement) = &mut consumer.role else {
-            unreachable!("fixture is a consumer");
-        };
-        requirement.target = ConsumerBindingTarget::SourceBoundary {
-            scan_domain: Some(RuntimeFilterSemanticScanDomainTarget {
-                column_id: crate::column_id::ColumnId::new_for_test(9),
-                data_type: DataType::Int64,
-                nullable: false,
-            }),
-        };
-        graph.insert_binding(consumer).unwrap();
-
-        let error = graph.validate().expect_err("literal is not a scan column");
-        assert_eq!(
-            error.kind,
-            super::super::validation::GraphValidationErrorKind::ConsumerScanDomainTargetMismatch
-        );
     }
 
     #[test]

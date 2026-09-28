@@ -1401,8 +1401,10 @@ impl Operator for DataStreamSinkOperator {
         self.maybe_mark_finished()
     }
 
-    fn pending_finish(&self) -> bool {
-        !self.send_tracker.is_idle()
+    fn pending_finish(&self) -> Option<crate::exec::pipeline::operator::FinishWatch> {
+        (!self.send_tracker.is_idle()).then(|| {
+            crate::exec::pipeline::operator::FinishWatch::Notify(Arc::clone(&self.send_observable))
+        })
     }
 
     fn cancel(&mut self) {
@@ -2752,7 +2754,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("EOS transmit started");
         assert!(!Operator::is_finished(&sink));
-        assert!(Operator::pending_finish(&sink));
+        assert!(Operator::pending_finish(&sink).is_some());
 
         release.send(()).expect("release real EOS transmit");
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2760,7 +2762,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(Operator::is_finished(&sink));
-        assert!(!Operator::pending_finish(&sink));
+        assert!(Operator::pending_finish(&sink).is_none());
         assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
     }
 
@@ -2773,7 +2775,7 @@ mod tests {
             .expect("EOS transmit started");
         Operator::cancel(&mut sink);
         assert!(!Operator::is_finished(&sink));
-        assert!(Operator::pending_finish(&sink));
+        assert!(Operator::pending_finish(&sink).is_some());
         assert!(!ProcessorOperator::need_input(&sink));
 
         release.send(()).expect("release real EOS transmit");
@@ -2782,7 +2784,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(Operator::is_finished(&sink));
-        assert!(!Operator::pending_finish(&sink));
+        assert!(Operator::pending_finish(&sink).is_none());
         assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
     }
 
@@ -2980,18 +2982,7 @@ mod tests {
     #[test]
     fn bind_runtime_state_uses_backend_num_as_be_number() {
         let mut op = make_test_operator();
-        let state = RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            Some(7),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let state = RuntimeState::new(None, None, None, None, Some(7), None, None, None, None);
 
         Operator::bind_runtime_state(&mut op, &state).expect("bind runtime state");
 

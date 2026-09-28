@@ -118,7 +118,6 @@ fn release_query_options() -> novarocks::QueryOptions {
         enable_profile: true,
         pipeline_dop: 8,
         query_mem_limit: 512 << 20,
-        connector_io_tasks_per_scan_operator: 4,
         runtime_filter_scan_wait_time_ms: Some(1500),
         runtime_filter_wait_timeout_ms: Some(3000),
         allow_throw_exception: true,

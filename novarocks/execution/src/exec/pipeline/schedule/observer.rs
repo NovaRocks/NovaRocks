@@ -83,6 +83,10 @@ impl PipelineObserver {
         self.trigger("sink");
     }
 
+    pub(crate) fn finish_trigger(&self) {
+        self.trigger("finish");
+    }
+
     fn trigger(&self, event: &'static str) {
         if let (Some(scheduler), Some(observable)) =
             (self.scheduler.upgrade(), self.observable.upgrade())

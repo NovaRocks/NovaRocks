@@ -9,9 +9,6 @@ pub enum FragmentEvent {
     /// installed consumer identity. Execution emits this exactly once at the
     /// real application point.
     RuntimeFilterRowEffect(crate::runtime_filter::RuntimeFilterRowEffect),
-    /// Neutral Execution-owned scan-unit evaluation outcome. Backend validates/consumes
-    /// the full outcome so fail-open reasons cannot be reconstructed later.
-    RuntimeFilterScanUnitOutcome(crate::runtime_filter::scan_domain::RuntimeFilterScanUnitOutcome),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

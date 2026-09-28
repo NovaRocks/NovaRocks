@@ -21,8 +21,9 @@ workspace, and recursive writer schema before parsing, install one lease per
 cache entry under the cache lock, and retain it until cache drop; the versioned
 `SchemaManager` cache reserves each parsed `TableSchema` with a conservative
 recursive retained-size estimate, installs only one charged value per schema ID,
-and embeds the shared lease in the schema so returned `Arc` and owned schema
-clones remain charged after a temporary manager or its cache is dropped; every Avro OCF
+and embeds the shared lease in the returned execution schema, so its `Arc`
+clones remain charged after a temporary manager or its cache is dropped, while
+an owned `TableSchema` copy is plain data its holder charges; every Avro OCF
 block reserves its actual borrowed or decompressed payload, and that reservation
 moves together with the fixed decoded-object reservation through manifest
 pruning and split construction into the returned `Plan`, then remains live until
@@ -41,6 +42,21 @@ reservation across the yield. The merge loop checkpoints each history row and th
 path so large delete-only key histories remain cancellable. Reservations move
 with retained buffers and are released on compaction, error, cancellation, or
 stream drop.
+
+A read-only host also learns each object's size from the SDK:
+`ReadOnlyFileIO::read` carries the size the SDK already knows, from a data
+file's frozen `file_size` (`InputFile::with_known_size`) or from its own stat
+before a whole-file read, so the host never probes the same object twice for
+one read. Ranged and whole-file reads fail when the host answers with any byte
+count other than the one requested, short as well as long.
+
+Execution resources also offer a cooperative yield point,
+`ReadExecutionResources::cooperate`, that defaults to never yielding. The
+primary-key sort merge awaits it once per source batch it takes or skips, and
+the data-file reader once per file it moves to, so a long all-ready run of
+same-key, all-delete or empty batches, or of files that yield nothing, gives an
+embedding host its scheduling turn back without the SDK inventing an output
+batch. It only marks cooperation points; no Arrow kernel is interrupted.
 
 The patched read path also fails closed on physical corruption before logical
 merge. Every decoded KV batch must declare `_SEQUENCE_NUMBER` as non-null

@@ -138,23 +138,6 @@ pub(crate) struct RuntimeFilterTerminalConsumerTotals {
     pub(crate) row_evaluations: u64,
     pub(crate) input_rows: u64,
     pub(crate) output_rows: u64,
-    pub(crate) scan_evaluated: u64,
-    pub(crate) scan_kept: u64,
-    pub(crate) scan_pruned: u64,
-    pub(crate) scan_not_evaluated: u64,
-    pub(crate) scan_not_evaluated_reasons: RuntimeFilterTerminalScanNotEvaluatedTotals,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterTerminalScanNotEvaluatedTotals {
-    pub(crate) unit_facts_missing: u64,
-    pub(crate) column_facts_missing: u64,
-    pub(crate) data_type_unsupported: u64,
-    pub(crate) predicate_capability_unsupported: u64,
-    pub(crate) resource_unavailable: u64,
-    pub(crate) snapshot_unavailable: u64,
-    pub(crate) snapshot_timed_out: u64,
-    pub(crate) snapshot_not_published: u64,
 }
 
 /// Folds one participant's telemetry at a time into the query rollup.
@@ -316,10 +299,6 @@ fn add_contribution_totals(
         )?;
     }
     for consumer in contribution.consumers() {
-        let reasons = consumer
-            .scan_not_evaluated_reasons
-            .as_ref()
-            .expect("validated terminal consumer always has scan not-evaluated reasons");
         checked_add(&mut totals.consumers.count, 1)?;
         checked_add(
             &mut totals.consumers.row_evaluations,
@@ -327,72 +306,6 @@ fn add_contribution_totals(
         )?;
         checked_add(&mut totals.consumers.input_rows, consumer.input_rows)?;
         checked_add(&mut totals.consumers.output_rows, consumer.output_rows)?;
-        checked_add(
-            &mut totals.consumers.scan_evaluated,
-            consumer.scan_evaluated,
-        )?;
-        checked_add(&mut totals.consumers.scan_kept, consumer.scan_kept)?;
-        checked_add(&mut totals.consumers.scan_pruned, consumer.scan_pruned)?;
-        checked_add(
-            &mut totals.consumers.scan_not_evaluated,
-            consumer.scan_not_evaluated,
-        )?;
-        checked_add(
-            &mut totals
-                .consumers
-                .scan_not_evaluated_reasons
-                .unit_facts_missing,
-            reasons.unit_facts_missing,
-        )?;
-        checked_add(
-            &mut totals
-                .consumers
-                .scan_not_evaluated_reasons
-                .column_facts_missing,
-            reasons.column_facts_missing,
-        )?;
-        checked_add(
-            &mut totals
-                .consumers
-                .scan_not_evaluated_reasons
-                .data_type_unsupported,
-            reasons.data_type_unsupported,
-        )?;
-        checked_add(
-            &mut totals
-                .consumers
-                .scan_not_evaluated_reasons
-                .predicate_capability_unsupported,
-            reasons.predicate_capability_unsupported,
-        )?;
-        checked_add(
-            &mut totals
-                .consumers
-                .scan_not_evaluated_reasons
-                .resource_unavailable,
-            reasons.resource_unavailable,
-        )?;
-        checked_add(
-            &mut totals
-                .consumers
-                .scan_not_evaluated_reasons
-                .snapshot_unavailable,
-            reasons.snapshot_unavailable,
-        )?;
-        checked_add(
-            &mut totals
-                .consumers
-                .scan_not_evaluated_reasons
-                .snapshot_timed_out,
-            reasons.snapshot_timed_out,
-        )?;
-        checked_add(
-            &mut totals
-                .consumers
-                .scan_not_evaluated_reasons
-                .snapshot_not_published,
-            reasons.snapshot_not_published,
-        )?;
     }
     Ok(())
 }
@@ -507,20 +420,7 @@ mod tests {
                                 row_evaluations: 12,
                                 input_rows: 100,
                                 output_rows: 20,
-                                scan_evaluated: 8,
-                                scan_kept: 3,
-                                scan_pruned: 5,
-                                scan_not_evaluated: 7,
-                                scan_not_evaluated_reasons: Some(novarocks::QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
-                                    unit_facts_missing: 1,
-                                    column_facts_missing: 1,
-                                    data_type_unsupported: 1,
-                                    predicate_capability_unsupported: 1,
-                                    resource_unavailable: 1,
-                                    snapshot_unavailable: 1,
-                                    snapshot_timed_out: 1,
-                                    snapshot_not_published: 0,
-                                }),
+
                             }],
                         },
                     ),
@@ -583,14 +483,6 @@ mod tests {
         assert_eq!(totals.transport_routes.sent_count, 2);
         assert_eq!(totals.transport_routes.retried_count, 2);
         assert_eq!(totals.consumers.input_rows, 200);
-        assert_eq!(totals.consumers.scan_pruned, 10);
-        assert_eq!(
-            totals
-                .consumers
-                .scan_not_evaluated_reasons
-                .snapshot_timed_out,
-            2
-        );
     }
 
     #[test]

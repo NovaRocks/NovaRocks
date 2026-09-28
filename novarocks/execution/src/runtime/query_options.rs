@@ -28,7 +28,6 @@ pub struct QueryOptions {
     pub runtime_profile_report_interval: Option<i64>,
     pub pipeline_dop: Option<i32>,
     pub exec_mem_limit: Option<i64>,
-    pub connector_io_tasks_per_scan_operator: Option<i32>,
     pub orc_use_column_names: bool,
     pub enable_file_metacache: bool,
     pub enable_file_pagecache: bool,
@@ -56,7 +55,6 @@ pub struct QueryOptionsParts {
     pub runtime_profile_report_interval: Option<i64>,
     pub pipeline_dop: Option<i32>,
     pub exec_mem_limit: Option<i64>,
-    pub connector_io_tasks_per_scan_operator: Option<i32>,
     pub orc_use_column_names: bool,
     pub enable_file_metacache: bool,
     pub enable_file_pagecache: bool,
@@ -86,7 +84,6 @@ impl QueryOptions {
             runtime_profile_report_interval: parts.runtime_profile_report_interval,
             pipeline_dop: parts.pipeline_dop,
             exec_mem_limit: parts.exec_mem_limit,
-            connector_io_tasks_per_scan_operator: parts.connector_io_tasks_per_scan_operator,
             orc_use_column_names: parts.orc_use_column_names,
             enable_file_metacache: parts.enable_file_metacache,
             enable_file_pagecache: parts.enable_file_pagecache,
@@ -116,10 +113,6 @@ impl QueryOptions {
 
     pub const fn exec_mem_limit(&self) -> Option<i64> {
         self.exec_mem_limit
-    }
-
-    pub const fn connector_io_tasks_per_scan_operator(&self) -> Option<i32> {
-        self.connector_io_tasks_per_scan_operator
     }
 
     pub const fn orc_use_column_names(&self) -> bool {

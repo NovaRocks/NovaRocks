@@ -25,11 +25,9 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use novarocks_execution::exec::node::scan::ScanOp;
-use novarocks_execution::exec::operators::scan::ScanDispatchState;
 use novarocks_execution::runtime::fragment::FragmentPrepareContext;
 use novarocks_execution::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter, ScanRegistrationPort,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter,
 };
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
@@ -65,35 +63,15 @@ pub struct NativeFragmentQueryRuntime {
     memory_authority: Arc<MemoryAuthority>,
 }
 
-struct QueryContextScanRegistrationPort {
-    manager: Arc<QueryContextManager>,
-}
-
-impl ScanRegistrationPort for QueryContextScanRegistrationPort {
-    fn register_incremental_scan(
-        &self,
-        fragment_instance_id: UniqueId,
-        node_id: i32,
-        op: Arc<dyn ScanOp>,
-        dispatch: Arc<ScanDispatchState>,
-    ) -> Result<(), String> {
-        self.manager
-            .register_incremental_scan_node(fragment_instance_id, node_id, op, dispatch)
-    }
-}
-
 impl NativeFragmentQueryRuntime {
-    pub fn scan_registration_port(&self) -> Arc<dyn ScanRegistrationPort> {
-        Arc::new(QueryContextScanRegistrationPort {
-            manager: Arc::clone(&self.manager),
-        })
-    }
-
     pub fn publish_resource_snapshot(&self) {
         let _publication = self
             .resource_metrics_publish
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let _global_publication = crate::backend_metrics::NATIVE_QUERY_RESOURCE_SCRAPE_LOCK
+            .lock()
+            .expect("native query resource scrape lock");
         let snapshot = self.manager.native_execution_resource_snapshot();
         crate::backend_metrics::publish_backend_query_execution_resource(
             "native_query_contexts_active",
@@ -178,7 +156,7 @@ impl NativeFragmentQueryRuntime {
             // account side grows, and their sum stays this one limit.
             let account = self
                 .manager
-                .ensure_query_account(execution.query_id(), &self.memory_authority)?;
+                .ensure_query_account(execution, &self.memory_authority)?;
             let limit_bytes = u64::try_from(limit)
                 .map_err(|_| format!("query memory limit must not be negative: {limit}"))?;
             account.install_policy(limit_bytes, LimitDimension::Work);
@@ -193,9 +171,7 @@ impl NativeFragmentQueryRuntime {
             query_mem_tracker,
             fragment_mem_tracker,
             runtime_filter,
-            scan_registration: self.scan_registration_port(),
         };
-        self.publish_resource_snapshot();
         Ok(resources)
     }
 
@@ -221,14 +197,17 @@ impl NativeFragmentQueryRuntime {
             fragment_instance_id,
             active: true,
         };
-        self.publish_resource_snapshot();
         Ok(lease)
     }
 
     pub fn finish_fragment(&self, execution_id: QueryExecutionId) {
         self.manager
             .finish_fragment_execution(execution_key(execution_id));
-        self.publish_resource_snapshot();
+    }
+
+    pub fn retire_idle_execution(&self, execution_id: QueryExecutionId) -> bool {
+        self.manager
+            .retire_idle_native_execution(execution_key(execution_id))
     }
 
     pub fn unregister_fragment_execution(
@@ -238,7 +217,6 @@ impl NativeFragmentQueryRuntime {
     ) {
         self.manager
             .unregister_finst_execution(fragment_instance_id, execution_key(execution_id));
-        self.publish_resource_snapshot();
     }
 }
 
@@ -286,7 +264,6 @@ pub struct NativeFragmentAdmissionResources {
     query_mem_tracker: Arc<MemTracker>,
     fragment_mem_tracker: Arc<MemTracker>,
     runtime_filter: Option<RuntimeFilterSessionRef>,
-    scan_registration: Arc<dyn ScanRegistrationPort>,
 }
 
 impl NativeFragmentAdmissionResources {
@@ -313,7 +290,6 @@ impl NativeFragmentAdmissionResources {
             result_writer,
             event_sink,
         )
-        .with_scan_registration_port(self.scan_registration)
         .with_fragment_commit_port(Arc::new(WorkerSinkCommitPort))
         .with_debug_exec_node_output(crate::debug_environment::debug_exec_node_output())
     }

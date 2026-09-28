@@ -526,7 +526,7 @@ impl TaskAckIntakeHandle {
         self.inner.wake.wake();
     }
 
-    fn publish_establish_send_started(
+    pub(crate) fn publish_establish_send_started(
         &self,
         operation_id: TaskOperationId,
         context: QueryContextRef,

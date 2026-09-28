@@ -511,10 +511,8 @@ impl Lowering<'_> {
         use lp::ProgramNodeKind as P;
         let mapped = match node {
             ExecNodeKind::Scan(n) => {
-                let (
-                    runtime_source,
-                    (node_id, filter_specs, conjunct_predicate, io_tasks, limit, accept_empty),
-                ) = n.into_static_fields_with_source();
+                let (runtime_source, (node_id, filter_specs, conjunct_predicate, limit)) =
+                    n.into_static_fields_with_source();
                 let node_id = node_id
                     .ok_or_else(|| LocalProgramLoweringError::new("scan has no native node ID"))?;
                 let source = self.scan_sources.remove(&node_id).ok_or_else(|| {
@@ -537,9 +535,7 @@ impl Lowering<'_> {
                         source,
                         runtime_filters,
                         conjunct_predicate: conjunct_predicate.map(expr),
-                        connector_io_tasks_per_scan_operator: io_tasks,
                         limit,
-                        accept_empty_scan_ranges: accept_empty,
                     },
                 )
             }
@@ -1074,21 +1070,12 @@ fn freeze_consumer(binding: &RuntimeFilterConsumerBinding) -> Result<lp::StaticF
             }
         }
     };
-    let scan_domain = binding
-        .scan_domain
-        .as_ref()
-        .map(|domain| lp::FilterScanDomainTarget {
-            field_ordinal: domain.target().field_ordinal(),
-            data_type: domain.target().data_type().clone(),
-            nullable: domain.target().nullable(),
-        });
     lp::StaticFilterConsumer::try_new(
         contract.binding_id().get(),
         contract.channel_id().get(),
         activation,
         freeze_filter_contract(contract.contract()),
         freeze_reduction(contract.reduction())?,
-        scan_domain,
     )
     .map_err(|error| LocalProgramLoweringError::new(error.to_string()))
 }

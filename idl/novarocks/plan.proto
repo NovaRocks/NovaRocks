@@ -546,23 +546,10 @@ message RuntimeFilterConsumerRole {
   }
 }
 
-// A source boundary can remain a normal row-filter boundary, or can carry the
-// exact, FE-frozen contract a scan-domain consumer applies under.
+// The source boundary identifies the scan's row-filter input.
 message RuntimeFilterSourceBoundaryTarget {
-  RuntimeFilterScanDomainTarget scan_domain_target = 1;
-}
-
-// The scan-domain contract names no column.  A runtime filter reaches a
-// connector scan through that scan's own ConnectorTableScanSource, whose
-// DynamicFilterBinding maps this binding id to a ScanAssignment variable and
-// therefore to a typed ColumnHandle.  Field 1 used to carry a provider schema
-// field index frozen with the removed opaque connector read, so never reuse
-// either the field number or name.
-message RuntimeFilterScanDomainTarget {
   reserved 1;
-  reserved "field_ordinal";
-  common.TypeDesc type = 2;
-  bool nullable = 3;
+  reserved "scan_domain_target";
 }
 
 enum RuntimeFilterContributionKind {

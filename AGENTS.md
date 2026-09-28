@@ -269,6 +269,12 @@ Execution, and do not recreate a Backend facade around it.
 - `novarocks/execution/src/exec/pipeline/schedule/**`
   Scheduling and observable event mechanisms.
 
+- `novarocks/execution/src/exec/operators/scan/stream_source.rs`
+  Driver-owned scan source: the scan pipeline's one driver polls the
+  connector page stream directly, refills its per-turn poll budget, and
+  observes the stream's close as pending finish. No scan thread pool or scan
+  chunk queue exists; see ADR-0159.
+
 ### 4.6 Exchange and Runtime
 
 - `novarocks/execution/src/runtime/exchange.rs`
@@ -278,7 +284,7 @@ Execution, and do not recreate a Backend facade around it.
   Fragment I/O edges: `exchange_edge.rs` (the Installed/normal-close gated open
   barrier), `exchange_queue.rs` (outbound queue and backpressure),
   `exchange_receiver.rs` (application-hosted ingress for one receiver),
-  `result.rs`, `scan.rs`, `commit.rs`.
+  `result.rs`, `commit.rs`.
 
 - `novarocks/execution/src/exec/operators/exchange_source.rs`
   Source operator for an exchange node: reconstructs chunks and tracks sender
@@ -477,7 +483,7 @@ Execution, and do not recreate a Backend facade around it.
 
 - `[runtime]`
   `exchange_wait_ms`, `exchange_io_threads`, `exchange_io_max_inflight_bytes`,
-  `pipeline_scan_thread_pool_thread_num`, `pipeline_exec_thread_pool_thread_num`, `cache.*`
+  `pipeline_exec_thread_pool_thread_num`, `scan_io_*`, `scan_range_*`, `prefetch_*`, `cache.*`
 
 - `[iceberg]`
   Embedded-JVM toggle for Iceberg metadata-table and remote metadata planning.
@@ -846,11 +852,18 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/execution/src/task_execution/**`. Preserve the Installed/normal-close
   gated edge-open barrier and the per-domain Apply / Idempotent / Older /
   Conflict verdict; do not add a protocol shim, a standalone direct-call path,
-  or a no-runtime-filter retry inside an attempt. See ADR-0146.
+  or a no-runtime-filter retry inside an attempt. See ADR-0161.
 - **Connector behavior**: inspect `novarocks/connector/**` and
   `novarocks/fs/**`. The active sealed providers are Iceberg and Paimon;
   StarRocks is retired and must not be restored through a local-binding config
   or runtime fallback.
+- **Connector scan execution**: inspect
+  `novarocks/spi/src/connector/read_stack/page_stream.rs` (the page stream
+  contract and poll budget), `novarocks/worker/src/typed_connector_runtime/stream.rs`
+  (split claims, successor window and per-split streams as one stream) and
+  `novarocks/execution/src/exec/operators/scan/stream_source.rs`. Keep one
+  stream per scan driver, the fan-out inside the builder's scan branch, and
+  close as observation of physical exit; see ADR-0159.
 - **FE/BE interface behavior**: inspect `novarocks/frontend-application/src/**`,
   `novarocks/query-application/src/**`, `novarocks/worker/src/**`,
   `novarocks/native-adapter/src/**`, and the neutral contracts under `novarocks/spi/**`

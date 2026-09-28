@@ -108,7 +108,9 @@ impl Operator for LocalExchangeSinkOperator {
     }
 
     fn is_finished(&self) -> bool {
-        self.finished || self.exchanger.is_all_sources_finished()
+        // Once every consumer has left, nothing this producer pushes can be
+        // read; reporting finished ends the producer pipeline.
+        self.finished || self.exchanger.all_consumers_closed()
     }
 }
 
@@ -191,10 +193,17 @@ impl ProcessorOperator for LocalExchangeSinkOperator {
     }
 
     fn sink_observable(&self) -> Option<Arc<Observable>> {
-        if self.finished {
+        if self.is_finished() {
             return None;
         }
         Some(self.exchanger.sink_observable())
+    }
+
+    fn early_finish_observable(&self) -> Option<Arc<Observable>> {
+        if self.is_finished() {
+            return None;
+        }
+        Some(self.exchanger.closed_observable())
     }
 }
 
@@ -283,6 +292,269 @@ mod tests {
             .pull_chunk(&rt)
             .expect("pull done");
         assert!(out3.is_none());
+    }
+
+    fn pull(
+        source: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
+        rt: &RuntimeState,
+    ) -> Option<Chunk> {
+        source
+            .as_processor_mut()
+            .expect("source op")
+            .pull_chunk(rt)
+            .expect("pull")
+    }
+
+    fn push(
+        sink: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
+        rt: &RuntimeState,
+        values: &[i32],
+    ) {
+        sink.as_processor_mut()
+            .expect("sink op")
+            .push_chunk(rt, chunk_of(values))
+            .expect("push");
+    }
+
+    fn need_input(sink: &dyn crate::exec::pipeline::operator::Operator) -> bool {
+        sink.as_processor_ref().expect("sink op").need_input()
+    }
+
+    fn first_value(chunk: &Chunk) -> i32 {
+        chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 column")
+            .value(0)
+    }
+
+    #[test]
+    fn handoff_queue_backpressures_at_its_chunk_bound_and_wakes_on_pop() {
+        let rt = RuntimeState::default();
+        let exchanger = LocalExchanger::new_handoff(1, 3, 2, Arc::new(ExprArena::default()));
+        let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0);
+        let mut source =
+            LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger)).create(3, 0);
+
+        assert!(need_input(sink.as_ref()));
+        push(&mut sink, &rt, &[1]);
+        assert!(
+            need_input(sink.as_ref()),
+            "one queued chunk is below the bound of two"
+        );
+        push(&mut sink, &rt, &[2, 3]);
+        assert!(
+            !need_input(sink.as_ref()),
+            "the whole queue holds at most two chunks"
+        );
+
+        let capacity = exchanger.sink_observable();
+        let before = capacity.generation();
+        assert!(pull(&mut source, &rt).is_some());
+        assert!(need_input(sink.as_ref()));
+        assert!(
+            capacity.generation() > before,
+            "a pop that frees the bound must wake a producer parked on the sink"
+        );
+    }
+
+    #[test]
+    fn handoff_consumers_share_one_queue_and_take_each_chunk_once() {
+        let rt = RuntimeState::default();
+        let exchanger = LocalExchanger::new_handoff(1, 3, 8, Arc::new(ExprArena::default()));
+        let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
+        let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
+        let mut sink = sink_factory.create(1, 0);
+        let mut consumers = (0..3)
+            .map(|index| source_factory.create(3, index))
+            .collect::<Vec<_>>();
+        for value in 0..6 {
+            push(&mut sink, &rt, &[value]);
+        }
+        sink.as_processor_mut()
+            .expect("sink op")
+            .set_finishing(&rt)
+            .expect("finish producer");
+
+        // Consumer 2 takes everything while the others are idle: no chunk is
+        // reserved for a consumer that is not running.
+        let mut taken = Vec::new();
+        while let Some(chunk) = pull(&mut consumers[2], &rt) {
+            taken.push(first_value(&chunk));
+        }
+        assert_eq!(taken, vec![0, 1, 2, 3, 4, 5]);
+        for consumer in &mut consumers {
+            assert!(pull(consumer, &rt).is_none());
+            assert!(
+                consumer.is_finished(),
+                "an empty queue with no producer is end of stream"
+            );
+        }
+    }
+
+    #[test]
+    fn racing_handoff_consumers_neither_duplicate_nor_lose_chunks() {
+        const CHUNKS: i32 = 2_000;
+        let rt = RuntimeState::default();
+        let exchanger = LocalExchanger::new_handoff(1, 3, 2, Arc::new(ExprArena::default()));
+        let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
+        let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
+        let mut sink = sink_factory.create(1, 0);
+        let consumers = (0..3)
+            .map(|index| source_factory.create(3, index))
+            .collect::<Vec<_>>();
+
+        let mut taken = std::thread::scope(|scope| {
+            let rt = &rt;
+            let readers = consumers
+                .into_iter()
+                .map(|mut consumer| {
+                    scope.spawn(move || {
+                        let mut values = Vec::new();
+                        loop {
+                            if let Some(chunk) = pull(&mut consumer, rt) {
+                                values.push(first_value(&chunk));
+                            } else if consumer.is_finished() {
+                                return values;
+                            } else {
+                                std::thread::yield_now();
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for value in 0..CHUNKS {
+                while !need_input(sink.as_ref()) {
+                    std::thread::yield_now();
+                }
+                push(&mut sink, rt, &[value]);
+            }
+            sink.as_processor_mut()
+                .expect("sink op")
+                .set_finishing(rt)
+                .expect("finish producer");
+            readers
+                .into_iter()
+                .flat_map(|reader| reader.join().expect("consumer thread"))
+                .collect::<Vec<_>>()
+        });
+
+        taken.sort_unstable();
+        assert_eq!(taken, (0..CHUNKS).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn handoff_queue_ignores_the_query_spill_policy() {
+        let spill = crate::exec::spill::SpillConfig {
+            enable_spill: true,
+            spill_mode: crate::exec::spill::SpillMode::Force,
+            spill_mem_limit_threshold: None,
+            spill_operator_min_bytes: None,
+            spill_operator_max_bytes: None,
+            spill_encode_level: None,
+            enable_spill_buffer_read: None,
+            max_spill_read_buffer_bytes_per_driver: None,
+            spill_mem_table_size: None,
+            spill_mem_table_num: None,
+        };
+        // Force spill without a spill manager: a spilling exchange would fail
+        // to install its spill state, a handoff queue must never try.
+        let rt = RuntimeState::new(None, None, None, None, None, None, Some(spill), None, None);
+        let handoff = LocalExchanger::new_handoff(1, 2, 1, Arc::new(ExprArena::default()));
+        let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&handoff)).create(1, 0);
+        push(&mut sink, &rt, &[1]);
+        assert!(
+            !need_input(sink.as_ref()),
+            "a full handoff queue backpressures instead of spilling"
+        );
+
+        let buffered = LocalExchanger::new(
+            1,
+            1,
+            LocalExchangePartitionSpec::Single,
+            Arc::new(ExprArena::default()),
+        );
+        let mut buffered_sink =
+            LocalExchangeSinkFactory::new(-1, Arc::clone(&buffered)).create(1, 0);
+        let error = buffered_sink
+            .as_processor_mut()
+            .expect("sink op")
+            .push_chunk(&rt, chunk_of(&[1]))
+            .expect_err("a spilling exchange needs the spill manager");
+        assert!(error.contains("spill manager"), "{error}");
+    }
+
+    #[test]
+    fn partial_consumer_close_keeps_the_shared_queue_for_the_others() {
+        let rt = RuntimeState::default();
+        let exchanger = LocalExchanger::new_handoff(1, 2, 8, Arc::new(ExprArena::default()));
+        let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
+        let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
+        let mut sink = sink_factory.create(1, 0);
+        let mut first = source_factory.create(2, 0);
+        let mut second = source_factory.create(2, 1);
+        push(&mut sink, &rt, &[7]);
+
+        first.close().expect("close first consumer");
+        first.close().expect("a repeated close is a no-op");
+        assert!(!exchanger.all_consumers_closed());
+        assert!(!sink.is_finished());
+        assert!(need_input(sink.as_ref()));
+        let chunk = pull(&mut second, &rt).expect("the remaining consumer still reads");
+        assert_eq!(first_value(&chunk), 7);
+    }
+
+    #[test]
+    fn last_consumer_close_finishes_producers_and_drops_the_queue() {
+        let rt = RuntimeState::default();
+        let exchanger = LocalExchanger::new_handoff(1, 2, 8, Arc::new(ExprArena::default()));
+        let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
+        let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
+        let mut sink = sink_factory.create(1, 0);
+        let mut first = source_factory.create(2, 0);
+        let mut second = source_factory.create(2, 1);
+        push(&mut sink, &rt, &[1]);
+        push(&mut sink, &rt, &[2]);
+
+        let early_finish = sink
+            .as_processor_ref()
+            .expect("sink op")
+            .early_finish_observable()
+            .expect("an open handoff sink exposes its early-finish observable");
+        let before = early_finish.generation();
+        first.close().expect("close first consumer");
+        assert_eq!(
+            early_finish.generation(),
+            before,
+            "one consumer is still reading"
+        );
+        second.close().expect("close second consumer");
+
+        assert!(exchanger.all_consumers_closed());
+        assert!(
+            early_finish.generation() > before,
+            "producers must be woken"
+        );
+        assert!(
+            sink.is_finished(),
+            "nothing a producer pushes can be read any more"
+        );
+        assert!(!need_input(sink.as_ref()));
+        assert_eq!(
+            exchanger
+                .partition_buffered_chunks(0)
+                .map(|(chunks, _)| chunks),
+            Some(0)
+        );
+        // A late push after every consumer left is dropped, not queued.
+        push(&mut sink, &rt, &[3]);
+        assert_eq!(
+            exchanger
+                .partition_buffered_chunks(0)
+                .map(|(chunks, _)| chunks),
+            Some(0)
+        );
+        assert_eq!(exchanger.consumer_count(), 2);
     }
     #[test]
     fn local_exchange_limit_zero_wakes_source_blocked_remote_driver() {
@@ -386,7 +658,7 @@ mod tests {
         // overlapping downstream completion. Neither event replaces the other.
         source_observable.notify_observers();
         assert!(wait.generation() > generation + 1);
-        assert!(exchanger.is_all_sources_finished());
+        assert!(exchanger.all_consumers_closed());
         let weak_wait = Arc::downgrade(&wait);
         drop(wait);
         drop(producer);
@@ -481,6 +753,6 @@ mod tests {
             "necessary sibling receives normal EOS"
         );
         sibling.close().unwrap();
-        assert!(exchanger.is_all_sources_finished());
+        assert!(exchanger.all_consumers_closed());
     }
 }

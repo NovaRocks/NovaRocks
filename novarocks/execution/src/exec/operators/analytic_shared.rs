@@ -3281,7 +3281,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         );
         (state, tracker)
     }

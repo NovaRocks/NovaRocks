@@ -391,13 +391,6 @@ fn validate_consumers(
             | Ok(novarocks::QueryTerminalRuntimeFilterSubscriptionTerminalV1::CompletedWithoutArtifact) => {}
             _ => return Err(error(value_path.field("subscription_terminal"), ProtocolErrorKind::InvalidEnum, "invalid terminal runtime-filter subscription terminal state")),
         }
-        let _reasons = value.scan_not_evaluated_reasons.as_ref().ok_or_else(|| {
-            error(
-                value_path.field("scan_not_evaluated_reasons"),
-                ProtocolErrorKind::MissingField,
-                "terminal runtime-filter scan not-evaluated counters are required",
-            )
-        })?;
     }
     Ok(())
 }

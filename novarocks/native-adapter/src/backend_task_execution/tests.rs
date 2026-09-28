@@ -425,6 +425,8 @@ impl TaskExecutionHost for FakeTaskHost {
         self.ledger.contexts_closed.fetch_add(1, Ordering::SeqCst);
     }
 
+    fn retire_context_execution(&self, _context: QueryContextRef) {}
+
     fn forget_context_admission(&self, _context: QueryContextRef) {}
 
     fn install_receiver(
@@ -2020,6 +2022,83 @@ fn retention_is_swept_by_capacity_as_well_as_by_horizon() {
             ))
             .outcome(),
         OperationOutcome::Gone
+    );
+}
+
+#[test]
+fn a_create_that_loses_to_a_closing_context_is_reclaimed_without_ever_being_observed() {
+    // Capacity 1: the second context's retired task reclaims the first one.
+    let fixture = Fixture::with_config(|config| {
+        config.retained_task_capacity = 1;
+        config.gone_fence_capacity = 1;
+    });
+    let context = fixture.establish(1);
+    let identity = fixture.identity(1, 1, 1);
+    fixture.task_host.submit_gate.close();
+    let registry = Arc::clone(&fixture.registry);
+    let request = fixture.create_request(identity);
+    let create = std::thread::spawn(move || registry.create_task(&request, body(5)));
+    while HostLedger::get(&fixture.ledger.submit_attempts) == 0 {
+        std::thread::yield_now();
+    }
+    // The abort linearizes while the create is submitting its runnable, so
+    // the create loses: its task exists only to converge, and no observer is
+    // ever told it was created.
+    let abort = fixture
+        .registry
+        .abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            AbortCause::QueryFailed,
+        ));
+    assert_eq!(abort.outcome(), OperationOutcome::Accepted);
+    fixture.task_host.submit_gate.open();
+    let receipt = create.join().expect("create thread");
+    assert_eq!(
+        receipt.outcome(),
+        OperationOutcome::ContextTerminalReceipt,
+        "{receipt:?}"
+    );
+    let source = fixture
+        .registry
+        .status_source(context)
+        .expect("a retained context has an observation source");
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        source.observe(TaskStatusCursor::unobserved(identity)),
+        CursorObservation::Unknown
+    );
+
+    // Reclaiming the retired record by capacity, then expiring its gone
+    // fence, must neither fence nor forget an observation nobody saw.
+    let second = fixture.establish(2);
+    for task in 1..=2u32 {
+        let reporter = fixture.create(fixture.identity(2, 1, task), 5);
+        fixture.finish(&reporter);
+        reporter.release_output();
+        fixture.registry.advance_deadlines();
+    }
+    assert_eq!(
+        fixture
+            .registry
+            .get_final_task_info(&GetFinalTaskInfo::new(TaskOperationId::new_v7(), identity))
+            .outcome(),
+        OperationOutcome::Gone
+    );
+    assert_eq!(
+        source.observe(TaskStatusCursor::unobserved(identity)),
+        CursorObservation::Unknown
+    );
+    while let Some(event) = source.next_event() {
+        assert_ne!(event, TaskStatusEvent::Gone(identity));
+        assert!(
+            !matches!(&event, TaskStatusEvent::Status(status) if status.identity() == identity),
+            "a task that lost its creation is never observable: {event:?}"
+        );
+    }
+    assert_eq!(
+        fixture.registry.context_state(second),
+        QueryContextState::Active
     );
 }
 

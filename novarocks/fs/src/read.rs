@@ -80,8 +80,10 @@ pub struct FileReadContext {
     pub deadline: Option<Instant>,
     pub runtime: Arc<dyn FileIoRuntime>,
     pub task_spawner: Arc<dyn FileTaskSpawner>,
-    pub range_service: Option<Arc<crate::FileRangeService>>,
-    pub range_scope: Option<crate::FileRangeScope>,
+    /// The shared scan I/O an execution-attempt read goes through, bound to
+    /// the source the read is for. Without it a read goes straight to the
+    /// object store.
+    pub range: Option<crate::FileRangeBinding>,
 }
 
 /// One immutable, contiguous backing prepared for an exact authorized file.
@@ -184,6 +186,12 @@ impl PreparedFileInput {
 }
 
 impl FileReadContext {
+    /// The read's stop bounded by its deadline: what every wait of the read
+    /// observes.
+    pub fn bounded_cancellation(&self) -> FileCancellation {
+        self.cancellation.clone().with_deadline(self.deadline)
+    }
+
     pub fn check_active(&self) -> FileResult<()> {
         self.cancellation.check()?;
         if self
@@ -203,7 +211,7 @@ impl Debug for FileReadContext {
         f.debug_struct("FileReadContext")
             .field("cancellation", &self.cancellation)
             .field("deadline", &self.deadline)
-            .field("range_scope", &self.range_scope)
+            .field("range", &self.range)
             .finish_non_exhaustive()
     }
 }

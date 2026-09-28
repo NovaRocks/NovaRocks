@@ -69,3 +69,27 @@ count(*)
 -- query 38
 count(*)
 3
+
+-- query 22
+count(*)
+3
+
+-- query 23
+count(*)
+3
+
+-- query 25
+count(*)
+3
+
+-- query 26
+count(*)
+3
+
+-- query 28
+count(*)
+3
+
+-- query 29
+count(*)
+3

@@ -138,10 +138,8 @@ pub fn load_expected_results(
 
     // If the file is organised by `-- query N` markers, parse the
     // bodies by section regardless of whether the case was tagged as
-    // multi_step. This handles tests like `function_cast` whose result-
-    // bearing SELECTs are interleaved with `USE`-prefixed steps that
-    // implicit-skip on the SQL side but still need their own result
-    // section keyed by query number.
+    // multi_step. Result-bearing SELECTs interleaved with setup commands
+    // still need their own result section keyed by query number.
     if !markers.is_empty() {
         let mut result_sets = BTreeMap::new();
         for (idx, (start, query_number)) in markers.iter().enumerate() {
@@ -548,8 +546,14 @@ pub fn step_requires_recorded_result(step: &SqlStep) -> bool {
 }
 
 pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
-    let normalized = step
-        .sql
+    let Ok(statements) = crate::session::split_sql_statements(&step.sql) else {
+        // Invalid SQL must not silently waive the result assertion.
+        return false;
+    };
+    let Some(statement) = statements.last() else {
+        return false;
+    };
+    let normalized = statement
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -559,6 +563,7 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
     {
         return true;
     }
+    // Classify the final statement, so setup such as USE cannot hide a query.
     // DDL / DML statements do not produce recordable rowsets. Treat them as
     // implicit skip_result_check so only real queries (SELECT/SHOW/WITH/etc.)
     // need a recorded result set. This lets legacy tests that issue
@@ -744,6 +749,58 @@ mod normalize_explain_tests {
             out[0][0],
             "Planning: <MS> ms / Execution: <MS> ms / Rows: 42"
         );
+    }
+}
+
+#[cfg(test)]
+mod implicit_skip_result_tests {
+    use super::*;
+
+    fn step(sql: &str) -> SqlStep {
+        SqlStep {
+            query_number: 1,
+            sql: sql.to_string(),
+            meta: QueryMeta::default(),
+        }
+    }
+
+    #[test]
+    fn queries_require_comparison_after_setup_statements() {
+        for sql in [
+            "SELECT 1",
+            "USE x;\nselect 1;",
+            "USE x; SET query_timeout = 60; SELECT 1;",
+            "CREATE TABLE t (x INT); SELECT x FROM t;",
+            "USE `x;y`; SELECT 'use x; set y=1'; -- trailing comment;",
+            "USE x; /* setup; */ SELECT 1; /* trailing; */ ;",
+            "USE x; WITH t AS (SELECT 1) SELECT * FROM t;",
+            "USE x; SHOW TABLES;",
+        ] {
+            let step = step(sql);
+            assert!(!step_has_implicit_skip_result(&step), "{sql}");
+            assert!(step_requires_recorded_result(&step), "{sql}");
+        }
+    }
+
+    #[test]
+    fn final_non_rowset_statements_remain_implicitly_skipped() {
+        for sql in [
+            "USE x; SET query_timeout = 60;",
+            "USE x;",
+            "CREATE TABLE t (x INT);",
+            "USE x; INSERT INTO t VALUES (1);",
+            "USE x; DROP TABLE t; -- trailing comment;",
+            "USE x; REFRESH MATERIALIZED VIEW mv WITH SYNC MODE;",
+        ] {
+            let step = step(sql);
+            assert!(step_has_implicit_skip_result(&step), "{sql}");
+            assert!(!step_requires_recorded_result(&step), "{sql}");
+        }
+    }
+
+    #[test]
+    fn malformed_batch_does_not_waive_comparison() {
+        assert!(!step_has_implicit_skip_result(&step("USE x; SELECT '")));
     }
 }
 

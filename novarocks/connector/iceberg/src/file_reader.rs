@@ -19,28 +19,23 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow::array::{ArrayData, ArrayRef, make_array};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use bytes::Bytes;
 use novarocks_fs::{
-    FileBatch, FileFormat, FileIdentity, FileProjection, FileReadBudget, FileReadContext,
-    FileReadRange, FileReadRequest, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
-    PhysicalPruning, ScanPredicate, ScanPredicateDomain, ScanPredicateSource, open_file_reader,
+    BoundFile, FileBatch, FileFormat, FileIdentity, FileProjection, FileReadBudget,
+    FileReadContext, FileReadRange, FileReadRequest, FileResult, FsAccessHandle, MinMaxPredicateOp,
+    MinMaxPredicateValue, PhysicalPruning, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
+    open_file_reader, open_file_reader_async,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-use novarocks_spi::connector::{ConnectorReaderMetricsSnapshot, ConnectorRequestContext};
+use novarocks_spi::connector::ConnectorError;
 
 use crate::scan_model::{
     IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
     IcebergPhysicalPredicateValue,
 };
 
-#[path = "batch_reader.rs"]
-pub mod batch_reader;
-#[path = "delta_reader.rs"]
-pub mod delta_reader;
 #[path = "equality_delete.rs"]
 pub mod equality_delete;
 
@@ -216,84 +211,10 @@ pub fn physical_predicates_to_file_predicates(
         .collect()
 }
 
-/// Resolve the physical decoder from an Iceberg data file path.
-pub fn iceberg_data_file_format(path: &str) -> Result<FileFormat, ConnectorError> {
-    let path = path.split('?').next().unwrap_or(path);
-    if path.to_ascii_lowercase().ends_with(".orc") {
-        return Ok(FileFormat::Orc);
-    }
-    if path.to_ascii_lowercase().ends_with(".parquet")
-        || path.to_ascii_lowercase().ends_with(".parq")
-    {
-        return Ok(FileFormat::Parquet);
-    }
-    Err(ConnectorError::new(
-        ConnectorErrorKind::Unsupported,
-        format!("Iceberg data file format is not declared or supported: {path}"),
-    ))
-}
-
-/// Reject an expired or cancelled connector reader request before starting or
-/// continuing provider I/O.
-pub fn validate_reader_request_context(
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    if context.is_cancelled() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Cancelled,
-            "connector request was cancelled",
-        ));
-    }
-    if Instant::now() >= context.deadline() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::DeadlineExceeded,
-            "connector request deadline elapsed",
-        ));
-    }
-    Ok(())
-}
-
 /// Preserve the connector-neutral error taxonomy at the provider's physical
 /// filesystem boundary.
 pub fn map_file_error(error: novarocks_fs::FileError) -> ConnectorError {
-    let kind = match error.kind() {
-        novarocks_fs::FileErrorKind::Invalid => ConnectorErrorKind::InvalidRequest,
-        novarocks_fs::FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
-        novarocks_fs::FileErrorKind::NotFound => ConnectorErrorKind::NotFound,
-        novarocks_fs::FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
-        novarocks_fs::FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
-        novarocks_fs::FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
-        novarocks_fs::FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
-        novarocks_fs::FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
-        novarocks_fs::FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
-        novarocks_fs::FileErrorKind::AlreadyExists | novarocks_fs::FileErrorKind::Internal => {
-            ConnectorErrorKind::Internal
-        }
-    };
-    ConnectorError::new(kind, error.to_string())
-}
-
-/// Project physical read metrics into the connector-neutral reader snapshot.
-pub fn connector_metrics(
-    metrics: novarocks_fs::FileMetricsSnapshot,
-) -> ConnectorReaderMetricsSnapshot {
-    ConnectorReaderMetricsSnapshot {
-        bytes_read: metrics.bytes_read,
-        read_requests: metrics.read_requests,
-        rows_decoded: metrics.rows_decoded,
-        batches_delivered: metrics.batches_delivered,
-        cache_hits: metrics.cache_hits,
-        cache_misses: metrics.cache_misses,
-        io_time_ns: metrics.io_time_ns,
-        decode_time_ns: metrics.decode_time_ns,
-        row_groups_read: metrics.row_groups_read,
-        row_groups_pruned: metrics.row_groups_pruned,
-        delayed_materialization_ranges: metrics.delayed_materialization_ranges,
-        page_index_attempts: metrics.page_index_attempts,
-        page_index_fallbacks: metrics.page_index_fallbacks,
-        page_index_rows_considered: metrics.page_index_rows_considered,
-        page_index_rows_pruned: metrics.page_index_rows_pruned,
-    }
+    ConnectorError::from(error)
 }
 
 pub fn read_parquet_batches(
@@ -304,46 +225,57 @@ pub fn read_parquet_batches(
     context: FileReadContext,
 ) -> Result<Vec<FileBatch>, String> {
     context.check_active().map_err(|error| error.to_string())?;
-    let provisional = access
-        .bind_location(
-            path,
-            FileIdentity::new(path, file_size.unwrap_or_default(), None),
-        )
-        .map_err(|error| error.to_string())?;
-    let resolved_size = match file_size {
-        Some(size) if size > 0 => size,
-        _ => {
-            let file = provisional.clone();
-            let cancellation = context.cancellation.clone();
-            context
+    let file = match known_size(file_size) {
+        Some(size) => bind(access, path, size)?,
+        None => {
+            let size = context
                 .runtime
-                .block_on_u64(Box::pin(async move { file.stat(&cancellation).await }))
-                .map_err(|error| error.to_string())?
+                .block_on_u64(Box::pin(stat_size(bind(access, path, 0)?, context.clone())))
+                .map_err(|error| error.to_string())?;
+            context.check_active().map_err(|error| error.to_string())?;
+            bind(access, path, size)?
         }
     };
-    context.check_active().map_err(|error| error.to_string())?;
-    let file = access
-        .bind_location(path, FileIdentity::new(path, resolved_size, None))
+    let mut reader = open_file_reader(whole_file_request(file, projection, context))
         .map_err(|error| error.to_string())?;
-    let mut reader = open_file_reader(FileReadRequest {
-        file,
-        format: FileFormat::Parquet,
-        range: FileReadRange::WholeFile,
-        projection,
-        budget: FileReadBudget {
-            max_rows: NonZeroUsize::new(4096).expect("constant is nonzero"),
-            max_bytes: NonZeroUsize::new(64 * 1024 * 1024).expect("constant is nonzero"),
-        },
-        predicates: Vec::new(),
-        pruning: PhysicalPruning::default(),
-        options: Default::default(),
-        cache: None,
-        prepared_input: None,
-        context,
-    })
-    .map_err(|error| error.to_string())?;
     let mut batches = Vec::new();
     while let Some(batch) = reader.next_batch().map_err(|error| error.to_string())? {
+        batches.push(batch);
+    }
+    reader.close().map_err(|error| error.to_string())?;
+    Ok(batches)
+}
+
+/// Awaited [`read_parquet_batches`]: an unknown size is a HEAD and the file
+/// is read by the awaited reader, both through the source's range service
+/// when the read has one.
+pub async fn read_parquet_batches_async(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    projection: FileProjection,
+    context: FileReadContext,
+) -> Result<Vec<FileBatch>, String> {
+    context.check_active().map_err(|error| error.to_string())?;
+    let file = match known_size(file_size) {
+        Some(size) => bind(access, path, size)?,
+        None => {
+            let size = stat_size(bind(access, path, 0)?, context.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            context.check_active().map_err(|error| error.to_string())?;
+            bind(access, path, size)?
+        }
+    };
+    let mut reader = open_file_reader_async(whole_file_request(file, projection, context), None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut batches = Vec::new();
+    while let Some(batch) = reader
+        .next_batch()
+        .await
+        .map_err(|error| error.to_string())?
+    {
         batches.push(batch);
     }
     reader.close().map_err(|error| error.to_string())?;
@@ -358,25 +290,117 @@ pub fn read_bytes(
     context: &FileReadContext,
 ) -> Result<Bytes, String> {
     context.check_active().map_err(|error| error.to_string())?;
-    let file = access
-        .bind_location(
-            path,
-            FileIdentity::new(path, file_size.unwrap_or_default(), None),
-        )
-        .map_err(|error| error.to_string())?;
-    let cancellation = context.cancellation.clone();
     context
         .runtime
-        .block_on_bytes(Box::pin(
-            async move { file.read(range, &cancellation).await },
-        ))
+        .block_on_bytes(Box::pin(read_range(
+            access, path, file_size, range, context,
+        )?))
         .map_err(|error| error.to_string())
+}
+
+/// Awaited [`read_bytes`].
+pub async fn read_bytes_async(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    range: FileReadRange,
+    context: &FileReadContext,
+) -> Result<Bytes, String> {
+    context.check_active().map_err(|error| error.to_string())?;
+    read_range(access, path, file_size, range, context)?
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn known_size(file_size: Option<u64>) -> Option<u64> {
+    file_size.filter(|size| *size > 0)
+}
+
+fn bind(access: &FsAccessHandle, path: &str, size: u64) -> Result<BoundFile, String> {
+    access
+        .bind_location(path, FileIdentity::new(path, size, None))
+        .map_err(|error| error.to_string())
+}
+
+fn whole_file_request(
+    file: BoundFile,
+    projection: FileProjection,
+    context: FileReadContext,
+) -> FileReadRequest {
+    FileReadRequest {
+        file,
+        format: FileFormat::Parquet,
+        range: FileReadRange::WholeFile,
+        projection,
+        budget: FileReadBudget {
+            max_rows: NonZeroUsize::new(4096).expect("constant is nonzero"),
+            max_bytes: NonZeroUsize::new(64 * 1024 * 1024).expect("constant is nonzero"),
+        },
+        predicates: Vec::new(),
+        pruning: PhysicalPruning::default(),
+        options: Default::default(),
+        cache: None,
+        prepared_input: None,
+        context,
+    }
+}
+
+/// The size of `file` in storage: a HEAD through the source's range service
+/// when the read has one, under the read's cancellation and deadline.
+async fn stat_size(file: BoundFile, context: FileReadContext) -> FileResult<u64> {
+    let cancellation = context.bounded_cancellation();
+    let Some(range) = context.range else {
+        return file.stat(&cancellation).await;
+    };
+    let mut request = range.stat_wait(file, cancellation).await?;
+    let size = request.size_ready().await;
+    let exit = request.drained().await;
+    let size = size?;
+    exit?;
+    Ok(size)
+}
+
+/// One read of `range` of `path`. With a range service, an unknown size is
+/// a HEAD first and the read is a managed request, so neither bypasses the
+/// source's windows and exit accounting; without one it is a direct read.
+fn read_range(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    range: FileReadRange,
+    context: &FileReadContext,
+) -> Result<impl std::future::Future<Output = FileResult<Bytes>> + Send + 'static, String> {
+    let provisional = bind(access, path, file_size.unwrap_or_default())?;
+    let access = access.clone();
+    let path = path.to_string();
+    let context = context.clone();
+    Ok(async move {
+        let cancellation = context.bounded_cancellation();
+        let Some(binding) = context.range.clone() else {
+            return provisional.read(range, &cancellation).await;
+        };
+        let size = match known_size(file_size) {
+            Some(size) => size,
+            None => stat_size(provisional, context.clone()).await?,
+        };
+        let range = match range {
+            FileReadRange::Bounded { .. } => range,
+            FileReadRange::WholeFile if size == 0 => return Ok(Bytes::new()),
+            FileReadRange::WholeFile => FileReadRange::bounded(0, size)?,
+        };
+        let file = access.bind_location(&path, FileIdentity::new(&path, size, None))?;
+        let mut request = binding.start_wait(file, range, cancellation).await?;
+        let bytes = request.result_ready().await;
+        let exit = request.drained().await;
+        let bytes = bytes?;
+        exit?;
+        Ok(bytes)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     use arrow::array::{Array, Int32Array, Int64Array, MapArray, StringArray, StructArray};
     use arrow::buffer::OffsetBuffer;
@@ -412,42 +436,6 @@ mod tests {
                 op: MinMaxPredicateOp::Ge,
                 value: MinMaxPredicateValue::Int32(20_000),
             }
-        );
-    }
-
-    #[test]
-    fn resolves_iceberg_physical_file_format_without_query_suffix() {
-        assert_eq!(
-            iceberg_data_file_format("s3://warehouse/part-0.parquet?version=1").expect("parquet"),
-            FileFormat::Parquet
-        );
-        assert_eq!(
-            iceberg_data_file_format("file:///warehouse/part-1.orc").expect("orc"),
-            FileFormat::Orc
-        );
-        assert_eq!(
-            iceberg_data_file_format("file:///warehouse/part-2.avro")
-                .expect_err("unsupported")
-                .kind(),
-            ConnectorErrorKind::Unsupported
-        );
-    }
-
-    #[test]
-    fn rejects_expired_reader_context_before_provider_io() {
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() - Duration::from_millis(1),
-            novarocks_spi::connector::ConnectorStopOwner::new().view(),
-            1,
-            1,
-        )
-        .expect("context");
-
-        assert_eq!(
-            validate_reader_request_context(&context)
-                .expect_err("expired")
-                .kind(),
-            ConnectorErrorKind::DeadlineExceeded
         );
     }
 
@@ -507,21 +495,5 @@ mod tests {
         assert!(fields[0].is_nullable());
         let map = out.as_any().downcast_ref::<MapArray>().expect("map array");
         assert!(map.keys().is_null(1));
-    }
-
-    #[test]
-    fn projects_page_index_metrics_without_provider_metadata() {
-        let projected = connector_metrics(novarocks_fs::FileMetricsSnapshot {
-            page_index_attempts: 3,
-            page_index_fallbacks: 1,
-            page_index_rows_considered: 96,
-            page_index_rows_pruned: 64,
-            ..Default::default()
-        });
-
-        assert_eq!(projected.page_index_attempts, 3);
-        assert_eq!(projected.page_index_fallbacks, 1);
-        assert_eq!(projected.page_index_rows_considered, 96);
-        assert_eq!(projected.page_index_rows_pruned, 64);
     }
 }

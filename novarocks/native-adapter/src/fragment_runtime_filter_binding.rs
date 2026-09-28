@@ -22,7 +22,6 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crate::fragment_error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
-use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
@@ -73,26 +72,8 @@ pub enum DecodedBindingRole {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodedConsumerBindingTarget {
-    DirectInput {
-        input_ordinal: usize,
-    },
-    SourceBoundary {
-        scan_domain: Option<DecodedRuntimeFilterScanDomainTarget>,
-    },
-}
-
-/// A scan-domain target is deliberately decoded before the execution node is
-/// built.  The backend never infers it from a connector schema or catalog.
-///
-/// It names no column.  Which column a runtime filter constrains is stated by
-/// the scan's own `ConnectorTableScanSource`, whose `DynamicFilterBinding` maps
-/// this binding id to a `ScanAssignment` variable and so to a typed
-/// `ColumnHandle`.  This target carries only the exact type contract the
-/// consumer expression was frozen against.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecodedRuntimeFilterScanDomainTarget {
-    pub data_type: DataType,
-    pub nullable: bool,
+    DirectInput { input_ordinal: usize },
+    SourceBoundary,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -925,31 +906,8 @@ fn decode_wire_role(
                         })?,
                     }
                 }
-                plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(target) => {
-                    let scan_domain = target.scan_domain_target.as_ref().map(|target| {
-                        let path = target_path.clone().field("source_boundary_target").field("scan_domain_target");
-                        let wire_type = target.r#type.as_ref().ok_or_else(|| {
-                            NativeFragmentDecodeError::missing(
-                                path.clone().field("type"),
-                                format!(
-                                    "native runtime-filter consumer binding_id={binding_id} scan-domain target is missing type"
-                                ),
-                            )
-                        })?;
-                        let data_type = novarocks_plan_codec::native_type::decode_type(wire_type).map_err(|error| {
-                            NativeFragmentDecodeError::invalid_value(
-                                path.clone().field("type"),
-                                format!(
-                                    "native runtime-filter consumer binding_id={binding_id} scan-domain target has invalid type: {error}"
-                                ),
-                            )
-                        })?;
-                        Ok::<_, NativeFragmentDecodeError>(DecodedRuntimeFilterScanDomainTarget {
-                            data_type,
-                            nullable: target.nullable,
-                        })
-                    }).transpose()?;
-                    DecodedConsumerBindingTarget::SourceBoundary { scan_domain }
+                plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(_) => {
+                    DecodedConsumerBindingTarget::SourceBoundary
                 }
             };
             Ok(DecodedWireBindingRole::Consumer {

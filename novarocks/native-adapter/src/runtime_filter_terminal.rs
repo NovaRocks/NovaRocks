@@ -151,7 +151,6 @@ fn terminal_profile_contribution(
                     }
                 },
             };
-            let reasons = consumer.scan_not_evaluated_reasons();
             let channel = identity.channel();
             let fragment = identity.fragment_instance_id();
             wire::QueryTerminalRuntimeFilterConsumerV1 {
@@ -172,22 +171,6 @@ fn terminal_profile_contribution(
                 row_evaluations: consumer.row_evaluations(),
                 input_rows: consumer.row_input(),
                 output_rows: consumer.row_output(),
-                scan_evaluated: consumer.scan_evaluated(),
-                scan_kept: consumer.scan_kept(),
-                scan_pruned: consumer.scan_pruned(),
-                scan_not_evaluated: consumer.scan_not_evaluated(),
-                scan_not_evaluated_reasons: Some(
-                    wire::QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
-                        unit_facts_missing: reasons.unit_facts_missing,
-                        column_facts_missing: reasons.column_facts_missing,
-                        data_type_unsupported: reasons.data_type_unsupported,
-                        predicate_capability_unsupported: reasons.predicate_capability_unsupported,
-                        resource_unavailable: reasons.resource_unavailable,
-                        snapshot_unavailable: reasons.snapshot_unavailable,
-                        snapshot_timed_out: reasons.snapshot_timed_out,
-                        snapshot_not_published: reasons.snapshot_not_published,
-                    },
-                ),
             }
         })
         .collect();

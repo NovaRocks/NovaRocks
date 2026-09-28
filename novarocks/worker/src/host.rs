@@ -293,6 +293,9 @@ pub trait TaskExecutionHost: Send + Sync {
     fn abort_context_admission(&self, context: QueryContextRef) {
         self.close_context_admission(context);
     }
+    /// Releases an idle execution context after every task has physically
+    /// converged and no new task can be admitted for this exact attempt.
+    fn retire_context_execution(&self, context: QueryContextRef);
 
     /// Reclaims the compact context fence after the registry has forgotten
     /// the context itself. No task capability for the execution may remain.

@@ -739,8 +739,6 @@ mod tests {
                 ExecutionRuntime::new(
                     ExecutionRuntimeConfig {
                         driver_threads: 1,
-                        scan_threads: 1,
-                        scan_queue_capacity: 8,
                         spill_io_threads: 1,
                         spill_io_queue_capacity: 8,
                         spill_storage: ExecutionSpillStorageConfig::default(),
@@ -751,9 +749,6 @@ mod tests {
                         operator_buffer_chunks: 1,
                         local_exchange_buffer_mem_limit_per_driver: 1024,
                         local_exchange_max_buffered_rows: 1024,
-                        connector_io_tasks_per_scan_operator: 1,
-                        scan_submit_fail_max: 1,
-                        scan_submit_fail_timeout_ms: 1,
                         runtime_filter_scan_wait_time_ms_override: None,
                         runtime_filter_wait_timeout_ms_override: None,
                         sink_io_worker_threads: 1,
@@ -778,7 +773,6 @@ mod tests {
             None,
             None,
             Some(test_execution_runtime()),
-            None,
         ))
     }
 
@@ -1079,7 +1073,6 @@ mod tests {
                 None,
                 None,
                 Some(Arc::clone(&runtime)),
-                None,
             ));
             let output = ResultSinkHandle::new();
             let prepared = super::prepare_report_neutral_local_program_pipeline_execution(
@@ -1231,7 +1224,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
         let observable = Arc::new(Observable::new());
         let ready = Arc::new(AtomicBool::new(false));
@@ -1309,7 +1301,6 @@ mod tests {
             None,
             None,
             Some(test_execution_runtime()),
-            None,
         ));
         let driver = PipelineDriver::new(
             2,

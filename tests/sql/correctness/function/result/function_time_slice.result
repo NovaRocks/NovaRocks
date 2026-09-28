@@ -1,33 +1,33 @@
 -- query 1
-time_slice('9999-12-31 23:59:59', INTERVAL 5 year, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 YEAR, ceil)
 NULL
 
 -- query 2
-time_slice('9999-12-31 23:59:59', INTERVAL 5 month, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 MONTH, ceil)
 NULL
 
 -- query 3
-time_slice('9999-12-31 23:59:59', INTERVAL 5 day, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 DAY, ceil)
 NULL
 
 -- query 4
-time_slice('9999-12-31 23:59:59', INTERVAL 5 quarter, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 QUARTER, ceil)
 NULL
 
 -- query 5
-time_slice('9999-12-31 23:59:59', INTERVAL 5 week, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 WEEK, ceil)
 NULL
 
 -- query 6
-time_slice('9999-12-31 23:59:59', INTERVAL 5 hour, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 HOUR, ceil)
 NULL
 
 -- query 7
-time_slice('9999-12-31 23:59:59', INTERVAL 5 minute, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 MINUTE, ceil)
 NULL
 
 -- query 8
-time_slice('9999-12-31 23:59:59', INTERVAL 5 second, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 SECOND, ceil)
 NULL
 
 -- query 9
@@ -63,23 +63,23 @@ time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 second, floor)
 1974-06-25 21:49:23
 
 -- query 22
-time_slice('9999-12-31', INTERVAL 5 year, ceil)
+time_slice('9999-12-31', INTERVAL 5 YEAR, ceil)
 NULL
 
 -- query 23
-time_slice('9999-12-31', INTERVAL 5 month, ceil)
+time_slice('9999-12-31', INTERVAL 5 MONTH, ceil)
 NULL
 
 -- query 24
-time_slice('9999-12-31', INTERVAL 5 day, ceil)
+time_slice('9999-12-31', INTERVAL 5 DAY, ceil)
 NULL
 
 -- query 25
-time_slice('9999-12-31', INTERVAL 5 quarter, ceil)
+time_slice('9999-12-31', INTERVAL 5 QUARTER, ceil)
 NULL
 
 -- query 26
-time_slice('9999-12-31', INTERVAL 5 week, ceil)
+time_slice('9999-12-31', INTERVAL 5 WEEK, ceil)
 NULL
 
 -- query 27
@@ -103,35 +103,35 @@ time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 week, floor)
 0001-01-01 00:00:00
 
 -- query 38
-time_slice('9999-12-31 23:59:59', INTERVAL 5 year, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 YEAR, ceil)
 NULL
 
 -- query 39
-time_slice('9999-12-31 23:59:59', INTERVAL 5 month, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 MONTH, ceil)
 NULL
 
 -- query 40
-time_slice('9999-12-31 23:59:59', INTERVAL 5 day, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 DAY, ceil)
 NULL
 
 -- query 41
-time_slice('9999-12-31 23:59:59', INTERVAL 5 quarter, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 QUARTER, ceil)
 NULL
 
 -- query 42
-time_slice('9999-12-31 23:59:59', INTERVAL 5 week, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 WEEK, ceil)
 NULL
 
 -- query 43
-time_slice('9999-12-31 23:59:59', INTERVAL 5 hour, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 HOUR, ceil)
 NULL
 
 -- query 44
-time_slice('9999-12-31 23:59:59', INTERVAL 5 minute, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 MINUTE, ceil)
 NULL
 
 -- query 45
-time_slice('9999-12-31 23:59:59', INTERVAL 5 second, ceil)
+time_slice('9999-12-31 23:59:59', INTERVAL 5 SECOND, ceil)
 NULL
 
 -- query 46
@@ -167,23 +167,23 @@ time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 second, floor)
 1974-06-25 21:49:23
 
 -- query 59
-time_slice('9999-12-31', INTERVAL 5 year, ceil)
+time_slice('9999-12-31', INTERVAL 5 YEAR, ceil)
 NULL
 
 -- query 60
-time_slice('9999-12-31', INTERVAL 5 month, ceil)
+time_slice('9999-12-31', INTERVAL 5 MONTH, ceil)
 NULL
 
 -- query 61
-time_slice('9999-12-31', INTERVAL 5 day, ceil)
+time_slice('9999-12-31', INTERVAL 5 DAY, ceil)
 NULL
 
 -- query 62
-time_slice('9999-12-31', INTERVAL 5 quarter, ceil)
+time_slice('9999-12-31', INTERVAL 5 QUARTER, ceil)
 NULL
 
 -- query 63
-time_slice('9999-12-31', INTERVAL 5 week, ceil)
+time_slice('9999-12-31', INTERVAL 5 WEEK, ceil)
 NULL
 
 -- query 64

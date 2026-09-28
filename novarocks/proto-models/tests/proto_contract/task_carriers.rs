@@ -168,7 +168,6 @@ fn query_options() -> novarocks::QueryOptions {
         enable_profile: true,
         pipeline_dop: 8,
         query_mem_limit: 512 << 20,
-        connector_io_tasks_per_scan_operator: 4,
         runtime_filter_scan_wait_time_ms: Some(1500),
         runtime_filter_wait_timeout_ms: Some(3000),
         allow_throw_exception: true,
@@ -223,8 +222,8 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
 
     assert_eq!(
         fields,
-        (1..=29).collect::<Vec<_>>(),
-        "QueryOptions must keep native runtime consumed fields on tags 1..=29"
+        (1..=29).filter(|tag| *tag != 6).collect::<Vec<_>>(),
+        "QueryOptions must keep native runtime consumed fields on tags 1..=29 except reserved 6"
     );
 }
 

@@ -79,17 +79,17 @@ percentile_cont(db, 1)
 11.5
 
 -- query 31
-percentile_cont(db, CAST(1.0 AS DOUBLE))
+percentile_cont(db, CAST(1.0 AS double))
 11.5
 
 -- query 32
-percentile_cont(db, CAST(0.5 AS DOUBLE))
+percentile_cont(db, CAST(0.5 AS double))
 11.3
 
 -- query 34
-percentile_cont(1, CAST(1.0 AS DOUBLE))
+percentile_cont(1, CAST(1.0 AS double))
 1
 
 -- query 35
-percentile_cont(1, CAST(0.5 AS DOUBLE))
+percentile_cont(1, CAST(0.5 AS double))
 1

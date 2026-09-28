@@ -40,18 +40,85 @@ pub fn load_position_deletes_with_context(
         if spec.file_content != IcebergFileContent::PositionDeletes {
             continue;
         }
-        accumulate_deletes_from_file(spec, data_file_path, access, context, &mut deleted)?;
+        match plan_position_delete(spec, data_file_path)? {
+            PositionDeleteRead::DeletionVector(range) => {
+                let payload = crate::file_reader::read_bytes(
+                    access,
+                    &spec.path,
+                    spec.length,
+                    range,
+                    context,
+                )?;
+                apply_deletion_vector(spec, &payload, &mut deleted)?;
+            }
+            PositionDeleteRead::Parquet => {
+                let batches = crate::file_reader::read_parquet_batches(
+                    access,
+                    &spec.path,
+                    spec.length,
+                    position_delete_projection(),
+                    context.clone(),
+                )?;
+                apply_position_delete_batches(spec, data_file_path, batches, &mut deleted)?;
+            }
+        }
     }
     Ok(deleted)
 }
 
-fn accumulate_deletes_from_file(
-    spec: &IcebergDeleteFileSpec,
+/// Awaited [`load_position_deletes_with_context`]: the same reads, awaited
+/// through the source's range service.
+pub async fn load_position_deletes_async(
+    specs: &[IcebergDeleteFileSpec],
     data_file_path: &str,
     access: &FsAccessHandle,
     context: &FileReadContext,
-    deleted: &mut RoaringTreemap,
-) -> Result<(), String> {
+) -> Result<RoaringTreemap, String> {
+    let mut deleted = RoaringTreemap::new();
+    for spec in specs {
+        if spec.file_content != IcebergFileContent::PositionDeletes {
+            continue;
+        }
+        match plan_position_delete(spec, data_file_path)? {
+            PositionDeleteRead::DeletionVector(range) => {
+                let payload = crate::file_reader::read_bytes_async(
+                    access,
+                    &spec.path,
+                    spec.length,
+                    range,
+                    context,
+                )
+                .await?;
+                apply_deletion_vector(spec, &payload, &mut deleted)?;
+            }
+            PositionDeleteRead::Parquet => {
+                let batches = crate::file_reader::read_parquet_batches_async(
+                    access,
+                    &spec.path,
+                    spec.length,
+                    position_delete_projection(),
+                    context.clone(),
+                )
+                .await?;
+                apply_position_delete_batches(spec, data_file_path, batches, &mut deleted)?;
+            }
+        }
+    }
+    Ok(deleted)
+}
+
+/// What one position-delete file needs read before it can be applied.
+enum PositionDeleteRead {
+    /// A deletion vector: one byte range of its Puffin container.
+    DeletionVector(FileReadRange),
+    /// A Parquet position-delete file, read whole.
+    Parquet,
+}
+
+fn plan_position_delete(
+    spec: &IcebergDeleteFileSpec,
+    data_file_path: &str,
+) -> Result<PositionDeleteRead, String> {
     if let Some(referenced_data_file) = spec.referenced_data_file.as_deref()
         && referenced_data_file != data_file_path
     {
@@ -77,21 +144,9 @@ fn accumulate_deletes_from_file(
             .map_err(|_| format!("Puffin deletion vector {} has negative offset", spec.path))?;
         let length = u64::try_from(size)
             .map_err(|_| format!("Puffin deletion vector {} size is too large", spec.path))?;
-        let payload = crate::file_reader::read_bytes(
-            access,
-            &spec.path,
-            spec.length,
-            FileReadRange::bounded(start, length).map_err(|error| error.to_string())?,
-            context,
-        )?;
-        let dv = DeletionVector::from_iceberg_payload(payload.as_ref()).map_err(|error| {
-            format!(
-                "decode Puffin deletion vector {} failed: {error}",
-                spec.path
-            )
-        })?;
-        *deleted |= dv.to_roaring_treemap();
-        return Ok(());
+        return FileReadRange::bounded(start, length)
+            .map(PositionDeleteRead::DeletionVector)
+            .map_err(|error| error.to_string());
     }
     if spec.file_format != IcebergFileFormat::Parquet {
         return Err(format!(
@@ -99,13 +154,35 @@ fn accumulate_deletes_from_file(
             spec.path, spec.file_format
         ));
     }
-    for batch in crate::file_reader::read_parquet_batches(
-        access,
-        &spec.path,
-        spec.length,
-        FileProjection::RootNames(vec![FILE_PATH_COLUMN.to_string(), POS_COLUMN.to_string()]),
-        context.clone(),
-    )? {
+    Ok(PositionDeleteRead::Parquet)
+}
+
+fn position_delete_projection() -> FileProjection {
+    FileProjection::RootNames(vec![FILE_PATH_COLUMN.to_string(), POS_COLUMN.to_string()])
+}
+
+fn apply_deletion_vector(
+    spec: &IcebergDeleteFileSpec,
+    payload: &[u8],
+    deleted: &mut RoaringTreemap,
+) -> Result<(), String> {
+    let dv = DeletionVector::from_iceberg_payload(payload).map_err(|error| {
+        format!(
+            "decode Puffin deletion vector {} failed: {error}",
+            spec.path
+        )
+    })?;
+    *deleted |= dv.to_roaring_treemap();
+    Ok(())
+}
+
+fn apply_position_delete_batches(
+    spec: &IcebergDeleteFileSpec,
+    data_file_path: &str,
+    batches: Vec<novarocks_fs::FileBatch>,
+    deleted: &mut RoaringTreemap,
+) -> Result<(), String> {
+    for batch in batches {
         let batch = batch.batch;
         let schema = batch.schema();
         let file_path_index = schema.index_of(FILE_PATH_COLUMN).map_err(|error| {
@@ -209,8 +286,7 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_secs(1)),
             runtime: file_runtime,
             task_spawner,
-            range_service: None,
-            range_scope: None,
+            range: None,
         };
         let spec = IcebergDeleteFileSpec {
             path: delete_path

@@ -30,7 +30,6 @@ fn query_options_encoder_maps_every_query_wide_option() {
         runtime_profile_report_interval: Some(7),
         pipeline_dop: Some(8),
         exec_mem_limit: Some(1 << 20),
-        connector_io_tasks_per_scan_operator: Some(12),
         runtime_filter_scan_wait_time_ms: Some(250),
         runtime_filter_wait_timeout_ms: Some(5_000),
         allow_throw_exception: true,

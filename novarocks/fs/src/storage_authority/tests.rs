@@ -554,6 +554,121 @@ fn one_waiter_giving_up_does_not_end_the_shared_request() {
     );
 }
 
+/// Panics on its first acquisition and succeeds on every later one.
+struct PanicsOnceSource {
+    calls: AtomicUsize,
+    then: AuthorityMaterial,
+}
+
+impl AuthorityMaterialSource for PanicsOnceSource {
+    fn acquire(&self, _deadline: Instant) -> Result<AuthorityMaterial, AcquisitionFailure> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("injected material source panic");
+        }
+        Ok(self.then.clone())
+    }
+}
+
+/// Accepts every job and drops it without running it, like an executor
+/// whose runtime is shutting down.
+#[derive(Default)]
+struct DroppingExecutor {
+    dropped: AtomicUsize,
+}
+
+impl RefreshExecutor for DroppingExecutor {
+    fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        self.dropped.fetch_add(1, Ordering::SeqCst);
+        drop(job);
+    }
+}
+
+#[test]
+fn a_panicking_source_settles_its_refresh_and_a_later_one_can_start() {
+    let now = Instant::now();
+    let executor = Arc::new(QueuedExecutor::default());
+    let source = Arc::new(PanicsOnceSource {
+        calls: AtomicUsize::new(0),
+        then: renewed_material(now + Duration::from_secs(3600)),
+    });
+    let authority = StorageAuthority::new(
+        identity("https://catalog/credentials"),
+        Arc::clone(&source) as Arc<dyn AuthorityMaterialSource>,
+        Arc::clone(&executor) as Arc<dyn RefreshExecutor>,
+        policy(),
+    );
+    let handle = runtime();
+    let already_elapsed = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+
+    // The first request queues a refresh and gives up at once.
+    assert!(
+        handle
+            .block_on(authority.material_for_request(now, already_elapsed))
+            .is_err()
+    );
+    assert!(executor.run_one(), "the panicking refresh runs");
+    assert!(
+        authority.shared.lock_state().inflight.is_none(),
+        "a panicked refresh does not stay in flight"
+    );
+    let error = handle
+        .block_on(authority.material_for_request(now, now + Duration::from_secs(10)))
+        .expect_err("the panic is reported, inside its backoff");
+    assert_eq!(error.kind(), FileErrorKind::Transient);
+    assert!(error.to_string().contains("panicked"), "{error}");
+
+    // Past the backoff a new refresh starts and succeeds.
+    let later = now + Duration::from_secs(1);
+    assert!(
+        handle
+            .block_on(authority.material_for_request(later, already_elapsed))
+            .is_err()
+    );
+    assert!(executor.run_one(), "a second refresh was started");
+    let material = handle
+        .block_on(authority.material_for_request(later, later + Duration::from_secs(10)))
+        .expect("renewed material");
+    assert_eq!(material.access_key_id().expose_secret(), "renewed-ak");
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_refresh_its_executor_drops_unrun_settles_as_a_failure() {
+    let now = Instant::now();
+    let executor = Arc::new(DroppingExecutor::default());
+    let source = Arc::new(ScriptedSource::new(vec![Ok(renewed_material(
+        now + Duration::from_secs(3600),
+    ))]));
+    let authority = StorageAuthority::new(
+        identity("https://catalog/credentials"),
+        Arc::clone(&source) as Arc<dyn AuthorityMaterialSource>,
+        Arc::clone(&executor) as Arc<dyn RefreshExecutor>,
+        policy(),
+    );
+    let handle = runtime();
+
+    // The waiter is told at once rather than holding its whole deadline.
+    let error = handle
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                authority.material_for_request(now, now + Duration::from_secs(10)),
+            )
+            .await
+        })
+        .expect("an unrun refresh still reaches its waiter")
+        .expect_err("no material was acquired");
+    assert_eq!(error.kind(), FileErrorKind::Transient);
+    assert!(authority.shared.lock_state().inflight.is_none());
+
+    // Past the backoff the authority starts a fresh refresh instead of
+    // waiting on the one that never ran.
+    let later = now + Duration::from_secs(1);
+    let _ = handle.block_on(authority.material_for_request(later, later + Duration::from_secs(10)));
+    assert_eq!(executor.dropped.load(Ordering::SeqCst), 2);
+    assert_eq!(source.calls(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // CAD-1 D8 / acceptance 12: a late result cannot reopen a closed authority
 // ---------------------------------------------------------------------------

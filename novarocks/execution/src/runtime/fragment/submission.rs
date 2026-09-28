@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -31,7 +30,6 @@ use crate::exec::fragment::program::{
 use crate::exec::node::LocalRuntimeBindings;
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
 use novarocks_local_program::{BindingRequirement, LocalProgram, ProgramNodeKind, StaticLayout};
-use novarocks_types::SlotId;
 
 pub struct FragmentSubmission {
     program: Arc<FragmentProgram>,
@@ -107,16 +105,6 @@ impl FragmentSubmission {
 
     pub const fn instance(&self) -> &FragmentInstanceSpec {
         &self.instance
-    }
-
-    pub fn incremental_scan_contracts(&self) -> HashMap<i32, Option<SlotId>> {
-        let mut contracts = HashMap::new();
-        for node in self.program.local_program().nodes() {
-            if matches!(node.kind(), ProgramNodeKind::Scan { .. }) {
-                contracts.insert(node.native_node_id(), None);
-            }
-        }
-        contracts
     }
 
     pub fn root_plan_node_id(&self) -> i32 {
@@ -635,7 +623,6 @@ pub(crate) mod tests {
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
         MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     };
-    use crate::exec::node::BoxedExecIter;
     use crate::exec::node::exchange_source::ExchangeSourceNode;
     use crate::exec::node::filter::FilterNode;
     use crate::exec::node::join::{
@@ -643,7 +630,7 @@ pub(crate) mod tests {
     };
     use crate::exec::node::runtime_filter::RuntimeFilterConsumerNode;
     use crate::exec::node::scan::{
-        BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
+        BoundScanRanges, ScanNode, ScanOp, ScanStreamSource, UnusedScanStream,
     };
     use crate::exec::node::set_op::{SetOpKind, SetOpNode};
     use crate::exec::node::union_all::UnionAllNode;
@@ -665,7 +652,6 @@ pub(crate) mod tests {
         BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
         FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
-    use crate::runtime::profile::RuntimeProfile;
     use crate::runtime::query_options::QueryOptions;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use novarocks_types::QueryId;
@@ -698,17 +684,8 @@ pub(crate) mod tests {
     struct DummyScanOp;
 
     impl ScanOp for DummyScanOp {
-        fn execute_iter(
-            &self,
-            _morsel: ScanMorsel,
-            _profile: Option<RuntimeProfile>,
-            _runtime_filters: Option<&RuntimeFilterContext>,
-        ) -> Result<BoxedExecIter, String> {
-            Ok(Box::new(std::iter::empty()))
-        }
-
-        fn build_morsels(&self) -> Result<ScanMorsels, String> {
-            Ok(ScanMorsels::default())
+        fn stream_source(&self) -> Arc<dyn ScanStreamSource> {
+            Arc::new(UnusedScanStream)
         }
     }
 

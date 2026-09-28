@@ -366,7 +366,6 @@ impl Scenario for QueryConcurrency {
                 // host CPU saturation benchmark.
                 be: Some(
                     "[runtime]\n\
-                     pipeline_scan_thread_pool_thread_num = 1\n\
                      pipeline_exec_thread_pool_thread_num = 1\n\
                      exchange_io_threads = 1\n"
                         .to_string(),
@@ -499,7 +498,6 @@ fn uea4a1_performance_launch_config(profile: Uea4a1PerformanceProfile) -> Scenar
             // a host CPU benchmark.
             be: Some(
                 "[runtime]\n\
-                 pipeline_scan_thread_pool_thread_num = 1\n\
                  pipeline_exec_thread_pool_thread_num = 1\n\
                  exchange_io_threads = 1\n"
                     .to_owned(),
@@ -1143,7 +1141,6 @@ fn fault_launch_config(concurrency_limit: usize, cleanup_timeout_ms: u64) -> Sce
             )),
             be: Some(
                 "[runtime]\n\
-                 pipeline_scan_thread_pool_thread_num = 1\n\
                  pipeline_exec_thread_pool_thread_num = 1\n\
                  exchange_io_threads = 1\n"
                     .to_string(),

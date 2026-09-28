@@ -34,9 +34,11 @@ use std::time::Instant;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::exchange_source::ExchangeSourceNode;
-use crate::exec::operators::runtime_filter::RuntimeFilterConsumerSet;
+use crate::exec::operators::runtime_filter::{RuntimeFilterConsumerSet, RuntimeFilterGate};
 use crate::exec::pipeline::binding::ExchangeBinding;
-use crate::exec::pipeline::operator::{DriverBlockDeadline, Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    DriverBlockDeadline, Operator, ProcessorOperator, forward_observable,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::exchange;
@@ -248,6 +250,12 @@ impl OperatorFactory for ExchangeSourceFactory {
         let idle_deadline = Arc::new(ExchangeIdleDeadline::new());
         self.idle_progress
             .register(&idle_deadline, &source_observable);
+        // A chunk held at the runtime-filter gate waits on the same stable
+        // source observable as ordinary input.
+        forward_observable(
+            &self.runtime_filter_execution.consumers.gate_observable(),
+            &source_observable,
+        );
         Box::new(ExchangeSourceOperator {
             name: self.name.clone(),
             node: self.node.clone(),
@@ -263,6 +271,7 @@ impl OperatorFactory for ExchangeSourceFactory {
             last_partial_eos_marker_count: 0,
             arena: Arc::clone(&self.arena),
             native_runtime_filter_consumers: Some(self.runtime_filter_execution.consumers.clone()),
+            gated_chunk: None,
             event_sink: Arc::new(NoopFragmentEventSink),
             receiver_mem_tracker_ready: false,
         })
@@ -292,8 +301,19 @@ struct ExchangeSourceOperator {
     last_partial_eos_marker_count: usize,
     arena: Arc<ExprArena>,
     native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
+    /// The first chunk received, held while the runtime-filter gate that its
+    /// arrival opened is still pending.
+    gated_chunk: Option<Chunk>,
     event_sink: Arc<dyn FragmentEventSink>,
     receiver_mem_tracker_ready: bool,
+}
+
+impl ExchangeSourceOperator {
+    fn gate_open(&self) -> bool {
+        self.native_runtime_filter_consumers
+            .as_ref()
+            .is_none_or(|consumers| matches!(consumers.poll_gate(), RuntimeFilterGate::Open))
+    }
 }
 
 impl Operator for ExchangeSourceOperator {
@@ -368,6 +388,9 @@ impl ProcessorOperator for ExchangeSourceOperator {
         if self.finished {
             return false;
         }
+        if self.gated_chunk.is_some() {
+            return self.gate_open();
+        }
         let Some(receiver) = self.receiver.as_ref() else {
             return false;
         };
@@ -428,11 +451,14 @@ impl ProcessorOperator for ExchangeSourceOperator {
         }
 
         loop {
-            let out = {
-                let receiver = self.receiver.as_ref().expect("receiver");
-                receiver
-                    .try_pop_next_with_stats(self.binding.expected_senders)
-                    .map_err(|e| e.to_string())?
+            let out = match self.gated_chunk.take() {
+                Some(chunk) => Some(exchange::ExchangePopResult::Chunk(chunk)),
+                None => {
+                    let receiver = self.receiver.as_ref().expect("receiver");
+                    receiver
+                        .try_pop_next_with_stats(self.binding.expected_senders)
+                        .map_err(|e| e.to_string())?
+                }
             };
 
             match out {
@@ -441,7 +467,12 @@ impl ProcessorOperator for ExchangeSourceOperator {
                     let input_rows = chunk.len();
                     let chunk =
                         if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
-                            consumers.acquire_configured()?;
+                            // The gate's wait starts with the first chunk
+                            // actually received and holds it until it opens.
+                            if !matches!(consumers.poll_gate(), RuntimeFilterGate::Open) {
+                                self.gated_chunk = Some(chunk);
+                                return Ok(None);
+                            }
                             let Some(chunk) =
                                 consumers.apply_chunk_observed(chunk, Some(&self.event_sink))?
                             else {
@@ -589,6 +620,14 @@ impl ProcessorOperator for ExchangeSourceOperator {
     }
 
     fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
+        // Input already arrived: the wait is the gate's, not the exchange's
+        // idle timeout.
+        if self.gated_chunk.is_some() {
+            return self
+                .native_runtime_filter_consumers
+                .as_ref()
+                .and_then(RuntimeFilterConsumerSet::gate_deadline);
+        }
         self.idle_deadline.arm(self.node.timeout)
     }
 }
@@ -695,15 +734,35 @@ mod tests {
         }
     }
 
-    struct PublishedSubscription(Arc<execution::RuntimeFilterSnapshot>);
+    struct PublishedSubscription {
+        snapshot: Arc<execution::RuntimeFilterSnapshot>,
+        published: Arc<crate::runtime::observable::Observable>,
+    }
+
+    impl PublishedSubscription {
+        fn new(snapshot: Arc<execution::RuntimeFilterSnapshot>) -> Self {
+            Self {
+                snapshot,
+                published: Arc::new(crate::runtime::observable::Observable::new()),
+            }
+        }
+    }
 
     impl execution::BlockingSnapshotSubscription for PublishedSubscription {
-        fn acquire(&self, _: Duration) -> execution::SnapshotAcquireOutcome {
-            execution::SnapshotAcquireOutcome::Published(Arc::clone(&self.0))
+        fn try_outcome(&self) -> Option<execution::SnapshotAcquireOutcome> {
+            Some(execution::SnapshotAcquireOutcome::Published(Arc::clone(
+                &self.snapshot,
+            )))
         }
 
+        fn outcome_observable(&self) -> Arc<crate::runtime::observable::Observable> {
+            Arc::clone(&self.published)
+        }
+
+        fn record_consumer_outcome(&self, _: &execution::SnapshotAcquireOutcome) {}
+
         fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
-            Some(Arc::clone(&self.0))
+            Some(Arc::clone(&self.snapshot))
         }
     }
 
@@ -767,7 +826,7 @@ mod tests {
             RuntimeFilterExecutionContract::Membership(schema),
         )
         .expect("membership consumer contract");
-        RuntimeFilterConsumerBinding::new(expr_id, contract, None)
+        RuntimeFilterConsumerBinding::new(expr_id, contract)
     }
 
     fn published_runtime_state(accepted: Vec<i32>) -> RuntimeState {
@@ -778,7 +837,7 @@ mod tests {
             Arc::new(Int32MembershipQuery { accepted }),
         ));
         let session: execution::RuntimeFilterSessionRef = Arc::new(PublishedSession {
-            subscription: Arc::new(PublishedSubscription(snapshot)),
+            subscription: Arc::new(PublishedSubscription::new(snapshot)),
         });
         runtime_state().with_runtime_filter_session(Some(session))
     }
@@ -1314,6 +1373,115 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(int32_values(&output), vec![2, 4]);
+        binding_receiver_port(&factory)
+            .cancel_fragment(UniqueId::new(key.finst_id_hi, key.finst_id_lo));
+    }
+
+    /// A blocking subscription the test publishes later.
+    struct LaterSubscription {
+        outcome: std::sync::Mutex<Option<execution::SnapshotAcquireOutcome>>,
+        published: Arc<Observable>,
+    }
+
+    impl execution::BlockingSnapshotSubscription for LaterSubscription {
+        fn try_outcome(&self) -> Option<execution::SnapshotAcquireOutcome> {
+            self.outcome.lock().expect("outcome lock").clone()
+        }
+
+        fn outcome_observable(&self) -> Arc<Observable> {
+            Arc::clone(&self.published)
+        }
+
+        fn record_consumer_outcome(&self, _: &execution::SnapshotAcquireOutcome) {}
+
+        fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
+            None
+        }
+    }
+
+    #[test]
+    fn the_first_received_chunk_waits_at_a_pending_gate_without_popping_more() {
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 91_021,
+            finst_id_lo: 91_022,
+            node_id: 91_023,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let node = ExchangeSourceNode::new(
+            key.node_id,
+            Duration::from_secs(2),
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .unwrap(),
+        )
+        .with_runtime_filter_consumers(vec![membership_binding(expr_id)]);
+        let binding = ExchangeBinding {
+            key,
+            expected_senders: 1,
+            receiver_port: in_process_test_exchange_receiver_port(),
+        };
+        let factory = ExchangeSourceFactory::new_native(node, binding, Arc::new(arena)).unwrap();
+        let subscription = Arc::new(LaterSubscription {
+            outcome: std::sync::Mutex::new(None),
+            published: Arc::new(Observable::new()),
+        });
+        let session: execution::RuntimeFilterSessionRef = Arc::new(PublishedSession {
+            subscription: Arc::clone(&subscription)
+                as Arc<dyn execution::BlockingSnapshotSubscription>,
+        });
+        let state = runtime_state().with_runtime_filter_session(Some(session));
+        let mut source = factory.create(1, 0);
+        source.prepare().unwrap();
+        source.bind_runtime_state(&state).unwrap();
+        source.activate(&state).unwrap();
+        let processor = source.as_processor_mut().unwrap();
+        let source_observable = processor.source_observable().expect("source observable");
+        binding_receiver_port(&factory).push_local(
+            receiver_key(key),
+            0,
+            0,
+            vec![int32_chunk(vec![1, 2, 3, 4]), int32_chunk(vec![2, 5])],
+            true,
+        );
+
+        assert!(processor.pull_chunk(&state).unwrap().is_none());
+        assert!(
+            !processor.has_output(),
+            "the gate holds the first chunk back"
+        );
+        assert!(
+            processor.pull_chunk(&state).unwrap().is_none(),
+            "a held chunk is not popped again, nor is the next one"
+        );
+        let deadline = processor
+            .source_block_deadline()
+            .expect("a held chunk waits at most for the gate's deadline");
+        assert!(deadline.at() > Instant::now() + Duration::from_millis(500));
+
+        let generation = source_observable.generation();
+        *subscription.outcome.lock().expect("outcome lock") =
+            Some(execution::SnapshotAcquireOutcome::Published(Arc::new(
+                execution::RuntimeFilterSnapshot::new(
+                    RuntimeFilterBindingId::new(1),
+                    execution::LogicalVersion::FIRST,
+                    [0; 32],
+                    Arc::new(Int32MembershipQuery {
+                        accepted: vec![2, 4],
+                    }),
+                ),
+            )));
+        subscription.published.notify_observers();
+        assert!(
+            source_observable.generation() > generation,
+            "a publication wakes the parked source"
+        );
+
+        assert!(processor.has_output());
+        let first = processor.pull_chunk(&state).unwrap().expect("held chunk");
+        assert_eq!(int32_values(&first), vec![2, 4]);
+        let second = processor.pull_chunk(&state).unwrap().expect("next chunk");
+        assert_eq!(int32_values(&second), vec![2]);
         binding_receiver_port(&factory)
             .cancel_fragment(UniqueId::new(key.finst_id_hi, key.finst_id_lo));
     }

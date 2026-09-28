@@ -362,7 +362,12 @@ fn an_overlapping_copy_is_charged_twice_on_purpose() {
 
     // Once the external memory is really gone, its bound settles.
     assert_eq!(bound.settle(), 100);
-    assert_eq!(work.snapshot().committed_bytes, 140);
-    assert_eq!(work.snapshot().live_bytes, 40);
+    let settled = work.snapshot();
+    assert_eq!(settled.live_bytes, 40);
+    assert_eq!(settled.bounded_bytes, 0);
+    assert_eq!(
+        settled.committed_bytes, 41,
+        "idle capacity returned synchronously"
+    );
     copy.release();
 }

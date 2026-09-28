@@ -1,6 +1,6 @@
 ---
 name: dev-workflow-write-spec
-description: "Write an explicitly accepted design into the resolved project documentation root, with current-code evidence, scope, contracts, acceptance criteria, roadmap metadata, and links. Use after design discussion is accepted, when the user asks to create or update a spec, umbrella, roadmap design, or PR-sized design artifact."
+description: "Write an explicitly accepted design into the resolved project documentation root, with current-code evidence, scope, contracts, acceptance criteria, roadmap metadata, and links. An umbrella also carries the arc's overall route (independently mergeable PR subtasks, order, interface freeze points, migration states, gates); there is no separate umbrella-level plan. Use after design discussion is accepted, when the user asks to create or update a spec, umbrella, umbrella route (umbrella plan), roadmap design, or PR-sized design artifact."
 ---
 
 # 写 Spec
@@ -23,7 +23,17 @@ description: "Write an explicitly accepted design into the resolved project docu
 
 - 一个可独立实现、一个 PR 粒度的执行单元：写入 contract 或适用 `AGENTS.md` 规定的 spec 目录。
 - 会派生多个独立 spec 的长期工作线：写入 contract 或适用 `AGENTS.md` 规定的 umbrella 目录。
+  - umbrella 是这条 arc 唯一的 arc 级文档：设计之外，还写整体路线，也就是 arc 的主稿（见下方「Umbrella 的整体
+    路线」）。不另建 umbrella 级 plan。
+  - 每个子任务是一个可独立合入的 PR，拥有自己的 spec 与 plan。
 - 文件名遵循 `YYYY-MM-DD-<kebab-slug>-design.md`。
+
+**骨架 spec 与细化。**
+- 写 umbrella 的整体路线时，可以为即将开工的子任务先建骨架 spec（`design_status: skeleton`），固定范围、从
+  umbrella 继承的契约与验收；实现相关的章节标注“实现前细化”。
+- 细化骨架 spec 时补齐机制、稳定性与验收章节，然后改为 `design_status: accepted`。
+- 细化只能做工程层面的局部选择，并在设计裁决章单列这些局部选择。一旦需要改变 umbrella 已接受的方向、外部契约、
+  所有权或失败语义，停止细化，回到 `$dev-workflow-discuss-design`。
 
 参考 `assets/spec-template.md` 或 `assets/umbrella-template.md`，并按 contract 调整 frontmatter；项目启用
 roadmap / umbrella 时，再维护 Roadmap、子任务面板和阶段依赖图。
@@ -72,6 +82,19 @@ Spec 的详细设计要足以判断机制是否正确；plan 再落实代码结�
 一级章节默认保留；确实不适用时，用一句话说明原因，不编造内容。用户或项目另有明确结构要求时遵循该要求。
 新增 review 意见整合到对应章节，不在末尾不断追加孤立裁决。Umbrella 继续使用独立模板及 contract 的面板约定。
 
+## Umbrella 的整体路线
+
+Umbrella 在设计章节之后写 `## 整体路线` 一章，契约见 contract 第 6.1 节。要点：
+
+- **切分。** 每个子任务是一个可独立合入的 PR。切分时先回答“这个 PR 合入后，哪些行为已经成立、哪些中间态缺口仍然
+  存在”，答不出来说明边界还没切对。
+- **不重复。** 子任务面板是路线的索引，「阶段依赖」图是路线的 DAG；路线章不再重复子任务表或第二张依赖图。默认推进
+  顺序与每条硬依赖的原因写在依赖图之后。
+- **路线级内容。** 写路线总则、跨 PR 的迁移路线、接口冻结点、路线级闸门与测试面、推进方式与回退、子任务文档约定，
+  以及每个子任务一节（四个小节，写到模块、crate、套件或场景一级）。文件级修改、命令、参数与阈值留给子任务 plan。
+- **测试面。** 路线级闸门与测试面约定同样按 contract 第 8 节判断相关性，并写明需要全量验证的子任务及其理由。
+- **接受。** 整体路线写入或修订后，请用户明确接受；接受 umbrella 不改变任何子任务的状态，也不授权执行任何子任务。
+
 分清当前行为、目标态和假设，代码锚点放在其支持的解释附近。未知的默认值和性能数值不编造；成熟系统的局部实现
 不能用于推断整个系统。章内采用连贯段落、必要的表格和图，不要求把每项写作提示复制为列表。
 
@@ -82,12 +105,15 @@ Spec 的详细设计要足以判断机制是否正确；plan 再落实代码结�
 - 文档位于 `DOC_ROOT/workflow/` 下对应子目录（`specs/` 或 `umbrella/`）；
 - frontmatter 可解析；项目启用 Roadmap 时，对应字段完整；
 - 单 PR spec 的九章可定位，各章完成其职责；名词解释独立成节，关键裁决位于具体方案之前；不适用内容说明原因，结构例外有用户或项目依据；
-- spec 粒度可由一个 PR 独立验收，或 umbrella 明确拆出子任务；
+- spec 粒度可由一个 PR 独立验收，或 umbrella 明确拆出子任务并写齐整体路线（contract 第 6.1 节），没有另建
+  umbrella 级 plan；
 - 所有关键现状结论都能追溯到当前代码；
 - 未参与讨论的读者能从开头说清任务、问题、目标，并沿示例理解机制和取舍；
 - 正文说明了裁决之间的因果，未把术语、路径或 review 历史当作解释；
 - 验收标准描述行为，不用旧符号缺失、精确文件数或迁移编号作永久 guard；
-- 项目启用 umbrella 时，更新必要的面板、反链和阶段图；
+- 项目启用 umbrella 时，更新必要的面板、反链和阶段图；面板状态按 contract 第 6 节以子任务 plan 是否获批为准，
+  写 spec 本身不改变子任务状态；
 - 没有同时开始 plan 或实现。
 
-完成后向用户报告文档路径、核心裁决，并说明下一阶段是在当前可编辑模式中直接编写和落盘实现 plan。
+完成后向用户报告文档路径、核心裁决，并说明下一阶段是在当前可编辑模式中直接编写和落盘实现 plan。写的是 umbrella
+时，请用户明确接受设计与整体路线；接受后的下一步是推进第一个子任务：细化它的 spec，再为它编写 plan。

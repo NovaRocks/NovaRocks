@@ -1213,8 +1213,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    scan_threads: 1,
-                    scan_queue_capacity: 1,
                     spill_io_threads: 1,
                     spill_io_queue_capacity: 1,
                     spill_storage: ExecutionSpillStorageConfig::default(),
@@ -1225,9 +1223,6 @@ mod tests {
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1024,
                     local_exchange_max_buffered_rows: 1024,
-                    connector_io_tasks_per_scan_operator: 1,
-                    scan_submit_fail_max: 1,
-                    scan_submit_fail_timeout_ms: 1,
                     runtime_filter_scan_wait_time_ms_override: None,
                     runtime_filter_wait_timeout_ms_override: None,
                     sink_io_worker_threads: 1,
@@ -1248,7 +1243,6 @@ mod tests {
             None,
             None,
             Some(runtime),
-            None,
         )
     }
 
@@ -1499,13 +1493,17 @@ mod tests {
             operator.cancel();
         }
         let deadline = Instant::now() + Duration::from_secs(5);
-        while operators.iter().any(|operator| operator.pending_finish())
+        while operators
+            .iter()
+            .any(|operator| operator.pending_finish().is_some())
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
-            operators.iter().all(|operator| !operator.pending_finish()),
+            operators
+                .iter()
+                .all(|operator| operator.pending_finish().is_none()),
             "every activated writer exits before its test runtime is released"
         );
     }

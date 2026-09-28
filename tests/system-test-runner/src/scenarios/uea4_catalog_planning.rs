@@ -1262,7 +1262,10 @@ fn frontend_workload_state(context: &mut ScenarioContext) -> Result<serde_json::
     serde_json::from_str(&response.body).context("decode FE workload state")
 }
 
-fn await_frontend_local_exit(context: &mut ScenarioContext, operation: &str) -> Result<()> {
+pub(super) fn await_frontend_local_exit(
+    context: &mut ScenarioContext,
+    operation: &str,
+) -> Result<()> {
     let deadline = Instant::now() + context.remaining(operation)?.min(Duration::from_secs(45));
     loop {
         let state = frontend_workload_state(context)?;

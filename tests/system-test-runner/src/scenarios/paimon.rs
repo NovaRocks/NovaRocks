@@ -652,13 +652,27 @@ impl Scenario for IcebergPaimonRead {
 }
 
 #[derive(Clone, Debug)]
-struct Fixture {
+pub(super) struct Fixture {
     root: PathBuf,
     warehouse: String,
-    endpoint: String,
+    /// Object-store endpoint the catalog reads through; a scenario may point
+    /// it at a proxy in front of the same store.
+    pub(super) endpoint: String,
     region: String,
     credential_name: String,
     credential_generation: String,
+}
+
+impl Fixture {
+    /// The static object-store credential the fixture's base config defines,
+    /// as (name, generation); other catalogs in the same scenario reuse it.
+    pub(super) fn credential(&self) -> (&str, &str) {
+        (&self.credential_name, &self.credential_generation)
+    }
+
+    pub(super) fn region(&self) -> &str {
+        &self.region
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -736,7 +750,7 @@ fn connect(context: &ScenarioContext, operation: &str) -> Result<mysql::Conn> {
     )
 }
 
-fn load_shared_fixture(expected_stage: &str) -> Result<Fixture> {
+pub(super) fn load_shared_fixture(expected_stage: &str) -> Result<Fixture> {
     let path = env::var(FIXTURE_MANIFEST_ENV).with_context(|| {
         format!(
             "{FIXTURE_MANIFEST_ENV} must name the manifest produced by docker/paimon-read/prepare.sh"
@@ -839,7 +853,11 @@ fn required_map_string(value: &serde_json::Map<String, Value>, key: &str) -> Res
         .with_context(|| format!("Paimon fixture manifest is missing catalog.{key}"))
 }
 
-fn create_paimon_catalog(control: &mut mysql::Conn, name: &str, fixture: &Fixture) -> Result<()> {
+pub(super) fn create_paimon_catalog(
+    control: &mut mysql::Conn,
+    name: &str,
+    fixture: &Fixture,
+) -> Result<()> {
     control
         .query_drop(format!("DROP CATALOG IF EXISTS {name}"))
         .with_context(|| format!("remove stale Paimon catalog {name}"))?;

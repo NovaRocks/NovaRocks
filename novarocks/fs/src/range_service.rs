@@ -23,13 +23,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
+use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::read_stack::{ConnectorOperationTicket, ConnectorSourceOperations};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, oneshot};
-use tokio::task::JoinHandle;
 
 use crate::{
     BoundFile, FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult,
@@ -85,6 +86,298 @@ pub enum FileRangeClass {
 pub enum FileRangeStart {
     Started(FileRangeRequest),
     Deferred,
+}
+
+pub enum FileStatStart {
+    Started(FileStatRequest),
+    Deferred,
+}
+
+/// One execution source's handle on the shared range service.
+///
+/// Every request made through it is scheduled under the source's exact scope
+/// and is admitted to the source's operations the moment it is submitted,
+/// before it waits for queue room or starts any work. Sealing those
+/// operations refuses later submissions and stops every admitted request,
+/// and the source's exit observes each request's physical exit, not only its
+/// result.
+#[derive(Clone)]
+pub struct FileRangeBinding {
+    service: Arc<FileRangeService>,
+    scope: FileRangeScope,
+    operations: ConnectorSourceOperations,
+}
+
+/// A submitted request's registration: its id, its own cancellation and the
+/// ticket that ends once the request physically exited. Dropped before the
+/// request is queued, the ticket ends as an operation that never started.
+struct Admission {
+    id: u64,
+    cancellation: FileCancellation,
+    ticket: ConnectorOperationTicket,
+}
+
+enum Queued<T> {
+    Started(T),
+    Deferred(Admission),
+}
+
+impl std::fmt::Debug for FileRangeBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileRangeBinding")
+            .field("scope", &self.scope)
+            .field("operations", &self.operations)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileRangeBinding {
+    pub fn scope(&self) -> FileRangeScope {
+        self.scope
+    }
+
+    pub fn operations(&self) -> &ConnectorSourceOperations {
+        &self.operations
+    }
+
+    pub fn service(&self) -> &Arc<FileRangeService> {
+        &self.service
+    }
+
+    /// The same service and scope, admitting to `operations` instead: a
+    /// stream reading one unit of the source binds the unit's own child
+    /// operations, so closing the unit observes only its requests.
+    pub fn with_operations(&self, operations: ConnectorSourceOperations) -> FileRangeBinding {
+        FileRangeBinding {
+            service: Arc::clone(&self.service),
+            scope: self.scope,
+            operations,
+        }
+    }
+
+    /// Admits a read that must start now: a full queue is an error.
+    pub fn start(
+        &self,
+        class: FileRangeClass,
+        file: BoundFile,
+        range: FileReadRange,
+        cancellation: FileCancellation,
+    ) -> FileResult<FileRangeRequest> {
+        match self.try_start(class, file, range, cancellation)? {
+            FileRangeStart::Started(request) => Ok(request),
+            FileRangeStart::Deferred => Err(FileError::new(
+                FileErrorKind::ResourceExhausted,
+                "range request queue is full",
+            )),
+        }
+    }
+
+    pub fn try_start(
+        &self,
+        class: FileRangeClass,
+        file: BoundFile,
+        range: FileReadRange,
+        cancellation: FileCancellation,
+    ) -> FileResult<FileRangeStart> {
+        self.try_start_with_present(class, file, range, cancellation, None)
+    }
+
+    /// Admits a read now, or reports that it would have to wait for room.
+    pub fn try_start_with_present(
+        &self,
+        class: FileRangeClass,
+        file: BoundFile,
+        range: FileReadRange,
+        cancellation: FileCancellation,
+        present: Option<PreparedFileInput>,
+    ) -> FileResult<FileRangeStart> {
+        let admission = self.admit(&cancellation)?;
+        Ok(
+            match self.service.queue_read(
+                self.scope,
+                admission,
+                class,
+                file,
+                range,
+                present.as_ref(),
+            )? {
+                Queued::Started(request) => FileRangeStart::Started(request),
+                Queued::Deferred(_) => FileRangeStart::Deferred,
+            },
+        )
+    }
+
+    pub async fn start_wait(
+        &self,
+        file: BoundFile,
+        range: FileReadRange,
+        cancellation: FileCancellation,
+    ) -> FileResult<FileRangeRequest> {
+        self.start_wait_with_present(file, range, cancellation, None)
+            .await
+    }
+
+    /// Admits a demand read, waiting for queue room. The request is already
+    /// the source's operation while it waits, so sealing the source ends the
+    /// wait.
+    pub async fn start_wait_with_present(
+        &self,
+        file: BoundFile,
+        range: FileReadRange,
+        cancellation: FileCancellation,
+        present: Option<PreparedFileInput>,
+    ) -> FileResult<FileRangeRequest> {
+        let _waiter = DemandWaitGuard::new(Arc::clone(&self.service));
+        let mut admission = self.admit(&cancellation)?;
+        loop {
+            let changed = self.service.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.service.queue_read(
+                self.scope,
+                admission,
+                FileRangeClass::Demand,
+                file.clone(),
+                range,
+                present.as_ref(),
+            )? {
+                Queued::Started(request) => return Ok(request),
+                Queued::Deferred(deferred) => {
+                    admission = deferred;
+                    tokio::select! {
+                        _ = &mut changed => {}
+                        error = admission.cancellation.ended() => return Err(error),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Admits one HEAD of `file` as demand work now, or reports that it would
+    /// have to wait for room.
+    pub fn try_stat(
+        &self,
+        file: BoundFile,
+        cancellation: FileCancellation,
+    ) -> FileResult<FileStatStart> {
+        let admission = self.admit(&cancellation)?;
+        Ok(
+            match self.service.queue_stat(self.scope, admission, file)? {
+                Queued::Started(request) => FileStatStart::Started(request),
+                Queued::Deferred(_) => FileStatStart::Deferred,
+            },
+        )
+    }
+
+    /// Admits one HEAD of `file`, waiting for queue room like a demand read.
+    pub async fn stat_wait(
+        &self,
+        file: BoundFile,
+        cancellation: FileCancellation,
+    ) -> FileResult<FileStatRequest> {
+        let _waiter = DemandWaitGuard::new(Arc::clone(&self.service));
+        let mut admission = self.admit(&cancellation)?;
+        loop {
+            let changed = self.service.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self
+                .service
+                .queue_stat(self.scope, admission, file.clone())?
+            {
+                Queued::Started(request) => return Ok(request),
+                Queued::Deferred(deferred) => {
+                    admission = deferred;
+                    tokio::select! {
+                        _ = &mut changed => {}
+                        error = admission.cancellation.ended() => return Err(error),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Registers one request with the source before anything else happens to
+    /// it. Its stop cancels the request's own cancellation, which ends a wait
+    /// for room, and stops the request once it is queued.
+    fn admit(&self, cancellation: &FileCancellation) -> FileResult<Admission> {
+        cancellation.check()?;
+        let id = self.service.next_request_id()?;
+        let cancellation = cancellation.child();
+        let stop = {
+            let service = Arc::downgrade(&self.service);
+            let cancellation = cancellation.clone();
+            Arc::new(move || {
+                cancellation.cancel();
+                if let Some(service) = service.upgrade() {
+                    service.stop_request(id);
+                }
+            })
+        };
+        let ticket = self
+            .operations
+            .admit(stop)
+            .map_err(|_| FileError::cancelled("range request source is closed"))?;
+        Ok(Admission {
+            id,
+            cancellation,
+            ticket,
+        })
+    }
+}
+
+/// One HEAD of a bound file, admitted and supervised like a range read: it
+/// takes a process and a source window slot, is dispatched fairly with demand
+/// reads, and its slot returns only when its task exited. Dropping it stops it.
+pub struct FileStatRequest {
+    service: Arc<FileRangeService>,
+    id: u64,
+    cancellation: FileCancellation,
+    size: Option<oneshot::Receiver<FileResult<u64>>>,
+    exit: Option<oneshot::Receiver<FileResult<()>>>,
+}
+
+impl Drop for FileStatRequest {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
+impl FileStatRequest {
+    /// The object's current size. Awaited in place: a dropped wait loses
+    /// nothing and a later one receives the same answer.
+    pub async fn size_ready(&mut self) -> FileResult<u64> {
+        let receiver = self
+            .size
+            .as_mut()
+            .ok_or_else(|| FileError::invalid("stat result already consumed"))?;
+        let outcome = receiver.await;
+        self.size = None;
+        outcome
+            .map_err(|_| FileError::new(FileErrorKind::Internal, "stat request lost its result"))?
+    }
+
+    /// Waits for the stat task to exit; resumable like the result.
+    pub async fn drained(&mut self) -> FileResult<()> {
+        let receiver = self
+            .exit
+            .as_mut()
+            .ok_or_else(|| FileError::invalid("stat exit already consumed"))?;
+        let outcome = receiver.await;
+        self.exit = None;
+        outcome.map_err(|_| {
+            FileError::new(
+                FileErrorKind::Internal,
+                "stat request lost its exit receipt",
+            )
+        })?
+    }
+
+    pub fn request_stop(&self) {
+        self.cancellation.cancel();
+        self.service.stop_request(self.id);
+    }
 }
 
 pub struct FileRangeRequest {
@@ -157,30 +450,47 @@ impl FileRangeRequest {
         self.missing_bytes
     }
 
+    /// The result receiver is awaited in place: a dropped wait loses
+    /// nothing, and a later wait receives the same result.
     async fn take_result(&mut self) -> FileResult<RangeOutput> {
-        self.result
-            .take()
-            .ok_or_else(|| FileError::invalid("range result already consumed"))?
-            .await
+        let receiver = self
+            .result
+            .as_mut()
+            .ok_or_else(|| FileError::invalid("range result already consumed"))?;
+        let outcome = receiver.await;
+        self.result = None;
+        outcome
             .map_err(|_| FileError::new(FileErrorKind::Internal, "range request lost its result"))?
     }
 
-    pub async fn drained(mut self) -> FileResult<()> {
-        self.exit
-            .take()
-            .ok_or_else(|| FileError::invalid("range exit already consumed"))?
-            .await
-            .map_err(|_| {
-                FileError::new(
-                    FileErrorKind::Internal,
-                    "range request lost its exit receipt",
-                )
-            })?
+    /// Waits for every physical segment of the request to exit. Awaited in
+    /// place like the result, so a dropped wait can be resumed.
+    pub async fn drained(&mut self) -> FileResult<()> {
+        let receiver = self
+            .exit
+            .as_mut()
+            .ok_or_else(|| FileError::invalid("range exit already consumed"))?;
+        let outcome = receiver.await;
+        self.exit = None;
+        outcome.map_err(|_| {
+            FileError::new(
+                FileErrorKind::Internal,
+                "range request lost its exit receipt",
+            )
+        })?
     }
 
     pub fn request_stop(&self) {
         self.cancellation.cancel();
         self.service.stop_request(self.id);
+    }
+
+    /// Keeps `hold` alive until the request's physical exit, however long
+    /// that outlives this handle: a charge a caller took for the request's
+    /// bytes stays taken while a task can still hold them. A request that
+    /// already exited drops it at once.
+    pub fn retain_until_exit(&self, hold: Box<dyn std::any::Any + Send>) {
+        self.service.retain_until_exit(self.id, hold);
     }
 }
 
@@ -258,25 +568,156 @@ struct Segment {
     index: usize,
 }
 
+/// What one request asks of the object store.
+enum RequestWork {
+    /// Byte ranges read into one final backing, one segment per unit.
+    Read {
+        pending: VecDeque<Segment>,
+        completed: Vec<Option<BytesMut>>,
+        expected_length: usize,
+        result: Option<oneshot::Sender<FileResult<RangeOutput>>>,
+    },
+    /// One HEAD of the bound file, a single unit.
+    Stat {
+        pending: bool,
+        size: Option<u64>,
+        result: Option<oneshot::Sender<FileResult<u64>>>,
+    },
+}
+
+impl RequestWork {
+    fn has_pending(&self) -> bool {
+        match self {
+            Self::Read { pending, .. } => !pending.is_empty(),
+            Self::Stat { pending, .. } => *pending,
+        }
+    }
+
+    fn next_unit(&mut self) -> DispatchUnit {
+        match self {
+            Self::Read { pending, .. } => {
+                DispatchUnit::Segment(pending.pop_front().expect("queued segment"))
+            }
+            Self::Stat { pending, .. } => {
+                *pending = false;
+                DispatchUnit::Stat
+            }
+        }
+    }
+
+    /// Drops the work not dispatched yet and reports `error` as the result.
+    fn fail(&mut self, error: FileError) {
+        match self {
+            Self::Read {
+                pending, result, ..
+            } => {
+                pending.clear();
+                if let Some(sender) = result.take() {
+                    let _ = sender.send(Err(error));
+                }
+            }
+            Self::Stat {
+                pending, result, ..
+            } => {
+                *pending = false;
+                if let Some(sender) = result.take() {
+                    let _ = sender.send(Err(error));
+                }
+            }
+        }
+    }
+
+    fn record(&mut self, output: UnitOutput) {
+        match (self, output) {
+            (Self::Read { completed, .. }, UnitOutput::Segment { index, bytes }) => {
+                completed[index] = Some(bytes);
+            }
+            (Self::Stat { size, .. }, UnitOutput::Stat(stat)) => *size = Some(stat),
+            _ => unreachable!("a unit reports the work it was dispatched for"),
+        }
+    }
+
+    /// Publishes the result of work every unit of which completed.
+    fn publish(self) {
+        match self {
+            Self::Read {
+                completed,
+                expected_length,
+                result: Some(sender),
+                ..
+            } => {
+                let mut segments = completed.into_iter();
+                let mut backing = segments
+                    .next()
+                    .expect("nonempty range")
+                    .expect("completed segment");
+                for segment in segments {
+                    backing.unsplit(segment.expect("completed segment"));
+                }
+                let result =
+                    if backing.len() == expected_length && backing.capacity() == expected_length {
+                        Ok(RangeOutput {
+                            bytes: backing.freeze(),
+                            retained_backing_capacity: expected_length,
+                        })
+                    } else {
+                        Err(FileError::new(
+                            FileErrorKind::Internal,
+                            "range target changed its reserved length or capacity",
+                        ))
+                    };
+                let _ = sender.send(result);
+            }
+            Self::Stat {
+                size,
+                result: Some(sender),
+                ..
+            } => {
+                let _ = sender.send(size.ok_or_else(|| {
+                    FileError::new(
+                        FileErrorKind::Internal,
+                        "stat request exited without a size",
+                    )
+                }));
+            }
+            Self::Read { result: None, .. } | Self::Stat { result: None, .. } => {}
+        }
+    }
+}
+
+/// One dispatched unit of a request.
+enum DispatchUnit {
+    Segment(Segment),
+    Stat,
+}
+
+/// What a dispatched unit produced.
+enum UnitOutput {
+    Segment { index: usize, bytes: BytesMut },
+    Stat(u64),
+}
+
 struct RequestState {
     scope: FileRangeScope,
     class: FileRangeClass,
     paused: bool,
     file: BoundFile,
     cancellation: FileCancellation,
-    pending: VecDeque<Segment>,
-    completed: Vec<Option<BytesMut>>,
-    expected_length: usize,
+    work: RequestWork,
     active: usize,
     failed: bool,
     exit_error: Option<FileError>,
-    result: Option<oneshot::Sender<FileResult<RangeOutput>>>,
     exit: Option<oneshot::Sender<FileResult<()>>>,
+    /// The request's operation in its source, ended with its physical exit.
+    ticket: Option<ConnectorOperationTicket>,
+    /// What callers keep alive until the physical exit; see
+    /// [`FileRangeRequest::retain_until_exit`].
+    holds: Vec<Box<dyn std::any::Any + Send>>,
 }
 
+#[derive(Default)]
 struct State {
     closed: bool,
-    next_id: u64,
     active: usize,
     source_active: HashMap<FileRangeScope, usize>,
     requests: HashMap<u64, RequestState>,
@@ -286,28 +727,12 @@ struct State {
     last_source: HashMap<(i64, i64, u64), (i64, i64, i32)>,
 }
 
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            closed: false,
-            next_id: 0,
-            active: 0,
-            source_active: HashMap::new(),
-            requests: HashMap::new(),
-            demand: VecDeque::new(),
-            prefetch: VecDeque::new(),
-            last_query: None,
-            last_source: HashMap::new(),
-        }
-    }
-}
-
 struct Dispatch {
     id: u64,
     scope: FileRangeScope,
     file: BoundFile,
     cancellation: FileCancellation,
-    segment: Segment,
+    unit: DispatchUnit,
 }
 
 pub struct FileRangeService {
@@ -315,11 +740,74 @@ pub struct FileRangeService {
     source_window: usize,
     queue_capacity: usize,
     demand_waiters: AtomicUsize,
+    next_id: AtomicU64,
     task_spawner: Arc<dyn FileTaskSpawner>,
     scan_handle: Handle,
     state: Mutex<State>,
-    supervisors: Mutex<Vec<JoinHandle<()>>>,
+    /// Segment supervisors that have not exited yet.
+    live_supervisors: AtomicUsize,
     changed: Notify,
+}
+
+/// Settles one dispatched segment exactly once: with the supervisor's real
+/// outcome, or, when the supervisor ends early (its runtime dropped it or it
+/// panicked), with an error. The window slot is released either way.
+struct SegmentSettlement {
+    service: Arc<FileRangeService>,
+    id: u64,
+    scope: FileRangeScope,
+    result_delivered: bool,
+    settled: bool,
+}
+
+impl SegmentSettlement {
+    fn new(service: Arc<FileRangeService>, id: u64, scope: FileRangeScope) -> Self {
+        service.live_supervisors.fetch_add(1, Ordering::AcqRel);
+        Self {
+            service,
+            id,
+            scope,
+            result_delivered: false,
+            settled: false,
+        }
+    }
+
+    fn deliver(&mut self, result: FileResult<UnitOutput>) {
+        self.result_delivered = true;
+        self.service.unit_result(self.id, result);
+    }
+
+    fn settle(mut self, exit: FileResult<()>) {
+        self.settled = true;
+        self.service.segment_exit(self.id, self.scope, exit);
+    }
+}
+
+impl Drop for SegmentSettlement {
+    fn drop(&mut self) {
+        if !self.settled {
+            if !self.result_delivered {
+                self.service.unit_result(
+                    self.id,
+                    Err(FileError::new(
+                        FileErrorKind::Internal,
+                        "range segment supervisor ended before its result",
+                    )),
+                );
+            }
+            self.service.segment_exit(
+                self.id,
+                self.scope,
+                Err(FileError::new(
+                    FileErrorKind::Internal,
+                    "range segment supervisor ended before its task exited",
+                )),
+            );
+        }
+        if self.service.live_supervisors.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.service.changed.notify_waiters();
+        }
+    }
 }
 
 struct DemandWaitGuard(Arc<FileRangeService>);
@@ -351,94 +839,50 @@ impl FileRangeService {
             source_window: source_window.get(),
             queue_capacity: queue_capacity.get(),
             demand_waiters: AtomicUsize::new(0),
+            next_id: AtomicU64::new(0),
             task_spawner,
             scan_handle,
             state: Mutex::new(State::default()),
-            supervisors: Mutex::new(Vec::new()),
+            live_supervisors: AtomicUsize::new(0),
             changed: Notify::new(),
         })
     }
 
-    pub fn start(
+    /// How many units one source may run at once; a caller planning several
+    /// requests of one source gains nothing from submitting more at a time.
+    pub fn source_window(&self) -> usize {
+        self.source_window
+    }
+
+    /// Binds one execution source to this service; see [`FileRangeBinding`].
+    pub fn bind(
         self: &Arc<Self>,
         scope: FileRangeScope,
-        class: FileRangeClass,
-        file: BoundFile,
-        range: FileReadRange,
-        cancellation: FileCancellation,
-    ) -> FileResult<FileRangeRequest> {
-        match self.try_start(scope, class, file, range, cancellation)? {
-            FileRangeStart::Started(request) => Ok(request),
-            FileRangeStart::Deferred => Err(FileError::new(
-                FileErrorKind::ResourceExhausted,
-                "range request queue is full",
-            )),
+        operations: ConnectorSourceOperations,
+    ) -> FileRangeBinding {
+        FileRangeBinding {
+            service: Arc::clone(self),
+            scope,
+            operations,
         }
     }
 
-    pub async fn start_wait(
-        self: &Arc<Self>,
-        scope: FileRangeScope,
-        file: BoundFile,
-        range: FileReadRange,
-        cancellation: FileCancellation,
-    ) -> FileResult<FileRangeRequest> {
-        self.start_wait_with_present(scope, file, range, cancellation, None)
-            .await
+    fn next_request_id(&self) -> FileResult<u64> {
+        self.next_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+            .map_err(|_| FileError::new(FileErrorKind::Internal, "range request id exhausted"))
     }
 
-    pub async fn start_wait_with_present(
+    fn queue_read(
         self: &Arc<Self>,
         scope: FileRangeScope,
-        file: BoundFile,
-        range: FileReadRange,
-        cancellation: FileCancellation,
-        present: Option<PreparedFileInput>,
-    ) -> FileResult<FileRangeRequest> {
-        let _waiter = DemandWaitGuard::new(Arc::clone(self));
-        loop {
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            cancellation.check()?;
-            match self.try_start_with_present(
-                scope,
-                FileRangeClass::Demand,
-                file.clone(),
-                range,
-                cancellation.clone(),
-                present.clone(),
-            )? {
-                FileRangeStart::Started(request) => return Ok(request),
-                FileRangeStart::Deferred => {
-                    tokio::select! { _ = &mut changed => {}, error = cancellation.ended() => return Err(error) }
-                }
-            }
-        }
-    }
-
-    pub fn try_start(
-        self: &Arc<Self>,
-        scope: FileRangeScope,
+        admission: Admission,
         class: FileRangeClass,
         file: BoundFile,
         range: FileReadRange,
-        cancellation: FileCancellation,
-    ) -> FileResult<FileRangeStart> {
-        self.try_start_with_present(scope, class, file, range, cancellation, None)
-    }
-
-    pub fn try_start_with_present(
-        self: &Arc<Self>,
-        scope: FileRangeScope,
-        class: FileRangeClass,
-        file: BoundFile,
-        range: FileReadRange,
-        cancellation: FileCancellation,
-        present: Option<PreparedFileInput>,
-    ) -> FileResult<FileRangeStart> {
-        cancellation.check()?;
-        if let Some(input) = &present {
+        present: Option<&PreparedFileInput>,
+    ) -> FileResult<Queued<FileRangeRequest>> {
+        if let Some(input) = present {
             input.validate_for(&file)?;
         }
         let (offset, length) = match range {
@@ -470,35 +914,28 @@ impl FileRangeService {
         if state.closed {
             return Err(FileError::cancelled("range service admission is closed"));
         }
+        // Checked under the lock a stop takes: a source sealed before this
+        // point refuses the request, and one sealed after it finds it queued.
+        admission.cancellation.check()?;
         if class == FileRangeClass::Prefetch && self.demand_waiters.load(Ordering::SeqCst) != 0 {
-            return Ok(FileRangeStart::Deferred);
+            return Ok(Queued::Deferred(admission));
         }
         if state.demand.len() + state.prefetch.len() >= self.queue_capacity {
             if class == FileRangeClass::Prefetch {
-                return Ok(FileRangeStart::Deferred);
+                return Ok(Queued::Deferred(admission));
             }
-            // Queued speculation must not occupy the last demand slot.
-            while state.demand.len() + state.prefetch.len() >= self.queue_capacity {
-                let Some(evicted) = state.prefetch.pop_back() else {
-                    return Ok(FileRangeStart::Deferred);
-                };
-                self.fail_request_locked(
-                    &mut state,
-                    evicted,
-                    FileError::cancelled("queued prefetch yielded to demand"),
-                );
+            if !self.make_demand_room_locked(&mut state) {
+                return Ok(Queued::Deferred(admission));
             }
         }
-        let cancellation = cancellation.child();
-        let (pending, completed, partial_copy_bytes) =
-            prepare_segments(offset, length, present.as_ref())?;
+        let (pending, completed, partial_copy_bytes) = prepare_segments(offset, length, present)?;
         let (result_sender, result) = oneshot::channel();
         let (exit_sender, exit) = oneshot::channel();
-        let id = state.next_id;
-        state.next_id = state
-            .next_id
-            .checked_add(1)
-            .ok_or_else(|| FileError::new(FileErrorKind::Internal, "range request id exhausted"))?;
+        let Admission {
+            id,
+            cancellation,
+            ticket,
+        } = admission;
         state.requests.insert(
             id,
             RequestState {
@@ -507,17 +944,21 @@ impl FileRangeService {
                 paused: false,
                 file: file.clone(),
                 cancellation: cancellation.clone(),
-                pending,
-                completed,
-                expected_length: length,
+                work: RequestWork::Read {
+                    pending,
+                    completed,
+                    expected_length: length,
+                    result: Some(result_sender),
+                },
                 active: 0,
                 failed: false,
                 exit_error: None,
-                result: Some(result_sender),
                 exit: Some(exit_sender),
+                ticket: Some(ticket),
+                holds: Vec::new(),
             },
         );
-        if state.requests[&id].pending.is_empty() {
+        if !state.requests[&id].work.has_pending() {
             self.finish_locked(&mut state, id);
         } else {
             match class {
@@ -527,7 +968,7 @@ impl FileRangeService {
         }
         drop(state);
         self.dispatch();
-        Ok(FileRangeStart::Started(FileRangeRequest {
+        Ok(Queued::Started(FileRangeRequest {
             service: Arc::clone(self),
             id,
             cancellation,
@@ -538,6 +979,80 @@ impl FileRangeService {
             result: Some(result),
             exit: Some(exit),
         }))
+    }
+
+    fn queue_stat(
+        self: &Arc<Self>,
+        scope: FileRangeScope,
+        admission: Admission,
+        file: BoundFile,
+    ) -> FileResult<Queued<FileStatRequest>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FileError::new(FileErrorKind::Internal, "range service state poisoned"))?;
+        if state.closed {
+            return Err(FileError::cancelled("range service admission is closed"));
+        }
+        admission.cancellation.check()?;
+        if !self.make_demand_room_locked(&mut state) {
+            return Ok(Queued::Deferred(admission));
+        }
+        let (size_sender, size) = oneshot::channel();
+        let (exit_sender, exit) = oneshot::channel();
+        let Admission {
+            id,
+            cancellation,
+            ticket,
+        } = admission;
+        state.requests.insert(
+            id,
+            RequestState {
+                scope,
+                class: FileRangeClass::Demand,
+                paused: false,
+                file,
+                cancellation: cancellation.clone(),
+                work: RequestWork::Stat {
+                    pending: true,
+                    size: None,
+                    result: Some(size_sender),
+                },
+                active: 0,
+                failed: false,
+                exit_error: None,
+                exit: Some(exit_sender),
+                ticket: Some(ticket),
+                holds: Vec::new(),
+            },
+        );
+        state.demand.push_back(id);
+        drop(state);
+        self.dispatch();
+        Ok(Queued::Started(FileStatRequest {
+            service: Arc::clone(self),
+            id,
+            cancellation,
+            size: Some(size),
+            exit: Some(exit),
+        }))
+    }
+
+    /// Makes room for demand work in the shared queue: queued speculation must
+    /// not occupy the last demand slot, so queued prefetches yield from the
+    /// back. False when the queue holds nothing but demand.
+    fn make_demand_room_locked(&self, state: &mut State) -> bool {
+        while state.demand.len() + state.prefetch.len() >= self.queue_capacity {
+            let Some(evicted) = state.prefetch.pop_back() else {
+                return false;
+            };
+            self.fail_request_locked(
+                state,
+                evicted,
+                FileError::cancelled("queued prefetch yielded to demand"),
+            );
+        }
+        true
     }
 
     pub fn close_admission(self: &Arc<Self>) {
@@ -572,6 +1087,21 @@ impl FileRangeService {
         self.dispatch();
     }
 
+    fn retain_until_exit(&self, id: u64, hold: Box<dyn std::any::Any + Send>) {
+        let released = match self.state.lock() {
+            Ok(mut state) => match state.requests.get_mut(&id) {
+                Some(request) => {
+                    request.holds.push(hold);
+                    None
+                }
+                None => Some(hold),
+            },
+            Err(_) => Some(hold),
+        };
+        // Outside the lock: a request that already exited holds no bytes.
+        drop(released);
+    }
+
     fn set_prefetch_paused(self: &Arc<Self>, id: u64, paused: bool) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -591,18 +1121,10 @@ impl FileRangeService {
         }
     }
 
+    /// Waits until every request ended and every segment supervisor exited.
+    /// It owns nothing, so a dropped wait loses no exit.
     pub async fn drain(&self) -> FileResult<()> {
-        self.wait_requests_empty(|| {}).await?;
-        let supervisors =
-            std::mem::take(&mut *self.supervisors.lock().map_err(|_| {
-                FileError::new(FileErrorKind::Internal, "range supervisors poisoned")
-            })?);
-        for supervisor in supervisors {
-            supervisor.await.map_err(|error| {
-                FileError::with_source(FileErrorKind::Internal, "range supervisor failed", error)
-            })?;
-        }
-        Ok(())
+        self.wait_requests_empty(|| {}).await
     }
 
     async fn wait_requests_empty(&self, mut before_wait: impl FnMut()) -> FileResult<()> {
@@ -618,6 +1140,7 @@ impl FileRangeService {
                 })?
                 .requests
                 .is_empty()
+                && self.live_supervisors.load(Ordering::Acquire) == 0
             {
                 break;
             }
@@ -636,11 +1159,8 @@ impl FileRangeService {
         };
         if !request.failed {
             request.cancellation.cancel();
-            request.pending.clear();
             request.failed = true;
-            if let Some(sender) = request.result.take() {
-                let _ = sender.send(Err(error));
-            }
+            request.work.fail(error);
         }
         if request.active == 0 {
             self.finish_locked(state, id);
@@ -651,29 +1171,15 @@ impl FileRangeService {
         let Some(mut request) = state.requests.remove(&id) else {
             return;
         };
-        if let Some(sender) = request.result.take() {
-            let mut segments = request.completed.into_iter();
-            let mut backing = segments
-                .next()
-                .expect("nonempty range")
-                .expect("completed segment");
-            for segment in segments {
-                backing.unsplit(segment.expect("completed segment"));
-            }
-            let result = if backing.len() == request.expected_length
-                && backing.capacity() == request.expected_length
-            {
-                Ok(RangeOutput {
-                    bytes: backing.freeze(),
-                    retained_backing_capacity: request.expected_length,
-                })
-            } else {
-                Err(FileError::new(
-                    FileErrorKind::Internal,
-                    "range target changed its reserved length or capacity",
-                ))
-            };
-            let _ = sender.send(result);
+        request.work.publish();
+        // Released before the exit is announced, so whoever observes the
+        // exit also observes its charges returned.
+        drop(std::mem::take(&mut request.holds));
+        if let Some(ticket) = request.ticket.take() {
+            ticket.end(match &request.exit_error {
+                None => Ok(()),
+                Some(error) => Err(ConnectorError::from(error)),
+            });
         }
         if let Some(sender) = request.exit.take() {
             let _ = sender.send(request.exit_error.map_or(Ok(()), Err));
@@ -695,15 +1201,15 @@ impl FileRangeService {
                     return;
                 };
                 let request = state.requests.get_mut(&id).expect("queued range request");
-                let segment = request.pending.pop_front().expect("queued segment");
+                let unit = request.work.next_unit();
                 let work = Dispatch {
                     id,
                     scope: request.scope,
                     file: request.file.clone(),
                     cancellation: request.cancellation.child(),
-                    segment,
+                    unit,
                 };
-                let has_more = !request.pending.is_empty();
+                let has_more = request.work.has_pending();
                 let class = request.class;
                 request.active += 1;
                 state.active += 1;
@@ -812,63 +1318,72 @@ impl FileRangeService {
             scope,
             file,
             cancellation,
-            segment,
+            unit,
         } = work;
-        let Segment {
-            offset,
-            mut bytes,
-            index,
-        } = segment;
-        let len = bytes.len() as u64;
         let (sender, receiver) = oneshot::channel();
-        let task = self.task_spawner.spawn(Box::pin(async move {
-            let result = file
-                .read_into(
-                    FileReadRange::Bounded {
-                        offset,
-                        length: len,
-                    },
-                    &mut bytes,
-                    &cancellation,
-                )
-                .await
-                .map(|()| bytes);
-            let _ = sender.send(result);
-        }));
+        let task = match unit {
+            DispatchUnit::Segment(Segment {
+                offset,
+                mut bytes,
+                index,
+            }) => {
+                let len = bytes.len() as u64;
+                self.task_spawner.spawn(Box::pin(async move {
+                    let result = file
+                        .read_into(
+                            FileReadRange::Bounded {
+                                offset,
+                                length: len,
+                            },
+                            &mut bytes,
+                            &cancellation,
+                        )
+                        .await
+                        .map(|()| UnitOutput::Segment { index, bytes });
+                    let _ = sender.send(result);
+                }))
+            }
+            DispatchUnit::Stat => self.task_spawner.spawn(Box::pin(async move {
+                let result = file.stat(&cancellation).await.map(UnitOutput::Stat);
+                let _ = sender.send(result);
+            })),
+        };
         match task {
-            Ok(task) => {
-                let service = Arc::clone(self);
-                let supervisor = self.scan_handle.spawn(async move {
+            Ok(mut task) => {
+                // Created before the spawn: a supervisor the runtime never
+                // runs still releases its slot when its future is dropped.
+                let mut settlement = SegmentSettlement::new(Arc::clone(self), id, scope);
+                // The supervisor is the one owner of the physical task; its
+                // handle is not kept, the settlement accounts for its exit.
+                drop(self.scan_handle.spawn(async move {
                     let result = receiver.await.unwrap_or_else(|_| {
                         Err(FileError::new(
                             FileErrorKind::Internal,
                             "range segment exited without result",
                         ))
                     });
-                    service.segment_result(id, index, result);
+                    settlement.deliver(result);
                     let exit = task.drain().await;
-                    service.segment_exit(id, scope, exit);
-                });
-                if let Ok(mut supervisors) = self.supervisors.lock() {
-                    supervisors.retain(|supervisor| !supervisor.is_finished());
-                    supervisors.push(supervisor);
-                }
+                    settlement.settle(exit);
+                }));
             }
             Err(error) => {
-                self.segment_result(id, index, Err(error));
+                self.unit_result(id, Err(error));
                 self.segment_exit(id, scope, Ok(()));
             }
         }
     }
 
-    fn segment_result(&self, id: u64, index: usize, result: FileResult<BytesMut>) {
+    fn unit_result(&self, id: u64, result: FileResult<UnitOutput>) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
         match result {
-            Ok(bytes) => {
-                if let Some(request) = state.requests.get_mut(&id) {
-                    request.completed[index] = Some(bytes);
+            Ok(output) => {
+                if let Some(request) = state.requests.get_mut(&id)
+                    && !request.failed
+                {
+                    request.work.record(output);
                 }
             }
             Err(error) => self.fail_request_locked(&mut state, id, error),
@@ -901,7 +1416,7 @@ impl FileRangeService {
             if state
                 .requests
                 .get(&id)
-                .is_some_and(|request| request.active == 0 && request.pending.is_empty())
+                .is_some_and(|request| request.active == 0 && !request.work.has_pending())
             {
                 self.finish_locked(&mut state, id);
             }
@@ -998,14 +1513,18 @@ mod tests {
                 paused: false,
                 file,
                 cancellation: FileCancellation::new(),
-                pending: VecDeque::new(),
-                completed: Vec::new(),
-                expected_length: 0,
+                work: RequestWork::Read {
+                    pending: VecDeque::new(),
+                    completed: Vec::new(),
+                    expected_length: 0,
+                    result: None,
+                },
                 active: 0,
                 failed: false,
                 exit_error: None,
-                result: None,
                 exit: None,
+                ticket: None,
+                holds: Vec::new(),
             },
         );
         let mut removed = false;
@@ -1026,6 +1545,476 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_waits_for_the_result_and_the_exit_can_be_resumed() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        let mut request = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .start(
+                FileRangeClass::Demand,
+                file,
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("admitted");
+
+        // A waiter gives up before the segment ran: nothing is lost.
+        let gave_up =
+            tokio::time::timeout(std::time::Duration::from_millis(20), request.result_ready())
+                .await;
+        assert!(gave_up.is_err(), "the gated segment has not run yet");
+        let gave_up =
+            tokio::time::timeout(std::time::Duration::from_millis(20), request.drained()).await;
+        assert!(gave_up.is_err());
+
+        spawner.release(1);
+        assert_eq!(
+            &request.result_ready().await.expect("the same result")[..],
+            b"abcd"
+        );
+        request.drained().await.expect("the same exit");
+        assert_eq!(spawner.started(), 1, "waiting again never re-reads");
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn a_stat_waits_for_the_window_a_read_holds_and_then_reports_the_size() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        let mut read = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("read admitted");
+        let mut stat = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .stat_wait(file, FileCancellation::new())
+            .await
+            .expect("stat admitted");
+        assert_eq!(
+            spawner.started(),
+            1,
+            "the stat queues behind the read holding the only slot"
+        );
+
+        spawner.release(1);
+        read.result_ready().await.expect("read bytes");
+        read.drained().await.expect("read exit");
+        spawner.release(1);
+        assert_eq!(stat.size_ready().await.expect("stat size"), 16);
+        stat.drained().await.expect("stat exit");
+        assert_eq!(spawner.started(), 2);
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_queued_stat_reports_cancellation_and_exits() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        let mut read = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("read admitted");
+        let FileStatStart::Started(mut stat) = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .try_stat(file, FileCancellation::new())
+            .expect("stat admission")
+        else {
+            panic!("room for the stat");
+        };
+        stat.request_stop();
+        let error = stat.size_ready().await.expect_err("stopped");
+        assert_eq!(error.kind(), FileErrorKind::Cancelled);
+        stat.drained()
+            .await
+            .expect("a stat that never ran has exited");
+
+        spawner.release(1);
+        read.result_ready().await.expect("read bytes");
+        read.drained().await.expect("read exit");
+        assert_eq!(spawner.started(), 1, "the stopped stat never ran");
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn a_hold_outlives_its_dropped_request_until_the_physical_exit() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        let operations = ConnectorSourceOperations::new();
+        let source = service.bind(scope(1, 1), operations.clone());
+        let charge = Arc::new(());
+        let request = source
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("admitted");
+        request.retain_until_exit(Box::new(Arc::clone(&charge)));
+        assert_eq!(spawner.started(), 1);
+
+        drop(request);
+        assert_eq!(
+            Arc::strong_count(&charge),
+            2,
+            "the stopped read's task can still hold its bytes"
+        );
+        operations.seal();
+        spawner.release(1);
+        operations.exited().await.expect("the source exits");
+        assert_eq!(
+            Arc::strong_count(&charge),
+            1,
+            "the charge is returned by the time the exit is observed"
+        );
+
+        // A request that already exited keeps nothing it is handed.
+        let operations = ConnectorSourceOperations::new();
+        let source = service.bind(scope(1, 2), operations.clone());
+        let mut request = source
+            .start(
+                FileRangeClass::Demand,
+                file,
+                range(4, 4),
+                FileCancellation::new(),
+            )
+            .expect("admitted");
+        spawner.release(1);
+        assert_eq!(&request.result_ready().await.expect("read")[..], b"efgh");
+        request.drained().await.expect("exit");
+        request.retain_until_exit(Box::new(Arc::clone(&charge)));
+        assert_eq!(Arc::strong_count(&charge), 1);
+        drop(request);
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn a_sealed_source_stops_its_request_and_exits_only_after_the_physical_task() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        let operations = ConnectorSourceOperations::new();
+        let source = service.bind(scope(1, 1), operations.clone());
+        let mut request = source
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("admitted");
+        assert_eq!(spawner.started(), 1);
+        assert_eq!(operations.live_operations(), 1);
+
+        operations.seal();
+        assert_eq!(
+            request.result_ready().await.expect_err("stopped").kind(),
+            FileErrorKind::Cancelled
+        );
+        match source.try_start(
+            FileRangeClass::Demand,
+            file.clone(),
+            range(4, 4),
+            FileCancellation::new(),
+        ) {
+            Err(error) => assert_eq!(error.kind(), FileErrorKind::Cancelled),
+            Ok(_) => panic!("a sealed source admits no request"),
+        }
+        let refused = source
+            .stat_wait(file, FileCancellation::new())
+            .await
+            .err()
+            .expect("a sealed source admits no stat");
+        assert_eq!(refused.kind(), FileErrorKind::Cancelled);
+
+        let mut exit = operations.exited();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut exit)
+                .await
+                .is_err(),
+            "the stopped read still holds its physical task"
+        );
+        assert_eq!(service.state.lock().expect("state").active, 1);
+
+        spawner.release(1);
+        exit.await
+            .expect("the source exits cleanly once the task exited");
+        request.drained().await.expect("request exit");
+        {
+            let state = service.state.lock().expect("state");
+            assert_eq!(state.active, 0, "the window slot is released exactly once");
+            assert!(state.source_active.is_empty());
+            assert!(state.requests.is_empty());
+        }
+        assert_eq!(spawner.started(), 1, "a sealed source dispatches nothing");
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn a_request_waiting_for_room_ends_when_its_source_is_sealed() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        // Another source holds the only slot and the only queue entry.
+        let other = service.bind(scope(1, 2), ConnectorSourceOperations::new());
+        let mut running = other
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("running");
+        let mut queued = other
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(4, 4),
+                FileCancellation::new(),
+            )
+            .expect("queued");
+
+        let operations = ConnectorSourceOperations::new();
+        let source = service.bind(scope(1, 1), operations.clone());
+        let waiting = tokio::spawn({
+            let file = file.clone();
+            async move {
+                source
+                    .start_wait(file, range(8, 4), FileCancellation::new())
+                    .await
+                    .map(drop)
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while operations.live_operations() != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the waiting request is already the source's operation");
+
+        operations.seal();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("the seal ends the wait for room")
+            .expect("waiting task");
+        assert_eq!(
+            outcome.expect_err("sealed").kind(),
+            FileErrorKind::Cancelled
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), operations.exited())
+            .await
+            .expect("a wait that never queued leaves nothing behind")
+            .expect("clean exit");
+
+        spawner.release(2);
+        running
+            .result_ready()
+            .await
+            .expect("other source unaffected");
+        queued
+            .result_ready()
+            .await
+            .expect("other source unaffected");
+        running.drained().await.expect("running exit");
+        queued.drained().await.expect("queued exit");
+        assert_eq!(spawner.started(), 2, "the refused request never ran");
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn each_source_of_a_task_closes_on_its_own() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        // Two scan nodes of one Task: one query, two sources.
+        let first_operations = ConnectorSourceOperations::new();
+        let second_operations = ConnectorSourceOperations::new();
+        let first = service.bind(scope(1, 1), first_operations.clone());
+        let second = service.bind(scope(1, 2), second_operations.clone());
+        let mut first_read = first
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("first source read");
+        let mut second_read = second
+            .start(
+                FileRangeClass::Demand,
+                file,
+                range(4, 4),
+                FileCancellation::new(),
+            )
+            .expect("second source read");
+        assert_eq!(spawner.started(), 2);
+
+        first_operations.seal();
+        spawner.release(2);
+        assert_eq!(
+            first_read
+                .result_ready()
+                .await
+                .expect_err("first source closed")
+                .kind(),
+            FileErrorKind::Cancelled
+        );
+        assert_eq!(
+            &second_read
+                .result_ready()
+                .await
+                .expect("the other source still reads")[..],
+            b"efgh"
+        );
+        first_operations
+            .exited()
+            .await
+            .expect("first source exited");
+        second_read.drained().await.expect("second read exit");
+        assert_eq!(second_operations.live_operations(), 0);
+        assert!(
+            !second_operations.is_exited(),
+            "an idle open source has not exited"
+        );
+        second_operations.seal();
+        second_operations
+            .exited()
+            .await
+            .expect("second source exited");
+        first_read.drained().await.expect("first read exit");
+        service.drain().await.expect("service drain");
+    }
+
+    #[test]
+    fn a_supervisor_its_runtime_drops_still_releases_its_slot() {
+        let (_dir, file) = fixture();
+        let io_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("io runtime");
+        let scan_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("scan runtime");
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            Arc::new(crate::TokioFileTaskSpawner::new(
+                io_runtime.handle().clone(),
+            )),
+            scan_runtime.handle().clone(),
+        );
+        // A read that never completes holds the only process slot.
+        let spawner = GateSpawner::new();
+        let blocked_service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            spawner.clone(),
+            scan_runtime.handle().clone(),
+        );
+        let _guard = io_runtime.enter();
+        let operations = ConnectorSourceOperations::new();
+        let mut stuck = blocked_service
+            .bind(scope(1, 1), operations.clone())
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("admitted");
+        drop(service);
+        assert_eq!(blocked_service.state.lock().expect("state").active, 1);
+
+        // The scan runtime goes away with the supervisor still waiting.
+        drop(scan_runtime);
+        let state = blocked_service.state.lock().expect("state");
+        assert_eq!(state.active, 0, "the window slot is released exactly once");
+        assert!(state.requests.is_empty());
+        drop(state);
+        assert_eq!(blocked_service.live_supervisors.load(Ordering::Acquire), 0);
+        let outcome = io_runtime.block_on(stuck.result_ready());
+        assert!(
+            outcome.is_err(),
+            "no result is invented for an abandoned read"
+        );
+        assert!(io_runtime.block_on(stuck.drained()).is_err());
+        assert_eq!(operations.live_operations(), 0);
+        operations.seal();
+        let exit = io_runtime
+            .block_on(operations.exited())
+            .expect_err("the source keeps the supervisor's exit error");
+        assert_eq!(
+            exit.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Internal
+        );
+        io_runtime
+            .block_on(blocked_service.drain())
+            .expect("nothing is left to wait for");
+    }
+
+    #[tokio::test]
     async fn prepared_middle_span_dispatches_only_two_missing_segments() {
         let (_dir, file) = fixture();
         let spawner = GateSpawner::new();
@@ -1039,8 +2028,8 @@ mod tests {
         let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
             .expect("prepared middle span");
         let mut request = match service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .try_start_with_present(
-                scope(1, 1),
                 FileRangeClass::Demand,
                 file,
                 range(0, 12),
@@ -1076,8 +2065,8 @@ mod tests {
             Handle::current(),
         );
         let mut request = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .start(
-                scope(1, 1),
                 FileRangeClass::Prefetch,
                 file.clone(),
                 range(2, 7),
@@ -1119,8 +2108,8 @@ mod tests {
                 .expect("prepared wrong file");
             assert!(
                 service
+                    .bind(scope(1, 1), ConnectorSourceOperations::new())
                     .try_start_with_present(
-                        scope(1, 1),
                         FileRangeClass::Demand,
                         file.clone(),
                         range(0, 8),
@@ -1146,13 +2135,8 @@ mod tests {
             .expect("prepared middle span");
         std::fs::remove_file(dir.path().join("range.parquet")).expect("remove source");
         let mut request = service
-            .start_wait_with_present(
-                scope(1, 1),
-                file,
-                range(0, 12),
-                FileCancellation::new(),
-                Some(present),
-            )
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .start_wait_with_present(file, range(0, 12), FileCancellation::new(), Some(present))
             .await
             .expect("accepted request");
         assert!(request.result_ready().await.is_err());
@@ -1175,8 +2159,8 @@ mod tests {
         let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
             .expect("prepared middle span");
         let mut partial = match service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .try_start_with_present(
-                scope(1, 1),
                 FileRangeClass::Demand,
                 file,
                 range(0, 12),
@@ -1191,7 +2175,7 @@ mod tests {
         assert_eq!(spawner.started(), 1);
         partial.request_stop();
         assert!(partial.result_ready().await.is_err());
-        let drain = tokio::spawn(partial.drained());
+        let drain = tokio::spawn(async move { partial.drained().await });
         tokio::task::yield_now().await;
         assert!(!drain.is_finished());
         assert_eq!(spawner.started(), 1);
@@ -1213,8 +2197,8 @@ mod tests {
             Handle::current(),
         );
         let mut first = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .start(
-                scope(1, 1),
                 FileRangeClass::Demand,
                 file.clone(),
                 range(0, 4),
@@ -1223,8 +2207,8 @@ mod tests {
             .expect("first");
         assert_eq!(spawner.started(), 1);
         let mut speculative = match service
+            .bind(scope(1, 2), ConnectorSourceOperations::new())
             .try_start(
-                scope(1, 2),
                 FileRangeClass::Prefetch,
                 file.clone(),
                 range(4, 4),
@@ -1236,8 +2220,8 @@ mod tests {
             FileRangeStart::Deferred => panic!("unexpected defer"),
         };
         let mut later_demand = service
+            .bind(scope(2, 1), ConnectorSourceOperations::new())
             .start(
-                scope(2, 1),
                 FileRangeClass::Demand,
                 file,
                 range(8, 4),
@@ -1293,8 +2277,8 @@ mod tests {
             Handle::current(),
         );
         let mut active = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .start(
-                scope(1, 1),
                 FileRangeClass::Demand,
                 file.clone(),
                 range(0, 4),
@@ -1302,8 +2286,8 @@ mod tests {
             )
             .expect("active");
         let mut waiting = service
+            .bind(scope(2, 1), ConnectorSourceOperations::new())
             .start(
-                scope(2, 1),
                 FileRangeClass::Demand,
                 file.clone(),
                 range(4, 4),
@@ -1312,8 +2296,8 @@ mod tests {
             .expect("waiting");
         assert!(matches!(
             service
+                .bind(scope(3, 1), ConnectorSourceOperations::new())
                 .try_start(
-                    scope(3, 1),
                     FileRangeClass::Prefetch,
                     file,
                     range(8, 4),
@@ -1371,8 +2355,8 @@ mod tests {
             Handle::current(),
         );
         let mut q1s1 = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .start(
-                scope(1, 1),
                 FileRangeClass::Demand,
                 file.clone(),
                 range(0, 4),
@@ -1380,8 +2364,8 @@ mod tests {
             )
             .expect("first");
         let mut q1s1_next = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .start(
-                scope(1, 1),
                 FileRangeClass::Demand,
                 file.clone(),
                 range(4, 4),
@@ -1389,8 +2373,8 @@ mod tests {
             )
             .expect("same source");
         let mut q1s2 = service
+            .bind(scope(1, 2), ConnectorSourceOperations::new())
             .start(
-                scope(1, 2),
                 FileRangeClass::Demand,
                 file.clone(),
                 range(8, 4),
@@ -1398,8 +2382,8 @@ mod tests {
             )
             .expect("other source");
         let mut q2s1 = service
+            .bind(scope(2, 1), ConnectorSourceOperations::new())
             .start(
-                scope(2, 1),
                 FileRangeClass::Demand,
                 file,
                 range(12, 4),
@@ -1450,8 +2434,8 @@ mod tests {
             Handle::current(),
         );
         let mut first = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .start(
-                scope(1, 1),
                 FileRangeClass::Demand,
                 file.clone(),
                 range(0, 4),
@@ -1459,8 +2443,8 @@ mod tests {
             )
             .expect("active demand");
         let mut queued = service
+            .bind(scope(2, 1), ConnectorSourceOperations::new())
             .start(
-                scope(2, 1),
                 FileRangeClass::Demand,
                 file.clone(),
                 range(4, 4),
@@ -1471,12 +2455,8 @@ mod tests {
         let waiting_file = file.clone();
         let waiting = tokio::spawn(async move {
             waiting_service
-                .start_wait(
-                    scope(3, 1),
-                    waiting_file,
-                    range(8, 4),
-                    FileCancellation::new(),
-                )
+                .bind(scope(3, 1), ConnectorSourceOperations::new())
+                .start_wait(waiting_file, range(8, 4), FileCancellation::new())
                 .await
         });
         for _ in 0..100 {
@@ -1488,8 +2468,8 @@ mod tests {
         assert_eq!(service.demand_waiters.load(Ordering::SeqCst), 1);
         assert!(matches!(
             service
+                .bind(scope(4, 1), ConnectorSourceOperations::new())
                 .try_start(
-                    scope(4, 1),
                     FileRangeClass::Prefetch,
                     file,
                     range(12, 4),
@@ -1540,8 +2520,8 @@ mod tests {
             runtime.handle().clone(),
         );
         let mut request = match service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .try_start(
-                scope(1, 1),
                 FileRangeClass::Prefetch,
                 file,
                 range(0, 4),
@@ -1601,8 +2581,8 @@ mod tests {
             Handle::current(),
         );
         let mut request = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .start(
-                scope(1, 1),
                 FileRangeClass::Demand,
                 file,
                 FileReadRange::WholeFile,
@@ -1648,8 +2628,8 @@ mod tests {
             Handle::current(),
         );
         let mut prefetch = service
+            .bind(scope(1, 1), ConnectorSourceOperations::new())
             .start(
-                scope(1, 1),
                 FileRangeClass::Prefetch,
                 file.clone(),
                 FileReadRange::WholeFile,
@@ -1675,8 +2655,8 @@ mod tests {
         .expect("first segment exits");
         assert_eq!(spawner.started(), 1, "queued segment remains paused");
         let mut demand = service
+            .bind(scope(2, 1), ConnectorSourceOperations::new())
             .start(
-                scope(2, 1),
                 FileRangeClass::Demand,
                 file,
                 range(0, 4),
@@ -1759,9 +2739,10 @@ mod tests {
             spawner.clone(),
             Handle::current(),
         );
+        let operations = ConnectorSourceOperations::new();
         let mut request = service
+            .bind(scope(1, 1), operations.clone())
             .start(
-                scope(1, 1),
                 FileRangeClass::Demand,
                 file,
                 FileReadRange::WholeFile,
@@ -1782,8 +2763,16 @@ mod tests {
             1,
             "held sibling still owns its physical slot"
         );
+        // Closing the source after the error does not end it early: the
+        // held sibling is still the source's physical work.
+        operations.seal();
+        assert!(!operations.is_exited());
         spawner.gate.add_permits(1);
         request.drained().await.expect("sibling exit");
+        operations
+            .exited()
+            .await
+            .expect("a result error is not an exit error");
         service.close_admission();
         service.drain().await.expect("service drain");
     }

@@ -10,7 +10,7 @@
 3. 阶段与人工门
 4. 文档目录和类型
 5. Frontmatter
-6. Umbrella 面板与依赖图
+6. Umbrella 面板、依赖图与整体路线
 7. Plan 并行任务图
 8. 测试面选择
 9. Goal、sub-agent 与本地 commit
@@ -99,7 +99,7 @@ DOC_ROOT/
 |---|---|---|
 | 理解（只读旁路） | `$dev-workflow-explain-technical-concept` | 技术概念、当前机制、证据边界和权衡已讲清 |
 | 讨论 | `$dev-workflow-discuss-design` | 问题、证据、目标、非目标和关键裁决被接受 |
-| Spec | `$dev-workflow-write-spec` | 一个 PR spec 或多阶段 umbrella 已落盘 |
+| Spec | `$dev-workflow-write-spec` | 一个 PR spec，或含整体路线的 umbrella 已落盘 |
 | Plan | `$dev-workflow-plan` | plan 已落盘，用户明确批准且状态为 `approved` |
 | Execute | `$dev-workflow-execute` | 本地实现完成且验证通过 |
 | Finish | `$dev-workflow-finish` | 明确授权的发布与归档完成 |
@@ -108,6 +108,14 @@ DOC_ROOT/
 
 1. **设计接受门**：用户明确接受问题定义、目标、非目标和关键设计决策。
 2. **计划批准门**：用户明确批准已经落盘的最终实现计划。
+
+**Umbrella arc 只有一份 arc 级文档。** 会派生多个子任务的 arc 由 umbrella 统一承载：它既写 arc 的设计，也写
+整体路线，是这条 arc 的主稿（第 6.1 节）。不在 `plans/` 另建 umbrella 级 plan。推进顺序：
+1. 讨论并接受 arc 设计后，把设计与整体路线写入 umbrella，由用户明确接受；
+2. 子任务**逐个推进**，每个子任务各自经过：细化 spec → 编写子任务 plan → 计划批准门 → execute → finish。
+
+接受 umbrella 只确认设计与路线，即子任务切分、依赖、接口冻结点与闸门，不构成任何子任务的执行授权。子任务的执行
+授权来自它自己获批的 plan。
 
 技术讲解不是状态机中的交付阶段，可以从任意阶段进入。它保持只读，不表示设计已接受、plan 已批准或实现已获授权；讲解
 完成后返回进入前的阶段。若用户随后要求产出 spec、plan 或代码，再路由到对应 skill 并执行其阶段门。
@@ -121,10 +129,14 @@ Plan mode，也不得把仅存在于对话中的计划当成阶段产物。Execu
 本节及第 10 节出现的 `specs/`、`plans/`、`umbrella/`、`archive/` 均相对 `DOC_ROOT/workflow/`。
 
 - 会派生多个独立 spec 的多阶段 arc：项目启用 umbrella 时写入 `umbrella/`，`type: design-umbrella`；否则按项目
-  约定记录父子关系。
+  约定记录父子关系。Umbrella 同时承载整体路线（第 6.1 节），没有对应的 umbrella 级 plan。
 - 可独立实现、一个 PR 粒度的执行单元：写入 `specs/`，`type: design-spec`；项目启用 roadmap 时再添加对应字段。
 - 实现计划：写入 `plans/`，`type: implementation-plan`；编写和评审期间为 `status: draft`，用户明确批准当前落盘版本后
   改为 `status: approved`。
+- Umbrella 拆出的每个子任务，都是一个**可独立合入的 PR**，维护自己的 spec 与 plan：
+  - 写 umbrella 的整体路线时，可以为即将开工的子任务先建骨架 spec（`design_status: skeleton`）；
+  - 其余子任务在前置接近完成时再建；
+  - 子任务实现前，先细化 spec，再单独编写 plan。
 - 已开 PR 的完成态文档：移动到 `archive/` 下同名类型目录。
 
 文件命名：
@@ -199,6 +211,9 @@ tags:
 ---
 ```
 
+骨架 spec 标 `design_status: skeleton`，细化完成后改为 `accepted`。子任务 spec 的 `roadmap_status` 跟随第 6 节的
+面板状态：未开始为 `todo`，进行中为 `active`，已完成为 `done`。
+
 Plan 正文必须链接 spec；spec 必须按项目约定反链 plan，没有既有约定时在第 9 章“未决问题与后续衔接”放置 plan wikilink。
 plan 阶段开始后直接创建并维护这份文档。只有用户明确批准与磁盘内容一致的版本后，才把 `status` 更新为
 `approved`；未批准草案不得进入 Execute。影响 DAG、文件所有权、验收边界、关键依赖或风险裁决的修订会使批准失效，
@@ -207,31 +222,40 @@ plan 阶段开始后直接创建并维护这份文档。只有用户明确批准
 项目启用 Roadmap 时，只更新文档 frontmatter、umbrella 子任务面板和阶段依赖图。`Roadmap.md` 由 Bases 聚合时，
 不手改其聚合行。
 
-## 6. Umbrella 面板与依赖图
+## 6. Umbrella 面板、依赖图与整体路线
 
 本节仅适用于启用了 umbrella 的项目。Umbrella 正文开头依次放置：
 
 1. `## 子任务（进度追踪）`
 2. `## 阶段依赖`
 
+设计章节之后放置 `## 整体路线`（第 6.1 节）。
+
 子任务面板固定列：
 
 ```markdown
 | 状态 | 子任务 | spec | plan | PR |
 |---|---|---|---|---|
-| ✅ | **<ID>** <一句话范围> | [[<spec>]] | [[<plan>]] | [#N](<url>) |
-| ⏳ | **<ID>** <一句话范围> | [[<spec>]] | — | — |
-| 🚧 | **<ID>** <一句话范围> | — | — | — |
+| ✅ 已完成 | **<ID>** <一句话范围> | [[<spec>]] | [[<plan>]] | [#N](<url>) |
+| ⏳ 进行中 | **<ID>** <一句话范围> | [[<spec>]] | [[<plan>]] | — |
+| 🚧 未开始 | **<ID>** <一句话范围> | [[<spec>]] | [[<plan>]] | — |
+| 🚧 未开始 | **<ID>** <一句话范围> | — | — | — |
 ```
 
-状态机械判定：
+状态只看两件事：**子任务 plan 是否已获批**，以及**是否已开 PR**。spec 或 plan 草稿是否存在，不影响状态。
 
-- 🚧：既无 spec 也无 plan。
-- ⏳：已有 spec 或 plan，但尚未开 PR。
-- ✅：已开 PR；被其他任务吸收或明确作废时也可标 ✅，但必须说明原因。
-- 多里程碑任务只要仍有里程碑未开 PR，整体保持 ⏳。
+- `🚧 未开始`：子任务 plan 尚未获批。这包括尚无文档、只有骨架 spec、spec 已细化但 plan 仍为 `draft` 等情形。
+- `⏳ 进行中`：子任务 plan 已获批（`status: approved`），但尚未开 PR。
+- `✅ 已完成`：已开 PR。被其他任务吸收或明确作废时也可以标 ✅，但必须说明原因。
+- 子任务按其 plan 拆成多个 PR 时，只要还有 PR 未开，整体保持 `⏳ 进行中`。
 
-Spec、plan 和 PR 分列独立维护。归档后保留 spec/plan wikilink；只更新状态和 PR。
+状态由对应事件驱动更新：
+- 子任务 plan 获批时，由 plan 阶段置为 `⏳ 进行中`；
+- PR 创建后，由 finish 阶段置为 `✅ 已完成`；
+- 接受 umbrella（含整体路线）、写 spec、起草 plan，都不改变子任务状态；
+- 已获批的 plan 退回 `draft` 时，状态回到 `🚧 未开始`。
+
+Spec、plan 和 PR 分列独立维护，各列只要文档存在就填入链接，与状态无关。归档后保留 spec/plan wikilink，只更新状态和 PR。
 
 阶段依赖图使用 `flowchart LR`，只画硬依赖。节点填充色表示状态，关键入口和收敛点用粗描边：
 
@@ -254,17 +278,55 @@ flowchart LR
   class A,D emphasis
 ```
 
-图后说明唯一入口、关键路径、可并行层、收敛点及每条硬依赖的原因。面板状态、节点颜色和 umbrella
-`roadmap_status` 必须同步：
+图后说明入口（可以有多个独立入口）、关键路径、可并行层、收敛点、默认推进顺序及每条硬依赖的原因。
 
-- 全 🚧：`todo`
-- 出现 ⏳/✅ 但未全 ✅：`active`
-- 全 ✅：`done`，随后归档 umbrella
+面板状态、节点颜色、子任务 spec 的 `roadmap_status` 和 umbrella 的 `roadmap_status` 必须同步。节点颜色：`✅ 已完成` 用 `done`，`⏳ 进行中` 用 `active`，`🚧 未开始` 用 `todo`。umbrella 的状态按面板汇总：
+
+- 全部 🚧：`todo`
+- 出现 ⏳ 或 ✅，但未全部 ✅：`active`
+- 全部 ✅：`done`，随后归档 umbrella
+
+### 6.1 整体路线（主稿）
+
+Umbrella 就是 arc 的主稿。`## 整体路线` 一章只负责路线，不写子任务的实现细节。路线的单位是**子任务**，每个子任务
+是一个可独立合入的 PR：行为完整，合入后主线保持自洽，不依赖后续 PR 才能正确。子任务面板就是路线的索引，阶段依赖图
+就是路线的 DAG；整体路线一章不再重复一份子任务表或第二张依赖图。
+
+整体路线包含：
+
+1. **路线总则**：全部子任务合入后哪些 arc 级验收成立、代码基线、实施前提、外部依赖与已作裁决。
+2. **推进顺序**：默认逐个推进，同一时间只有一个子任务处在 plan/execute 中；是否并行由用户决定。默认顺序写在
+   依赖图之后，外部依赖作为图中的节点单列。
+3. **接口冻结点**：跨子任务的接口由谁产出、谁消费、在产出方 spec 的哪个时点冻结；消费方 plan 在冻结之后才能编写。
+4. **跨 PR 的迁移路线**：切换需要多个 PR 才能完成时（例如新旧机制交替），给出中间状态序列，以及每次合入都必须
+   保持的不变量，并如实写明每个中间态仍然存在的缺口。
+5. **路线级闸门**：进入后续子任务前必须取得的证据，以及需要全量验证的子任务及其理由（第 8.1 节）。
+6. **边界与风险**：外部依赖的处理方式、必须回到设计讨论的变化，以及回退单位（整个子任务 PR）。
+
+每个子任务在整体路线中保留一节，沿用 plan 的四个小节，但只写路线级内容：
+- 目标与前置；
+- 模块或 crate 级的修改范围；
+- 交接给谁、交接什么；
+- 验收要点与测试面（写到 crate、套件或场景这一级）。
+
+整体路线**不写**文件级修改、测试命令、参数与阈值，这些属于子任务 plan。
+
+子任务文档按以下顺序推进：
+1. 写整体路线时，可以为即将开工的子任务先建骨架 spec（`design_status: skeleton`），固定范围、契约与验收；其余
+   子任务在前置接近完成时再建。
+2. 子任务实现前，先按 `$dev-workflow-write-spec` 细化 spec；细化只做工程层面的局部选择，改变方向时回到设计讨论。
+3. 再为该子任务写独立 plan（第 7 节）。
+4. 用户批准该 plan 后才进入执行，面板状态随之变为 `⏳ 进行中`（第 6 节）。
+
+整体路线写入或修订后，需要用户明确接受。子任务切分、依赖、接口冻结点、迁移路线或闸门的变化都属于 umbrella 修订；
+改变方向、外部契约、所有权或失败语义的，先回到 `$dev-workflow-discuss-design`。子任务内部细节的变化只修订子任务
+自己的文档。
 
 ## 7. Plan 并行任务图
 
 plan 阶段在当前可编辑模式中研究代码并把结果直接写入 plan 文档。尽量把实现计划设计成可由多个 sub-agent 安全并行
-调度的 task graph，但不得为了并行而制造错误边界。
+调度的 task graph，但不得为了并行而制造错误边界。本节适用于单 PR plan，包括 umbrella 子任务的 plan；umbrella
+本身不写 plan，它的整体路线见第 6.1 节。
 
 计划必须包含：
 
@@ -396,7 +458,8 @@ PR 创建成功后：
 1. 搜索待归档 spec / plan 的全部 wikilink。
 2. 将 spec 移到 `archive/specs/`，plan 移到 `archive/plans/`。
 3. 项目启用 umbrella 时，保留其面板中的 spec / plan wikilink。
-4. 项目启用 roadmap / umbrella 时，把子任务标为 ✅，填写 PR 链接，并同步依赖图节点颜色。
+4. 项目启用 roadmap / umbrella 时，把子任务标为 `✅ 已完成`，填写 PR 链接，并同步依赖图节点颜色与子任务 spec 的
+   `roadmap_status`。子任务按其 plan 拆成多个 PR 时，最后一个 PR 创建后才标 ✅，并归档其 spec/plan。
 5. 项目启用 umbrella 且整条 arc 全部完成后，将 umbrella 移到 `archive/umbrella/`。
 
 若一组互相引用的文件一起归档，确认 archive 外没有意外断链。归档文档不继续维护 active 状态；后续工作新建 active
@@ -422,8 +485,12 @@ spec/plan，并链接历史归档。
 - Discussion：事实、怀疑、提案分离；重大决策已接受。
 - Spec：开头解释任务、问题和目标，机制、取舍与验收形成因果链；代码证据当前有效；frontmatter 可解析；启用
   Roadmap / umbrella 时，元数据、反链和依赖图一致。
+- Umbrella：设计与整体路线在同一份文档中，没有另建 umbrella 级 plan；整体路线只含路线级内容，不重复面板或依赖图；
+  每个子任务都是可独立合入的 PR，各有一节、四个小节，spec/plan 链接在面板中维护；接口冻结点、跨 PR 的迁移路线与
+  闸门已写明；用户已明确接受；接受 umbrella 不改变任何子任务的状态。
 - Plan：文档已落盘；用户明确批准当前磁盘版本；状态为 `approved`；DAG、并行 waves、文件所有权、验证和 commit
   边界完整；所有 task ID 均有具名阶段说明，关键结构与流程有阶段归属；每个任务的验证指向具体测试面，要求全量验证的任务写明理由。
+  获批的是子任务 plan 时，umbrella 面板已置为 `⏳ 进行中`，依赖图与 spec 的 `roadmap_status` 已同步。
 - Execute：plan 必需 task 全部完成；定向、集成和生产形态验证与风险相称；全量验证只在第 8.1 节允许的点运行；
   失败已按单跑判据区分真实失败与负载噪声；无临时文件和残留进程。
 - Finish：发布授权明确；PR 已创建；spec/plan 已归档；启用 umbrella / Roadmap 时，对应状态已更新。

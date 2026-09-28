@@ -580,6 +580,9 @@ pub(crate) fn queue_control(
     intent: ControlIntent,
 ) -> Result<(), WorkError> {
     let node = state.nodes.get_mut(&id).ok_or(WorkError::Released)?;
+    if intent == ControlIntent::Cancel && node.terminal_cancel_settled {
+        return Ok(());
+    }
     node.control_pending.insert(intent);
     if !node.control_queued && !node.control_inflight {
         state.control_waiting.insert(id);
@@ -688,7 +691,11 @@ impl Drop for ControlPermit {
             let node = state.nodes.get_mut(&scope.id).unwrap();
             node.control_inflight = false;
             if !self.acknowledged {
-                node.control_pending.merge(self.intents);
+                let mut intents = self.intents;
+                if node.terminal_cancel_settled {
+                    intents.remove(ControlIntent::Cancel);
+                }
+                node.control_pending.merge(intents);
             }
             if !node.control_pending.is_empty() {
                 state.control_waiting.insert(scope.id);

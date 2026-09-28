@@ -31,7 +31,7 @@ array_sort(c6, (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
 [5,3,2,2,1]
 
 -- query 12
-array_sort(array_map(x -> CAST(x AS DECIMAL64(7,2)), c6), (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+array_sort(array_map(x -> CAST(x AS DECIMAL32(7,2)), c6), (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
 [5.00,3.00,2.00,2.00,1.00]
 
 -- query 13
@@ -83,15 +83,15 @@ array_sort(c1, (x, y) -> if((length(x)) < (length(y)), -1, if((length(x)) = (len
 ["a","abc","abcd"]
 
 -- query 39
-array_sort([3, 2, NULL, 5, NULL, 1, 2], (x, y) -> CASE WHEN (x IS NULL) THEN 1 WHEN (y IS NULL) THEN -1 WHEN (x < y) THEN 1 WHEN (x = y) THEN 0 ELSE -1 END)
+array_sort([3, 2, NULL, 5, NULL, 1, 2], (x, y) -> CASE WHEN x IS NULL THEN 1 WHEN y IS NULL THEN -1 WHEN x < y THEN 1 WHEN x = y THEN 0 ELSE -1 END)
 [5,3,2,2,1,null,null]
 
 -- query 43
-array_sort([3, 2, NULL, 5, NULL, 1, 2], (x, y) -> CASE WHEN (x IS NULL) THEN 1 WHEN (y IS NULL) THEN -1 WHEN (x < y) THEN 1 WHEN (x = y) THEN 0 ELSE -1 END)
+array_sort([3, 2, NULL, 5, NULL, 1, 2], (x, y) -> CASE WHEN x IS NULL THEN 1 WHEN y IS NULL THEN -1 WHEN x < y THEN 1 WHEN x = y THEN 0 ELSE -1 END)
 [5,3,2,2,1,null,null]
 
 -- query 45
-array_sort(c0, (x, y) -> CASE WHEN (x IS NULL) THEN 1 WHEN (y IS NULL) THEN -1 WHEN (x < y) THEN 1 WHEN (x = y) THEN 0 ELSE -1 END)
+array_sort(c0, (x, y) -> CASE WHEN x IS NULL THEN 1 WHEN y IS NULL THEN -1 WHEN x < y THEN 1 WHEN x = y THEN 0 ELSE -1 END)
 [5,3,2,2,1,null,null]
 
 -- query 47

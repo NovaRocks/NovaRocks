@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
@@ -243,7 +244,16 @@ class FixtureContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             runtime = self.runtime(root)
-            runtime.fe_config.write_text('access = "test-access"\nsecret = "test-secret"\n')
+            runtime.fe_config.write_text('''[cluster]
+role = "fe"
+[[connector.credentials]]
+purpose = "object-store-metadata"
+name = "test-data"
+generation = "v1"
+kind = "s3"
+access_key_id = "test-access"
+access_key_secret = "test-secret"
+''')
             runtime.sql_config.write_text('oss_ak = "test-access"\noss_sk = "test-secret"\n')
             scope = fixture.make_scope("unit-run", "test-env", "a" * 64)
             output = root / "fixture"
@@ -256,6 +266,18 @@ class FixtureContractTest(unittest.TestCase):
             self.assertNotIn("test-access", published)
             self.assertNotIn("test-secret", published)
             self.assertIn("${ENV:AWS_S3_ACCESS_KEY_ID}", published)
+            base = tomllib.loads((output / "base-server.toml").read_text())
+            credentials = base["connector"]["credentials"]
+            self.assertEqual(
+                [entry["purpose"] for entry in credentials],
+                ["object-store-metadata", "object-store-data"],
+            )
+            for entry in credentials:
+                self.assertEqual(entry["name"], runtime.credential_name)
+                self.assertEqual(entry["generation"], runtime.credential_generation)
+                self.assertEqual(entry["kind"], "s3")
+                self.assertEqual(entry["access_key_id"], "${ENV:AWS_S3_ACCESS_KEY_ID}")
+                self.assertEqual(entry["access_key_secret"], "${ENV:AWS_S3_SECRET_ACCESS_KEY}")
             (output / "leak.txt").write_text("test-secret")
             with self.assertRaises(fixture.FixtureError):
                 fixture.assert_artifacts_secret_free(output, runtime)

@@ -992,6 +992,16 @@ def remove_generated_paths(output_dir: Path) -> None:
 def publish_configs(output_dir: Path, runtime: Runtime, scope: Scope) -> None:
     if runtime.fe_config.is_file():
         base_config = redact_config_secrets(runtime.fe_config.read_text(), runtime)
+        # The native harness projects this shared input onto each process role.
+        # The FE template supplies metadata access; scans also need BE data access.
+        base_config = base_config.rstrip() + "\n\n" + f'''[[connector.credentials]]
+purpose = "object-store-data"
+name = {json.dumps(runtime.credential_name)}
+generation = {json.dumps(runtime.credential_generation)}
+kind = "s3"
+access_key_id = "${{ENV:AWS_S3_ACCESS_KEY_ID}}"
+access_key_secret = "${{ENV:AWS_S3_SECRET_ACCESS_KEY}}"
+'''
         atomic_write(output_dir / "base-server.toml", base_config.encode())
     else:
         raise FixtureError(f"FE base config does not exist: {runtime.fe_config}")

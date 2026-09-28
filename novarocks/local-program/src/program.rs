@@ -407,9 +407,7 @@ pub enum ProgramNodeKind {
         source: StaticConnectorScan,
         runtime_filters: Vec<FilterConsumerAtExpr>,
         conjunct_predicate: Option<ProgramExprId>,
-        connector_io_tasks_per_scan_operator: Option<i32>,
         limit: Option<usize>,
-        accept_empty_scan_ranges: bool,
     },
     ExchangeSource {
         timeout: Duration,
@@ -1127,10 +1125,6 @@ fn validate_shape(node: &ProgramNode) -> Result<(), LocalProgramError> {
                 return Err(LocalProgramError::InvalidNodeShape);
             }
         }
-        ProgramNodeKind::Scan {
-            connector_io_tasks_per_scan_operator: Some(0),
-            ..
-        } => return Err(LocalProgramError::InvalidNodeShape),
         ProgramNodeKind::Unpivot {
             max_output_rows,
             max_output_bytes,

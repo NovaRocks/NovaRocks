@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::future::Future;
 use std::io::{self, Read};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
@@ -111,6 +112,10 @@ fn saturating_add(counter: &AtomicU64, value: u64) {
     });
 }
 
+/// The whole of a small file, fetched once for every reader of one
+/// inspection. Awaited readers share the single fetch in flight.
+pub(crate) type SmallFileBuffer = Arc<tokio::sync::OnceCell<Bytes>>;
+
 #[derive(Clone)]
 pub(crate) struct BoundChunkReader {
     file: BoundFile,
@@ -118,8 +123,15 @@ pub(crate) struct BoundChunkReader {
     cache: Option<DataCacheContext>,
     range_cache_enabled: bool,
     metrics: Arc<ReaderMetrics>,
-    small_file: Arc<Mutex<Option<Bytes>>>,
+    small_file: SmallFileBuffer,
     prepared_input: Option<PreparedFileInput>,
+}
+
+/// Where one read is served from, decided without any I/O.
+enum ReadTier {
+    Ready(Bytes),
+    SmallFile { start: usize, end: usize },
+    Remote,
 }
 
 impl BoundChunkReader {
@@ -140,7 +152,7 @@ impl BoundChunkReader {
             cache,
             range_cache_enabled,
             metrics,
-            small_file: Arc::new(Mutex::new(None)),
+            small_file: SmallFileBuffer::default(),
             prepared_input: None,
         }
     }
@@ -156,13 +168,36 @@ impl BoundChunkReader {
         Ok(self)
     }
 
-    pub(crate) fn with_small_file_buffer(mut self, buffer: Arc<Mutex<Option<Bytes>>>) -> Self {
+    pub(crate) fn with_small_file_buffer(mut self, buffer: SmallFileBuffer) -> Self {
         self.small_file = buffer;
         self
     }
 
-    pub(crate) fn small_file_buffer(&self) -> Arc<Mutex<Option<Bytes>>> {
+    pub(crate) fn small_file_buffer(&self) -> SmallFileBuffer {
         Arc::clone(&self.small_file)
+    }
+
+    /// How many independent ranges of one decoder request are worth fetching
+    /// at once: the source's window in the shared range service, or one at a
+    /// time for a read outside it.
+    pub(crate) fn range_concurrency(&self) -> usize {
+        self.context
+            .range
+            .as_ref()
+            .map_or(1, |range| range.service().source_window().max(1))
+    }
+
+    pub(crate) async fn read_bytes_async(&self, start: u64, length: usize) -> FileResult<Bytes> {
+        self.read_bytes_impl_async(start, length, true).await
+    }
+
+    /// Awaited [`Self::read_backing_bytes`].
+    pub(crate) async fn read_backing_bytes_async(
+        &self,
+        start: u64,
+        length: usize,
+    ) -> FileResult<Bytes> {
+        self.read_bytes_impl_async(start, length, false).await
     }
 
     pub(crate) fn read_bytes(&self, start: u64, length: usize) -> FileResult<Bytes> {
@@ -181,6 +216,60 @@ impl BoundChunkReader {
         length: usize,
         populate_cache: bool,
     ) -> FileResult<Bytes> {
+        match self.plan_read(start, length)? {
+            ReadTier::Ready(bytes) => Ok(bytes),
+            ReadTier::SmallFile { start, end } => {
+                let whole = match self.small_file.get() {
+                    Some(whole) => whole.clone(),
+                    None => {
+                        let whole = self.fetch_bytes(0, self.small_file_length()?)?;
+                        let _ = self.small_file.set(whole);
+                        self.small_file
+                            .get()
+                            .expect("small-file probe initialized")
+                            .clone()
+                    }
+                };
+                self.context.check_active()?;
+                Ok(whole.slice(start..end))
+            }
+            ReadTier::Remote => {
+                let bytes = self.fetch_bytes(start, length)?;
+                self.populate_cache(start, length, &bytes, populate_cache);
+                Ok(bytes)
+            }
+        }
+    }
+
+    async fn read_bytes_impl_async(
+        &self,
+        start: u64,
+        length: usize,
+        populate_cache: bool,
+    ) -> FileResult<Bytes> {
+        match self.plan_read(start, length)? {
+            ReadTier::Ready(bytes) => Ok(bytes),
+            ReadTier::SmallFile { start, end } => {
+                let whole_length = self.small_file_length()?;
+                let whole = self
+                    .small_file
+                    .get_or_try_init(|| self.fetch_bytes_async(0, whole_length))
+                    .await?
+                    .clone();
+                self.context.check_active()?;
+                Ok(whole.slice(start..end))
+            }
+            ReadTier::Remote => {
+                let bytes = self.fetch_bytes_async(start, length).await?;
+                self.populate_cache(start, length, &bytes, populate_cache);
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// Validates one read and decides, without I/O, where it is served from:
+    /// the prepared input, the page cache, the small-file probe, or storage.
+    fn plan_read(&self, start: u64, length: usize) -> FileResult<ReadTier> {
         self.context.check_active()?;
         let length_u64 = u64::try_from(length)
             .map_err(|_| FileError::invalid("file read length overflows u64"))?;
@@ -202,7 +291,7 @@ impl BoundChunkReader {
             if start >= prepared.start && end <= prepared.end {
                 self.context.check_active()?;
                 let from = (start - prepared.start) as usize;
-                return Ok(input.bytes().slice(from..from + length));
+                return Ok(ReadTier::Ready(input.bytes().slice(from..from + length)));
             }
         }
 
@@ -212,22 +301,6 @@ impl BoundChunkReader {
                 .as_ref()
                 .is_some_and(crate::DataCacheContext::datacache_requested)
         {
-            let mut buffer = self.small_file.lock().map_err(|_| {
-                FileError::new(
-                    crate::FileErrorKind::Internal,
-                    "small-file buffer is poisoned",
-                )
-            })?;
-            if buffer.is_none() {
-                let whole_length = usize::try_from(self.file_size()).map_err(|_| {
-                    FileError::new(
-                        crate::FileErrorKind::ResourceExhausted,
-                        "small file is too large",
-                    )
-                })?;
-                *buffer = Some(self.fetch_bytes(0, whole_length)?);
-            }
-            self.context.check_active()?;
             let start = usize::try_from(start).map_err(|_| {
                 FileError::new(
                     crate::FileErrorKind::ResourceExhausted,
@@ -237,10 +310,7 @@ impl BoundChunkReader {
             let end = start.checked_add(length).ok_or_else(|| {
                 FileError::new(crate::FileErrorKind::Corrupt, "small-file slice overflows")
             })?;
-            return Ok(buffer
-                .as_ref()
-                .expect("small-file probe initialized")
-                .slice(start..end));
+            return Ok(ReadTier::SmallFile { start, end });
         }
 
         let cache_key = self.cache_key(start, length);
@@ -254,49 +324,85 @@ impl BoundChunkReader {
             && let Some(bytes) = cache.lookup_bytes(key)
         {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(bytes);
+            return Ok(ReadTier::Ready(bytes));
         }
         if cache_read_enabled && cache_key.is_some() {
             self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
+        Ok(ReadTier::Remote)
+    }
 
-        let bytes = self.fetch_bytes(start, length)?;
+    fn small_file_length(&self) -> FileResult<usize> {
+        usize::try_from(self.file_size()).map_err(|_| {
+            FileError::new(
+                crate::FileErrorKind::ResourceExhausted,
+                "small file is too large",
+            )
+        })
+    }
+
+    fn populate_cache(&self, start: u64, length: usize, bytes: &Bytes, populate_cache: bool) {
         let cache_population_enabled = self
             .cache
             .as_ref()
             .is_some_and(|cache| cache.io_options().enable_populate_datacache);
         if populate_cache
             && cache_population_enabled
-            && let Some(key) = cache_key
+            && let Some(key) = self.cache_key(start, length)
             && let Some(cache) = DataCacheManager::instance().page_cache()
         {
             let _ = cache.insert_bytes(key, bytes.clone(), bytes.len(), Some(100));
         }
-        Ok(bytes)
     }
 
     fn fetch_bytes(&self, start: u64, length: usize) -> FileResult<Bytes> {
-        let file = self.file.clone();
-        let cancellation = self
+        let began = Instant::now();
+        let bytes = self
             .context
-            .cancellation
-            .clone()
-            .with_deadline(self.context.deadline);
+            .runtime
+            .block_on_bytes(Box::pin(self.fetch_future(start, length)?))?;
+        self.finish_fetch(began)?;
+        Ok(bytes)
+    }
+
+    async fn fetch_bytes_async(&self, start: u64, length: usize) -> FileResult<Bytes> {
+        let began = Instant::now();
+        let bytes = self.fetch_future(start, length)?.await?;
+        self.finish_fetch(began)?;
+        Ok(bytes)
+    }
+
+    fn finish_fetch(&self, began: Instant) -> FileResult<()> {
+        self.context.check_active()?;
+        self.metrics
+            .io_time_ns
+            .fetch_add(clamp_u128(began.elapsed().as_nanos()), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// One storage read of `[start, start + length)`: through the source's
+    /// range service when it has one, otherwise as a direct segmented read.
+    /// Both wait for the read's physical exit before they return its bytes.
+    fn fetch_future(
+        &self,
+        start: u64,
+        length: usize,
+    ) -> FileResult<impl Future<Output = FileResult<Bytes>> + Send + 'static> {
+        let file = self.file.clone();
+        let cancellation = self.context.bounded_cancellation();
         let range = FileReadRange::Bounded {
             offset: start,
             length: u64::try_from(length)
                 .map_err(|_| FileError::invalid("file read length overflows u64"))?,
         };
-        let began = Instant::now();
         let spawner = Arc::clone(&self.context.task_spawner);
-        let range_service = self.context.range_service.clone();
-        let range_scope = self.context.range_scope;
+        let range_binding = self.context.range.clone();
         let present = self.prepared_input.clone();
         let metrics = Arc::clone(&self.metrics);
-        let bytes = self.context.runtime.block_on_bytes(Box::pin(async move {
-            if let (Some(service), Some(scope)) = (range_service, range_scope) {
-                let mut request = service
-                    .start_wait_with_present(scope, file, range, cancellation, present)
+        Ok(async move {
+            if let Some(binding) = range_binding {
+                let mut request = binding
+                    .start_wait_with_present(file, range, cancellation, present)
                     .await?;
                 let fetched_bytes = request.missing_bytes();
                 let partial_copy_bytes = request.partial_copy_bytes();
@@ -345,13 +451,7 @@ impl BoundChunkReader {
                     Ok(bytes)
                 }
             }
-        }))?;
-        self.context.check_active()?;
-        self.metrics
-            .io_time_ns
-            .fetch_add(clamp_u128(began.elapsed().as_nanos()), Ordering::Relaxed);
-
-        Ok(bytes)
+        })
     }
 
     fn cache_key(&self, start: u64, length: usize) -> Option<DataCachePageKey> {

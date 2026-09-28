@@ -103,27 +103,27 @@ NULL
 NULL
 
 -- query 14
-sum(array_contains(@arr, pk))
+sum(array_contains(array_generate(1000), pk))
 1000
 
 -- query 15
-sum(array_contains(@arr, 100))
+sum(array_contains(array_generate(1000), 100))
 1001
 
 -- query 16
-sum(array_position(@arr, pk))
+sum(array_position(array_generate(1000), pk))
 500500
 
 -- query 17
-sum(array_position(@arr, 100))
+sum(array_position(array_generate(1000), 100))
 100100
 
 -- query 18
-sum(array_contains(array_append(@arr, NULL), pk))
+sum(array_contains(array_append(array_generate(1000), NULL), pk))
 1000
 
 -- query 19
-sum(array_contains(array_append(@arr, NULL), NULL))
+sum(array_contains(array_append(array_generate(1000), NULL), NULL))
 1001
 
 -- query 20
@@ -159,11 +159,11 @@ sum(array_position(arr_decimal, 100))
 101
 
 -- query 29
-sum(array_contains(@arr, 'abcdefg'))
+sum(array_contains(array_repeat('abcdefg', 10000), 'abcdefg'))
 1001
 
 -- query 30
-sum(array_contains(@arr, str))
+sum(array_contains(array_repeat('abcdefg', 10000), str))
 0
 
 -- query 33
@@ -363,15 +363,15 @@ NULL
 NULL
 
 -- query 60
-array_contains_all(@arr0, @arr1)
+array_contains_all(array_repeat('abcdefg', 1000), array_repeat('abcdef', 2000))
 0
 
 -- query 63
-array_contains_all(@arr0, @arr1)
+array_contains_all(array_generate(1000), array_generate(2000))
 0
 
 -- query 64
-array_contains_all(@arr1, @arr0)
+array_contains_all(array_generate(2000), array_generate(1000))
 1
 
 -- query 65
@@ -571,7 +571,7 @@ array_contains_seq([NULL, NULL, 1, 2], [NULL, 1, 2])
 1
 
 -- query 90
-array_contains_seq(@arr0, @arr1)
+array_contains_seq(array_append(array_repeat(1, 1000), 2), array_append(array_repeat(1, 500), 2))
 1
 
 -- query 97

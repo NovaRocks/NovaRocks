@@ -92,12 +92,12 @@ null_type
 
 -- query 25
 typeof(c1)	typeof(c2)	typeof(c3)	typeof(c4)	typeof(c5)	typeof(c6)	typeof(c7)	typeof(c8)	typeof(c9)	typeof(c10)	typeof(c11)	typeof(c12)	typeof(c13)	typeof(c14)	typeof(c15)	typeof(c16)	typeof(c17)	typeof(c18)	typeof(c19)	typeof(c20)
-tinyint	smallint	int	bigint	largeint	decimal128(19, 2)	decimal128(38, 9)	decimal128(38, 9)	boolean	varchar	varchar	varchar	varbinary	date	datetime	array<tinyint>	varchar	map<tinyint,varchar>	struct<col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint>	json
+int	int	int	bigint	largeint	decimal128(19, 2)	decimal128(38, 9)	decimal128(38, 9)	boolean	varchar	varchar	varchar	varbinary	date	datetime	array<int>	varchar	map<int,varchar>	struct<col1 int, col2 int, col3 int, col4 int>	varchar
 
 -- query 28
 typeof(user_id)
-bitmap
+varbinary
 
 -- query 31
 typeof(uv_set)
-hll
+varbinary

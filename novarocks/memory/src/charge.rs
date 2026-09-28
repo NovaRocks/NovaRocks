@@ -251,20 +251,20 @@ impl ChargeState {
 /// charge object itself is the single release obligation.
 #[derive(Debug)]
 pub struct Charge {
-    state: Arc<ChargeState>,
+    state: Option<Arc<ChargeState>>,
 }
 
 impl Charge {
     pub(crate) fn new(sponsor: AccountHandle, bytes: u64) -> Self {
         Self {
-            state: ChargeState::new(sponsor, bytes),
+            state: Some(ChargeState::new(sponsor, bytes)),
         }
     }
 
     /// Returns the shared state, for an adapter that must bind this charge to
     /// a buffer's own lifetime.
     pub fn state(&self) -> &Arc<ChargeState> {
-        &self.state
+        self.state.as_ref().expect("charge state was moved")
     }
 
     /// Returns the shared state and gives up the release obligation with it.
@@ -273,45 +273,43 @@ impl Charge {
     /// releasing it through that state. This is how an Arrow buffer takes
     /// over: the reservation it carries becomes the owner, and the charge
     /// object stops being one.
-    pub fn into_state(self) -> Arc<ChargeState> {
-        let state = Arc::clone(&self.state);
-        std::mem::forget(self);
-        state
+    pub fn into_state(mut self) -> Arc<ChargeState> {
+        self.state.take().expect("charge state was moved")
     }
 
     /// Returns the capacity charged.
     pub fn bytes(&self) -> u64 {
-        self.state.bytes()
+        self.state().bytes()
     }
 
     /// Returns the sponsoring account's identity.
     pub fn sponsor_id(&self) -> AccountId {
-        self.state.sponsor_id()
+        self.state().sponsor_id()
     }
 
     /// Returns the sponsoring account.
     pub fn sponsor(&self) -> AccountHandle {
-        self.state.sponsor()
+        self.state().sponsor()
     }
 
     /// Grows this charge inside a grant's remainder.
     pub fn grow_within(&self, grant: &CapacityGrant, additional: u64) -> Result<(), FulfilError> {
-        self.state.grow_within(grant, additional)
+        self.state().grow_within(grant, additional)
     }
 
     /// Shrinks this charge to a smaller proven capacity.
     pub fn shrink_to(&self, proven_bytes: u64) {
-        self.state.shrink_to(proven_bytes);
+        self.state().shrink_to(proven_bytes);
     }
 
     /// Moves this charge to another sponsor.
     pub fn transfer_to(&self, destination: &AccountHandle) -> Result<(), TransferError> {
-        self.state.transfer_to(destination)
+        self.state().transfer_to(destination)
     }
 
     /// Settles this charge now, returning the bytes released.
     pub fn release(self) -> u64 {
-        self.state.release()
+        self.state().release()
     }
 
     /// Consumes the charge, keeping its bytes charged.
@@ -319,19 +317,20 @@ impl Charge {
     /// Used when one charge is folded into another for the same backing, so
     /// the accounting stays a single obligation rather than two.
     fn into_bytes_without_release(self) -> u64 {
-        let bytes = self.state.bytes();
+        let bytes = self.state().bytes();
         // The bytes stay charged to the account; the enclosing state now owns
         // the obligation, so this object must not settle on drop.
-        self.state.bytes.store(0, Ordering::Release);
-        self.state.released.store(true, Ordering::Release);
-        std::mem::forget(self);
+        self.state().bytes.store(0, Ordering::Release);
+        self.state().released.store(true, Ordering::Release);
         bytes
     }
 }
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        self.state.release();
+        if let Some(state) = &self.state {
+            state.release();
+        }
     }
 }
 

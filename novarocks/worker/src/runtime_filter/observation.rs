@@ -31,7 +31,6 @@ use std::sync::{Arc, Mutex};
 
 use novarocks_execution::runtime_filter::{
     ArtifactUnsupportedReason, LiveTerminal, LogicalVersion, UnavailableReason,
-    scan_domain::{RuntimeFilterScanUnitDecision, RuntimeFilterScanUnitNotEvaluatedReason},
 };
 use novarocks_types::UniqueId;
 
@@ -276,11 +275,6 @@ pub struct RuntimeFilterConsumerObservation {
     row_evaluations: u64,
     row_input: u64,
     row_output: u64,
-    scan_evaluated: u64,
-    scan_kept: u64,
-    scan_pruned: u64,
-    scan_not_evaluated: u64,
-    scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedObservation,
     outcome_conflicted: bool,
     terminal_conflicted: bool,
 }
@@ -317,38 +311,6 @@ impl RuntimeFilterConsumerObservation {
     pub const fn row_output(&self) -> u64 {
         self.row_output
     }
-
-    pub const fn scan_evaluated(&self) -> u64 {
-        self.scan_evaluated
-    }
-
-    pub const fn scan_kept(&self) -> u64 {
-        self.scan_kept
-    }
-
-    pub const fn scan_pruned(&self) -> u64 {
-        self.scan_pruned
-    }
-
-    pub const fn scan_not_evaluated(&self) -> u64 {
-        self.scan_not_evaluated
-    }
-
-    pub const fn scan_not_evaluated_reasons(&self) -> RuntimeFilterScanNotEvaluatedObservation {
-        self.scan_not_evaluated_reasons
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RuntimeFilterScanNotEvaluatedObservation {
-    pub unit_facts_missing: u64,
-    pub column_facts_missing: u64,
-    pub data_type_unsupported: u64,
-    pub predicate_capability_unsupported: u64,
-    pub resource_unavailable: u64,
-    pub snapshot_unavailable: u64,
-    pub snapshot_timed_out: u64,
-    pub snapshot_not_published: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1294,80 +1256,6 @@ fn fold_event(
             consumer.row_input = input;
             consumer.row_output = output;
         }
-        BackendRuntimeFilterEvent::ConsumerScanUnitEvaluated {
-            identity,
-            logical_version,
-            decision,
-        } => {
-            let consumer = consumer_mut(state, *identity)?;
-            let Some(delivered) = consumer.latest_delivered_version else {
-                return Err(
-                    RuntimeFilterObservationError::ConsumerAppliedWithoutDelivery {
-                        consumer: *identity,
-                    },
-                );
-            };
-            if *logical_version > delivered {
-                return Err(
-                    RuntimeFilterObservationError::ConsumerAppliedVersionExceedsDelivery {
-                        consumer: *identity,
-                    },
-                );
-            }
-            consumer.latest_applied_version =
-                max_option(consumer.latest_applied_version, *logical_version);
-            let evaluated = increment(consumer.scan_evaluated, 1, saturated);
-            let (kept, pruned) = match decision {
-                RuntimeFilterScanUnitDecision::Kept => (
-                    increment(consumer.scan_kept, 1, saturated),
-                    consumer.scan_pruned,
-                ),
-                RuntimeFilterScanUnitDecision::Pruned => (
-                    consumer.scan_kept,
-                    increment(consumer.scan_pruned, 1, saturated),
-                ),
-            };
-            consumer.scan_evaluated = evaluated;
-            consumer.scan_kept = kept;
-            consumer.scan_pruned = pruned;
-        }
-        BackendRuntimeFilterEvent::ConsumerScanUnitNotEvaluated {
-            identity,
-            observed_version: _,
-            reason,
-        } => {
-            let consumer = consumer_mut(state, *identity)?;
-            consumer.scan_not_evaluated = increment(consumer.scan_not_evaluated, 1, saturated);
-            let counter = match reason {
-                RuntimeFilterScanUnitNotEvaluatedReason::UnitFactsMissing(_) => {
-                    &mut consumer.scan_not_evaluated_reasons.unit_facts_missing
-                }
-                RuntimeFilterScanUnitNotEvaluatedReason::ColumnFactsMissing(_) => {
-                    &mut consumer.scan_not_evaluated_reasons.column_facts_missing
-                }
-                RuntimeFilterScanUnitNotEvaluatedReason::DataTypeUnsupported => {
-                    &mut consumer.scan_not_evaluated_reasons.data_type_unsupported
-                }
-                RuntimeFilterScanUnitNotEvaluatedReason::PredicateCapabilityUnsupported => {
-                    &mut consumer
-                        .scan_not_evaluated_reasons
-                        .predicate_capability_unsupported
-                }
-                RuntimeFilterScanUnitNotEvaluatedReason::ResourceUnavailable => {
-                    &mut consumer.scan_not_evaluated_reasons.resource_unavailable
-                }
-                RuntimeFilterScanUnitNotEvaluatedReason::SnapshotUnavailable => {
-                    &mut consumer.scan_not_evaluated_reasons.snapshot_unavailable
-                }
-                RuntimeFilterScanUnitNotEvaluatedReason::SnapshotTimedOut => {
-                    &mut consumer.scan_not_evaluated_reasons.snapshot_timed_out
-                }
-                RuntimeFilterScanUnitNotEvaluatedReason::SnapshotNotPublished => {
-                    &mut consumer.scan_not_evaluated_reasons.snapshot_not_published
-                }
-            };
-            *counter = increment(*counter, 1, saturated);
-        }
     }
     Ok(())
 }
@@ -1682,11 +1570,6 @@ fn consumer_observation(
         row_evaluations: 0,
         row_input: 0,
         row_output: 0,
-        scan_evaluated: 0,
-        scan_kept: 0,
-        scan_pruned: 0,
-        scan_not_evaluated: 0,
-        scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedObservation::default(),
         outcome_conflicted: false,
         terminal_conflicted: false,
     }
@@ -1700,7 +1583,6 @@ mod tests {
 
     use novarocks_execution::runtime_filter::{
         PartitionId, RuntimeFilterBindingId, RuntimeFilterConsumerContract,
-        scan_domain::RuntimeFilterScanUnitNotEvaluatedReason,
     };
 
     use super::*;
@@ -1845,16 +1727,6 @@ mod tests {
             input_rows: 100,
             output_rows: 20,
         });
-        emitter.record(BackendRuntimeFilterEvent::ConsumerScanUnitEvaluated {
-            identity: fixture.consumer,
-            logical_version: LogicalVersion::FIRST,
-            decision: RuntimeFilterScanUnitDecision::Pruned,
-        });
-        emitter.record(BackendRuntimeFilterEvent::ConsumerScanUnitNotEvaluated {
-            identity: fixture.consumer,
-            observed_version: Some(LogicalVersion::FIRST),
-            reason: RuntimeFilterScanUnitNotEvaluatedReason::SnapshotUnavailable,
-        });
 
         let frozen = emitter.capture();
         assert_eq!(frozen.producer_streams().len(), 1);
@@ -1876,9 +1748,6 @@ mod tests {
         assert_eq!(frozen.transport_routes()[0].bytes(), 17);
         assert_eq!(frozen.consumers()[0].row_input(), 100);
         assert_eq!(frozen.consumers()[0].row_output(), 20);
-        assert_eq!(frozen.consumers()[0].scan_evaluated(), 1);
-        assert_eq!(frozen.consumers()[0].scan_pruned(), 1);
-        assert_eq!(frozen.consumers()[0].scan_not_evaluated(), 1);
 
         emitter.record(BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
             identity: fixture.consumer,

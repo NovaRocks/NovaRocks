@@ -71,7 +71,9 @@ use crate::exec::operators::aggregate::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 use crate::exec::operators::unpivot_processor::UnpivotProcessorFactory;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator, forward_observable};
+use crate::exec::pipeline::operator::{
+    FinishWatch, Operator, ProcessorOperator, forward_observable,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
@@ -1286,12 +1288,17 @@ impl Operator for TableFinishOperator {
         finished
     }
 
-    fn pending_finish(&self) -> bool {
-        let pending = matches!(self.phase, FinishPhase::Finalizing | FinishPhase::Producing)
-            && self
-                .aggregate
+    fn pending_finish(&self) -> Option<FinishWatch> {
+        // Only the final aggregate owns asynchronous finish work here, so its
+        // own watch is the one to wait on.
+        let watch = if matches!(self.phase, FinishPhase::Finalizing | FinishPhase::Producing) {
+            self.aggregate
                 .as_ref()
-                .is_some_and(|aggregate| aggregate.pending_finish());
+                .and_then(|aggregate| aggregate.pending_finish())
+        } else {
+            None
+        };
+        let pending = watch.is_some();
         // PipelineDriver parks an EOS'd pipeline solely through this callback;
         // it does not call `has_output` while an asynchronous final aggregate
         // still reports pending finish. Observe that real scheduler boundary
@@ -1301,7 +1308,7 @@ impl Operator for TableFinishOperator {
             self.final_aggregate_blocked_time
                 .observe(pending && self.runtime_error().is_none());
         }
-        pending
+        watch
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -1704,8 +1711,9 @@ mod tests {
             self.finishing && self.ready.load(Ordering::Acquire) && self.outputs.is_empty()
         }
 
-        fn pending_finish(&self) -> bool {
-            self.finishing && !self.ready.load(Ordering::Acquire)
+        fn pending_finish(&self) -> Option<FinishWatch> {
+            (self.finishing && !self.ready.load(Ordering::Acquire))
+                .then(|| FinishWatch::Notify(Arc::clone(&self.observable)))
         }
 
         fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -1949,8 +1957,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    scan_threads: 1,
-                    scan_queue_capacity: 8,
                     spill_io_threads: 1,
                     spill_io_queue_capacity: 8,
                     spill_storage: ExecutionSpillStorageConfig::default(),
@@ -1961,9 +1967,6 @@ mod tests {
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1024,
                     local_exchange_max_buffered_rows: 1024,
-                    connector_io_tasks_per_scan_operator: 1,
-                    scan_submit_fail_max: 1,
-                    scan_submit_fail_timeout_ms: 1,
                     runtime_filter_scan_wait_time_ms_override: None,
                     runtime_filter_wait_timeout_ms_override: None,
                     sink_io_worker_threads: 1,
@@ -1984,7 +1987,6 @@ mod tests {
             None,
             None,
             Some(runtime),
-            None,
         )
     }
 
@@ -3072,7 +3074,7 @@ mod tests {
             )
             .expect("partial input");
         operator.set_finishing(&state).expect("gather EOS");
-        assert!(operator.pending_finish());
+        assert!(operator.pending_finish().is_some());
         assert!(Arc::ptr_eq(
             &source_identity,
             &operator
@@ -3084,7 +3086,7 @@ mod tests {
         ready.store(true, Ordering::Release);
         observable.notify_observers();
         assert_eq!(source_identity.generation(), source_generation + 1);
-        assert!(!operator.pending_finish());
+        assert!(operator.pending_finish().is_none());
         while !operator.is_finished() {
             let _ = operator.pull_chunk(&state).expect("root output");
         }
@@ -3178,12 +3180,12 @@ mod tests {
         // This is PipelineDriver's EOS sequence: set finishing once, then
         // poll only pending_finish while the asynchronous owner is parked.
         operator.set_finishing(&state).expect("gather EOS");
-        assert!(operator.pending_finish());
-        assert!(operator.pending_finish());
+        assert!(operator.pending_finish().is_some());
+        assert!(operator.pending_finish().is_some());
         std::thread::sleep(Duration::from_millis(1));
-        assert!(operator.pending_finish());
+        assert!(operator.pending_finish().is_some());
         ready.store(true, Ordering::Release);
-        assert!(!operator.pending_finish());
+        assert!(operator.pending_finish().is_none());
 
         while !operator.is_finished() {
             let _ = operator.pull_chunk(&state).expect("root output");
@@ -3231,13 +3233,13 @@ mod tests {
             )
             .expect("partial input");
         operator.set_finishing(&state).expect("gather EOS");
-        assert!(operator.pending_finish());
-        assert!(operator.pending_finish());
+        assert!(operator.pending_finish().is_some());
+        assert!(operator.pending_finish().is_some());
         std::thread::sleep(Duration::from_millis(1));
 
         operator.on_driver_failure();
         assert!(operator.is_finished());
-        assert!(!operator.pending_finish());
+        assert!(operator.pending_finish().is_none());
         let elapsed_after_failure = profiles
             .common
             .counter_value("FinalAggregateBlockedTime")

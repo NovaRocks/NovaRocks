@@ -15,26 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One split, one page source.
+//! One split, one page stream.
 //!
-//! A page source owns its cursor, its reader, its buffers, and one close
-//! latch. Nothing here is process-global and nothing survives an attempt: a
-//! replacement attempt builds a new page source over the same frozen split
-//! rather than resuming this one.
+//! A split's reader state owns its cursor, its reader and its buffers; the
+//! page stream (see [`stream`]) moves it through awaited steps. Nothing here
+//! is process-global and nothing survives an attempt: a replacement attempt
+//! builds a new stream over the same frozen split rather than resuming this
+//! one.
 //!
-//! Three invariants shape the reader:
+//! Two invariants shape the reader:
 //!
 //! * a row position is file-level, absolute, and zero-based -- byte-range
 //!   selection narrows which row groups are read, never how rows are numbered;
 //! * the scan's ordered columns are the output prefix, and whatever the delete
 //!   filter needs is appended as a hidden suffix that is dropped again once the
-//!   deletes and the remaining predicate have run over the complete page;
-//! * `next_source_page() == None` means "nothing right now". Only
-//!   [`ConnectorPageSource::is_finished`] is terminal.
+//!   deletes and the remaining predicate have run over the complete page.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
@@ -44,16 +42,15 @@ use arrow::array::{
 };
 use arrow::datatypes::{Field, FieldRef, Schema as ArrowSchema};
 use novarocks_fs::{
-    FileBatchReader, FileIdentity, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
-    FileReadRequest, FileReaderOptions, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
+    FileIdentity, FileProjection, FileReadBudget, FileReadContext, FileReadRange, FileReadRequest,
+    FileReaderOptions, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
     ParquetMetadataInspection, ParquetPhysicalType, ParquetStatisticsSortOrder,
     ParquetStatisticsValue, PhysicalPruning, PreparedFileInput, ScanPredicate, ScanPredicateDomain,
-    ScanPredicateSource, inspect_parquet_metadata, open_file_reader_with_parquet_inspection,
-    plan_parquet_input_ranges,
+    ScanPredicateSource, inspect_parquet_metadata, plan_parquet_input_ranges,
 };
 use novarocks_spi::connector::read_stack::DynamicFilter;
 use novarocks_spi::connector::read_stack::{
-    Bound, BoundsMatch, ColumnValueBounds, ConnectorPageSource, ConnectorPreparationControl,
+    Bound, BoundsMatch, ColumnValueBounds, ConnectorPollBudget, ConnectorPreparationControl,
     ConnectorPreparationProgress, ConnectorSplit, ConnectorValue, ConnectorValueType, Domain,
     PageSourceFileMetrics, PageSourceMetrics, SourcePage, TupleDomain,
 };
@@ -69,6 +66,13 @@ use super::change_window::IcebergChangeWindowHandle;
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, unsupported};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, SplitDeleteFilter};
 use super::preparation::{PlannedInput, PreparedRangeCandidate, SuccessorPreparationGroup};
+
+mod stream;
+pub use stream::{
+    IcebergParquetPageStream, IcebergPartitionOnlyPageStream, create_iceberg_page_stream,
+};
+pub(crate) use stream::{MaterializedPageStream, MaterializedPages, SplitOperations};
+
 pub(super) type IcebergDynamicFilter = dyn DynamicFilter<IcebergColumnHandle>;
 
 /// Lower the exact, non-null part of the typed Iceberg predicate into the
@@ -680,6 +684,29 @@ impl ParquetFooterCache {
         Ok(inspection)
     }
 
+    /// Awaited [`Self::footer`].
+    pub async fn footer_async(
+        &self,
+        access: &FsAccessHandle,
+        context: &FileReadContext,
+        path: &str,
+        file_size: u64,
+    ) -> Result<ParquetMetadataInspection, ConnectorError> {
+        let file = access
+            .bind_location(path, FileIdentity::new(path, file_size, None))
+            .map_err(map_file_error)?;
+        context.check_active().map_err(map_file_error)?;
+        let key = (file.access_domain(), file.identity().clone());
+        if let Some(cached) = self.lock()?.get(&key) {
+            return Ok(cached.clone());
+        }
+        let inspection = novarocks_fs::inspect_parquet_metadata_async(file, None, context.clone())
+            .await
+            .map_err(map_file_error)?;
+        self.lock()?.insert(key, inspection.clone());
+        Ok(inspection)
+    }
+
     /// Publish an identity-bound footer parsed from B-accounted preparation.
     /// A later demanded reader reuses this exact snapshot through the normal
     /// file/domain lookup rather than issuing a second footer request.
@@ -767,7 +794,8 @@ impl IcebergReadRelation {
     }
 }
 
-/// Everything one page source needs, all of it already frozen or process-local.
+/// Everything one split's page stream needs, all of it already frozen or
+/// process-local.
 pub struct IcebergPageSourceRequest<'a> {
     pub relation: &'a IcebergReadRelation,
     pub split: &'a IcebergSplit,
@@ -792,10 +820,16 @@ pub struct IcebergPageSourceRequest<'a> {
     pub pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
 }
 
-/// Build the page source for one Iceberg data split.
-pub fn create_iceberg_page_source(
-    request: IcebergPageSourceRequest<'_>,
-) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+/// A split's facts once its format, encryption material and partition spec
+/// are admitted. Admission reads nothing.
+struct AdmittedSplit {
+    table_schema: Arc<Schema>,
+    partition_spec: PartitionSpec,
+    partition_values: Struct,
+    effective_predicate: TupleDomain<IcebergColumnHandle>,
+}
+
+fn admit_split(request: &IcebergPageSourceRequest<'_>) -> Result<AdmittedSplit, ConnectorError> {
     let split = request.split;
     admit_file_format(split.file_format())?;
     reject_encryption_material(
@@ -820,82 +854,142 @@ pub fn create_iceberg_page_source(
         )));
     }
     let partition_values = parse_partition_values(split, &partition_spec, &table_schema)?;
-    let effective_predicate = request.relation.effective_predicate.clone();
+    Ok(AdmittedSplit {
+        table_schema,
+        partition_spec,
+        partition_values,
+        effective_predicate: request.relation.effective_predicate.clone(),
+    })
+}
 
+/// The fast path that needs no byte of the data file, when the split has one.
+fn partition_only_source(
+    request: &IcebergPageSourceRequest<'_>,
+    admitted: &AdmittedSplit,
+) -> Result<Option<IcebergPartitionOnlyPageSource>, ConnectorError> {
     // The fast path answers "every row of this file", which is only the right
     // answer when deletes hide rows. A mode that *selects* rows -- the change
     // window's reverse side, or reverse equality projection -- would get every
     // row of the file back with the right shape and the wrong contents.
-    if request.delete_mode == DeleteEvaluationMode::ExcludeDeleted
-        && let Some(mut fast_path) = try_partition_only_page_source(
-            split,
-            request.columns,
-            &partition_spec,
-            &partition_values,
-            &table_schema,
-            &effective_predicate,
-            request.budget,
-        )?
-    {
-        fast_path.pending_preparation_control = request.pending_preparation_control;
-        return Ok(Box::new(fast_path));
+    if request.delete_mode != DeleteEvaluationMode::ExcludeDeleted {
+        return Ok(None);
+    }
+    try_partition_only_page_source(
+        request.split,
+        request.columns,
+        &admitted.partition_spec,
+        &admitted.partition_values,
+        &admitted.table_schema,
+        &admitted.effective_predicate,
+        request.budget,
+    )
+}
+
+/// Everything one data split's reader is built from, owned so that a page
+/// stream can build it in its first poll.
+struct ParquetSplitRequest {
+    split: IcebergSplit,
+    name_mapping: Option<Arc<NameMapping>>,
+    columns: Vec<IcebergColumnHandle>,
+    delete_manager: Arc<DeleteManager>,
+    footers: Arc<ParquetFooterCache>,
+    access_binding: IcebergReadBinding,
+    context: FileReadContext,
+    cache: Option<novarocks_fs::DataCacheContext>,
+    budget: FileReadBudget,
+    reader_options: FileReaderOptions,
+    scheduled_split_sequence_id: u64,
+    dynamic_filter: Arc<IcebergDynamicFilter>,
+    prepared_input: Option<PreparedFileInput>,
+    pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
+}
+
+impl ParquetSplitRequest {
+    fn of(request: IcebergPageSourceRequest<'_>) -> (Self, DeleteEvaluationMode) {
+        (
+            Self {
+                split: request.split.clone(),
+                name_mapping: request.relation.name_mapping.clone(),
+                columns: request.columns.to_vec(),
+                delete_manager: request.delete_manager,
+                footers: request.footers,
+                access_binding: request.access_binding,
+                context: request.context,
+                cache: request.cache,
+                budget: request.budget,
+                reader_options: request.reader_options,
+                scheduled_split_sequence_id: request.scheduled_split_sequence_id,
+                dynamic_filter: request.dynamic_filter,
+                prepared_input: request.prepared_input,
+                pending_preparation_control: request.pending_preparation_control,
+            },
+            request.delete_mode,
+        )
     }
 
-    let name_mapping = request.relation.name_mapping.clone();
-    let delete_filter =
-        request
-            .delete_manager
-            .open_split(split, &table_schema, request.delete_mode)?;
-    let hidden_columns = delete_filter.required_hidden_columns().to_vec();
-
-    Ok(Box::new(IcebergParquetPageSource {
-        split: split.clone(),
-        table_schema,
-        name_mapping,
-        partition_spec,
-        partition_values,
-        prefix_len: request.columns.len(),
-        bound_handles: request
-            .columns
-            .iter()
-            .cloned()
-            .chain(hidden_columns)
-            .collect(),
-        delete_filter,
-        effective_predicate,
-        access_binding: request.access_binding,
-        context: request.context,
-        cache: request.cache,
-        footers: request.footers,
-        budget: request.budget,
-        reader_options: request.reader_options,
-        dynamic_filter: LiveDynamicFilter::new(
-            request.dynamic_filter,
-            request.scheduled_split_sequence_id,
-        ),
-        prepared_input: request.prepared_input.clone(),
-        prepared_retained_capacity: request
-            .prepared_input
+    /// The prepared input's backing capacity, held from creation until the
+    /// split's reader is closed.
+    fn prepared_retained_capacity(&self) -> u64 {
+        self.prepared_input
             .as_ref()
-            .map_or(0, |input| input.retained_backing_capacity() as u64),
-        pending_preparation_control: request.pending_preparation_control,
-        successor_preparation: None,
-        successor_control: Arc::new(SuccessorPreparationGroup::new()),
-        footer: None,
-        dynamic_filter_columns: Vec::new(),
-        pruned_row_groups: Vec::new(),
-        state: ReaderState::NotOpened,
-        row_window: ReaderPageSourceWithRowPositions::default(),
-        retired_bytes: 0,
-        completed_bytes: 0,
-        retired_file_metrics: Default::default(),
-        file_metrics: Default::default(),
-        completed_positions: 0,
-        read_time_nanos: 0,
-        retained_bytes: split.retained_size_in_bytes(),
-        finished: false,
-        closed: false,
-    }))
+            .map_or(0, |input| input.retained_backing_capacity() as u64)
+    }
+
+    /// What the split retains before a reader is open; the page source built
+    /// from it reports the same.
+    fn retained_base_bytes(&self) -> u64 {
+        self.split
+            .retained_size_in_bytes()
+            .saturating_add(self.prepared_retained_capacity())
+    }
+
+    fn into_source(
+        self,
+        admitted: AdmittedSplit,
+        delete_filter: SplitDeleteFilter,
+        successor_control: Arc<SuccessorPreparationGroup>,
+    ) -> IcebergParquetPageSource {
+        let hidden_columns = delete_filter.required_hidden_columns().to_vec();
+        let prepared_retained_capacity = self.prepared_retained_capacity();
+        IcebergParquetPageSource {
+            table_schema: admitted.table_schema,
+            name_mapping: self.name_mapping,
+            partition_spec: admitted.partition_spec,
+            partition_values: admitted.partition_values,
+            prefix_len: self.columns.len(),
+            bound_handles: self.columns.into_iter().chain(hidden_columns).collect(),
+            delete_filter,
+            effective_predicate: admitted.effective_predicate,
+            access_binding: self.access_binding,
+            context: self.context,
+            cache: self.cache,
+            footers: self.footers,
+            budget: self.budget,
+            reader_options: self.reader_options,
+            dynamic_filter: LiveDynamicFilter::new(
+                self.dynamic_filter,
+                self.scheduled_split_sequence_id,
+            ),
+            prepared_retained_capacity,
+            prepared_input: self.prepared_input,
+            successor_preparation: None,
+            successor_control,
+            footer: None,
+            dynamic_filter_columns: Vec::new(),
+            pruned_row_groups: Vec::new(),
+            state: ReaderState::NotOpened,
+            row_window: ReaderPageSourceWithRowPositions::default(),
+            retired_bytes: 0,
+            completed_bytes: 0,
+            retired_file_metrics: Default::default(),
+            file_metrics: Default::default(),
+            completed_positions: 0,
+            read_time_nanos: 0,
+            retained_bytes: self.split.retained_size_in_bytes(),
+            split: self.split,
+            finished: false,
+        }
+    }
 }
 
 /// Plan one conservative physical input range from an already prepared footer
@@ -1162,25 +1256,21 @@ fn try_partition_only_page_source(
         emitted_rows: 0,
         max_batch_rows: budget.max_rows.get(),
         retained_bytes: split.retained_size_in_bytes(),
-        pending_preparation_control: None,
-        closed: false,
     }))
 }
 
-/// A scan that needs no byte of the data file.
+/// A split that needs no byte of its data file: its pages are constants.
 pub struct IcebergPartitionOnlyPageSource {
     constants: Vec<(FieldRef, Option<Literal>)>,
     total_rows: u64,
     emitted_rows: u64,
     max_batch_rows: usize,
     retained_bytes: u64,
-    pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
-    closed: bool,
 }
 
-impl ConnectorPageSource for IcebergPartitionOnlyPageSource {
-    fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
-        if self.closed || self.emitted_rows >= self.total_rows {
+impl IcebergPartitionOnlyPageSource {
+    fn next_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
+        if self.is_exhausted() {
             return Ok(None);
         }
         let remaining = self.total_rows - self.emitted_rows;
@@ -1202,8 +1292,8 @@ impl ConnectorPageSource for IcebergPartitionOnlyPageSource {
         Ok(Some(page))
     }
 
-    fn is_finished(&self) -> bool {
-        self.closed || self.emitted_rows >= self.total_rows
+    fn is_exhausted(&self) -> bool {
+        self.emitted_rows >= self.total_rows
     }
 
     fn metrics(&self) -> PageSourceMetrics {
@@ -1215,21 +1305,8 @@ impl ConnectorPageSource for IcebergPartitionOnlyPageSource {
         }
     }
 
-    fn memory_usage_bytes(&self) -> u64 {
-        self.retained_bytes.saturating_add(
-            self.pending_preparation_control
-                .as_ref()
-                .map_or(0, |control| control.retained_input_bytes()),
-        )
-    }
-
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        self.closed = true;
-        if let Some(control) = self.pending_preparation_control.take() {
-            control.request_stop();
-            futures::executor::block_on(control.wait_drained());
-        }
-        Ok(())
+    fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
     }
 }
 
@@ -1274,15 +1351,18 @@ fn runtime_page_schema(schema: &ArrowSchema, columns: &[ArrayRef]) -> Arc<ArrowS
 }
 
 // ---------------------------------------------------------------------------
-// The Parquet page source
+// The Parquet split
 // ---------------------------------------------------------------------------
+
+/// The physical reader of one run, awaited by the split's page stream.
+type SplitReader = Box<novarocks_fs::AsyncFileBatchReader>;
 
 enum ReaderState {
     NotOpened,
     Open {
         /// Absent between two runs of the plan, while the next surviving row
         /// groups are still being chosen.
-        reader: Option<Box<dyn FileBatchReader>>,
+        reader: Option<SplitReader>,
         plan: RowGroupPlan,
         binding: IcebergSchemaBinding,
         page_schema: Arc<ArrowSchema>,
@@ -1336,7 +1416,7 @@ struct PredicateCheck {
     domain: Domain,
 }
 
-/// The per-split Parquet reader.
+/// The per-split Parquet reader state a page stream moves through its steps.
 pub struct IcebergParquetPageSource {
     split: IcebergSplit,
     table_schema: Arc<Schema>,
@@ -1358,7 +1438,6 @@ pub struct IcebergParquetPageSource {
     dynamic_filter: LiveDynamicFilter,
     prepared_input: Option<PreparedFileInput>,
     prepared_retained_capacity: u64,
-    pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
     /// At most the next ordered row group of the active source. Its control
     /// does not own or cancel the active reader's demand operation.
     successor_preparation: Option<(u32, PreparedRangeCandidate)>,
@@ -1386,21 +1465,38 @@ pub struct IcebergParquetPageSource {
     read_time_nanos: u64,
     retained_bytes: u64,
     finished: bool,
-    closed: bool,
 }
 
 impl IcebergParquetPageSource {
-    fn open(&mut self) -> Result<(), ConnectorError> {
-        let access = self.access_binding.resolve_access(self.split.path())?;
-        let file_size = u64::try_from(self.split.file_size()).map_err(|_| {
+    /// Resolves the file's access, reads its footer and binds the split to
+    /// it.
+    async fn open(&mut self) -> Result<(), ConnectorError> {
+        let access = self
+            .access_binding
+            .resolve_access_for_locations_async([self.split.path()], &self.context)
+            .await?;
+        let file_size = self.file_size()?;
+        let footer = self
+            .footers
+            .footer_async(&access, &self.context, self.split.path(), file_size)
+            .await?;
+        self.open_with_footer(footer)
+    }
+
+    fn file_size(&self) -> Result<u64, ConnectorError> {
+        u64::try_from(self.split.file_size()).map_err(|_| {
             corrupt(format!(
                 "iceberg data file {} declares a negative size",
                 self.split.path()
             ))
-        })?;
-        let footer = self
-            .footers
-            .footer(&access, &self.context, self.split.path(), file_size)?;
+        })
+    }
+
+    /// Judges and binds the split against its footer; no I/O.
+    fn open_with_footer(
+        &mut self,
+        footer: ParquetMetadataInspection,
+    ) -> Result<(), ConnectorError> {
         self.dynamic_filter_columns = self.dynamic_filter.resolve_columns(&footer);
         // The footer checkpoint judges the whole split at once. A split whose
         // every row group is proven impossible is finished without opening any
@@ -1511,14 +1607,34 @@ impl IcebergParquetPageSource {
     /// Returns `false` once the plan is exhausted. Every row group is judged
     /// against the filter as it stands at this moment, which is what lets a
     /// filter that arrived mid-split prune the row groups that follow.
-    fn open_next_run(&mut self) -> Result<bool, ConnectorError> {
-        let Some(footer) = self.footer.clone() else {
+    async fn open_next_run(&mut self) -> Result<bool, ConnectorError> {
+        let Some(row_groups) = self.next_run()? else {
             return Ok(false);
+        };
+        let reader = self.open_reader(row_groups).await?;
+        Ok(self.install_reader(reader))
+    }
+
+    fn install_reader(&mut self, reader: SplitReader) -> bool {
+        let ReaderState::Open { reader: slot, .. } = &mut self.state else {
+            return false;
+        };
+        *slot = Some(reader);
+        true
+    }
+
+    /// Chooses the next run's row groups against the filter as it stands now,
+    /// and takes over the successor's prepared input when the run reads it.
+    /// `None` once the plan is exhausted; `Some(None)` reads whatever the
+    /// byte range selects.
+    fn next_run(&mut self) -> Result<Option<Option<Vec<u32>>>, ConnectorError> {
+        let Some(footer) = self.footer.clone() else {
+            return Ok(None);
         };
         // Read the plan out first: judging a row group needs the filter and the
         // pruned-row-group log, which cannot be borrowed while the plan is.
         let Some((candidates, checkpoint)) = self.take_next_candidates() else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let row_groups = match candidates {
@@ -1549,7 +1665,7 @@ impl IcebergParquetPageSource {
                 self.restore_remaining(rest);
                 self.record_pruned(&pruned, checkpoint);
                 if run.is_empty() {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 // Reading every row group of the file is what this split did
                 // before any filter existed, so it is expressed the same way.
@@ -1566,12 +1682,7 @@ impl IcebergParquetPageSource {
             }
             drop(candidate);
         }
-        let reader = self.open_reader(row_groups)?;
-        let ReaderState::Open { reader: slot, .. } = &mut self.state else {
-            return Ok(false);
-        };
-        *slot = Some(reader);
-        Ok(true)
+        Ok(Some(row_groups))
     }
 
     /// Take the row groups the plan offers next, marking that offer consumed.
@@ -1625,17 +1736,28 @@ impl IcebergParquetPageSource {
     ///
     /// `None` means "whatever the range selects", which is byte for byte what
     /// this split did before any filter existed.
-    fn open_reader(
+    async fn open_reader(
         &mut self,
         row_groups: Option<Vec<u32>>,
-    ) -> Result<Box<dyn FileBatchReader>, ConnectorError> {
-        let access = self.access_binding.resolve_access(self.split.path())?;
-        let file_size = u64::try_from(self.split.file_size()).map_err(|_| {
-            corrupt(format!(
-                "iceberg data file {} declares a negative size",
-                self.split.path()
-            ))
-        })?;
+    ) -> Result<SplitReader, ConnectorError> {
+        let access = self
+            .access_binding
+            .resolve_access_for_locations_async([self.split.path()], &self.context)
+            .await?;
+        let request = self.reader_request(&access, row_groups)?;
+        novarocks_fs::open_file_reader_async(request, self.footer.as_ref())
+            .await
+            .map(Box::new)
+            .map_err(map_file_error)
+    }
+
+    /// The physical read request of one run; no I/O.
+    fn reader_request(
+        &mut self,
+        access: &FsAccessHandle,
+        row_groups: Option<Vec<u32>>,
+    ) -> Result<FileReadRequest, ConnectorError> {
+        let file_size = self.file_size()?;
         let ReaderState::Open { binding, .. } = &self.state else {
             return Err(invalid(
                 "iceberg page source opened a reader before binding its columns",
@@ -1664,31 +1786,27 @@ impl IcebergParquetPageSource {
                 FileIdentity::new(self.split.path(), file_size, None),
             )
             .map_err(map_file_error)?;
-        open_file_reader_with_parquet_inspection(
-            FileReadRequest {
-                file,
-                format: novarocks_fs::FileFormat::Parquet,
-                range,
-                projection,
-                budget: self.budget,
-                predicates: static_file_predicates(&self.effective_predicate),
-                pruning: PhysicalPruning {
-                    row_groups: row_groups.map(|ordinals| {
-                        ordinals
-                            .into_iter()
-                            .map(|ordinal| ordinal as usize)
-                            .collect()
-                    }),
-                    pages: Vec::new(),
-                },
-                options: self.reader_options,
-                cache: self.cache.clone(),
-                prepared_input: self.prepared_input.take(),
-                context: self.context.clone(),
+        Ok(FileReadRequest {
+            file,
+            format: novarocks_fs::FileFormat::Parquet,
+            range,
+            projection,
+            budget: self.budget,
+            predicates: static_file_predicates(&self.effective_predicate),
+            pruning: PhysicalPruning {
+                row_groups: row_groups.map(|ordinals| {
+                    ordinals
+                        .into_iter()
+                        .map(|ordinal| ordinal as usize)
+                        .collect()
+                }),
+                pages: Vec::new(),
             },
-            self.footer.as_ref(),
-        )
-        .map_err(map_file_error)
+            options: self.reader_options,
+            cache: self.cache.clone(),
+            prepared_input: self.prepared_input.take(),
+            context: self.context.clone(),
+        })
     }
 
     /// The row groups this split proved it need not read.
@@ -1730,29 +1848,15 @@ impl IcebergParquetPageSource {
     }
 }
 
-impl ConnectorPageSource for IcebergParquetPageSource {
-    fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
-        if self.closed || self.finished {
-            return Ok(None);
-        }
-        let began = Instant::now();
-        let result = self.produce_page();
-        self.read_time_nanos = self
-            .read_time_nanos
-            .saturating_add(began.elapsed().as_nanos() as u64);
-        result
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished || self.closed
-    }
-
+impl IcebergParquetPageSource {
+    /// Advances the preparation of the next ordered row group within the
+    /// supplied capacity, without moving the decode cursor.
     fn advance_successor_preparation(
         &mut self,
         remaining_input_bytes: u64,
         remaining_candidates: usize,
     ) -> Result<ConnectorPreparationProgress, ConnectorError> {
-        if self.closed || self.finished {
+        if self.finished {
             return Ok(ConnectorPreparationProgress::Deferred);
         }
         let next_ordinal = match &self.state {
@@ -1821,10 +1925,6 @@ impl ConnectorPageSource for IcebergParquetPageSource {
             .advance(remaining_input_bytes)
     }
 
-    fn successor_preparation_input_bytes(&self) -> u64 {
-        self.successor_control.retained_input_bytes()
-    }
-
     fn successor_preparation_candidate_count(&self) -> usize {
         let ready_active = self
             .successor_preparation
@@ -1835,10 +1935,6 @@ impl ConnectorPageSource for IcebergParquetPageSource {
             .saturating_add(usize::from(ready_active))
     }
 
-    fn successor_preparation_control(&self) -> Option<Arc<dyn ConnectorPreparationControl>> {
-        Some(Arc::clone(&self.successor_control) as Arc<dyn ConnectorPreparationControl>)
-    }
-
     fn metrics(&self) -> PageSourceMetrics {
         PageSourceMetrics {
             completed_bytes: self.completed_bytes,
@@ -1847,8 +1943,12 @@ impl ConnectorPageSource for IcebergParquetPageSource {
             file: page_source_file_metrics(self.file_metrics),
         }
     }
+}
 
-    fn memory_usage_bytes(&self) -> u64 {
+impl IcebergParquetPageSource {
+    /// Memory the split itself retains, apart from its successor and promoted
+    /// preparation, which report their own live retention.
+    fn retained_base_bytes(&self) -> u64 {
         let binding = match &self.state {
             ReaderState::Open { binding, .. } => binding.retained_size_in_bytes(),
             ReaderState::NotOpened | ReaderState::Drained => 0,
@@ -1856,22 +1956,13 @@ impl ConnectorPageSource for IcebergParquetPageSource {
         self.retained_bytes
             .saturating_add(binding)
             .saturating_add(self.prepared_retained_capacity)
-            .saturating_add(self.successor_control.retained_input_bytes())
-            .saturating_add(
-                self.pending_preparation_control
-                    .as_ref()
-                    .map_or(0, |control| control.retained_input_bytes()),
-            )
     }
 
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        if self.closed {
-            return Ok(());
-        }
-        self.closed = true;
-        // The reader is dropped whatever its own close says: a page source
-        // that has been closed must not keep an open file handle alive because
-        // the underlying close reported a late I/O error.
+    /// Drops the split's open reader; waits for nothing.
+    fn close_reader(&mut self) -> Result<(), ConnectorError> {
+        // The reader is dropped whatever its own close says: a closed split
+        // must not keep an open file handle alive because the underlying
+        // close reported a late I/O error.
         let state = std::mem::replace(&mut self.state, ReaderState::Drained);
         let reader_result = if let ReaderState::Open {
             reader: Some(mut reader),
@@ -1885,159 +1976,209 @@ impl ConnectorPageSource for IcebergParquetPageSource {
         } else {
             Ok(())
         };
-        self.successor_control.request_stop();
-        futures::executor::block_on(self.successor_control.wait_drained());
-        if let Some(control) = self.pending_preparation_control.take() {
-            control.request_stop();
-            futures::executor::block_on(control.wait_drained());
-        }
         self.prepared_retained_capacity = 0;
         reader_result
     }
 }
 
 impl IcebergParquetPageSource {
-    fn produce_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
+    /// The split's next page: a decoded batch judged by deletes and the
+    /// remaining predicate. Each decoded batch spends one unit of the host's
+    /// turn budget, so a run of batches that all filter to nothing still ends
+    /// the turn.
+    async fn produce_page_async(
+        &mut self,
+        budget: &ConnectorPollBudget,
+    ) -> Result<Option<SourcePage>, ConnectorError> {
         if matches!(self.state, ReaderState::NotOpened) {
-            self.open()?;
+            self.open().await?;
         }
+        loop {
+            let Some(file_batch) = self.next_file_batch().await? else {
+                return Ok(None);
+            };
+            let page = self.assemble_page(file_batch)?;
+            budget.consume(1).await;
+            if let Some(page) = page {
+                return Ok(Some(page));
+            }
+        }
+    }
+
+    /// The next decoded batch of the split, opening the next run of row
+    /// groups whenever the current one is drained. `None` once the split is.
+    async fn next_file_batch(&mut self) -> Result<Option<novarocks_fs::FileBatch>, ConnectorError> {
         loop {
             // A run ends at a row-group boundary, which is exactly where a
             // tighter dynamic filter can still save the next decode.
             if matches!(&self.state, ReaderState::Open { reader: None, .. })
-                && !self.open_next_run()?
+                && !self.open_next_run().await?
             {
-                self.finished = true;
-                self.state = ReaderState::Drained;
-                return Ok(None);
+                return Ok(self.finish());
             }
-
             let ReaderState::Open {
                 reader: Some(reader),
-                plan,
-                binding,
-                page_schema,
-                checks,
-                positions_required,
+                ..
             } = &mut self.state
             else {
                 self.finished = true;
                 return Ok(None);
             };
+            let next = reader.next_batch().await;
+            if let Some(batch) = self.observe_batch(next)? {
+                return Ok(Some(batch));
+            }
+            if self.retire_run()? {
+                return Ok(self.finish());
+            }
+        }
+    }
 
-            let next = reader.next_batch();
+    fn finish(&mut self) -> Option<novarocks_fs::FileBatch> {
+        self.finished = true;
+        self.state = ReaderState::Drained;
+        None
+    }
+
+    /// Folds the open reader's counters into the split's and returns its
+    /// batch, if it produced one.
+    fn observe_batch(
+        &mut self,
+        next: novarocks_fs::FileResult<Option<novarocks_fs::FileBatch>>,
+    ) -> Result<Option<novarocks_fs::FileBatch>, ConnectorError> {
+        if let ReaderState::Open {
+            reader: Some(reader),
+            ..
+        } = &self.state
+        {
             self.file_metrics =
                 file_metrics_saturating_add(self.retired_file_metrics, reader.metrics_snapshot());
             self.completed_bytes = self.file_metrics.bytes_read;
-            let next = next.map_err(map_file_error)?;
-            let Some(file_batch) = next else {
-                // This run is drained. Retire its byte counter and let the plan
-                // decide, against the filter as it now stands, what comes next.
-                let exhausted = plan.is_exhausted();
-                self.retired_bytes = self.completed_bytes;
-                self.retired_file_metrics = self.file_metrics;
-                let ReaderState::Open { reader, .. } = &mut self.state else {
-                    self.finished = true;
-                    return Ok(None);
-                };
-                if let Some(mut reader) = reader.take() {
-                    reader.close().map_err(map_file_error)?;
-                }
-                if exhausted {
-                    self.finished = true;
-                    self.state = ReaderState::Drained;
-                    return Ok(None);
-                }
-                continue;
-            };
+        }
+        next.map_err(map_file_error)
+    }
 
-            let positions = file_batch.physical_row_positions;
-            if *positions_required && positions.is_none() {
+    /// Retires the drained run's reader and its counters. True when the plan
+    /// has nothing left, so the split is drained; otherwise the plan decides,
+    /// against the filter as it now stands, what comes next.
+    fn retire_run(&mut self) -> Result<bool, ConnectorError> {
+        self.retired_bytes = self.completed_bytes;
+        self.retired_file_metrics = self.file_metrics;
+        let ReaderState::Open { reader, plan, .. } = &mut self.state else {
+            return Ok(true);
+        };
+        let exhausted = plan.is_exhausted();
+        if let Some(mut reader) = reader.take() {
+            reader.close().map_err(map_file_error)?;
+        }
+        Ok(exhausted)
+    }
+
+    /// Turns one decoded batch into the split's page: materialized, judged by
+    /// deletes and the remaining predicate over the complete page, and cut to
+    /// the scan's columns. `None` when nothing in it survives. No I/O.
+    fn assemble_page(
+        &mut self,
+        file_batch: novarocks_fs::FileBatch,
+    ) -> Result<Option<SourcePage>, ConnectorError> {
+        let ReaderState::Open {
+            binding,
+            page_schema,
+            checks,
+            positions_required,
+            ..
+        } = &self.state
+        else {
+            return Err(invalid(
+                "iceberg page source assembled a page before binding its columns",
+            ));
+        };
+        let positions = file_batch.physical_row_positions;
+        if *positions_required && positions.is_none() {
+            return Err(corrupt(format!(
+                "iceberg data file {} did not report the absolute row position of the split's first row group",
+                self.split.path()
+            )));
+        }
+        if let Some(positions) = positions.as_ref() {
+            self.row_window.observe(positions, self.split.path())?;
+            if let Some(end) = self.row_window.end_row_position()
+                && end > self.split.file_record_count() as u64
+            {
                 return Err(corrupt(format!(
-                    "iceberg data file {} did not report the absolute row position of the split's first row group",
-                    self.split.path()
+                    "iceberg data file {} produced absolute row position {} beyond its {} records",
+                    self.split.path(),
+                    end - 1,
+                    self.split.file_record_count()
                 )));
             }
-            if let Some(positions) = positions.as_ref() {
-                self.row_window.observe(positions, self.split.path())?;
-                if let Some(end) = self.row_window.end_row_position()
-                    && end > self.split.file_record_count() as u64
-                {
-                    return Err(corrupt(format!(
-                        "iceberg data file {} produced absolute row position {} beyond its {} records",
-                        self.split.path(),
-                        end - 1,
-                        self.split.file_record_count()
-                    )));
-                }
-            }
+        }
 
-            let facts = IcebergSplitFacts {
-                path: self.split.path(),
-                file_first_row_id: self.split.file_first_row_id(),
-                data_sequence_number: self.split.data_sequence_number(),
-            };
-            let columns = binding.materialize(&file_batch.batch, positions.as_ref(), &facts)?;
-            let rows = file_batch.batch.num_rows();
-            let runtime_schema = runtime_page_schema(page_schema, &columns);
-            let page_batch = RecordBatch::try_new_with_options(
-                runtime_schema,
-                columns.clone(),
-                &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
-            )
-            .map_err(|error| {
+        let facts = IcebergSplitFacts {
+            path: self.split.path(),
+            file_first_row_id: self.split.file_first_row_id(),
+            data_sequence_number: self.split.data_sequence_number(),
+        };
+        let columns = binding.materialize(&file_batch.batch, positions.as_ref(), &facts)?;
+        let rows = file_batch.batch.num_rows();
+        let runtime_schema = runtime_page_schema(page_schema, &columns);
+        let page_batch = RecordBatch::try_new_with_options(
+            runtime_schema,
+            columns.clone(),
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .map_err(|error| {
+            corrupt(format!(
+                "iceberg page assembly for {} failed: {error}",
+                self.split.path()
+            ))
+        })?;
+
+        // Deletes and the remaining predicate both judge the complete page,
+        // hidden suffix included, before the suffix is dropped.
+        let mut keep = if self.delete_filter.is_empty() {
+            None
+        } else {
+            let positions = positions.as_ref().ok_or_else(|| {
                 corrupt(format!(
-                    "iceberg page assembly for {} failed: {error}",
+                    "iceberg deletes for {} need absolute row positions",
                     self.split.path()
                 ))
             })?;
-
-            // Deletes and the remaining predicate both judge the complete page,
-            // hidden suffix included, before the suffix is dropped.
-            let mut keep = if self.delete_filter.is_empty() {
-                None
-            } else {
-                let positions = positions.as_ref().ok_or_else(|| {
-                    corrupt(format!(
-                        "iceberg deletes for {} need absolute row positions",
-                        self.split.path()
-                    ))
-                })?;
-                Some(self.delete_filter.evaluate(&page_batch, positions)?)
-            };
-            for check in checks.iter() {
-                let mask = evaluate_domain(
-                    page_batch.column(check.channel),
-                    &check.domain,
-                    self.split.path(),
-                )?;
-                keep = Some(match keep {
-                    None => mask,
-                    Some(previous) => arrow::compute::and(&previous, &mask).map_err(|error| {
-                        corrupt(format!("iceberg row predicate conjunction failed: {error}"))
-                    })?,
-                });
-            }
-
-            let mut page = SourcePage::try_new(rows, columns)?;
-            if let Some(keep) = keep {
-                let selected = surviving_positions(&keep);
-                if selected.len() != rows {
-                    page.select_positions(&selected)?;
-                }
-            }
-            page.truncate_channels(self.prefix_len)?;
-            if page.position_count() == 0 {
-                // Everything in this batch was deleted or filtered out. The
-                // split is not finished, so the next row group is read rather
-                // than reporting an empty page as if it were data.
-                continue;
-            }
-            self.completed_positions = self
-                .completed_positions
-                .saturating_add(page.position_count() as u64);
-            return Ok(Some(page));
+            Some(self.delete_filter.evaluate(&page_batch, positions)?)
+        };
+        for check in checks.iter() {
+            let mask = evaluate_domain(
+                page_batch.column(check.channel),
+                &check.domain,
+                self.split.path(),
+            )?;
+            keep = Some(match keep {
+                None => mask,
+                Some(previous) => arrow::compute::and(&previous, &mask).map_err(|error| {
+                    corrupt(format!("iceberg row predicate conjunction failed: {error}"))
+                })?,
+            });
         }
+
+        let mut page = SourcePage::try_new(rows, columns)?;
+        if let Some(keep) = keep {
+            let selected = surviving_positions(&keep);
+            if selected.len() != rows {
+                page.select_positions(&selected)?;
+            }
+        }
+        page.truncate_channels(self.prefix_len)?;
+        if page.position_count() == 0 {
+            // Everything in this batch was deleted or filtered out. The
+            // split is not finished, so the next row group is read rather
+            // than reporting an empty page as if it were data.
+            return Ok(None);
+        }
+        self.completed_positions = self
+            .completed_positions
+            .saturating_add(page.position_count() as u64);
+        Ok(Some(page))
     }
 }
 
@@ -2251,7 +2392,9 @@ mod tests {
         FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
     };
     use novarocks_spi::connector::ConnectorErrorKind;
-    use novarocks_spi::connector::read_stack::{DynamicFilter, SplitWeight, TupleDomain};
+    use novarocks_spi::connector::read_stack::{
+        DynamicFilter, OwnedConnectorPageStream, SplitWeight, TupleDomain,
+    };
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::file::properties::WriterProperties;
@@ -2265,6 +2408,8 @@ mod tests {
         IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergSplitParams,
     };
     use crate::typed_read::table_handle::{IcebergTableHandle, IcebergTableHandleParams};
+    use crate::typed_read::test_spawners::{CountingTaskSpawner, GatedTaskSpawner};
+    use crate::typed_read::test_streams::DrivenStream;
 
     const ROWS_PER_GROUP: usize = 4;
 
@@ -2282,8 +2427,7 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             runtime: file_runtime,
             task_spawner,
-            range_service: None,
-            range_scope: None,
+            range: None,
         }
     }
 
@@ -2668,12 +2812,13 @@ mod tests {
     }
 
     impl Harness {
+        /// The split's page stream, driven on the harness runtime.
         fn page_source(
             &self,
             split: &IcebergSplit,
             handle: &IcebergTableHandle,
             columns: &[IcebergColumnHandle],
-        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+        ) -> Result<DrivenStream<'_>, ConnectorError> {
             self.page_source_with_mode(split, handle, columns, DeleteEvaluationMode::ExcludeDeleted)
         }
 
@@ -2683,9 +2828,10 @@ mod tests {
             handle: &IcebergTableHandle,
             columns: &[IcebergColumnHandle],
             delete_mode: DeleteEvaluationMode,
-        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+        ) -> Result<DrivenStream<'_>, ConnectorError> {
             let relation = IcebergReadRelation::of_table(handle, split.partition_spec_id())?;
-            create_iceberg_page_source(IcebergPageSourceRequest {
+            let budget = ConnectorPollBudget::new();
+            let request = IcebergPageSourceRequest {
                 relation: &relation,
                 split,
                 columns,
@@ -2708,14 +2854,16 @@ mod tests {
                 ) as Arc<IcebergDynamicFilter>,
                 prepared_input: None,
                 pending_preparation_control: None,
-            })
+            };
+            let stream = create_iceberg_page_stream(request, &budget)?;
+            Ok(DrivenStream::new(&self._runtime, stream, budget))
         }
     }
 
-    fn drain_ids(source: &mut Box<dyn ConnectorPageSource>) -> Vec<i64> {
+    fn drain_ids(source: &mut DrivenStream<'_>) -> Vec<i64> {
         let mut ids = Vec::new();
         while !source.is_finished() {
-            let Some(page) = source.next_source_page().expect("page") else {
+            let Some(page) = source.next_page().expect("page") else {
                 continue;
             };
             let (rows, columns) = page.into_columns().expect("materialize");
@@ -2730,10 +2878,10 @@ mod tests {
     }
 
     /// Drain every page and return the first `count` output columns as i64.
-    fn drain_i64_columns(source: &mut Box<dyn ConnectorPageSource>, count: usize) -> Vec<Vec<i64>> {
+    fn drain_i64_columns(source: &mut DrivenStream<'_>, count: usize) -> Vec<Vec<i64>> {
         let mut out = vec![Vec::new(); count];
         while !source.is_finished() {
-            let Some(page) = source.next_source_page().expect("page") else {
+            let Some(page) = source.next_page().expect("page") else {
                 continue;
             };
             let (rows, columns) = page.into_columns().expect("materialize");
@@ -2872,9 +3020,10 @@ mod tests {
             columns: &[IcebergColumnHandle],
             dynamic_filter: Arc<IcebergDynamicFilter>,
             scheduled_split_sequence_id: u64,
-        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+        ) -> Result<DrivenStream<'_>, ConnectorError> {
             let relation = IcebergReadRelation::of_table(handle, split.partition_spec_id())?;
-            create_iceberg_page_source(IcebergPageSourceRequest {
+            let budget = ConnectorPollBudget::new();
+            let request = IcebergPageSourceRequest {
                 relation: &relation,
                 split,
                 columns,
@@ -2893,7 +3042,9 @@ mod tests {
                 dynamic_filter,
                 prepared_input: None,
                 pending_preparation_control: None,
-            })
+            };
+            let stream = create_iceberg_page_stream(request, &budget)?;
+            Ok(DrivenStream::new(&self._runtime, stream, budget))
         }
     }
 
@@ -2977,7 +3128,7 @@ mod tests {
 
         // The first row group is read while nothing is constrained.
         let first = source
-            .next_source_page()
+            .next_page()
             .expect("page")
             .expect("the first row group is readable");
         assert_eq!(first.position_count(), ROWS_PER_GROUP);
@@ -2996,14 +3147,19 @@ mod tests {
     fn a_prepared_successor_is_rechecked_against_a_late_filter() {
         let mut harness = harness_of(write_large_data_file);
         assert!(harness.file_size > novarocks_fs::SMALL_FILE_PROBE_MAX_BYTES);
-        harness.context.range_scope = Some(FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap());
-        harness.context.range_service = Some(FileRangeService::new(
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-            Arc::clone(&harness.context.task_spawner),
-            harness._runtime.handle().clone(),
-        ));
+        harness.context.range = Some(
+            FileRangeService::new(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                Arc::clone(&harness.context.task_spawner),
+                harness._runtime.handle().clone(),
+            )
+            .bind(
+                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+            ),
+        );
         let schema = iceberg_schema();
         let handle = table_handle(&schema, false);
         let split = whole_file_split(&harness, 3);
@@ -3019,7 +3175,7 @@ mod tests {
             .expect("page source");
         assert_eq!(
             source
-                .next_source_page()
+                .next_page()
                 .expect("page")
                 .expect("first run")
                 .position_count(),
@@ -3202,7 +3358,7 @@ mod tests {
             .expect("page source");
         source.close().expect("close");
         assert!(source.is_finished());
-        assert!(source.next_source_page().expect("no page").is_none());
+        assert!(source.next_page().expect("no page").is_none());
         assert!(
             filter.questions().is_empty(),
             "a closed scan must not consult the filter"
@@ -3305,6 +3461,27 @@ mod tests {
         );
     }
 
+    /// `_row_id`: `first_row_id` plus the row's absolute position in its file.
+    fn row_id_column() -> IcebergColumnHandle {
+        IcebergColumnHandle::try_new(
+            crate::typed_read::column_handle::IcebergColumnHandleParams {
+                base_column_identity: crate::typed_read::column_handle::ColumnIdentity::try_new(
+                    crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                    crate::row_lineage_synth::ICEBERG_ROW_ID_COL,
+                    crate::typed_read::column_handle::ColumnIdentityCategory::Primitive,
+                    Vec::new(),
+                )
+                .expect("identity"),
+                base_type_json: "\"long\"".to_owned(),
+                field_id_path: Vec::new(),
+                type_json: "\"long\"".to_owned(),
+                nullable: false,
+                comment: None,
+            },
+        )
+        .expect("row id handle")
+    }
+
     #[test]
     fn absolute_row_positions_survive_row_group_pruning() {
         let harness = harness(3);
@@ -3325,25 +3502,8 @@ mod tests {
         );
         // `_row_id` is `first_row_id + absolute position`, so it proves the
         // positions were not renumbered from the start of the split.
-        let row_id = IcebergColumnHandle::try_new(
-            crate::typed_read::column_handle::IcebergColumnHandleParams {
-                base_column_identity: crate::typed_read::column_handle::ColumnIdentity::try_new(
-                    crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                    crate::row_lineage_synth::ICEBERG_ROW_ID_COL,
-                    crate::typed_read::column_handle::ColumnIdentityCategory::Primitive,
-                    Vec::new(),
-                )
-                .expect("identity"),
-                base_type_json: "\"long\"".to_owned(),
-                field_id_path: Vec::new(),
-                type_json: "\"long\"".to_owned(),
-                nullable: false,
-                comment: None,
-            },
-        )
-        .expect("row id handle");
         let mut source = harness
-            .page_source(&split, &handle, &[row_id])
+            .page_source(&split, &handle, &[row_id_column()])
             .expect("page source");
         let ids = drain_ids(&mut source);
         assert_eq!(
@@ -3411,19 +3571,19 @@ mod tests {
             .expect("page source");
 
         assert!(!source.is_finished(), "a fresh page source is not finished");
-        let first = source.next_source_page().expect("first page");
+        let first = source.next_page().expect("first page");
         assert!(first.is_some());
         assert!(
             !source.is_finished(),
             "a produced page never terminates the source on its own"
         );
-        let second = source.next_source_page().expect("second call");
+        let second = source.next_page().expect("second call");
         assert!(second.is_none(), "the reader is drained");
         assert!(source.is_finished(), "only is_finished is terminal");
 
         source.close().expect("close");
         source.close().expect("close is idempotent");
-        assert!(source.next_source_page().expect("after close").is_none());
+        assert!(source.next_page().expect("after close").is_none());
     }
 
     #[test]
@@ -3440,7 +3600,7 @@ mod tests {
             .expect("page source");
         let mut positions = 0usize;
         while !source.is_finished() {
-            let Some(page) = source.next_source_page().expect("page") else {
+            let Some(page) = source.next_page().expect("page") else {
                 continue;
             };
             assert_eq!(page.channel_count(), 0, "a zero-column page is legal");
@@ -3469,7 +3629,7 @@ mod tests {
 
         let mut positions = 0usize;
         while !source.is_finished() {
-            let Some(mut page) = source.next_source_page().expect("page") else {
+            let Some(page) = source.next_page().expect("page") else {
                 continue;
             };
             let column = page.block(0).expect("partition constant").clone();
@@ -3508,11 +3668,13 @@ mod tests {
             .page_source(&split, &handle, &[])
             .expect("page source");
         let page = source
-            .next_source_page()
+            .next_page()
             .expect("page")
             .expect("a zero-column page is still a page");
         assert_eq!(page.channel_count(), 0);
         assert_eq!(page.position_count(), 7);
+        // A stream reports its end when it is polled again.
+        assert!(source.next_page().expect("end of stream").is_none());
         assert!(source.is_finished());
     }
 
@@ -3613,7 +3775,7 @@ mod tests {
 
         let mut ids = Vec::new();
         while !source.is_finished() {
-            let Some(page) = source.next_source_page().expect("page") else {
+            let Some(page) = source.next_page().expect("page") else {
                 continue;
             };
             assert_eq!(
@@ -3721,6 +3883,603 @@ mod tests {
                 "created_at",
             )
             .is_err()
+        );
+    }
+
+    // --- page streams -------------------------------------------------------
+
+    impl Harness {
+        fn page_stream_with(
+            &self,
+            split: &IcebergSplit,
+            handle: &IcebergTableHandle,
+            columns: &[IcebergColumnHandle],
+            dynamic_filter: Arc<IcebergDynamicFilter>,
+            budget: &ConnectorPollBudget,
+        ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+            let relation = IcebergReadRelation::of_table(handle, split.partition_spec_id())?;
+            create_iceberg_page_stream(
+                IcebergPageSourceRequest {
+                    relation: &relation,
+                    split,
+                    columns,
+                    delete_manager: Arc::clone(&self.delete_manager),
+                    delete_mode: DeleteEvaluationMode::ExcludeDeleted,
+                    footers: Arc::clone(&self.footers),
+                    access_binding: self.binding.clone(),
+                    context: self.context.clone(),
+                    cache: None,
+                    budget: FileReadBudget {
+                        max_rows: NonZeroUsize::new(1024).expect("nonzero"),
+                        max_bytes: NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
+                    },
+                    reader_options: FileReaderOptions::default(),
+                    scheduled_split_sequence_id: 0,
+                    dynamic_filter,
+                    prepared_input: None,
+                    pending_preparation_control: None,
+                },
+                budget,
+            )
+        }
+    }
+
+    fn no_dynamic_filter() -> Arc<IcebergDynamicFilter> {
+        Arc::new(
+            novarocks_spi::connector::read_stack::CompleteAllDynamicFilter::new(
+                std::collections::BTreeSet::new(),
+            ),
+        ) as Arc<IcebergDynamicFilter>
+    }
+
+    fn page_ids(page: SourcePage) -> Vec<i64> {
+        let (rows, columns) = page.into_columns().expect("materialize");
+        assert_eq!(columns[0].len(), rows);
+        columns[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 ids")
+            .values()
+            .to_vec()
+    }
+
+    /// Drains a stream on the harness runtime, one host turn per page.
+    fn drain_stream(
+        harness: &Harness,
+        stream: &mut OwnedConnectorPageStream,
+        budget: &ConnectorPollBudget,
+    ) -> Vec<i64> {
+        use futures::StreamExt;
+        harness._runtime.block_on(async {
+            let mut ids = Vec::new();
+            loop {
+                budget.refill(1024);
+                match stream.next().await {
+                    Some(page) => ids.extend(page_ids(page.expect("page"))),
+                    None => return ids,
+                }
+            }
+        })
+    }
+
+    fn equality_delete_of(harness: &Harness, regions: &[&str]) -> IcebergDeleteFile {
+        let delete_path = std::path::Path::new(&harness.file_name)
+            .parent()
+            .expect("data directory")
+            .join("eq-delete.parquet");
+        write_equality_delete(&delete_path, regions);
+        IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            content: IcebergDeleteFileContent::EqualityDeletes,
+            path: delete_path.to_string_lossy().to_string(),
+            format: IcebergFileFormat::Parquet,
+            record_count: regions.len() as i64,
+            file_size_in_bytes: fs::metadata(&delete_path).expect("stat").len() as i64,
+            equality_field_ids: vec![2],
+            row_position_lower_bound: None,
+            row_position_upper_bound: None,
+            data_sequence_number: 9,
+            content_offset: None,
+            content_size_in_bytes: None,
+            referenced_data_file: None,
+            decryption_data: None,
+        })
+        .expect("delete descriptor")
+    }
+
+    #[test]
+    fn a_page_stream_reads_the_rows_its_page_source_reads() {
+        let harness = harness(3);
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let split = whole_file_split(&harness, 3);
+        let mut source = harness
+            .page_source(&split, &handle, &id_column(&schema))
+            .expect("page source");
+        let expected = drain_ids(&mut source);
+        let budget = ConnectorPollBudget::new();
+        let mut stream = harness
+            .page_stream_with(
+                &split,
+                &handle,
+                &id_column(&schema),
+                no_dynamic_filter(),
+                &budget,
+            )
+            .expect("page stream");
+        assert_eq!(drain_stream(&harness, &mut stream, &budget), expected);
+        assert_eq!(expected.len(), 3 * ROWS_PER_GROUP);
+        harness
+            ._runtime
+            .block_on(stream.close())
+            .expect("closing a drained stream");
+
+        // A delete closure is judged over the hidden suffix and dropped, in
+        // the stream exactly as in the page source.
+        let deleted = build_split(
+            &harness.file_name,
+            SplitOptions {
+                deletes: vec![equality_delete_of(&harness, &["r2", "r5"])],
+                ..SplitOptions::whole_file(harness.file_size, (3 * ROWS_PER_GROUP) as i64)
+            },
+        );
+        let mut stream = harness
+            .page_stream_with(
+                &deleted,
+                &handle,
+                &id_column(&schema),
+                no_dynamic_filter(),
+                &budget,
+            )
+            .expect("page stream");
+        let ids = drain_stream(&harness, &mut stream, &budget);
+        assert_eq!(
+            ids,
+            (0..(3 * ROWS_PER_GROUP) as i64)
+                .filter(|id| *id != 2 && *id != 5)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_filter_arriving_mid_split_prunes_the_stream_s_later_row_groups() {
+        use futures::StreamExt;
+
+        let harness = harness(3);
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let split = whole_file_split(&harness, 3);
+        let filter = TestDynamicFilter::new(1, &schema);
+        let budget = ConnectorPollBudget::new();
+        budget.refill(1024);
+        let mut stream = harness
+            .page_stream_with(
+                &split,
+                &handle,
+                &id_column(&schema),
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
+                &budget,
+            )
+            .expect("page stream");
+        let first = harness
+            ._runtime
+            .block_on(stream.next())
+            .expect("a page")
+            .expect("the first row group is readable");
+        assert_eq!(first.position_count(), ROWS_PER_GROUP);
+        filter.reject_everything();
+        assert!(
+            drain_stream(&harness, &mut stream, &budget).is_empty(),
+            "a filter that arrives mid-split prunes every row group not yet read"
+        );
+    }
+
+    #[test]
+    fn a_split_of_filtered_batches_yields_when_its_turn_runs_out() {
+        use futures::StreamExt;
+
+        let harness = harness(3);
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let regions = (0..3 * ROWS_PER_GROUP)
+            .map(|id| format!("r{id}"))
+            .collect::<Vec<_>>();
+        let split = build_split(
+            &harness.file_name,
+            SplitOptions {
+                deletes: vec![equality_delete_of(
+                    &harness,
+                    &regions.iter().map(String::as_str).collect::<Vec<_>>(),
+                )],
+                ..SplitOptions::whole_file(harness.file_size, (3 * ROWS_PER_GROUP) as i64)
+            },
+        );
+        let budget = ConnectorPollBudget::new();
+        let mut stream = harness
+            .page_stream_with(
+                &split,
+                &handle,
+                &id_column(&schema),
+                no_dynamic_filter(),
+                &budget,
+            )
+            .expect("page stream");
+        // Driven the way a driver runs it: every poll is one turn with room
+        // for one decoded batch, and a Pending turn ends until the stream's
+        // own wake -- a spent turn or a finished read -- starts the next.
+        harness._runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                std::future::poll_fn(|cx| {
+                    budget.refill(1);
+                    stream.poll_next_unpin(cx).map(|page| {
+                        if let Some(page) = page {
+                            panic!(
+                                "every row is deleted, got {:?}",
+                                page.map(|page| page.position_count())
+                            );
+                        }
+                    })
+                }),
+            )
+            .await
+            .expect("the stream ends");
+        });
+        assert!(
+            budget.exhaustions() >= 2,
+            "three all-deleted batches with one unit per turn must yield, saw {}",
+            budget.exhaustions()
+        );
+    }
+
+    #[test]
+    fn closing_a_stream_seals_its_split_alone_and_waits_for_its_held_read() {
+        use futures::StreamExt;
+
+        let mut harness = harness_of(write_large_data_file);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let spawner = Arc::new(GatedTaskSpawner {
+            handle: harness._runtime.handle().clone(),
+            gate: Arc::clone(&gate),
+            started: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let task_operations =
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        harness.context.range = Some(
+            FileRangeService::new(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(8).unwrap(),
+                spawner.clone() as Arc<dyn FileTaskSpawner>,
+                harness._runtime.handle().clone(),
+            )
+            .bind(
+                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                task_operations.clone(),
+            ),
+        );
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let split = whole_file_split(&harness, 3);
+        let budget = ConnectorPollBudget::new();
+        budget.refill(1024);
+        let mut stream = harness
+            .page_stream_with(
+                &split,
+                &handle,
+                &id_column(&schema),
+                no_dynamic_filter(),
+                &budget,
+            )
+            .expect("page stream");
+        // Let the footer through (its tail, then its metadata) and hold the
+        // first data read.
+        gate.add_permits(2);
+        harness._runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while spawner.started.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+                    assert!(futures::poll!(stream.next()).is_pending());
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the first data read is in flight");
+        });
+        assert!(task_operations.live_operations() > 0);
+
+        // Closed the way a driver closes it: inside the runtime's context.
+        let mut closed = {
+            let _context = harness._runtime.enter();
+            stream.close()
+        };
+        harness._runtime.block_on(async {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut closed)
+                    .await
+                    .is_err(),
+                "the split has not exited while its read is held"
+            );
+        });
+        assert!(
+            !task_operations.is_sealed(),
+            "closing one split leaves its task source open"
+        );
+        gate.add_permits(64);
+        harness
+            ._runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), closed).await })
+            .expect("the split exits once its read does")
+            .expect("a stopped read exits cleanly");
+        assert_eq!(task_operations.live_operations(), 0);
+    }
+
+    /// Routes a harness's data and delete reads through a range service whose
+    /// every file task is spawned by `spawner`.
+    fn route_through(harness: &mut Harness, spawner: Arc<dyn FileTaskSpawner>) {
+        harness.context.task_spawner = Arc::clone(&spawner);
+        harness.context.range = Some(
+            FileRangeService::new(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(8).unwrap(),
+                spawner,
+                harness._runtime.handle().clone(),
+            )
+            .bind(
+                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+            ),
+        );
+        harness.delete_manager = Arc::new(DeleteManager::new(
+            harness.binding.clone(),
+            harness.context.clone(),
+        ));
+    }
+
+    #[test]
+    fn each_open_phase_of_a_stream_waits_on_its_own_read() {
+        use futures::StreamExt;
+
+        let mut harness = harness_of(write_large_data_file);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let spawner = Arc::new(GatedTaskSpawner {
+            handle: harness._runtime.handle().clone(),
+            gate: Arc::clone(&gate),
+            started: std::sync::atomic::AtomicUsize::new(0),
+        });
+        route_through(&mut harness, spawner.clone());
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        // The large file's region of row 1, so the delete phase has a row to
+        // remove.
+        let region = format!("1{}", "x".repeat(24 * 1024));
+        let split = build_split(
+            &harness.file_name,
+            SplitOptions {
+                deletes: vec![equality_delete_of(&harness, &[&region])],
+                ..SplitOptions::whole_file(harness.file_size, (3 * ROWS_PER_GROUP) as i64)
+            },
+        );
+        let budget = ConnectorPollBudget::new();
+        budget.refill(1024);
+        let mut stream = harness
+            .page_stream_with(
+                &split,
+                &handle,
+                &id_column(&schema),
+                no_dynamic_filter(),
+                &budget,
+            )
+            .expect("page stream");
+        let started = || spawner.started.load(std::sync::atomic::Ordering::SeqCst);
+        let ids = harness._runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                let mut ids = Vec::new();
+                let mut released = 0;
+                loop {
+                    match futures::poll!(stream.next()) {
+                        std::task::Poll::Ready(Some(page)) => {
+                            ids.extend(page_ids(page.expect("page")))
+                        }
+                        std::task::Poll::Ready(None) => return (ids, released),
+                        std::task::Poll::Pending => {
+                            // A pending stream waits on the one read it
+                            // holds, on a read already let through, or on
+                            // its split's exit -- never on two held reads.
+                            if started() > released {
+                                assert_eq!(started(), released + 1, "one phase reads at a time");
+                                gate.add_permits(1);
+                                released += 1;
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the stream ends")
+        });
+        let (ids, released) = ids;
+        assert_eq!(
+            ids,
+            (0..(3 * ROWS_PER_GROUP) as i64)
+                .filter(|id| *id != 1)
+                .collect::<Vec<_>>()
+        );
+        // The delete file, the footer's tail and metadata, then one data read
+        // per row group.
+        assert!(released >= 6, "saw {released} managed reads");
+    }
+
+    #[test]
+    fn a_page_stream_issues_the_reads_its_page_source_issues() {
+        let count_reads = |stream: bool| {
+            let mut harness = harness_of(write_large_data_file);
+            let spawner = Arc::new(CountingTaskSpawner {
+                handle: harness._runtime.handle().clone(),
+                spawned: std::sync::atomic::AtomicUsize::new(0),
+            });
+            route_through(&mut harness, spawner.clone());
+            let schema = iceberg_schema();
+            let handle = table_handle(&schema, false);
+            let split = whole_file_split(&harness, 3);
+            let ids = if stream {
+                let budget = ConnectorPollBudget::new();
+                let mut stream = harness
+                    .page_stream_with(
+                        &split,
+                        &handle,
+                        &id_column(&schema),
+                        no_dynamic_filter(),
+                        &budget,
+                    )
+                    .expect("page stream");
+                drain_stream(&harness, &mut stream, &budget)
+            } else {
+                let mut source = harness
+                    .page_source(&split, &handle, &id_column(&schema))
+                    .expect("page source");
+                drain_ids(&mut source)
+            };
+            (
+                ids,
+                spawner.spawned.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        };
+        let (source_ids, source_reads) = count_reads(false);
+        let (stream_ids, stream_reads) = count_reads(true);
+        assert_eq!(stream_ids, source_ids);
+        assert!(source_reads > 0);
+        assert_eq!(stream_reads, source_reads, "no GET is repeated or added");
+    }
+
+    /// A Puffin deletion vector naming `positions` of the harness's data file.
+    fn deletion_vector_of(harness: &Harness, positions: &[u64]) -> IcebergDeleteFile {
+        let path = std::path::Path::new(&harness.file_name)
+            .parent()
+            .expect("data directory")
+            .join("dv.puffin");
+        let mut vector = crate::commit::DeletionVector::new();
+        for position in positions {
+            vector.insert(*position).expect("position");
+        }
+        let payload = vector.to_iceberg_payload().expect("payload");
+        fs::write(&path, &payload).expect("write deletion vector");
+        IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            content: IcebergDeleteFileContent::PositionDeletes,
+            path: path.to_string_lossy().to_string(),
+            format: IcebergFileFormat::Puffin,
+            record_count: positions.len() as i64,
+            file_size_in_bytes: payload.len() as i64,
+            equality_field_ids: Vec::new(),
+            row_position_lower_bound: None,
+            row_position_upper_bound: None,
+            data_sequence_number: 9,
+            content_offset: Some(0),
+            content_size_in_bytes: Some(payload.len() as i64),
+            referenced_data_file: Some(harness.file_name.clone()),
+            decryption_data: None,
+        })
+        .expect("deletion vector descriptor")
+    }
+
+    #[test]
+    fn a_page_stream_applies_a_deletion_vector_and_keeps_absolute_positions() {
+        let harness = harness(3);
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let records = (3 * ROWS_PER_GROUP) as i64;
+        let budget = ConnectorPollBudget::new();
+        // Each read as a stream first, so that the stream loads the split's
+        // deletes, and then as a page source.
+        let read_both_ways = |split: &IcebergSplit, columns: &[IcebergColumnHandle]| {
+            let mut stream = harness
+                .page_stream_with(split, &handle, columns, no_dynamic_filter(), &budget)
+                .expect("page stream");
+            let streamed = drain_stream(&harness, &mut stream, &budget);
+            let mut source = harness
+                .page_source(split, &handle, columns)
+                .expect("page source");
+            assert_eq!(streamed, drain_ids(&mut source));
+            streamed
+        };
+
+        let deleted = build_split(
+            &harness.file_name,
+            SplitOptions {
+                deletes: vec![deletion_vector_of(&harness, &[1, 5])],
+                ..SplitOptions::whole_file(harness.file_size, records)
+            },
+        );
+        assert_eq!(
+            read_both_ways(&deleted, &id_column(&schema)),
+            (0..records)
+                .filter(|id| *id != 1 && *id != 5)
+                .collect::<Vec<_>>()
+        );
+
+        // A split that starts at the last row group reads it at its absolute
+        // positions, not renumbered from the split's start.
+        let start = harness.offsets[2];
+        let bounded = build_split(
+            &harness.file_name,
+            SplitOptions {
+                start: start as i64,
+                length: (harness.file_size - start) as i64,
+                file_size: harness.file_size as i64,
+                file_record_count: records,
+                first_row_id: Some(1_000),
+                ..SplitOptions::whole_file(harness.file_size, records)
+            },
+        );
+        assert_eq!(
+            read_both_ways(&bounded, &[row_id_column()]),
+            (1_000 + 2 * ROWS_PER_GROUP as i64..1_000 + records).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_second_stream_over_a_file_reuses_its_footer() {
+        let mut harness = harness_of(write_large_data_file);
+        let spawner = Arc::new(CountingTaskSpawner {
+            handle: harness._runtime.handle().clone(),
+            spawned: std::sync::atomic::AtomicUsize::new(0),
+        });
+        route_through(&mut harness, spawner.clone());
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let split = whole_file_split(&harness, 3);
+        let budget = ConnectorPollBudget::new();
+        let spawned = || spawner.spawned.load(std::sync::atomic::Ordering::SeqCst);
+        let mut reads = Vec::new();
+        for _ in 0..2 {
+            let before = spawned();
+            let mut stream = harness
+                .page_stream_with(
+                    &split,
+                    &handle,
+                    &id_column(&schema),
+                    no_dynamic_filter(),
+                    &budget,
+                )
+                .expect("page stream");
+            assert_eq!(
+                drain_stream(&harness, &mut stream, &budget).len(),
+                3 * ROWS_PER_GROUP
+            );
+            harness
+                ._runtime
+                .block_on(stream.close())
+                .expect("closing a drained stream");
+            reads.push(spawned() - before);
+        }
+        assert_eq!(harness.footers.len().expect("footer count"), 1);
+        assert_eq!(
+            reads[1], 3,
+            "the second stream reads its three row groups and no footer: {reads:?}"
+        );
+        assert!(
+            reads[0] > reads[1],
+            "only the first read the footer: {reads:?}"
         );
     }
 }

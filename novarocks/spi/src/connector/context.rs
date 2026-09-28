@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use novarocks_secret::SecretValue;
 
+use super::read_stack::ConnectorSourceOperations;
 use super::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind, ConnectorStopView,
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
@@ -373,8 +374,18 @@ pub struct ConnectorRequestContext {
     vended_credential_lease_sink: Option<Arc<dyn ConnectorVendedCredentialLeaseSink>>,
     vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
     request_scope: ConnectorRequestScope,
-    range_scope: Option<ConnectorRangeScope>,
+    execution_source: Option<ExecutionSource>,
     fresh_catalog_observation_required: bool,
+}
+
+/// The one execution source an attempt request reads for: the exact scope
+/// its I/O is scheduled under and the registry its operations are admitted
+/// to. Installed together, so no request schedules I/O for a source whose
+/// operations nobody can stop.
+#[derive(Clone)]
+struct ExecutionSource {
+    range_scope: ConnectorRangeScope,
+    operations: ConnectorSourceOperations,
 }
 
 /// Connector context for metadata observation and scan negotiation.
@@ -392,7 +403,7 @@ impl ConnectorPlanningContext {
         if request.storage_resolver.is_some()
             || request.vended_credential_lease_sink.is_some()
             || request.vended_credential_lease_collection.is_some()
-            || request.range_scope.is_some()
+            || request.execution_source.is_some()
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -453,7 +464,7 @@ impl ConnectorRequestContext {
             vended_credential_lease_sink: None,
             vended_credential_lease_collection: None,
             request_scope: ConnectorRequestScope::new(),
-            range_scope: None,
+            execution_source: None,
             fresh_catalog_observation_required: false,
         })
     }
@@ -466,13 +477,33 @@ impl ConnectorRequestContext {
         self
     }
 
-    pub fn with_range_scope(mut self, range_scope: ConnectorRangeScope) -> Self {
-        self.range_scope = Some(range_scope);
+    /// Binds this attempt request to the one execution source it reads for:
+    /// its I/O is scheduled under `range_scope`, and every operation it
+    /// starts is admitted to `operations` first, so closing the source stops
+    /// them and observes their exit.
+    pub fn with_execution_source(
+        mut self,
+        range_scope: ConnectorRangeScope,
+        operations: ConnectorSourceOperations,
+    ) -> Self {
+        self.execution_source = Some(ExecutionSource {
+            range_scope,
+            operations,
+        });
         self
     }
 
-    pub const fn range_scope(&self) -> Option<ConnectorRangeScope> {
-        self.range_scope
+    pub fn range_scope(&self) -> Option<ConnectorRangeScope> {
+        self.execution_source
+            .as_ref()
+            .map(|source| source.range_scope)
+    }
+
+    /// The execution source's operations; see [`Self::with_execution_source`].
+    pub fn source_operations(&self) -> Option<&ConnectorSourceOperations> {
+        self.execution_source
+            .as_ref()
+            .map(|source| &source.operations)
     }
 
     /// Add a child operation's independent stop without replacing the
@@ -565,7 +596,7 @@ impl ConnectorRequestContext {
         self.storage_resolver = None;
         self.vended_credential_lease_sink = None;
         self.vended_credential_lease_collection = None;
-        self.range_scope = None;
+        self.execution_source = None;
         self
     }
 
@@ -665,6 +696,8 @@ mod tests {
     };
     use novarocks_secret::SecretValue;
 
+    use crate::connector::read_stack::ConnectorSourceOperations;
+
     #[test]
     fn admitted_stop_reaches_every_request_clone_without_changing_deadline() {
         let owner = ConnectorStopOwner::new();
@@ -755,11 +788,27 @@ mod tests {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .expect("request")
-        .with_range_scope(scope);
+        .with_execution_source(scope, ConnectorSourceOperations::new());
         assert_eq!(request.clone().range_scope(), Some(scope));
+        let ticket = request
+            .source_operations()
+            .expect("source operations")
+            .admit(Arc::new(|| {}))
+            .expect("admitted");
+        assert_eq!(
+            request
+                .clone()
+                .source_operations()
+                .expect("source operations")
+                .live_operations(),
+            1,
+            "every clone of the request shares the source's operations"
+        );
+        drop(ticket);
         assert!(ConnectorPlanningContext::try_from_request(request.clone()).is_err());
         let planning = request.without_attempt_capabilities();
         assert_eq!(planning.range_scope(), None);
+        assert!(planning.source_operations().is_none());
         ConnectorPlanningContext::try_from_request(planning).expect("planning projection");
     }
 

@@ -86,7 +86,6 @@ pub(crate) use repeat_processor::repeat_output_chunk_schema;
 pub use result_buffer_sink::ResultBufferSinkFactory;
 #[cfg(test)]
 pub(crate) use result_sink::{ResultSinkFactory, ResultSinkHandle};
-pub use scan::ScanSourceFactory;
 pub(crate) use setop::{
     ExceptSharedState, IntersectSharedState, SetOpStageController, UnionAllSharedState,
 };

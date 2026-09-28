@@ -437,7 +437,6 @@ fn encode_decode_execute(plan: &PhysicalPlan) -> (Vec<Chunk>, Vec<SlotId>, ExecN
             None,
             None,
             Some(test_execution_runtime()),
-            None,
         )),
         None,
         None,
@@ -459,8 +458,6 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    scan_threads: 1,
-                    scan_queue_capacity: 8,
                     spill_io_threads: 1,
                     spill_io_queue_capacity: 8,
                     spill_storage: ExecutionSpillStorageConfig::default(),
@@ -471,9 +468,6 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1024,
                     local_exchange_max_buffered_rows: 1024,
-                    connector_io_tasks_per_scan_operator: 1,
-                    scan_submit_fail_max: 1,
-                    scan_submit_fail_timeout_ms: 1,
                     runtime_filter_scan_wait_time_ms_override: None,
                     runtime_filter_wait_timeout_ms_override: None,
                     sink_io_worker_threads: 1,

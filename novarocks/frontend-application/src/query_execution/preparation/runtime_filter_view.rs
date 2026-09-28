@@ -220,9 +220,7 @@ impl RuntimeFilterProducerTarget {
 #[derive(Clone)]
 pub enum RuntimeFilterConsumerTarget {
     DirectInputOrdinal(u32),
-    SourceBoundary {
-        scan_domain_target: Option<RuntimeFilterScanDomainTarget>,
-    },
+    SourceBoundary,
 }
 
 impl RuntimeFilterConsumerTarget {
@@ -231,28 +229,11 @@ impl RuntimeFilterConsumerTarget {
             attempt_facts::AttemptRuntimeFilterConsumerTarget::DirectInput { input_ordinal } => {
                 Self::DirectInputOrdinal(*input_ordinal)
             }
-            attempt_facts::AttemptRuntimeFilterConsumerTarget::SourceBoundary { scan_domain } => {
-                Self::SourceBoundary {
-                    scan_domain_target: scan_domain.as_ref().map(|target| {
-                        RuntimeFilterScanDomainTarget {
-                            data_type: target.data_type.clone(),
-                            nullable: target.nullable,
-                        }
-                    }),
-                }
+            attempt_facts::AttemptRuntimeFilterConsumerTarget::SourceBoundary => {
+                Self::SourceBoundary
             }
         }
     }
-}
-
-/// The exact type contract a scan-domain consumer applies under.
-///
-/// It names no column: the filter reaches the scan through the typed carrier's
-/// own `filter id -> variable -> ColumnHandle` binding.
-#[derive(Clone)]
-pub struct RuntimeFilterScanDomainTarget {
-    pub data_type: DataType,
-    pub nullable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -522,6 +503,7 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
                 capabilities,
                 activation,
                 target,
+                feedback_scan_type,
             } => RuntimeFilterDeploymentBindingRoleFacts::Consumer {
                 capabilities: capabilities
                     .iter()
@@ -530,6 +512,7 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
                     .collect(),
                 activation: RuntimeFilterConsumerActivation::from_attempt(*activation),
                 target: RuntimeFilterConsumerTarget::from_attempt(target),
+                feedback_scan_type: feedback_scan_type.clone(),
             },
         }
     }
@@ -545,6 +528,7 @@ pub enum RuntimeFilterDeploymentBindingRoleFacts {
         capabilities: Vec<RuntimeFilterArtifactCapability>,
         activation: RuntimeFilterConsumerActivation,
         target: RuntimeFilterConsumerTarget,
+        feedback_scan_type: Option<novarocks_physical_plan::ValueType>,
     },
 }
 

@@ -128,8 +128,6 @@ fn reconstruct_runtime_query_options(options: &QueryOptions) -> RuntimeQueryOpti
             .then_some(src.runtime_profile_report_interval),
         pipeline_dop: (src.pipeline_dop > 0).then_some(src.pipeline_dop),
         exec_mem_limit: (src.query_mem_limit > 0).then_some(src.query_mem_limit),
-        connector_io_tasks_per_scan_operator: (src.connector_io_tasks_per_scan_operator > 0)
-            .then_some(src.connector_io_tasks_per_scan_operator),
         orc_use_column_names: src.orc_use_column_names,
         enable_file_metacache: src.enable_file_metacache,
         enable_file_pagecache: src.enable_file_pagecache,
@@ -743,7 +741,6 @@ mod tests {
             runtime_profile_report_interval: 7,
             pipeline_dop: 8,
             query_mem_limit: 1 << 20,
-            connector_io_tasks_per_scan_operator: 12,
             runtime_filter_scan_wait_time_ms: Some(250),
             runtime_filter_wait_timeout_ms: Some(5000),
             allow_throw_exception: true,
@@ -787,7 +784,6 @@ mod tests {
         assert_eq!(runtime.runtime_profile_report_interval, Some(7));
         assert_eq!(runtime.pipeline_dop, Some(8));
         assert_eq!(runtime.exec_mem_limit, Some(1 << 20));
-        assert_eq!(runtime.connector_io_tasks_per_scan_operator, Some(12));
         assert_eq!(runtime.runtime_filter_scan_wait_time_ms, Some(250));
         assert_eq!(runtime.runtime_filter_wait_timeout_ms, Some(5000));
         assert!(runtime.allow_throw_exception);

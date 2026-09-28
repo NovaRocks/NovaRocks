@@ -309,7 +309,7 @@ fn attach_leaf_consumers(
                 ),
             ));
         };
-        let DecodedConsumerBindingTarget::SourceBoundary { scan_domain } = target else {
+        let DecodedConsumerBindingTarget::SourceBoundary = target else {
             return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone().field("runtime_filter_binding_ids"),
                 format!(
@@ -318,24 +318,6 @@ fn attach_leaf_consumers(
                 ),
             ));
         };
-        if scan_domain.is_some()
-            && !matches!(
-                wire_node.payload.as_ref(),
-                Some(plan::distributed_node::Payload::Physical(physical))
-                    if matches!(physical.kind.as_ref(), Some(plan::plan_node::Kind::Scan(_)))
-            )
-        {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                path.clone().field("runtime_filter_binding_ids"),
-                format!(
-                    "native runtime-filter binding_id={} scan-domain target must attach to a connector scan leaf",
-                    binding.binding_id
-                ),
-            ));
-        }
-        if let Some(target) = scan_domain {
-            validate_scan_domain_target(binding, target, path.clone())?;
-        }
     }
     let specs = bindings
         .iter()
@@ -417,52 +399,6 @@ fn attach_leaf_consumers(
                 ));
             }
         },
-    }
-    Ok(())
-}
-
-fn validate_scan_domain_target(
-    binding: &DecodedRuntimeFilterBinding,
-    target: &crate::fragment_runtime_filter_binding::DecodedRuntimeFilterScanDomainTarget,
-    path: FieldPath,
-) -> Result<(), NativeFragmentDecodeError> {
-    use novarocks_proto_models::expr::expr::Kind;
-
-    if !matches!(&binding.expression.kind, Some(Kind::ColumnRef(_))) {
-        return Err(NativeFragmentDecodeError::inconsistent(
-            path.field("runtime_filter_binding_ids"),
-            format!(
-                "native runtime-filter binding_id={} scan-domain target requires an exact ColumnRef consumer expression",
-                binding.binding_id
-            ),
-        ));
-    }
-    let expression_type = binding.expression.r#type.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(
-            binding.expression_path.clone().field("type"),
-            format!(
-                "native runtime-filter binding_id={} scan-domain consumer expression is missing type",
-                binding.binding_id
-            ),
-        )
-    })?;
-    let expression_type = novarocks_plan_codec::native_type::decode_type(expression_type).map_err(|error| {
-        NativeFragmentDecodeError::invalid_value(
-            binding.expression_path.clone().field("type"),
-            format!(
-                "native runtime-filter binding_id={} scan-domain consumer expression has invalid type: {error}",
-                binding.binding_id
-            ),
-        )
-    })?;
-    if expression_type != target.data_type || binding.expression.nullable != target.nullable {
-        return Err(NativeFragmentDecodeError::inconsistent(
-            path.field("runtime_filter_binding_ids"),
-            format!(
-                "native runtime-filter binding_id={} scan-domain target type/nullability does not match consumer expression",
-                binding.binding_id
-            ),
-        ));
     }
     Ok(())
 }
@@ -955,19 +891,7 @@ fn consumer_spec(
             binding.binding_id
         ));
     };
-    // A scan-domain consumer reaches its connector scan through that scan's own
-    // carrier: `ConnectorTableScanSource::dynamic_filters` maps this binding id
-    // to a `ScanAssignment` variable and so to a typed `ColumnHandle`, and
-    // `ScanSource::with_runtime_filter_contracts` turns the pair into the live
-    // dynamic filter the reader consults. The decoded scan-domain target states
-    // only the type contract -- already checked against the consumer expression
-    // by `validate_scan_domain_target` -- so there is no column identity left
-    // for the sealed-unit evaluator to key on, and none is fabricated here.
-    Ok(RuntimeFilterConsumerBinding::new(
-        expr_id,
-        contract.clone(),
-        None,
-    ))
+    Ok(RuntimeFilterConsumerBinding::new(expr_id, contract.clone()))
 }
 
 fn lower_binding_expression(
@@ -1548,29 +1472,6 @@ mod tests {
             output_type: Some(encode_type(&selected.output_type).expect("encoded output type")),
             state_format_identity: selected.state_format.as_str().to_string(),
         })
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for target-specific native integration and regression coverage."
-    )]
-    struct DummyScanOp;
-
-    impl novarocks_execution::exec::node::scan::ScanOp for DummyScanOp {
-        fn execute_iter(
-            &self,
-            _morsel: novarocks_execution::exec::node::scan::ScanMorsel,
-            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
-            _runtime_filters: Option<&novarocks_execution::exec::node::scan::RuntimeFilterContext>,
-        ) -> Result<novarocks_execution::exec::node::BoxedExecIter, String> {
-            Ok(Box::new(std::iter::empty()))
-        }
-
-        fn build_morsels(
-            &self,
-        ) -> Result<novarocks_execution::exec::node::scan::ScanMorsels, String> {
-            Ok(novarocks_execution::exec::node::scan::ScanMorsels::default())
-        }
     }
 
     pub(super) fn type_desc(data_type: &DataType) -> common::TypeDesc {

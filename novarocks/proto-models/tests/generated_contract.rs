@@ -413,6 +413,27 @@ fn retired_mv_native_scan_fields_remain_reserved_and_fail_closed() {
 }
 
 #[test]
+fn retired_scan_io_task_query_option_remains_reserved() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let query_options = pool
+        .get_message_by_name("novarocks.QueryOptions")
+        .expect("QueryOptions descriptor");
+    assert!(
+        query_options
+            .reserved_ranges()
+            .any(|range| range.contains(&6)),
+        "QueryOptions field 6 must remain reserved"
+    );
+    assert!(
+        query_options
+            .reserved_names()
+            .any(|name| name == "connector_io_tasks_per_scan_operator"),
+        "QueryOptions connector_io_tasks_per_scan_operator name must remain reserved"
+    );
+}
+
+#[test]
 fn retired_starrocks_native_scan_wire_fields_fail_closed() {
     let source = plan::ScanSource::decode(&[0x3a, 0x00][..])
         .expect("retired source field remains decodable as an unknown field");

@@ -34,3 +34,7 @@ doctest = false
 arrow.workspace = true
 arrow-buffer.workspace = true
 novarocks-memory.workspace = true
+
+[[bench]]
+name = "retained_cost"
+harness = false

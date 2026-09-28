@@ -340,10 +340,9 @@ pub trait AuthorityMaterialSource: Send + Sync {
 /// cluster commonly expire together, so a refresh that borrows its caller's
 /// thread can park the whole scan pool at once (CAD-1 D3).
 ///
-/// An implementation that runs `job` inline does not merely park a thread: it
-/// deadlocks. The job is handed over while the authority's state lock is held,
-/// and the job's first act is to take that same lock to apply its outcome. Every
-/// implementation must hand the job to another thread.
+/// Every implementation must hand the job to another thread. The job is handed
+/// over after the authority's state lock is released, and an implementation
+/// may drop a job it cannot run: the job settles its refresh either way.
 pub trait RefreshExecutor: Send + Sync {
     fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>);
 }
@@ -602,101 +601,129 @@ impl StorageAuthority {
         now: Instant,
         deadline: Instant,
     ) -> FileResult<AuthorityMaterial> {
-        let wait = {
-            let mut state = self.shared.lock_state();
-
-            if let Some(reason) = state.closed.clone() {
-                return Err(reason.into_file_error(&self.shared.id));
+        let (step, refresh) = self.decide(now, deadline);
+        // Handed over only once the state lock is released: a job the executor
+        // drops without running settles itself, and settling takes that lock.
+        if let Some(job) = refresh {
+            self.executor.execute(job);
+        }
+        match step {
+            RequestStep::Done(result) => result,
+            RequestStep::Wait { inflight, deadline } => {
+                self.shared.await_refresh(inflight, now, deadline).await
             }
-
-            let usable = state
-                .material
-                .as_ref()
-                .filter(|material| material.is_usable(now, &self.shared.policy))
-                .cloned();
-
-            match usable {
-                Some(material) => {
-                    self.shared
-                        .counters
-                        .cache_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                    if self.shared.should_prefetch(&state, &material, now) {
-                        self.shared
-                            .counters
-                            .prefetch_started
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.start_refresh(&mut state, deadline);
-                    }
-                    return Ok(material);
-                }
-                // State two. The caller has nothing usable, so it has to wait
-                // -- but for the effort's remaining window, not for its own
-                // deadline, so a retried request cannot restart the clock.
-                None => {
-                    // A backoff the last failure set applies here too, not only
-                    // to prefetch. Without that, a caller holding nothing
-                    // restarts an acquisition the moment the previous one
-                    // failed, and the storage layer's own retries turn one
-                    // failing acquisition into several.
-                    if state.backoff_until.is_some_and(|until| now < until) {
-                        return Err(self.shared.blocked_failure(&state));
-                    }
-                    // A caller that brought no time of its own still starts
-                    // the acquisition -- the material it cannot wait for is the
-                    // material the next request needs -- but it must not be the
-                    // one that sizes the window, or the effort would open
-                    // already spent.
-                    let window = *state.blocked_until.get_or_insert_with(|| {
-                        let ceiling = now + self.shared.policy.blocked_acquisition_budget;
-                        if deadline > now {
-                            deadline.min(ceiling)
-                        } else {
-                            ceiling
-                        }
-                    });
-                    if now >= window {
-                        // This effort has spent an operation's worth of time
-                        // and produced nothing. Report why, and hold off long
-                        // enough that the storage layer's remaining retries do
-                        // not each pay for the same window again.
-                        state.blocked_until = None;
-                        state.backoff_until = Some(now + self.shared.policy.max_backoff);
-                        return Err(self.shared.blocked_failure(&state));
-                    }
-                    self.shared
-                        .counters
-                        .blocking_waits
-                        .fetch_add(1, Ordering::Relaxed);
-                    // The job gets the effort's window; this waiter gets the
-                    // smaller of that and its own deadline, so one caller
-                    // giving up never ends the shared request.
-                    self.start_refresh(&mut state, window);
-                    state
-                        .inflight
-                        .clone()
-                        .map(|inflight| (inflight, deadline.min(window)))
-                }
-            }
-        };
-
-        let Some((inflight, waiter_deadline)) = wait else {
-            return Err(AcquisitionFailure::NoRenewalCapability.into_file_error(&self.shared.id));
-        };
-        self.shared
-            .await_refresh(inflight, now, waiter_deadline)
-            .await
+        }
     }
 
-    /// Start a refresh unless one is already in flight.
+    /// Decides one request under the state lock, returning what the request
+    /// does next and the refresh job it started, if any.
+    fn decide(&self, now: Instant, deadline: Instant) -> (RequestStep, Option<RefreshJob>) {
+        let mut state = self.shared.lock_state();
+
+        if let Some(reason) = state.closed.clone() {
+            return (
+                RequestStep::Done(Err(reason.into_file_error(&self.shared.id))),
+                None,
+            );
+        }
+
+        let usable = state
+            .material
+            .as_ref()
+            .filter(|material| material.is_usable(now, &self.shared.policy))
+            .cloned();
+
+        match usable {
+            Some(material) => {
+                self.shared
+                    .counters
+                    .cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                let refresh = if self.shared.should_prefetch(&state, &material, now) {
+                    self.shared
+                        .counters
+                        .prefetch_started
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.start_refresh(&mut state, deadline)
+                } else {
+                    None
+                };
+                (RequestStep::Done(Ok(material)), refresh)
+            }
+            // State two. The caller has nothing usable, so it has to wait -- but
+            // for the effort's remaining window, not for its own deadline, so a
+            // retried request cannot restart the clock.
+            None => {
+                // A backoff the last failure set applies here too, not only to
+                // prefetch. Without that, a caller holding nothing restarts an
+                // acquisition the moment the previous one failed, and the
+                // storage layer's own retries turn one failing acquisition into
+                // several.
+                if state.backoff_until.is_some_and(|until| now < until) {
+                    return (
+                        RequestStep::Done(Err(self.shared.blocked_failure(&state))),
+                        None,
+                    );
+                }
+                // A caller that brought no time of its own still starts the
+                // acquisition -- the material it cannot wait for is the material
+                // the next request needs -- but it must not be the one that
+                // sizes the window, or the effort would open already spent.
+                let window = *state.blocked_until.get_or_insert_with(|| {
+                    let ceiling = now + self.shared.policy.blocked_acquisition_budget;
+                    if deadline > now {
+                        deadline.min(ceiling)
+                    } else {
+                        ceiling
+                    }
+                });
+                if now >= window {
+                    // This effort has spent an operation's worth of time and
+                    // produced nothing. Report why, and hold off long enough
+                    // that the storage layer's remaining retries do not each
+                    // pay for the same window again.
+                    state.blocked_until = None;
+                    state.backoff_until = Some(now + self.shared.policy.max_backoff);
+                    return (
+                        RequestStep::Done(Err(self.shared.blocked_failure(&state))),
+                        None,
+                    );
+                }
+                self.shared
+                    .counters
+                    .blocking_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                // The job gets the effort's window; this waiter gets the
+                // smaller of that and its own deadline, so one caller giving up
+                // never ends the shared request.
+                let refresh = self.start_refresh(&mut state, window);
+                let step =
+                    match state.inflight.clone() {
+                        Some(inflight) => RequestStep::Wait {
+                            inflight,
+                            deadline: deadline.min(window),
+                        },
+                        None => RequestStep::Done(Err(AcquisitionFailure::NoRenewalCapability
+                            .into_file_error(&self.shared.id))),
+                    };
+                (step, refresh)
+            }
+        }
+    }
+
+    /// Registers a refresh unless one is already in flight, and returns the job
+    /// that performs it.
     ///
-    /// The job is handed to the executor rather than run here, so the caller's
-    /// thread is never the thread that talks to the catalog (CAD-1 D3). The job
-    /// owns the shared state, so it applies its own outcome and converges even
-    /// when every waiter has already given up (CAD-1 D6).
-    fn start_refresh(&self, state: &mut AuthorityState, deadline: Instant) {
+    /// The caller hands the job to the executor after releasing the state lock,
+    /// so the caller's thread is never the thread that talks to the catalog
+    /// (CAD-1 D3). The job owns the shared state, so it applies its own outcome
+    /// and converges even when every waiter has already given up (CAD-1 D6).
+    /// Its completion settles the refresh however the job ends -- returned,
+    /// panicked, or dropped by the executor without running -- so a refresh
+    /// never stays in flight and never blocks the next one.
+    fn start_refresh(&self, state: &mut AuthorityState, deadline: Instant) -> Option<RefreshJob> {
         if state.inflight.is_some() || !self.shared.id.capability.can_renew() {
-            return;
+            return None;
         }
 
         let generation = state.generation;
@@ -706,14 +733,68 @@ impl StorageAuthority {
             receiver,
         }));
 
-        let shared = Arc::clone(&self.shared);
-        self.executor.execute(Box::new(move || {
-            let outcome: AcquisitionOutcome = Arc::new(shared.source.acquire(deadline));
-            // Apply before publishing so a waking waiter never observes a
-            // published outcome that the authority has not yet accounted for.
-            shared.apply_outcome(generation, &outcome);
-            let _ = sender.send(Some(outcome));
-        }));
+        let completion = RefreshCompletion {
+            shared: Arc::clone(&self.shared),
+            generation,
+            sender: Some(sender),
+        };
+        Some(Box::new(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                completion.shared.source.acquire(deadline)
+            }))
+            .unwrap_or_else(|_| {
+                Err(AcquisitionFailure::Transient(
+                    "storage authority material source panicked".to_string(),
+                ))
+            });
+            completion.settle(outcome);
+        }))
+    }
+}
+
+/// What one request does after its decision.
+enum RequestStep {
+    Done(FileResult<AuthorityMaterial>),
+    Wait {
+        inflight: Arc<InflightRefresh>,
+        deadline: Instant,
+    },
+}
+
+type RefreshJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Settles one started refresh exactly once.
+///
+/// The authority applies the outcome before publishing it, so a waking waiter
+/// never observes an outcome the authority has not accounted for. A job that
+/// ends without an outcome -- its executor dropped it unrun, or it unwound --
+/// settles as a transient failure, which clears the refresh in flight and
+/// backs off like any other failed attempt.
+struct RefreshCompletion {
+    shared: Arc<AuthorityShared>,
+    generation: u64,
+    sender: Option<watch::Sender<Option<AcquisitionOutcome>>>,
+}
+
+impl RefreshCompletion {
+    fn settle(mut self, outcome: Result<AuthorityMaterial, AcquisitionFailure>) {
+        self.publish(Arc::new(outcome));
+    }
+
+    fn publish(&mut self, outcome: AcquisitionOutcome) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        self.shared.apply_outcome(self.generation, &outcome);
+        let _ = sender.send(Some(outcome));
+    }
+}
+
+impl Drop for RefreshCompletion {
+    fn drop(&mut self) {
+        self.publish(Arc::new(Err(AcquisitionFailure::Transient(
+            "storage authority refresh ended before it produced an outcome".to_string(),
+        ))));
     }
 }
 

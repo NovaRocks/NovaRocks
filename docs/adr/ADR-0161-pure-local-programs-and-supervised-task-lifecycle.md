@@ -85,6 +85,8 @@ DOP/layout 由 LocalProgram/CompileProfile 持有；FragmentInstanceSpec 独立�
 
 本条完整继承并替换 ADR-0146 的逻辑执行/结果信用/退出规则、ADR-0157 的分层入口规则以及准确文件 [Task 创建 ADR-0158](ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md) 的冻结/身份重放规则。ADR-0146 所继承的 ADR-0135 历史继续保留。另一个同号 [Parquet ADR-0158](ADR-0158-bounded-parquet-range-preparation.md) 不被替换；编号冲突治理为独立工作，不借本条重编号旧记录。ADR-0123 的更新水位、ADR-0151 的消费者 StorageAuthority、ADR-0153 的唯一静态计划和 ADR-0148 的进程内存权威保持各自范围。
 
+ADR-0159 继续拥有 driver poll 的单一扫描流、scan 分支内的 DOP 交接、轮次预算与 close 后观察实际退出；纯程序 builder 必须实例化同一套扫描规则。ADR-0160 继续拥有 Arrow 谱系、Reservation 叶账户与最后真实 holder 撤账；本条 preparing P/bytes、FE W 与发送责任的局部账本不能替代 retained backing 的内存权威。ContextStopped 与账户退休同时等待 Task 实际停止和准备 job 实际退出。
+
 ## 接受的妥协（诚实记录）
 
 - Accepted 只证明接管，FE 必须保留部署与清理状态直到额外事实到达；相比单一 Ready ACK，协议和故障诊断更复杂。P/count/bytes 与 W 也不能被合成一个简单的查询额度。

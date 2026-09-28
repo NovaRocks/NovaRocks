@@ -191,12 +191,16 @@ impl FileTask {
     }
 
     /// Wait for the spawned work to exit. A requested abort is not itself an
-    /// exit receipt, so the caller must retain the handle through this await.
-    pub async fn drain(mut self) -> FileResult<()> {
-        let Some(join) = self.join.take() else {
+    /// exit receipt, so the handle stays in the task through this await: a
+    /// wait that is dropped leaves the task owning, and aborting on drop, its
+    /// work, and a later wait still observes the same exit.
+    pub async fn drain(&mut self) -> FileResult<()> {
+        let Some(join) = self.join.as_mut() else {
             return Ok(());
         };
-        match join.await {
+        let outcome = join.await;
+        self.join = None;
+        match outcome {
             Ok(()) => Ok(()),
             Err(error) if error.is_cancelled() => {
                 Err(FileError::cancelled("file task was cancelled before drain"))
@@ -209,7 +213,7 @@ impl FileTask {
         }
     }
 
-    pub async fn abort_and_drain(mut self) -> FileResult<()> {
+    pub async fn abort_and_drain(&mut self) -> FileResult<()> {
         self.abort();
         match self.drain().await {
             Err(error) if error.kind() == crate::FileErrorKind::Cancelled => Ok(()),
@@ -444,7 +448,7 @@ mod tests {
         let exited = Arc::new(AtomicBool::new(false));
         let (started, receiver) = tokio::sync::oneshot::channel();
         let flag = Arc::clone(&exited);
-        let task = FileTask::new(tokio::spawn(async move {
+        let mut task = FileTask::new(tokio::spawn(async move {
             let _flag = ExitFlag(flag);
             let _ = started.send(());
             futures::future::pending::<()>().await;

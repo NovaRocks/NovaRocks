@@ -420,20 +420,9 @@ fn runtime_filter_consumer(
         }
     }
     .map_err(|error| error.to_string())?;
-    let scan_domain = static_consumer.scan_domain().map(|target| {
-        execution::scan_domain::RuntimeFilterScanDomainBinding::new(
-            id,
-            execution::scan_domain::RuntimeFilterScanDomainTarget::new(
-                target.field_ordinal,
-                target.data_type.clone(),
-                target.nullable,
-            ),
-        )
-    });
     Ok(RuntimeFilterConsumerBinding::new(
         expr(binding.expr_id),
         runtime_contract,
-        scan_domain,
     ))
 }
 
@@ -814,9 +803,7 @@ fn build_pipeline_for_program_node(
         lp::ProgramNodeKind::Scan {
             runtime_filters,
             conjunct_predicate,
-            connector_io_tasks_per_scan_operator,
             limit,
-            accept_empty_scan_ranges,
             ..
         } => {
             let consumers = runtime_filter_consumers(runtime_filters)?;
@@ -834,18 +821,27 @@ fn build_pipeline_for_program_node(
                 .with_runtime_filter_consumers(consumers)
                 .with_output_chunk_schema(ChunkSchema::from_static_layout(node.output_layout())?)
                 .with_conjunct_predicate(conjunct_predicate.map(expr))
-                .with_connector_io_tasks_per_scan_operator(*connector_io_tasks_per_scan_operator)
-                .with_limit(*limit)
-                .with_accept_empty_scan_ranges(*accept_empty_scan_ranges);
-            let factory = ScanSourceFactory::new_native(scan, op, Arc::clone(&ctx.arena))?
-                .with_operator_buffer_chunks(ctx.operator_buffer_chunks);
-            let source: Box<dyn OperatorFactory> = Box::new(factory);
-            let pipeline = new_source_pipeline(ctx, source);
-            Ok(PipelineBuildResult {
+                .with_limit(*limit);
+            // One driver owns the scan stream; the shared handoff restores the
+            // downstream DOP without duplicating the Task's reader capability.
+            let target_dop = ctx.pipeline_dop.max(1);
+            let scan_dop = 1;
+            let source: Box<dyn OperatorFactory> = Box::new(StreamScanSourceFactory::new_native(
+                scan,
+                op,
+                Arc::clone(&ctx.arena),
+            )?);
+            let pipeline = new_source_pipeline_with_dop(ctx, source, scan_dop);
+            let build = PipelineBuildResult {
                 pipeline,
                 extra_pipelines: Vec::new(),
-                stream: StreamDesc::any(ctx.pipeline_dop),
-            })
+                stream: StreamDesc::any(scan_dop),
+            };
+            if scan_dop < target_dop {
+                Ok(hand_off_to_dop(build, ctx, node_id, target_dop))
+            } else {
+                Ok(build)
+            }
         }
         lp::ProgramNodeKind::TableWriter {
             input,
@@ -2201,6 +2197,89 @@ mod tests {
         assert!(names[0].contains("ValuesSource"));
         assert!(names[1].contains("FILTER"));
         assert!(names[2].contains("PROJECT"));
+    }
+
+    #[test]
+    fn direct_local_scan_uses_one_reader_and_preserves_downstream_dop() {
+        use crate::exec::node::scan::{ScanOp, ScanStreamSource, UnusedScanStream};
+
+        struct BoundScan;
+        impl ScanOp for BoundScan {
+            fn stream_source(&self) -> Arc<dyn ScanStreamSource> {
+                Arc::new(UnusedScanStream)
+            }
+        }
+
+        for target_dop in [1, 4] {
+            let op: Arc<dyn ScanOp> = Arc::new(BoundScan);
+            let schema = Arc::new(ChunkSchema::empty());
+            let plan = ExecPlan {
+                arena: ExprArena::default(),
+                root: ExecNode {
+                    kind: ExecNodeKind::Scan(
+                        ScanNode::new_for_test(Arc::clone(&op))
+                            .with_node_id(7)
+                            .with_output_chunk_schema(schema),
+                    ),
+                },
+            };
+            let profile = plan
+                .local_compile_profile(NonZeroUsize::new(target_dop as usize).unwrap(), None)
+                .unwrap();
+            let (program, bindings) = plan
+                .into_local_program_and_bindings(
+                    profile,
+                    BTreeMap::from([(
+                        7,
+                        crate::runtime::fragment::submission::tests::static_scan_for_test(),
+                    )]),
+                    Vec::new(),
+                    lp::StaticSinkProgram::Noop,
+                )
+                .unwrap();
+            let mut scans = ScanBindings::default();
+            scans.insert(7, op);
+            let graph = build_native_pipeline_graph_for_local_program_with_runtime_settings(
+                &program,
+                &bindings,
+                false,
+                DependencyManager::new(),
+                None,
+                ExchangeBindings::default(),
+                scans,
+                target_dop,
+                None,
+                None,
+                crate::exec::expr::agg::test_builtin_execution_function_set(),
+                Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+                2,
+                1,
+                i64::MAX,
+            )
+            .unwrap();
+            let readers = graph
+                .pipelines
+                .iter()
+                .filter(|pipeline| pipeline.factories[0].name().starts_with("ScanSource"))
+                .collect::<Vec<_>>();
+            assert_eq!(readers.len(), 1);
+            assert_eq!(readers[0].dop, 1, "the exact reader is never duplicated");
+            if target_dop == 1 {
+                assert_eq!(graph.pipelines.len(), 1);
+            } else {
+                assert_eq!(graph.pipelines.len(), 2);
+                let consumers = graph
+                    .pipelines
+                    .iter()
+                    .find(|pipeline| {
+                        pipeline.factories[0]
+                            .name()
+                            .starts_with("LOCAL_EXCHANGE_SOURCE")
+                    })
+                    .expect("parallel downstream handoff");
+                assert_eq!(consumers.dop, target_dop);
+            }
+        }
     }
 
     #[test]

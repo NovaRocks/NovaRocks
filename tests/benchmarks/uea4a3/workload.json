@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "scenario": "uea4/scan-producer-performance",
+  "frozen_on": "2026-09-25",
+  "measurement": {
+    "repetitions": 3,
+    "window_seconds": 120,
+    "warmup_seconds": 30,
+    "query_timeout_seconds": 300,
+    "resource_sample_interval_ms": 200
+  },
+  "fixture": {
+    "database": "uea4a3_perf",
+    "wide_table": "perf_wide",
+    "wide_files": 32,
+    "wide_rows_per_file": 250000,
+    "small_table": "perf_small",
+    "small_files": 400,
+    "small_rows_per_file": 1000,
+    "point_table": "perf_point",
+    "point_rows": 1000,
+    "paimon_tables": [
+      "append_none",
+      "pk_sequence"
+    ],
+    "delayed_io_ms": 5
+  },
+  "config_groups": [
+    {
+      "name": "default",
+      "driver_workers": null,
+      "workloads": [
+        "wide_scan",
+        "small_files",
+        "paimon_append",
+        "paimon_pk",
+        "cpu_project",
+        "hash_agg",
+        "exchange_encode",
+        "cpu_project_dop1",
+        "ordered_topn",
+        "wide_scan_delayed_io"
+      ],
+      "control": true
+    },
+    {
+      "name": "single-worker",
+      "driver_workers": 1,
+      "workloads": [
+        "wide_scan",
+        "cpu_project"
+      ],
+      "control": false
+    }
+  ],
+  "workloads": [
+    {
+      "name": "wide_scan",
+      "catalog": "direct",
+      "clients": 4,
+      "session": [],
+      "sql": "SELECT COUNT(*), SUM(c1), SUM(c5) FROM {iceberg}.{database}.{wide} WHERE c3 % 7 = 3",
+      "gated": true
+    },
+    {
+      "name": "small_files",
+      "catalog": "direct",
+      "clients": 4,
+      "session": [],
+      "sql": "SELECT COUNT(*), SUM(v) FROM {iceberg}.{database}.{small}",
+      "gated": true
+    },
+    {
+      "name": "paimon_append",
+      "catalog": "direct",
+      "clients": 4,
+      "session": [],
+      "sql": "SELECT * FROM {paimon}.fixture.append_none",
+      "gated": true
+    },
+    {
+      "name": "paimon_pk",
+      "catalog": "direct",
+      "clients": 4,
+      "session": [],
+      "sql": "SELECT * FROM {paimon}.fixture.pk_sequence",
+      "gated": true
+    },
+    {
+      "name": "cpu_project",
+      "catalog": "direct",
+      "clients": 2,
+      "session": [],
+      "sql": "SELECT SUM(LENGTH(sha2(CAST(c1 AS VARCHAR), 256))) FROM {iceberg}.{database}.{wide}",
+      "gated": true
+    },
+    {
+      "name": "hash_agg",
+      "catalog": "direct",
+      "clients": 2,
+      "session": [],
+      "sql": "SELECT c2, COUNT(*), SUM(c1) FROM {iceberg}.{database}.{wide} GROUP BY c2",
+      "gated": true
+    },
+    {
+      "name": "exchange_encode",
+      "catalog": "direct",
+      "clients": 2,
+      "session": [],
+      "sql": "SELECT c1, c4 FROM {iceberg}.{database}.{wide} WHERE c2 < 5",
+      "gated": true
+    },
+    {
+      "name": "cpu_project_dop1",
+      "catalog": "direct",
+      "clients": 2,
+      "session": [
+        "SET pipeline_dop = 1"
+      ],
+      "sql": "SELECT SUM(LENGTH(sha2(CAST(c1 AS VARCHAR), 256))) FROM {iceberg}.{database}.{wide}",
+      "gated": true
+    },
+    {
+      "name": "ordered_topn",
+      "catalog": "direct",
+      "clients": 2,
+      "session": [],
+      "sql": "SELECT c1, c3 FROM {iceberg}.{database}.{wide} ORDER BY c3 DESC, c1 LIMIT 100",
+      "gated": true
+    },
+    {
+      "name": "wide_scan_delayed_io",
+      "catalog": "delayed",
+      "clients": 4,
+      "session": [],
+      "sql": "SELECT COUNT(*), SUM(c1), SUM(c5) FROM {iceberg}.{database}.{wide} WHERE c3 % 7 = 3",
+      "gated": false
+    }
+  ],
+  "control": {
+    "background_workload": "wide_scan",
+    "background_clients": 4,
+    "window_seconds": 120,
+    "short_query_sql": "SELECT COUNT(*), SUM(v) FROM {iceberg}.{database}.{point} WHERE v = 7",
+    "short_query_samples": 60,
+    "short_query_interval_ms": 1000,
+    "kill_query_sql": "SELECT SUM(LENGTH(sha2(sha2(sha2(sha2(CAST(c1 AS VARCHAR), 512), 512), 512), 512))) FROM {iceberg}.{database}.{wide}",
+    "kill_samples": 20,
+    "kill_after_ms": 500
+  },
+  "gates": {
+    "throughput_regression_max": 0.15,
+    "p95_growth_max": 0.25,
+    "control_p99_max_ms": 2000,
+    "control_p99_max_ratio_to_idle": 3.0,
+    "b0_throughput_noise_max": 0.1,
+    "b0_p95_noise_max": 0.2
+  }
+}

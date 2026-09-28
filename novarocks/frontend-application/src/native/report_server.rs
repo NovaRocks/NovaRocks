@@ -138,11 +138,6 @@ struct RuntimeFilterConsumerDebug {
     row_evaluations: u64,
     input_rows: u64,
     output_rows: u64,
-    scan_evaluated: u64,
-    scan_kept: u64,
-    scan_pruned: u64,
-    scan_not_evaluated: u64,
-    scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedDebug,
 }
 
 #[derive(serde::Serialize)]
@@ -207,23 +202,6 @@ struct RuntimeFilterConsumerTotalsDebug {
     row_evaluations: u64,
     input_rows: u64,
     output_rows: u64,
-    scan_evaluated: u64,
-    scan_kept: u64,
-    scan_pruned: u64,
-    scan_not_evaluated: u64,
-    scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedDebug,
-}
-
-#[derive(serde::Serialize)]
-struct RuntimeFilterScanNotEvaluatedDebug {
-    unit_facts_missing: u64,
-    column_facts_missing: u64,
-    data_type_unsupported: u64,
-    predicate_capability_unsupported: u64,
-    resource_unavailable: u64,
-    snapshot_unavailable: u64,
-    snapshot_timed_out: u64,
-    snapshot_not_published: u64,
 }
 
 pub(crate) fn lifecycle_convergence_debug_json(
@@ -402,15 +380,6 @@ fn runtime_filter_participant_available_debug(
                 row_evaluations: consumer.row_evaluations,
                 input_rows: consumer.input_rows,
                 output_rows: consumer.output_rows,
-                scan_evaluated: consumer.scan_evaluated,
-                scan_kept: consumer.scan_kept,
-                scan_pruned: consumer.scan_pruned,
-                scan_not_evaluated: consumer.scan_not_evaluated,
-                scan_not_evaluated_reasons: runtime_filter_scan_not_evaluated_debug(
-                    consumer
-                        .scan_not_evaluated_reasons
-                        .expect("validated runtime-filter consumer scan reasons"),
-                ),
             })
             .collect(),
     }
@@ -422,21 +391,6 @@ fn runtime_filter_unique_id_debug(
     RuntimeFilterUniqueIdDebug {
         high: id.hi,
         low: id.lo,
-    }
-}
-
-fn runtime_filter_scan_not_evaluated_debug(
-    reasons: proto::QueryTerminalRuntimeFilterScanNotEvaluatedV1,
-) -> RuntimeFilterScanNotEvaluatedDebug {
-    RuntimeFilterScanNotEvaluatedDebug {
-        unit_facts_missing: reasons.unit_facts_missing,
-        column_facts_missing: reasons.column_facts_missing,
-        data_type_unsupported: reasons.data_type_unsupported,
-        predicate_capability_unsupported: reasons.predicate_capability_unsupported,
-        resource_unavailable: reasons.resource_unavailable,
-        snapshot_unavailable: reasons.snapshot_unavailable,
-        snapshot_timed_out: reasons.snapshot_timed_out,
-        snapshot_not_published: reasons.snapshot_not_published,
     }
 }
 
@@ -495,44 +449,6 @@ fn runtime_filter_available_totals_debug(
             row_evaluations: totals.consumers.row_evaluations,
             input_rows: totals.consumers.input_rows,
             output_rows: totals.consumers.output_rows,
-            scan_evaluated: totals.consumers.scan_evaluated,
-            scan_kept: totals.consumers.scan_kept,
-            scan_pruned: totals.consumers.scan_pruned,
-            scan_not_evaluated: totals.consumers.scan_not_evaluated,
-            scan_not_evaluated_reasons: RuntimeFilterScanNotEvaluatedDebug {
-                unit_facts_missing: totals
-                    .consumers
-                    .scan_not_evaluated_reasons
-                    .unit_facts_missing,
-                column_facts_missing: totals
-                    .consumers
-                    .scan_not_evaluated_reasons
-                    .column_facts_missing,
-                data_type_unsupported: totals
-                    .consumers
-                    .scan_not_evaluated_reasons
-                    .data_type_unsupported,
-                predicate_capability_unsupported: totals
-                    .consumers
-                    .scan_not_evaluated_reasons
-                    .predicate_capability_unsupported,
-                resource_unavailable: totals
-                    .consumers
-                    .scan_not_evaluated_reasons
-                    .resource_unavailable,
-                snapshot_unavailable: totals
-                    .consumers
-                    .scan_not_evaluated_reasons
-                    .snapshot_unavailable,
-                snapshot_timed_out: totals
-                    .consumers
-                    .scan_not_evaluated_reasons
-                    .snapshot_timed_out,
-                snapshot_not_published: totals
-                    .consumers
-                    .scan_not_evaluated_reasons
-                    .snapshot_not_published,
-            },
         },
     }
 }
@@ -835,11 +751,6 @@ mod tests {
                             row_evaluations: 9,
                             input_rows: 8,
                             output_rows: 7,
-                            scan_evaluated: 6,
-                            scan_kept: 4,
-                            scan_pruned: 2,
-                            scan_not_evaluated: 0,
-                            scan_not_evaluated_reasons: Some(Default::default()),
                         }],
                     },
                 ),

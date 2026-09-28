@@ -12,7 +12,7 @@ code-anchors:
   - "novarocks/fs/src/range_service.rs (FileRangeService)"
   - "novarocks/fs/src/physical_reader/parquet.rs (ParquetPhysicalReader::try_new)"
   - "novarocks/connector/iceberg/src/typed_read/preparation.rs (PreparedRangeCandidate)"
-  - "novarocks/worker/src/typed_connector_runtime.rs (TypedConnectorSplitIter::advance_preparation)"
+  - "novarocks/worker/src/typed_connector_runtime/stream.rs (TypedConnectorScanStream::advance_preparation)"
   - "novarocks/worker/src/typed_preparation_flow.rs (StreamPreparationFlow)"
   - "novarocks-server/src/scan_io.rs (ScanIoRuntime)"
 ---
@@ -30,7 +30,7 @@ code-anchors:
 | Server/BE | `ScanIoRuntime` 创建独立 scan I/O runtime 和一个共享的 `FileRangeService`，关闭准入后等待 range 工作退出。 |
 | FS | `FileRangeService` 按查询、source 和 demand/prefetch 类别派发授权文件的物理 range；`PreparedFileInput` 校验文件身份与授权域；`ParquetPhysicalReader::try_new` 复用准确 inspection，并在 scan CPU 路径构造 decoder。 |
 | Iceberg | `PreparedRangeCandidate` 规划文件内候选并持有子操作；page source 在提升前重新判断 runtime filter，并保持 schema、delete 和输出语义。 |
-| Worker | `TypedConnectorSplitIter` 保持唯一 current、按 sequence 顺序持有已领取 split，并为当前 source 的后继和未来 split 共用每流 B 字节 / N 候选窗口；`StreamPreparationFlow` 处理暂停、定时回收和恢复观察。 |
+| Worker | `TypedConnectorScanStream` 保持唯一 current、按 sequence 顺序持有已领取 split，并为当前 source 的后继和未来 split 共用每流 B 字节 / N 候选窗口；`StreamPreparationFlow` 处理暂停、定时回收和恢复观察。 |
 
 `FileRangeService` 的队列名额和进程/source 并发窗口约束物理请求；其 request result 与实际任务退出是两种观察。B 统计尚未消费的推测输入 backing 与预留容量，N 统计候选和仍未退出的旧操作。它们都不是 BE 进程容量授权，也不覆盖 current decoder、Arrow 输出、cache、传输临时分配或 RSS。合法大 range 可以分段由 demand 完成，不能因为预读 B 不够而拒绝读取。
 

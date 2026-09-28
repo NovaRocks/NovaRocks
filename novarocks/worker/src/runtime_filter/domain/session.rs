@@ -1611,8 +1611,10 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            handle.acquire(Duration::ZERO),
-            SnapshotAcquireOutcome::Unavailable(UnavailableReason::ProducerFailed)
+            handle.try_outcome(),
+            Some(SnapshotAcquireOutcome::Unavailable(
+                UnavailableReason::ProducerFailed
+            ))
         ));
     }
 
@@ -1975,10 +1977,10 @@ mod tests {
             .close_partition(PartitionId::new(0), ProducerSequence::new(0))
             .unwrap();
 
-        assert!(matches!(
-            subscription.acquire(Duration::ZERO),
-            SnapshotAcquireOutcome::TimedOut
-        ));
+        assert!(
+            subscription.try_outcome().is_none(),
+            "no snapshot is published while a producer route stays open"
+        );
     }
 
     #[test]
@@ -2047,8 +2049,10 @@ mod tests {
             .fail(RuntimeFilterProducerFailure::ExecutionFailed)
             .unwrap();
         assert!(matches!(
-            subscription.acquire(Duration::ZERO),
-            SnapshotAcquireOutcome::Unavailable(UnavailableReason::ProducerFailed)
+            subscription.try_outcome(),
+            Some(SnapshotAcquireOutcome::Unavailable(
+                UnavailableReason::ProducerFailed
+            ))
         ));
     }
 }

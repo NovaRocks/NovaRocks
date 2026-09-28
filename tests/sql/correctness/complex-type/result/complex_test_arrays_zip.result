@@ -419,7 +419,7 @@ pk	conditional_zip
 20	[{"col1":"42","col2":"42.00"}]
 
 -- query 30
-pk	arrays_zip(int_array, CASE WHEN (pk > 10) THEN str_array ELSE empty_array END)
+pk	arrays_zip(int_array, CASE WHEN pk > 10 THEN str_array ELSE empty_array END)
 1	[{"col1":1,"col2":null},{"col1":2,"col2":null},{"col1":3,"col2":null}]
 2	[{"col1":10,"col2":null},{"col1":20,"col2":null}]
 3	[{"col1":100,"col2":null}]

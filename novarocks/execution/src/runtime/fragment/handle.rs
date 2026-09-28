@@ -37,8 +37,8 @@ use crate::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentResultWriter, ResultPresentation, ResultWriteSpec,
 };
 use crate::runtime::fragment::io::{
-    ExchangeReceiverPort, FragmentCommitPort, ScanRegistrationPort,
-    UnavailableExchangeReceiverPort, UnavailableFragmentCommitPort,
+    ExchangeReceiverPort, FragmentCommitPort, UnavailableExchangeReceiverPort,
+    UnavailableFragmentCommitPort,
 };
 use crate::runtime::fragment::resources::{FragmentResources, ResourceCleanupFaults};
 use crate::runtime::fragment::runtime_state::{
@@ -65,7 +65,6 @@ pub struct FragmentPrepareContext {
     group_execution_scan_dop: Option<i32>,
     debug_exec_node_output: bool,
     execution_runtime: Option<Arc<ExecutionRuntime>>,
-    scan_registration: Option<Arc<dyn ScanRegistrationPort>>,
     commit_port: Arc<dyn FragmentCommitPort>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     /// The per-edge send permission this task's push sinks are bound by.
@@ -595,7 +594,6 @@ impl Default for FragmentPrepareContext {
             group_execution_scan_dop: None,
             debug_exec_node_output: false,
             execution_runtime: Some(crate::runtime::execution_runtime::test_execution_runtime()),
-            scan_registration: None,
             commit_port: Arc::new(TestFragmentCommitPort),
             exchange_receiver_port:
                 crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port(),
@@ -636,7 +634,6 @@ impl FragmentPrepareContext {
             group_execution_scan_dop: None,
             debug_exec_node_output: false,
             execution_runtime: None,
-            scan_registration: None,
             commit_port: Arc::new(UnavailableFragmentCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
             #[cfg(test)]
@@ -668,11 +665,6 @@ impl FragmentPrepareContext {
         gates: Arc<crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates>,
     ) -> Self {
         self.edge_gates = Some(gates);
-        self
-    }
-
-    pub fn with_scan_registration_port(mut self, port: Arc<dyn ScanRegistrationPort>) -> Self {
-        self.scan_registration = Some(port);
         self
     }
 
@@ -741,7 +733,6 @@ impl FragmentPrepareContext {
             group_execution_scan_dop,
             debug_exec_node_output: false,
             execution_runtime: None,
-            scan_registration: None,
             commit_port: Arc::new(UnavailableFragmentCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
             #[cfg(test)]
@@ -1201,7 +1192,6 @@ pub fn prepare_fragment(
                 mem_tracker: context.mem_tracker.clone(),
                 runtime_filter_session: context.runtime_filter.clone(),
                 execution_runtime: context.execution_runtime.clone(),
-                scan_registration: context.scan_registration.clone(),
             },
             context.profiler.as_ref(),
         )

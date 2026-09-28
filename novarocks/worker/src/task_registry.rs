@@ -1155,6 +1155,10 @@ impl TaskExecutionRegistry {
                 state.prepare_context_counts.remove(&context);
             }
         }
+        // A terminal record can precede the preparation job's true exit.
+        // Publish ContextStopped and retire its resource owner only now that
+        // the final physical preparation charge has returned.
+        self.settle();
         self.launch_preparations();
     }
 
@@ -2727,7 +2731,14 @@ impl TaskExecutionRegistry {
             return false;
         };
         let tasks_drained = entry.tasks.values().all(TaskEntry::is_terminal_record);
-        tasks_drained && state.in_flight_of(context).is_idle()
+        tasks_drained
+            && state
+                .prepare_context_counts
+                .get(&context)
+                .copied()
+                .unwrap_or(0)
+                == 0
+            && state.in_flight_of(context).is_idle()
     }
 
     // ----------------------------------------------------------------- reads
@@ -3327,7 +3338,13 @@ impl TaskExecutionRegistry {
                 let Some(entry) = state.contexts.get(&context) else {
                     continue;
                 };
-                let ready = entry.tasks.values().all(TaskEntry::is_terminal_record);
+                let ready = entry.tasks.values().all(TaskEntry::is_terminal_record)
+                    && state
+                        .prepare_context_counts
+                        .get(&context)
+                        .copied()
+                        .unwrap_or(0)
+                        == 0;
                 match entry.state {
                     QueryContextState::Aborting if ready => QueryContextEvent::AbortCompleted,
                     QueryContextState::Releasing if ready => QueryContextEvent::ReleaseCompleted,
@@ -3406,6 +3423,15 @@ impl TaskExecutionRegistry {
             "query context convergence requires every task to have physically converged"
         );
 
+        assert_eq!(
+            state
+                .prepare_context_counts
+                .get(&context)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "query context convergence requires every preparation job to have exited"
+        );
         self.task_host.close_context_admission(context);
         if let Some(lease) = entry.lease {
             state.lease_expiry.remove(context, lease);
@@ -3431,6 +3457,7 @@ impl TaskExecutionRegistry {
             self.ports.discard_task(identity);
         }
         self.admission_tickets.release_context(context, now);
+        self.task_host.retire_context_execution(context);
 
         let entry = state
             .contexts
@@ -3946,7 +3973,12 @@ impl CreationTransaction<'_> {
             entry
                 .tasks
                 .insert(self.identity, TaskEntry::Live(Box::new(live)));
-            if !closed {
+            if closed && self.cell.accepted_status().is_none() {
+                // A creation that never became Accepted is invisible to
+                // observers. Accepted tasks already have a source fact and
+                // retain it until their physical convergence is observed.
+                entry.source.withhold(self.identity);
+            } else if !closed {
                 if self.cell.stop().is_none() {
                     status.note_installed();
                 }

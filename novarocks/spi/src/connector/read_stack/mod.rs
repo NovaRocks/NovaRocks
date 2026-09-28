@@ -34,6 +34,7 @@ pub mod handle;
 pub mod mv_target_selection;
 pub mod negotiation;
 pub mod page_source;
+pub mod page_stream;
 pub mod predicate;
 pub mod projection;
 pub mod runtime;
@@ -57,10 +58,13 @@ pub use mv_target_selection::{
     MAX_MV_TARGET_PARTITION_VALUE_BYTES,
 };
 pub use page_source::{
-    ConnectorDataCacheOptions, ConnectorPageSource, ConnectorPageSourceProviderOptions,
-    ConnectorPreparationControl, ConnectorPreparationProgress, ConnectorPreparationStart,
-    ConnectorPreparedPageSource, LazyBlockLoader, PageSourceFileMetrics, PageSourceMetrics,
-    SourcePage,
+    ConnectorDataCacheOptions, ConnectorPageSourceProviderOptions, ConnectorPreparationControl,
+    ConnectorPreparationProgress, ConnectorPreparationStart, ConnectorPreparedPageSource,
+    PageSourceFileMetrics, PageSourceMetrics, SourcePage,
+};
+pub use page_stream::{
+    BudgetConsume, ConnectorOperationTicket, ConnectorPageStream, ConnectorPollBudget,
+    ConnectorSourceExit, ConnectorSourceOperations, OwnedConnectorPageStream,
 };
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,

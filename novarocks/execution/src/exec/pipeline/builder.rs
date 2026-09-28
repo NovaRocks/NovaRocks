@@ -71,6 +71,7 @@ use crate::exec::operators::AssertNumRowsProcessorFactory;
 use crate::exec::operators::analytic_shared::AnalyticSharedState;
 use crate::exec::operators::local_exchanger::{LocalExchangePartitionSpec, LocalExchanger};
 use crate::exec::operators::runtime_filter::NativeRuntimeFilterProcessorFactory;
+use crate::exec::operators::scan::StreamScanSourceFactory;
 use crate::exec::operators::{
     AggregateProcessorFactory, AggregateStreamingSinkFactory, AggregateStreamingSourceFactory,
     AggregateStreamingState, AnalyticSinkFactory, AnalyticSourceFactory,
@@ -78,7 +79,7 @@ use crate::exec::operators::{
     ExceptSourceFactory, ExchangeSourceFactory, FilterProcessorFactory, HashJoinBuildSinkFactory,
     IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory, LocalExchangeSinkFactory,
     LocalExchangeSourceFactory, PartitionedJoinProbeProcessorFactory, ProjectProcessorFactory,
-    RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory, TableFinishOperatorFactory,
+    RepeatProcessorFactory, SortProcessorFactory, TableFinishOperatorFactory,
     TableFunctionProcessorFactory, TableWriterOperatorFactory, UnionAllSharedState,
     UnionAllSinkFactory, UnionAllSourceFactory, UnpivotProcessorFactory, ValuesSourceFactory,
 };
@@ -438,6 +439,50 @@ fn gather_to_one(
         pipeline: downstream,
         extra_pipelines,
         stream: StreamDesc::single(),
+    }
+}
+
+// Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
+/// Spreads a pipeline's chunks over `target_dop` consumer drivers.
+///
+/// The consumers take whole chunks from one shared queue, so an idle consumer
+/// takes the next chunk instead of it waiting behind a busy one. The queue
+/// holds at most `operator_buffer_chunks` chunks for the whole exchange and
+/// only applies backpressure when full; it never spills. The output carries
+/// no key ownership or order.
+fn hand_off_to_dop(
+    mut build: PipelineBuildResult,
+    ctx: &mut PipelineBuildContext,
+    owner_node_id: i32,
+    target_dop: i32,
+) -> PipelineBuildResult {
+    let consumer_count = target_dop.max(1) as usize;
+    let producer_count = build.pipeline.dop.max(1) as usize;
+    let exchanger = LocalExchanger::new_handoff(
+        producer_count,
+        consumer_count,
+        ctx.operator_buffer_chunks,
+        Arc::clone(&ctx.arena),
+    );
+    build
+        .pipeline
+        .factories
+        .push(Box::new(LocalExchangeSinkFactory::new(
+            owner_node_id,
+            Arc::clone(&exchanger),
+        )));
+    build.pipeline.needs_sink = false;
+
+    let source_factory = Box::new(LocalExchangeSourceFactory::new(owner_node_id, 1, exchanger));
+    let downstream = new_source_pipeline_with_dop(ctx, source_factory, consumer_count as i32);
+
+    let mut extra_pipelines = build.extra_pipelines;
+    extra_pipelines.push(build.pipeline);
+
+    PipelineBuildResult {
+        pipeline: downstream,
+        extra_pipelines,
+        stream: StreamDesc::any(consumer_count as i32),
     }
 }
 
@@ -1992,15 +2037,29 @@ fn build_pipeline_for_node(
                 .scan_bindings
                 .get(node_id)
                 .ok_or_else(|| format!("missing scan binding for node {node_id}"))?;
-            let factory = ScanSourceFactory::new_native(scan.clone(), op, Arc::clone(&ctx.arena))?
-                .with_operator_buffer_chunks(ctx.operator_buffer_chunks);
-            let source: Box<dyn OperatorFactory> = Box::new(factory);
-            let pipeline = new_source_pipeline(ctx, source);
-            Ok(PipelineBuildResult {
+            // A scan reads one stream, polled by the one driver of the scan
+            // pipeline. Downstream branches size themselves from the scan's
+            // DOP, so the scan keeps presenting the target DOP and hands its
+            // chunks to it through a shared queue, which makes that promise
+            // true.
+            let target_dop = ctx.pipeline_dop.max(1);
+            let scan_dop = 1;
+            let source: Box<dyn OperatorFactory> = Box::new(StreamScanSourceFactory::new_native(
+                scan.clone(),
+                op,
+                Arc::clone(&ctx.arena),
+            )?);
+            let pipeline = new_source_pipeline_with_dop(ctx, source, scan_dop);
+            let build = PipelineBuildResult {
                 pipeline,
                 extra_pipelines: Vec::new(),
-                stream: StreamDesc::any(ctx.pipeline_dop),
-            })
+                stream: StreamDesc::any(scan_dop),
+            };
+            if scan_dop < target_dop {
+                Ok(hand_off_to_dop(build, ctx, node_id, target_dop))
+            } else {
+                Ok(build)
+            }
         }
         ExecNodeKind::TableWriter(node) => {
             // A table writer is an ordinary unary processor: every driver of the
@@ -2224,6 +2283,400 @@ mod tests {
             );
         }
         bindings
+    }
+
+    struct UnclaimableStreamSource;
+
+    impl crate::exec::node::scan::ScanStreamSource for UnclaimableStreamSource {
+        fn claim(
+            &self,
+            _budget: novarocks_spi::connector::read_stack::ConnectorPollBudget,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+        ) -> Result<crate::exec::node::scan::ScanOutputStream, String> {
+            Err("builder tests never poll the stream".to_string())
+        }
+    }
+
+    /// A scan that hands its driver one stream, as every scan does.
+    struct StreamingScanOp;
+
+    impl crate::exec::node::scan::ScanOp for StreamingScanOp {
+        fn stream_source(&self) -> Arc<dyn crate::exec::node::scan::ScanStreamSource> {
+            Arc::new(UnclaimableStreamSource)
+        }
+    }
+
+    fn scan_node_with(
+        node_id: i32,
+        output_chunk_schema: ChunkSchemaRef,
+    ) -> (ExecNode, ScanBindings) {
+        let op: Arc<dyn crate::exec::node::scan::ScanOp> = Arc::new(StreamingScanOp);
+        let node = crate::exec::node::scan::ScanNode::new_for_test(Arc::clone(&op))
+            .with_node_id(node_id)
+            .with_output_chunk_schema(output_chunk_schema);
+        let mut bindings = ScanBindings::default();
+        bindings.insert(node_id, op);
+        (
+            ExecNode {
+                kind: ExecNodeKind::Scan(node),
+            },
+            bindings,
+        )
+    }
+
+    fn two_int_columns() -> ChunkSchemaRef {
+        chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("v", DataType::Int32, false),
+            ])),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+    }
+
+    fn pipeline_named<'a>(
+        graph: &'a super::PipelineGraph,
+        first_factory_prefix: &str,
+    ) -> Vec<&'a super::PipelinePlan> {
+        graph
+            .pipelines
+            .iter()
+            .filter(|pipeline| {
+                pipeline
+                    .factories
+                    .first()
+                    .is_some_and(|factory| factory.name().starts_with(first_factory_prefix))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_stream_scan_hands_its_chunks_to_the_target_dop() {
+        let (root, bindings) = scan_node_with(3, two_int_columns());
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root,
+        };
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            bindings,
+            4,
+        )
+        .expect("build pipeline graph");
+
+        assert_eq!(graph.pipelines.len(), 2);
+        let consumers = pipeline_named(&graph, "LOCAL_EXCHANGE_SOURCE");
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(
+            consumers[0].dop, 4,
+            "the scan node still presents the target DOP"
+        );
+        let scans = graph
+            .pipelines
+            .iter()
+            .filter(|pipeline| {
+                pipeline
+                    .factories
+                    .last()
+                    .is_some_and(|factory| factory.name().starts_with("LOCAL_EXCHANGE_SINK"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scans.len(), 1);
+        assert_eq!(
+            scans[0].dop, 1,
+            "only the one real stream gets a scan driver"
+        );
+    }
+
+    #[test]
+    fn single_stream_scan_at_dop_one_needs_no_handoff() {
+        let (root, bindings) = scan_node_with(3, two_int_columns());
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root,
+        };
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            bindings,
+            1,
+        )
+        .expect("build pipeline graph");
+
+        assert_eq!(graph.pipelines.len(), 1);
+        assert_eq!(graph.pipelines[0].dop, 1);
+    }
+
+    #[test]
+    fn aggregate_over_a_single_stream_scan_keeps_its_parallel_plan() {
+        let input_schema = two_int_columns();
+        let agg_output_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("sum", DataType::Int64, true),
+            ])),
+            &[SlotId::new(1), SlotId::new(2)],
+        );
+        let mut arena = ExprArena::default();
+        let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let v = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
+        let (scan, bindings) = scan_node_with(0, input_schema);
+        let root = ExecNode {
+            kind: ExecNodeKind::Aggregate(AggregateNode {
+                input: Box::new(scan),
+                node_id: 1,
+                group_by: vec![k],
+                functions: vec![AggFunction {
+                    name: "sum".to_string(),
+                    inputs: vec![v],
+                    input_is_intermediate: false,
+                    types: Some(AggTypeSignature {
+                        intermediate_type: None,
+                        output_type: Some(DataType::Int64),
+                        input_arg_type: None,
+                    }),
+                    ..Default::default()
+                }],
+                resolved_aggregates: vec![resolved_aggregate("sum", &[DataType::Int32])],
+                need_finalize: true,
+                input_is_intermediate: false,
+                output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
+                runtime_filter_spec: AggregateRuntimeFilterSpec {
+                    topn_producers: Vec::new(),
+                },
+                streaming_preaggregation_mode: None,
+            }),
+        };
+        let plan = ExecPlan { arena, root };
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            bindings,
+            4,
+        )
+        .expect("build pipeline graph");
+
+        // Scan (1 driver) -> handoff -> partial aggregate on 4 drivers ->
+        // hash shuffle -> final aggregate on 4 drivers: the aggregate sees
+        // the same input DOP as over any other four-way source.
+        assert_eq!(graph.pipelines.len(), 3);
+        let consumers = pipeline_named(&graph, "LOCAL_EXCHANGE_SOURCE");
+        assert_eq!(consumers.len(), 2);
+        assert!(consumers.iter().all(|pipeline| pipeline.dop == 4));
+    }
+
+    fn pipeline_ending_with<'a>(
+        graph: &'a super::PipelineGraph,
+        last_factory_prefix: &str,
+    ) -> Vec<&'a super::PipelinePlan> {
+        graph
+            .pipelines
+            .iter()
+            .filter(|pipeline| {
+                pipeline
+                    .factories
+                    .last()
+                    .is_some_and(|factory| factory.name().starts_with(last_factory_prefix))
+            })
+            .collect()
+    }
+
+    fn root_pipeline(graph: &super::PipelineGraph) -> &super::PipelinePlan {
+        graph
+            .pipelines
+            .iter()
+            .find(|pipeline| pipeline.id == graph.root_id)
+            .expect("root pipeline")
+    }
+
+    /// Pipelines that run a scan and hand its chunks to a shared queue.
+    fn handoff_scan_pipelines(graph: &super::PipelineGraph) -> Vec<&super::PipelinePlan> {
+        pipeline_ending_with(graph, "LOCAL_EXCHANGE_SINK")
+            .into_iter()
+            .filter(|pipeline| {
+                pipeline
+                    .factories
+                    .first()
+                    .is_some_and(|factory| !factory.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
+            })
+            .collect()
+    }
+
+    fn join_over_single_stream_scans(
+        distribution_mode: crate::exec::node::join::JoinDistributionMode,
+    ) -> super::PipelineGraph {
+        let left_schema = two_int_columns();
+        let right_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("rk", DataType::Int32, false),
+                Field::new("rv", DataType::Int32, false),
+            ])),
+            &[SlotId::new(3), SlotId::new(4)],
+        );
+        let join_scope_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("v", DataType::Int32, false),
+                Field::new("rk", DataType::Int32, false),
+                Field::new("rv", DataType::Int32, false),
+            ])),
+            &[
+                SlotId::new(1),
+                SlotId::new(2),
+                SlotId::new(3),
+                SlotId::new(4),
+            ],
+        );
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(3)), DataType::Int32);
+        let (left, left_bindings) = scan_node_with(1, Arc::clone(&left_schema));
+        let (right, right_bindings) = scan_node_with(2, Arc::clone(&right_schema));
+        let mut bindings = left_bindings;
+        bindings.insert(2, right_bindings.get(2).expect("right scan binding"));
+        let root = ExecNode {
+            kind: ExecNodeKind::Join(crate::exec::node::join::JoinNode {
+                left: Box::new(left),
+                right: Box::new(right),
+                node_id: 3,
+                join_type: JoinType::Inner,
+                distribution_mode,
+                left_chunk_schema: left_schema,
+                right_chunk_schema: right_schema,
+                join_scope_chunk_schema: join_scope_schema,
+                probe_keys: vec![probe_key],
+                build_keys: vec![build_key],
+                eq_null_safe: vec![false],
+                residual_predicate: None,
+                runtime_filter_execution:
+                    crate::exec::node::join::JoinRuntimeFilterExecution::empty(),
+            }),
+        };
+        let plan = ExecPlan { arena, root };
+        build_native_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            bindings,
+            4,
+        )
+        .expect("build pipeline graph")
+    }
+
+    #[test]
+    fn broadcast_join_over_single_stream_scans_keeps_its_probe_dop() {
+        let graph =
+            join_over_single_stream_scans(crate::exec::node::join::JoinDistributionMode::Broadcast);
+
+        let root = root_pipeline(&graph);
+        assert_eq!(root.dop, 4, "the probe runs on every target driver");
+        assert!(
+            root.factories
+                .last()
+                .is_some_and(|factory| factory.name().starts_with("HASH_JOIN"))
+        );
+        let builds = pipeline_ending_with(&graph, "HASH_JOIN")
+            .into_iter()
+            .filter(|pipeline| pipeline.id != graph.root_id)
+            .collect::<Vec<_>>();
+        assert_eq!(builds.len(), 1);
+        assert_eq!(
+            builds[0].dop, 1,
+            "the broadcast build still gathers to one driver"
+        );
+        let scans = handoff_scan_pipelines(&graph);
+        assert_eq!(scans.len(), 2);
+        assert!(scans.iter().all(|pipeline| pipeline.dop == 1));
+        let gathers = pipeline_ending_with(&graph, "LOCAL_EXCHANGE_SINK")
+            .into_iter()
+            .filter(|pipeline| {
+                pipeline
+                    .factories
+                    .first()
+                    .is_some_and(|factory| factory.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(gathers.len(), 1);
+        assert_eq!(
+            gathers[0].dop, 4,
+            "the build gather has as many producers as over a four-way scan"
+        );
+    }
+
+    #[test]
+    fn partitioned_join_over_single_stream_scans_keeps_its_partition_count() {
+        let graph = join_over_single_stream_scans(
+            crate::exec::node::join::JoinDistributionMode::Partitioned,
+        );
+
+        let root = root_pipeline(&graph);
+        assert_eq!(root.dop, 4);
+        let builds = pipeline_ending_with(&graph, "HASH_JOIN")
+            .into_iter()
+            .filter(|pipeline| pipeline.id != graph.root_id)
+            .collect::<Vec<_>>();
+        assert_eq!(builds.len(), 1);
+        assert_eq!(
+            builds[0].dop, 4,
+            "both sides still split into four partitions"
+        );
+        let shuffles = pipeline_ending_with(&graph, "LOCAL_EXCHANGE_SINK")
+            .into_iter()
+            .filter(|pipeline| {
+                pipeline
+                    .factories
+                    .first()
+                    .is_some_and(|factory| factory.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shuffles.len(), 2, "one hash shuffle per join side");
+        assert!(shuffles.iter().all(|pipeline| pipeline.dop == 4));
+    }
+
+    #[test]
+    fn root_sink_dop_overrides_apply_to_a_single_stream_scan_as_to_any_scan() {
+        for (root_sink_dop, root_dop, pipelines) in [(1, 1, 3), (4, 4, 2)] {
+            let (root, bindings) = scan_node_with(3, two_int_columns());
+            let plan = ExecPlan {
+                arena: ExprArena::default(),
+                root,
+            };
+            let graph = build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
+                &plan,
+                false,
+                DependencyManager::new(),
+                None,
+                ExchangeBindings::default(),
+                bindings,
+                4,
+                Some(root_sink_dop),
+            )
+            .expect("build pipeline graph");
+
+            let root = root_pipeline(&graph);
+            assert_eq!(root.dop, root_dop);
+            assert!(root.needs_sink);
+            assert_eq!(graph.pipelines.len(), pipelines);
+            assert!(
+                graph
+                    .pipelines
+                    .iter()
+                    .filter(|pipeline| pipeline.id != graph.root_id)
+                    .all(|pipeline| !pipeline.needs_sink)
+            );
+        }
     }
 
     #[test]

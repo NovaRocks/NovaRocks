@@ -461,8 +461,6 @@ fn build_runtime(
     ExecutionRuntime::new(
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            scan_threads: 1,
-            scan_queue_capacity: 8,
             spill_io_threads: 1,
             spill_io_queue_capacity: 8,
             spill_storage: ExecutionSpillStorageConfig::default(),
@@ -473,9 +471,6 @@ fn build_runtime(
             operator_buffer_chunks: 1,
             local_exchange_buffer_mem_limit_per_driver: 1 << 20,
             local_exchange_max_buffered_rows: 65_536,
-            connector_io_tasks_per_scan_operator: 1,
-            scan_submit_fail_max: 1,
-            scan_submit_fail_timeout_ms: 1,
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,
@@ -548,7 +543,6 @@ fn run_once(
         None,
         None,
         Some(runtime),
-        None,
     );
     let writer_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkTableWriter"));
     let finish_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkTableFinish"));

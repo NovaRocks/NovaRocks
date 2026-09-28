@@ -166,7 +166,7 @@ pub use task_registry_config::{TaskExecutionRegistryConfig, TaskPreparationLimit
 pub use typed_preparation_flow::ScanPreparationTimer;
 pub use typed_scan_runtime::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,
-    ScanPreparationConfig, TypedConnectorReadDescriptor, TypedScanRuntime,
+    ScanPreparationConfig, ScanStreamHost, TypedConnectorReadDescriptor, TypedScanRuntime,
 };
 
 /// Positive, ordered joint retained-result limits owned by one worker process.

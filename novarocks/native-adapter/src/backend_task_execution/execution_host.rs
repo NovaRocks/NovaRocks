@@ -201,8 +201,7 @@ pub struct NativeTaskExecutionHost {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     commit_port: Arc<dyn FragmentCommitPort>,
     execution_runtime: Arc<ExecutionRuntime>,
-    scan_preparation_config: novarocks_worker::ScanPreparationConfig,
-    scan_preparation_timer: Arc<novarocks_worker::ScanPreparationTimer>,
+    scan_stream_host: novarocks_worker::ScanStreamHost,
     completion_supervisor: Arc<TaskCompletionSupervisor>,
     /// Split delivery, keyed by execution and kernel key so a replaced attempt
     /// gets a fresh queue set and can never inherit a sequence space.
@@ -373,8 +372,7 @@ impl FragmentEventSink for TaskOperatorStatisticsSink {
             // Runtime-filter evidence answers to the query context's filter
             // participant. Folding it here would put two unrelated facts
             // behind one identity.
-            FragmentEvent::RuntimeFilterRowEffect(_)
-            | FragmentEvent::RuntimeFilterScanUnitOutcome(_) => {}
+            FragmentEvent::RuntimeFilterRowEffect(_) => {}
         }
     }
 }
@@ -397,7 +395,7 @@ impl NativeTaskExecutionHost {
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         commit_port: Arc<dyn FragmentCommitPort>,
         execution_runtime: Arc<ExecutionRuntime>,
-        scan_preparation_config: novarocks_worker::ScanPreparationConfig,
+        scan_stream_host: novarocks_worker::ScanStreamHost,
         completion_supervisor: Arc<TaskCompletionSupervisor>,
     ) -> Self {
         Self {
@@ -409,8 +407,7 @@ impl NativeTaskExecutionHost {
             exchange_receiver_port,
             commit_port,
             execution_runtime,
-            scan_preparation_config,
-            scan_preparation_timer: novarocks_worker::ScanPreparationTimer::new(),
+            scan_stream_host,
             completion_supervisor,
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
@@ -473,8 +470,7 @@ impl NativeTaskExecutionHost {
             runtime_filter,
             read_context,
             self.context_facts.storage_resolver(execution)?,
-            self.scan_preparation_config,
-            Arc::clone(&self.scan_preparation_timer),
+            self.scan_stream_host.clone(),
         ))
     }
 
@@ -639,6 +635,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
 
     fn abort_context_admission(&self, context: QueryContextRef) {
         self.capabilities.abort_context(context);
+    }
+
+    fn retire_context_execution(&self, context: QueryContextRef) {
+        self.queries
+            .retire_idle_execution(context.query_execution_id());
     }
 
     fn forget_context_admission(&self, context: QueryContextRef) {
@@ -1616,7 +1617,7 @@ mod tests {
     };
     use crate::task_query_context_options::query_options_fingerprint;
 
-    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1657,7 +1658,7 @@ mod tests {
     use novarocks_execution_contract::task_execution::operation::{
         AcquireQueryContextAdmissionTicket, CreateTask, CredentialUpdate, EstablishQueryContext,
         OperationEnvelope, OperationKind, OperationOutcome, QueryContextDomainUpdate,
-        TaskDomainUpdate, UpdateQueryContext,
+        ReleaseQueryContext, TaskDomainUpdate, UpdateQueryContext,
     };
     use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
@@ -1674,6 +1675,7 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use novarocks_types::{NativeCompatibilityId, UniqueId};
+    use novarocks_worker::query_context::{QueryExecutionKey, query_context_manager};
     use novarocks_worker::{InboundFrameClaim, IngressRejection, TaskInboundCapabilities};
     use prost::Message;
 
@@ -2070,8 +2072,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    scan_threads: 1,
-                    scan_queue_capacity: 1,
                     spill_io_threads: 1,
                     spill_io_queue_capacity: 1,
                     spill_storage: ExecutionSpillStorageConfig::default(),
@@ -2082,9 +2082,6 @@ mod tests {
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1,
                     local_exchange_max_buffered_rows: 1,
-                    connector_io_tasks_per_scan_operator: 1,
-                    scan_submit_fail_max: 1,
-                    scan_submit_fail_timeout_ms: 1,
                     runtime_filter_scan_wait_time_ms_override: None,
                     runtime_filter_wait_timeout_ms_override: None,
                     sink_io_worker_threads: 1,
@@ -2116,7 +2113,10 @@ mod tests {
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
             test_execution_runtime(),
-            novarocks_worker::ScanPreparationConfig::default(),
+            novarocks_worker::ScanStreamHost::new(
+                novarocks_worker::ScanPreparationConfig::default(),
+                novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
+            ),
             completion_supervisor,
         )
     }
@@ -3731,12 +3731,51 @@ mod tests {
     #[test]
     fn an_abort_racing_a_submitted_task_still_reaches_a_terminal_status() {
         let facts = Arc::new(StubContextFacts::default());
-        let host = host(Arc::clone(&facts));
+        let mut host = host(Arc::clone(&facts));
+        host.exchange_receiver_port = Arc::new(
+            novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(
+                Arc::clone(&host.execution_runtime),
+            ),
+        );
         let task = identity(35, 1, 1);
-        let descriptor = consistent_descriptor(task, UniqueId::new(261, 262));
+        let node = FragmentNodeId::new(10);
+        let descriptor = descriptor_with(
+            task,
+            UniqueId::new(261, 262),
+            1,
+            inbound_topology(
+                node,
+                vec![ExchangeSource::new(
+                    identity(35, 2, 1),
+                    UniqueId::new(263, 264),
+                    0,
+                )],
+            ),
+        );
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
+        // This sender never sends data or EOS, so the fragment cannot finish
+        // before the abort wins the first-wins terminal latch.
+        let mut body = Body::values(1);
+        body.frozen
+            .plan
+            .as_mut()
+            .expect("a plan")
+            .root
+            .as_mut()
+            .expect("a root")
+            .payload = Some(plan::distributed_node::Payload::Exchange(
+            plan::ExchangeReceiver {
+                partition_type: plan::PartitionType::Unpartitioned as i32,
+                source_fragment_id: 8,
+                flavor: Some(plan::ExchangeFlavor {
+                    kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
+                }),
+                ..Default::default()
+            },
+        ));
+        host.install_receiver(&descriptor, body.input(&descriptor))
+            .expect("prepares");
         let runnable = submit_committed(&host, &descriptor, reporter);
 
         // The owner publishes ABORTING and then asks the task to stand down,
@@ -3964,6 +4003,10 @@ mod tests {
             self.inner.close_context_admission(context);
         }
 
+        fn retire_context_execution(&self, context: QueryContextRef) {
+            self.inner.retire_context_execution(context);
+        }
+
         fn forget_context_admission(&self, context: QueryContextRef) {
             self.inner.forget_context_admission(context);
         }
@@ -4166,6 +4209,55 @@ mod tests {
             let (request, input): (CreateTask, TaskCreationInput) = decoded.into_parts();
             self.registry.create_task(&request, input)
         }
+    }
+
+    #[test]
+    fn terminal_task_context_retires_prepared_unregistered_query_context() {
+        let fixture = OwnerFixture::new(60_901);
+        let execution = fixture.context.query_execution_id();
+        let query = QueryExecutionKey::native_attempt(
+            QueryId::new(execution.query_id().high(), execution.query_id().low()),
+            NonZeroU64::new(execution.attempt_id().get()).unwrap(),
+        );
+        fixture
+            .host
+            .inner
+            .queries
+            .prepare_admission_execution(
+                execution,
+                UniqueId::new(60_903, 1),
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+                None,
+                None,
+            )
+            .expect("preparation creates the zero-fragment query context");
+        assert!(
+            query_context_manager()
+                .query_mem_tracker_execution(query)
+                .is_some()
+        );
+
+        let quiesced = fixture.registry.quiesce_query_context(
+            &novarocks_execution_contract::task_execution::operation::QuiesceQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+            ),
+        );
+        assert_eq!(quiesced.outcome(), OperationOutcome::Accepted);
+
+        let released = fixture
+            .registry
+            .release_query_context(&ReleaseQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+            ));
+        assert_eq!(released.outcome(), OperationOutcome::Accepted);
+        assert!(
+            query_context_manager()
+                .query_mem_tracker_execution(query)
+                .is_none()
+        );
     }
 
     /// A winning round interprets its body once; a replay of the same

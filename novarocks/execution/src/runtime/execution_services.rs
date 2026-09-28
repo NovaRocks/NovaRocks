@@ -17,14 +17,13 @@
 //! Execution-service resource boundaries (IW-1).
 //!
 //! Responsibilities:
-//! - Defines explicit execution-service classes so write-path I/O does not
-//!   share the query `data_runtime` directly.
+//! - Gives write-path I/O a dedicated runtime so it does not share the query
+//!   `data_runtime` directly.
 //! - Every service is explicitly owned by an `ExecutionRuntime`; no lookup
 //!   reaches an application configuration singleton or a shared global runtime.
 //!
 //! Key exported interfaces:
-//! - Types: `ExecutorKind`, `IoExecutor`, `IoExecutorMetrics`, `ExecutionServices`.
-//! - Types: `ExecutorKind`, `IoExecutor`, `IoExecutorMetrics`, `ExecutionServices`.
+//! - Types: `IoExecutor`, `IoExecutorMetrics`, `ExecutionServices`.
 
 use std::fmt;
 use std::future::Future;
@@ -39,27 +38,6 @@ use tokio::task::JoinHandle;
 use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
 
 const SINK_IO_THREAD_NAME: &str = "novarocks-sink-io";
-const SHARED_IO_THREAD_NAME: &str = "novarocks-execution-io";
-
-/// Identifies an execution-service class for metrics/logging.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutorKind {
-    ScanIo,
-    SinkIo,
-    MetadataIo,
-    Commit,
-}
-
-impl ExecutorKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ExecutorKind::ScanIo => "scan_io",
-            ExecutorKind::SinkIo => "sink_io",
-            ExecutorKind::MetadataIo => "metadata_io",
-            ExecutorKind::Commit => "commit",
-        }
-    }
-}
 
 /// Per-service counters. `queue_len = submitted - started`, `running = started - completed`.
 #[derive(Debug, Default)]
@@ -125,22 +103,16 @@ enum Spawner {
 /// A uniform handle to one execution service. Cloneable; cheap to pass around.
 #[derive(Clone)]
 pub struct IoExecutor {
-    kind: ExecutorKind,
     spawner: Spawner,
     metrics: Arc<IoExecutorMetrics>,
 }
 
 impl IoExecutor {
-    fn new(kind: ExecutorKind, spawner: Spawner) -> Self {
+    fn new(spawner: Spawner) -> Self {
         Self {
-            kind,
             spawner,
             metrics: Arc::new(IoExecutorMetrics::default()),
         }
-    }
-
-    pub fn kind(&self) -> ExecutorKind {
-        self.kind
     }
 
     pub fn metrics(&self) -> &Arc<IoExecutorMetrics> {
@@ -183,7 +155,6 @@ impl IoExecutor {
     #[cfg(test)]
     fn with_isolated_metrics(&self) -> Self {
         Self {
-            kind: self.kind,
             spawner: self.spawner.clone(),
             metrics: Arc::new(IoExecutorMetrics::default()),
         }
@@ -216,10 +187,7 @@ impl IoExecutor {
 
 /// I/O services owned by one explicit execution runtime.
 pub struct ExecutionServices {
-    scan_io: IoExecutor,
     sink_io: IoExecutor,
-    metadata_io: IoExecutor,
-    commit: IoExecutor,
 }
 
 impl fmt::Debug for ExecutionServices {
@@ -237,36 +205,13 @@ impl ExecutionServices {
             config.sink_io_worker_threads,
             config.sink_io_max_blocking_threads,
         )?;
-        let shared_io_rt = build_runtime(
-            SHARED_IO_THREAD_NAME,
-            config.scan_threads,
-            config.scan_queue_capacity,
-        )?;
         Ok(Self {
-            scan_io: IoExecutor::new(
-                ExecutorKind::ScanIo,
-                Spawner::Owned(Arc::clone(&shared_io_rt)),
-            ),
-            sink_io: IoExecutor::new(ExecutorKind::SinkIo, Spawner::Owned(sink_rt)),
-            metadata_io: IoExecutor::new(
-                ExecutorKind::MetadataIo,
-                Spawner::Owned(Arc::clone(&shared_io_rt)),
-            ),
-            commit: IoExecutor::new(ExecutorKind::Commit, Spawner::Owned(shared_io_rt)),
+            sink_io: IoExecutor::new(Spawner::Owned(sink_rt)),
         })
     }
 
-    pub fn scan_io(&self) -> &IoExecutor {
-        &self.scan_io
-    }
     pub fn sink_io(&self) -> &IoExecutor {
         &self.sink_io
-    }
-    pub fn metadata_io(&self) -> &IoExecutor {
-        &self.metadata_io
-    }
-    pub fn commit(&self) -> &IoExecutor {
-        &self.commit
     }
 }
 
@@ -296,8 +241,6 @@ mod tests {
     fn services() -> ExecutionServices {
         ExecutionServices::new(&ExecutionRuntimeConfig {
             driver_threads: 1,
-            scan_threads: 1,
-            scan_queue_capacity: 1,
             spill_io_threads: 1,
             spill_io_queue_capacity: 1,
             spill_storage: crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(
@@ -309,9 +252,6 @@ mod tests {
             operator_buffer_chunks: 1,
             local_exchange_buffer_mem_limit_per_driver: 1,
             local_exchange_max_buffered_rows: 1,
-            connector_io_tasks_per_scan_operator: 1,
-            scan_submit_fail_max: 1,
-            scan_submit_fail_timeout_ms: 1,
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,
@@ -333,22 +273,6 @@ mod tests {
         assert!(
             name.contains("novarocks-sink-io"),
             "sink_io task ran on unexpected thread: {name}"
-        );
-    }
-
-    #[test]
-    fn metadata_io_runs_on_runtime_owned_shared_io() {
-        let services = services();
-        let handle = services.metadata_io().spawn(async {
-            std::thread::current()
-                .name()
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-        });
-        let name = futures::executor::block_on(handle).expect("join");
-        assert!(
-            name.contains(SHARED_IO_THREAD_NAME),
-            "metadata_io ran on unexpected runtime: {name}"
         );
     }
 

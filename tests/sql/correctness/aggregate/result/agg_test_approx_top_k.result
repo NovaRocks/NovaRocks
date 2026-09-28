@@ -1179,19 +1179,19 @@ approx_top_k(L_LINENUMBER, 10)
 [{"item":1,"count":36},{"item":2,"count":31},{"item":3,"count":26},{"item":4,"count":21},{"item":5,"count":16},{"item":6,"count":11},{"item":7,"count":6}]
 
 -- query 181
-L_RETURNFLAG	approx_top_k(L_LINENUMBER)
+l_returnflag	approx_top_k(L_LINENUMBER)
 A	[{"item":1,"count":9},{"item":2,"count":8},{"item":3,"count":7},{"item":4,"count":6},{"item":5,"count":5}]
 N	[{"item":1,"count":15},{"item":2,"count":13},{"item":3,"count":11},{"item":4,"count":9},{"item":5,"count":7}]
 R	[{"item":1,"count":12},{"item":2,"count":10},{"item":3,"count":8},{"item":4,"count":6},{"item":5,"count":4}]
 
 -- query 182
-L_RETURNFLAG	approx_top_k(L_LINENUMBER, 2)
+l_returnflag	approx_top_k(L_LINENUMBER, 2)
 A	[{"item":1,"count":9},{"item":2,"count":8}]
 N	[{"item":1,"count":15},{"item":2,"count":13}]
 R	[{"item":1,"count":12},{"item":2,"count":10}]
 
 -- query 183
-L_RETURNFLAG	approx_top_k(L_LINENUMBER, 20)
+l_returnflag	approx_top_k(L_LINENUMBER, 20)
 A	[{"item":1,"count":9},{"item":2,"count":8},{"item":3,"count":7},{"item":4,"count":6},{"item":5,"count":5},{"item":6,"count":4},{"item":7,"count":3}]
 N	[{"item":1,"count":15},{"item":2,"count":13},{"item":3,"count":11},{"item":4,"count":9},{"item":5,"count":7},{"item":6,"count":5},{"item":7,"count":3}]
 R	[{"item":1,"count":12},{"item":2,"count":10},{"item":3,"count":8},{"item":4,"count":6},{"item":5,"count":4},{"item":6,"count":2}]

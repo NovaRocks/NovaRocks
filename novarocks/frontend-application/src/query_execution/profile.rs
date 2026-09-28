@@ -287,43 +287,11 @@ impl ProfileTerminalBuilder {
     }
 }
 
-const RUNTIME_FILTER_SCAN_UNITS_PRUNED: &str = "RuntimeFilterScanUnitsPruned";
-const RUNTIME_FILTER_SCAN_UNITS_KEPT: &str = "RuntimeFilterScanUnitsKept";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED: &str = "RuntimeFilterScanUnitsNotEvaluated";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING: &str =
-    "RuntimeFilterScanUnitsNotEvaluatedUnitFactsMissing";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING: &str =
-    "RuntimeFilterScanUnitsNotEvaluatedColumnFactsMissing";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED: &str =
-    "RuntimeFilterScanUnitsNotEvaluatedDataTypeUnsupported";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED: &str =
-    "RuntimeFilterScanUnitsNotEvaluatedPredicateCapabilityUnsupported";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE: &str =
-    "RuntimeFilterScanUnitsNotEvaluatedResourceUnavailable";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE: &str =
-    "RuntimeFilterScanUnitsNotEvaluatedSnapshotUnavailable";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT: &str =
-    "RuntimeFilterScanUnitsNotEvaluatedSnapshotTimedOut";
-const RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED: &str =
-    "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished";
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RuntimeFilterProfileTotals {
     has_row_evaluation: bool,
     input_rows: u64,
     output_rows: u64,
-    has_scan_evaluation: bool,
-    scan_pruned: u64,
-    scan_kept: u64,
-    scan_not_evaluated: u64,
-    scan_not_evaluated_unit_facts_missing: u64,
-    scan_not_evaluated_column_facts_missing: u64,
-    scan_not_evaluated_data_type_unsupported: u64,
-    scan_not_evaluated_predicate_capability_unsupported: u64,
-    scan_not_evaluated_resource_unavailable: u64,
-    scan_not_evaluated_snapshot_unavailable: u64,
-    scan_not_evaluated_snapshot_timed_out: u64,
-    scan_not_evaluated_snapshot_not_published: u64,
 }
 
 impl RuntimeFilterProfileTotals {
@@ -333,8 +301,6 @@ impl RuntimeFilterProfileTotals {
         let mut totals = Self::default();
         for consumer in contribution.consumers() {
             totals.has_row_evaluation |= consumer.row_evaluations != 0;
-            totals.has_scan_evaluation |=
-                consumer.scan_evaluated != 0 || consumer.scan_not_evaluated != 0;
             checked_add_profile_counter(
                 &mut totals.input_rows,
                 consumer.input_rows,
@@ -344,65 +310,6 @@ impl RuntimeFilterProfileTotals {
                 &mut totals.output_rows,
                 consumer.output_rows,
                 RUNTIME_FILTER_OUTPUT_ROWS,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_pruned,
-                consumer.scan_pruned,
-                RUNTIME_FILTER_SCAN_UNITS_PRUNED,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_kept,
-                consumer.scan_kept,
-                RUNTIME_FILTER_SCAN_UNITS_KEPT,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_not_evaluated,
-                consumer.scan_not_evaluated,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
-            )?;
-            let reasons = consumer
-                .scan_not_evaluated_reasons
-                .as_ref()
-                .expect("validated runtime-filter consumer has scan reasons");
-            checked_add_profile_counter(
-                &mut totals.scan_not_evaluated_unit_facts_missing,
-                reasons.unit_facts_missing,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_not_evaluated_column_facts_missing,
-                reasons.column_facts_missing,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_not_evaluated_data_type_unsupported,
-                reasons.data_type_unsupported,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_not_evaluated_predicate_capability_unsupported,
-                reasons.predicate_capability_unsupported,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_not_evaluated_resource_unavailable,
-                reasons.resource_unavailable,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_not_evaluated_snapshot_unavailable,
-                reasons.snapshot_unavailable,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_not_evaluated_snapshot_timed_out,
-                reasons.snapshot_timed_out,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT,
-            )?;
-            checked_add_profile_counter(
-                &mut totals.scan_not_evaluated_snapshot_not_published,
-                reasons.snapshot_not_published,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED,
             )?;
         }
         totals.validate_profile_range()?;
@@ -422,62 +329,6 @@ impl RuntimeFilterProfileTotals {
                 other.output_rows,
                 RUNTIME_FILTER_OUTPUT_ROWS,
             )?,
-            has_scan_evaluation: self.has_scan_evaluation || other.has_scan_evaluation,
-            scan_pruned: checked_profile_counter_sum(
-                self.scan_pruned,
-                other.scan_pruned,
-                RUNTIME_FILTER_SCAN_UNITS_PRUNED,
-            )?,
-            scan_kept: checked_profile_counter_sum(
-                self.scan_kept,
-                other.scan_kept,
-                RUNTIME_FILTER_SCAN_UNITS_KEPT,
-            )?,
-            scan_not_evaluated: checked_profile_counter_sum(
-                self.scan_not_evaluated,
-                other.scan_not_evaluated,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
-            )?,
-            scan_not_evaluated_unit_facts_missing: checked_profile_counter_sum(
-                self.scan_not_evaluated_unit_facts_missing,
-                other.scan_not_evaluated_unit_facts_missing,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING,
-            )?,
-            scan_not_evaluated_column_facts_missing: checked_profile_counter_sum(
-                self.scan_not_evaluated_column_facts_missing,
-                other.scan_not_evaluated_column_facts_missing,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING,
-            )?,
-            scan_not_evaluated_data_type_unsupported: checked_profile_counter_sum(
-                self.scan_not_evaluated_data_type_unsupported,
-                other.scan_not_evaluated_data_type_unsupported,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED,
-            )?,
-            scan_not_evaluated_predicate_capability_unsupported: checked_profile_counter_sum(
-                self.scan_not_evaluated_predicate_capability_unsupported,
-                other.scan_not_evaluated_predicate_capability_unsupported,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED,
-            )?,
-            scan_not_evaluated_resource_unavailable: checked_profile_counter_sum(
-                self.scan_not_evaluated_resource_unavailable,
-                other.scan_not_evaluated_resource_unavailable,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
-            )?,
-            scan_not_evaluated_snapshot_unavailable: checked_profile_counter_sum(
-                self.scan_not_evaluated_snapshot_unavailable,
-                other.scan_not_evaluated_snapshot_unavailable,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE,
-            )?,
-            scan_not_evaluated_snapshot_timed_out: checked_profile_counter_sum(
-                self.scan_not_evaluated_snapshot_timed_out,
-                other.scan_not_evaluated_snapshot_timed_out,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT,
-            )?,
-            scan_not_evaluated_snapshot_not_published: checked_profile_counter_sum(
-                self.scan_not_evaluated_snapshot_not_published,
-                other.scan_not_evaluated_snapshot_not_published,
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED,
-            )?,
         })
     }
 
@@ -485,44 +336,6 @@ impl RuntimeFilterProfileTotals {
         for (name, value) in [
             (RUNTIME_FILTER_INPUT_ROWS, self.input_rows),
             (RUNTIME_FILTER_OUTPUT_ROWS, self.output_rows),
-            (RUNTIME_FILTER_SCAN_UNITS_PRUNED, self.scan_pruned),
-            (RUNTIME_FILTER_SCAN_UNITS_KEPT, self.scan_kept),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
-                self.scan_not_evaluated,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING,
-                self.scan_not_evaluated_unit_facts_missing,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING,
-                self.scan_not_evaluated_column_facts_missing,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED,
-                self.scan_not_evaluated_data_type_unsupported,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED,
-                self.scan_not_evaluated_predicate_capability_unsupported,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
-                self.scan_not_evaluated_resource_unavailable,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE,
-                self.scan_not_evaluated_snapshot_unavailable,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT,
-                self.scan_not_evaluated_snapshot_timed_out,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED,
-                self.scan_not_evaluated_snapshot_not_published,
-            ),
         ] {
             profile_counter_value(name, value)?;
         }
@@ -555,50 +368,6 @@ fn runtime_filter_profile_tree(
             ProfileUnit::Unit,
             profile_counter_value(RUNTIME_FILTER_OUTPUT_ROWS, totals.output_rows)?,
         );
-    }
-    if totals.has_scan_evaluation {
-        for (name, value) in [
-            (RUNTIME_FILTER_SCAN_UNITS_PRUNED, totals.scan_pruned),
-            (RUNTIME_FILTER_SCAN_UNITS_KEPT, totals.scan_kept),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
-                totals.scan_not_evaluated,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_UNIT_FACTS_MISSING,
-                totals.scan_not_evaluated_unit_facts_missing,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_COLUMN_FACTS_MISSING,
-                totals.scan_not_evaluated_column_facts_missing,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_DATA_TYPE_UNSUPPORTED,
-                totals.scan_not_evaluated_data_type_unsupported,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_PREDICATE_CAPABILITY_UNSUPPORTED,
-                totals.scan_not_evaluated_predicate_capability_unsupported,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
-                totals.scan_not_evaluated_resource_unavailable,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_UNAVAILABLE,
-                totals.scan_not_evaluated_snapshot_unavailable,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_TIMED_OUT,
-                totals.scan_not_evaluated_snapshot_timed_out,
-            ),
-            (
-                RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_SNAPSHOT_NOT_PUBLISHED,
-                totals.scan_not_evaluated_snapshot_not_published,
-            ),
-        ] {
-            common.counter_set(name, ProfileUnit::Unit, profile_counter_value(name, value)?);
-        }
     }
 
     for channel in contribution.channels() {
@@ -1286,14 +1055,7 @@ mod tests {
                                 row_evaluations: 1,
                                 input_rows,
                                 output_rows,
-                                scan_evaluated: 2,
-                                scan_kept: 1,
-                                scan_pruned: 1,
-                                scan_not_evaluated: 1,
-                                scan_not_evaluated_reasons: Some(novarocks::QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
-                                    resource_unavailable: 1,
-                                    ..Default::default()
-                                }),
+
                             }],
                         },
                     ),
@@ -1347,26 +1109,6 @@ mod tests {
         let apply = super::collect_native_runtime_filter_apply_from_profile_trees(&trees)
             .expect("row effects produce RuntimeFilterApply");
         assert_eq!((apply.input_rows, apply.output_rows), (100, 30));
-        let scans = super::sum_profile_counters_by_name_from_profile_trees(
-            &trees,
-            &[
-                super::RUNTIME_FILTER_SCAN_UNITS_PRUNED,
-                super::RUNTIME_FILTER_SCAN_UNITS_KEPT,
-                super::RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED,
-                super::RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE,
-            ],
-        );
-        assert_eq!(
-            scans[super::RUNTIME_FILTER_SCAN_UNITS_PRUNED],
-            2,
-            "participant scan counters are summed"
-        );
-        assert_eq!(scans[super::RUNTIME_FILTER_SCAN_UNITS_KEPT], 2);
-        assert_eq!(scans[super::RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED], 2);
-        assert_eq!(
-            scans[super::RUNTIME_FILTER_SCAN_UNITS_NOT_EVALUATED_RESOURCE_UNAVAILABLE],
-            2
-        );
     }
 
     #[test]

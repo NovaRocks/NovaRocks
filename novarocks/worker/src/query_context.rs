@@ -21,13 +21,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use novarocks_execution::exec::node::scan::IncrementalScanRange;
-use novarocks_execution::exec::node::scan::ScanOp;
-use novarocks_execution::exec::operators::scan::dispatch::ScanDispatchState;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
 use novarocks_memory::{AccountHandle, AccountKind, ExternalRef, MemoryAuthority};
-use novarocks_types::{QueryId, SlotId, UniqueId};
+use novarocks_types::{QueryId, UniqueId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum QueryExecutionGeneration {
@@ -42,6 +39,7 @@ fn legacy_native_attempt() -> NonZeroU64 {
     NonZeroU64::new(1).expect("one is a nonzero native attempt")
 }
 
+// Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct QueryExecutionKey {
     query_id: QueryId,
@@ -87,6 +85,14 @@ impl QueryExecutionKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueryContextGeneration {
     Native(NonZeroU64),
+}
+
+impl QueryContextGeneration {
+    const fn execution_key(query_id: QueryId, generation: Self) -> QueryExecutionKey {
+        match generation {
+            Self::Native(attempt) => QueryExecutionKey::native_attempt(query_id, attempt),
+        }
+    }
 }
 
 pub struct QueryCleanupLease {
@@ -224,14 +230,9 @@ impl QueryContext {
         }
     }
 
-    fn matches_execution(&self, key: QueryExecutionKey) -> bool {
-        self.query_id == key.query_id
-            && match (self.execution_generation, key.generation) {
-                (
-                    QueryContextGeneration::Native(current),
-                    QueryExecutionGeneration::Native(requested),
-                ) => current == requested,
-            }
+    /// The execution this context belongs to: its query and attempt.
+    fn execution_key(&self) -> QueryExecutionKey {
+        QueryContextGeneration::execution_key(self.query_id, self.execution_generation)
     }
 
     pub(crate) fn increment_num_fragments(&mut self) {
@@ -286,38 +287,39 @@ impl QueryContext {
     }
 }
 
-struct IncrementalScanNodeHandle {
-    op: Arc<dyn ScanOp>,
-    dispatch: Arc<ScanDispatchState>,
-    update_mu: Mutex<()>,
+/// Contexts are keyed by execution, not by query: an attempt that was
+/// aborted keeps its own context while it drains, so a newer attempt of the
+/// same query is admitted beside it instead of being mistaken for it.
+#[derive(Default)]
+struct QueryContextManagerInner {
+    active: HashMap<QueryExecutionKey, QueryContext>,
+    second_chance: HashMap<QueryExecutionKey, QueryContext>,
+    finst_to_query: HashMap<UniqueId, QueryExecutionKey>,
+    exchange_receiver_ports: HashMap<UniqueId, Arc<dyn ExchangeReceiverPort>>,
 }
 
-impl IncrementalScanNodeHandle {
-    fn new(op: Arc<dyn ScanOp>, dispatch: Arc<ScanDispatchState>) -> Self {
-        Self {
-            op,
-            dispatch,
-            update_mu: Mutex::new(()),
+impl QueryContextManagerInner {
+    fn context(&self, execution: QueryExecutionKey) -> Option<&QueryContext> {
+        self.active
+            .get(&execution)
+            .or_else(|| self.second_chance.get(&execution))
+    }
+
+    fn context_mut(&mut self, execution: QueryExecutionKey) -> Option<&mut QueryContext> {
+        if self.active.contains_key(&execution) {
+            self.active.get_mut(&execution)
+        } else {
+            self.second_chance.get_mut(&execution)
         }
     }
 
-    fn append_scan_ranges(&self, scan_ranges: &[IncrementalScanRange]) -> Result<(), String> {
-        let _guard = self.update_mu.lock().expect("incremental scan handle lock");
-        let morsels = self.op.build_incremental_morsels(scan_ranges)?;
-        self.dispatch
-            .append_morsels(morsels.morsels, morsels.has_more)
+    /// Every context of one query, of whichever attempt.
+    fn query_contexts_mut(&mut self, query_id: QueryId) -> impl Iterator<Item = &mut QueryContext> {
+        self.active
+            .values_mut()
+            .chain(self.second_chance.values_mut())
+            .filter(move |context| context.query_id == query_id)
     }
-}
-
-#[derive(Default)]
-struct QueryContextManagerInner {
-    active: HashMap<QueryId, QueryContext>,
-    second_chance: HashMap<QueryId, QueryContext>,
-    finst_to_query: HashMap<UniqueId, QueryExecutionKey>,
-    exchange_receiver_ports: HashMap<UniqueId, Arc<dyn ExchangeReceiverPort>>,
-    incremental_scan_nodes: HashMap<UniqueId, HashMap<i32, Arc<IncrementalScanNodeHandle>>>,
-    pending_incremental_scan_ranges: HashMap<UniqueId, HashMap<i32, Vec<IncrementalScanRange>>>,
-    incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
 }
 
 pub struct QueryContextManager {
@@ -428,15 +430,16 @@ impl QueryContextManager {
             let expired_second_chance = guard
                 .second_chance
                 .iter()
-                .filter_map(|(qid, ctx)| {
-                    (ctx.has_no_active_instances() && ctx.is_delivery_expired()).then_some(*qid)
+                .filter_map(|(execution, ctx)| {
+                    (ctx.has_no_active_instances() && ctx.is_delivery_expired())
+                        .then_some(*execution)
                 })
                 .collect::<Vec<_>>();
             let expired_active = guard
                 .active
                 .iter()
-                .filter_map(|(qid, ctx)| {
-                    (ctx.has_no_active_instances() && ctx.is_query_expired()).then_some(*qid)
+                .filter_map(|(execution, ctx)| {
+                    (ctx.has_no_active_instances() && ctx.is_query_expired()).then_some(*execution)
                 })
                 .collect::<Vec<_>>();
             let mut expired = Vec::with_capacity(
@@ -444,16 +447,15 @@ impl QueryContextManager {
                     .len()
                     .saturating_add(expired_active.len()),
             );
-            expired.extend(
-                expired_second_chance
-                    .into_iter()
-                    .filter_map(|qid| guard.second_chance.remove(&qid).map(|ctx| (qid, ctx))),
-            );
-            expired.extend(
-                expired_active
-                    .into_iter()
-                    .filter_map(|qid| guard.active.remove(&qid).map(|ctx| (qid, ctx))),
-            );
+            expired.extend(expired_second_chance.into_iter().filter_map(|execution| {
+                guard
+                    .second_chance
+                    .remove(&execution)
+                    .map(|ctx| (execution, ctx))
+            }));
+            expired.extend(expired_active.into_iter().filter_map(|execution| {
+                guard.active.remove(&execution).map(|ctx| (execution, ctx))
+            }));
             expired
         };
         drop(expired);
@@ -465,26 +467,22 @@ impl QueryContextManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn expire_delivery_for_test(&self, query_id: QueryId) {
+    pub(crate) fn expire_delivery_for_test(&self, execution: QueryExecutionKey) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let context = if guard.active.contains_key(&query_id) {
-            guard.active.get_mut(&query_id).expect("checked active")
-        } else {
-            guard
-                .second_chance
-                .get_mut(&query_id)
-                .expect("query context must exist")
-        };
+        let context = guard
+            .context_mut(execution)
+            .expect("query context must exist");
         context.delivery_deadline = Instant::now() - Duration::from_millis(1);
     }
 
     #[cfg(test)]
-    pub(crate) fn fragment_counts_for_test(&self, query_id: QueryId) -> Option<(usize, usize)> {
+    pub(crate) fn fragment_counts_for_test(
+        &self,
+        execution: QueryExecutionKey,
+    ) -> Option<(usize, usize)> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
+            .context(execution)
             .map(|context| (context.num_fragments, context.num_active_fragments))
     }
 
@@ -549,19 +547,17 @@ impl QueryContextManager {
     /// a way to reach capacity without being given it.
     pub fn ensure_query_account(
         &self,
-        query_id: QueryId,
+        execution: QueryExecutionKey,
         authority: &Arc<MemoryAuthority>,
     ) -> Result<AccountHandle, String> {
         let mut inner = self.inner.lock().expect("query context manager lock");
-        let context = if inner.active.contains_key(&query_id) {
-            inner.active.get_mut(&query_id)
-        } else {
-            inner.second_chance.get_mut(&query_id)
-        }
-        .ok_or_else(|| "QueryContext missing for memory account".to_string())?;
+        let context = inner
+            .context_mut(execution)
+            .ok_or_else(|| "QueryContext missing for memory account".to_string())?;
         if let Some(account) = context.mem_account.as_ref() {
             return Ok(account.clone());
         }
+        let query_id = execution.query_id();
         let account = authority
             .create_account(
                 AccountKind::Work,
@@ -614,6 +610,35 @@ impl QueryContextManager {
         )
     }
 
+    /// Retires a preparation-only native context once its Task owner has
+    /// closed admission and all tasks have physically converged. A live
+    /// fragment or another attempt's context remains owned by its own path.
+    pub fn retire_idle_native_execution(&self, execution: QueryExecutionKey) -> bool {
+        if execution.native_attempt_id().is_none() {
+            return false;
+        }
+        let removed = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            let eligible = guard
+                .active
+                .get(&execution)
+                .is_some_and(|context| context.num_active_fragments == 0)
+                && !guard
+                    .finst_to_query
+                    .values()
+                    .any(|current| *current == execution);
+            eligible.then(|| {
+                guard
+                    .active
+                    .remove(&execution)
+                    .expect("checked idle context")
+            })
+        };
+        let retired = removed.is_some();
+        drop(removed);
+        retired
+    }
+
     fn ensure_context(
         &self,
         query_id: QueryId,
@@ -663,19 +688,19 @@ impl QueryContextManager {
         generation: QueryContextGeneration,
         _native_runtime_filter_lifecycle: bool,
     ) -> Result<(), String> {
+        let execution = QueryContextGeneration::execution_key(query_id, generation);
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        if let Some(ctx) = guard.active.get_mut(&query_id) {
+        if let Some(existing) = guard.active.get_mut(&execution) {
             if increment {
-                ctx.increment_num_fragments();
+                existing.increment_num_fragments();
             }
             return Ok(());
         }
-        if guard.second_chance.contains_key(&query_id) {
-            let mut ctx = guard.second_chance.remove(&query_id).expect("checked");
+        if let Some(mut existing) = guard.second_chance.remove(&execution) {
             if increment {
-                ctx.increment_num_fragments();
+                existing.increment_num_fragments();
             }
-            guard.active.insert(query_id, ctx);
+            guard.active.insert(execution, existing);
             return Ok(());
         }
         if return_error_if_not_exist {
@@ -686,28 +711,32 @@ impl QueryContextManager {
         if increment {
             ctx.increment_num_fragments();
         }
-        guard.active.insert(query_id, ctx);
+        guard.active.insert(execution, ctx);
         Ok(())
     }
 
-    pub(crate) fn with_context_mut<T, F>(&self, query_id: QueryId, f: F) -> Result<T, String>
+    pub(crate) fn with_context_mut<T, F>(
+        &self,
+        execution: QueryExecutionKey,
+        f: F,
+    ) -> Result<T, String>
     where
         F: FnOnce(&mut QueryContext) -> Result<T, String>,
     {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         let ctx = guard
             .active
-            .get_mut(&query_id)
+            .get_mut(&execution)
             .ok_or_else(|| "QueryContext not found".to_string())?;
         f(ctx)
     }
 
     pub(crate) fn attach_cleanup_lease(
         &self,
-        query_id: QueryId,
+        execution: QueryExecutionKey,
         lease: QueryCleanupLease,
     ) -> Result<(), String> {
-        self.with_context_mut(query_id, |ctx| {
+        self.with_context_mut(execution, |ctx| {
             ctx.attach_cleanup_lease(lease);
             Ok(())
         })
@@ -720,138 +749,21 @@ impl QueryContextManager {
             .active
             .keys()
             .chain(guard.second_chance.keys())
-            .copied()
+            .map(|execution| execution.query_id())
             .collect::<Vec<_>>();
         query_ids.sort_by_key(|query_id| (query_id.high(), query_id.low()));
         query_ids.dedup();
         query_ids
     }
 
-    /// Returns the query tracker for lifecycle verification and neutral runtime observers.
-    pub fn query_mem_tracker(&self, query_id: QueryId) -> Option<Arc<MemTracker>> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .map(|ctx| ctx.mem_tracker())
-    }
-
+    /// Returns one execution's query tracker, for its admission and for
+    /// lifecycle verification.
     pub fn query_mem_tracker_execution(
         &self,
         execution: QueryExecutionKey,
     ) -> Option<Arc<MemTracker>> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&execution.query_id())
-            .or_else(|| guard.second_chance.get(&execution.query_id()))
-            .filter(|context| context.matches_execution(execution))
-            .map(QueryContext::mem_tracker)
-    }
-
-    pub fn register_incremental_scan_node(
-        &self,
-        finst_id: UniqueId,
-        node_id: i32,
-        op: Arc<dyn ScanOp>,
-        dispatch: Arc<ScanDispatchState>,
-    ) -> Result<(), String> {
-        let handle = {
-            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            if !guard.finst_to_query.contains_key(&finst_id) {
-                return Ok(());
-            }
-            let node_map = guard.incremental_scan_nodes.entry(finst_id).or_default();
-            if let Some(existing) = node_map.get(&node_id) {
-                Arc::clone(existing)
-            } else {
-                let handle = Arc::new(IncrementalScanNodeHandle::new(op, dispatch));
-                node_map.insert(node_id, Arc::clone(&handle));
-                handle
-            }
-        };
-
-        let pending = {
-            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            guard
-                .pending_incremental_scan_ranges
-                .get_mut(&finst_id)
-                .and_then(|node_map| node_map.remove(&node_id))
-        };
-        if let Some(scan_ranges) = pending {
-            handle.append_scan_ranges(&scan_ranges)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn append_incremental_scan_ranges(
-        &self,
-        finst_id: UniqueId,
-        node_id: i32,
-        mut scan_ranges: Vec<IncrementalScanRange>,
-    ) -> Result<(), String> {
-        if scan_ranges.is_empty() {
-            return Ok(());
-        }
-        let handle = {
-            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            if let Some(handle) = guard
-                .incremental_scan_nodes
-                .get(&finst_id)
-                .and_then(|node_map| node_map.get(&node_id))
-            {
-                Some(Arc::clone(handle))
-            } else if guard.finst_to_query.contains_key(&finst_id) {
-                guard
-                    .pending_incremental_scan_ranges
-                    .entry(finst_id)
-                    .or_default()
-                    .entry(node_id)
-                    .or_default()
-                    .append(&mut scan_ranges);
-                None
-            } else {
-                None
-            }
-        };
-        if let Some(handle) = handle {
-            handle.append_scan_ranges(&scan_ranges)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn incremental_change_op_slot(
-        &self,
-        finst_id: UniqueId,
-        node_id: i32,
-    ) -> Result<Option<SlotId>, String> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .incremental_change_op_slots
-            .get(&finst_id)
-            .and_then(|contracts| contracts.get(&node_id))
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "incremental scan range has no registered scan contract for finst_id={finst_id} node_id={node_id}"
-                )
-            })
-    }
-
-    #[cfg(test)]
-    fn pending_incremental_scan_ranges_for_test(
-        &self,
-        finst_id: UniqueId,
-        node_id: i32,
-    ) -> Vec<IncrementalScanRange> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .pending_incremental_scan_ranges
-            .get(&finst_id)
-            .and_then(|nodes| nodes.get(&node_id))
-            .cloned()
-            .unwrap_or_default()
+        guard.context(execution).map(QueryContext::mem_tracker)
     }
 
     pub(crate) fn register_finst(&self, finst_id: UniqueId, query_id: QueryId) {
@@ -885,12 +797,8 @@ impl QueryContextManager {
             return Err("native finst registration requires a native execution key".to_string());
         }
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let context = guard
-            .active
-            .get(&execution.query_id())
-            .ok_or_else(|| "QueryContext not found".to_string())?;
-        if !context.matches_execution(execution) {
-            return Err("native finst registration belongs to another attempt".to_string());
+        if !guard.active.contains_key(&execution) {
+            return Err("QueryContext not found".to_string());
         }
         guard.finst_to_query.insert(finst_id, execution);
         Ok(())
@@ -905,25 +813,6 @@ impl QueryContextManager {
             guard
                 .finst_to_query
                 .insert(finst_id, QueryExecutionKey::native(query_id));
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn register_finsts_with_incremental_contracts<I>(
-        &self,
-        instances: I,
-        query_id: QueryId,
-    ) where
-        I: IntoIterator<Item = (UniqueId, HashMap<i32, Option<SlotId>>)>,
-    {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        for (finst_id, contracts) in instances {
-            guard
-                .finst_to_query
-                .insert(finst_id, QueryExecutionKey::native(query_id));
-            guard
-                .incremental_change_op_slots
-                .insert(finst_id, contracts);
         }
     }
 
@@ -945,9 +834,6 @@ impl QueryContextManager {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.remove(&finst_id);
         guard.exchange_receiver_ports.remove(&finst_id);
-        guard.incremental_scan_nodes.remove(&finst_id);
-        guard.pending_incremental_scan_ranges.remove(&finst_id);
-        guard.incremental_change_op_slots.remove(&finst_id);
     }
 
     /// Undo the registration performed before a native worker reports readiness.
@@ -961,40 +847,7 @@ impl QueryContextManager {
         query_id: QueryId,
         finst_id: UniqueId,
     ) -> bool {
-        let removed = {
-            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            if guard.finst_to_query.get(&finst_id) != Some(&QueryExecutionKey::native(query_id)) {
-                return false;
-            }
-            let Some(context) = guard.active.get(&query_id) else {
-                return false;
-            };
-            if !context.matches_execution(QueryExecutionKey::native(query_id))
-                || context.num_fragments == 0
-                || context.num_active_fragments == 0
-            {
-                return false;
-            }
-
-            guard.finst_to_query.remove(&finst_id);
-            guard.exchange_receiver_ports.remove(&finst_id);
-            let remove_empty_context = {
-                let context = guard
-                    .active
-                    .get_mut(&query_id)
-                    .expect("checked active context");
-                context.rollback_inc_fragments();
-                context.num_fragments == 0 && context.num_active_fragments == 0
-            };
-            remove_empty_context.then(|| {
-                guard
-                    .active
-                    .remove(&query_id)
-                    .expect("checked empty active context")
-            })
-        };
-        drop(removed);
-        true
+        self.rollback_pre_ready(QueryExecutionKey::native(query_id), finst_id, true)
     }
 
     pub fn rollback_pre_ready_native_fragment_execution(
@@ -1002,30 +855,34 @@ impl QueryContextManager {
         execution: QueryExecutionKey,
         finst_id: UniqueId,
     ) -> bool {
-        let query_id = execution.query_id();
+        self.rollback_pre_ready(execution, finst_id, false)
+    }
+
+    fn rollback_pre_ready(
+        &self,
+        execution: QueryExecutionKey,
+        finst_id: UniqueId,
+        release_exchange_port: bool,
+    ) -> bool {
         let removed = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             if guard.finst_to_query.get(&finst_id) != Some(&execution) {
                 return false;
             }
-            let Some(context) = guard.active.get(&query_id) else {
+            let Some(context) = guard.active.get(&execution) else {
                 return false;
             };
-            if !context.matches_execution(execution)
-                || context.num_fragments == 0
-                || context.num_active_fragments == 0
-            {
+            if context.num_fragments == 0 || context.num_active_fragments == 0 {
                 return false;
             }
             guard.finst_to_query.remove(&finst_id);
-            guard.exchange_receiver_ports.remove(&finst_id);
-            guard.incremental_scan_nodes.remove(&finst_id);
-            guard.pending_incremental_scan_ranges.remove(&finst_id);
-            guard.incremental_change_op_slots.remove(&finst_id);
+            if release_exchange_port {
+                guard.exchange_receiver_ports.remove(&finst_id);
+            }
             let remove_empty_context = {
                 let context = guard
                     .active
-                    .get_mut(&query_id)
+                    .get_mut(&execution)
                     .expect("checked active context");
                 context.rollback_inc_fragments();
                 // Completed siblings no longer own this native attempt. The
@@ -1036,7 +893,7 @@ impl QueryContextManager {
             remove_empty_context.then(|| {
                 guard
                     .active
-                    .remove(&query_id)
+                    .remove(&execution)
                     .expect("checked empty active context")
             })
         };
@@ -1051,51 +908,41 @@ impl QueryContextManager {
         }
         guard.finst_to_query.remove(&finst_id);
         guard.exchange_receiver_ports.remove(&finst_id);
-        guard.incremental_scan_nodes.remove(&finst_id);
-        guard.pending_incremental_scan_ranges.remove(&finst_id);
-        guard.incremental_change_op_slots.remove(&finst_id);
     }
 
     pub(crate) fn get_query_timeout_by_finst(&self, finst_id: UniqueId) -> Option<Duration> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
-        let query_id = guard.finst_to_query.get(&finst_id)?.query_id();
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .map(|ctx| ctx.query_expire)
+        let execution = *guard.finst_to_query.get(&finst_id)?;
+        guard.context(execution).map(|ctx| ctx.query_expire)
     }
 
-    /// Read-only cancellation capability for protocol adapters that own scan planning.
-    pub fn is_query_canceled(&self, query_id: QueryId) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_execution_canceled_for_test(&self, execution: QueryExecutionKey) -> bool {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
-            .active
-            .get(&query_id)
-            .map(|ctx| ctx.cancelled_by_fe)
-            .or_else(|| {
-                guard
-                    .second_chance
-                    .get(&query_id)
-                    .map(|ctx| ctx.cancelled_by_fe)
-            })
-            .unwrap_or(false)
+            .context(execution)
+            .is_some_and(|ctx| ctx.cancelled_by_fe)
     }
 
+    /// Marks the cancelled contexts: one execution's, or every attempt of the
+    /// query when none is named.
     fn prepare_runtime_filter_query_cancellation(
         inner: &mut QueryContextManagerInner,
         query_id: QueryId,
         expected_execution: Option<QueryExecutionKey>,
         _cancellation_error: Option<&str>,
     ) -> RuntimeFilterQueryCancellationAction {
-        let context = inner
-            .active
-            .get_mut(&query_id)
-            .or_else(|| inner.second_chance.get_mut(&query_id));
-        if let Some(context) = context
-            && expected_execution.is_none_or(|execution| context.matches_execution(execution))
-        {
-            context.cancelled_by_fe = true;
+        match expected_execution {
+            Some(execution) => {
+                if let Some(context) = inner.context_mut(execution) {
+                    context.cancelled_by_fe = true;
+                }
+            }
+            None => {
+                for context in inner.query_contexts_mut(query_id) {
+                    context.cancelled_by_fe = true;
+                }
+            }
         }
         RuntimeFilterQueryCancellationAction
     }
@@ -1206,10 +1053,11 @@ impl QueryContextManager {
                 .collect::<Vec<_>>();
             let detached_native_context = (execution.native_attempt_id().is_some()
                 && finsts.is_empty()
-                && guard.active.get(&query_id).is_some_and(|context| {
-                    context.matches_execution(execution) && context.num_active_fragments == 0
-                }))
-            .then(|| guard.active.remove(&query_id))
+                && guard
+                    .active
+                    .get(&execution)
+                    .is_some_and(|context| context.num_active_fragments == 0))
+            .then(|| guard.active.remove(&execution))
             .flatten();
             (cancellation, finsts, detached_native_context)
         };
@@ -1328,21 +1176,14 @@ impl QueryContextManager {
         query_id: QueryId,
         execution: Option<QueryExecutionKey>,
     ) {
+        let key = execution.unwrap_or_else(|| QueryExecutionKey::native(query_id));
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        if execution.is_some_and(|execution| {
-            !guard
-                .active
-                .get(&query_id)
-                .is_some_and(|ctx| ctx.matches_execution(execution))
-        }) {
-            return;
-        }
-        let Some(mut ctx) = guard.active.remove(&query_id) else {
+        let Some(mut ctx) = guard.active.remove(&key) else {
             return;
         };
         let no_active_fragments = ctx.count_down_fragments();
         if !no_active_fragments {
-            guard.active.insert(query_id, ctx);
+            guard.active.insert(key, ctx);
             return;
         }
         // Native lifecycle completion has already transferred its terminal fact
@@ -1360,7 +1201,7 @@ impl QueryContextManager {
             return;
         }
         ctx.extend_delivery_lifetime();
-        guard.second_chance.insert(query_id, ctx);
+        guard.second_chance.insert(key, ctx);
     }
 }
 
@@ -1392,6 +1233,101 @@ mod fragment_cancellation_boundary_tests {
     }
 }
 
+#[cfg(test)]
+mod attempt_isolation_tests {
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use novarocks_types::UniqueId;
+
+    use super::{QueryContextManager, QueryExecutionKey, QueryId};
+
+    fn attempt(query_id: QueryId, attempt: u64) -> QueryExecutionKey {
+        QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(attempt).expect("attempt"))
+    }
+
+    fn admit_fragment(manager: &QueryContextManager, execution: QueryExecutionKey) {
+        manager
+            .get_or_register_native_execution(
+                execution,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("admit a fragment");
+    }
+
+    /// An aborted attempt can still be draining a fragment -- a driver inside
+    /// a kernel that cannot be interrupted -- when the frontend replans. The
+    /// replacement attempt must be admitted beside it, with its own tracker,
+    /// instead of being mistaken for the attempt it replaces.
+    #[test]
+    fn a_newer_attempt_is_admitted_beside_an_older_one_still_draining() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = QueryId::new(7_301, 7_302);
+        let (first, second) = (attempt(query_id, 1), attempt(query_id, 2));
+        admit_fragment(&manager, first);
+
+        manager
+            .ensure_native_context_execution(
+                second,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("the replacement attempt is admitted");
+        let first_tracker = manager
+            .query_mem_tracker_execution(first)
+            .expect("the draining attempt keeps its context");
+        let second_tracker = manager
+            .query_mem_tracker_execution(second)
+            .expect("the replacement attempt has its own context");
+        assert!(!Arc::ptr_eq(&first_tracker, &second_tracker));
+        assert_eq!(
+            manager.native_execution_resource_snapshot().active_contexts,
+            2
+        );
+
+        // The old attempt's fragment ends; only its own context goes.
+        manager.finish_fragment_execution(first);
+        assert!(manager.query_mem_tracker_execution(first).is_none());
+        assert!(manager.query_mem_tracker_execution(second).is_some());
+        assert_eq!(
+            manager.native_execution_resource_snapshot().active_contexts,
+            1
+        );
+    }
+
+    #[test]
+    fn cancelling_one_attempt_leaves_the_other_and_a_query_cancel_reaches_both() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = QueryId::new(7_311, 7_312);
+        let (first, second) = (attempt(query_id, 1), attempt(query_id, 2));
+        let (finst_first, finst_second) = (UniqueId::new(7_313, 1), UniqueId::new(7_313, 2));
+        admit_fragment(&manager, first);
+        admit_fragment(&manager, second);
+        manager
+            .register_native_finst_execution(finst_first, first)
+            .expect("register the first attempt's fragment");
+        manager
+            .register_native_finst_execution(finst_second, second)
+            .expect("register the second attempt's fragment");
+
+        assert_eq!(
+            manager.cancel_query_execution(first, "abort the first attempt".to_string()),
+            vec![finst_first]
+        );
+        assert!(manager.is_execution_canceled_for_test(first));
+        assert!(!manager.is_execution_canceled_for_test(second));
+
+        let mut routed = manager.cancel_query(query_id, "kill the query".to_string());
+        routed.sort_by_key(|finst| (finst.high(), finst.low()));
+        assert_eq!(routed, vec![finst_first, finst_second]);
+        assert!(manager.is_execution_canceled_for_test(second));
+    }
+}
+
 static QUERY_CONTEXT_MANAGER: OnceLock<Arc<QueryContextManager>> = OnceLock::new();
 
 pub fn query_context_manager() -> Arc<QueryContextManager> {
@@ -1406,7 +1342,7 @@ mod sender_error_tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    use super::{QueryContextManager, QueryContextManagerInner, QueryId};
+    use super::{QueryContextManager, QueryContextManagerInner, QueryExecutionKey, QueryId};
     use novarocks_types::UniqueId;
 
     fn test_manager() -> QueryContextManager {
@@ -1432,7 +1368,7 @@ mod sender_error_tests {
         finsts.sort_by_key(|id| (id.high(), id.low()));
 
         assert_eq!(finsts, vec![finst_a, finst_b]);
-        assert!(mgr.is_query_canceled(qid));
+        assert!(mgr.is_execution_canceled_for_test(QueryExecutionKey::native(qid)));
     }
 
     #[test]
@@ -1448,11 +1384,16 @@ mod sender_error_tests {
 
 #[cfg(test)]
 mod native_lifecycle_cleanup_tests {
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    use super::{QueryContextManager, QueryContextManagerInner, QueryId};
+    use super::{
+        QueryCleanupLease, QueryContextManager, QueryContextManagerInner, QueryExecutionKey,
+        QueryId,
+    };
     use novarocks_types::UniqueId;
 
     fn test_manager() -> QueryContextManager {
@@ -1487,93 +1428,121 @@ mod native_lifecycle_cleanup_tests {
             mgr.register_finst(finst_id, query_id);
         }
 
+        let execution = QueryExecutionKey::native(query_id);
         assert!(mgr.rollback_pre_ready_native_fragment(query_id, second));
-        assert_eq!(mgr.fragment_counts_for_test(query_id), Some((1, 1)));
+        assert_eq!(mgr.fragment_counts_for_test(execution), Some((1, 1)));
         assert_eq!(mgr.query_id_by_finst(first), Some(query_id));
         assert_eq!(mgr.query_id_by_finst(second), None);
         mgr.inner
             .lock()
             .expect("query ctx manager lock")
             .active
-            .get_mut(&query_id)
+            .get_mut(&execution)
             .expect("remaining fragment query")
             .total_fragments = Some(1);
 
         mgr.finish_fragment(query_id);
         mgr.unregister_finst(first);
-        assert_eq!(mgr.fragment_counts_for_test(query_id), None);
+        assert_eq!(mgr.fragment_counts_for_test(execution), None);
         assert_eq!(mgr.query_id_by_finst(first), None);
     }
-}
 
-#[cfg(test)]
-mod incremental_scan_domain_tests {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
+    #[test]
+    fn terminal_owner_retires_only_its_idle_native_attempt_without_waiting_for_expiry() {
+        let mgr = Arc::new(test_manager());
+        let query_id = QueryId::new(4_141, 4_142);
+        let first = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(1).unwrap());
+        let second = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(2).unwrap());
+        mgr.ensure_native_context_execution(
+            first,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        assert_eq!(mgr.native_execution_resource_snapshot().active_contexts, 1);
+        let weak = Arc::downgrade(&mgr);
+        mgr.attach_cleanup_lease(
+            first,
+            QueryCleanupLease::from_release(move || {
+                assert!(
+                    weak.upgrade().unwrap().inner.try_lock().is_ok(),
+                    "context cleanup must run outside the manager lock"
+                );
+            }),
+        )
+        .unwrap();
 
-    use super::{QueryContextManager, QueryContextManagerInner, QueryId};
-    use novarocks_execution::exec::node::scan::IncrementalScanRange;
-    use novarocks_types::SlotId;
-    use novarocks_types::UniqueId;
-
-    fn manager() -> QueryContextManager {
-        QueryContextManager {
-            inner: Mutex::new(QueryContextManagerInner::default()),
-            stopped: AtomicBool::new(false),
-        }
+        assert!(!mgr.retire_idle_native_execution(second));
+        assert_eq!(mgr.fragment_counts_for_test(first), Some((0, 0)));
+        assert!(mgr.retire_idle_native_execution(first));
+        assert_eq!(mgr.native_execution_resource_snapshot().active_contexts, 0);
+        assert!(!mgr.retire_idle_native_execution(first));
+        mgr.ensure_native_context_execution(
+            second,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        )
+        .expect("the successor attempt may own the released query slot");
     }
 
     #[test]
-    fn pending_incremental_ranges_store_domain_values_and_registered_slot_contract() {
-        let manager = manager();
-        let finst_id = UniqueId::new(91, 92);
-        manager.register_finsts_with_incremental_contracts(
-            [(finst_id, HashMap::from([(41, Some(SlotId::new(7)))]))],
-            QueryId::new(81, 82),
-        );
+    fn terminal_owner_keeps_registered_native_fragments_until_they_stop() {
+        let mgr = test_manager();
+        let query_id = QueryId::new(4_151, 4_152);
+        let execution = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(1).unwrap());
+        let finst = UniqueId::new(4_153, 1);
+        mgr.get_or_register_native_execution(
+            execution,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        mgr.register_native_finst_execution(finst, execution)
+            .unwrap();
 
-        assert_eq!(
-            manager
-                .incremental_change_op_slot(finst_id, 41)
-                .expect("registered contract"),
-            Some(SlotId::new(7))
-        );
-        manager
-            .append_incremental_scan_ranges(
-                finst_id,
-                41,
-                vec![IncrementalScanRange::Empty {
-                    has_more: Some(true),
-                }],
-            )
-            .expect("queue domain range");
-        let pending = manager.pending_incremental_scan_ranges_for_test(finst_id, 41);
-        assert!(matches!(
-            pending.as_slice(),
-            [IncrementalScanRange::Empty {
-                has_more: Some(true)
-            }]
-        ));
+        assert!(!mgr.retire_idle_native_execution(execution));
+        assert_eq!(mgr.fragment_counts_for_test(execution), Some((1, 1)));
+        mgr.unregister_finst_execution(finst, execution);
+        mgr.finish_fragment_execution(execution);
+        assert_eq!(mgr.native_execution_resource_snapshot().active_contexts, 0);
     }
 
     #[test]
-    fn incremental_slot_lookup_rejects_unknown_node_without_pending_side_effect() {
-        let manager = manager();
-        let finst_id = UniqueId::new(93, 94);
-        manager.register_finsts_with_incremental_contracts(
-            [(finst_id, HashMap::from([(41, None)]))],
-            QueryId::new(83, 84),
-        );
+    fn concurrent_native_attempts_retire_only_their_own_context_generation() {
+        let mgr = test_manager();
+        let query_id = QueryId::new(4_161, 4_162);
+        let first = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(1).unwrap());
+        let second = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(2).unwrap());
+        mgr.ensure_native_context_execution(
+            first,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        )
+        .unwrap();
 
-        let error = manager
-            .incremental_change_op_slot(finst_id, 42)
-            .expect_err("unknown node must fail before append");
-        assert!(error.contains("no registered scan contract"), "{error}");
-        assert!(
-            manager
-                .pending_incremental_scan_ranges_for_test(finst_id, 42)
-                .is_empty()
-        );
+        mgr.ensure_native_context_execution(
+            second,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        )
+        .expect("each native attempt owns an independent context");
+        assert_eq!(mgr.native_execution_resource_snapshot().active_contexts, 2);
+        assert_eq!(mgr.fragment_counts_for_test(first), Some((0, 0)));
+        assert_eq!(mgr.fragment_counts_for_test(second), Some((0, 0)));
+        assert!(mgr.query_mem_tracker_execution(first).is_some());
+        assert!(mgr.query_mem_tracker_execution(second).is_some());
+
+        assert!(mgr.retire_idle_native_execution(first));
+        assert_eq!(mgr.native_execution_resource_snapshot().active_contexts, 1);
+        assert!(mgr.query_mem_tracker_execution(first).is_none());
+        assert!(mgr.query_mem_tracker_execution(second).is_some());
+        assert!(!mgr.retire_idle_native_execution(first));
+        assert!(mgr.retire_idle_native_execution(second));
+        assert_eq!(mgr.native_execution_resource_snapshot().active_contexts, 0);
     }
 }

@@ -62,12 +62,14 @@ pub use novarocks_secret::SecretValue;
 pub use object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 pub use object_store_settings::ObjectStoreRetrySettings;
 pub use physical_reader::{
-    MAX_PARQUET_INSPECTION_PHYSICAL_COLUMNS, MAX_PARQUET_INSPECTION_ROW_GROUPS,
-    MAX_PARQUET_INSPECTION_STATISTIC_CELLS, MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES,
-    ParquetColumnStatistics, ParquetMetadataInspection, ParquetPhysicalColumn, ParquetPhysicalType,
-    ParquetRowGroupLayout, ParquetStatisticsSortOrder, ParquetStatisticsValue,
-    inspect_parquet_metadata, inspect_parquet_metadata_from_prepared, open_file_reader,
-    open_file_reader_with_parquet_inspection, parquet_footer_range, plan_parquet_input_ranges,
+    AsyncFileBatchReader, MAX_PARQUET_INSPECTION_PHYSICAL_COLUMNS,
+    MAX_PARQUET_INSPECTION_ROW_GROUPS, MAX_PARQUET_INSPECTION_STATISTIC_CELLS,
+    MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES, ParquetColumnStatistics,
+    ParquetMetadataInspection, ParquetPhysicalColumn, ParquetPhysicalType, ParquetRowGroupLayout,
+    ParquetStatisticsSortOrder, ParquetStatisticsValue, inspect_parquet_metadata,
+    inspect_parquet_metadata_async, inspect_parquet_metadata_from_prepared, open_file_reader,
+    open_file_reader_async, open_file_reader_with_parquet_inspection, parquet_footer_range,
+    plan_parquet_input_ranges,
 };
 pub use predicate::{
     MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection, PhysicalPruning, ScanPredicate,
@@ -75,8 +77,8 @@ pub use predicate::{
 };
 pub use range_operation::FileRangeOperation;
 pub use range_service::{
-    FileRangeClass, FileRangeControl, FileRangeRequest, FileRangeScope, FileRangeService,
-    FileRangeStart,
+    FileRangeBinding, FileRangeClass, FileRangeControl, FileRangeRequest, FileRangeScope,
+    FileRangeService, FileRangeStart, FileStatRequest, FileStatStart,
 };
 pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,

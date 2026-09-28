@@ -32,10 +32,6 @@ use crate::exec::node::ExecNode;
 pub struct RuntimeFilterConsumerBinding {
     pub expr_id: ExprId,
     pub contract: execution::RuntimeFilterConsumerContract,
-    /// Present only for a connector scan whose FE-pinned source boundary is
-    /// eligible for scan-unit pre-reader evaluation. Core carries this sealed
-    /// value but does not interpret scan-domain facts or decisions.
-    pub scan_domain: Option<execution::scan_domain::RuntimeFilterScanDomainBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,16 +64,8 @@ impl RuntimeFilterConsumerNode {
 }
 
 impl RuntimeFilterConsumerBinding {
-    pub const fn new(
-        expr_id: ExprId,
-        contract: execution::RuntimeFilterConsumerContract,
-        scan_domain: Option<execution::scan_domain::RuntimeFilterScanDomainBinding>,
-    ) -> Self {
-        Self {
-            expr_id,
-            contract,
-            scan_domain,
-        }
+    pub const fn new(expr_id: ExprId, contract: execution::RuntimeFilterConsumerContract) -> Self {
+        Self { expr_id, contract }
     }
 
     pub const fn contract(&self) -> &execution::RuntimeFilterConsumerContract {
@@ -130,7 +118,7 @@ mod tests {
             ),
         )
         .expect("membership consumer contract");
-        let binding = RuntimeFilterConsumerBinding::new(expr_id, contract, None);
+        let binding = RuntimeFilterConsumerBinding::new(expr_id, contract);
 
         assert_eq!(binding.expr_id, expr_id);
         assert_eq!(binding.contract().binding_id().get(), 1);

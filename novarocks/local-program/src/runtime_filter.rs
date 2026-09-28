@@ -96,13 +96,6 @@ pub enum FilterConsumerActivation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FilterScanDomainTarget {
-    pub field_ordinal: u32,
-    pub data_type: DataType,
-    pub nullable: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StaticFilterProducer {
     binding_id: u32,
     channel_id: u32,
@@ -118,7 +111,6 @@ pub struct StaticFilterConsumer {
     activation: FilterConsumerActivation,
     contract: StaticFilterContract,
     reduction: FilterReduction,
-    scan_domain: Option<FilterScanDomainTarget>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,7 +203,6 @@ impl StaticFilterConsumer {
         activation: FilterConsumerActivation,
         contract: StaticFilterContract,
         reduction: FilterReduction,
-        scan_domain: Option<FilterScanDomainTarget>,
     ) -> Result<Self, StaticFilterError> {
         contract.validate()?;
         if matches!(activation, FilterConsumerActivation::BlockingSnapshot)
@@ -238,7 +229,6 @@ impl StaticFilterConsumer {
             activation,
             contract,
             reduction,
-            scan_domain,
         })
     }
 
@@ -260,10 +250,6 @@ impl StaticFilterConsumer {
 
     pub const fn reduction(&self) -> FilterReduction {
         self.reduction
-    }
-
-    pub const fn scan_domain(&self) -> Option<&FilterScanDomainTarget> {
-        self.scan_domain.as_ref()
     }
 }
 

@@ -41,6 +41,8 @@ use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -1035,6 +1037,9 @@ trait MergeOwnership: Send + 'static {
     ) -> crate::Result<(T, Self::Hold)>;
     fn own_output(&self, batch: RecordBatch) -> crate::Result<(RecordBatch, Self::OutputHold)>;
     fn handoff(&self, hold: Self::OutputHold) -> crate::Result<Self::OutputHold>;
+    /// Awaited once per source batch the merge takes or skips; see
+    /// [`ReadExecutionResources::cooperate`].
+    fn cooperate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 struct PlainMergeOwnership {
@@ -1066,6 +1071,10 @@ impl MergeOwnership for PlainMergeOwnership {
 
     fn handoff(&self, hold: Self::OutputHold) -> crate::Result<Self::OutputHold> {
         Ok(hold)
+    }
+
+    fn cooperate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
     }
 }
 
@@ -1115,6 +1124,10 @@ impl MergeOwnership for ExecutionMergeOwnership {
             }),
             ExecutionOutputHold::HostAccepted => Ok(ExecutionOutputHold::HostAccepted),
         }
+    }
+
+    fn cooperate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.resources.cooperate()
     }
 }
 
@@ -1308,6 +1321,7 @@ fn sort_merge_stream<O: MergeOwnership>(
             let mut found = false;
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result?;
+                owner.cooperate().await;
                 if batch.num_rows() > 0 {
                     cursors.push(Some(make_cursor(
                         batch,
@@ -1421,6 +1435,11 @@ fn sort_merge_stream<O: MergeOwnership>(
                         cursors[current_winner] = None;
                         while let Some(batch_result) = streams[current_winner].next().await {
                             let batch = batch_result?;
+                            // Each source batch, empty or not, is one unit of
+                            // the host's turn: a run of same-key, all-delete
+                            // or empty batches otherwise produces no output
+                            // for as long as it lasts.
+                            owner.cooperate().await;
                             if batch.num_rows() > 0 {
                                 let mut cursor = make_cursor(
                                     batch,
@@ -1661,6 +1680,11 @@ mod tests {
         checkpoints: AtomicUsize,
         cancel_after: AtomicUsize,
         limit: AtomicU64,
+        /// When set, cooperation spends `turn_units` like a host turn.
+        turns: std::sync::atomic::AtomicBool,
+        turn_units: AtomicU64,
+        cooperations: AtomicUsize,
+        yields: AtomicUsize,
     }
 
     #[derive(Debug)]
@@ -1719,6 +1743,43 @@ mod tests {
             Ok(Box::new(ObservedOutputReservation {
                 state: self.state.clone(),
                 bytes,
+            }))
+        }
+
+        /// Spends one unit of the current test turn. When the turn is spent
+        /// it yields once and, as a host budget does, charges the turn it
+        /// resumes in.
+        fn cooperate(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.state.cooperations.fetch_add(1, AtomicOrdering::SeqCst);
+            let state = self.state.clone();
+            let mut yielded = false;
+            Box::pin(futures::future::poll_fn(move |cx| {
+                if !state.turns.load(AtomicOrdering::SeqCst) {
+                    return std::task::Poll::Ready(());
+                }
+                if yielded {
+                    let _ = state.turn_units.fetch_update(
+                        AtomicOrdering::SeqCst,
+                        AtomicOrdering::SeqCst,
+                        |units| Some(units.saturating_sub(1)),
+                    );
+                    return std::task::Poll::Ready(());
+                }
+                if state
+                    .turn_units
+                    .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |units| {
+                        units.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return std::task::Poll::Ready(());
+                }
+                yielded = true;
+                state.yields.fetch_add(1, AtomicOrdering::SeqCst);
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
             }))
         }
     }
@@ -2135,6 +2196,171 @@ mod tests {
 
         assert!(error.to_string().contains("test read cancelled"));
         assert_eq!(state.retained.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// Drives `stream` with one unit of budget per turn, starting a new turn
+    /// whenever it yields; its inputs are all ready, so every yield is a
+    /// cooperation point. Returns the output and the number of yields.
+    async fn drive_in_turns(
+        state: &ObservedReadState,
+        mut stream: ArrowRecordBatchStream,
+    ) -> (Vec<RecordBatch>, usize) {
+        state.turns.store(true, AtomicOrdering::SeqCst);
+        state.turn_units.store(1, AtomicOrdering::SeqCst);
+        let mut output = Vec::new();
+        let mut yields = 0;
+        loop {
+            match futures::poll!(stream.next()) {
+                std::task::Poll::Ready(Some(batch)) => output.push(batch.unwrap()),
+                std::task::Poll::Ready(None) => return (output, yields),
+                std::task::Poll::Pending => {
+                    yields += 1;
+                    assert!(yields < 10_000, "the merge never finished");
+                    state.turn_units.store(1, AtomicOrdering::SeqCst);
+                }
+            }
+        }
+    }
+
+    fn deduplicate(streams: Vec<ArrowRecordBatchStream>) -> SortMergeReaderBuilder {
+        SortMergeReaderBuilder::new(
+            streams,
+            make_schema(),
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(DeduplicateMergeFunction),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_long_all_delete_run_across_ready_batches_yields_its_turn() {
+        let schema = make_schema();
+        // Eight ready batches whose every key ends deleted, then one live key.
+        let mut batches = (0..8)
+            .map(|batch| {
+                let keys = (batch * 16..batch * 16 + 16).collect::<Vec<i32>>();
+                make_batch_with_kind(
+                    &schema,
+                    keys,
+                    vec![1; 16],
+                    vec![RowKind::Delete.to_value(); 16],
+                    vec![Some("deleted"); 16],
+                )
+            })
+            .collect::<Vec<_>>();
+        batches.push(make_batch(
+            &schema,
+            vec![1_000],
+            vec![1],
+            vec![Some("live")],
+        ));
+        let expected = deduplicate(vec![stream_from_batches(batches.clone())])
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(expected.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        let (state, control) = observed_control(0);
+        let merge = deduplicate(vec![stream_from_batches(batches)])
+            .build_execution(control)
+            .unwrap();
+        let (output, yields) = drive_in_turns(&state, merge).await;
+        assert_eq!(output, expected, "yielding does not change the merge");
+        // Nine source batches on one unit a turn: every batch after the first
+        // waits for a turn of its own.
+        assert_eq!(state.cooperations.load(AtomicOrdering::SeqCst), 9);
+        assert_eq!(yields, 8);
+        assert_eq!(state.yields.load(AtomicOrdering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn a_long_same_key_history_across_ready_batches_yields_its_turn() {
+        let schema = make_schema();
+        // Eight ready batches of versions of one key; only the last wins.
+        let batches = (0..8)
+            .map(|batch| {
+                let base = i64::from(batch) * 16;
+                make_batch(
+                    &schema,
+                    vec![7; 16],
+                    (base..base + 16).collect(),
+                    vec![Some("version"); 16],
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = deduplicate(vec![stream_from_batches(batches.clone())])
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(expected.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        let (state, control) = observed_control(0);
+        let merge = deduplicate(vec![stream_from_batches(batches)])
+            .build_execution(control)
+            .unwrap();
+        let (output, yields) = drive_in_turns(&state, merge).await;
+        assert_eq!(output, expected, "yielding does not change the winner");
+        assert_eq!(state.cooperations.load(AtomicOrdering::SeqCst), 8);
+        assert_eq!(yields, 7);
+    }
+
+    #[tokio::test]
+    async fn a_run_of_empty_ready_batches_yields_its_turn() {
+        let schema = make_schema();
+        let empty = || make_batch(&schema, vec![], vec![], vec![]);
+        let mut batches = (0..10).map(|_| empty()).collect::<Vec<_>>();
+        batches.push(make_batch(
+            &schema,
+            vec![1, 2],
+            vec![1, 1],
+            vec![Some("a"), Some("b")],
+        ));
+        batches.extend((0..10).map(|_| empty()));
+        let expected = deduplicate(vec![stream_from_batches(batches.clone())])
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let (state, control) = observed_control(0);
+        let merge = deduplicate(vec![stream_from_batches(batches)])
+            .build_execution(control)
+            .unwrap();
+        let (output, yields) = drive_in_turns(&state, merge).await;
+        assert_eq!(output, expected);
+        assert_eq!(state.cooperations.load(AtomicOrdering::SeqCst), 21);
+        assert_eq!(
+            yields, 20,
+            "each empty batch past the first unit is its own turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_without_turns_cooperates_without_yielding() {
+        let schema = make_schema();
+        let batches = vec![
+            make_batch(&schema, vec![1], vec![1], vec![Some("a")]),
+            make_batch(&schema, vec![1], vec![2], vec![Some("b")]),
+        ];
+        let (state, control) = observed_control(0);
+        let output = deduplicate(vec![stream_from_batches(batches)])
+            .build_execution(control)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(state.cooperations.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(state.yields.load(AtomicOrdering::SeqCst), 0);
     }
 
     struct MaterializingMergeFunction;

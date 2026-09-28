@@ -66,7 +66,12 @@ impl ReadOnlyFileIO for Backend {
     async fn exists(&self, _path: &str) -> paimon::Result<bool> {
         Ok(true)
     }
-    async fn read(&self, _path: &str, range: Range<u64>) -> paimon::Result<Bytes> {
+    async fn read(
+        &self,
+        _path: &str,
+        range: Range<u64>,
+        _known_size: Option<u64>,
+    ) -> paimon::Result<Bytes> {
         self.reads.fetch_add(1, Ordering::AcqRel);
         Ok(self.bytes.slice(range.start as usize..range.end as usize))
     }

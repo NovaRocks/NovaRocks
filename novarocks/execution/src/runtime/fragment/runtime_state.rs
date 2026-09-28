@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use crate::exec::spill::QuerySpillManager;
 use crate::runtime::execution_runtime::ExecutionRuntime;
-use crate::runtime::fragment::io::ScanRegistrationPort;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_options::QueryOptions;
@@ -36,7 +35,6 @@ pub(crate) struct RuntimeStateInputs {
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
     pub(crate) runtime_filter_session: Option<RuntimeFilterSessionRef>,
     pub(crate) execution_runtime: Option<Arc<ExecutionRuntime>>,
-    pub(crate) scan_registration: Option<Arc<dyn ScanRegistrationPort>>,
 }
 
 pub(crate) fn apply_query_option_overrides(
@@ -93,7 +91,6 @@ pub(crate) fn build_runtime_state(
             spill_config,
             spill_manager,
             inputs.execution_runtime,
-            inputs.scan_registration,
         )
         .with_runtime_filter_session(inputs.runtime_filter_session),
     ))

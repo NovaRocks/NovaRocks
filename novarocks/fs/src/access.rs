@@ -995,47 +995,109 @@ impl ObjectStoreProviderPool {
             &ObjectStoreCredentialSource,
         ) -> FileResult<Operator>,
     {
-        let endpoint = ObjectStoreEndpointIdentity::try_new(bucket, endpoint_config)?;
-        let key = ObjectStoreProviderKey {
-            endpoint: endpoint.clone(),
-            access_domain,
-            credential_identity: credential_identity.clone(),
-        };
-        let now = Instant::now();
-        let acquisition = {
-            let mut inner = self.state.lock_inner()?;
-            inner.expire_due(now);
-            if let Some(operator) = inner.touch(&key, now, self.state.options.idle_ttl) {
-                inner.cache_hits = inner.cache_hits.saturating_add(1);
-                self.state.wake.notify_one();
-                return Ok(operator);
-            }
-            inner.cache_misses = inner.cache_misses.saturating_add(1);
-            if let Some(reservation) = inner.inflight.get(&key).cloned() {
-                inner.singleflight_waits = inner.singleflight_waits.saturating_add(1);
-                ProviderAcquisition::Wait(reservation)
-            } else {
-                if inner.inflight.len() >= self.state.options.capacity {
-                    return Err(FileError::new(
-                        FileErrorKind::ResourceExhausted,
-                        "object-store provider construction reservations are full",
-                    ));
-                }
-                let reservation = Arc::new(ObjectStoreBuildReservation::default());
-                inner.inflight.insert(key.clone(), Arc::clone(&reservation));
-                ProviderAcquisition::Build(reservation)
-            }
-        };
-
-        let reservation = match acquisition {
-            ProviderAcquisition::Build(reservation) => reservation,
+        let (endpoint, key) =
+            provider_key(access_domain, bucket, endpoint_config, credential_identity)?;
+        match self.claim(key)? {
+            ProviderAcquisition::Ready(operator) => Ok(operator),
+            ProviderAcquisition::Build(claim) => claim.build(&endpoint, credentials, builder),
             ProviderAcquisition::Wait(reservation) => {
-                return reservation.wait(OBJECT_STORE_PROVIDER_BUILD_WAIT_TIMEOUT);
+                reservation.wait(OBJECT_STORE_PROVIDER_BUILD_WAIT_TIMEOUT)
             }
-        };
+        }
+    }
 
-        let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            builder(&endpoint, credentials)
+    /// Like [`Self::acquire`], for a caller that must not block its thread.
+    ///
+    /// A caller that finds another caller constructing the same operator
+    /// awaits that construction under its own `cancellation` and deadline;
+    /// giving up ends only its own wait. The construction itself never yields:
+    /// the claimer builds the client inline, so dropping the claimer's future
+    /// can never leave a construction without an owner.
+    async fn acquire_async<F>(
+        &self,
+        endpoint: ObjectStoreEndpointIdentity,
+        key: ObjectStoreProviderKey,
+        credentials: &ObjectStoreCredentialSource,
+        cancellation: &FileCancellation,
+        builder: F,
+    ) -> FileResult<Operator>
+    where
+        F: FnOnce(
+            &ObjectStoreEndpointIdentity,
+            &ObjectStoreCredentialSource,
+        ) -> FileResult<Operator>,
+    {
+        cancellation.check()?;
+        match self.claim(key)? {
+            ProviderAcquisition::Ready(operator) => Ok(operator),
+            ProviderAcquisition::Build(claim) => claim.build(&endpoint, credentials, builder),
+            ProviderAcquisition::Wait(reservation) => reservation.wait_async(cancellation).await,
+        }
+    }
+
+    /// Serves `key` from the pool, joins the construction already in flight
+    /// for it, or claims its construction.
+    fn claim(&self, key: ObjectStoreProviderKey) -> FileResult<ProviderAcquisition> {
+        let now = Instant::now();
+        let mut inner = self.state.lock_inner()?;
+        inner.expire_due(now);
+        if let Some(operator) = inner.touch(&key, now, self.state.options.idle_ttl) {
+            inner.cache_hits = inner.cache_hits.saturating_add(1);
+            self.state.wake.notify_one();
+            return Ok(ProviderAcquisition::Ready(operator));
+        }
+        inner.cache_misses = inner.cache_misses.saturating_add(1);
+        if let Some(reservation) = inner.inflight.get(&key).cloned() {
+            inner.singleflight_waits = inner.singleflight_waits.saturating_add(1);
+            return Ok(ProviderAcquisition::Wait(reservation));
+        }
+        if inner.inflight.len() >= self.state.options.capacity {
+            return Err(FileError::new(
+                FileErrorKind::ResourceExhausted,
+                "object-store provider construction reservations are full",
+            ));
+        }
+        let reservation = Arc::new(ObjectStoreBuildReservation::default());
+        inner.inflight.insert(key.clone(), Arc::clone(&reservation));
+        drop(inner);
+        Ok(ProviderAcquisition::Build(Box::new(BuildClaim {
+            state: Arc::clone(&self.state),
+            key,
+            reservation,
+            settled: false,
+        })))
+    }
+}
+
+/// The one caller that constructs the operator for a key.
+///
+/// However the construction ends -- published, failed, panicked, or abandoned
+/// by an early return -- the claim takes the key out of the in-flight set and
+/// completes its reservation, so no key stays in construction and every
+/// waiter wakes with an outcome. Settling tolerates a poisoned pool lock for
+/// the same reason.
+struct BuildClaim {
+    state: Arc<ObjectStoreProviderPoolState>,
+    key: ObjectStoreProviderKey,
+    reservation: Arc<ObjectStoreBuildReservation>,
+    settled: bool,
+}
+
+impl BuildClaim {
+    fn build<F>(
+        self,
+        endpoint: &ObjectStoreEndpointIdentity,
+        credentials: &ObjectStoreCredentialSource,
+        builder: F,
+    ) -> FileResult<Operator>
+    where
+        F: FnOnce(
+            &ObjectStoreEndpointIdentity,
+            &ObjectStoreCredentialSource,
+        ) -> FileResult<Operator>,
+    {
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            builder(endpoint, credentials)
         }))
         .unwrap_or_else(|_| {
             Err(FileError::new(
@@ -1043,17 +1105,22 @@ impl ObjectStoreProviderPool {
                 "object-store provider construction panicked",
             ))
         });
+        self.settle(built)
+    }
+
+    fn settle(mut self, built: FileResult<Operator>) -> FileResult<Operator> {
+        self.settled = true;
         let result = {
-            let mut inner = self.state.lock_inner()?;
-            inner.inflight.remove(&key);
-            match build_result {
+            let mut inner = self.state.lock_inner_for_settlement();
+            inner.remove_inflight(&self.key, &self.reservation);
+            match built {
                 Ok(operator) => {
                     if inner.entries.len() >= self.state.options.capacity {
                         inner.evict_oldest();
                     }
                     inner.operator_constructions = inner.operator_constructions.saturating_add(1);
                     inner.insert(
-                        key,
+                        self.key.clone(),
                         operator.clone(),
                         Instant::now(),
                         self.state.options.idle_ttl,
@@ -1067,10 +1134,45 @@ impl ObjectStoreProviderPool {
                 }
             }
         };
-        reservation.complete(&result);
+        self.reservation.complete(&result);
         self.state.wake.notify_all();
         result
     }
+}
+
+impl Drop for BuildClaim {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        {
+            let mut inner = self.state.lock_inner_for_settlement();
+            inner.remove_inflight(&self.key, &self.reservation);
+            inner.operator_construction_failures =
+                inner.operator_construction_failures.saturating_add(1);
+        }
+        self.reservation.complete(&Err(FileError::new(
+            FileErrorKind::Internal,
+            "object-store provider construction was abandoned before it finished",
+        )));
+        self.state.wake.notify_all();
+    }
+}
+
+/// The endpoint an operator is built for and the pool key that names it.
+fn provider_key(
+    access_domain: StorageAccessDomainId,
+    bucket: &str,
+    endpoint_config: &ObjectStoreEndpointConfig,
+    credential_identity: &ObjectStoreCredentialProviderIdentity,
+) -> FileResult<(ObjectStoreEndpointIdentity, ObjectStoreProviderKey)> {
+    let endpoint = ObjectStoreEndpointIdentity::try_new(bucket, endpoint_config)?;
+    let key = ObjectStoreProviderKey {
+        endpoint: endpoint.clone(),
+        access_domain,
+        credential_identity: credential_identity.clone(),
+    };
+    Ok((endpoint, key))
 }
 
 impl Drop for ObjectStoreProviderPool {
@@ -1104,6 +1206,15 @@ impl ObjectStoreProviderPoolState {
         self.inner
             .lock()
             .map_err(|_| FileError::new(FileErrorKind::Internal, "lock object-store provider pool"))
+    }
+
+    /// The pool lock for settling a construction, which must happen even
+    /// after an unrelated panic poisoned it: a construction that cannot
+    /// settle would leave its key in construction forever.
+    fn lock_inner_for_settlement(&self) -> std::sync::MutexGuard<'_, ObjectStoreProviderPoolInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -1265,6 +1376,22 @@ impl ObjectStoreProviderPoolInner {
         }
     }
 
+    /// Takes `key` out of construction, if `reservation` is still the one in
+    /// flight for it.
+    fn remove_inflight(
+        &mut self,
+        key: &ObjectStoreProviderKey,
+        reservation: &Arc<ObjectStoreBuildReservation>,
+    ) {
+        if self
+            .inflight
+            .get(key)
+            .is_some_and(|inflight| Arc::ptr_eq(inflight, reservation))
+        {
+            self.inflight.remove(key);
+        }
+    }
+
     fn next_expiration(&self) -> Option<Instant> {
         self.expiration_index
             .first_key_value()
@@ -1294,14 +1421,19 @@ impl ObjectStoreProviderPoolInner {
 }
 
 enum ProviderAcquisition {
-    Build(Arc<ObjectStoreBuildReservation>),
+    Ready(Operator),
+    Build(Box<BuildClaim>),
     Wait(Arc<ObjectStoreBuildReservation>),
 }
 
+/// One construction in flight, shared by the caller that builds it and every
+/// caller that waits for it. Waiters either block, bounded by a fixed timeout
+/// on the coordinator's synchronous path, or await it under their own stop.
 #[derive(Default)]
 struct ObjectStoreBuildReservation {
     state: Mutex<ObjectStoreBuildReservationState>,
     ready: Condvar,
+    completed: tokio::sync::Notify,
 }
 
 #[derive(Clone, Default)]
@@ -1318,47 +1450,74 @@ struct ObjectStoreBuildFailure {
 
 impl ObjectStoreBuildReservation {
     fn wait(&self, timeout: Duration) -> FileResult<Operator> {
-        let state = self.state.lock().map_err(|_| {
-            FileError::new(
-                FileErrorKind::Internal,
-                "lock object-store provider construction reservation",
-            )
-        })?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (state, wait) = self
             .ready
             .wait_timeout_while(state, timeout, |state| {
                 matches!(state, ObjectStoreBuildReservationState::Building)
             })
-            .map_err(|_| {
-                FileError::new(
-                    FileErrorKind::Internal,
-                    "wait for object-store provider construction",
-                )
-            })?;
-        match &*state {
-            ObjectStoreBuildReservationState::Complete(Ok(operator)) => Ok(operator.clone()),
-            ObjectStoreBuildReservationState::Complete(Err(error)) => Err(FileError::new(
-                error.kind,
-                "object-store provider construction failed",
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match Self::outcome(&state) {
+            Some(outcome) => outcome,
+            None if wait.timed_out() => Err(FileError::deadline(
+                "timed out waiting for object-store provider construction",
             )),
-            ObjectStoreBuildReservationState::Building if wait.timed_out() => Err(
-                FileError::deadline("timed out waiting for object-store provider construction"),
-            ),
-            ObjectStoreBuildReservationState::Building => Err(FileError::new(
+            None => Err(FileError::new(
                 FileErrorKind::Internal,
                 "object-store provider construction waiter woke without completion",
             )),
         }
     }
 
+    /// Awaits the construction under the waiter's own cancellation and
+    /// deadline. Registered before every check, so a completion between the
+    /// check and the wait is never missed.
+    async fn wait_async(&self, cancellation: &FileCancellation) -> FileResult<Operator> {
+        loop {
+            let completed = self.completed.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
+            let outcome = Self::outcome(
+                &self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if let Some(outcome) = outcome {
+                return outcome;
+            }
+            tokio::select! {
+                _ = &mut completed => {}
+                error = cancellation.ended() => return Err(error),
+            }
+        }
+    }
+
+    fn outcome(state: &ObjectStoreBuildReservationState) -> Option<FileResult<Operator>> {
+        match state {
+            ObjectStoreBuildReservationState::Building => None,
+            ObjectStoreBuildReservationState::Complete(Ok(operator)) => Some(Ok(operator.clone())),
+            ObjectStoreBuildReservationState::Complete(Err(error)) => Some(Err(FileError::new(
+                error.kind,
+                "object-store provider construction failed",
+            ))),
+        }
+    }
+
     fn complete(&self, result: &FileResult<Operator>) {
-        if let Ok(mut state) = self.state.lock() {
-            *state = ObjectStoreBuildReservationState::Complete(match result {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            ObjectStoreBuildReservationState::Complete(match result {
                 Ok(operator) => Ok(operator.clone()),
                 Err(error) => Err(ObjectStoreBuildFailure { kind: error.kind() }),
             });
-        }
         self.ready.notify_all();
+        self.completed.notify_waiters();
     }
 }
 
@@ -1503,6 +1662,81 @@ impl FsAccessResolver {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let (scheme, locations) = self.parse_one_scheme(locations)?;
+        match scheme {
+            FsScheme::Local => resolve_local_locations(access_domain, locations),
+            FsScheme::ObjectStore => {
+                resolve_object_store_locations(access_domain, locations, object_store_access)
+            }
+            FsScheme::Hdfs => resolve_hdfs_locations(access_domain, locations),
+        }
+    }
+
+    /// Resolves like [`Self::resolve_location`] for a caller that must not
+    /// block its thread; see [`Self::resolve_locations_async`].
+    pub async fn resolve_location_async(
+        &self,
+        access_domain: StorageAccessDomainId,
+        location: impl AsRef<str>,
+        object_store_access: Option<ObjectStoreAccessContext<'_>>,
+        cancellation: &FileCancellation,
+    ) -> FileResult<FsAccessHandle> {
+        self.resolve_locations_async(
+            access_domain,
+            std::iter::once(location),
+            object_store_access,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Resolves like [`Self::resolve_locations`] for a caller that must not
+    /// block its thread. Resolution only waits when another caller is
+    /// constructing the same object-store client; this caller then awaits that
+    /// construction under `cancellation` and its deadline instead of parking.
+    pub async fn resolve_locations_async<I, S>(
+        &self,
+        access_domain: StorageAccessDomainId,
+        locations: I,
+        object_store_access: Option<ObjectStoreAccessContext<'_>>,
+        cancellation: &FileCancellation,
+    ) -> FileResult<FsAccessHandle>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let (scheme, locations) = self.parse_one_scheme(locations)?;
+        match scheme {
+            FsScheme::Local => resolve_local_locations(access_domain, locations),
+            FsScheme::ObjectStore => {
+                let (access, bucket) = object_store_target(&locations, object_store_access)?;
+                let (endpoint, key) = provider_key(
+                    access_domain,
+                    &bucket,
+                    &access.endpoint_config,
+                    &access.credential_identity,
+                )?;
+                let operator = access
+                    .provider_pool
+                    .acquire_async(
+                        endpoint,
+                        key,
+                        &access.credentials,
+                        cancellation,
+                        build_object_store_operator,
+                    )
+                    .await?;
+                object_store_handle(access_domain, locations, bucket, operator)
+            }
+            FsScheme::Hdfs => resolve_hdfs_locations(access_domain, locations),
+        }
+    }
+
+    fn parse_one_scheme<I, S>(&self, locations: I) -> FileResult<(FsScheme, Vec<FsLocation>)>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let locations = self.parse_locations(locations)?;
         let first = locations
             .first()
@@ -1513,14 +1747,7 @@ impl FsAccessResolver {
                 "mixed fs location schemes are not allowed",
             ));
         }
-
-        match scheme {
-            FsScheme::Local => resolve_local_locations(access_domain, locations),
-            FsScheme::ObjectStore => {
-                resolve_object_store_locations(access_domain, locations, object_store_access)
-            }
-            FsScheme::Hdfs => resolve_hdfs_locations(access_domain, locations),
-        }
+        Ok((scheme, locations))
     }
 }
 
@@ -1636,6 +1863,23 @@ fn resolve_object_store_locations(
     locations: Vec<FsLocation>,
     object_store_access: Option<ObjectStoreAccessContext<'_>>,
 ) -> FileResult<FsAccessHandle> {
+    let (object_store_access, bucket) = object_store_target(&locations, object_store_access)?;
+    let operator = object_store_access.provider_pool.acquire(
+        access_domain,
+        &bucket,
+        &object_store_access.endpoint_config,
+        &object_store_access.credential_identity,
+        &object_store_access.credentials,
+        build_object_store_operator,
+    )?;
+    object_store_handle(access_domain, locations, bucket, operator)
+}
+
+/// The access context and the one bucket every object-store location names.
+fn object_store_target<'a>(
+    locations: &[FsLocation],
+    object_store_access: Option<ObjectStoreAccessContext<'a>>,
+) -> FileResult<(ObjectStoreAccessContext<'a>, String)> {
     let object_store_access = object_store_access.ok_or_else(|| {
         FileError::invalid("object-store location requires explicit access context")
     })?;
@@ -1652,14 +1896,15 @@ fn resolve_object_store_locations(
             "mixed object-store buckets are not allowed",
         ));
     }
-    let operator = object_store_access.provider_pool.acquire(
-        access_domain,
-        &bucket,
-        &object_store_access.endpoint_config,
-        &object_store_access.credential_identity,
-        &object_store_access.credentials,
-        build_object_store_operator,
-    )?;
+    Ok((object_store_access, bucket))
+}
+
+fn object_store_handle(
+    access_domain: StorageAccessDomainId,
+    locations: Vec<FsLocation>,
+    bucket: String,
+    operator: Operator,
+) -> FileResult<FsAccessHandle> {
     let paths = locations
         .into_iter()
         .map(|location| {
@@ -2747,6 +2992,278 @@ mod tests {
         assert_eq!(metrics.operator_constructions, 1);
         assert_eq!(metrics.singleflight_waits, 1);
         assert_eq!(metrics.resident_entries, 1);
+    }
+
+    /// Polls `condition` until it holds, failing the test after five seconds.
+    async fn eventually(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("condition within five seconds");
+    }
+
+    fn waiting_key() -> (ObjectStoreEndpointIdentity, ObjectStoreProviderKey) {
+        provider_key(
+            domain(1),
+            "warehouse",
+            &endpoint_config("http://localhost:9000"),
+            &credential_identity("blue"),
+        )
+        .expect("provider key")
+    }
+
+    fn spawn_async_waiter(
+        pool: &Arc<ObjectStoreProviderPool>,
+        cancellation: FileCancellation,
+    ) -> tokio::task::JoinHandle<FileResult<Operator>> {
+        let pool = Arc::clone(pool);
+        let (endpoint, key) = waiting_key();
+        tokio::spawn(async move {
+            pool.acquire_async(
+                endpoint,
+                key,
+                &static_source("one"),
+                &cancellation,
+                |_, _| -> FileResult<Operator> { panic!("a waiter never constructs") },
+            )
+            .await
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_async_waiter_gives_up_alone_while_another_receives_the_shared_build() {
+        let pool =
+            Arc::new(ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(60)).unwrap());
+        let (entered, building) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let constructions = Arc::new(AtomicUsize::new(0));
+        // The claimer constructs on its own thread and holds it open.
+        let claimer = {
+            let pool = Arc::clone(&pool);
+            let constructions = Arc::clone(&constructions);
+            std::thread::spawn(move || {
+                pool.acquire(
+                    domain(1),
+                    "warehouse",
+                    &endpoint_config("http://localhost:9000"),
+                    &credential_identity("blue"),
+                    &static_source("one"),
+                    |_, _| {
+                        constructions.fetch_add(1, Ordering::SeqCst);
+                        entered.send(()).expect("entered");
+                        released.recv().expect("released");
+                        memory_operator()
+                    },
+                )
+            })
+        };
+        building
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the claimer is constructing");
+
+        let stopped = FileCancellation::new();
+        let gives_up = spawn_async_waiter(&pool, stopped.clone());
+        let times_out = spawn_async_waiter(
+            &pool,
+            FileCancellation::new().with_deadline(Some(Instant::now() + Duration::from_millis(50))),
+        );
+        let receives = spawn_async_waiter(&pool, FileCancellation::new());
+        eventually(|| pool.metrics_snapshot().unwrap().singleflight_waits == 3).await;
+
+        stopped.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), gives_up)
+            .await
+            .expect("a stop ends only its own wait")
+            .expect("waiter task")
+            .expect_err("stopped");
+        assert_eq!(error.kind(), FileErrorKind::Cancelled);
+        let error = tokio::time::timeout(Duration::from_secs(1), times_out)
+            .await
+            .expect("a deadline ends only its own wait")
+            .expect("waiter task")
+            .expect_err("timed out");
+        assert_eq!(error.kind(), FileErrorKind::DeadlineExceeded);
+
+        release.send(()).expect("release");
+        tokio::time::timeout(Duration::from_secs(5), receives)
+            .await
+            .expect("the shared construction reaches the remaining waiter")
+            .expect("waiter task")
+            .expect("operator");
+        claimer
+            .join()
+            .expect("claimer thread")
+            .expect("claimer operator");
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
+        let metrics = pool.metrics_snapshot().unwrap();
+        assert_eq!(metrics.operator_constructions, 1);
+        assert_eq!(metrics.resident_entries, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_claim_wakes_its_waiters_and_frees_its_key() {
+        let pool =
+            Arc::new(ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(60)).unwrap());
+        let (_, key) = waiting_key();
+        let ProviderAcquisition::Build(claim) = pool.claim(key).expect("claim") else {
+            panic!("the first caller claims the construction");
+        };
+        let waiter = spawn_async_waiter(&pool, FileCancellation::new());
+        eventually(|| pool.metrics_snapshot().unwrap().singleflight_waits == 1).await;
+
+        drop(claim);
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("an abandoned claim still wakes its waiter")
+            .expect("waiter task")
+            .expect_err("abandoned");
+        assert_eq!(error.kind(), FileErrorKind::Internal);
+
+        pool.acquire(
+            domain(1),
+            "warehouse",
+            &endpoint_config("http://localhost:9000"),
+            &credential_identity("blue"),
+            &static_source("one"),
+            |_, _| memory_operator(),
+        )
+        .expect("the key is free to construct again");
+        let metrics = pool.metrics_snapshot().unwrap();
+        assert_eq!(metrics.operator_construction_failures, 1);
+        assert_eq!(metrics.operator_constructions, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_construction_settles_even_after_the_pool_lock_was_poisoned() {
+        let pool =
+            Arc::new(ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(60)).unwrap());
+        let (endpoint, key) = waiting_key();
+        let ProviderAcquisition::Build(claim) = pool.claim(key).expect("claim") else {
+            panic!("the first caller claims the construction");
+        };
+        let waiter = spawn_async_waiter(&pool, FileCancellation::new());
+        eventually(|| pool.metrics_snapshot().unwrap().singleflight_waits == 1).await;
+
+        let state = Arc::clone(&pool.state);
+        let poisoner = std::thread::spawn(move || {
+            let _held = state.inner.lock().expect("pool lock");
+            panic!("poison the pool lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(pool.state.inner.is_poisoned());
+
+        claim
+            .build(&endpoint, &static_source("one"), |_, _| memory_operator())
+            .expect("the claimer still settles");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the waiter is not left behind a poisoned lock")
+            .expect("waiter task")
+            .expect("operator");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_construction_leaves_no_key_in_construction() {
+        let pool =
+            Arc::new(ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(60)).unwrap());
+        let (entered, building) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let claimer = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                pool.acquire(
+                    domain(1),
+                    "warehouse",
+                    &endpoint_config("http://localhost:9000"),
+                    &credential_identity("blue"),
+                    &static_source("one"),
+                    |_, _| -> FileResult<Operator> {
+                        entered.send(()).expect("entered");
+                        released.recv().expect("released");
+                        panic!("injected construction panic")
+                    },
+                )
+            })
+        };
+        building
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the claimer is constructing");
+        let waiter = spawn_async_waiter(&pool, FileCancellation::new());
+        eventually(|| pool.metrics_snapshot().unwrap().singleflight_waits == 1).await;
+
+        release.send(()).expect("release");
+        let error = claimer
+            .join()
+            .expect("the panic is contained")
+            .expect_err("constructing panicked");
+        assert_eq!(error.kind(), FileErrorKind::Internal);
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the waiter learns of the panic")
+            .expect("waiter task")
+            .expect_err("construction failed");
+        assert_eq!(error.kind(), FileErrorKind::Internal);
+
+        pool.acquire(
+            domain(1),
+            "warehouse",
+            &endpoint_config("http://localhost:9000"),
+            &credential_identity("blue"),
+            &static_source("one"),
+            |_, _| memory_operator(),
+        )
+        .expect("the key is not left in construction");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_and_blocking_resolution_share_one_pooled_client() {
+        let pool =
+            Arc::new(ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(60)).unwrap());
+        let resolved = {
+            let pool = Arc::clone(&pool);
+            // Spawned onto the runtime: the resolution future is Send.
+            tokio::spawn(async move {
+                FsAccessResolver::new()
+                    .resolve_location_async(
+                        domain(1),
+                        "s3://warehouse/sales/part-0.parquet",
+                        Some(ObjectStoreAccessContext::new(
+                            endpoint_config("http://localhost:9000"),
+                            credential_identity("blue"),
+                            secret_material("one"),
+                            &pool,
+                        )),
+                        &FileCancellation::new(),
+                    )
+                    .await
+                    .map(|handle| handle.paths().len())
+            })
+        };
+        assert_eq!(
+            resolved
+                .await
+                .expect("resolution task")
+                .expect("async resolution"),
+            1
+        );
+        FsAccessResolver::new()
+            .resolve_location(
+                domain(1),
+                "s3://warehouse/sales/part-1.parquet",
+                Some(ObjectStoreAccessContext::new(
+                    endpoint_config("http://localhost:9000"),
+                    credential_identity("blue"),
+                    secret_material("one"),
+                    &pool,
+                )),
+            )
+            .expect("blocking resolution");
+        let metrics = pool.metrics_snapshot().unwrap();
+        assert_eq!(metrics.operator_constructions, 1);
+        assert_eq!(metrics.cache_hits, 1);
     }
 
     #[test]

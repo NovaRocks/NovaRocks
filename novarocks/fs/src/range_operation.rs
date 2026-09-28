@@ -145,15 +145,18 @@ impl FileRangeOperation {
     }
 
     /// Return the read outcome once. A missing sender is an abnormal exit,
-    /// never a successful empty range.
+    /// never a successful empty range. The receiver is awaited in place, so a
+    /// dropped wait loses nothing and a later one receives the same outcome.
     pub async fn result_ready(&mut self) -> FileResult<Bytes> {
-        let receiver = self.result.take().ok_or_else(|| {
+        let receiver = self.result.as_mut().ok_or_else(|| {
             FileError::new(
                 FileErrorKind::Invalid,
                 "file range result was already consumed",
             )
         })?;
-        receiver.await.map_err(|_| {
+        let outcome = receiver.await;
+        self.result = None;
+        outcome.map_err(|_| {
             FileError::new(
                 FileErrorKind::Internal,
                 "file range operation exited without a result",
@@ -166,11 +169,11 @@ impl FileRangeOperation {
     }
 
     /// Wait for the spawned operation's destructor path and task exit.
-    pub async fn drained(self) -> FileResult<()> {
+    pub async fn drained(&mut self) -> FileResult<()> {
         self.task.drain().await
     }
 
-    pub async fn stop_and_drain(self) -> FileResult<()> {
+    pub async fn stop_and_drain(&mut self) -> FileResult<()> {
         self.request_stop();
         self.drained().await
     }

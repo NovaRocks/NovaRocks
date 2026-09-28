@@ -244,8 +244,43 @@ pub struct TypedScanRuntime {
     read_context: Arc<TypedReadAttemptContext>,
     storage_resolver: Arc<dyn ConnectorStorageResolver>,
     connector_resource_ledger: Arc<WorkerConnectorResourceLedger>,
-    preparation_config: ScanPreparationConfig,
-    preparation_timer: Arc<crate::ScanPreparationTimer>,
+    stream_host: ScanStreamHost,
+}
+
+/// What hosts the typed scan streams of one BE application: the bounds of
+/// each stream's speculative successor window, the one timer that supervises
+/// paused windows, and the scan I/O runtime a stream is entered into whenever
+/// it is polled or closed, so page streams may use its timers and spawn onto
+/// it.
+#[derive(Clone)]
+pub struct ScanStreamHost {
+    preparation: ScanPreparationConfig,
+    timer: Arc<crate::ScanPreparationTimer>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl ScanStreamHost {
+    /// Starts the host's preparation timer; the caller keeps one host per BE
+    /// application.
+    pub fn new(preparation: ScanPreparationConfig, runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            preparation,
+            timer: crate::ScanPreparationTimer::new(),
+            runtime,
+        }
+    }
+
+    pub const fn preparation(&self) -> ScanPreparationConfig {
+        self.preparation
+    }
+
+    pub fn timer(&self) -> &Arc<crate::ScanPreparationTimer> {
+        &self.timer
+    }
+
+    pub fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.runtime
+    }
 }
 
 /// BE-local bounds for one typed scan's speculative successor window.
@@ -314,8 +349,7 @@ impl TypedScanRuntime {
         runtime_filter: RuntimeFilterSessionResolver,
         read_context: Arc<TypedReadAttemptContext>,
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
-        preparation_config: ScanPreparationConfig,
-        preparation_timer: Arc<crate::ScanPreparationTimer>,
+        stream_host: ScanStreamHost,
     ) -> Self {
         let connector_resource_ledger = Arc::new(WorkerConnectorResourceLedger::new());
         Self {
@@ -328,8 +362,7 @@ impl TypedScanRuntime {
             read_context,
             storage_resolver,
             connector_resource_ledger,
-            preparation_config,
-            preparation_timer,
+            stream_host,
         }
     }
 
@@ -337,12 +370,8 @@ impl TypedScanRuntime {
         self.execution_id
     }
 
-    pub const fn preparation_config(&self) -> ScanPreparationConfig {
-        self.preparation_config
-    }
-
-    pub fn preparation_timer(&self) -> Arc<crate::ScanPreparationTimer> {
-        Arc::clone(&self.preparation_timer)
+    pub fn stream_host(&self) -> &ScanStreamHost {
+        &self.stream_host
     }
 
     pub fn catalog_read_execution(

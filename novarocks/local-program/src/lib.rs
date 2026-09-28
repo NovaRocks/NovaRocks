@@ -64,9 +64,8 @@ pub use requirements::{
 };
 pub use runtime_filter::{
     FilterConsumerActivation, FilterLateApplyGranularity, FilterNullOrder, FilterNullSemantics,
-    FilterOrderKey, FilterProducerKind, FilterReduction, FilterScanDomainTarget,
-    FilterSortDirection, StaticFilterConsumer, StaticFilterContract, StaticFilterError,
-    StaticFilterProducer,
+    FilterOrderKey, FilterProducerKind, FilterReduction, FilterSortDirection, StaticFilterConsumer,
+    StaticFilterContract, StaticFilterError, StaticFilterProducer,
 };
 pub use sink::{
     MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,

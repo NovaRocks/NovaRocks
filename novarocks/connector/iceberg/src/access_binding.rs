@@ -536,6 +536,52 @@ impl IcebergReadBinding {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let (access_domain, locations, object_store_access) = self.access_resolution(locations)?;
+        self.resources
+            .access_resolver()
+            .resolve_locations(access_domain, locations, object_store_access)
+            .map_err(file_error)
+    }
+
+    /// Awaited [`Self::resolve_access_for_locations`] for a read that must
+    /// not block: it waits for a shared object-store client under the read's
+    /// own stop and deadline instead of parking a thread.
+    pub async fn resolve_access_for_locations_async<I, S>(
+        &self,
+        locations: I,
+        context: &FileReadContext,
+    ) -> Result<FsAccessHandle, ConnectorError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let (access_domain, locations, object_store_access) = self.access_resolution(locations)?;
+        let cancellation = context.bounded_cancellation();
+        self.resources
+            .access_resolver()
+            .resolve_locations_async(access_domain, locations, object_store_access, &cancellation)
+            .await
+            .map_err(file_error)
+    }
+
+    /// Everything a resolution needs before it reaches the filesystem
+    /// resolver: the access domain, the locations, and the object-store
+    /// access this binding holds for them.
+    fn access_resolution<I, S>(
+        &self,
+        locations: I,
+    ) -> Result<
+        (
+            StorageAccessDomainId,
+            Vec<String>,
+            Option<ObjectStoreAccessContext<'_>>,
+        ),
+        ConnectorError,
+    >
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let locations = locations
             .into_iter()
             .map(|location| location.as_ref().to_string())
@@ -552,14 +598,11 @@ impl IcebergReadBinding {
             self.storage_access.as_ref(),
             Some(IcebergStorageAccess::VendedObjectStore { .. })
         ) {
-            return self.resolve_vended_access_for_locations(locations, parsed.scheme());
+            return self.vended_access_resolution(locations, parsed.scheme());
         }
         let access_domain = self.access_domain_for_location(&parsed)?;
         let object_store_access = self.object_store_access_context_for_scheme(parsed.scheme())?;
-        self.resources
-            .access_resolver()
-            .resolve_locations(access_domain, locations, object_store_access)
-            .map_err(file_error)
+        Ok((access_domain, locations, object_store_access))
     }
 
     fn access_domain_for_location(
@@ -610,11 +653,18 @@ impl IcebergReadBinding {
         }
     }
 
-    fn resolve_vended_access_for_locations(
+    fn vended_access_resolution(
         &self,
         locations: Vec<String>,
         scheme: FsScheme,
-    ) -> Result<FsAccessHandle, ConnectorError> {
+    ) -> Result<
+        (
+            StorageAccessDomainId,
+            Vec<String>,
+            Option<ObjectStoreAccessContext<'_>>,
+        ),
+        ConnectorError,
+    > {
         if scheme != FsScheme::ObjectStore {
             return Err(invalid(
                 "Iceberg vended object-store capability cannot resolve an uncredentialed location",
@@ -732,14 +782,11 @@ impl IcebergReadBinding {
             authority,
             self.resources.object_store_provider_pool(),
         );
-        self.resources
-            .access_resolver()
-            .resolve_locations(
-                selected.storage_access_domain_id(),
-                locations,
-                Some(object_store_access),
-            )
-            .map_err(file_error)
+        Ok((
+            selected.storage_access_domain_id(),
+            locations,
+            Some(object_store_access),
+        ))
     }
 
     /// Decide, once per resolution, whether this role can acquire for itself.
@@ -856,18 +903,20 @@ impl IcebergReadBinding {
         self.storage_access.as_ref().ok_or_else(|| {
             invalid("Iceberg filesystem operation has no admitted storage capability")
         })?;
-        let range_scope = if self.range_service.is_some() {
-            let scope = self
-                .request_context
-                .as_ref()
-                .and_then(ConnectorRequestContext::range_scope)
-                .ok_or_else(|| {
-                    invalid("BE Iceberg scan requires an exact range scheduling scope")
-                })?;
-            let (query_high, query_low, attempt, fragment_high, fragment_low, node_id) =
-                scope.parts();
-            Some(
-                novarocks_fs::FileRangeScope::try_new(
+        // A BE scan reads through the shared range service only for the one
+        // execution source its request was bound to, whose operations every
+        // request is admitted to before it starts.
+        let range = match &self.range_service {
+            None => None,
+            Some(service) => {
+                let (scope, operations) = self
+                    .request_context
+                    .as_ref()
+                    .and_then(|request| request.range_scope().zip(request.source_operations()))
+                    .ok_or_else(|| invalid("BE Iceberg scan requires an exact execution source"))?;
+                let (query_high, query_low, attempt, fragment_high, fragment_low, node_id) =
+                    scope.parts();
+                let scope = novarocks_fs::FileRangeScope::try_new(
                     query_high,
                     query_low,
                     attempt,
@@ -875,18 +924,16 @@ impl IcebergReadBinding {
                     fragment_low,
                     node_id,
                 )
-                .map_err(|error| invalid(error.to_string()))?,
-            )
-        } else {
-            None
+                .map_err(|error| invalid(error.to_string()))?;
+                Some(service.bind(scope, operations.clone()))
+            }
         };
         Ok(FileReadContext {
             cancellation,
             deadline: Some(deadline),
             runtime: Arc::clone(self.resources.file_runtime()),
             task_spawner: Arc::clone(self.resources.file_task_spawner()),
-            range_service: self.range_service.clone(),
-            range_scope,
+            range,
         })
     }
 
@@ -1101,19 +1148,27 @@ mod tests {
             "BE scan cannot invent a scheduling source"
         );
         let scope = ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).expect("scope");
-        let request = request.with_range_scope(scope);
+        let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        let request = request.with_execution_source(scope, operations.clone());
         let context = binding
             .for_request(request.clone())
             .file_read_context(FileCancellation::from_connector_request(&request), deadline)
             .expect("scoped file context");
-        assert!(Arc::ptr_eq(
-            context.range_service.as_ref().unwrap(),
-            &range_service
-        ));
+        let range = context
+            .range
+            .expect("BE scan reads through the range service");
+        assert!(Arc::ptr_eq(range.service(), &range_service));
         assert_eq!(
-            context.range_scope,
-            Some(novarocks_fs::FileRangeScope::try_new(1, 2, 3, 4, 5, 6).unwrap())
+            range.scope(),
+            novarocks_fs::FileRangeScope::try_new(1, 2, 3, 4, 5, 6).unwrap()
         );
+        let ticket = range.operations().admit(Arc::new(|| {})).expect("admitted");
+        assert_eq!(
+            operations.live_operations(),
+            1,
+            "file requests are admitted to the request's own source operations"
+        );
+        drop(ticket);
     }
 
     struct RejectingVendedResolver {

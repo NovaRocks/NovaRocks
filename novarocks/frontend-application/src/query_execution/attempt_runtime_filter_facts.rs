@@ -89,6 +89,7 @@ pub(crate) enum AttemptRuntimeFilterBindingRoleFacts {
         capabilities: Vec<AttemptRuntimeFilterArtifactCapability>,
         activation: AttemptRuntimeFilterConsumerActivation,
         target: AttemptRuntimeFilterConsumerTarget,
+        feedback_scan_type: Option<novarocks_physical_plan::ValueType>,
     },
 }
 #[derive(Clone, Copy, Debug)]
@@ -130,17 +131,8 @@ pub(crate) enum AttemptRuntimeFilterProducerTarget {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum AttemptRuntimeFilterConsumerTarget {
-    DirectInput {
-        input_ordinal: u32,
-    },
-    SourceBoundary {
-        scan_domain: Option<AttemptRuntimeFilterScanDomainTarget>,
-    },
-}
-#[derive(Clone, Debug)]
-pub(crate) struct AttemptRuntimeFilterScanDomainTarget {
-    pub data_type: DataType,
-    pub nullable: bool,
+    DirectInput { input_ordinal: u32 },
+    SourceBoundary,
 }
 
 #[derive(Clone, Debug)]
@@ -668,15 +660,10 @@ fn completed_consumer_role(
         }
         PhysicalConsumerTarget::ScanField { .. }
         | PhysicalConsumerTarget::AggregateTopNScanField { .. } => {
-            let ty = scan_type.ok_or_else(|| {
+            scan_type.ok_or_else(|| {
                 "a completed scan runtime filter has no pinned output type".to_string()
             })?;
-            AttemptRuntimeFilterConsumerTarget::SourceBoundary {
-                scan_domain: Some(AttemptRuntimeFilterScanDomainTarget {
-                    data_type: ty.data_type.clone(),
-                    nullable: ty.nullable,
-                }),
-            }
+            AttemptRuntimeFilterConsumerTarget::SourceBoundary
         }
     };
     Ok(AttemptRuntimeFilterBindingRoleFacts::Consumer {
@@ -697,6 +684,7 @@ fn completed_consumer_role(
             .collect(),
         activation,
         target,
+        feedback_scan_type: scan_type.cloned(),
     })
 }
 
@@ -933,17 +921,23 @@ mod tests {
             },
         };
         let role = completed_consumer_role(&consumer, None).expect("a probe key names its input");
-        let AttemptRuntimeFilterBindingRoleFacts::Consumer { target, .. } = role else {
+        let AttemptRuntimeFilterBindingRoleFacts::Consumer {
+            target,
+            feedback_scan_type,
+            ..
+        } = role
+        else {
             panic!("a consumer binding has a consumer role");
         };
         assert!(matches!(
             target,
             AttemptRuntimeFilterConsumerTarget::DirectInput { input_ordinal: 0 }
         ));
+        assert!(feedback_scan_type.is_none());
     }
 
     #[test]
-    fn a_scan_consumer_deploys_its_pinned_domain_type_for_feedback() {
+    fn a_scan_consumer_deploys_its_pinned_value_type_for_feedback() {
         let consumer = RuntimeFilterConsumer {
             endpoint: RuntimeFilterEndpoint {
                 fragment: PhysicalFragmentId::new(1),
@@ -962,18 +956,19 @@ mod tests {
         };
         let ty = novarocks_physical_plan::ValueType::new(DataType::Int32, true);
         let role = completed_consumer_role(&consumer, Some(&ty)).expect("scan type is pinned");
-        let AttemptRuntimeFilterBindingRoleFacts::Consumer { target, .. } = role else {
+        let AttemptRuntimeFilterBindingRoleFacts::Consumer {
+            target,
+            feedback_scan_type,
+            ..
+        } = role
+        else {
             panic!("a consumer binding has a consumer role");
         };
         assert!(matches!(
             target,
-            AttemptRuntimeFilterConsumerTarget::SourceBoundary {
-                scan_domain: Some(AttemptRuntimeFilterScanDomainTarget {
-                    data_type: DataType::Int32,
-                    nullable: true,
-                }),
-            }
+            AttemptRuntimeFilterConsumerTarget::SourceBoundary
         ));
+        assert_eq!(feedback_scan_type, Some(ty));
     }
 
     /// Coverage is carried as an arena and read as a tree.

@@ -49,6 +49,10 @@ pub mod system_page_source;
 pub mod system_table;
 pub mod table_execute;
 pub mod table_handle;
+#[cfg(test)]
+mod test_spawners;
+#[cfg(test)]
+mod test_streams;
 
 pub use change_window::{
     ICEBERG_CHANGE_OP_COLUMN, ICEBERG_CHANGE_OP_FIELD_ID, IcebergAddedRows, IcebergChangeSide,
@@ -60,8 +64,8 @@ pub use change_window::{
     TableChangesSplit, TableChangesSplitParams, change_op_column_handle,
 };
 pub use change_window_page_source::{
-    IcebergChangeWindowPageSource, IcebergChangeWindowPageSourceRequest,
-    create_iceberg_change_window_page_source,
+    IcebergChangeWindowPageSourceRequest, IcebergChangeWindowPageStream,
+    create_iceberg_change_window_page_stream,
 };
 pub use codec::IcebergConnectorReadWireAdapter;
 pub use column_handle::{
@@ -78,12 +82,12 @@ pub use merge::{
 pub use page_source::{
     DynamicFilterCheckpoint, DynamicFilterObservation, DynamicFilterVerdict,
     IcebergPageSourceRequest, IcebergParquetPageSource, IcebergPartitionOnlyPageSource,
-    IcebergReadRelation, ParquetFooterCache, create_iceberg_page_source,
+    IcebergReadRelation, ParquetFooterCache,
 };
 pub use page_source_provider::{IcebergPageSourceProvider, IcebergPageSourceProviderOptions};
 pub use rewrite_position_page_source::{
     IcebergRewritePositionDeleteFilesPageSourceRequest,
-    create_iceberg_rewrite_position_delete_files_page_source,
+    create_iceberg_rewrite_position_delete_files_page_stream,
 };
 pub use runtime::{IcebergExecutionReadRuntime, IcebergReadSplit, IcebergRuntimeRelation};
 pub use schema_binding::{

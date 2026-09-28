@@ -27,14 +27,14 @@ NULL
 NULL
 
 -- query 10
-CASE WHEN (i = 1) THEN ai WHEN (i = 3) THEN ass END
+CASE WHEN i = 1 THEN ai WHEN i = 3 THEN ass END
 ["1","2"]
 NULL
 ["a","b"]
 NULL
 
 -- query 11
-CASE WHEN (i = 1) THEN ai WHEN (i = 3) THEN ass ELSE ai END
+CASE WHEN i = 1 THEN ai WHEN i = 3 THEN ass ELSE ai END
 ["1","2"]
 ["1","2"]
 ["a","b"]

@@ -976,7 +976,7 @@ mod tests {
                         ArtifactCapability::EmptyDomain,
                     ]),
                     activation,
-                    target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
+                    target: ConsumerBindingTarget::SourceBoundary,
                 }),
             })
             .unwrap();

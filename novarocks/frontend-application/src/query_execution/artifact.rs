@@ -280,7 +280,8 @@ impl SnapshotBoundDormantAttemptInputs {
         request: &novarocks_query_application::api::NativeAttemptPreparationRequest,
         snapshot: BackendTopologySnapshot,
     ) -> Result<Self, DistributedQueryError> {
-        let topology = FrozenAttemptTopology::capture(snapshot)?;
+        let topology =
+            FrozenAttemptTopology::capture_for_candidate(snapshot, request.topology_requirement())?;
         let bound = template.bind_attempt(request)?;
         let (native, access) = bound.into_native_and_access();
         Ok(Self {

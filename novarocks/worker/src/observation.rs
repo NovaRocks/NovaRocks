@@ -529,6 +529,12 @@ struct SourceState {
     /// this set finite. It preserves an explicit observation gap (`Gone`) for
     /// a lagging stream after the heavier terminal snapshot is released.
     forgotten: BTreeSet<TaskIdentity>,
+    /// Tasks whose creation lost to this context closing underneath it. They
+    /// exist only until their physical stop converges and were never
+    /// released to observers, so this source answers them as `Unknown` for
+    /// its whole lifetime: reclaiming one fences nothing and expires nothing.
+    /// The owning context's cumulative task bound makes this set finite.
+    withheld: BTreeSet<TaskIdentity>,
     /// One coalesced change-index entry per retained task. Subscriptions walk
     /// this index with private revision cursors instead of rescanning all tasks
     /// for every delivered frame.
@@ -818,6 +824,10 @@ impl TaskStatusSource {
         let identity = status.identity();
         let status_state = status.state();
         let mut state = self.state.lock().expect("task status source lock");
+        debug_assert!(
+            !state.withheld.contains(&identity),
+            "a task withheld from observers is never published"
+        );
         state.latest.insert(identity, status.clone());
         Self::publish_control_locked(
             &mut state,
@@ -911,12 +921,30 @@ impl TaskStatusSource {
             .copied()
     }
 
+    /// Records that a task lost its creation to this context closing and is
+    /// never released to observers.
+    ///
+    /// Called at the creation's commit, before the task can retire, so its
+    /// later reclamation is known to have no observation to fence.
+    pub fn withhold(&self, identity: TaskIdentity) {
+        let mut state = self.state.lock().expect("task status source lock");
+        assert!(
+            !state.latest.contains_key(&identity)
+                && !state.reclaimed.contains_key(&identity)
+                && !state.forgotten.contains(&identity),
+            "only a task no observer has seen can be withheld"
+        );
+        state.withheld.insert(identity);
+    }
+
     /// Records that a task's retained state was reclaimed.
     pub fn mark_gone(&self, identity: TaskIdentity) {
         let mut state = self.state.lock().expect("task status source lock");
         let Some(terminal) = state.latest.remove(&identity) else {
             assert!(
-                state.reclaimed.contains_key(&identity) || state.forgotten.contains(&identity),
+                state.reclaimed.contains_key(&identity)
+                    || state.forgotten.contains(&identity)
+                    || state.withheld.contains(&identity),
                 "a reclaimed task must retain its final observation"
             );
             return;
@@ -951,7 +979,7 @@ impl TaskStatusSource {
         let mut state = self.state.lock().expect("task status source lock");
         if state.reclaimed.remove(&identity).is_none() {
             assert!(
-                state.forgotten.contains(&identity),
+                state.forgotten.contains(&identity) || state.withheld.contains(&identity),
                 "only a reclaimed observation can expire"
             );
             return;

@@ -569,15 +569,8 @@ fn encode_runtime_filter_consumer(
         }
         RuntimeFilterConsumerTarget::ScanField { .. }
         | RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
-            let value = only_endpoint_value(&consumer.endpoint)?;
-            let ty = &fragment.values()[&value].ty;
             plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(
-                plan::RuntimeFilterSourceBoundaryTarget {
-                    scan_domain_target: Some(plan::RuntimeFilterScanDomainTarget {
-                        r#type: Some(encode_physical_type(&ty.data_type)?),
-                        nullable: ty.nullable,
-                    }),
-                },
+                plan::RuntimeFilterSourceBoundaryTarget {},
             )
         }
     };

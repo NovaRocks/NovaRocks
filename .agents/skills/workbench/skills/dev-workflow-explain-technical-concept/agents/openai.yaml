@@ -1,4 +1,4 @@
 interface:
   display_name: "Explain Technical Concepts"
-  short_description: "Explain technical concepts from first principles"
-  default_prompt: "Use $dev-workflow-explain-technical-concept to explain this topic in Chinese from first principles with one concrete running example."
+  short_description: "Build understanding with examples and causal reasoning"
+  default_prompt: "Use $dev-workflow-explain-technical-concept to help me understand this topic in Chinese through a concrete example and step-by-step reasoning, choosing diagrams and details that clarify it."

@@ -18,6 +18,7 @@
 use std::ops::Range;
 
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt, stream};
 
 use super::chunk_reader::BoundChunkReader;
 use crate::{FileError, FileErrorKind, FileReaderOptions, FileResult};
@@ -73,35 +74,93 @@ pub(crate) fn read_decoder_ranges(
     let groups = coalesce_ranges(ranges, reader.file_size(), options)?;
     let mut output = vec![None; ranges.len()];
     for group in groups {
-        let length = usize::try_from(group.range.end - group.range.start).map_err(|_| {
-            FileError::new(
-                FileErrorKind::ResourceExhausted,
-                "Parquet input range is too large",
-            )
-        })?;
-        let exact = group.requests.len() == 1 && ranges[group.requests[0]] == group.range;
-        let bytes = if exact {
+        let length = group_length(&group)?;
+        let bytes = if is_exact(&group, ranges) {
             reader.read_bytes(group.range.start, length)?
         } else {
             reader.read_backing_bytes(group.range.start, length)?
         };
-        for index in group.requests {
-            let range = &ranges[index];
-            let start = usize::try_from(range.start - group.range.start).map_err(|_| {
-                FileError::new(
-                    FileErrorKind::ResourceExhausted,
-                    "Parquet input slice is too large",
-                )
-            })?;
-            let end = usize::try_from(range.end - group.range.start).map_err(|_| {
-                FileError::new(
-                    FileErrorKind::ResourceExhausted,
-                    "Parquet input slice is too large",
-                )
-            })?;
-            output[index] = Some(bytes.slice(start..end));
-        }
+        fill_group(&mut output, ranges, &group, &bytes)?;
     }
+    filled(output)
+}
+
+/// Awaited [`read_decoder_ranges`]. The independent merged groups of one
+/// decoder request are fetched concurrently -- at most the source's window at
+/// a time, each still admitted to the shared range service -- and handed back
+/// in the decoder's original range order, whatever order they complete in.
+/// The first error drops the groups still in flight, which stops their
+/// requests; their exit stays observed by the operations they were admitted
+/// to.
+pub(crate) async fn read_decoder_ranges_async(
+    reader: &BoundChunkReader,
+    ranges: &[Range<u64>],
+    options: FileReaderOptions,
+) -> FileResult<Vec<Bytes>> {
+    let groups = coalesce_ranges(ranges, reader.file_size(), options)?;
+    let fetched: Vec<(CoalescedRange, Bytes)> =
+        stream::iter(groups.into_iter().map(|group| async move {
+            let length = group_length(&group)?;
+            let bytes = if is_exact(&group, ranges) {
+                reader.read_bytes_async(group.range.start, length).await?
+            } else {
+                reader
+                    .read_backing_bytes_async(group.range.start, length)
+                    .await?
+            };
+            Ok::<_, FileError>((group, bytes))
+        }))
+        .buffered(reader.range_concurrency())
+        .try_collect()
+        .await?;
+    let mut output = vec![None; ranges.len()];
+    for (group, bytes) in &fetched {
+        fill_group(&mut output, ranges, group, bytes)?;
+    }
+    filled(output)
+}
+
+fn group_length(group: &CoalescedRange) -> FileResult<usize> {
+    usize::try_from(group.range.end - group.range.start).map_err(|_| {
+        FileError::new(
+            FileErrorKind::ResourceExhausted,
+            "Parquet input range is too large",
+        )
+    })
+}
+
+/// A group serving exactly one decoder range may fill the exact-range cache;
+/// a merged backing must not.
+fn is_exact(group: &CoalescedRange, ranges: &[Range<u64>]) -> bool {
+    group.requests.len() == 1 && ranges[group.requests[0]] == group.range
+}
+
+fn fill_group(
+    output: &mut [Option<Bytes>],
+    ranges: &[Range<u64>],
+    group: &CoalescedRange,
+    bytes: &Bytes,
+) -> FileResult<()> {
+    for index in &group.requests {
+        let range = &ranges[*index];
+        let start = usize::try_from(range.start - group.range.start).map_err(|_| {
+            FileError::new(
+                FileErrorKind::ResourceExhausted,
+                "Parquet input slice is too large",
+            )
+        })?;
+        let end = usize::try_from(range.end - group.range.start).map_err(|_| {
+            FileError::new(
+                FileErrorKind::ResourceExhausted,
+                "Parquet input slice is too large",
+            )
+        })?;
+        output[*index] = Some(bytes.slice(start..end));
+    }
+    Ok(())
+}
+
+fn filled(output: Vec<Option<Bytes>>) -> FileResult<Vec<Bytes>> {
     output
         .into_iter()
         .map(|bytes| {
@@ -223,8 +282,7 @@ mod tests {
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())) as Arc<dyn FileIoRuntime>,
             task_spawner: Arc::new(TokioFileTaskSpawner::new(handle)) as Arc<dyn FileTaskSpawner>,
-            range_service: None,
-            range_scope: None,
+            range: None,
         };
         let reader = BoundChunkReader::new(
             file,
@@ -248,6 +306,8 @@ mod tests {
     }
 
     #[test]
+    // The inverted range is the input under test, not an iteration.
+    #[allow(clippy::reversed_empty_ranges)]
     fn rejects_empty_inverted_and_out_of_file_ranges() {
         for range in [0..0, 10..9, 9..11, u64::MAX - 1..u64::MAX] {
             assert_eq!(
@@ -300,8 +360,10 @@ mod tests {
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
                 task_spawner: spawner,
-                range_service: Some(service),
-                range_scope: Some(FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap()),
+                range: Some(service.bind(
+                    FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
+                    novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                )),
             },
             None,
             false,
@@ -355,8 +417,10 @@ mod tests {
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
                 task_spawner: spawner,
-                range_service: Some(service),
-                range_scope: Some(FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap()),
+                range: Some(service.bind(
+                    FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
+                    novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                )),
             },
             None,
             false,

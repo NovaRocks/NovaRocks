@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorResourceReservation};
 use paimon::io::{ReadControl, ReadExecutionResources, ReadReservation};
 
@@ -58,14 +61,18 @@ pub struct PaimonSdkExecutionResources {
     resources: PaimonExecutionResources,
     output_handoff: Arc<OutputHandoff>,
     schema_copy_reservations: Arc<Mutex<Vec<ConnectorResourceReservation>>>,
+    /// The poll budget of the host turn the split's page stream runs in; the
+    /// SDK's cooperation points spend it.
+    poll_budget: ConnectorPollBudget,
 }
 
 impl PaimonSdkExecutionResources {
-    pub fn new(resources: PaimonExecutionResources) -> Self {
+    pub fn new(resources: PaimonExecutionResources, poll_budget: ConnectorPollBudget) -> Self {
         Self {
             resources,
             output_handoff: Arc::new(OutputHandoff::default()),
             schema_copy_reservations: Arc::new(Mutex::new(Vec::new())),
+            poll_budget,
         }
     }
 
@@ -157,6 +164,10 @@ impl ReadExecutionResources for PaimonSdkExecutionResources {
         }
         *pending = Some(reservation);
         Ok(None)
+    }
+
+    fn cooperate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.poll_budget.consume(1))
     }
 }
 
@@ -276,7 +287,7 @@ mod tests {
                 ledger.clone(),
             ),
         );
-        let execution = PaimonSdkExecutionResources::new(resources);
+        let execution = PaimonSdkExecutionResources::new(resources, ConnectorPollBudget::new());
 
         let sdk_reservation = execution.try_reserve_output(64).unwrap();
         assert_eq!(ledger.retained.load(Ordering::Acquire), 64);
@@ -310,12 +321,37 @@ mod tests {
                 ledger.clone(),
             ),
         );
-        let execution = PaimonSdkExecutionResources::new(resources);
+        let execution = PaimonSdkExecutionResources::new(resources, ConnectorPollBudget::new());
         execution.reserve_schema_copy(128).unwrap();
         execution.reserve_schema_copy(128).unwrap();
         assert_eq!(ledger.retained.load(Ordering::Acquire), 256);
         assert_eq!(ledger.reservations.load(Ordering::Acquire), 2);
         drop(execution);
         assert_eq!(ledger.retained.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn sdk_cooperation_spends_the_host_turn_and_yields_once_when_it_is_spent() {
+        let ledger = Arc::new(Ledger::default());
+        let control = PaimonRequestControl::new(
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            Instant::now() + Duration::from_secs(60),
+        );
+        let resources = PaimonExecutionResources::new(
+            control,
+            novarocks_spi::connector::ConnectorExecutionResources::from_admitted_ledger(ledger),
+        );
+        let budget = ConnectorPollBudget::new();
+        let execution = PaimonSdkExecutionResources::new(resources, budget.clone());
+        budget.refill(1);
+        assert!(futures::poll!(execution.cooperate()).is_ready());
+        let mut spent = execution.cooperate();
+        assert!(futures::poll!(&mut spent).is_pending(), "the turn is spent");
+        assert_eq!(budget.exhaustions(), 1);
+        assert!(
+            futures::poll!(&mut spent).is_ready(),
+            "a later turn resumes it"
+        );
+        assert_eq!(budget.exhaustions(), 1);
     }
 }

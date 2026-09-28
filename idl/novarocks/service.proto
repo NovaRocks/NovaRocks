@@ -280,17 +280,6 @@ message QueryTerminalRuntimeFilterTransportRouteV1 {
   uint64 fail_open_bytes = 11;
 }
 
-message QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
-  uint64 unit_facts_missing = 1;
-  uint64 column_facts_missing = 2;
-  uint64 data_type_unsupported = 3;
-  uint64 predicate_capability_unsupported = 4;
-  uint64 resource_unavailable = 5;
-  uint64 snapshot_unavailable = 6;
-  uint64 snapshot_timed_out = 7;
-  uint64 snapshot_not_published = 8;
-}
-
 message QueryTerminalRuntimeFilterConsumerV1 {
   uint32 channel_binding_id = 1;
   uint32 channel_id = 2;
@@ -302,11 +291,9 @@ message QueryTerminalRuntimeFilterConsumerV1 {
   uint64 row_evaluations = 8;
   uint64 input_rows = 9;
   uint64 output_rows = 10;
-  uint64 scan_evaluated = 11;
-  uint64 scan_kept = 12;
-  uint64 scan_pruned = 13;
-  uint64 scan_not_evaluated = 14;
-  QueryTerminalRuntimeFilterScanNotEvaluatedV1 scan_not_evaluated_reasons = 15;
+  reserved 11 to 15;
+  reserved "scan_evaluated", "scan_kept", "scan_pruned", "scan_not_evaluated",
+      "scan_not_evaluated_reasons";
 }
 
 // Process-neutral, canonical participant-local runtime-filter observation.
@@ -453,7 +440,6 @@ message QueryOptions {
   bool enable_profile = 3;
   int32 pipeline_dop = 4;
   int64 query_mem_limit = 5;
-  int32 connector_io_tasks_per_scan_operator = 6;
   optional int64 runtime_filter_scan_wait_time_ms = 7;
   optional int32 runtime_filter_wait_timeout_ms = 8;
   bool allow_throw_exception = 9;
@@ -477,6 +463,8 @@ message QueryOptions {
   bool enable_file_metacache = 27;
   bool enable_file_pagecache = 28;
   bool enable_parquet_reader_page_index = 29;
+  reserved 6;
+  reserved "connector_io_tasks_per_scan_operator";
 }
 
 // Spill options consumed by NovaRocks native runtime.

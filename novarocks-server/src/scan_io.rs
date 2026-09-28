@@ -182,9 +182,16 @@ pub struct ScanIoServices {
     file_task_spawner: Arc<dyn FileTaskSpawner>,
     range_service: Arc<FileRangeService>,
     flight: Arc<FlightState>,
+    handle: tokio::runtime::Handle,
 }
 
 impl ScanIoServices {
+    /// The scan I/O runtime itself: typed scan streams are polled and closed
+    /// inside its context.
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.handle.clone()
+    }
+
     pub fn file_runtime(&self) -> Arc<dyn FileIoRuntime> {
         Arc::clone(&self.file_runtime)
     }
@@ -255,6 +262,7 @@ impl ScanIoRuntime {
                 file_task_spawner,
                 range_service,
                 flight: Arc::clone(&flight),
+                handle: handle.clone(),
             },
             flight,
         })

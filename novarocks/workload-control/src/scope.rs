@@ -204,6 +204,7 @@ pub(crate) struct Node {
     pub result_credit: crate::ResultCreditSnapshot,
     pub control_pending: ControlIntents,
     pub cancellation_signalled: bool,
+    pub terminal_cancel_settled: bool,
     pub control_queued: bool,
     pub control_inflight: bool,
 }
@@ -238,6 +239,7 @@ impl Node {
             result_credit: crate::ResultCreditSnapshot::default(),
             control_pending: ControlIntents::empty(),
             cancellation_signalled: false,
+            terminal_cancel_settled: false,
             control_queued: false,
             control_inflight: false,
         }
@@ -1176,6 +1178,7 @@ impl WorkOwner {
                 node.completed = true;
                 node.owner = OwnerState::Completed;
                 if terminal_cancel_settled {
+                    node.terminal_cancel_settled = true;
                     node.control_pending.remove(crate::ControlIntent::Cancel);
                 }
                 let remove_waiting_control =
@@ -1480,6 +1483,49 @@ mod tests {
             "completed work has no owner left to deliver a later deadline control"
         );
         work.business.release();
+    }
+
+    #[test]
+    fn late_request_cannot_requeue_terminally_settled_cancel() {
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("admit root work");
+        let requester = work.owner.cancellation_requester();
+        let scope = work.owner.scope();
+        requester
+            .request(CancellationReason::DeadlineExceeded)
+            .expect("request cancellation");
+        work.owner.complete_after_terminal_cancel_settled();
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        assert!(control.next_control().is_none());
+
+        requester
+            .request(CancellationReason::Requested)
+            .expect("late request retains the first cancellation reason");
+        scope
+            .request_control(crate::ControlIntent::Cancel)
+            .expect("late direct control request is harmless");
+        assert!(control.next_control().is_none());
+        work.business.release();
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+    }
+
+    #[test]
+    fn dropped_inflight_cancel_cannot_requeue_after_terminal_settlement() {
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("admit root work");
+        work.owner.cancel(CancellationReason::DeadlineExceeded);
+        let permit = control.next_control().expect("dispatch cancel control");
+        assert!(permit.intents().contains(crate::ControlIntent::Cancel));
+
+        work.owner.complete_after_terminal_cancel_settled();
+        drop(permit);
+        assert!(control.next_control().is_none());
+        work.business.release();
+        assert_eq!(control.snapshot().root_responsibilities, 0);
     }
 
     #[test]

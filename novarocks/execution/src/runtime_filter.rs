@@ -19,7 +19,6 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
@@ -29,7 +28,6 @@ pub mod contribution;
 pub mod evaluator;
 pub mod feedback_domain;
 pub mod row_group_domain;
-pub mod scan_domain;
 
 pub use evaluator::{
     RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterRowEffect,
@@ -1066,8 +1064,21 @@ pub enum LivePollOutcome {
     },
 }
 
+/// A consumer's subscription to one snapshot that its input waits for.
+///
+/// Nothing here blocks: the consumer's gate asks for the outcome, parks on
+/// the outcome observable while it is pending, and decides itself when it
+/// stops waiting.
 pub trait BlockingSnapshotSubscription: Send + Sync {
-    fn acquire(&self, timeout: Duration) -> SnapshotAcquireOutcome;
+    /// The published outcome, or `None` while the snapshot is still pending.
+    /// Never `TimedOut`: only the consumer decides that it stopped waiting.
+    fn try_outcome(&self) -> Option<SnapshotAcquireOutcome>;
+    /// Notified once when the outcome is published. Its identity is stable
+    /// for the subscription's lifetime.
+    fn outcome_observable(&self) -> Arc<crate::runtime::observable::Observable>;
+    /// Records the outcome the consumer finally acted on: the published one,
+    /// or `TimedOut` when its wait ended first. Only the first record counts.
+    fn record_consumer_outcome(&self, outcome: &SnapshotAcquireOutcome);
     fn snapshot(&self) -> Option<Arc<RuntimeFilterSnapshot>>;
 }
 pub trait NonBlockingLiveSubscription: Send + Sync {

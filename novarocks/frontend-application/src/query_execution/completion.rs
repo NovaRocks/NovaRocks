@@ -507,10 +507,6 @@ fn complete_profile(
             ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
             "ProfileCounters",
         ),
-        (
-            RUNTIME_FILTER_SCAN_UNIT_COUNTER_NAMES,
-            "RuntimeFilterScanUnits",
-        ),
         (CONNECTOR_FILE_COUNTER_NAMES, "ConnectorFileMetrics"),
         (TYPED_CONNECTOR_COUNTER_NAMES, "TypedConnectorMetrics"),
         (
@@ -640,19 +636,6 @@ const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
     "IcebergRuntimeFilePruning/Predicates",
     "IcebergRuntimeFilePruning/Unsupported",
     "IcebergRuntimeFilePruning/Unavailable",
-];
-const RUNTIME_FILTER_SCAN_UNIT_COUNTER_NAMES: &[&str] = &[
-    "RuntimeFilterScanUnitsPruned",
-    "RuntimeFilterScanUnitsKept",
-    "RuntimeFilterScanUnitsNotEvaluated",
-    "RuntimeFilterScanUnitsNotEvaluatedUnitFactsMissing",
-    "RuntimeFilterScanUnitsNotEvaluatedColumnFactsMissing",
-    "RuntimeFilterScanUnitsNotEvaluatedDataTypeUnsupported",
-    "RuntimeFilterScanUnitsNotEvaluatedPredicateCapabilityUnsupported",
-    "RuntimeFilterScanUnitsNotEvaluatedResourceUnavailable",
-    "RuntimeFilterScanUnitsNotEvaluatedSnapshotUnavailable",
-    "RuntimeFilterScanUnitsNotEvaluatedSnapshotTimedOut",
-    "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished",
 ];
 const CONNECTOR_FILE_COUNTER_NAMES: &[&str] = &[
     "ConnectorFileCacheHits",

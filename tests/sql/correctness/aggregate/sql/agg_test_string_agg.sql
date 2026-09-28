@@ -149,4 +149,4 @@ select string_agg(distinct name, ',') from ss where id = 1;
 
 -- query 26
 USE ${case_db};
-select string_agg(concat(name, ':', score), ',') from ss where id = 1;
+select string_agg(concat(name, ':', score), ',' order by score desc) as ordered_scores from ss where id = 1;

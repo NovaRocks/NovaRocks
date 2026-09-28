@@ -129,12 +129,6 @@ struct BindingSpec {
     role: BindingRole,
 }
 
-#[derive(Clone)]
-struct ScanDomainBindingSpec {
-    data_type: arrow::datatypes::DataType,
-    nullable: bool,
-}
-
 #[derive(Clone, Copy)]
 struct FragmentEdgeSpec {
     source_fragment_id: u32,
@@ -160,7 +154,7 @@ enum BindingRole {
     Consumer {
         capabilities: BTreeSet<Capability>,
         activation: plan::RuntimeFilterConsumerActivation,
-        scan_domain: Option<ScanDomainBindingSpec>,
+        feedback_scan_type: Option<novarocks_physical_plan::ValueType>,
     },
 }
 
@@ -566,7 +560,8 @@ fn materialize_bindings(
             RuntimeFilterDeploymentBindingRoleFacts::Consumer {
                 capabilities,
                 activation,
-                target,
+                feedback_scan_type,
+                ..
             } => {
                 if fact.coverage_witness_id().is_some() {
                     return Err(compilation_error(format!(
@@ -576,20 +571,7 @@ fn materialize_bindings(
                 BindingRole::Consumer {
                     capabilities: unique_capabilities(capabilities)?,
                     activation: activation_wire(activation),
-                    scan_domain: match target {
-                        crate::query_execution::preparation::runtime_filter_view::RuntimeFilterConsumerTarget::SourceBoundary {
-                            scan_domain_target: Some(target),
-                        } => Some(ScanDomainBindingSpec {
-                            data_type: target.data_type,
-                            nullable: target.nullable,
-                        }),
-                        crate::query_execution::preparation::runtime_filter_view::RuntimeFilterConsumerTarget::SourceBoundary {
-                            scan_domain_target: None,
-                        }
-                        | crate::query_execution::preparation::runtime_filter_view::RuntimeFilterConsumerTarget::DirectInputOrdinal(
-                            _,
-                        ) => None,
-                    },
+                    feedback_scan_type,
                 }
             }
         };
@@ -856,17 +838,18 @@ fn compile_feedback_declaration(
             .filter(|binding| binding.channel_id == channel_id)
             .filter_map(|binding| match &binding.role {
                 BindingRole::Consumer {
-                    scan_domain: Some(scan_domain),
+                    feedback_scan_type: Some(value_type),
                     ..
                 } => Some(FrontendRuntimeFilterFeedbackScanBinding {
                     fragment_id: binding.fragment_id,
                     plan_node_id: binding.node_id,
                     binding_id: binding.binding_id,
-                    data_type: scan_domain.data_type.clone(),
-                    nullable: scan_domain.nullable,
+                    data_type: value_type.data_type.clone(),
+                    nullable: value_type.nullable,
                 }),
                 BindingRole::Consumer {
-                    scan_domain: None, ..
+                    feedback_scan_type: None,
+                    ..
                 }
                 | BindingRole::Producer { .. } => None,
             })
@@ -2057,7 +2040,7 @@ mod tests {
             role: BindingRole::Consumer {
                 capabilities: BTreeSet::from([Capability::Membership]),
                 activation: plan::RuntimeFilterConsumerActivation { kind: Some(kind) },
-                scan_domain: None,
+                feedback_scan_type: None,
             },
         }
     }

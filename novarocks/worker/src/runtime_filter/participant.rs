@@ -23,8 +23,7 @@ use std::sync::{Arc, Weak};
 
 use novarocks_execution::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 use novarocks_execution::runtime_filter::{
-    RuntimeFilterBindingId, RuntimeFilterChannelId, RuntimeFilterRowEffect,
-    RuntimeFilterSessionRef, scan_domain::RuntimeFilterScanUnitOutcome,
+    RuntimeFilterBindingId, RuntimeFilterChannelId, RuntimeFilterRowEffect, RuntimeFilterSessionRef,
 };
 use novarocks_types::UniqueId;
 
@@ -299,39 +298,6 @@ impl WorkerRuntimeFilterParticipant {
                 input_rows: effect.input_rows(),
                 output_rows: effect.output_rows(),
             });
-    }
-
-    pub fn record_scan_unit_outcome(
-        &self,
-        fragment_instance_id: UniqueId,
-        outcome: RuntimeFilterScanUnitOutcome,
-    ) {
-        let Some(identity) = self.consumer_identity(outcome.binding_id(), fragment_instance_id)
-        else {
-            return;
-        };
-        match outcome.evaluation() {
-            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::Evaluated {
-                decision,
-                logical_version,
-            } => self.observation.record(
-                BackendRuntimeFilterEvent::ConsumerScanUnitEvaluated {
-                    identity,
-                    logical_version,
-                    decision,
-                },
-            ),
-            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::NotEvaluated {
-                reason,
-                observed_version,
-            } => self.observation.record(
-                BackendRuntimeFilterEvent::ConsumerScanUnitNotEvaluated {
-                    identity,
-                    observed_version,
-                    reason,
-                },
-            ),
-        }
     }
 
     fn consumer_identity(

@@ -142,6 +142,7 @@ impl FileIO {
                 path: path.to_string(),
                 cache_path: String::new(),
                 cache: None,
+                known_size: None,
             });
         }
         let FileIOBackend::Native(storage) = &self.backend else {
@@ -161,6 +162,7 @@ impl FileIO {
                 .as_ref()
                 .filter(|cache| cache.is_cacheable(path))
                 .cloned(),
+            known_size: None,
         })
     }
 
@@ -594,6 +596,7 @@ enum InputFileReader {
         backend: Arc<dyn ReadOnlyFileIO>,
         control: Arc<dyn ReadControl>,
         path: String,
+        known_size: Option<u64>,
     },
 }
 
@@ -625,6 +628,7 @@ impl FileRead for InputFileReader {
                 backend,
                 control,
                 path,
+                known_size,
             } => {
                 control.check_active()?;
                 let requested =
@@ -634,8 +638,10 @@ impl FileRead for InputFileReader {
                         .ok_or_else(|| Error::ConfigInvalid {
                             message: "read range end precedes start".to_string(),
                         })?;
-                let bytes = backend.read(path, range).await?;
-                if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > requested {
+                let bytes = backend.read(path, range, *known_size).await?;
+                // A short range is as wrong as a long one: it would be decoded
+                // as if it were the requested bytes.
+                if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != requested {
                     return Err(Error::DataInvalid {
                         message: format!(
                             "host read-only FileIO returned {} bytes for a {requested}-byte range",
@@ -767,6 +773,8 @@ pub struct InputFile {
     path: String,
     cache_path: String,
     cache: Option<Arc<LocalCache>>,
+    /// The object's size from frozen file metadata, when the caller has it.
+    known_size: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -784,6 +792,13 @@ enum InputFileSource {
 impl InputFile {
     pub fn location(&self) -> &str {
         &self.path
+    }
+
+    /// Declares the object's size from frozen file metadata, so a read-only
+    /// host reads its ranges without probing the size.
+    pub fn with_known_size(mut self, size: u64) -> Self {
+        self.known_size = Some(size);
+        self
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
@@ -828,14 +843,18 @@ impl InputFile {
                 }
                 InputFileSource::ReadOnly { backend, control } => {
                     control.check_active()?;
-                    let status = backend.stat(&self.path).await?;
-                    let bytes = backend.read(&self.path, 0..status.size).await?;
-                    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > status.size {
+                    // The stat's size is handed to the read, so the host does
+                    // not probe the same object a second time.
+                    let size = match self.known_size {
+                        Some(size) => size,
+                        None => backend.stat(&self.path).await?.size,
+                    };
+                    let bytes = backend.read(&self.path, 0..size, Some(size)).await?;
+                    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != size {
                         return Err(Error::DataInvalid {
                             message: format!(
-                                "host read-only FileIO returned {} bytes for a {}-byte file",
+                                "host read-only FileIO returned {} bytes for a {size}-byte file",
                                 bytes.len(),
-                                status.size
                             ),
                             source: None,
                         });
@@ -880,6 +899,7 @@ impl InputFile {
                 backend: backend.clone(),
                 control: control.clone(),
                 path: self.path.clone(),
+                known_size: self.known_size,
             });
         }
         let InputFileSource::Native { op, relative_path } = &self.source else {
@@ -939,6 +959,7 @@ impl OutputFile {
             path: self.path,
             cache_path: self.cache_path,
             cache,
+            known_size: None,
         }
     }
 
@@ -1034,7 +1055,12 @@ mod file_action_test {
             Ok(self.existing.contains(path))
         }
 
-        async fn read(&self, path: &str, _range: Range<u64>) -> crate::Result<Bytes> {
+        async fn read(
+            &self,
+            path: &str,
+            _range: Range<u64>,
+            _known_size: Option<u64>,
+        ) -> crate::Result<Bytes> {
             Err(crate::Error::IoUnsupported {
                 message: format!("test backend cannot read {path}"),
             })
@@ -2059,5 +2085,132 @@ mod input_output_test {
         assert_eq!(tables, vec!["table".to_string()]);
         drop(tables);
         assert_eq!(current.load(Ordering::Acquire), 0);
+    }
+
+    #[derive(Debug)]
+    struct PassingControl;
+
+    impl ReadControl for PassingControl {
+        fn check_active(&self) -> crate::Result<()> {
+            Ok(())
+        }
+        fn checkpoint(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A host that records what each read was told about the object's size.
+    #[derive(Debug)]
+    struct SizeRecordingFileIo {
+        bytes: Bytes,
+        /// A byte to drop from each answered range, to play a short read.
+        truncate: bool,
+        stats: std::sync::atomic::AtomicU64,
+        reads: std::sync::Mutex<Vec<(Range<u64>, Option<u64>)>>,
+    }
+
+    impl SizeRecordingFileIo {
+        fn new(bytes: &'static [u8], truncate: bool) -> Arc<Self> {
+            Arc::new(Self {
+                bytes: Bytes::from_static(bytes),
+                truncate,
+                stats: std::sync::atomic::AtomicU64::new(0),
+                reads: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn reads(&self) -> Vec<(Range<u64>, Option<u64>)> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReadOnlyFileIO for SizeRecordingFileIo {
+        async fn stat(&self, path: &str) -> crate::Result<FileStatus> {
+            self.stats.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(FileStatus {
+                size: self.bytes.len() as u64,
+                is_dir: false,
+                path: path.to_string(),
+                last_modified: None,
+            })
+        }
+
+        async fn exists(&self, _path: &str) -> crate::Result<bool> {
+            Ok(true)
+        }
+
+        async fn read(
+            &self,
+            _path: &str,
+            range: Range<u64>,
+            known_size: Option<u64>,
+        ) -> crate::Result<Bytes> {
+            self.reads.lock().unwrap().push((range.clone(), known_size));
+            let end = if self.truncate {
+                range.end - 1
+            } else {
+                range.end
+            };
+            Ok(self.bytes.slice(range.start as usize..end as usize))
+        }
+
+        async fn list(
+            &self,
+            _path: &str,
+            _recursive: bool,
+        ) -> crate::Result<crate::io::FileStatusStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frozen_size_reaches_every_ranged_read_and_a_stat_reaches_the_whole_read() {
+        let backend = SizeRecordingFileIo::new(b"paimon-bytes", false);
+        let file_io = FileIO::from_read_only(backend.clone(), Arc::new(PassingControl));
+        let path = "s3://bucket/warehouse/db.db/t/bucket-0/data-0.parquet";
+
+        let reader = file_io
+            .new_input(path)
+            .unwrap()
+            .with_known_size(12)
+            .reader()
+            .await
+            .unwrap();
+        assert_eq!(&reader.read(0..6).await.unwrap()[..], b"paimon");
+        assert_eq!(&reader.read(7..12).await.unwrap()[..], b"bytes");
+        assert_eq!(backend.stats.load(std::sync::atomic::Ordering::Acquire), 0);
+
+        // A whole-file read of an object of unknown size stats it once and
+        // hands that size to the read.
+        let whole = file_io.new_input(path).unwrap().read().await.unwrap();
+        assert_eq!(&whole[..], b"paimon-bytes");
+        assert_eq!(backend.stats.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(
+            backend.reads(),
+            vec![(0..6, Some(12)), (7..12, Some(12)), (0..12, Some(12))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_answer_shorter_than_its_range_is_refused() {
+        let backend = SizeRecordingFileIo::new(b"paimon-bytes", true);
+        let file_io = FileIO::from_read_only(backend, Arc::new(PassingControl));
+        let path = "s3://bucket/warehouse/db.db/t/bucket-0/data-0.parquet";
+        let reader = file_io
+            .new_input(path)
+            .unwrap()
+            .with_known_size(12)
+            .reader()
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.read(0..6).await,
+            Err(Error::DataInvalid { .. })
+        ));
+        assert!(matches!(
+            file_io.new_input(path).unwrap().read().await,
+            Err(Error::DataInvalid { .. })
+        ));
     }
 }

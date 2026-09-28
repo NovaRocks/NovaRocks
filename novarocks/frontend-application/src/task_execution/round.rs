@@ -516,45 +516,28 @@ impl TaskRound {
         }
         let mut report = TurnReport::default();
 
+        let mut first_ack_error = None;
         for event in self.acks.drain_events() {
             let ack = match event {
                 TaskOperationIntakeEvent::EstablishSendStarted {
                     operation_id,
                     context,
                 } => {
-                    self.execution
-                        .establish_send_started(context, operation_id)?;
+                    if let Err(error) = self.execution.establish_send_started(context, operation_id)
+                    {
+                        first_ack_error.get_or_insert(error);
+                    }
                     continue;
                 }
                 TaskOperationIntakeEvent::Acknowledgement(ack) => ack,
             };
             report.acknowledgements += 1;
-            let queued_context = self
-                .execution
-                .classify_queued_context_acknowledgement(&ack)?;
-            if queued_context == QueuedContextAcknowledgement::IgnoreOlderTransportUnknown {
-                // This fact belongs to an older transport generation. The
-                // unchanged replay and its actor authorization remain owned by
-                // the current queued generation.
-                continue;
+            if let Err(error) = self.settle_acknowledgement(&ack) {
+                first_ack_error.get_or_insert(error);
             }
-            // Before the state machine settles it: settling can fail the
-            // attempt, and an observer that learned nothing in that case would
-            // leave a blocked owner waiting for a verdict that did arrive.
-            for observer in &self.observers {
-                if let Err(error) = observer.observe_acknowledgement(&ack) {
-                    self.fail_closed_abort_operation(ack.operation_id())?;
-                    return Err(TaskExecutionError::Schedule(error));
-                }
-            }
-            if self.process_abort_ack(&ack)? {
-                continue;
-            }
-            if queued_context == QueuedContextAcknowledgement::ApplyDefinitive {
-                self.execution.acknowledge_queued_context_replay(&ack)?;
-                continue;
-            }
-            self.execution.acknowledge(&ack)?;
+        }
+        if let Some(error) = first_ack_error {
+            return Err(error);
         }
 
         for _ in 0..ABORT_EFFECTS_PER_TURN {
@@ -771,6 +754,36 @@ impl TaskRound {
         }
 
         Ok(report)
+    }
+
+    fn settle_acknowledgement(
+        &mut self,
+        ack: &OperationAcknowledgement,
+    ) -> Result<(), TaskExecutionError> {
+        let queued_context = self
+            .execution
+            .classify_queued_context_acknowledgement(ack)?;
+        if queued_context == QueuedContextAcknowledgement::IgnoreOlderTransportUnknown {
+            // This fact belongs to an older transport generation. The
+            // unchanged replay and its actor authorization remain owned by
+            // the current queued generation.
+            return Ok(());
+        }
+        // Observe before state-machine settlement: an error there may fail
+        // the attempt, but every owner still needs its exact Worker verdict.
+        for observer in &self.observers {
+            if let Err(error) = observer.observe_acknowledgement(ack) {
+                self.fail_closed_abort_operation(ack.operation_id())?;
+                return Err(TaskExecutionError::Schedule(error));
+            }
+        }
+        if self.process_abort_ack(ack)? {
+            return Ok(());
+        }
+        if queued_context == QueuedContextAcknowledgement::ApplyDefinitive {
+            return self.execution.acknowledge_queued_context_replay(ack);
+        }
+        self.execution.acknowledge(ack)
     }
 
     /// Stops input-producing pumps after the accepted root success seal while

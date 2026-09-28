@@ -53,11 +53,12 @@ fn idle_slack_is_reclaimable_but_issued_capacity_is_not() {
     assert_eq!(outcome.reclaimed_bytes, 0, "nothing is idle: {outcome:?}");
     assert_eq!(outcome.kept_for_grants_bytes, 300);
 
-    // Releasing the live bytes turns them into idle slack, which is now
-    // reclaimable without the account's cooperation.
+    // Releasing live bytes now returns most idle commitment immediately;
+    // explicit reclamation takes only the retained quantum.
     charge.release();
+    assert_eq!(work.committed_bytes(), 201);
     let outcome = work.shrink_idle(1000);
-    assert_eq!(outcome.reclaimed_bytes, 100, "{outcome:?}");
+    assert_eq!(outcome.reclaimed_bytes, 1, "{outcome:?}");
     assert_eq!(
         outcome.kept_for_grants_bytes, 200,
         "the outstanding grant still holds its share"
@@ -73,14 +74,18 @@ fn the_floor_survives_ordinary_competition() {
         .expect("work");
 
     let grant = work.request_grant(300).expect("grant");
-    drop(grant);
-    assert_eq!(work.local_free_bytes(), 300, "all of it is idle now");
-
     work.set_floor(200);
+    drop(grant);
+    assert_eq!(
+        work.local_free_bytes(),
+        200,
+        "automatic return preserves the floor"
+    );
+
     let outcome = work.shrink_idle(1000);
     assert_eq!(
-        outcome.reclaimed_bytes, 100,
-        "only what is above the floor may go: {outcome:?}"
+        outcome.reclaimed_bytes, 0,
+        "automatic return already removed all capacity above the floor: {outcome:?}"
     );
     assert_eq!(outcome.kept_for_floor_bytes, 200, "{outcome:?}");
     assert_eq!(work.committed_bytes(), 200, "the floor is still held");

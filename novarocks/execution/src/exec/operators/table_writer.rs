@@ -69,7 +69,7 @@ use crate::exec::node::table_writer::{
 use crate::exec::operators::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::pipeline::async_writer::{AsyncWriterOwner, AsyncWriterQueueConfig};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
@@ -598,8 +598,8 @@ impl Operator for TableWriterOperator {
                 && !self.writer.has_output())
     }
 
-    fn pending_finish(&self) -> bool {
-        match self.state {
+    fn pending_finish(&self) -> Option<FinishWatch> {
+        let pending = match self.state {
             TableWriterState::Draining => {
                 self.partial_child_finished()
                     && !self.partial_output_available()
@@ -608,6 +608,17 @@ impl Operator for TableWriterOperator {
             TableWriterState::Aborting => !self.writer.is_done() || !self.writer.actor_exited(),
             TableWriterState::Failed | TableWriterState::Finished => !self.writer.actor_exited(),
             TableWriterState::Open | TableWriterState::Producing => false,
+        };
+        if !pending {
+            None
+        } else if self.writer.is_done() && !self.writer.actor_exited() {
+            // Terminal publication can precede the executor wrapper's exit,
+            // which has no completion observable of its own.
+            Some(FinishWatch::RecheckAfter(std::time::Duration::from_millis(
+                1,
+            )))
+        } else {
+            Some(FinishWatch::Notify(Arc::clone(&self.readiness_observable)))
         }
     }
 
@@ -1398,8 +1409,6 @@ pub(crate) mod tests {
             crate::runtime::ExecutionRuntime::new(
                 crate::runtime::ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    scan_threads: 1,
-                    scan_queue_capacity: 8,
                     spill_io_threads: 1,
                     spill_io_queue_capacity: 8,
                     spill_storage:
@@ -1411,9 +1420,6 @@ pub(crate) mod tests {
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1024,
                     local_exchange_max_buffered_rows: 1024,
-                    connector_io_tasks_per_scan_operator: 1,
-                    scan_submit_fail_max: 1,
-                    scan_submit_fail_timeout_ms: 1,
                     runtime_filter_scan_wait_time_ms_override: None,
                     runtime_filter_wait_timeout_ms_override: None,
                     sink_io_worker_threads: 1,
@@ -1434,7 +1440,6 @@ pub(crate) mod tests {
             None,
             None,
             Some(runtime),
-            None,
         )
     }
 
@@ -2182,7 +2187,7 @@ pub(crate) mod tests {
         ));
         operator.cancel();
         assert!(poll_until(
-            || !operator.pending_finish(),
+            || operator.pending_finish().is_none(),
             Duration::from_secs(5)
         ));
     }
@@ -2201,7 +2206,7 @@ pub(crate) mod tests {
 
         assert_eq!(stats.opened.load(Ordering::Acquire), 0);
         assert!(operator.is_finished());
-        assert!(!operator.pending_finish());
+        assert!(operator.pending_finish().is_none());
     }
 
     #[test]
@@ -2517,7 +2522,7 @@ pub(crate) mod tests {
             .expect("second input page");
         ProcessorOperator::set_finishing(&mut operator, &state).expect("finish");
         assert!(
-            !operator.pending_finish(),
+            operator.pending_finish().is_none(),
             "pending partial output must remain dataflow-drivable while the writer finishes"
         );
         let mut outputs = vec![first, second];
@@ -3273,7 +3278,7 @@ pub(crate) mod tests {
 
         abort_gate.notify_one();
         assert!(poll_until(
-            || task.pending_finish_complete(),
+            || !task.has_pending_finish(),
             Duration::from_secs(5)
         ));
         assert!(
@@ -3308,10 +3313,13 @@ pub(crate) mod tests {
         writer.state = TableWriterState::Finished;
 
         assert!(writer.is_finished(), "semantic output has finished");
-        assert!(writer.pending_finish(), "live actor prevents actual stop");
+        assert!(
+            writer.pending_finish().is_some(),
+            "live actor prevents actual stop"
+        );
         gate.add_permits(1);
         assert!(poll_until(
-            || !writer.pending_finish(),
+            || writer.pending_finish().is_none(),
             Duration::from_secs(5)
         ));
     }

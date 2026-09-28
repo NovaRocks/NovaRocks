@@ -80,8 +80,6 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         preparation_limits: novarocks_worker::TaskPreparationLimits::default(),
         execution_runtime_config: ExecutionRuntimeConfig {
             driver_threads: 1,
-            scan_threads: 1,
-            scan_queue_capacity: 1,
             spill_io_threads: 1,
             spill_io_queue_capacity: 1,
             spill_storage: ExecutionSpillStorageConfig::default(),
@@ -92,9 +90,6 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             operator_buffer_chunks: 1,
             local_exchange_buffer_mem_limit_per_driver: 1,
             local_exchange_max_buffered_rows: -1,
-            connector_io_tasks_per_scan_operator: 1,
-            scan_submit_fail_max: 1,
-            scan_submit_fail_timeout_ms: 1,
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,
@@ -102,6 +97,8 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         },
         catalog_manager_config: novarocks_worker::CatalogManagerConfig::default(),
         scan_preparation_config: novarocks_worker::ScanPreparationConfig::default(),
+        scan_stream_runtime:
+            novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
         execution_role_binding_factories: Vec::new(),
     }
 }

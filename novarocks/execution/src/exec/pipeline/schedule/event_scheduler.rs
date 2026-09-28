@@ -20,6 +20,8 @@
 //! - Associates dependency events with blocked driver keys and wake-up queues.
 //! - Coalesces notifications and returns blocked tasks to worker threads.
 //! - Filters stale observable identity/generation events without polling operators.
+//! - Holds drivers in `PendingFinish` until a finish watch fires or a requested
+//!   recheck is due.
 //!
 //! Key exported interfaces:
 //! - Types: `DriverKey`, `EventScheduler`.
@@ -38,9 +40,15 @@ use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::global_driver_executor::{DriverTask, ExecutorShared};
 use crate::exec::pipeline::operator::{BlockedReason, DriverBlockDeadline};
 use crate::exec::pipeline::schedule::observer::{Observable, PipelineObserver};
+use crate::runtime::dispatch_metrics::{
+    DispatchTransition, StaleDispatchEvent, observe_dispatch, observe_stale_dispatch,
+};
 use tracing::debug;
 
 const EVENT_SCHEDULER_LOG_EVERY: u64 = 1024;
+/// Deadline token of a pending-finish recheck. Operator block deadlines carry
+/// their operator's token; this one belongs to the driver.
+const PENDING_FINISH_RECHECK_TOKEN: u64 = u64::MAX;
 static EVENT_SCHEDULER_MISSING_OBS_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static EVENT_SCHEDULER_BLOCKED_ADD_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -60,6 +68,10 @@ pub(crate) struct DriverKey {
 struct BlockedTask {
     task: DriverTask,
     observable: Option<(Weak<Observable>, u64)>,
+    /// Terminal operator's early-finish observable and the generation sampled
+    /// before the driver last checked whether it was finished. A newer
+    /// generation wakes the driver whatever it is otherwise waiting for.
+    terminal: Option<(Weak<Observable>, u64)>,
     block_epoch: u64,
 }
 
@@ -99,9 +111,18 @@ impl DeadlineIndexEntry {
 
 struct RescheduleState {
     queue: VecDeque<DriverKey>,
-    pending: HashSet<DriverKey>,
+    /// Keys queued for rescheduling, with when their earliest coalesced
+    /// wake-up became effective.
+    pending: HashMap<DriverKey, WakeOrigin>,
     deadlines: HashMap<DriverKey, ScheduledDeadline>,
     deadline_index: BTreeSet<DeadlineIndexEntry>,
+}
+
+/// When and why a queued key's wake-up became effective.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WakeOrigin {
+    at: Instant,
+    transition: DispatchTransition,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,16 +135,29 @@ impl RescheduleState {
     fn new() -> Self {
         Self {
             queue: VecDeque::new(),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
             deadlines: HashMap::new(),
             deadline_index: BTreeSet::new(),
         }
     }
 
     fn enqueue(&mut self, key: DriverKey) -> bool {
-        if !self.pending.insert(key) {
+        self.enqueue_from(
+            key,
+            WakeOrigin {
+                at: Instant::now(),
+                transition: DispatchTransition::WakeToEnqueue,
+            },
+        )
+    }
+
+    /// Queues `key` unless it is queued already; a coalesced wake-up keeps
+    /// the earlier origin.
+    fn enqueue_from(&mut self, key: DriverKey, origin: WakeOrigin) -> bool {
+        if self.pending.contains_key(&key) {
             return false;
         }
+        self.pending.insert(key, origin);
         self.queue.push_back(key);
         true
     }
@@ -345,6 +379,56 @@ impl EventDispatcherState {
         queues.unregister(scheduler_id);
         self.wake_cv.notify_one();
     }
+
+    fn registered_schedulers(&self) -> Vec<Arc<EventScheduler>> {
+        self.queues
+            .lock()
+            .expect("event dispatcher queue lock")
+            .registered
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+
+    fn close_and_drain(&self) -> Vec<DriverTask> {
+        if self.shutdown.swap(true, Ordering::AcqRel) {
+            return Vec::new();
+        }
+        let schedulers = {
+            let mut queues = self.queues.lock().expect("event dispatcher queue lock");
+            let schedulers = queues.registered.values().cloned().collect::<Vec<_>>();
+            queues.registered.clear();
+            queues.ready.clear();
+            queues.ready_pending.clear();
+            queues.deadlines.clear();
+            queues.deadline_index.clear();
+            schedulers
+        };
+        self.wake_cv.notify_all();
+        schedulers
+            .into_iter()
+            .filter_map(|scheduler| scheduler.upgrade())
+            .flat_map(|scheduler| scheduler.shutdown_and_take_blocked())
+            .collect()
+    }
+}
+
+/// The dispatcher thread together with the duty to close it, handed to the
+/// executor reaper so the dispatcher outlives every driver that may still
+/// wait on it.
+pub(crate) struct EventDispatcherCloser {
+    state: Arc<EventDispatcherState>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl EventDispatcherCloser {
+    /// Closes the dispatcher, joins its thread and returns drivers that were
+    /// still parked on it.
+    pub(crate) fn close_and_join(self) -> Vec<DriverTask> {
+        let tasks = self.state.close_and_drain();
+        let _ = self.thread.join();
+        tasks
+    }
 }
 
 /// One process-runtime scheduler thread for every fragment's blocked-driver
@@ -389,43 +473,38 @@ impl EventDispatcher {
             .len()
     }
 
+    #[cfg(test)]
     pub(crate) fn close_and_drain(&self) -> Vec<DriverTask> {
-        if self.state.shutdown.swap(true, Ordering::AcqRel) {
-            return Vec::new();
-        }
-        let schedulers = {
-            let mut queues = self
-                .state
-                .queues
-                .lock()
-                .expect("event dispatcher queue lock");
-            let schedulers = queues.registered.values().cloned().collect::<Vec<_>>();
-            queues.registered.clear();
-            queues.ready.clear();
-            queues.ready_pending.clear();
-            queues.deadlines.clear();
-            queues.deadline_index.clear();
-            schedulers
-        };
-        self.state.wake_cv.notify_all();
-        schedulers
-            .into_iter()
-            .filter_map(|scheduler| scheduler.upgrade())
-            .flat_map(|scheduler| scheduler.shutdown_and_take_blocked())
-            .collect()
+        self.state.close_and_drain()
     }
 
-    pub(crate) fn take_thread(&self) -> Option<thread::JoinHandle<()>> {
-        self.thread
+    /// Wakes every parked driver of every attached fragment once, so each
+    /// observes a state change on a worker.
+    pub(crate) fn wake_all_blocked(&self) {
+        for scheduler in self.state.registered_schedulers() {
+            scheduler.enqueue_all_blocked();
+        }
+    }
+
+    /// Hands the dispatcher thread and its closing to the caller; `None` once
+    /// they were handed out.
+    pub(crate) fn take_closer(&self) -> Option<EventDispatcherCloser> {
+        let thread = self
+            .thread
             .lock()
             .expect("event dispatcher thread lock")
-            .take()
+            .take()?;
+        Some(EventDispatcherCloser {
+            state: Arc::clone(&self.state),
+            thread,
+        })
     }
 
+    /// Closes and joins the dispatcher unless its closer was handed out, in
+    /// which case closing belongs to whoever took it.
     pub(crate) fn shutdown_and_join(&self) {
-        let _ = self.close_and_drain();
-        if let Some(thread) = self.take_thread() {
-            let _ = thread.join();
+        if let Some(closer) = self.take_closer() {
+            let _ = closer.close_and_join();
         }
     }
 
@@ -611,10 +690,17 @@ impl EventScheduler {
         let Some(entry) = blocked.get(&key) else {
             return;
         };
-        let Some((current_observable, blocked_generation)) = &entry.observable else {
-            return;
+        let newer_than = |recorded: &Option<(Weak<Observable>, u64)>| {
+            recorded
+                .as_ref()
+                .is_some_and(|(current, blocked_generation)| {
+                    Weak::ptr_eq(current, observable) && generation > *blocked_generation
+                })
         };
-        if !Weak::ptr_eq(current_observable, observable) || generation <= *blocked_generation {
+        if !newer_than(&entry.observable) && !newer_than(&entry.terminal) {
+            // A delayed callback for a transition the parked driver already
+            // observed before it parked.
+            observe_stale_dispatch(StaleDispatchEvent::Notification);
             return;
         }
         let mut state = self
@@ -678,6 +764,90 @@ impl EventScheduler {
         }
     }
 
+    /// Whether the executor stopped admitting drivers. Read under the blocked
+    /// lock by every parking path: the executor closes admission before it
+    /// wakes all parked drivers, so a driver parking concurrently either sees
+    /// the closure here or is woken by that pass.
+    fn executor_closing(&self) -> bool {
+        self.shared
+            .get()
+            .is_some_and(|shared| shared.admission_closed.load(Ordering::Acquire))
+    }
+
+    /// Parks a driver whose asynchronous owners still hold finish work until
+    /// one of their finish watches fires or a requested recheck is due.
+    ///
+    /// The pending question is asked here, on the worker, before any
+    /// scheduler lock is taken. A driver whose work ended meanwhile goes
+    /// straight back to a worker to complete.
+    pub(crate) fn add_pending_finish(
+        self: &Arc<Self>,
+        mut task: DriverTask,
+    ) -> Result<(), Box<DriverTask>> {
+        let Some(wait) = task.refresh_pending_finish_wait() else {
+            task.set_ready();
+            self.enqueue_ready(task);
+            return Ok(());
+        };
+        let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
+        let block_epoch = self
+            .next_block_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.register_finish_observer(&task, Arc::clone(&wait.observable));
+        let wake_now = {
+            let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(Box::new(task));
+            }
+            blocked.insert(
+                key,
+                BlockedTask {
+                    task,
+                    observable: Some((Arc::downgrade(&wait.observable), wait.generation)),
+                    terminal: None,
+                    block_epoch,
+                },
+            );
+            let entry = blocked.get(&key).expect("blocked task was just inserted");
+            entry.task.set_in_blocked(true);
+            // A driver whose operators have not heard of an abort yet needs a
+            // turn to deliver it. One that already did only waits for its
+            // owners: another abort turn would change nothing.
+            let wake_now = (entry.task.should_abort_immediately() || self.executor_closing())
+                && !entry.task.operator_terminal_signal_delivered();
+            if let Some(at) = wait.recheck_at {
+                let mut state = self
+                    .reschedule_queue
+                    .lock()
+                    .expect("event scheduler queue lock");
+                state.install_deadline(
+                    key,
+                    ScheduledDeadline {
+                        at,
+                        operator_token: PENDING_FINISH_RECHECK_TOKEN,
+                        block_epoch,
+                    },
+                );
+                self.deadline_generation.fetch_add(1, Ordering::AcqRel);
+                drop(state);
+                self.notify_dispatcher();
+            }
+            wake_now
+        };
+        if wake_now {
+            self.enqueue(key);
+        } else {
+            // A finish published between the question and parking.
+            self.enqueue_observable(
+                key,
+                &Arc::downgrade(&wait.observable),
+                wait.observable.generation(),
+            );
+        }
+        Ok(())
+    }
+
     fn park_blocked(
         self: &Arc<Self>,
         task: DriverTask,
@@ -696,6 +866,12 @@ impl EventScheduler {
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
         self.register_observer(&task, &reason, Arc::clone(&observable));
+        let terminal = task
+            .blocked_terminal_snapshot()
+            .filter(|(terminal, _)| !Arc::ptr_eq(terminal, &observable));
+        if let Some((terminal, _)) = terminal.as_ref() {
+            self.register_terminal_observer(&task, Arc::clone(terminal));
+        }
         let aborted = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             if self.shutdown.load(Ordering::Acquire) {
@@ -706,12 +882,15 @@ impl EventScheduler {
                 BlockedTask {
                     task,
                     observable: Some((Arc::downgrade(&observable), generation)),
+                    terminal: terminal
+                        .as_ref()
+                        .map(|(terminal, generation)| (Arc::downgrade(terminal), *generation)),
                     block_epoch,
                 },
             );
             let entry = blocked.get(&key).expect("blocked task was just inserted");
             entry.task.set_in_blocked(true);
-            let aborted = entry.task.should_abort_immediately();
+            let aborted = entry.task.should_abort_immediately() || self.executor_closing();
             if let Some(deadline) = deadline {
                 let mut state = self
                     .reschedule_queue
@@ -754,6 +933,9 @@ impl EventScheduler {
         } else {
             let current_generation = observable.generation();
             self.enqueue_observable(key, &Arc::downgrade(&observable), current_generation);
+            if let Some((terminal, _)) = terminal.as_ref() {
+                self.enqueue_observable(key, &Arc::downgrade(terminal), terminal.generation());
+            }
         }
         Ok(())
     }
@@ -768,6 +950,10 @@ impl EventScheduler {
             .next_block_epoch
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
+        let terminal = task.blocked_terminal_snapshot();
+        if let Some((terminal, _)) = terminal.as_ref() {
+            self.register_terminal_observer(&task, Arc::clone(terminal));
+        }
         let aborted = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             if self.shutdown.load(Ordering::Acquire) {
@@ -778,12 +964,15 @@ impl EventScheduler {
                 BlockedTask {
                     task,
                     observable: None,
+                    terminal: terminal
+                        .as_ref()
+                        .map(|(terminal, generation)| (Arc::downgrade(terminal), *generation)),
                     block_epoch,
                 },
             );
             let entry = blocked.get(&key).expect("blocked task was just inserted");
             entry.task.set_in_blocked(true);
-            entry.task.should_abort_immediately()
+            entry.task.should_abort_immediately() || self.executor_closing()
         };
         let scheduler = Arc::downgrade(self);
         let dep_name = dep.name().to_string();
@@ -801,8 +990,46 @@ impl EventScheduler {
         }));
         if aborted {
             self.enqueue(key);
+        } else if let Some((terminal, _)) = terminal.as_ref() {
+            self.enqueue_observable(key, &Arc::downgrade(terminal), terminal.generation());
         }
         Ok(())
+    }
+
+    /// Watches a driver's finish observable while it waits in `PendingFinish`.
+    /// Registration is once per driver and observable identity.
+    fn register_finish_observer(self: &Arc<Self>, task: &DriverTask, observable: Arc<Observable>) {
+        if !task.try_mark_finish_observer_registered(&observable) {
+            return;
+        }
+        let observer = Arc::new(PipelineObserver::new(
+            Arc::downgrade(self),
+            Arc::downgrade(&observable),
+            DriverKey::new(task.fragment_instance_id(), task.driver_id()),
+            task.driver_id(),
+            task.fragment_instance_id(),
+        ));
+        self.add_observer(observable, observer, ObserverKind::Finish);
+    }
+
+    /// Watches a terminal operator's early-finish observable for a parked
+    /// driver. Registration is once per driver and observable identity.
+    fn register_terminal_observer(
+        self: &Arc<Self>,
+        task: &DriverTask,
+        observable: Arc<Observable>,
+    ) {
+        if !task.try_mark_sink_observer_registered(&observable) {
+            return;
+        }
+        let observer = Arc::new(PipelineObserver::new(
+            Arc::downgrade(self),
+            Arc::downgrade(&observable),
+            DriverKey::new(task.fragment_instance_id(), task.driver_id()),
+            task.driver_id(),
+            task.fragment_instance_id(),
+        ));
+        self.add_observer(observable, observer, ObserverKind::Sink);
     }
 
     fn register_observer(
@@ -848,6 +1075,10 @@ impl EventScheduler {
             ObserverKind::Sink => {
                 let observer = Arc::clone(&observer);
                 Arc::new(move || observer.sink_trigger())
+            }
+            ObserverKind::Finish => {
+                let observer = Arc::clone(&observer);
+                Arc::new(move || observer.finish_trigger())
             }
         };
         observable.add_observer(callback);
@@ -902,9 +1133,11 @@ impl EventScheduler {
     fn enqueue_due_deadline(&self, key: DriverKey, block_epoch: u64, operator_token: u64) {
         let blocked = self.blocked.lock().expect("event scheduler blocked lock");
         let Some(entry) = blocked.get(&key) else {
+            observe_stale_dispatch(StaleDispatchEvent::Deadline);
             return;
         };
         if entry.block_epoch != block_epoch {
+            observe_stale_dispatch(StaleDispatchEvent::Deadline);
             return;
         }
         let mut state = self
@@ -912,17 +1145,23 @@ impl EventScheduler {
             .lock()
             .expect("event scheduler queue lock");
         let Some(deadline) = state.deadlines.get(&key).copied() else {
+            observe_stale_dispatch(StaleDispatchEvent::Deadline);
             return;
         };
         if deadline.block_epoch != block_epoch
             || deadline.operator_token != operator_token
             || deadline.at > Instant::now()
         {
+            observe_stale_dispatch(StaleDispatchEvent::Deadline);
             return;
         }
         state.remove_deadline(key);
         self.deadline_generation.fetch_add(1, Ordering::AcqRel);
-        if state.enqueue(key) {
+        let origin = WakeOrigin {
+            at: deadline.at,
+            transition: DispatchTransition::DeadlineToEnqueue,
+        };
+        if state.enqueue_from(key, origin) {
             drop(state);
             self.notify_dispatcher();
         }
@@ -958,11 +1197,11 @@ impl EventScheduler {
                 .reschedule_queue
                 .lock()
                 .expect("event scheduler queue lock");
-            state.pending.remove(&key);
+            let origin = state.pending.remove(&key);
             if state.remove_deadline(key).is_some() {
                 self.deadline_generation.fetch_add(1, Ordering::AcqRel);
             }
-            (entry.map(|entry| entry.task), exchange_marker)
+            (entry.map(|entry| (entry.task, origin)), exchange_marker)
         };
         if let Some((blocked_generation, current_generation, block_epoch)) = exchange_marker {
             crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
@@ -972,19 +1211,23 @@ impl EventScheduler {
                 )
             });
         }
-        let Some(mut task) = task else {
+        let Some((mut task, origin)) = task else {
             return;
         };
         task.set_ready();
         task.set_in_blocked(false);
         self.enqueue_ready(task);
+        if let Some(origin) = origin {
+            observe_dispatch(origin.transition, origin.at.elapsed());
+        }
     }
 
-    fn enqueue_ready(&self, task: DriverTask) {
+    fn enqueue_ready(&self, mut task: DriverTask) {
         let Some(shared) = self.shared.get() else {
             debug!("EventScheduler enqueue_ready: executor not attached");
             return;
         };
+        task.mark_queued();
         let mut queue = shared.queue.lock().expect("global executor queue lock");
         queue.push_back(task);
         shared.cv.notify_one();
@@ -994,20 +1237,21 @@ impl EventScheduler {
 enum ObserverKind {
     Source,
     Sink,
+    Finish,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use crate::exec::chunk::Chunk;
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::exec::pipeline::fragment_context::FragmentContext;
     use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
-    use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+    use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator};
     use crate::runtime::runtime_state::RuntimeState;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn deadline_index_replace_remove_and_clear_leave_no_stale_entries() {
@@ -1301,13 +1545,7 @@ mod tests {
         let completion = FragmentCompletion::new(1);
         let task = DriverTask::new(driver, completion, fragment_ctx, Duration::from_millis(10));
         let scheduler = Arc::new(EventScheduler::new());
-        let executor = Arc::new(ExecutorShared {
-            queue: Mutex::new(VecDeque::new()),
-            cv: Condvar::new(),
-            admission_closed: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
-            live_workers: AtomicUsize::new(0),
-        });
+        let executor = Arc::new(ExecutorShared::new());
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
 
         assert!(
@@ -1333,6 +1571,677 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A terminal sink that can finish without a turn of its own driver, as a
+    /// local-exchange sink does when all of its consumers leave.
+    struct EarlyFinishSink {
+        finished: Arc<AtomicBool>,
+        capacity: Arc<Observable>,
+        early_finish: Arc<Observable>,
+    }
+
+    impl Operator for EarlyFinishSink {
+        fn name(&self) -> &str {
+            "EARLY_FINISH_SINK"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished.load(Ordering::Acquire)
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for EarlyFinishSink {
+        fn need_input(&self) -> bool {
+            !self.is_finished()
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.capacity))
+        }
+
+        fn early_finish_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.early_finish))
+        }
+    }
+
+    struct EarlyFinishHarness {
+        scheduler: Arc<EventScheduler>,
+        executor: Arc<ExecutorShared>,
+        finished: Arc<AtomicBool>,
+        source_observable: Arc<Observable>,
+        early_finish: Arc<Observable>,
+        driver: Option<PipelineDriver>,
+        runtime_state: Arc<RuntimeState>,
+    }
+
+    fn input_empty_driver_with_early_finish_sink() -> EarlyFinishHarness {
+        let finished = Arc::new(AtomicBool::new(false));
+        let source_observable = Arc::new(Observable::new());
+        let early_finish = Arc::new(Observable::new());
+        let runtime_state = Arc::new(RuntimeState::default());
+        let mut driver = PipelineDriver::new(
+            5,
+            vec![
+                Box::new(ControlledDynamicSource {
+                    ready: Arc::new(AtomicBool::new(false)),
+                    poll_forbidden: Arc::new(AtomicBool::new(false)),
+                    use_second_observable: Arc::new(AtomicBool::new(false)),
+                    first_observable: Arc::clone(&source_observable),
+                    second_observable: Arc::new(Observable::new()),
+                }),
+                Box::new(EarlyFinishSink {
+                    finished: Arc::clone(&finished),
+                    capacity: Arc::new(Observable::new()),
+                    early_finish: Arc::clone(&early_finish),
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            Some((67_300, 65_540)),
+        );
+        assert!(matches!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::Blocked(BlockedReason::InputEmpty)
+        ));
+        let scheduler = Arc::new(EventScheduler::new());
+        let executor = Arc::new(ExecutorShared::new());
+        assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
+        EarlyFinishHarness {
+            scheduler,
+            executor,
+            finished,
+            source_observable,
+            early_finish,
+            driver: Some(driver),
+            runtime_state,
+        }
+    }
+
+    impl EarlyFinishHarness {
+        fn park(&mut self) {
+            let fragment_ctx = Arc::new(FragmentContext::new(
+                None,
+                Arc::clone(&self.runtime_state),
+                Some((67_300, 65_540)),
+                None,
+                None,
+                None,
+            ));
+            let task = DriverTask::new(
+                self.driver.take().expect("driver"),
+                FragmentCompletion::new(1),
+                fragment_ctx,
+                Duration::from_millis(10),
+            );
+            assert!(
+                self.scheduler
+                    .add_blocked(task, BlockedReason::InputEmpty)
+                    .is_ok()
+            );
+        }
+
+        fn queued_wakes(&self) -> usize {
+            self.scheduler
+                .reschedule_queue
+                .lock()
+                .expect("event scheduler queue lock")
+                .queue
+                .len()
+        }
+
+        fn deliver_wakes(&self) -> usize {
+            loop {
+                let key = self
+                    .scheduler
+                    .reschedule_queue
+                    .lock()
+                    .expect("event scheduler queue lock")
+                    .queue
+                    .pop_front();
+                let Some(key) = key else {
+                    break;
+                };
+                self.scheduler.try_schedule_key(key);
+            }
+            self.executor
+                .queue
+                .lock()
+                .expect("global executor queue lock")
+                .len()
+        }
+    }
+
+    #[test]
+    fn input_empty_driver_wakes_when_its_terminal_sink_finishes_early() {
+        let mut harness = input_empty_driver_with_early_finish_sink();
+        harness.park();
+        assert_eq!(harness.queued_wakes(), 0, "nothing has happened yet");
+
+        harness.finished.store(true, Ordering::Release);
+        harness.early_finish.notify_observers();
+
+        assert_eq!(
+            harness.deliver_wakes(),
+            1,
+            "a parked driver must learn that its pipeline ended without waiting for its source"
+        );
+        assert_eq!(harness.source_observable.generation(), 0);
+        let mut task = harness
+            .executor
+            .queue
+            .lock()
+            .expect("global executor queue lock")
+            .pop_front()
+            .expect("rescheduled driver");
+        task.set_ready();
+        assert!(matches!(
+            task.process_for_test(Duration::from_millis(10)),
+            DriverState::Finished
+        ));
+    }
+
+    #[test]
+    fn early_finish_between_the_turn_and_parking_is_not_lost() {
+        let mut harness = input_empty_driver_with_early_finish_sink();
+        // The turn sampled the early-finish generation before it parked; the
+        // finish lands before the scheduler registers its observer.
+        harness.finished.store(true, Ordering::Release);
+        harness.early_finish.notify_observers();
+        harness.park();
+
+        assert_eq!(harness.deliver_wakes(), 1);
+    }
+
+    fn one_row_chunk() -> Chunk {
+        use arrow::array::{ArrayRef, Int32Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![7])) as ArrayRef],
+        )
+        .expect("record batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[novarocks_types::SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    struct DrainedSource;
+
+    impl Operator for DrainedSource {
+        fn name(&self) -> &str {
+            "DRAINED_SOURCE"
+        }
+
+        fn is_finished(&self) -> bool {
+            true
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for DrainedSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("a source accepts no input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A processor whose finishing runs asynchronously and then owes one
+    /// output chunk, like a table writer publishing its commit row.
+    struct OwingAfterFinishProcessor {
+        finishing: bool,
+        pending: Arc<AtomicBool>,
+        observable: Arc<Observable>,
+        owed: Option<Chunk>,
+    }
+
+    impl Operator for OwingAfterFinishProcessor {
+        fn name(&self) -> &str {
+            "OWING_AFTER_FINISH"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finishing && !self.pending.load(Ordering::Acquire) && self.owed.is_none()
+        }
+
+        fn pending_finish(&self) -> Option<FinishWatch> {
+            (self.finishing && self.pending.load(Ordering::Acquire))
+                .then(|| FinishWatch::Notify(Arc::clone(&self.observable)))
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for OwingAfterFinishProcessor {
+        fn need_input(&self) -> bool {
+            !self.finishing
+        }
+
+        fn has_output(&self) -> bool {
+            !self.pending.load(Ordering::Acquire) && self.owed.is_some()
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            if self.pending.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            Ok(self.owed.take())
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finishing = true;
+            Ok(())
+        }
+
+        fn source_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
+    struct CountingSink {
+        rows: Arc<AtomicUsize>,
+        finished: bool,
+        observable: Arc<Observable>,
+    }
+
+    impl Operator for CountingSink {
+        fn name(&self) -> &str {
+            "COUNTING_SINK"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for CountingSink {
+        fn need_input(&self) -> bool {
+            !self.finished
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+            self.rows.fetch_add(chunk.len(), Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finished = true;
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
+    #[test]
+    fn output_owed_after_pending_finish_reaches_the_sink_before_the_driver_ends() {
+        let pending = Arc::new(AtomicBool::new(true));
+        let owner = Arc::new(Observable::new());
+        let rows = Arc::new(AtomicUsize::new(0));
+        let runtime_state = Arc::new(RuntimeState::default());
+        let mut driver = PipelineDriver::new(
+            7,
+            vec![
+                Box::new(DrainedSource),
+                Box::new(OwingAfterFinishProcessor {
+                    finishing: false,
+                    pending: Arc::clone(&pending),
+                    observable: Arc::clone(&owner),
+                    owed: Some(one_row_chunk()),
+                }),
+                Box::new(CountingSink {
+                    rows: Arc::clone(&rows),
+                    finished: false,
+                    observable: Arc::new(Observable::new()),
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            Some((67_500, 65_550)),
+        );
+        assert!(matches!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::PendingFinish
+        ));
+
+        let scheduler = Arc::new(EventScheduler::new());
+        let executor = Arc::new(ExecutorShared::new());
+        assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
+        let fragment_ctx = Arc::new(FragmentContext::new(
+            None,
+            Arc::clone(&runtime_state),
+            Some((67_500, 65_550)),
+            None,
+            None,
+            None,
+        ));
+        let task = DriverTask::new(
+            driver,
+            FragmentCompletion::new(1),
+            fragment_ctx,
+            Duration::from_millis(10),
+        );
+        assert!(scheduler.add_pending_finish(task).is_ok());
+        let queued = |scheduler: &EventScheduler| {
+            scheduler
+                .reschedule_queue
+                .lock()
+                .expect("event scheduler queue lock")
+                .queue
+                .len()
+        };
+        assert_eq!(queued(&scheduler), 0, "nothing ended yet");
+
+        pending.store(false, Ordering::Release);
+        owner.notify_observers();
+        assert_eq!(queued(&scheduler), 1, "the owner's end wakes the driver");
+        let key = scheduler
+            .reschedule_queue
+            .lock()
+            .expect("event scheduler queue lock")
+            .queue
+            .pop_front()
+            .expect("woken driver");
+        scheduler.try_schedule_key(key);
+        let mut task = executor
+            .queue
+            .lock()
+            .expect("global executor queue lock")
+            .pop_front()
+            .expect("rescheduled driver");
+
+        assert!(matches!(
+            task.process_for_test(Duration::from_millis(10)),
+            DriverState::Finished
+        ));
+        assert_eq!(
+            rows.load(Ordering::Acquire),
+            1,
+            "the owed chunk is pushed before the driver completes"
+        );
+    }
+
+    struct EndlessSource;
+
+    impl Operator for EndlessSource {
+        fn name(&self) -> &str {
+            "ENDLESS_SOURCE"
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for EndlessSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            true
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("a source accepts no input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(Some(one_row_chunk()))
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A sink that stops after `limit` rows and then flushes asynchronously.
+    struct FlushingLimitSink {
+        rows: Arc<AtomicUsize>,
+        limit: usize,
+        flushing: Arc<AtomicBool>,
+        observable: Arc<Observable>,
+    }
+
+    impl Operator for FlushingLimitSink {
+        fn name(&self) -> &str {
+            "FLUSHING_LIMIT_SINK"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.rows.load(Ordering::Acquire) >= self.limit
+        }
+
+        fn pending_finish(&self) -> Option<FinishWatch> {
+            (self.is_finished() && self.flushing.load(Ordering::Acquire))
+                .then(|| FinishWatch::Notify(Arc::clone(&self.observable)))
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for FlushingLimitSink {
+        fn need_input(&self) -> bool {
+            !self.is_finished()
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+            self.rows.fetch_add(chunk.len(), Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
+    #[test]
+    fn a_continuously_ready_driver_still_waits_for_its_sinks_pending_finish() {
+        let rows = Arc::new(AtomicUsize::new(0));
+        let flushing = Arc::new(AtomicBool::new(true));
+        let mut driver = PipelineDriver::new(
+            9,
+            vec![
+                Box::new(EndlessSource),
+                Box::new(FlushingLimitSink {
+                    rows: Arc::clone(&rows),
+                    limit: 3,
+                    flushing: Arc::clone(&flushing),
+                    observable: Arc::new(Observable::new()),
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            Some((67_700, 65_570)),
+        );
+
+        // The source never runs dry, so nothing but the finished sink ends
+        // the turn: it must end in PendingFinish, not Ready.
+        assert!(matches!(
+            driver.process(Duration::from_secs(5)),
+            DriverState::PendingFinish
+        ));
+        assert_eq!(rows.load(Ordering::Acquire), 3);
+        assert!(driver.pending_finish_wait_on_worker().is_some());
+
+        flushing.store(false, Ordering::Release);
+        assert!(driver.pending_finish_wait_on_worker().is_none());
+        assert!(matches!(
+            driver.process(Duration::from_secs(5)),
+            DriverState::Finished
+        ));
+        assert_eq!(rows.load(Ordering::Acquire), 3, "no row after the limit");
+    }
+
+    #[test]
+    fn pending_work_that_ended_before_parking_goes_straight_back_to_a_worker() {
+        let pending = Arc::new(AtomicBool::new(true));
+        let rows = Arc::new(AtomicUsize::new(0));
+        let runtime_state = Arc::new(RuntimeState::default());
+        let mut driver = PipelineDriver::new(
+            8,
+            vec![
+                Box::new(DrainedSource),
+                Box::new(OwingAfterFinishProcessor {
+                    finishing: false,
+                    pending: Arc::clone(&pending),
+                    observable: Arc::new(Observable::new()),
+                    owed: None,
+                }),
+                Box::new(CountingSink {
+                    rows,
+                    finished: false,
+                    observable: Arc::new(Observable::new()),
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            Some((67_600, 65_560)),
+        );
+        assert!(matches!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::PendingFinish
+        ));
+        // The work ends between the turn and parking, without a notification
+        // the scheduler could still observe.
+        pending.store(false, Ordering::Release);
+
+        let scheduler = Arc::new(EventScheduler::new());
+        let executor = Arc::new(ExecutorShared::new());
+        assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
+        let task = DriverTask::new(
+            driver,
+            FragmentCompletion::new(1),
+            Arc::new(FragmentContext::new(
+                None,
+                runtime_state,
+                Some((67_600, 65_560)),
+                None,
+                None,
+                None,
+            )),
+            Duration::from_millis(10),
+        );
+        assert!(scheduler.add_pending_finish(task).is_ok());
+        assert!(scheduler.blocked.lock().expect("blocked lock").is_empty());
+        let mut task = executor
+            .queue
+            .lock()
+            .expect("global executor queue lock")
+            .pop_front()
+            .expect("driver handed back to a worker");
+        assert!(matches!(
+            task.process_for_test(Duration::from_millis(10)),
+            DriverState::Finished
+        ));
     }
 
     #[test]
@@ -1381,13 +2290,7 @@ mod tests {
             Duration::from_millis(10),
         );
         let scheduler = Arc::new(EventScheduler::new());
-        let executor = Arc::new(ExecutorShared {
-            queue: Mutex::new(VecDeque::new()),
-            cv: Condvar::new(),
-            admission_closed: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
-            live_workers: AtomicUsize::new(0),
-        });
+        let executor = Arc::new(ExecutorShared::new());
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
 
         let reason = match task.process_for_test(Duration::from_millis(10)) {
@@ -1441,7 +2344,7 @@ mod tests {
                 state.queue.is_empty(),
                 "a notification in the pop-to-remove gap must join the pending wake-up"
             );
-            assert!(state.pending.contains(&key));
+            assert!(state.pending.contains_key(&key));
         }
         scheduler.try_schedule_key(key);
 
@@ -1566,13 +2469,7 @@ mod tests {
             state => panic!("expected input-empty block, got {state:?}"),
         };
         let scheduler = Arc::new(EventScheduler::new());
-        let executor = Arc::new(ExecutorShared {
-            queue: Mutex::new(VecDeque::new()),
-            cv: Condvar::new(),
-            admission_closed: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
-            live_workers: AtomicUsize::new(0),
-        });
+        let executor = Arc::new(ExecutorShared::new());
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
         assert!(scheduler.add_blocked(task, reason).is_ok());
         let key = DriverKey::new(Some((93_001, 93_002)), 19);
@@ -1703,16 +2600,7 @@ mod tests {
         };
         let scheduler = Arc::new(EventScheduler::new());
         let dispatcher = EventDispatcher::new();
-        scheduler.attach_executor(
-            Arc::new(ExecutorShared {
-                queue: Mutex::new(VecDeque::new()),
-                cv: Condvar::new(),
-                admission_closed: AtomicBool::new(false),
-                shutdown: AtomicBool::new(false),
-                live_workers: AtomicUsize::new(0),
-            }),
-            &dispatcher,
-        );
+        scheduler.attach_executor(Arc::new(ExecutorShared::new()), &dispatcher);
         assert!(scheduler.add_blocked(task, reason).is_ok());
         let scheduler_id = scheduler
             .dispatcher
@@ -1771,13 +2659,7 @@ mod tests {
     #[test]
     fn dispatcher_visits_only_the_scheduler_that_was_marked_ready() {
         let dispatcher = EventDispatcher::new();
-        let executor = Arc::new(ExecutorShared {
-            queue: Mutex::new(VecDeque::new()),
-            cv: Condvar::new(),
-            admission_closed: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
-            live_workers: AtomicUsize::new(0),
-        });
+        let executor = Arc::new(ExecutorShared::new());
         let idle = (0..512)
             .map(|_| {
                 let scheduler = Arc::new(EventScheduler::new());

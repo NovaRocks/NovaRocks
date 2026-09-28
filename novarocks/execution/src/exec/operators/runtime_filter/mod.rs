@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::runtime_filter as execution;
@@ -26,8 +26,11 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
 };
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    DriverBlockDeadline, Operator, ProcessorOperator, forward_observable,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::compute::filter_record_batch;
@@ -85,40 +88,6 @@ impl Clone for NativeOrderedLiveConsumerSet {
     reason = "Ordered live-consumer helpers remain available for native scan integration paths."
 )]
 impl NativeOrderedLiveConsumerSet {
-    #[expect(
-        clippy::type_complexity,
-        reason = "The return value preserves each scan-domain binding with its independently optional snapshot."
-    )]
-    pub(crate) fn scan_domain_snapshots(
-        &self,
-    ) -> Result<
-        Vec<(
-            execution::scan_domain::RuntimeFilterScanDomainBinding,
-            Option<Arc<execution::RuntimeFilterSnapshot>>,
-        )>,
-        String,
-    > {
-        self.poll_updates()?;
-        let bindings = self
-            .inner
-            .bindings
-            .lock()
-            .expect("native ordered RF consumer lock");
-        Ok(bindings
-            .iter()
-            .filter_map(|binding| {
-                let target = binding.spec.scan_domain.clone()?;
-                let snapshot = match &binding.state {
-                    NativeOrderedLiveBindingState::BoundExecutionLive {
-                        latest_snapshot, ..
-                    } => latest_snapshot.clone(),
-                    _ => None,
-                };
-                Some((target, snapshot))
-            })
-            .collect())
-    }
-
     pub(crate) fn from_plan(
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
@@ -408,6 +377,31 @@ impl NativeOrderedLiveConsumerSet {
     }
 }
 
+/// Deadline token of a consumer set's gate wait. The wait is frozen once per
+/// set, so one token distinguishes it from a consumer's own block deadlines.
+const RUNTIME_FILTER_GATE_DEADLINE_TOKEN: u64 = u64::MAX - 1;
+
+/// What a consumer's input must wait for before it may pass the runtime
+/// filters of its consumer set.
+pub(crate) enum RuntimeFilterGate {
+    /// Every blocking binding reached its outcome; input may pass.
+    Open,
+    /// A blocking binding is still pending, at most until
+    /// [`RuntimeFilterConsumerSet::gate_deadline`]. A publication notifies
+    /// [`RuntimeFilterConsumerSet::gate_observable`]; a consumer forwards
+    /// that into the observable its driver parks on, whose generation the
+    /// driver samples before it asks.
+    Pending,
+}
+
+/// Runtime filters one consumer applies to its input, shared by every driver
+/// of that consumer.
+///
+/// Blocking-snapshot bindings hold input back behind one gate. The gate's
+/// wait starts when a driver first has real input at hand and lasts at most
+/// the configured timeout for the whole set: later touches, by any driver,
+/// share that deadline. Nothing blocks a thread; a pending gate is waited on
+/// through its observable and deadline.
 #[derive(Clone)]
 pub(crate) struct RuntimeFilterConsumerSet {
     inner: Arc<NativeConsumerInner>,
@@ -416,16 +410,20 @@ pub(crate) struct RuntimeFilterConsumerSet {
 struct NativeConsumerInner {
     arena: Arc<ExprArena>,
     bindings: Mutex<Vec<NativeConsumerBinding>>,
-    acquire_phase: Mutex<NativeConsumerAcquirePhase>,
-    acquire_ready: Condvar,
+    gate: Mutex<NativeConsumerGate>,
+    /// Notified when a blocking binding's outcome is published.
+    gate_observable: Arc<Observable>,
     wait_timeout: Mutex<Duration>,
 }
 
-enum NativeConsumerAcquirePhase {
-    Pending,
-    Acquiring,
-    Complete,
-    Failed(String),
+enum NativeConsumerGate {
+    /// No input reached the gate yet; its wait has not started.
+    Idle,
+    /// Input is held back until every blocking binding settles, at most
+    /// until `deadline`.
+    Waiting { deadline: Instant },
+    /// Every blocking binding settled.
+    Open,
 }
 
 struct NativeConsumerBinding {
@@ -440,7 +438,6 @@ enum NativeConsumerBindingState {
         subscription: Arc<dyn execution::NonBlockingLiveSubscription>,
         observed: Option<execution::LogicalVersion>,
     },
-    Acquiring,
     Active(NativeConsumerPredicate),
     PassThrough,
 }
@@ -468,28 +465,6 @@ impl NativeConsumerPredicate {
     reason = "The direct consumer API remains available for non-polling integration callers."
 )]
 impl RuntimeFilterConsumerSet {
-    pub(crate) fn scan_domain_snapshots(
-        &self,
-    ) -> Vec<(
-        execution::scan_domain::RuntimeFilterScanDomainBinding,
-        Option<Arc<execution::RuntimeFilterSnapshot>>,
-    )> {
-        let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
-        bindings
-            .iter()
-            .filter_map(|binding| {
-                let target = binding.spec.scan_domain.clone()?;
-                let snapshot = match &binding.state {
-                    NativeConsumerBindingState::Active(NativeConsumerPredicate::Execution(
-                        snapshot,
-                    )) => Some(Arc::clone(snapshot)),
-                    _ => None,
-                };
-                Some((target, snapshot))
-            })
-            .collect()
-    }
-
     pub(crate) fn from_plan(
         owner: &'static str,
         specs: &[RuntimeFilterConsumerBinding],
@@ -509,8 +484,8 @@ impl RuntimeFilterConsumerSet {
                         })
                         .collect(),
                 ),
-                acquire_phase: Mutex::new(NativeConsumerAcquirePhase::Pending),
-                acquire_ready: Condvar::new(),
+                gate: Mutex::new(NativeConsumerGate::Idle),
+                gate_observable: Arc::new(Observable::new()),
                 wait_timeout: Mutex::new(Duration::from_secs(1)),
             }),
         })
@@ -554,6 +529,10 @@ impl RuntimeFilterConsumerSet {
                     execution::ConsumerActivation::BlockingSnapshot
                 ) =>
                 {
+                    forward_observable(
+                        &subscription.outcome_observable(),
+                        &self.inner.gate_observable,
+                    );
                     binding.state = NativeConsumerBindingState::BoundBlocking(subscription);
                 }
                 Ok(execution::RuntimeFilterBindOutcome::Bound(
@@ -603,77 +582,76 @@ impl RuntimeFilterConsumerSet {
         Ok(())
     }
 
-    pub(crate) fn acquire_blocking(&self, timeout: Duration) -> Result<(), String> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(Instant::now);
-        let mut phase = self
-            .inner
-            .acquire_phase
-            .lock()
-            .expect("native RF acquire phase lock");
-        loop {
-            match &*phase {
-                NativeConsumerAcquirePhase::Pending => {
-                    *phase = NativeConsumerAcquirePhase::Acquiring;
-                    break;
-                }
-                NativeConsumerAcquirePhase::Acquiring => {
-                    phase = self
+    /// Polls the gate for input that is at hand. The first touch of the set
+    /// starts its one total wait. Never blocks.
+    pub(crate) fn poll_gate(&self) -> RuntimeFilterGate {
+        let (gate, settled) = {
+            let mut gate = self.inner.gate.lock().expect("native RF gate lock");
+            let deadline = match *gate {
+                NativeConsumerGate::Open => return RuntimeFilterGate::Open,
+                NativeConsumerGate::Idle => {
+                    let timeout = *self
                         .inner
-                        .acquire_ready
-                        .wait(phase)
-                        .expect("native RF acquire phase lock");
+                        .wait_timeout
+                        .lock()
+                        .expect("native RF timeout lock");
+                    let deadline = Instant::now()
+                        .checked_add(timeout)
+                        .unwrap_or_else(Instant::now);
+                    *gate = NativeConsumerGate::Waiting { deadline };
+                    deadline
                 }
-                NativeConsumerAcquirePhase::Complete => return Ok(()),
-                NativeConsumerAcquirePhase::Failed(error) => return Err(error.clone()),
+                NativeConsumerGate::Waiting { deadline } => deadline,
+            };
+            let (open, settled) = self.settle_blocking_bindings(Instant::now() >= deadline);
+            if open {
+                *gate = NativeConsumerGate::Open;
+                (RuntimeFilterGate::Open, settled)
+            } else {
+                (RuntimeFilterGate::Pending, settled)
             }
-        }
-        drop(phase);
-
-        let result = self.acquire_once(deadline);
-        let mut phase = self
-            .inner
-            .acquire_phase
-            .lock()
-            .expect("native RF acquire phase lock");
-        *phase = match &result {
-            Ok(()) => NativeConsumerAcquirePhase::Complete,
-            Err(error) => NativeConsumerAcquirePhase::Failed(error.clone()),
         };
-        self.inner.acquire_ready.notify_all();
-        result
+        for (subscription, outcome) in settled {
+            subscription.record_consumer_outcome(&outcome);
+        }
+        gate
     }
 
-    fn acquire_once(&self, deadline: Instant) -> Result<(), String> {
-        let pending = {
-            let mut bindings = self.inner.bindings.lock().expect("native RF consumer lock");
-            bindings
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(index, binding)| {
-                    let state = std::mem::replace(
-                        &mut binding.state,
-                        NativeConsumerBindingState::Acquiring,
-                    );
-                    match state {
-                        NativeConsumerBindingState::BoundBlocking(subscription) => {
-                            Some((index, subscription))
-                        }
-                        state => {
-                            binding.state = state;
-                            None
-                        }
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-
-        for (index, subscription) in pending {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let state = match subscription.acquire(remaining) {
+    /// Settles blocking bindings in binding order: a binding waits until every
+    /// earlier one settled, so outcomes are recorded in that order. When the
+    /// wait `expired`, every unsettled binding passes through as timed out.
+    /// Returns whether every blocking binding settled, and what to record.
+    #[expect(
+        clippy::type_complexity,
+        reason = "Each settled subscription is recorded with the outcome that settled it."
+    )]
+    fn settle_blocking_bindings(
+        &self,
+        expired: bool,
+    ) -> (
+        bool,
+        Vec<(
+            Arc<dyn execution::BlockingSnapshotSubscription>,
+            execution::SnapshotAcquireOutcome,
+        )>,
+    ) {
+        let mut settled = Vec::new();
+        let mut bindings = self.inner.bindings.lock().expect("native RF consumer lock");
+        for binding in bindings.iter_mut() {
+            let NativeConsumerBindingState::BoundBlocking(subscription) = &binding.state else {
+                continue;
+            };
+            let outcome = match subscription.try_outcome() {
+                Some(outcome) => outcome,
+                None if expired => execution::SnapshotAcquireOutcome::TimedOut,
+                None => return (false, settled),
+            };
+            let subscription = Arc::clone(subscription);
+            binding.state = match &outcome {
                 execution::SnapshotAcquireOutcome::Published(snapshot) => {
-                    NativeConsumerBindingState::Active(NativeConsumerPredicate::Execution(snapshot))
+                    NativeConsumerBindingState::Active(NativeConsumerPredicate::Execution(
+                        Arc::clone(snapshot),
+                    ))
                 }
                 execution::SnapshotAcquireOutcome::Unsupported(_)
                 | execution::SnapshotAcquireOutcome::Unavailable(_)
@@ -682,18 +660,37 @@ impl RuntimeFilterConsumerSet {
                     NativeConsumerBindingState::PassThrough
                 }
             };
-            self.inner.bindings.lock().expect("native RF consumer lock")[index].state = state;
+            settled.push((subscription, outcome));
         }
-        Ok(())
+        (true, settled)
     }
 
-    pub(crate) fn acquire_configured(&self) -> Result<(), String> {
-        let timeout = *self
-            .inner
-            .wait_timeout
-            .lock()
-            .expect("native RF timeout lock");
-        self.acquire_blocking(timeout)
+    /// Whether input already reached the gate and is still held back. Asking
+    /// settles what it can, so a woken consumer observes a publication or an
+    /// expired wait. An untouched gate holds nothing back.
+    pub(crate) fn gate_holds_input(&self) -> bool {
+        let waiting = matches!(
+            *self.inner.gate.lock().expect("native RF gate lock"),
+            NativeConsumerGate::Waiting { .. }
+        );
+        waiting && matches!(self.poll_gate(), RuntimeFilterGate::Pending)
+    }
+
+    /// The deadline of a gate that holds input back.
+    pub(crate) fn gate_deadline(&self) -> Option<DriverBlockDeadline> {
+        match *self.inner.gate.lock().expect("native RF gate lock") {
+            NativeConsumerGate::Waiting { deadline } => Some(DriverBlockDeadline::new(
+                deadline,
+                RUNTIME_FILTER_GATE_DEADLINE_TOKEN,
+            )),
+            NativeConsumerGate::Idle | NativeConsumerGate::Open => None,
+        }
+    }
+
+    /// Notified when a blocking binding's outcome is published. Its identity
+    /// is stable for the set's lifetime.
+    pub(crate) fn gate_observable(&self) -> Arc<Observable> {
+        Arc::clone(&self.inner.gate_observable)
     }
 
     pub(crate) fn set_wait_timeout(&self, timeout: Duration) {
@@ -730,15 +727,15 @@ impl RuntimeFilterConsumerSet {
         let active = {
             let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
             if bindings.iter().any(|binding| {
-                let unacquired = matches!(
+                matches!(
                     binding.state,
                     NativeConsumerBindingState::Unbound
                         | NativeConsumerBindingState::BoundBlocking(_)
-                        | NativeConsumerBindingState::Acquiring
-                );
-                unacquired
+                )
             }) {
-                return Err("native runtime-filter consumers must acquire before apply".into());
+                return Err(
+                    "native runtime-filter consumers must pass their gate before apply".into(),
+                );
             }
             bindings
                 .iter()
@@ -1142,24 +1139,38 @@ impl Operator for NativeRuntimeFilterProcessor {
     }
 }
 
-impl ProcessorOperator for NativeRuntimeFilterProcessor {
-    fn need_input(&self) -> bool {
+impl NativeRuntimeFilterProcessor {
+    fn has_room(&self) -> bool {
         !self.finishing && self.output.is_none()
+    }
+}
+
+impl ProcessorOperator for NativeRuntimeFilterProcessor {
+    /// Held back only once a chunk reached a pending gate: until then the
+    /// gate's wait has not started and must not hold the pipeline.
+    fn need_input(&self) -> bool {
+        self.has_room() && !self.consumers.gate_holds_input()
+    }
+
+    /// The gate's wait starts here, with a chunk actually on the edge. While
+    /// the gate is pending the chunk stays on the edge.
+    fn can_accept_input(&self, _chunk: &Chunk) -> Result<bool, String> {
+        Ok(self.has_room() && matches!(self.consumers.poll_gate(), RuntimeFilterGate::Open))
     }
 
     fn has_output(&self) -> bool {
         self.output.is_some()
     }
 
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if !self.need_input() {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        if !self.has_room() {
             return Err("native runtime-filter processor cannot accept input".into());
         }
-        self.consumers.acquire_blocking(
-            state
-                .runtime_filter_wait_timeout()
-                .unwrap_or(Duration::from_secs(1)),
-        )?;
+        if !matches!(self.consumers.poll_gate(), RuntimeFilterGate::Open) {
+            return Err(
+                "native runtime-filter processor received input before its gate opened".into(),
+            );
+        }
         self.output = self
             .consumers
             .apply_chunk_observed(chunk, Some(&self.event_sink))?;
@@ -1173,6 +1184,14 @@ impl ProcessorOperator for NativeRuntimeFilterProcessor {
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
         self.finishing = true;
         Ok(())
+    }
+
+    fn sink_observable(&self) -> Option<Arc<Observable>> {
+        Some(self.consumers.gate_observable())
+    }
+
+    fn sink_block_deadline(&self) -> Option<DriverBlockDeadline> {
+        self.consumers.gate_deadline()
     }
 }
 
@@ -1234,15 +1253,35 @@ mod tests {
         }
     }
 
-    struct PublishedSubscription(Arc<execution::RuntimeFilterSnapshot>);
+    struct PublishedSubscription {
+        snapshot: Arc<execution::RuntimeFilterSnapshot>,
+        published: Arc<crate::runtime::observable::Observable>,
+    }
+
+    impl PublishedSubscription {
+        fn new(snapshot: Arc<execution::RuntimeFilterSnapshot>) -> Self {
+            Self {
+                snapshot,
+                published: Arc::new(crate::runtime::observable::Observable::new()),
+            }
+        }
+    }
 
     impl execution::BlockingSnapshotSubscription for PublishedSubscription {
-        fn acquire(&self, _: Duration) -> execution::SnapshotAcquireOutcome {
-            execution::SnapshotAcquireOutcome::Published(Arc::clone(&self.0))
+        fn try_outcome(&self) -> Option<execution::SnapshotAcquireOutcome> {
+            Some(execution::SnapshotAcquireOutcome::Published(Arc::clone(
+                &self.snapshot,
+            )))
         }
 
+        fn outcome_observable(&self) -> Arc<crate::runtime::observable::Observable> {
+            Arc::clone(&self.published)
+        }
+
+        fn record_consumer_outcome(&self, _: &execution::SnapshotAcquireOutcome) {}
+
         fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
-            Some(Arc::clone(&self.0))
+            Some(Arc::clone(&self.snapshot))
         }
     }
 
@@ -1326,7 +1365,6 @@ mod tests {
                 RuntimeFilterExecutionContract::Membership(schema),
             )
             .expect("consumer contract"),
-            None,
         )
     }
 
@@ -1407,7 +1445,7 @@ mod tests {
             RuntimeFilterExecutionContract::Ordered(order),
         );
         let error = match NativeOrderedLiveConsumerSet::from_plan(
-            &[RuntimeFilterConsumerBinding::new(expr_id, contract, None)],
+            &[RuntimeFilterConsumerBinding::new(expr_id, contract)],
             Arc::new(arena),
         ) {
             Ok(_) => panic!("ordered consumers are live only"),
@@ -1439,7 +1477,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             outcome: execution::RuntimeFilterBindOutcome::Bound(
                 execution::RuntimeFilterSubscriptionHandle::Blocking(Arc::new(
-                    PublishedSubscription(snapshot),
+                    PublishedSubscription::new(snapshot),
                 )),
             ),
         });
@@ -1451,7 +1489,7 @@ mod tests {
         .expect("consumer set");
         let state = RuntimeState::default().with_runtime_filter_session(Some(session));
         consumers.bind(&state).expect("bind");
-        consumers.acquire_configured().expect("acquire");
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Open));
         let batch = arrow::record_batch::RecordBatch::try_new(
             schema.arrow_schema_ref(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -1486,7 +1524,7 @@ mod tests {
         });
         let state = RuntimeState::default().with_runtime_filter_session(Some(session));
         consumers.bind(&state).expect("bind");
-        consumers.acquire_configured().expect("acquire");
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Open));
         let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
             &arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
                 "v",
@@ -1509,5 +1547,477 @@ mod tests {
             .expect("apply")
             .expect("pass-through output");
         assert!(Arc::ptr_eq(output.batch.column(0), input.batch.column(0)));
+    }
+
+    /// A blocking subscription whose outcome the test publishes, keeping what
+    /// the consumer records.
+    struct ControlledSubscription {
+        outcome: Mutex<Option<execution::SnapshotAcquireOutcome>>,
+        published: Arc<Observable>,
+        records: Mutex<Vec<&'static str>>,
+    }
+
+    impl ControlledSubscription {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                outcome: Mutex::new(None),
+                published: Arc::new(Observable::new()),
+                records: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn publish(&self, outcome: execution::SnapshotAcquireOutcome) {
+            *self.outcome.lock().expect("outcome lock") = Some(outcome);
+            self.published.notify_observers();
+        }
+
+        fn records(&self) -> Vec<&'static str> {
+            self.records.lock().expect("records lock").clone()
+        }
+    }
+
+    fn outcome_label(outcome: &execution::SnapshotAcquireOutcome) -> &'static str {
+        match outcome {
+            execution::SnapshotAcquireOutcome::Published(_) => "published",
+            execution::SnapshotAcquireOutcome::Unsupported(_) => "unsupported",
+            execution::SnapshotAcquireOutcome::Unavailable(_) => "unavailable",
+            execution::SnapshotAcquireOutcome::Cancelled => "cancelled",
+            execution::SnapshotAcquireOutcome::TimedOut => "timed_out",
+        }
+    }
+
+    impl execution::BlockingSnapshotSubscription for ControlledSubscription {
+        fn try_outcome(&self) -> Option<execution::SnapshotAcquireOutcome> {
+            self.outcome.lock().expect("outcome lock").clone()
+        }
+
+        fn outcome_observable(&self) -> Arc<Observable> {
+            Arc::clone(&self.published)
+        }
+
+        fn record_consumer_outcome(&self, outcome: &execution::SnapshotAcquireOutcome) {
+            self.records
+                .lock()
+                .expect("records lock")
+                .push(outcome_label(outcome));
+        }
+
+        fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
+            match &*self.outcome.lock().expect("outcome lock") {
+                Some(execution::SnapshotAcquireOutcome::Published(snapshot)) => {
+                    Some(Arc::clone(snapshot))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn accepting(value: i32) -> execution::SnapshotAcquireOutcome {
+        execution::SnapshotAcquireOutcome::Published(Arc::new(
+            execution::RuntimeFilterSnapshot::new(
+                RuntimeFilterBindingId::new(1),
+                execution::LogicalVersion::FIRST,
+                [0; 32],
+                Arc::new(Int32MembershipQuery { accepted: value }),
+            ),
+        ))
+    }
+
+    fn controlled_state(subscription: &Arc<ControlledSubscription>) -> RuntimeState {
+        let subscription: Arc<dyn execution::BlockingSnapshotSubscription> =
+            Arc::clone(subscription) as Arc<dyn execution::BlockingSnapshotSubscription>;
+        let session: execution::RuntimeFilterSessionRef = Arc::new(SubscriptionSession {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: execution::RuntimeFilterBindOutcome::Bound(
+                execution::RuntimeFilterSubscriptionHandle::Blocking(subscription),
+            ),
+        });
+        RuntimeState::default().with_runtime_filter_session(Some(session))
+    }
+
+    fn one_binding_arena() -> (Arc<ExprArena>, crate::exec::expr::ExprId) {
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        (Arc::new(arena), expr_id)
+    }
+
+    fn controlled_consumers(
+        timeout: Duration,
+    ) -> (RuntimeFilterConsumerSet, Arc<ControlledSubscription>) {
+        let (arena, expr_id) = one_binding_arena();
+        let subscription = ControlledSubscription::new();
+        let consumers =
+            RuntimeFilterConsumerSet::from_plan("Join", &[membership_spec(expr_id)], arena)
+                .expect("consumer set");
+        consumers
+            .bind(&controlled_state(&subscription))
+            .expect("bind");
+        consumers.set_wait_timeout(timeout);
+        (consumers, subscription)
+    }
+
+    fn int_chunk(values: &[i32]) -> Chunk {
+        let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            &arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+                "v",
+                DataType::Int32,
+                false,
+            )]),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(
+            arrow::record_batch::RecordBatch::try_new(
+                schema.arrow_schema_ref(),
+                vec![Arc::new(Int32Array::from(values.to_vec()))],
+            )
+            .expect("batch"),
+            schema,
+        )
+    }
+
+    fn int_values(chunk: &Chunk) -> Vec<i32> {
+        chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 column")
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn a_gate_wait_starts_at_its_first_touch_and_is_shared_by_its_set() {
+        let (consumers, _subscription) = controlled_consumers(Duration::from_millis(500));
+        assert!(
+            !consumers.gate_holds_input(),
+            "an untouched gate holds nothing"
+        );
+        assert!(consumers.gate_deadline().is_none());
+
+        std::thread::sleep(Duration::from_millis(30));
+        let touched_at = Instant::now();
+        assert!(
+            matches!(consumers.poll_gate(), RuntimeFilterGate::Pending),
+            "an unpublished snapshot keeps the gate pending"
+        );
+        let deadline = consumers
+            .gate_deadline()
+            .expect("a touched gate has a deadline");
+        assert!(
+            deadline.at() >= touched_at + Duration::from_millis(500),
+            "the wait starts when input is at hand, not at bind"
+        );
+
+        let other_driver = consumers.clone();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            matches!(other_driver.poll_gate(), RuntimeFilterGate::Pending),
+            "the shared gate is still pending"
+        );
+        let shared = other_driver.gate_deadline().expect("shared deadline");
+        assert_eq!(shared, deadline, "drivers of one set share one total wait");
+        assert!(other_driver.gate_holds_input());
+
+        let (independent, _) = controlled_consumers(Duration::from_millis(500));
+        assert!(
+            independent.gate_deadline().is_none(),
+            "another consumer set keeps its own wait"
+        );
+    }
+
+    #[test]
+    fn a_publication_after_the_check_moves_the_generation_and_opens_the_gate_once() {
+        let (consumers, subscription) = controlled_consumers(Duration::from_secs(5));
+        let observable = consumers.gate_observable();
+        let generation = observable.generation();
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Pending));
+
+        subscription.publish(accepting(2));
+        assert!(
+            observable.generation() > generation,
+            "a publication must wake whoever parked on the pending answer"
+        );
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Open));
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Open));
+        assert!(!consumers.gate_holds_input());
+        assert_eq!(subscription.records(), vec!["published"]);
+
+        let output = consumers
+            .apply_chunk(int_chunk(&[1, 2, 3]))
+            .expect("apply")
+            .expect("one matching row");
+        assert_eq!(int_values(&output), vec![2]);
+    }
+
+    #[test]
+    fn an_expired_wait_passes_input_through_as_timed_out_once() {
+        let (consumers, subscription) = controlled_consumers(Duration::from_millis(20));
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Pending));
+        std::thread::sleep(Duration::from_millis(40));
+
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Open));
+        // A late publication does not reopen a settled binding.
+        subscription.publish(accepting(2));
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Open));
+        assert_eq!(subscription.records(), vec!["timed_out"]);
+        let output = consumers
+            .apply_chunk(int_chunk(&[1, 2, 3]))
+            .expect("apply")
+            .expect("pass-through");
+        assert_eq!(int_values(&output), vec![1, 2, 3]);
+    }
+
+    /// A source that emits the chunks the test gives it.
+    struct QueueSource {
+        chunks: Arc<Mutex<std::collections::VecDeque<Chunk>>>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        observable: Arc<Observable>,
+    }
+
+    impl Operator for QueueSource {
+        fn name(&self) -> &str {
+            "QUEUE_SOURCE"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished.load(std::sync::atomic::Ordering::Acquire)
+                && self.chunks.lock().expect("chunks lock").is_empty()
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for QueueSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            !self.chunks.lock().expect("chunks lock").is_empty()
+        }
+
+        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> Result<(), String> {
+            Err("a source accepts no input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(self.chunks.lock().expect("chunks lock").pop_front())
+        }
+
+        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn source_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
+    struct CollectSink {
+        values: Arc<Mutex<Vec<i32>>>,
+        finished: bool,
+        observable: Arc<Observable>,
+    }
+
+    impl Operator for CollectSink {
+        fn name(&self) -> &str {
+            "COLLECT_SINK"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for CollectSink {
+        fn need_input(&self) -> bool {
+            !self.finished
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+            self.values
+                .lock()
+                .expect("values lock")
+                .extend(int_values(&chunk));
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+            self.finished = true;
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
+    struct GatedPipeline {
+        driver: crate::exec::pipeline::driver::PipelineDriver,
+        chunks: Arc<Mutex<std::collections::VecDeque<Chunk>>>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        source: Arc<Observable>,
+        values: Arc<Mutex<Vec<i32>>>,
+        subscription: Arc<ControlledSubscription>,
+        gate: Arc<Observable>,
+    }
+
+    fn gated_pipeline(timeout: Duration) -> GatedPipeline {
+        let (arena, expr_id) = one_binding_arena();
+        let factory =
+            NativeRuntimeFilterProcessorFactory::new(5, &[membership_spec(expr_id)], arena)
+                .expect("processor factory");
+        let gate = factory.consumers.gate_observable();
+        let subscription = ControlledSubscription::new();
+        let session = controlled_state(&subscription)
+            .runtime_filter_session()
+            .cloned();
+        let state = Arc::new(
+            RuntimeState::new(
+                Some(crate::runtime::query_options::QueryOptions {
+                    runtime_filter_wait_timeout_ms: Some(
+                        i32::try_from(timeout.as_millis()).unwrap(),
+                    ),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .with_runtime_filter_session(session),
+        );
+        let mut processor = factory.create(1, 0);
+        processor
+            .bind_runtime_state(&state)
+            .expect("bind processor");
+        let chunks = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source = Arc::new(Observable::new());
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let driver = crate::exec::pipeline::driver::PipelineDriver::new(
+            1,
+            vec![
+                Box::new(QueueSource {
+                    chunks: Arc::clone(&chunks),
+                    finished: Arc::clone(&finished),
+                    observable: Arc::clone(&source),
+                }),
+                processor,
+                Box::new(CollectSink {
+                    values: Arc::clone(&values),
+                    finished: false,
+                    observable: Arc::new(Observable::new()),
+                }),
+            ],
+            None,
+            Vec::new(),
+            state,
+            None,
+        );
+        GatedPipeline {
+            driver,
+            chunks,
+            finished,
+            source,
+            values,
+            subscription,
+            gate,
+        }
+    }
+
+    #[test]
+    fn a_processor_gate_holds_the_first_chunk_on_its_edge_until_it_opens() {
+        use crate::exec::pipeline::driver::DriverState;
+        use crate::exec::pipeline::operator::BlockedReason;
+
+        let mut pipeline = gated_pipeline(Duration::from_secs(5));
+        // No input yet: the driver waits on its source, and the gate's wait
+        // has not started however long the first chunk takes.
+        assert!(matches!(
+            pipeline.driver.process(Duration::from_millis(10)),
+            DriverState::Blocked(BlockedReason::InputEmpty)
+        ));
+        std::thread::sleep(Duration::from_millis(20));
+        pipeline
+            .chunks
+            .lock()
+            .expect("chunks lock")
+            .push_back(int_chunk(&[1, 2, 3]));
+        pipeline.source.notify_observers();
+
+        let arrived = Instant::now();
+        assert!(matches!(
+            pipeline.driver.process(Duration::from_millis(10)),
+            DriverState::Blocked(BlockedReason::OutputFull)
+        ));
+        let (observable, _, deadline) = pipeline
+            .driver
+            .blocked_observable_snapshot()
+            .expect("parked on the gate");
+        assert!(Arc::ptr_eq(&observable, &pipeline.gate));
+        let deadline = deadline.expect("a gate wait is bounded");
+        assert!(deadline.at() >= arrived + Duration::from_secs(5));
+        assert!(pipeline.values.lock().expect("values lock").is_empty());
+
+        pipeline.subscription.publish(accepting(2));
+        assert!(matches!(
+            pipeline.driver.process(Duration::from_millis(10)),
+            DriverState::Blocked(BlockedReason::InputEmpty)
+        ));
+        assert_eq!(*pipeline.values.lock().expect("values lock"), vec![2]);
+
+        pipeline
+            .finished
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            pipeline.driver.process(Duration::from_millis(10)),
+            DriverState::Finished
+        ));
+        assert_eq!(pipeline.subscription.records(), vec!["published"]);
+    }
+
+    #[test]
+    fn a_pipeline_ending_before_its_first_chunk_never_touches_the_gate() {
+        use crate::exec::pipeline::driver::DriverState;
+
+        let mut pipeline = gated_pipeline(Duration::from_secs(5));
+        pipeline
+            .finished
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            pipeline.driver.process(Duration::from_millis(10)),
+            DriverState::Finished
+        ));
+        assert!(
+            pipeline.subscription.records().is_empty(),
+            "no input reached the gate, so no outcome is consumed"
+        );
     }
 }

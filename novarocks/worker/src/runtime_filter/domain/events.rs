@@ -24,7 +24,6 @@
 use novarocks_execution::runtime_filter::{
     ArtifactUnsupportedReason, LiveTerminal, LogicalVersion, RuntimeFilterBindingId,
     UnavailableReason,
-    scan_domain::{RuntimeFilterScanUnitDecision, RuntimeFilterScanUnitNotEvaluatedReason},
 };
 
 use super::{BackendAcceptStatus, BackendTransportFailOpenReason};
@@ -156,16 +155,6 @@ pub enum BackendRuntimeFilterEvent {
         logical_version: LogicalVersion,
         input_rows: u64,
         output_rows: u64,
-    },
-    ConsumerScanUnitEvaluated {
-        identity: BackendConsumerSubscriptionIdentity,
-        logical_version: LogicalVersion,
-        decision: RuntimeFilterScanUnitDecision,
-    },
-    ConsumerScanUnitNotEvaluated {
-        identity: BackendConsumerSubscriptionIdentity,
-        observed_version: Option<LogicalVersion>,
-        reason: RuntimeFilterScanUnitNotEvaluatedReason,
     },
 }
 

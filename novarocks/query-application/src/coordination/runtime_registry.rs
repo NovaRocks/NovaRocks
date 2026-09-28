@@ -39,7 +39,8 @@ use tokio::task::JoinHandle;
 use crate::coordination::{
     AttemptInstantiationPermit, LogicalExecutionActor, LogicalExecutionActorConfig,
     LogicalExecutionActorError, LogicalExecutionActorId, LogicalExecutionOutputTransfer,
-    RegistryContextConvergence, assert_shutdown_complete, spawn_logical_execution_actor,
+    RegistryClose, RegistryContextConvergence, assert_shutdown_complete,
+    spawn_logical_execution_actor,
 };
 
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
@@ -455,7 +456,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 .collect::<Vec<_>>()
         };
         for actor in actors {
-            drop(actor.request_registry_close_for_join());
+            drop(actor.request_registry_close_for_join(RegistryClose::Shutdown));
         }
     }
 
@@ -491,7 +492,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             let mut close_waiters = Vec::with_capacity(registrations.len());
             for registration in registrations {
                 let actor = self.actor(&registration)?;
-                let closed = actor.request_registry_close_for_join();
+                let closed = actor.request_registry_close_for_join(RegistryClose::Shutdown);
                 close_waiters.push((registration, closed));
             }
 
@@ -803,7 +804,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
         mut registration: LogicalExecutionRegistration,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
         let actor = self.actor(&registration)?;
-        let mut closed = actor.request_registry_close_for_join();
+        let mut closed = actor.request_registry_close_for_join(RegistryClose::Retire);
         while !*closed.borrow_and_update() {
             if closed.changed().await.is_err() {
                 break;
@@ -996,7 +997,8 @@ mod tests {
 
     use novarocks_types::identity::{AttemptId, BackendProcessId, FrontendProcessId};
     use novarocks_workload_control::{
-        ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        CancellationReason, ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig,
+        WorkloadControl,
     };
 
     use super::*;
@@ -1010,6 +1012,17 @@ mod tests {
         execution: QueryExecutionId,
         contexts: Vec<QueryContextRef>,
     ) -> LogicalExecutionActorConfig {
+        config_observing_cancellation(execution, contexts).0
+    }
+
+    /// Also returns a view of the work cancellation the actor owns.
+    fn config_observing_cancellation(
+        execution: QueryExecutionId,
+        contexts: Vec<QueryContextRef>,
+    ) -> (
+        LogicalExecutionActorConfig,
+        novarocks_workload_control::CancellationView,
+    ) {
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
@@ -1024,8 +1037,9 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let stage = root.owner.scope().try_acquire(Stage::Execution).unwrap();
+        let cancellation = root.owner.scope().cancellation().unwrap();
         drop(root.business);
-        LogicalExecutionActorConfig::single_attempt_completion(
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
             execution,
             ExecutionEffect::None,
             NonZeroUsize::new(4).unwrap(),
@@ -1035,7 +1049,8 @@ mod tests {
             root.owner,
             stage,
         )
-        .unwrap()
+        .unwrap();
+        (config, cancellation)
     }
 
     #[tokio::test]
@@ -1245,6 +1260,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(registry.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn retiring_a_concluded_actor_leaves_its_work_uncancelled() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let execution = execution(31);
+        let (config, cancellation) = config_observing_cancellation(execution, Vec::new());
+        let (registration, initial, _output) = registry
+            .reserve(execution, Vec::new())
+            .unwrap()
+            .spawn_and_install(config)
+            .unwrap()
+            .into_parts();
+        let actor = registry.actor(&registration).unwrap();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        assert_eq!(
+            actor.complete_attempt(running).await.unwrap(),
+            LogicalConclusion::Succeeded
+        );
+
+        // Retirement follows the client-visible conclusion; closing the
+        // actor's ingress to join it must not revise that outcome.
+        registry
+            .handle()
+            .join_and_retire(registration)
+            .await
+            .unwrap();
+        assert_eq!(cancellation.reason(), None);
+        assert_eq!(registry.entry_count(), 0);
+        registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_the_work_of_an_actor_still_running() {
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let execution = execution(32);
+        let (config, cancellation) = config_observing_cancellation(execution, Vec::new());
+        let (registration, initial, _output) = registry
+            .reserve(execution, Vec::new())
+            .unwrap()
+            .spawn_and_install(config)
+            .unwrap()
+            .into_parts();
+        let actor = registry.actor(&registration).unwrap();
+        let running = actor.activate(initial.ready()).await.unwrap();
+
+        let shutdown = registry.shutdown_until(Instant::now()).await;
+        assert!(actor.registry_close_was_requested());
+        let reason = tokio::time::timeout(Duration::from_secs(5), cancellation.cancelled())
+            .await
+            .expect("shutdown cancels running work");
+        assert_eq!(reason, CancellationReason::ServerShutdown);
+        drop(running);
+        drop(registration);
+        if shutdown.is_err() {
+            registry
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

@@ -9,7 +9,6 @@ pub mod exchange_metrics;
 pub mod exchange_queue;
 pub mod exchange_receiver;
 pub mod result;
-pub mod scan;
 
 pub use commit::{
     FragmentCommitLease, FragmentCommitPort, FragmentCommitReport, FragmentSinkLoadStats,
@@ -33,4 +32,3 @@ pub use result::{
     FragmentResultSession, FragmentResultWriter, ResultAbort, ResultPresentation, ResultProjection,
     ResultWriteAdmission, ResultWriteCredit, ResultWriteSpec,
 };
-pub use scan::{ScanRegistrationPort, UnavailableScanRegistrationPort};

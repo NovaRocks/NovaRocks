@@ -71,9 +71,6 @@ pub(crate) fn encode_query_options(src: &QueryOptions) -> wire::QueryOptions {
         enable_profile: src.enable_profile,
         pipeline_dop: src.pipeline_dop.unwrap_or_default(),
         query_mem_limit: src.exec_mem_limit.unwrap_or_default(),
-        connector_io_tasks_per_scan_operator: src
-            .connector_io_tasks_per_scan_operator
-            .unwrap_or_default(),
         runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
         runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
         allow_throw_exception: src.allow_throw_exception,

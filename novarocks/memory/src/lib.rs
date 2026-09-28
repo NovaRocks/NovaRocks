@@ -71,6 +71,8 @@ pub mod observe;
 pub mod policy;
 pub mod pressure;
 pub mod reclaim;
+pub mod reservation;
+mod reservation_protocol;
 pub mod snapshot;
 pub mod wait;
 
@@ -88,6 +90,7 @@ pub use ids::{
     ReclaimTicketId, ReclaimerId, WaitTicketId,
 };
 pub use policy::{LimitDimension, LimitUnit, PolicyInstallOutcome, PolicyLimit};
+pub use reservation::{Reservation, ReservationLease, ReservationSnapshot};
 pub use snapshot::{
     AccountSnapshot, AuthoritySnapshot, EventBatch, EventRing, MemoryEvent, MemoryEventKind,
 };
@@ -106,3 +109,6 @@ pub use snapshot::{
 // novarocks_memory::observe::{CountingAllocator, AllocatorSnapshot, CoverageDescriptor}
 // ```
 pub use observe::{AllocatorSnapshot, CountingAllocator, CoverageDescriptor};
+
+#[cfg(all(test, loom))]
+mod reservation_loom;

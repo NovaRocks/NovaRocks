@@ -33,7 +33,6 @@ use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBindingFactory,
     ConnectorProviderId,
 };
-use novarocks_types::ClusterRole;
 
 use crate::app_config::NovaRocksConfig;
 use crate::scan_io::ScanIoServices;
@@ -242,11 +241,8 @@ fn build_paimon_control_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
-    let access = crate::composition::compose_paimon_access_factory(
-        config,
-        runtime.clone(),
-        ClusterRole::Fe,
-    )?;
+    let access =
+        crate::composition::compose_paimon_control_access_factory(config, runtime.clone())?;
     Ok(Arc::new(PaimonControlRoleBindingFactory::new(
         access, runtime,
     )))
@@ -255,16 +251,11 @@ fn build_paimon_control_factory(
 fn build_paimon_execution_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
-    _scan_io: &ScanIoServices,
+    scan_io: &ScanIoServices,
 ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
-    let access = crate::composition::compose_paimon_access_factory(
-        config,
-        runtime.clone(),
-        ClusterRole::Be,
-    )?;
-    Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(
-        access, runtime,
-    )))
+    let access =
+        crate::composition::compose_paimon_execution_access_factory(config, runtime, scan_io)?;
+    Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(access)))
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use std::time::Instant;
 use novarocks_connector_paimon::io::{PaimonFsAuthorizedListing, PaimonHostFileIo};
 use novarocks_connector_paimon::role_binding::PaimonRoleFileIoFactory;
 use novarocks_fs::{
-    FileCancellation, FileError, FileErrorKind, FsAccessResources, FsScheme,
+    FileCancellation, FileError, FileRangeScope, FileRangeService, FsAccessResources, FsScheme,
     ObjectStoreAccessContext, ObjectStoreCredentialProviderIdentity, ObjectStoreSecretMaterial,
     object_store_endpoint_config_from_aws_s3_catalog_property_pairs,
 };
@@ -43,6 +43,8 @@ pub(crate) struct ServerPaimonRoleFileIoFactory {
     resources: FsAccessResources,
     credentials: CatalogCredentialRegistry,
     purpose: CatalogCredentialPurpose,
+    /// The shared scan I/O a BE attempt reads through; a coordinator has none.
+    range_service: Option<Arc<FileRangeService>>,
 }
 
 impl ServerPaimonRoleFileIoFactory {
@@ -58,7 +60,15 @@ impl ServerPaimonRoleFileIoFactory {
             resources,
             credentials,
             purpose,
+            range_service: None,
         }
+    }
+
+    /// Reads of every bound attempt go through `range_service`, under the
+    /// execution source their request was bound to.
+    pub(crate) fn with_range_service(mut self, range_service: Arc<FileRangeService>) -> Self {
+        self.range_service = Some(range_service);
+        self
     }
 }
 
@@ -169,13 +179,33 @@ impl PaimonRoleFileIoFactory for ServerPaimonRoleFileIoFactory {
             .resolve_location(access_domain, warehouse, Some(object_store_access))
             .map_err(map_file_error)?;
 
-        PaimonHostFileIo::try_new(
+        let file_io = PaimonHostFileIo::try_new(
             access,
             warehouse,
             FileCancellation::from_connector_request(request),
             Arc::new(PaimonFsAuthorizedListing),
         )
-        .map_err(map_file_error)
+        .map_err(map_file_error)?;
+        let Some(range_service) = &self.range_service else {
+            return Ok(file_io);
+        };
+        // A BE attempt reads through the shared range service only for the one
+        // execution source its request was bound to.
+        let (scope, operations) = request
+            .range_scope()
+            .zip(request.source_operations())
+            .ok_or_else(|| invalid("BE Paimon read requires an exact execution source"))?;
+        let (query_high, query_low, attempt, fragment_high, fragment_low, node_id) = scope.parts();
+        let scope = FileRangeScope::try_new(
+            query_high,
+            query_low,
+            attempt,
+            fragment_high,
+            fragment_low,
+            node_id,
+        )
+        .map_err(map_file_error)?;
+        Ok(file_io.with_range_binding(range_service.bind(scope, operations.clone())))
     }
 }
 
@@ -204,19 +234,7 @@ fn unsupported(message: impl Into<String>) -> ConnectorError {
 }
 
 fn map_file_error(error: FileError) -> ConnectorError {
-    let kind = match error.kind() {
-        FileErrorKind::Invalid | FileErrorKind::AlreadyExists => ConnectorErrorKind::InvalidRequest,
-        FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
-        FileErrorKind::NotFound => ConnectorErrorKind::NotFound,
-        FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
-        FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
-        FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
-        FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
-        FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
-        FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
-        FileErrorKind::Internal => ConnectorErrorKind::Internal,
-    };
-    ConnectorError::new(kind, error.to_string())
+    ConnectorError::from(error)
 }
 
 #[cfg(test)]
@@ -229,10 +247,11 @@ mod tests {
         TokioFileIoRuntime, TokioFileTaskSpawner,
     };
     use novarocks_secret::SecretValue;
+    use novarocks_spi::connector::read_stack::ConnectorSourceOperations;
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
         CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorRequestContext, CredentialConsumerRole,
+        ConnectorProviderId, ConnectorRangeScope, ConnectorRequestContext, CredentialConsumerRole,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         StaticCredentialReference,
     };
@@ -336,6 +355,56 @@ mod tests {
                 &request(),
             )
             .expect("pure Paimon file binding");
+    }
+
+    #[test]
+    fn a_backend_attempt_reads_through_the_scan_io_of_its_execution_source() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let reference = StaticCredentialReference::try_new("minio", "v1").expect("reference");
+        let range_service = FileRangeService::new(
+            std::num::NonZeroUsize::new(2).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(4).unwrap(),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            runtime.handle().clone(),
+        );
+        let factory = factory(
+            &runtime,
+            &reference,
+            ClusterRole::Be,
+            CatalogCredentialPurpose::ObjectStoreData,
+        )
+        .with_range_service(range_service);
+        let properties = properties(
+            &reference,
+            CatalogCredentialPurpose::ObjectStoreData,
+            CredentialConsumerRole::Backend,
+        );
+
+        let error = factory
+            .bind_file_io(&properties, "s3://warehouse/paimon", &request())
+            .expect_err("a backend attempt must name its execution source");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+
+        let operations = ConnectorSourceOperations::new();
+        let scoped = request().with_execution_source(
+            ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).expect("scope"),
+            operations.clone(),
+        );
+        let file_io = factory
+            .bind_file_io(&properties, "s3://warehouse/paimon", &scoped)
+            .expect("scoped Paimon file binding");
+        // The bound IO carries this request's own scope and source operations:
+        // sealing the request's registry is visible through it.
+        operations.seal();
+        let bound = format!("{file_io:?}");
+        assert!(
+            bound.contains(
+                "FileRangeBinding { scope: FileRangeScope { query: (1, 2, 3), source: (4, 5, 6) }"
+            ),
+            "{bound}"
+        );
+        assert!(bound.contains("sealed: true"), "{bound}");
     }
 
     #[test]

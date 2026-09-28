@@ -14,20 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Scan operator module exports.
-//!
-//! Responsibilities:
-//! - Exposes scan source, runner, dispatch, and shared scan types used by pipeline scan execution.
-//! - Provides the integration surface between scan planning and runtime scan workers.
-//!
-//! Current limitations:
-//! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
-//! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
+//! The scan source operator: the driver of a scan pipeline polls the scan's
+//! one output stream itself and applies the scan's conjuncts, runtime
+//! filters and LIMIT to every chunk it takes.
 
-pub mod dispatch;
-mod runner;
-mod source;
-mod types;
+mod output_filter;
+mod stream_source;
 
-pub use dispatch::ScanDispatchState;
-pub use source::ScanSourceFactory;
+pub(crate) use stream_source::StreamScanSourceFactory;

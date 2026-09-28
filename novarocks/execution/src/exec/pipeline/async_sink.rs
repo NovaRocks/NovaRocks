@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::execution_services::IoExecutor;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -237,10 +237,20 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
         self.shared.finished.load(Ordering::Acquire)
     }
 
-    fn pending_finish(&self) -> bool {
-        (self.finishing && !self.shared.finished.load(Ordering::Acquire))
-            || ((self.finishing || self.shared.finished.load(Ordering::Acquire))
-                && self.join.as_ref().is_some_and(|join| !join.is_finished()))
+    fn pending_finish(&self) -> Option<FinishWatch> {
+        if self.shared.finished.load(Ordering::Acquire) {
+            // A final semantic wake can precede the backend destructor and
+            // executor wrapper exit. The join itself has no observable.
+            self.join
+                .as_ref()
+                .is_some_and(|join| !join.is_finished())
+                .then_some(FinishWatch::RecheckAfter(std::time::Duration::from_millis(
+                    1,
+                )))
+        } else {
+            self.finishing
+                .then(|| FinishWatch::Notify(Arc::clone(&self.shared.observable)))
+        }
     }
 
     fn cancel(&mut self) {
@@ -471,7 +481,7 @@ mod tests {
 
         assert!(
             poll_until(
-                || state.error().is_some() && !op.pending_finish(),
+                || state.error().is_some() && op.pending_finish().is_none(),
                 Duration::from_secs(5)
             ),
             "panic must become a terminal error after the actor exits"
@@ -518,11 +528,11 @@ mod tests {
             assert!(entered, "{path}: backend destructor did not start");
             assert!(finished, "{path}: semantic terminal state must be visible");
             assert!(
-                pending && handle_live,
+                pending.is_some() && handle_live,
                 "{path}: live actor must hold PendingFinish"
             );
             assert!(
-                poll_until(|| !op.pending_finish(), Duration::from_secs(5)),
+                poll_until(|| op.pending_finish().is_none(), Duration::from_secs(5)),
                 "{path}: actor did not exit after release"
             );
         }
@@ -544,8 +554,6 @@ mod tests {
             crate::runtime::ExecutionRuntime::new(
                 crate::runtime::ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    scan_threads: 1,
-                    scan_queue_capacity: 8,
                     spill_io_threads: 1,
                     spill_io_queue_capacity: 8,
                     spill_storage:
@@ -557,9 +565,6 @@ mod tests {
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1024,
                     local_exchange_max_buffered_rows: 1024,
-                    connector_io_tasks_per_scan_operator: 1,
-                    scan_submit_fail_max: 1,
-                    scan_submit_fail_timeout_ms: 1,
                     runtime_filter_scan_wait_time_ms_override: None,
                     runtime_filter_wait_timeout_ms_override: None,
                     sink_io_worker_threads: 1,
@@ -580,7 +585,6 @@ mod tests {
             None,
             None,
             Some(runtime),
-            None,
         )
     }
 
@@ -609,7 +613,7 @@ mod tests {
 
         assert!(
             poll_until(
-                || op.is_finished() && !op.pending_finish(),
+                || op.is_finished() && op.pending_finish().is_none(),
                 Duration::from_secs(5)
             ),
             "sink did not finish"
@@ -651,7 +655,7 @@ mod tests {
         op.set_finishing(&state).expect("finish");
         assert!(
             poll_until(
-                || op.is_finished() && !op.pending_finish(),
+                || op.is_finished() && op.pending_finish().is_none(),
                 Duration::from_secs(5)
             ),
             "sink did not finish"
@@ -672,7 +676,7 @@ mod tests {
 
         // While finish() sleeps, pending_finish must be true and is_finished false.
         assert!(
-            poll_until(|| op.pending_finish(), Duration::from_secs(1)),
+            poll_until(|| op.pending_finish().is_some(), Duration::from_secs(1)),
             "expected pending_finish during async finish"
         );
         assert!(
@@ -683,13 +687,13 @@ mod tests {
         // After finish completes, pending_finish clears and is_finished is true.
         assert!(
             poll_until(
-                || op.is_finished() && !op.pending_finish(),
+                || op.is_finished() && op.pending_finish().is_none(),
                 Duration::from_secs(5)
             ),
             "sink did not finish"
         );
         assert!(
-            !op.pending_finish(),
+            op.pending_finish().is_none(),
             "pending_finish must clear after finish"
         );
         assert_eq!(op.take_output(), Some(2));

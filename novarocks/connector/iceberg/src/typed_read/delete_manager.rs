@@ -41,6 +41,7 @@
 //! artifacts and can be dropped at any time without changing a result.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow::array::{Array, BooleanArray, UInt64Array};
@@ -55,10 +56,11 @@ use crate::delete_file::{
     IcebergFileFormat as PhysicalDeleteFormat, validate_delete_apply_cost,
 };
 use crate::file_reader::equality_delete::{
-    EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets_with_context,
+    EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets,
 };
+use crate::file_reader::map_file_error;
 use crate::iceberg::spec::Schema;
-use crate::position_delete::load_position_deletes_with_context;
+use crate::position_delete::load_position_deletes_async;
 
 use super::column_handle::{IcebergColumnHandle, corrupt, unsupported};
 use super::split::{IcebergDeleteFile, IcebergDeleteFileContent, IcebergFileFormat, IcebergSplit};
@@ -164,27 +166,6 @@ struct PositionCacheKey {
 /// One split's equality deletes, grouped by their schema-ordered key.
 type EqualityGroups<'a> = BTreeMap<Vec<i32>, Vec<&'a IcebergDeleteFile>>;
 
-/// One side's loaded equality artifacts and the key columns they must read,
-/// keyed by top-level schema position.
-type LoadedEqualityDeletes = (
-    Vec<Arc<LoadedEqualityDelete>>,
-    BTreeMap<usize, IcebergColumnHandle>,
-);
-
-/// Everything the loading of one side needs.
-///
-/// A change window's reverse side loads two sides in one open, so grouping
-/// the per-side inputs keeps that from becoming an eight-argument call whose
-/// two invocations differ only in the middle.
-struct SideLoad<'a, 'b> {
-    split: &'a IcebergSplit,
-    scope: &'a DeleteScope,
-    closure: &'a GatedClosure<'b>,
-    position_work: &'a [(PositionCacheKey, &'b IcebergDeleteFile)],
-    table_schema: &'a Schema,
-    access: Option<&'a FsAccessHandle>,
-}
-
 /// One equality-delete file after decoding.
 struct LoadedEqualityDelete {
     path: Arc<str>,
@@ -210,13 +191,25 @@ struct EqualityDeleteIndex {
     highest_loaded_sequence: Option<i64>,
 }
 
+/// One artifact's load, shared by every split of the manager that needs it.
+///
+/// The first split that finds it unloaded loads it and every other split
+/// awaits that same outcome, so an artifact is read once and a failure is
+/// shared rather than retried by each waiter. A load abandoned before it
+/// finished -- its split's stream was dropped -- leaves the slot for the next
+/// split, and so does a stop or a deadline, which belong to the reads that hit
+/// them rather than to the artifact.
+type SharedLoad<T> = Arc<tokio::sync::OnceCell<Result<Arc<T>, ConnectorError>>>;
+
 #[derive(Default)]
 struct DeleteManagerState {
+    /// Published equality indexes. A split publishes by merging what it
+    /// loaded into the index current at that moment, never by replacing it
+    /// with the snapshot it started from.
     equality: HashMap<EqualityCacheKey, Arc<EqualityDeleteIndex>>,
-    position: HashMap<PositionCacheKey, Arc<RoaringTreemap>>,
-    /// How many delete artifacts this manager actually read. Observability
-    /// only: it never participates in a verdict.
-    loaded_artifacts: usize,
+    /// Equality artifacts being loaded or loaded, by key and delete path.
+    equality_loads: HashMap<(EqualityCacheKey, Arc<str>), SharedLoad<LoadedEqualityDelete>>,
+    position: HashMap<PositionCacheKey, SharedLoad<RoaringTreemap>>,
 }
 
 /// Provider-lifetime Iceberg delete state: one BE fragment instance and scan
@@ -225,6 +218,56 @@ pub struct DeleteManager {
     binding: IcebergReadBinding,
     context: FileReadContext,
     state: Mutex<DeleteManagerState>,
+    /// How many delete artifacts this manager actually read. Observability
+    /// only: it never participates in a verdict.
+    loaded_artifacts: AtomicUsize,
+}
+
+/// Everything one split's open decides before any I/O.
+struct SplitOpen<'a> {
+    shape: VerdictShape,
+    scope: DeleteScope,
+    applied: SidePlan<'a>,
+    previously: SidePlan<'a>,
+}
+
+/// One side's sequence-gated closure and its position-delete identities.
+struct SidePlan<'a> {
+    closure: GatedClosure<'a>,
+    position_work: Vec<(PositionCacheKey, &'a IcebergDeleteFile)>,
+}
+
+/// One side's artifacts with the shared loads that produce them, claimed
+/// under the state lock and awaited outside it.
+struct SideClaims<'a> {
+    positions: Vec<(&'a IcebergDeleteFile, SharedLoad<RoaringTreemap>)>,
+    /// One entry per equality group, in the closure's schema order.
+    equality: Vec<Vec<(&'a IcebergDeleteFile, SharedLoad<LoadedEqualityDelete>)>>,
+}
+
+impl SideClaims<'_> {
+    /// Paths of artifacts whose load has not completed yet: the ones this
+    /// open may have to load itself.
+    fn pending_paths<'b>(&'b self, pending: &mut Vec<&'b str>) {
+        for (delete, load) in &self.positions {
+            if !load.initialized() {
+                pending.push(delete.path());
+            }
+        }
+        for group in &self.equality {
+            for (delete, load) in group {
+                if !load.initialized() {
+                    pending.push(delete.path());
+                }
+            }
+        }
+    }
+}
+
+/// One side's loaded artifacts, in claim order.
+struct LoadedSide {
+    positions: Vec<Arc<RoaringTreemap>>,
+    equality: Vec<Vec<Arc<LoadedEqualityDelete>>>,
 }
 
 impl DeleteManager {
@@ -235,12 +278,13 @@ impl DeleteManager {
             binding,
             context,
             state: Mutex::new(DeleteManagerState::default()),
+            loaded_artifacts: AtomicUsize::new(0),
         }
     }
 
     /// How many delete artifacts this manager has read so far.
     pub fn loaded_artifacts(&self) -> Result<usize, ConnectorError> {
-        Ok(self.lock_state()?.loaded_artifacts)
+        Ok(self.loaded_artifacts.load(Ordering::Relaxed))
     }
 
     /// Resolve only the columns a later delete verdict will need. Preparing
@@ -271,18 +315,67 @@ impl DeleteManager {
     /// the per-split filter.
     ///
     /// All grouping, sequence gating, and I/O happen once here rather than
-    /// per page. The state lock is held across the loads so one artifact is
-    /// read exactly once even when sibling splits open concurrently; that
-    /// serializes the first opens of a scan node and is the price of the
-    /// once-only guarantee.
-    pub fn open_split(
+    /// per page. Loads are claimed under the state lock, awaited outside it,
+    /// and published back under it, so a split waiting for one artifact never
+    /// holds up a sibling that needs another, and two splits needing the same
+    /// artifact share its one read. A split whose closure is fully cached
+    /// resolves no access at all.
+    pub async fn open_split(
         &self,
         split: &IcebergSplit,
         table_schema: &Schema,
         mode: DeleteEvaluationMode,
     ) -> Result<SplitDeleteFilter, ConnectorError> {
-        let shape = verdict_shape(&mode);
-        let (applied, previously_applied) = evaluation_inputs(split, &mode)?;
+        let open = Self::plan_open(split, table_schema, &mode)?;
+        let (applied, previously) = {
+            let mut state = self.lock_state()?;
+            (
+                Self::claim_side(&mut state, &open.scope, &open.applied),
+                Self::claim_side(&mut state, &open.scope, &open.previously),
+            )
+        };
+        let mut pending = Vec::new();
+        applied.pending_paths(&mut pending);
+        previously.pending_paths(&mut pending);
+        let access = if pending.is_empty() {
+            None
+        } else {
+            Some(
+                self.binding
+                    .resolve_access_for_locations_async(pending.iter().copied(), &self.context)
+                    .await?,
+            )
+        };
+        let applied_loaded = self.load_side(split, &applied, access.as_ref()).await?;
+        let previously_loaded = self.load_side(split, &previously, access.as_ref()).await?;
+        let mut state = self.lock_state()?;
+        let mut hidden_columns = BTreeMap::new();
+        let applied = Self::publish_side(
+            &mut state,
+            &open.scope,
+            &open.applied,
+            applied_loaded,
+            table_schema,
+            &mut hidden_columns,
+        )?;
+        let previously = Self::publish_side(
+            &mut state,
+            &open.scope,
+            &open.previously,
+            previously_loaded,
+            table_schema,
+            &mut hidden_columns,
+        )?;
+        Ok(open.filter(split, applied, previously, hidden_columns))
+    }
+
+    fn plan_open<'a>(
+        split: &'a IcebergSplit,
+        table_schema: &Schema,
+        mode: &'a DeleteEvaluationMode,
+    ) -> Result<SplitOpen<'a>, ConnectorError> {
+        let shape = verdict_shape(mode);
+        let (applied, previously_applied) = evaluation_inputs(split, mode)?;
 
         // Classification and the cost bound both run before any I/O, so an
         // illegal or oversized closure never opens a file. A rewritten
@@ -293,70 +386,287 @@ impl DeleteManager {
         validate_split_delete_cost(split, applied, previously_applied)?;
 
         let data_sequence_number = split.data_sequence_number();
-        let applied = GatedClosure::of(split, applied, data_sequence_number, table_schema)?;
-        let previously = GatedClosure::of(
-            split,
-            previously_applied,
-            data_sequence_number,
-            table_schema,
-        )?;
-
-        let scope = DeleteScope::of(split);
-        let mut state = self.lock_state()?;
-
-        let applied_position_work = position_work(split, &applied.position_files);
-        let previously_position_work = position_work(split, &previously.position_files);
-
-        // Resolve access exactly once, over exactly the artifacts still
-        // missing. A split whose closure is fully cached opens no handle at
-        // all, which is what makes a second split of the same data file free.
-        let mut pending_paths = Vec::new();
-        for side in [&applied, &previously] {
-            collect_pending_paths(&state, &scope, side, &mut pending_paths);
-        }
-        for work in [&applied_position_work, &previously_position_work] {
-            for (key, delete) in work {
-                if !state.position.contains_key(key) {
-                    pending_paths.push(delete.path());
-                }
-            }
-        }
-        let access = if pending_paths.is_empty() {
-            None
-        } else {
-            Some(
-                self.binding
-                    .resolve_access_for_locations(pending_paths.iter().copied())?,
-            )
+        let side = |deletes| -> Result<SidePlan<'a>, ConnectorError> {
+            let closure = GatedClosure::of(split, deletes, data_sequence_number, table_schema)?;
+            let position_work = position_work(split, &closure.position_files);
+            Ok(SidePlan {
+                closure,
+                position_work,
+            })
         };
+        Ok(SplitOpen {
+            shape,
+            scope: DeleteScope::of(split),
+            applied: side(applied)?,
+            previously: side(previously_applied)?,
+        })
+    }
 
-        let mut hidden_columns: BTreeMap<usize, IcebergColumnHandle> = BTreeMap::new();
-        let applied = self.resolve_side(
-            &mut state,
-            SideLoad {
-                split,
-                scope: &scope,
-                closure: &applied,
-                position_work: &applied_position_work,
-                table_schema,
-                access: access.as_ref(),
-            },
-            &mut hidden_columns,
-        )?;
-        let previously = self.resolve_side(
-            &mut state,
-            SideLoad {
-                split,
-                scope: &scope,
-                closure: &previously,
-                position_work: &previously_position_work,
-                table_schema,
-                access: access.as_ref(),
-            },
-            &mut hidden_columns,
-        )?;
+    fn claim_side<'a>(
+        state: &mut DeleteManagerState,
+        scope: &DeleteScope,
+        side: &SidePlan<'a>,
+    ) -> SideClaims<'a> {
+        let positions = side
+            .position_work
+            .iter()
+            .map(|(key, delete)| {
+                (
+                    *delete,
+                    Arc::clone(state.position.entry(key.clone()).or_default()),
+                )
+            })
+            .collect();
+        let equality = side
+            .closure
+            .equality_groups
+            .iter()
+            .map(|(equality_field_ids, deletes)| {
+                let cache_key = EqualityCacheKey {
+                    scope: scope.clone(),
+                    equality_field_ids: equality_field_ids.clone(),
+                };
+                deletes
+                    .iter()
+                    .map(|delete| {
+                        (
+                            *delete,
+                            Arc::clone(
+                                state
+                                    .equality_loads
+                                    .entry((cache_key.clone(), Arc::from(delete.path())))
+                                    .or_default(),
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        SideClaims {
+            positions,
+            equality,
+        }
+    }
 
-        let verdict = match shape {
+    async fn load_side(
+        &self,
+        split: &IcebergSplit,
+        claims: &SideClaims<'_>,
+        access: Option<&FsAccessHandle>,
+    ) -> Result<LoadedSide, ConnectorError> {
+        let mut positions = Vec::with_capacity(claims.positions.len());
+        for (delete, load) in &claims.positions {
+            positions.push(
+                self.shared_load(load, || self.load_position_delete(split, delete, access))
+                    .await?,
+            );
+        }
+        let mut equality = Vec::with_capacity(claims.equality.len());
+        for group in &claims.equality {
+            let mut loaded = Vec::with_capacity(group.len());
+            for (delete, load) in group {
+                loaded.push(
+                    self.shared_load(load, || self.load_equality_delete(delete, access))
+                        .await?,
+                );
+            }
+            equality.push(loaded);
+        }
+        Ok(LoadedSide {
+            positions,
+            equality,
+        })
+    }
+
+    /// Awaits `load`'s shared outcome, running `run` if this caller is the
+    /// one to load it.
+    async fn shared_load<T, F, Fut>(
+        &self,
+        load: &SharedLoad<T>,
+        run: F,
+    ) -> Result<Arc<T>, ConnectorError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ConnectorError>>,
+    {
+        load.get_or_try_init(|| async {
+            match run().await {
+                Ok(value) => {
+                    self.loaded_artifacts.fetch_add(1, Ordering::Relaxed);
+                    Ok(Ok(Arc::new(value)))
+                }
+                Err(error) => self.settle_failure(error).map(Err),
+            }
+        })
+        .await?
+        .clone()
+    }
+
+    /// Classifies a failed load: `Err` for a stop or deadline of the reads,
+    /// which is returned but not shared, and `Ok` for the artifact's own
+    /// failure, which every split needing it then receives.
+    fn settle_failure(&self, error: ConnectorError) -> Result<ConnectorError, ConnectorError> {
+        match self.context.check_active() {
+            Err(stop) => Err(map_file_error(stop)),
+            Ok(()) => Ok(error),
+        }
+    }
+
+    async fn load_position_delete(
+        &self,
+        split: &IcebergSplit,
+        delete: &IcebergDeleteFile,
+        access: Option<&FsAccessHandle>,
+    ) -> Result<RoaringTreemap, ConnectorError> {
+        let access = access.ok_or_else(|| missing_access(delete))?;
+        let spec = physical_delete_spec(delete)?;
+        load_position_deletes_async(
+            std::slice::from_ref(&spec),
+            split.path(),
+            access,
+            &self.context,
+        )
+        .await
+        .map_err(|error| position_load_error(delete, split, error))
+    }
+
+    async fn load_equality_delete(
+        &self,
+        delete: &IcebergDeleteFile,
+        access: Option<&FsAccessHandle>,
+    ) -> Result<LoadedEqualityDelete, ConnectorError> {
+        let access = access.ok_or_else(|| missing_access(delete))?;
+        let spec = physical_delete_spec(delete)?;
+        let sets = load_equality_delete_sets(std::slice::from_ref(&spec), access, &self.context)
+            .await
+            .map_err(|error| equality_load_error(delete, error))?;
+        loaded_equality_delete(delete, sets)
+    }
+
+    /// Folds one side's loads into its per-split verdict input, publishing
+    /// equality artifacts into the index current under the lock.
+    fn publish_side(
+        state: &mut DeleteManagerState,
+        scope: &DeleteScope,
+        side: &SidePlan<'_>,
+        loaded: LoadedSide,
+        table_schema: &Schema,
+        hidden_columns: &mut BTreeMap<usize, IcebergColumnHandle>,
+    ) -> Result<ResolvedDeletes, ConnectorError> {
+        // One artifact is by far the common case, and sharing it avoids
+        // copying a bitmap that the cache already owns.
+        let deleted_positions = match loaded.positions.len() {
+            0 => Arc::new(RoaringTreemap::new()),
+            1 => Arc::clone(&loaded.positions[0]),
+            _ => {
+                let mut merged = RoaringTreemap::new();
+                for part in &loaded.positions {
+                    merged |= part.as_ref();
+                }
+                Arc::new(merged)
+            }
+        };
+        let mut applications = Vec::new();
+        for ((equality_field_ids, _), artifacts) in
+            side.closure.equality_groups.iter().zip(loaded.equality)
+        {
+            let cache_key = EqualityCacheKey {
+                scope: scope.clone(),
+                equality_field_ids: equality_field_ids.clone(),
+            };
+            let index = Self::publish_equality(
+                state,
+                cache_key,
+                equality_field_ids,
+                &artifacts,
+                table_schema,
+            )?;
+            // Keyed by top-level schema position so the hidden suffix is
+            // ordered by the table schema and carries each column exactly
+            // once, however many equality keys asked for it.
+            for column in &index.columns {
+                let position = top_level_schema_position(table_schema, column.base_field_id())?;
+                hidden_columns.insert(position, column.clone());
+            }
+            // The filter sees exactly this split's own gated closure, never
+            // whatever a sibling split happened to load into the same key.
+            applications.extend(artifacts);
+        }
+        Ok(ResolvedDeletes {
+            deleted_positions,
+            equality: applications,
+        })
+    }
+
+    /// Merges `artifacts` into the index current for `cache_key`. The index
+    /// is immutable once published, so a merge rebuilds and swaps it, and a
+    /// sibling's artifacts published in between are kept.
+    fn publish_equality(
+        state: &mut DeleteManagerState,
+        cache_key: EqualityCacheKey,
+        equality_field_ids: &[i32],
+        artifacts: &[Arc<LoadedEqualityDelete>],
+        table_schema: &Schema,
+    ) -> Result<Arc<EqualityDeleteIndex>, ConnectorError> {
+        let current = state.equality.get(&cache_key).cloned();
+        let missing = artifacts
+            .iter()
+            .filter(|artifact| {
+                current
+                    .as_ref()
+                    .is_none_or(|index| !index.artifacts.contains_key(&artifact.path))
+            })
+            .collect::<Vec<_>>();
+        if let Some(index) = &current
+            && missing.is_empty()
+        {
+            return Ok(Arc::clone(index));
+        }
+        let mut next = match &current {
+            Some(index) => EqualityDeleteIndex {
+                columns: index.columns.clone(),
+                artifacts: index.artifacts.clone(),
+                highest_loaded_sequence: index.highest_loaded_sequence,
+            },
+            None => EqualityDeleteIndex {
+                columns: equality_columns(equality_field_ids, table_schema)?,
+                artifacts: HashMap::new(),
+                highest_loaded_sequence: None,
+            },
+        };
+        for artifact in missing {
+            let sequence = artifact.data_sequence_number;
+            next.highest_loaded_sequence = Some(
+                next.highest_loaded_sequence
+                    .map_or(sequence, |highest| highest.max(sequence)),
+            );
+            next.artifacts
+                .insert(Arc::clone(&artifact.path), Arc::clone(artifact));
+        }
+        let next = Arc::new(next);
+        state.equality.insert(cache_key, Arc::clone(&next));
+        Ok(next)
+    }
+
+    fn lock_state(&self) -> Result<MutexGuard<'_, DeleteManagerState>, ConnectorError> {
+        self.state.lock().map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!("iceberg delete manager state lock: {error}"),
+            )
+        })
+    }
+}
+
+impl SplitOpen<'_> {
+    fn filter(
+        self,
+        split: &IcebergSplit,
+        applied: ResolvedDeletes,
+        previously: ResolvedDeletes,
+        hidden_columns: BTreeMap<usize, IcebergColumnHandle>,
+    ) -> SplitDeleteFilter {
+        let verdict = match self.shape {
             VerdictShape::ExcludeDeleted => FilterVerdict::ExcludeDeleted(applied),
             VerdictShape::EqualityMatchOnly => FilterVerdict::EqualityMatchOnly(applied),
             VerdictShape::SelectNamedRows => FilterVerdict::SelectRemovedRows {
@@ -368,206 +678,49 @@ impl DeleteManager {
                 previously_applied: previously,
             },
         };
-
-        Ok(SplitDeleteFilter {
+        SplitDeleteFilter {
             verdict,
             data_file_path: Arc::from(split.path()),
             hidden_columns: hidden_columns.into_values().collect(),
-        })
-    }
-
-    /// Load one side's artifacts and fold its equality key columns into the
-    /// shared hidden suffix.
-    fn resolve_side(
-        &self,
-        state: &mut DeleteManagerState,
-        load: SideLoad<'_, '_>,
-        hidden_columns: &mut BTreeMap<usize, IcebergColumnHandle>,
-    ) -> Result<ResolvedDeletes, ConnectorError> {
-        let deleted_positions =
-            self.load_position_deletes(state, load.split, load.position_work, load.access)?;
-        let (equality, side_hidden) = self.load_equality_deletes(
-            state,
-            load.scope,
-            &load.closure.equality_groups,
-            load.table_schema,
-            load.access,
-        )?;
-        hidden_columns.extend(side_hidden);
-        Ok(ResolvedDeletes {
-            deleted_positions,
-            equality,
-        })
-    }
-
-    fn load_position_deletes(
-        &self,
-        state: &mut DeleteManagerState,
-        split: &IcebergSplit,
-        work: &[(PositionCacheKey, &IcebergDeleteFile)],
-        access: Option<&FsAccessHandle>,
-    ) -> Result<Arc<RoaringTreemap>, ConnectorError> {
-        let mut parts = Vec::with_capacity(work.len());
-        for (key, delete) in work {
-            if let Some(cached) = state.position.get(key) {
-                parts.push(Arc::clone(cached));
-                continue;
-            }
-            let access = access.ok_or_else(|| missing_access(delete))?;
-            let spec = physical_delete_spec(delete)?;
-            let loaded = load_position_deletes_with_context(
-                std::slice::from_ref(&spec),
-                split.path(),
-                access,
-                &self.context,
-            )
-            .map_err(|error| {
-                corrupt(format!(
-                    "load iceberg position deletes from {} for {}: {error}",
-                    delete.path(),
-                    split.path()
-                ))
-            })?;
-            let loaded = Arc::new(loaded);
-            state.position.insert(key.clone(), Arc::clone(&loaded));
-            state.loaded_artifacts += 1;
-            parts.push(loaded);
         }
-
-        // One artifact is by far the common case, and sharing it avoids
-        // copying a bitmap that the cache already owns.
-        Ok(match parts.len() {
-            0 => Arc::new(RoaringTreemap::new()),
-            1 => Arc::clone(&parts[0]),
-            _ => {
-                let mut merged = RoaringTreemap::new();
-                for part in &parts {
-                    merged |= part.as_ref();
-                }
-                Arc::new(merged)
-            }
-        })
     }
+}
 
-    fn load_equality_deletes(
-        &self,
-        state: &mut DeleteManagerState,
-        scope: &DeleteScope,
-        groups: &EqualityGroups<'_>,
-        table_schema: &Schema,
-        access: Option<&FsAccessHandle>,
-    ) -> Result<LoadedEqualityDeletes, ConnectorError> {
-        let mut applications = Vec::new();
-        // Keyed by top-level schema position so the hidden suffix is ordered
-        // by the table schema and carries each column exactly once, however
-        // many equality keys asked for it.
-        let mut hidden_columns: BTreeMap<usize, IcebergColumnHandle> = BTreeMap::new();
+fn position_load_error(
+    delete: &IcebergDeleteFile,
+    split: &IcebergSplit,
+    error: String,
+) -> ConnectorError {
+    corrupt(format!(
+        "load iceberg position deletes from {} for {}: {error}",
+        delete.path(),
+        split.path()
+    ))
+}
 
-        for (equality_field_ids, deletes) in groups {
-            let cache_key = EqualityCacheKey {
-                scope: scope.clone(),
-                equality_field_ids: equality_field_ids.clone(),
-            };
-            let mut index = match state.equality.get(&cache_key) {
-                Some(index) => Arc::clone(index),
-                None => Arc::new(EqualityDeleteIndex {
-                    columns: equality_columns(equality_field_ids, table_schema)?,
-                    artifacts: HashMap::new(),
-                    highest_loaded_sequence: None,
-                }),
-            };
+fn equality_load_error(delete: &IcebergDeleteFile, error: String) -> ConnectorError {
+    corrupt(format!(
+        "load iceberg equality deletes from {}: {error}",
+        delete.path()
+    ))
+}
 
-            let missing = deletes
-                .iter()
-                .copied()
-                .filter(|delete| !index.artifacts.contains_key(delete.path()))
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                let mut next = EqualityDeleteIndex {
-                    columns: index.columns.clone(),
-                    artifacts: index.artifacts.clone(),
-                    highest_loaded_sequence: index.highest_loaded_sequence,
-                };
-                for delete in missing {
-                    let access = access.ok_or_else(|| missing_access(delete))?;
-                    let keys = self.load_equality_delete(delete, access)?;
-                    let sequence = delete.data_sequence_number();
-                    next.highest_loaded_sequence = Some(
-                        next.highest_loaded_sequence
-                            .map_or(sequence, |highest| highest.max(sequence)),
-                    );
-                    next.artifacts.insert(
-                        Arc::from(delete.path()),
-                        Arc::new(LoadedEqualityDelete {
-                            path: Arc::from(delete.path()),
-                            data_sequence_number: sequence,
-                            keys,
-                        }),
-                    );
-                    state.loaded_artifacts += 1;
-                }
-                index = Arc::new(next);
-                state.equality.insert(cache_key, Arc::clone(&index));
-            }
-
-            // The filter sees exactly this split's own gated closure, never
-            // whatever a sibling split happened to load into the same key.
-            for delete in deletes {
-                let artifact = index.artifacts.get(delete.path()).ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::Internal,
-                        format!(
-                            "iceberg equality-delete artifact {} vanished from its loaded index",
-                            delete.path()
-                        ),
-                    )
-                })?;
-                applications.push(Arc::clone(artifact));
-            }
-            for column in &index.columns {
-                let position = top_level_schema_position(table_schema, column.base_field_id())?;
-                hidden_columns.insert(position, column.clone());
-            }
-        }
-
-        Ok((applications, hidden_columns))
+fn loaded_equality_delete(
+    delete: &IcebergDeleteFile,
+    mut sets: Vec<EqualityDeleteSet>,
+) -> Result<LoadedEqualityDelete, ConnectorError> {
+    if sets.len() != 1 {
+        return Err(corrupt(format!(
+            "iceberg equality-delete file {} decoded into {} key sets, expected exactly one",
+            delete.path(),
+            sets.len()
+        )));
     }
-
-    fn load_equality_delete(
-        &self,
-        delete: &IcebergDeleteFile,
-        access: &FsAccessHandle,
-    ) -> Result<EqualityDeleteSet, ConnectorError> {
-        let spec = physical_delete_spec(delete)?;
-        let mut sets = load_equality_delete_sets_with_context(
-            std::slice::from_ref(&spec),
-            access,
-            &self.context,
-        )
-        .map_err(|error| {
-            corrupt(format!(
-                "load iceberg equality deletes from {}: {error}",
-                delete.path()
-            ))
-        })?;
-        if sets.len() != 1 {
-            return Err(corrupt(format!(
-                "iceberg equality-delete file {} decoded into {} key sets, expected exactly one",
-                delete.path(),
-                sets.len()
-            )));
-        }
-        Ok(sets.remove(0))
-    }
-
-    fn lock_state(&self) -> Result<MutexGuard<'_, DeleteManagerState>, ConnectorError> {
-        self.state.lock().map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                format!("iceberg delete manager state lock: {error}"),
-            )
-        })
-    }
+    Ok(LoadedEqualityDelete {
+        path: Arc::from(delete.path()),
+        data_sequence_number: delete.data_sequence_number(),
+        keys: sets.remove(0),
+    })
 }
 
 /// One side's loaded delete state.
@@ -919,27 +1072,6 @@ fn position_work<'a>(
         .iter()
         .map(|delete| (position_cache_key(split, delete), *delete))
         .collect()
-}
-
-/// The equality-delete paths of one side that this manager has not read yet.
-fn collect_pending_paths<'a>(
-    state: &DeleteManagerState,
-    scope: &DeleteScope,
-    closure: &GatedClosure<'a>,
-    pending: &mut Vec<&'a str>,
-) {
-    for (equality_field_ids, deletes) in &closure.equality_groups {
-        let cache_key = EqualityCacheKey {
-            scope: scope.clone(),
-            equality_field_ids: equality_field_ids.clone(),
-        };
-        let index = state.equality.get(&cache_key);
-        for delete in deletes {
-            if index.is_none_or(|index| !index.artifacts.contains_key(delete.path())) {
-                pending.push(delete.path());
-            }
-        }
-    }
 }
 
 /// A split's declared delete closure, classified before any I/O.
@@ -1341,6 +1473,17 @@ mod tests {
         fn loaded_artifacts(&self) -> usize {
             self.manager.loaded_artifacts().expect("loaded artifacts")
         }
+
+        /// Opens a split's delete state the way its page stream does.
+        fn open_split(
+            &self,
+            split: &IcebergSplit,
+            table_schema: &Schema,
+            mode: DeleteEvaluationMode,
+        ) -> Result<SplitDeleteFilter, ConnectorError> {
+            self._runtime
+                .block_on(self.manager.open_split(split, table_schema, mode))
+        }
     }
 
     fn table_schema() -> Schema {
@@ -1615,6 +1758,266 @@ mod tests {
         .expect("valid iceberg split")
     }
 
+    /// Holds each spawned file task until the test releases its spawn index.
+    struct OrderedGate {
+        handle: tokio::runtime::Handle,
+        started: std::sync::atomic::AtomicUsize,
+        gates: std::sync::Mutex<HashMap<usize, StdArc<tokio::sync::Notify>>>,
+        released: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl OrderedGate {
+        fn started(&self) -> usize {
+            self.started.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn gate(&self, index: usize) -> StdArc<tokio::sync::Notify> {
+            StdArc::clone(
+                self.gates
+                    .lock()
+                    .unwrap()
+                    .entry(index)
+                    .or_insert_with(|| StdArc::new(tokio::sync::Notify::new())),
+            )
+        }
+
+        fn release(&self, index: usize) {
+            self.released.lock().unwrap().push(index);
+            self.gate(index).notify_one();
+        }
+    }
+
+    impl FileTaskSpawner for OrderedGate {
+        fn spawn(
+            &self,
+            task: novarocks_fs::FileTaskFuture,
+        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+            let index = self
+                .started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let held = !self.released.lock().unwrap().contains(&index);
+            let gate = self.gate(index);
+            Ok(novarocks_fs::FileTask::new(self.handle.spawn(async move {
+                if held {
+                    gate.notified().await;
+                }
+                task.await;
+            })))
+        }
+
+        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+            self.handle.spawn_blocking(job);
+        }
+    }
+
+    /// A manager whose every delete read waits for the test to release it.
+    struct GatedFixture {
+        runtime: tokio::runtime::Runtime,
+        directory: tempfile::TempDir,
+        manager: StdArc<DeleteManager>,
+        gate: StdArc<OrderedGate>,
+    }
+
+    impl GatedFixture {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build Tokio runtime");
+            let gate = StdArc::new(OrderedGate {
+                handle: runtime.handle().clone(),
+                started: std::sync::atomic::AtomicUsize::new(0),
+                gates: std::sync::Mutex::new(HashMap::new()),
+                released: std::sync::Mutex::new(Vec::new()),
+            });
+            let file_runtime: StdArc<dyn FileIoRuntime> =
+                StdArc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
+            let task_spawner: StdArc<dyn FileTaskSpawner> = gate.clone();
+            let binding =
+                IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, task_spawner);
+            let context = binding
+                .file_read_context(
+                    FileCancellation::new(),
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .expect("build file read context");
+            Self {
+                runtime,
+                directory: tempfile::tempdir().expect("create temporary directory"),
+                manager: StdArc::new(DeleteManager::new(binding, context)),
+                gate,
+            }
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.directory.path().join(name)
+        }
+
+        fn open(
+            &self,
+            split: IcebergSplit,
+        ) -> tokio::task::JoinHandle<Result<SplitDeleteFilter, ConnectorError>> {
+            let manager = StdArc::clone(&self.manager);
+            self.runtime.spawn(async move {
+                manager
+                    .open_split(
+                        &split,
+                        &table_schema(),
+                        DeleteEvaluationMode::ExcludeDeleted,
+                    )
+                    .await
+            })
+        }
+
+        fn wait_started(&self, count: usize) {
+            self.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while self.gate.started() < count {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("delete reads started");
+            });
+        }
+
+        fn loaded_artifacts(&self) -> usize {
+            self.manager.loaded_artifacts().expect("loaded artifacts")
+        }
+    }
+
+    #[test]
+    fn concurrent_opens_share_one_read_of_the_same_artifact() {
+        let fixture = GatedFixture::new();
+        let deletes = fixture.path("deletes.parquet");
+        write_position_delete_parquet(&deletes, &[(DATA_FILE, 1)]);
+        let split = |start| {
+            split_range(
+                DATA_FILE,
+                start,
+                512,
+                Some(1),
+                vec![DeleteBuilder::position(&deletes, 9).build()],
+            )
+        };
+
+        let first = fixture.open(split(0));
+        fixture.wait_started(1);
+        let second = fixture.open(split(512));
+        fixture.gate.release(0);
+        let batch = data_batch(&[1, 2, 3], &["a", "a", "a"]);
+        for open in [first, second] {
+            let filter = fixture
+                .runtime
+                .block_on(open)
+                .expect("open task")
+                .expect("open split");
+            let mask = filter
+                .evaluate(&batch, &positions(&[0, 1, 2]))
+                .expect("evaluate");
+            assert_eq!(keeps(&mask), vec![true, false, true]);
+        }
+        assert_eq!(fixture.gate.started(), 1, "the waiting split read nothing");
+        assert_eq!(fixture.loaded_artifacts(), 1);
+    }
+
+    #[test]
+    fn interleaved_equality_loads_under_one_key_keep_each_other() {
+        let fixture = GatedFixture::new();
+        let first_deletes = fixture.path("first.parquet");
+        let second_deletes = fixture.path("second.parquet");
+        write_equality_delete_parquet(&first_deletes, 1, "id", &[1]);
+        write_equality_delete_parquet(&second_deletes, 1, "id", &[3]);
+        let first = fixture.open(split_of(
+            DATA_FILE,
+            Some(1),
+            vec![DeleteBuilder::equality(&first_deletes, 4, vec![1]).build()],
+        ));
+        fixture.wait_started(1);
+        let second = fixture.open(split_of(
+            OTHER_DATA_FILE,
+            Some(1),
+            vec![DeleteBuilder::equality(&second_deletes, 5, vec![1]).build()],
+        ));
+        fixture.wait_started(2);
+
+        // The later load publishes first; the earlier one must merge into
+        // it rather than replace it with the index it started from.
+        fixture.gate.release(1);
+        let second = fixture
+            .runtime
+            .block_on(second)
+            .expect("open task")
+            .expect("open second split");
+        fixture.gate.release(0);
+        let first = fixture
+            .runtime
+            .block_on(first)
+            .expect("open task")
+            .expect("open first split");
+
+        let published = fixture
+            .manager
+            .lock_state()
+            .expect("state")
+            .equality
+            .values()
+            .map(|index| index.artifacts.len())
+            .collect::<Vec<_>>();
+        assert_eq!(published, vec![2], "both artifacts stay published");
+        let batch = data_batch(&[1, 2, 3], &["a", "a", "a"]);
+        let positions = positions(&[0, 1, 2]);
+        // Each split applies only its own closure, not the shared index.
+        assert_eq!(
+            keeps(&first.evaluate(&batch, &positions).expect("evaluate")),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            keeps(&second.evaluate(&batch, &positions).expect("evaluate")),
+            vec![true, true, false]
+        );
+        assert_eq!(fixture.loaded_artifacts(), 2);
+    }
+
+    #[test]
+    fn an_abandoned_load_is_taken_over_by_the_next_split() {
+        let fixture = GatedFixture::new();
+        let deletes = fixture.path("deletes.parquet");
+        write_position_delete_parquet(&deletes, &[(DATA_FILE, 2)]);
+        let split = || {
+            split_of(
+                DATA_FILE,
+                Some(1),
+                vec![DeleteBuilder::position(&deletes, 9).build()],
+            )
+        };
+
+        let abandoned = fixture.open(split());
+        fixture.wait_started(1);
+        abandoned.abort();
+        let _ = fixture.runtime.block_on(abandoned);
+        assert_eq!(fixture.loaded_artifacts(), 0);
+
+        let taken_over = fixture.open(split());
+        fixture.wait_started(2);
+        fixture.gate.release(1);
+        let filter = fixture
+            .runtime
+            .block_on(taken_over)
+            .expect("open task")
+            .expect("the next split loads the artifact itself");
+        let mask = filter
+            .evaluate(
+                &data_batch(&[1, 2, 3], &["a", "a", "a"]),
+                &positions(&[0, 1, 2]),
+            )
+            .expect("evaluate");
+        assert_eq!(keeps(&mask), vec![true, true, false]);
+        assert_eq!(fixture.loaded_artifacts(), 1);
+        fixture.gate.release(0);
+    }
+
     #[test]
     fn a_delete_applies_only_above_the_data_sequence_number() {
         let fixture = Fixture::new();
@@ -1634,7 +2037,6 @@ mod tests {
             ],
         );
         let filter = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -1665,7 +2067,6 @@ mod tests {
             vec![DeleteBuilder::equality(&deletes, 7, vec![1]).build()],
         );
         let error = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -1700,12 +2101,10 @@ mod tests {
         );
 
         let first = fixture
-            .manager
             .open_split(&first, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open first split");
         assert_eq!(fixture.loaded_artifacts(), 1);
         let second = fixture
-            .manager
             .open_split(&second, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open second split");
         assert_eq!(fixture.loaded_artifacts(), 1);
@@ -1737,7 +2136,6 @@ mod tests {
             vec![DeleteBuilder::position(&deletes, 9).build()],
         );
         let mask = fixture
-            .manager
             .open_split(&mine, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open split")
             .evaluate(&batch, &positions(&[0, 1, 2]))
@@ -1746,7 +2144,6 @@ mod tests {
 
         // Position 5 belongs to the same data file but to another page.
         let mask = fixture
-            .manager
             .open_split(&mine, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("reopen split")
             .evaluate(&batch, &positions(&[4, 5, 6]))
@@ -1760,7 +2157,6 @@ mod tests {
             vec![DeleteBuilder::position(&deletes, 9).build()],
         );
         let mask = fixture
-            .manager
             .open_split(&theirs, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open other split")
             .evaluate(&batch, &positions(&[0, 1, 2]))
@@ -1786,7 +2182,6 @@ mod tests {
             ],
         );
         let filter = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -1824,7 +2219,6 @@ mod tests {
             vec![DeleteBuilder::deletion_vector(&first, 9, first_range).build()],
         );
         let mask = fixture
-            .manager
             .open_split(&single, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open split")
             .evaluate(&batch, &positions(&[0, 1, 2]))
@@ -1840,7 +2234,6 @@ mod tests {
             ],
         );
         let error = fixture
-            .manager
             .open_split(&two, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect_err("two deletion vectors must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
@@ -1863,7 +2256,6 @@ mod tests {
             ],
         );
         let error = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -1885,7 +2277,6 @@ mod tests {
             vec![DeleteBuilder::equality(&deletes, 9, vec![99]).build()],
         );
         let error = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -1925,7 +2316,6 @@ mod tests {
         );
         assert_eq!(fixture.loaded_artifacts(), 0);
         let filter = fixture
-            .manager
             .open_split(&split, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open split");
 
@@ -1973,7 +2363,6 @@ mod tests {
             ],
         );
         let filter = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -2018,7 +2407,6 @@ mod tests {
         };
 
         let exclude = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(1), deletes()),
                 &schema,
@@ -2030,7 +2418,6 @@ mod tests {
         assert_eq!(keeps(&exclude), vec![false, false, true]);
 
         let matched = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(1), deletes()),
                 &schema,
@@ -2052,7 +2439,6 @@ mod tests {
 
         let schema = table_schema();
         let with_positions = fixture
-            .manager
             .open_split(
                 &split_of(
                     DATA_FILE,
@@ -2067,7 +2453,6 @@ mod tests {
         assert!(!with_positions.is_empty());
 
         let without_deletes = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(1), Vec::new()),
                 &schema,
@@ -2080,7 +2465,6 @@ mod tests {
         // Reverse projection with nothing to match keeps nothing, so it is
         // never reported as an empty filter.
         let reverse = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(1), Vec::new()),
                 &schema,
@@ -2117,7 +2501,6 @@ mod tests {
             ],
         );
         let error = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -2136,7 +2519,6 @@ mod tests {
         write_position_delete_parquet(&deletes, &[(DATA_FILE, 1)]);
 
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(
                     DATA_FILE,
@@ -2168,7 +2550,6 @@ mod tests {
         write_position_delete_parquet(&newly, &[(DATA_FILE, 0), (DATA_FILE, 2)]);
 
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(5), Vec::new()),
                 &table_schema(),
@@ -2200,7 +2581,6 @@ mod tests {
         write_equality_delete_parquet(&previously, 1, "id", &[2]);
 
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(5), Vec::new()),
                 &table_schema(),
@@ -2229,7 +2609,6 @@ mod tests {
     fn a_whole_file_selection_with_nothing_already_applied_filters_nothing() {
         let fixture = Fixture::new();
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(5), Vec::new()),
                 &table_schema(),
@@ -2255,7 +2634,6 @@ mod tests {
         // One split cannot say both "hide these rows" and "these are exactly
         // the rows to emit" about the same data file.
         let error = fixture
-            .manager
             .open_split(
                 &split_of(
                     DATA_FILE,
@@ -2283,7 +2661,6 @@ mod tests {
         let newly_range = write_deletion_vector(&newly, &[0, 2], 4);
 
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(5), Vec::new()),
                 &table_schema(),

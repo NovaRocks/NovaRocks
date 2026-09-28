@@ -16,7 +16,7 @@
 // under the License.
 
 //! Control for one typed scan's speculative successor window. The flow lock
-//! never encloses a network wait or page-source pull; timeout reclaim issues
+//! never encloses a network wait or a stream poll; timeout reclaim issues
 //! nonblocking control requests under it to preserve generation ordering.
 
 use std::cmp::{Ordering, Reverse};
@@ -170,6 +170,8 @@ impl StreamPreparationFlow {
         })
     }
 
+    /// Registers a candidate's control. A flow that already stopped stops
+    /// the candidate at once; its drain is observed by [`Self::drained`].
     pub(super) fn register(&self, control: Arc<dyn ConnectorPreparationControl>) -> u64 {
         let id = {
             let mut state = self.state.lock().expect("typed preparation flow lock");
@@ -180,14 +182,6 @@ impl StreamPreparationFlow {
             id
         };
         self.sync_control(&control);
-        if self
-            .state
-            .lock()
-            .expect("typed preparation flow lock")
-            .closed
-        {
-            futures::executor::block_on(control.wait_drained());
-        }
         id
     }
 
@@ -400,7 +394,9 @@ impl StreamPreparationFlow {
         }
     }
 
-    pub(super) fn stop_and_drain(&self) {
+    /// Stops every candidate, now and whatever registers later, without
+    /// waiting: [`Self::drained`] observes their exit.
+    pub(super) fn stop(&self) {
         let controls = {
             let mut state = self.state.lock().expect("typed preparation flow lock");
             state.closed = true;
@@ -411,8 +407,15 @@ impl StreamPreparationFlow {
         for control in &controls {
             self.sync_control(control);
         }
-        for control in controls {
-            futures::executor::block_on(control.wait_drained());
+    }
+
+    /// Resolves once every candidate registered now has drained.
+    pub(super) fn drained(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let controls = self.controls();
+        async move {
+            for control in controls {
+                control.wait_drained().await;
+            }
         }
     }
 

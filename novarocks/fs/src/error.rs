@@ -18,6 +18,8 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
 pub type FileResult<T> = Result<T, FileError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,5 +107,31 @@ impl Error for FileError {
         self.source
             .as_deref()
             .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
+/// The connector-neutral taxonomy of a file failure, shared by every provider
+/// and by the source operations a file request is registered in.
+impl From<&FileError> for ConnectorError {
+    fn from(error: &FileError) -> Self {
+        let kind = match error.kind() {
+            FileErrorKind::Invalid => ConnectorErrorKind::InvalidRequest,
+            FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
+            FileErrorKind::NotFound => ConnectorErrorKind::NotFound,
+            FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
+            FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
+            FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
+            FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
+            FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
+            FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
+            FileErrorKind::AlreadyExists | FileErrorKind::Internal => ConnectorErrorKind::Internal,
+        };
+        ConnectorError::new(kind, error.to_string())
+    }
+}
+
+impl From<FileError> for ConnectorError {
+    fn from(error: FileError) -> Self {
+        Self::from(&error)
     }
 }

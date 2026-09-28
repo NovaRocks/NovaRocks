@@ -69,6 +69,24 @@ pub fn test_backend_native_trust() -> Arc<NativeTrust> {
     ))
 }
 
+/// The runtime Native adapter tests poll typed scan streams in, standing in
+/// for the Server's scan I/O runtime.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_scan_stream_runtime() -> tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("test-scan-stream")
+                .build()
+                .expect("test scan stream runtime")
+        })
+        .handle()
+        .clone()
+}
+
 /// A real, small memory authority for Native adapter tests and Backend role
 /// tests that construct the adapter's query runtime.
 #[cfg(any(test, feature = "test-support"))]

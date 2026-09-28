@@ -183,7 +183,7 @@ count(DISTINCT c1, c2, c3)	count(DISTINCT c2, c3)	sum(c2)
 1	1	3750
 
 -- query 50
-count(DISTINCT t1.c1, if(t2.c3 IS NULL, 1, 0))	sum(t1.c2 + (if(t2.c3 IS NULL, 1, 0)))
+count(DISTINCT t1.c1, if(c3 IS NULL, 1, 0))	sum(c2 + (if(c3 IS NULL, 1, 0)))
 1	5000
 
 -- query 53

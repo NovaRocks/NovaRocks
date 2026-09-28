@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -26,13 +27,11 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorReso
 use paimon::DataSplit;
 use paimon::io::{ReadControl, ReadExecutionResources};
 use paimon::spec::{DataField, DataType};
-use paimon::table::{ArrowRecordBatchStream, ExecutionTableRead, Table, TableRead};
+use paimon::table::{ArrowRecordBatchStream, ExecutionTableRead, Table};
 
 use crate::domain::{PaimonColumn, PaimonMergeEngine, PaimonReadView, PaimonSplit, PaimonTable};
-use crate::metadata::PaimonFrozenRead;
 use crate::schema::PaimonDataType;
 use crate::sdk_control::PaimonSdkExecutionResources;
-use crate::split_source::PaimonPlannedSplit;
 
 /// One SDK output batch and the exact host reservation transferred with it.
 pub struct PaimonReadBatch {
@@ -67,31 +66,48 @@ impl PaimonReadBatch {
     }
 }
 
-/// Pull boundary used by the page source.
-///
-/// Production uses [`PaimonReader`]. The trait keeps lifecycle tests at the
-/// connector boundary without replacing SDK merge behavior.
-pub trait PaimonBatchReader: Send {
-    fn next_batch(&mut self) -> Result<Option<PaimonReadBatch>, ConnectorError>;
+/// Poll boundary used by the page stream: the SDK stream of one split,
+/// polled by the host driver. Production uses [`PaimonAwaitedReader`]; the
+/// trait keeps lifecycle tests at the connector boundary.
+pub trait PaimonBatchStream: Send + Unpin {
+    fn poll_next_batch(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<PaimonReadBatch>, ConnectorError>>;
+
+    /// Drops the SDK stream; an in-flight read keeps what it paid for until
+    /// its own exit.
     fn close(&mut self) -> Result<(), ConnectorError>;
 }
 
-/// One SDK stream constructed from an already-frozen table and one atomic
-/// Paimon split.
-pub struct PaimonReader {
-    stream: Option<ArrowRecordBatchStream>,
-    output_schema: SchemaRef,
-    runtime: Option<tokio::runtime::Handle>,
+/// The execution SDK stream of one validated split, and the projection it
+/// must produce; no batch is read.
+fn open_execution_stream(
+    sdk_table: &Table,
+    sdk_split: &DataSplit,
+    projected_columns: &[PaimonColumn],
+    resources: &Arc<PaimonSdkExecutionResources>,
+) -> Result<(ArrowRecordBatchStream, SchemaRef), ConnectorError> {
+    let read_type = projected_sdk_fields(sdk_table, projected_columns)?;
+    let output_schema =
+        paimon::arrow::build_target_arrow_schema(&read_type).map_err(map_paimon_error)?;
+    let sdk_resources: Arc<dyn ReadExecutionResources> = resources.clone();
+    let stream = ExecutionTableRead::new(sdk_table, read_type, Vec::new(), sdk_resources)
+        .to_arrow(std::slice::from_ref(sdk_split))
+        .map_err(map_paimon_error)?;
+    Ok((stream, output_schema))
 }
 
-/// BE reader with an admitted execution capability and output handoff owner.
-pub struct PaimonExecutionReader {
-    reader: PaimonReader,
+/// BE reader polled by the host driver: the page stream's SDK stream, whose
+/// every batch is paired with the output reservation the SDK handed over.
+pub struct PaimonAwaitedReader {
+    stream: Option<ArrowRecordBatchStream>,
+    output_schema: SchemaRef,
     resources: Arc<PaimonSdkExecutionResources>,
     _schema: Arc<paimon::table::ExecutionTableSchema>,
 }
 
-impl PaimonExecutionReader {
+impl PaimonAwaitedReader {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         sdk_table: Arc<Table>,
@@ -100,7 +116,6 @@ impl PaimonExecutionReader {
         split: &PaimonSplit,
         sdk_split: DataSplit,
         projected_columns: &[PaimonColumn],
-        runtime: tokio::runtime::Handle,
         resources: Arc<PaimonSdkExecutionResources>,
         schema: Arc<paimon::table::ExecutionTableSchema>,
     ) -> Result<Self, ConnectorError> {
@@ -112,219 +127,66 @@ impl PaimonExecutionReader {
             &sdk_split,
             projected_columns,
         )?;
-        let read_type = projected_sdk_fields(sdk_table.as_ref(), projected_columns)?;
-        let output_schema =
-            paimon::arrow::build_target_arrow_schema(&read_type).map_err(map_paimon_error)?;
-        let sdk_resources: Arc<dyn ReadExecutionResources> = resources.clone();
-        let table_read =
-            ExecutionTableRead::new(sdk_table.as_ref(), read_type, Vec::new(), sdk_resources);
-        let stream = table_read
-            .to_arrow(std::slice::from_ref(&sdk_split))
-            .map_err(map_paimon_error)?;
-        let reader = PaimonReader {
+        let (stream, output_schema) = open_execution_stream(
+            sdk_table.as_ref(),
+            &sdk_split,
+            projected_columns,
+            &resources,
+        )?;
+        Ok(Self {
             stream: Some(stream),
             output_schema,
-            runtime: Some(runtime),
-        };
-        Ok(Self {
-            reader,
             resources,
             _schema: schema,
         })
     }
 }
 
-impl PaimonReader {
-    /// Build from the FE-local frozen/planned pair without reconstructing a
-    /// table or split from current catalog state.
-    pub fn try_new_frozen(
-        frozen: &PaimonFrozenRead,
-        planned: &PaimonPlannedSplit,
-        projected_columns: &[PaimonColumn],
-    ) -> Result<Self, ConnectorError> {
-        if planned
-            .split()
-            .files()
-            .iter()
-            .any(|file| file.compression() != frozen.options().data_compression)
-        {
-            return Err(invalid(
-                "Paimon split compression differs from the frozen read recipe",
-            ));
+impl PaimonBatchStream for PaimonAwaitedReader {
+    fn poll_next_batch(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<PaimonReadBatch>, ConnectorError>> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Poll::Ready(Ok(None));
+        };
+        if let Err(error) = self.resources.checkpoint() {
+            return Poll::Ready(Err(map_paimon_error(error)));
         }
-        validate_historical_schemas(planned, projected_columns)?;
-        Self::try_new(
-            Arc::clone(frozen.sdk_table()),
-            frozen.table(),
-            frozen.view(),
-            planned.split(),
-            planned.sdk_split().clone(),
-            projected_columns,
-        )
-    }
-
-    /// Construct the SDK reader without predicates or a physical limit.
-    ///
-    /// Non-key residual predicates and limits belong above the merge. Passing
-    /// either to `TableRead` here could remove the winning version of a key.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        sdk_table: Arc<Table>,
-        table: &PaimonTable,
-        view: &PaimonReadView,
-        split: &PaimonSplit,
-        sdk_split: DataSplit,
-        projected_columns: &[PaimonColumn],
-    ) -> Result<Self, ConnectorError> {
-        Self::try_new_with_runtime(
-            sdk_table,
-            table,
-            view,
-            split,
-            sdk_split,
-            projected_columns,
-            None,
-        )
-    }
-
-    /// Construct a reader whose asynchronous SDK stream is polled inside the
-    /// Server-owned Tokio reactor. The SDK never creates a second runtime.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new_with_runtime(
-        sdk_table: Arc<Table>,
-        table: &PaimonTable,
-        view: &PaimonReadView,
-        split: &PaimonSplit,
-        sdk_split: DataSplit,
-        projected_columns: &[PaimonColumn],
-        runtime: Option<tokio::runtime::Handle>,
-    ) -> Result<Self, ConnectorError> {
-        validate_frozen_input(
-            sdk_table.as_ref(),
-            table,
-            view,
-            split,
-            &sdk_split,
-            projected_columns,
-        )?;
-
-        let read_type = projected_sdk_fields(sdk_table.as_ref(), projected_columns)?;
-        let output_schema =
-            paimon::arrow::build_target_arrow_schema(&read_type).map_err(map_paimon_error)?;
-        let table_read = TableRead::new(sdk_table.as_ref(), read_type, Vec::new());
-        let stream = table_read
-            .to_arrow(std::slice::from_ref(&sdk_split))
-            .map_err(map_paimon_error)?;
-        Ok(Self {
-            stream: Some(stream),
-            output_schema,
-            runtime,
+        let next = match stream.poll_next_unpin(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(next) => next,
+        };
+        Poll::Ready(match next {
+            Some(Ok(batch)) => {
+                if batch.schema().as_ref() != self.output_schema.as_ref() {
+                    return Poll::Ready(Err(corrupt(
+                        "Paimon SDK returned a batch whose schema differs from the frozen projection",
+                    )));
+                }
+                // The SDK hands the output reservation over before yielding
+                // its batch, so the pair is complete here.
+                self.resources.take_output_reservation().map(|reservation| {
+                    Some(match reservation {
+                        Some(reservation) => {
+                            PaimonReadBatch::with_output_reservation(batch, reservation)
+                        }
+                        None => PaimonReadBatch::unreserved(batch),
+                    })
+                })
+            }
+            Some(Err(error)) => Err(map_paimon_error(error)),
+            None => {
+                self.stream = None;
+                self.resources.take_output_reservation().map(|_| None)
+            }
         })
     }
 
-    pub fn output_schema(&self) -> &SchemaRef {
-        &self.output_schema
-    }
-
-    fn validate_output(&self, batch: &RecordBatch) -> Result<(), ConnectorError> {
-        if batch.schema().as_ref() != self.output_schema.as_ref() {
-            return Err(corrupt(
-                "Paimon SDK returned a batch whose schema differs from the frozen projection",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn validate_historical_schemas(
-    planned: &PaimonPlannedSplit,
-    projected_columns: &[PaimonColumn],
-) -> Result<(), ConnectorError> {
-    for file in planned.split().files() {
-        let schema = planned.historical_schema(file.schema_id()).ok_or_else(|| {
-            corrupt("Paimon split is missing a file's declared historical schema")
-        })?;
-        for column in projected_columns {
-            match schema
-                .fields()
-                .iter()
-                .find(|field| field.id() == column.field_id())
-            {
-                Some(field) => validate_column(field, column)?,
-                None if column.nullable() => {}
-                None => {
-                    return Err(corrupt(
-                        "Paimon historical file predates a required non-nullable column",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-impl PaimonBatchReader for PaimonReader {
-    fn next_batch(&mut self) -> Result<Option<PaimonReadBatch>, ConnectorError> {
-        let Some(stream) = self.stream.as_mut() else {
-            return Ok(None);
-        };
-        let next = match &self.runtime {
-            Some(runtime) => {
-                let _entered = runtime.enter();
-                futures::executor::block_on(stream.next())
-            }
-            None => futures::executor::block_on(stream.next()),
-        };
-        match next {
-            Some(Ok(batch)) => {
-                self.validate_output(&batch)?;
-                Ok(Some(PaimonReadBatch {
-                    batch,
-                    output_reservation: None,
-                }))
-            }
-            Some(Err(error)) => Err(map_paimon_error(error)),
-            None => Ok(None),
-        }
-    }
-
     fn close(&mut self) -> Result<(), ConnectorError> {
-        self.stream.take();
-        Ok(())
-    }
-}
-
-impl PaimonBatchReader for PaimonExecutionReader {
-    fn next_batch(&mut self) -> Result<Option<PaimonReadBatch>, ConnectorError> {
-        self.resources.checkpoint().map_err(map_paimon_error)?;
-        let next = self.reader.next_batch()?;
-        let reservation = self.resources.take_output_reservation()?;
-        match (next, reservation) {
-            (Some(batch), Some(reservation)) => {
-                let (batch, _) = batch.into_parts();
-                Ok(Some(PaimonReadBatch::with_output_reservation(
-                    batch,
-                    reservation,
-                )))
-            }
-            (Some(batch), None) => Ok(Some(batch)),
-            (None, reservation) => {
-                drop(reservation);
-                Ok(None)
-            }
-        }
-    }
-
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        self.reader.close()?;
+        self.stream = None;
         drop(self.resources.take_output_reservation()?);
         Ok(())
-    }
-}
-
-impl Drop for PaimonReader {
-    fn drop(&mut self) {
-        self.stream.take();
     }
 }
 
@@ -750,11 +612,207 @@ fn corrupt(message: &'static str) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use std::fmt::{Display, Formatter};
+    use std::ops::Range;
+    use std::sync::Arc;
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream;
     use novarocks_fs::{FileError, FileErrorKind};
+    use novarocks_spi::connector::read_stack::{SchemaTableName, SplitWeight};
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    use paimon::catalog::Identifier;
+    use paimon::io::{FileIO, FileStatus, FileStatusStream, ReadControl, ReadOnlyFileIO};
+    use paimon::spec::{
+        BinaryRow, DataType as SdkDataType, IntType, Schema as SdkSchema, TableSchema,
+    };
+    use paimon::table::Table;
 
-    use super::map_paimon_error;
+    use super::{map_paimon_error, projected_sdk_fields, validate_frozen_input};
+    use crate::domain::{
+        PaimonBucketMode, PaimonColumn, PaimonMergeEngine, PaimonReadView, PaimonSplit, PaimonTable,
+    };
+    use crate::schema::PaimonDataType;
+
+    #[derive(Debug)]
+    struct NoIo;
+
+    #[async_trait]
+    impl ReadOnlyFileIO for NoIo {
+        async fn stat(&self, _path: &str) -> paimon::Result<FileStatus> {
+            unreachable!("frozen validation performs no I/O")
+        }
+
+        async fn exists(&self, _path: &str) -> paimon::Result<bool> {
+            unreachable!("frozen validation performs no I/O")
+        }
+
+        async fn read(
+            &self,
+            _path: &str,
+            _range: Range<u64>,
+            _known_size: Option<u64>,
+        ) -> paimon::Result<Bytes> {
+            unreachable!("frozen validation performs no I/O")
+        }
+
+        async fn list(&self, _path: &str, _recursive: bool) -> paimon::Result<FileStatusStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoControl;
+
+    impl ReadControl for NoControl {
+        fn check_active(&self) -> paimon::Result<()> {
+            Ok(())
+        }
+
+        fn checkpoint(&self) -> paimon::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FrozenRead {
+        sdk_table: Arc<Table>,
+        table: PaimonTable,
+        view: PaimonReadView,
+        split: PaimonSplit,
+        sdk_split: paimon::DataSplit,
+        columns: Vec<PaimonColumn>,
+    }
+
+    fn frozen_read() -> FrozenRead {
+        let location = "s3://bucket/warehouse/db/table";
+        let schema = SdkSchema::builder()
+            .column("id", SdkDataType::Int(IntType::with_nullable(false)))
+            .column("value", SdkDataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .build()
+            .unwrap();
+        let sdk_table = Arc::new(Table::new(
+            FileIO::from_read_only(Arc::new(NoIo), Arc::new(NoControl)),
+            Identifier::new("db", "table"),
+            location.to_string(),
+            TableSchema::new(7, &schema),
+            None,
+        ));
+        let table = PaimonTable::try_new(
+            SchemaTableName::try_new("db", "table").unwrap(),
+            location,
+            PaimonMergeEngine::Deduplicate,
+            PaimonBucketMode::Fixed,
+            vec![0],
+            vec![],
+        )
+        .unwrap();
+        let view = PaimonReadView::try_new(location, Some(11), 7, [1; 32], [2; 32], None).unwrap();
+        let serialized_partition = BinaryRow::new(0).to_serialized_bytes();
+        let partition = serialized_partition[4..].to_vec();
+        let split = PaimonSplit::try_new(
+            11,
+            7,
+            0,
+            partition.clone(),
+            0,
+            format!("{location}/bucket-0"),
+            1,
+            vec![],
+            None,
+            None,
+            false,
+            false,
+            SplitWeight::STANDARD,
+        )
+        .unwrap();
+        let sdk_split = paimon::DataSplit::builder()
+            .with_snapshot(11)
+            .with_partition(BinaryRow::from_bytes(0, partition))
+            .with_bucket(0)
+            .with_bucket_path(format!("{location}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap();
+        let columns = vec![
+            PaimonColumn::try_new(0, "id", PaimonDataType::Int32, false, 0).unwrap(),
+            PaimonColumn::try_new(1, "value", PaimonDataType::Int32, true, 1).unwrap(),
+        ];
+        FrozenRead {
+            sdk_table,
+            table,
+            view,
+            split,
+            sdk_split,
+            columns,
+        }
+    }
+
+    /// The output a validated split's reader produces, without opening it.
+    fn output_field_names(
+        read: &FrozenRead,
+        view: &PaimonReadView,
+        columns: &[PaimonColumn],
+    ) -> Result<Vec<String>, ConnectorError> {
+        validate_frozen_input(
+            read.sdk_table.as_ref(),
+            &read.table,
+            view,
+            &read.split,
+            &read.sdk_split,
+            columns,
+        )?;
+        let read_type = projected_sdk_fields(read.sdk_table.as_ref(), columns)?;
+        let schema =
+            paimon::arrow::build_target_arrow_schema(&read_type).map_err(map_paimon_error)?;
+        Ok(schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect())
+    }
+
+    #[test]
+    fn validation_is_zero_io_and_accepts_a_zero_projection() {
+        let read = frozen_read();
+        assert!(
+            output_field_names(&read, &read.view, &[])
+                .expect("zero projection")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_reader_exposes_only_the_requested_public_columns() {
+        let read = frozen_read();
+        assert_eq!(
+            output_field_names(&read, &read.view, &read.columns).expect("projected"),
+            ["id", "value"]
+        );
+    }
+
+    #[test]
+    fn validation_rejects_snapshot_drift_before_sdk_io() {
+        let read = frozen_read();
+        let drifted =
+            PaimonReadView::try_new(read.table.location(), Some(12), 7, [1; 32], [2; 32], None)
+                .unwrap();
+        let error = output_field_names(&read, &drifted, &read.columns)
+            .expect_err("snapshot drift must fail");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn validation_rejects_projection_type_or_order_drift() {
+        let read = frozen_read();
+        let wrong = vec![PaimonColumn::try_new(0, "id", PaimonDataType::Int64, false, 0).unwrap()];
+        let error =
+            output_field_names(&read, &read.view, &wrong).expect_err("projection drift must fail");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
 
     #[derive(Debug)]
     struct ExternalWrapper(Box<dyn std::error::Error + Send + Sync>);

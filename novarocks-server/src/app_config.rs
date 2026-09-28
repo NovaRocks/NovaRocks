@@ -1348,18 +1348,12 @@ pub struct RuntimeConfig {
     pub olap_sink_write_buffer_size_bytes: usize,
     #[serde(default = "default_olap_sink_max_tablet_write_chunk_bytes")]
     pub olap_sink_max_tablet_write_chunk_bytes: usize,
-    #[serde(default = "default_pipeline_scan_thread_pool_thread_num")]
-    pub pipeline_scan_thread_pool_thread_num: usize,
-    #[serde(default = "default_connector_io_tasks_per_scan_operator")]
-    pub connector_io_tasks_per_scan_operator: i32,
     #[serde(default = "default_io_coalesce_read_enable")]
     pub io_coalesce_read_enable: bool,
     #[serde(default = "default_io_coalesce_read_max_buffer_size")]
     pub io_coalesce_read_max_buffer_size: u64,
     #[serde(default = "default_io_coalesce_read_max_distance_size")]
     pub io_coalesce_read_max_distance_size: u64,
-    #[serde(default = "default_pipeline_scan_thread_pool_queue_size")]
-    pub pipeline_scan_thread_pool_queue_size: usize,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
     pub pipeline_exec_thread_pool_thread_num: usize,
     #[serde(default = "default_data_runtime_worker_threads")]
@@ -1367,7 +1361,7 @@ pub struct RuntimeConfig {
     #[serde(default = "default_data_runtime_max_blocking_threads")]
     pub data_runtime_max_blocking_threads: usize,
     /// BE-local runtime for object-store scan I/O. Zero derives a small worker
-    /// count from CPU capacity, independently of the scan executor threads.
+    /// count from CPU capacity.
     #[serde(default = "default_scan_io_worker_threads")]
     pub scan_io_worker_threads: usize,
     #[serde(default = "default_scan_io_max_blocking_threads")]
@@ -1410,10 +1404,6 @@ pub struct RuntimeConfig {
     pub spill_io_threads: usize,
     #[serde(default = "default_spill_io_queue_size")]
     pub spill_io_queue_size: usize,
-    #[serde(default = "default_scan_submit_fail_max")]
-    pub scan_submit_fail_max: usize,
-    #[serde(default = "default_scan_submit_fail_timeout_ms")]
-    pub scan_submit_fail_timeout_ms: u64,
     #[serde(default = "default_profile_report_interval")]
     pub profile_report_interval: i64,
     #[serde(default = "default_table_schema_service_max_retries")]
@@ -2505,14 +2495,6 @@ fn default_spill_io_queue_size() -> usize {
     1024
 }
 
-fn default_pipeline_scan_thread_pool_thread_num() -> usize {
-    0 // 0 means use CPU cores, aligned with StarRocks pipeline_scan_thread_pool_thread_num
-}
-
-fn default_connector_io_tasks_per_scan_operator() -> i32 {
-    16 // aligned with StarRocks BE config::connector_io_tasks_per_scan_operator
-}
-
 fn default_io_coalesce_read_enable() -> bool {
     true
 }
@@ -2523,18 +2505,6 @@ fn default_io_coalesce_read_max_buffer_size() -> u64 {
 
 fn default_io_coalesce_read_max_distance_size() -> u64 {
     1024 * 1024 // aligned with StarRocks io_coalesce_read_max_distance_size
-}
-
-fn default_pipeline_scan_thread_pool_queue_size() -> usize {
-    102_400 // Aligned with StarRocks pipeline_scan_thread_pool_queue_size
-}
-
-fn default_scan_submit_fail_max() -> usize {
-    128
-}
-
-fn default_scan_submit_fail_timeout_ms() -> u64 {
-    2000
 }
 
 fn default_profile_report_interval() -> i64 {
@@ -2643,12 +2613,9 @@ impl Default for RuntimeConfig {
             olap_sink_write_buffer_size_bytes: default_olap_sink_write_buffer_size_bytes(),
             olap_sink_max_tablet_write_chunk_bytes: default_olap_sink_max_tablet_write_chunk_bytes(
             ),
-            pipeline_scan_thread_pool_thread_num: default_pipeline_scan_thread_pool_thread_num(),
-            connector_io_tasks_per_scan_operator: default_connector_io_tasks_per_scan_operator(),
             io_coalesce_read_enable: default_io_coalesce_read_enable(),
             io_coalesce_read_max_buffer_size: default_io_coalesce_read_max_buffer_size(),
             io_coalesce_read_max_distance_size: default_io_coalesce_read_max_distance_size(),
-            pipeline_scan_thread_pool_queue_size: default_pipeline_scan_thread_pool_queue_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
@@ -2667,8 +2634,6 @@ impl Default for RuntimeConfig {
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
             spill_io_threads: default_spill_io_threads(),
             spill_io_queue_size: default_spill_io_queue_size(),
-            scan_submit_fail_max: default_scan_submit_fail_max(),
-            scan_submit_fail_timeout_ms: default_scan_submit_fail_timeout_ms(),
             profile_report_interval: default_profile_report_interval(),
             table_schema_service_max_retries: default_table_schema_service_max_retries(),
             table_schema_service_cache_capacity: default_table_schema_service_cache_capacity(),
@@ -2803,18 +2768,6 @@ impl RuntimeConfig {
     pub fn actual_exec_threads(&self) -> usize {
         if self.pipeline_exec_thread_pool_thread_num > 0 {
             self.pipeline_exec_thread_pool_thread_num
-        } else {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        }
-    }
-
-    /// Get the actual number of scan threads.
-    /// Returns CPU cores if configured as 0.
-    pub fn actual_scan_threads(&self) -> usize {
-        if self.pipeline_scan_thread_pool_thread_num > 0 {
-            self.pipeline_scan_thread_pool_thread_num
         } else {
             std::thread::available_parallelism()
                 .map(|n| n.get())

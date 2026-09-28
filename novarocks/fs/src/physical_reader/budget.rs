@@ -28,24 +28,30 @@ use crate::{
     FileResult,
 };
 
-pub(crate) struct BudgetedFileReader {
-    inner: Box<dyn FileBatchReader>,
+/// Splits decoded batches to a read budget, keeping each remainder for the
+/// next call. Shared by the blocking and the awaited reader.
+pub(crate) struct BudgetSplitter {
     budget: FileReadBudget,
     pending: VecDeque<FileBatch>,
-    closed: bool,
 }
 
-impl BudgetedFileReader {
-    pub(crate) fn new(inner: Box<dyn FileBatchReader>, budget: FileReadBudget) -> Self {
+impl BudgetSplitter {
+    pub(crate) fn new(budget: FileReadBudget) -> Self {
         Self {
-            inner,
             budget,
             pending: VecDeque::new(),
-            closed: false,
         }
     }
 
-    fn split_to_budget(&mut self, batch: FileBatch) -> FileResult<FileBatch> {
+    pub(crate) fn take_pending(&mut self) -> Option<FileBatch> {
+        self.pending.pop_front()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    pub(crate) fn split(&mut self, batch: FileBatch) -> FileResult<FileBatch> {
         let max_rows = self.budget.max_rows.get();
         let max_bytes = self.budget.max_bytes.get();
         let row_count = batch.batch.num_rows();
@@ -70,13 +76,29 @@ impl BudgetedFileReader {
     }
 }
 
+pub(crate) struct BudgetedFileReader {
+    inner: Box<dyn FileBatchReader>,
+    splitter: BudgetSplitter,
+    closed: bool,
+}
+
+impl BudgetedFileReader {
+    pub(crate) fn new(inner: Box<dyn FileBatchReader>, budget: FileReadBudget) -> Self {
+        Self {
+            inner,
+            splitter: BudgetSplitter::new(budget),
+            closed: false,
+        }
+    }
+}
+
 impl FileBatchReader for BudgetedFileReader {
     fn next_batch(&mut self) -> FileResult<Option<FileBatch>> {
         if self.closed {
             return Ok(None);
         }
         loop {
-            let batch = match self.pending.pop_front() {
+            let batch = match self.splitter.take_pending() {
                 Some(batch) => Some(batch),
                 None => self.inner.next_batch()?,
             };
@@ -87,7 +109,7 @@ impl FileBatchReader for BudgetedFileReader {
             if batch.batch.num_rows() == 0 {
                 continue;
             }
-            return self.split_to_budget(batch).map(Some);
+            return self.splitter.split(batch).map(Some);
         }
     }
 
@@ -96,7 +118,7 @@ impl FileBatchReader for BudgetedFileReader {
             return Ok(());
         }
         self.closed = true;
-        self.pending.clear();
+        self.splitter.clear();
         self.inner.close()
     }
 

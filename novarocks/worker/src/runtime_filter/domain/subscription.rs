@@ -17,15 +17,18 @@
 
 //! Backend-owned publication and subscription state.
 //!
-//! A slot retains only immutable Execution snapshots. Blocking acquisition and
-//! live polling therefore share one publication path while Execution remains
-//! the owner of snapshot/version semantics exposed to operators.
+//! A slot retains only immutable Execution snapshots. Blocking-snapshot
+//! outcomes and live polling therefore share one publication path while
+//! Execution remains the owner of snapshot/version semantics exposed to
+//! operators. Nothing here blocks a caller: a blocking-snapshot consumer waits
+//! on the slot's outcome observable and decides its own timeout.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use novarocks_execution::runtime::observable::Observable;
 use novarocks_execution::runtime_filter::{
     BlockingSnapshotSubscription, ConsumerActivation, LivePollOutcome, LiveTerminal,
     LogicalVersion, NonBlockingLiveSubscription, RuntimeFilterSnapshot,
@@ -67,7 +70,10 @@ pub struct BackendBlockingSubscription {
     identity: BackendConsumerSubscriptionIdentity,
     events: Arc<dyn BackendRuntimeFilterEventObserver>,
     state: Mutex<BlockingState>,
-    changed: Condvar,
+    /// Notified once, when the outcome is published.
+    published: Arc<Observable>,
+    /// Whether the consumer's final outcome was recorded.
+    recorded: AtomicBool,
 }
 
 impl BackendBlockingSubscription {
@@ -79,15 +85,23 @@ impl BackendBlockingSubscription {
             identity,
             events,
             state: Mutex::new(BlockingState::Pending),
-            changed: Condvar::new(),
+            published: Arc::new(Observable::new()),
+            recorded: AtomicBool::new(false),
         }
     }
 
     fn publish(&self, outcome: SnapshotAcquireOutcome) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if matches!(*state, BlockingState::Pending) {
-            *state = BlockingState::Terminal(outcome);
-            self.changed.notify_all();
+        let published = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if matches!(*state, BlockingState::Pending) {
+                *state = BlockingState::Terminal(outcome);
+                true
+            } else {
+                false
+            }
+        };
+        if published {
+            self.published.notify_observers();
         }
     }
 
@@ -123,21 +137,22 @@ impl BackendBlockingSubscription {
 }
 
 impl BlockingSnapshotSubscription for BackendBlockingSubscription {
-    fn acquire(&self, timeout: Duration) -> SnapshotAcquireOutcome {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let (state, _) = self
-            .changed
-            .wait_timeout_while(state, timeout, |state| {
-                matches!(state, BlockingState::Pending)
-            })
-            .unwrap_or_else(|error| error.into_inner());
-        let outcome = match &*state {
-            BlockingState::Pending => SnapshotAcquireOutcome::TimedOut,
-            BlockingState::Terminal(outcome) => outcome.clone(),
-        };
-        drop(state);
-        self.emit(&outcome);
-        outcome
+    fn try_outcome(&self) -> Option<SnapshotAcquireOutcome> {
+        match &*self.state.lock().unwrap_or_else(|error| error.into_inner()) {
+            BlockingState::Pending => None,
+            BlockingState::Terminal(outcome) => Some(outcome.clone()),
+        }
+    }
+
+    fn outcome_observable(&self) -> Arc<Observable> {
+        Arc::clone(&self.published)
+    }
+
+    fn record_consumer_outcome(&self, outcome: &SnapshotAcquireOutcome) {
+        if self.recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.emit(outcome);
     }
 
     fn snapshot(&self) -> Option<Arc<RuntimeFilterSnapshot>> {
@@ -456,7 +471,6 @@ impl BackendSubscriptionGroup {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use novarocks_execution::runtime_filter::{
         RuntimeFilterBindingId, RuntimeFilterChannelId, RuntimeFilterLateApplyGranularity,
@@ -511,11 +525,12 @@ mod tests {
         else {
             panic!("expected blocking slot")
         };
-        let acquired = slot.acquire(Duration::ZERO);
+        let acquired = slot.try_outcome().expect("published outcome");
         assert!(matches!(
             acquired,
             SnapshotAcquireOutcome::Unavailable(UnavailableReason::RouteUnavailable)
         ));
+        slot.record_consumer_outcome(&acquired);
         assert!(events.events().iter().any(|event| matches!(
             event,
             BackendRuntimeFilterEvent::SubscriptionUnavailable { .. }

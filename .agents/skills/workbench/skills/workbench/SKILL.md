@@ -41,6 +41,8 @@ description: "Route engineering work through explicit stages, and maintain a dur
 | 主要目标是从基础理解技术概念、内部机制、代码 / 架构 / plan 变化或数据流 | `$dev-workflow-explain-technical-concept` |
 | 问题、边界或方案尚未讨论清楚 | `$dev-workflow-discuss-design` |
 | 设计已明确接受，但尚无 spec | `$dev-workflow-write-spec` |
+| 多子任务 arc：要写或修订 umbrella 的整体路线（“umbrella plan”） | `$dev-workflow-write-spec`（路线写在 umbrella 内，不另建 plan） |
+| Umbrella 已接受，推进下一个子任务 | spec 仍是骨架：`$dev-workflow-write-spec` 细化；已细化：`$dev-workflow-plan` |
 | 已有 accepted spec，但尚无 approved plan | `$dev-workflow-plan` |
 | 已有 accepted spec + approved plan，用户要求实现 | `$dev-workflow-execute` |
 | 实现已验证，用户明确要求提交、开 PR 或归档 | `$dev-workflow-finish` |
@@ -61,6 +63,9 @@ persisted plan --plan 被明确批准--> goal execution
 goal execution --验收证据充分--> verified
 verified --用户另行明确授权发布--> PR + archive
 ```
+
+多子任务 arc 只有一份 arc 级文档：umbrella 同时写设计与整体路线（主稿），用户接受后，子任务逐个走上面的状态机；
+接受 umbrella 不授权执行任何子任务。
 
 只设置两个常规人工门：
 

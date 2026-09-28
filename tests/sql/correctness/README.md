@@ -169,3 +169,9 @@ Each suite follows the runner convention:
 
 The `sql-reject` skeleton deliberately contains a parser-only drift case.  It
 keeps the suite non-empty and runnable before the broader reject corpus lands.
+
+Result comparison is implicitly skipped for steps whose final statement is
+DDL, DML, or a session command without a rowset. The runner uses the same SQL
+statement splitter as execution: `USE db; SELECT ...` requires a recorded
+result and comparison, while `USE db; SET ...` remains implicitly skipped.
+An explicit `@skip_result_check=true` still skips comparison for the whole step.

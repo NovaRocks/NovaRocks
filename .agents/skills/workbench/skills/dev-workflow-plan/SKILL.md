@@ -1,6 +1,6 @@
 ---
 name: dev-workflow-plan
-description: "Turn an accepted spec into a persisted, reviewable, and executable implementation plan in the resolved project documentation root without requiring Codex Plan mode. Use when a design spec is accepted and the user asks to plan implementation, review or revise implementation steps, or prepare parallel execution."
+description: "Turn an accepted spec into a persisted, reviewable, and executable implementation plan in the resolved project documentation root without requiring Codex Plan mode. For an umbrella arc, plan one subtask (one independently mergeable PR) at a time; the umbrella itself carries the overall route, so no umbrella-level plan is written. Use when a design spec or umbrella subtask is accepted and the user asks to plan implementation, review or revise implementation steps, or prepare parallel execution."
 ---
 
 # 实现计划
@@ -14,7 +14,9 @@ description: "Turn an accepted spec into a persisted, reviewable, and executable
 2. 读取 `AGENTS.md`；按 contract 从当前请求 / memory 解析 `DOC_ROOT`，无可用记录时回退到仓库
    `docs/workbench/`。
 3. 读取 `DOC_ROOT` 下适用的 `AGENTS.md` 和目标 spec。
-4. 确认 spec 已被接受，且粒度适合一个 PR。
+4. 确认 spec 已被接受，且粒度适合一个 PR。目标是 umbrella 时，不创建 umbrella 级 plan：umbrella 本身就是整体
+   路线的主稿（contract 第 6.1 节），路线的写入与修订按 `$dev-workflow-write-spec` 进行；本 skill 只为 umbrella 的
+   单个子任务编写 plan（见下方「Umbrella 子任务」）。
 5. 检查当前代码、测试入口、依赖关系和相关 ADR；不要只把 spec 改写成任务列表。
 6. 摸清测试构成：有哪些测试目标 / 套件，各自覆盖什么区域，判断相关性的依据在哪里（适用 `AGENTS.md`、
    测试目录说明、测试与模块的实际依赖）。依据不足时见下方「测试面选择」一节。
@@ -75,10 +77,12 @@ Plan 默认保留以下六章及顺序，文档标题下的一级章节使用 `#
 7. 标出适合创建本地检查点 commit 的边界：完整章节 / 行为切片完成后，以及进入高风险改动前。
 8. 明确 execute 阶段可以本地 commit，但禁止 push 和 PR。
 9. 写明哪些局部选择可由执行者自行决定，哪些变化会使 plan 失效并必须回到设计讨论。
-10. 使用 `assets/plan-template.md` 的标准结构，将计划以 `status: draft` 写入 contract 或适用 `AGENTS.md` 规定的 plan 目录。
+10. 使用 `assets/plan-template.md` 的标准结构，将计划以 `status: draft` 写入 contract 或适用 `AGENTS.md` 规定的
+    plan 目录。
 11. 在 plan frontmatter 和正文链接目标 spec，并按项目约定在 spec 中增加反向链接；没有既有约定时添加
     到 spec 第 9 章“未决问题与后续衔接”，使用 plan wikilink。
-12. 项目使用 umbrella 时，将 plan 链接补入对应子任务面板。
+12. 项目使用 umbrella 时，将 plan 链接补入对应子任务面板；此时只补链接，状态保持 `🚧 未开始`，获批后再更新
+    （见「批准与修订」）。
 13. 向用户报告 plan 路径、关键任务图和仍需确认的内容，请用户明确批准已落盘版本。
 
 plan 阶段可使用 sub-agent 并行梳理独立子系统、测试面、文件所有权或风险点。主 agent 负责验证调研结果、
@@ -87,6 +91,18 @@ plan 阶段可使用 sub-agent 并行梳理独立子系统、测试面、文件�
 plan 阶段只修改计划文档及其必要的 spec / umbrella 链接，不修改产品代码。计划必须足够完整，让执行阶段无需重新做
 架构决策；但不要规定无关紧要的逐行实现。将模板落盘时，把标题、字段显示名和占位文字转换为当前请求与适用
 `AGENTS.md` 要求的文档语言。
+
+## Umbrella 子任务
+
+Umbrella 没有自己的 plan：设计与整体路线都写在 umbrella 中（contract 第 6.1 节）。为 umbrella 的子任务写 plan 时：
+
+- **前置。** 该子任务的 spec 已从骨架细化为 `design_status: accepted`；它消费的跨子任务接口，已在产出方 spec 中按
+  umbrella 的接口冻结点冻结。
+- **范围。** plan 只覆盖这一个子任务，按本 skill 的单 PR 规则完整编写；umbrella 整体路线中的该子任务小节是它的
+  路线级输入，不在 plan 中重抄其他子任务的内容。
+- **路线冲突。** 调研中发现切分、依赖、接口冻结点或闸门需要改变时，停下并回到 umbrella 修订（contract 第 6.1 节），
+  不在子任务 plan 中静默改路线。
+- **状态。** 起草 plan 不改变面板状态；获批后按「批准与修订」更新。
 
 ## 测试面选择
 
@@ -112,10 +128,13 @@ plan 阶段只修改计划文档及其必要的 spec / umbrella 链接，不修�
 1. 最后核对用户批准的内容与磁盘版本一致。
 2. 将 plan frontmatter 更新为 `status: approved`。
 3. 再次检查 spec / plan 双向链接和 umbrella 面板。
-4. 只有完成以上步骤后才进入 `$dev-workflow-execute`。
+4. 获批的是 umbrella 子任务的 plan 时，按 contract 第 6 节把面板中该子任务置为 `⏳ 进行中`，并同步依赖图节点颜色、
+   子任务 spec 的 `roadmap_status: active` 和 umbrella 的 `roadmap_status`。
+5. 只有完成以上步骤后才进入 `$dev-workflow-execute`。
 
 用户要求修订已经 approved 的计划时，若改动影响任务 DAG、文件所有权、验收边界、关键依赖或风险裁决，先将状态退回
-`draft`，完成落盘修订后重新取得明确批准。纯文字澄清且不改变执行契约时可保留 `approved`。
+`draft`，完成落盘修订后重新取得明确批准。纯文字澄清且不改变执行契约时可保留 `approved`。子任务 plan 退回 `draft`
+时，面板状态同步回到 `🚧 未开始`。
 
 ## 完成门
 

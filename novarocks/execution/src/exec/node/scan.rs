@@ -14,293 +14,77 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+use futures::Stream;
+use futures::future::BoxFuture;
+
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
-use crate::exec::node::BoxedExecIter;
-use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
-use crate::runtime::cache::ExternalDataCacheRangeOptions;
 use crate::runtime::profile::RuntimeProfile;
-use novarocks_spi::connector::ConnectorPreparedScanUnit;
+use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 
-#[derive(Clone, Debug)]
-pub enum ScanMorsel {
-    FileRange {
-        path: String,
-        file_len: u64,
-        offset: u64,
-        length: u64,
-        scan_range_id: i32,
-        external_datacache: Option<ExternalDataCacheRangeOptions>,
-    },
-    /// Provider-neutral prepared connector unit. The generic core adapter
-    /// resolves the index to an SPI-owned sealed local unit; no provider
-    /// payload appears in the core morsel contract.
-    ConnectorScanUnit {
-        index: usize,
-    },
-    Schema {
-        table_name: String,
-    },
-    /// The scan's work is not described by a morsel at all: the operator owns
-    /// it and produces rows until it says it is done.
-    ///
-    /// Deliberately not [`Self::Empty`]. An empty morsel means "nothing to
-    /// read", and the runner short-circuits it without ever touching the
-    /// operator — which is right for a scan whose work is fully described by
-    /// its morsels, and silently wrong for one whose work arrives afterwards.
-    /// A typed connector scan reads splits delivered to its task at runtime,
-    /// so its morsel has to reach the operator or the splits are never read.
-    OperatorDriven,
-    Empty,
+/// A scan's single output stream, owned by the one driver that polls it.
+///
+/// `Poll::Pending` registers the context's waker and is never end of
+/// stream; neither is an empty chunk. `Ready(None)` means no more chunks.
+/// After an error the driver polls the stream no more.
+pub trait ScanChunkStream: Stream<Item = Result<Chunk, String>> + Send {
+    /// Ends delivery and asks every operation of the scan to stop, before
+    /// returning. The future resolves once they all exited, with the first
+    /// real error; it only observes, so dropping it changes nothing.
+    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), String>>;
 }
 
-impl ScanMorsel {
-    pub fn describe(&self) -> String {
-        match self {
-            ScanMorsel::FileRange {
-                path,
-                file_len,
-                offset,
-                length,
-                scan_range_id,
-                external_datacache,
-            } => format!(
-                "path={} file_len={} offset={} length={} scan_range_id={} external_datacache={:?}",
-                path, file_len, offset, length, scan_range_id, external_datacache,
-            ),
-            ScanMorsel::ConnectorScanUnit { index } => format!("connector_scan_unit_index={index}"),
-            ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
-            ScanMorsel::OperatorDriven => "operator_driven".to_string(),
-            ScanMorsel::Empty => "empty".to_string(),
-        }
-    }
+/// A scan output stream owned by its driver.
+pub type ScanOutputStream = Pin<Box<dyn ScanChunkStream>>;
+
+/// Hands a scan's single output stream to the driver that runs it.
+pub trait ScanStreamSource: Send + Sync {
+    /// Hands the stream over, polled with `budget` in every driver turn and
+    /// reporting into the scan operator's own `profile`. A scan has one
+    /// stream: a second claim is refused, never a second reader.
+    fn claim(
+        &self,
+        budget: ConnectorPollBudget,
+        profile: Option<RuntimeProfile>,
+    ) -> Result<ScanOutputStream, String>;
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ScanMorsels {
-    pub morsels: Vec<ScanMorsel>,
-    pub has_more: bool,
-}
-
-impl ScanMorsels {
-    pub fn new(morsels: Vec<ScanMorsel>, has_more: bool) -> Self {
-        Self { morsels, has_more }
-    }
-
-    pub fn ensure_non_empty(&mut self, accept_empty_scan_ranges: bool) {
-        if accept_empty_scan_ranges {
-            return;
-        }
-        if self.morsels.is_empty() {
-            self.morsels.push(ScanMorsel::Empty);
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HdfsScanFileFormat {
-    Parquet,
-    Orc,
-    Other,
-}
-
-#[derive(Clone, Debug)]
-pub struct IncrementalHdfsScanRange {
-    pub file_format: Option<HdfsScanFileFormat>,
-    pub full_path: Option<String>,
-    pub relative_path: Option<String>,
-    pub table_id: Option<i64>,
-    pub file_length: i64,
-    pub offset: i64,
-    pub length: i64,
-    pub first_row_id: Option<i64>,
-    pub ivm_change_op: Option<i8>,
-    pub external_datacache: Option<ExternalDataCacheRangeOptions>,
-}
-
-#[derive(Clone, Debug)]
-pub enum IncrementalScanRange {
-    Empty {
-        has_more: Option<bool>,
-    },
-    Hdfs {
-        has_more: Option<bool>,
-        range: IncrementalHdfsScanRange,
-    },
-    Other {
-        has_more: Option<bool>,
-    },
-}
-
-impl IncrementalScanRange {
-    pub fn has_more(&self) -> Option<bool> {
-        match self {
-            Self::Empty { has_more } | Self::Hdfs { has_more, .. } | Self::Other { has_more } => {
-                *has_more
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct RuntimeFilterContext {
-    inner: RuntimeFilterContextInner,
-}
-
-#[derive(Clone)]
-enum RuntimeFilterContextInner {
-    Static {
-        in_filters: Vec<RuntimeInFilter>,
-        membership_filters: Vec<RuntimeMembershipFilter>,
-        min_max_filters: Vec<(i32, Arc<RuntimeMinMaxFilter>)>,
-    },
-}
-
-impl RuntimeFilterContext {
-    pub fn new(
-        in_filters: Vec<RuntimeInFilter>,
-        membership_filters: Vec<RuntimeMembershipFilter>,
-    ) -> Self {
-        Self {
-            inner: RuntimeFilterContextInner::Static {
-                in_filters,
-                membership_filters,
-                min_max_filters: Vec::new(),
-            },
-        }
-    }
-
-    pub fn with_min_max_filters(
-        in_filters: Vec<RuntimeInFilter>,
-        membership_filters: Vec<RuntimeMembershipFilter>,
-        min_max_filters: Vec<(i32, Arc<RuntimeMinMaxFilter>)>,
-    ) -> Self {
-        Self {
-            inner: RuntimeFilterContextInner::Static {
-                in_filters,
-                membership_filters,
-                min_max_filters,
-            },
-        }
-    }
-
-    pub fn in_filters(&self) -> &[RuntimeInFilter] {
-        match &self.inner {
-            RuntimeFilterContextInner::Static { in_filters, .. } => in_filters,
-        }
-    }
-
-    pub fn membership_filters(&self) -> &[RuntimeMembershipFilter] {
-        match &self.inner {
-            RuntimeFilterContextInner::Static {
-                membership_filters, ..
-            } => membership_filters,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.in_filters().is_empty()
-            && self.membership_filters().is_empty()
-            && self.min_max_filters().is_empty()
-    }
-
-    pub fn min_max_filters(&self) -> Vec<(i32, Arc<RuntimeMinMaxFilter>)> {
-        match &self.inner {
-            RuntimeFilterContextInner::Static {
-                min_max_filters, ..
-            } => min_max_filters.clone(),
-        }
-    }
-}
-
-impl Default for RuntimeFilterContext {
-    fn default() -> Self {
-        Self::new(Vec::new(), Vec::new())
-    }
-}
-
-impl std::fmt::Debug for RuntimeFilterContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeFilterContext")
-            .field("in_filters", &self.in_filters().len())
-            .field("membership_filters", &self.membership_filters().len())
-            .finish()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScanMorselPruneDecision {
-    Keep,
-    Skip,
-}
-
+/// One bound scan: the stream its driver polls, and the hooks through which
+/// the pipeline tells the scan about its consumer.
 pub trait ScanOp: Send + Sync {
-    /// Starts terminal cleanup for readers owned by this scan operation. The
-    /// default keeps non-connector scan operators source-compatible.
+    /// The scan's one output stream. The pipeline runs a single driver that
+    /// polls it and hands its chunks to the target degree of parallelism.
+    fn stream_source(&self) -> Arc<dyn ScanStreamSource>;
+
+    /// Starts terminal cleanup of the scan's reads without waiting for them:
+    /// the scan's stream observes their exit when it is closed.
     fn terminate(&self) -> Result<(), String> {
         Ok(())
     }
 
-    /// Reports whether this scan source's output buffer prevents more reader
-    /// work. The callback must not wait for a page-source pull to finish:
-    /// output can remain buffered while the downstream pipeline is blocked.
+    /// Reports whether the scan's consumer is full and holds back more reader
+    /// work. The callback must not wait: output can stay queued while the
+    /// downstream pipeline is blocked.
     fn on_output_backpressure(&self, _paused: bool) {}
 
-    /// Reports one nonempty chunk actually removed from the scan source's
-    /// output buffer for downstream consumption. Producing or buffering a
-    /// chunk is not progress at this boundary.
+    /// Reports one nonempty chunk actually taken by the scan's consumer.
+    /// Producing a chunk is not progress at this boundary.
     fn on_nonempty_chunk_consumed(&self) {}
-
-    fn execute_iter(
-        &self,
-        morsel: ScanMorsel,
-        profile: Option<RuntimeProfile>,
-        runtime_filters: Option<&RuntimeFilterContext>,
-    ) -> Result<BoxedExecIter, String>;
 
     fn profile_name(&self) -> Option<String> {
         None
-    }
-
-    fn supports_incremental_scan_ranges(&self) -> bool {
-        false
-    }
-
-    fn build_incremental_morsels(
-        &self,
-        _scan_ranges: &[IncrementalScanRange],
-    ) -> Result<ScanMorsels, String> {
-        Err("incremental scan ranges are not supported for this scan node".to_string())
-    }
-
-    fn build_morsels(&self) -> Result<ScanMorsels, String>;
-
-    /// Return the storage-tablet identity associated with a provider-neutral
-    /// scheduled split, when that split participates in lake row positioning.
-    fn storage_tablet_id(&self, _morsel: &ScanMorsel) -> Result<Option<i64>, String> {
-        Ok(None)
-    }
-
-    /// Exposes only the sealed unit identity/domain facts to the scan runner.
-    /// Reader handles and provider payload remain owned by the connector op.
-    fn prepared_scan_unit(
-        &self,
-        _morsel: &ScanMorsel,
-    ) -> Result<Option<ConnectorPreparedScanUnit>, String> {
-        Ok(None)
     }
 }
 
 /// Instance-decoded, proto-free connector ranges handed to [`ScanSource::bind`].
 ///
-/// The wire -> connector-range conversion (and its native/compat divergence)
-/// lives in the decoders (`protocol/*/decode`); this enum is that conversion's
-/// already-enriched output. Keeping it proto-free lets the wire-free connector
-/// layer materialize a per-instance [`ScanOp`] from static config plus these
-/// ranges.
+/// The wire -> connector-range conversion lives in the decoders; this enum is
+/// that conversion's already-enriched output. Keeping it proto-free lets the
+/// wire-free connector layer materialize a per-instance [`ScanOp`] from static
+/// config plus these ranges.
 ///
 /// Every variant is consumed at execution time: the decoders route the
 /// enriched ranges into the instance's `ScanAssignment`, and
@@ -308,7 +92,8 @@ pub trait ScanOp: Send + Sync {
 /// produce the per-instance `ScanOp`.
 #[derive(Clone, Debug)]
 pub enum BoundScanRanges {
-    /// No ranges; the op emits a single morsel (jdbc/mysql).
+    /// No frozen range: a typed scan's work arrives as splits at runtime,
+    /// and a system relation is read without any.
     None,
     /// Schema scans carry only the per-instance assignment gate.
     SchemaSelection { should_scan: bool },
@@ -356,11 +141,9 @@ pub struct ScanNode {
         Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
     conjunct_predicate: Option<ExprId>,
     output_chunk_schema: ChunkSchemaRef,
-    connector_io_tasks_per_scan_operator: Option<i32>,
-    /// Scan-level limit for early termination optimization.
-    /// When set, scan operators will stop reading new morsels after outputting this many rows.
+    /// Scan-level limit: the scan stops delivering once it has output this
+    /// many rows.
     limit: Option<usize>,
-    accept_empty_scan_ranges: bool,
 }
 
 /// Test-only static source that binds to a fixed, pre-built op regardless of
@@ -385,9 +168,7 @@ impl ScanNode {
             Option<i32>,
             Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
             Option<ExprId>,
-            Option<i32>,
             Option<usize>,
-            bool,
         ),
     ) {
         (
@@ -396,9 +177,7 @@ impl ScanNode {
                 self.node_id,
                 self.native_runtime_filter_specs,
                 self.conjunct_predicate,
-                self.connector_io_tasks_per_scan_operator,
                 self.limit,
-                self.accept_empty_scan_ranges,
             ),
         )
     }
@@ -410,9 +189,7 @@ impl ScanNode {
             native_runtime_filter_specs: Vec::new(),
             conjunct_predicate: None,
             output_chunk_schema: Arc::new(ChunkSchema::empty()),
-            connector_io_tasks_per_scan_operator: None,
             limit: None,
-            accept_empty_scan_ranges: false,
         }
     }
 
@@ -463,18 +240,8 @@ impl ScanNode {
         self
     }
 
-    pub fn with_connector_io_tasks_per_scan_operator(mut self, value: Option<i32>) -> Self {
-        self.connector_io_tasks_per_scan_operator = value;
-        self
-    }
-
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
-        self
-    }
-
-    pub fn with_accept_empty_scan_ranges(mut self, value: bool) -> Self {
-        self.accept_empty_scan_ranges = value;
         self
     }
 
@@ -512,16 +279,8 @@ impl ScanNode {
         self.conjunct_predicate = predicate;
     }
 
-    pub fn connector_io_tasks_per_scan_operator(&self) -> Option<i32> {
-        self.connector_io_tasks_per_scan_operator
-    }
-
     pub fn limit(&self) -> Option<usize> {
         self.limit
-    }
-
-    pub fn accept_empty_scan_ranges(&self) -> bool {
-        self.accept_empty_scan_ranges
     }
 }
 
@@ -533,30 +292,27 @@ impl std::fmt::Debug for ScanNode {
     }
 }
 
+/// A stream source for tests whose scan is built but never run: claiming it fails.
+#[cfg(test)]
+pub(crate) struct UnusedScanStream;
+
+#[cfg(test)]
+impl ScanStreamSource for UnusedScanStream {
+    fn claim(
+        &self,
+        _budget: ConnectorPollBudget,
+        _profile: Option<RuntimeProfile>,
+    ) -> Result<ScanOutputStream, String> {
+        Err("this test scan is never run".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{BoundScanRanges, RuntimeFilterContext, ScanNode, ScanOp, ScanSource};
-    use crate::exec::runtime_filter::{RuntimeFilterType, RuntimeMinMaxFilter};
-
-    #[test]
-    fn runtime_filter_context_preserves_min_max_filters() {
-        let ctx = RuntimeFilterContext::with_min_max_filters(
-            Vec::new(),
-            Vec::new(),
-            vec![(
-                7,
-                Arc::new(
-                    RuntimeMinMaxFilter::empty_range(RuntimeFilterType::Int32)
-                        .expect("empty min/max filter"),
-                ),
-            )],
-        );
-
-        assert_eq!(ctx.min_max_filters().len(), 1);
-    }
+    use super::{BoundScanRanges, ScanNode, ScanOp, ScanSource};
 
     #[test]
     fn freezing_scan_keeps_exact_source_binding_capability() {
@@ -567,14 +323,12 @@ mod tests {
                 Err("test binding reached".to_string())
             }
         }
-
         let calls = Arc::new(AtomicUsize::new(0));
         let source: Arc<dyn ScanSource> = Arc::new(TestSource(Arc::clone(&calls)));
         let (retained, (node_id, ..)) = ScanNode::new(Arc::clone(&source))
             .with_node_id(7)
             .into_static_fields_with_source();
         drop(source);
-
         assert_eq!(node_id, Some(7));
         assert!(retained.bind(BoundScanRanges::None).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);

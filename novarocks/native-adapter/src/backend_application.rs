@@ -109,6 +109,9 @@ pub struct BackendServerConfig {
     pub preparation_limits: novarocks_worker::TaskPreparationLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
     pub scan_preparation_config: novarocks_worker::ScanPreparationConfig,
+    /// The Server's scan I/O runtime. Typed scan streams are polled and
+    /// closed inside its context, where their I/O waits and timers live.
+    pub scan_stream_runtime: tokio::runtime::Handle,
     /// Server-frozen bounded failure and provider-bind policy for the BE
     /// catalog manager.
     pub catalog_manager_config: CatalogManagerConfig,
@@ -254,6 +257,8 @@ struct UnroutedTaskExecutionHost;
 impl TaskExecutionHost for UnroutedTaskExecutionHost {
     fn close_context_admission(&self, _context: QueryContextRef) {}
 
+    fn retire_context_execution(&self, _context: QueryContextRef) {}
+
     fn forget_context_admission(&self, _context: QueryContextRef) {}
 
     fn install_receiver(
@@ -332,7 +337,7 @@ fn compose_backend_application_services(
     result_retained_limits: WorkerResultRetainedLimits,
     inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits,
     preparation_limits: novarocks_worker::TaskPreparationLimits,
-    scan_preparation_config: novarocks_worker::ScanPreparationConfig,
+    scan_stream_host: novarocks_worker::ScanStreamHost,
     catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
@@ -381,10 +386,6 @@ fn compose_backend_application_services(
             )
         },
     )?);
-    novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime::global(
-        Arc::clone(&memory_authority),
-    )
-    .publish_resource_snapshot();
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
     let runtime_filter_factory = NativeRuntimeFilterParticipantFactory::new(data_runtime.clone());
@@ -438,7 +439,7 @@ fn compose_backend_application_services(
             write_commit_evidence_limits,
         )),
         Arc::clone(&execution_runtime),
-        scan_preparation_config,
+        scan_stream_host,
         Arc::clone(&task_completion_supervisor),
     ));
     let task_execution_registry = TaskExecutionRegistry::with_process_clock_and_task_creation_gate(
@@ -589,6 +590,7 @@ impl BackendApplicationHost {
             preparation_limits,
             execution_runtime_config,
             scan_preparation_config,
+            scan_stream_runtime,
             catalog_manager_config,
             execution_role_binding_factories,
         } = config;
@@ -615,7 +617,7 @@ impl BackendApplicationHost {
             result_retained_limits,
             inbound_capability_limits,
             preparation_limits,
-            scan_preparation_config,
+            novarocks_worker::ScanStreamHost::new(scan_preparation_config, scan_stream_runtime),
             catalog_manager_config,
             &execution_role_binding_factories,
         )?;
@@ -647,6 +649,10 @@ impl BackendApplicationHost {
                 .map_err(|error| {
                     BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
                 })?
+                .with_native_query_resources(Arc::new(|| {
+                    novarocks_worker::query_context::query_context_manager()
+                        .native_execution_resource_snapshot()
+                }))
                 .with_worker_reservations(
                     services
                         .task_execution_registry
@@ -868,8 +874,6 @@ mod tests {
     fn execution_runtime_config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            scan_threads: 1,
-            scan_queue_capacity: 1,
             spill_io_threads: 1,
             spill_io_queue_capacity: 1,
             spill_storage: ExecutionSpillStorageConfig::default(),
@@ -880,9 +884,6 @@ mod tests {
             operator_buffer_chunks: 1,
             local_exchange_buffer_mem_limit_per_driver: 1,
             local_exchange_max_buffered_rows: -1,
-            connector_io_tasks_per_scan_operator: 1,
-            scan_submit_fail_max: 1,
-            scan_submit_fail_timeout_ms: 1,
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,
@@ -974,16 +975,12 @@ mod tests {
     }
 
     fn http_get(port: u16, path: &str) -> std::io::Result<String> {
-        let mut stream =
-            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP listener");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("set HTTP read timeout");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
         write!(
             stream,
             "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        )
-        .expect("write HTTP request");
+        )?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
         Ok(response)
@@ -1028,6 +1025,8 @@ mod tests {
                 Duration::from_millis(100),
             )
             .expect("valid scan preparation configuration"),
+            scan_stream_runtime:
+                novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
             catalog_manager_config: CatalogManagerConfig::default(),
             execution_role_binding_factories: Vec::new(),
         }
@@ -1084,14 +1083,17 @@ mod tests {
                 .expect("valid test result retained-byte limits"),
             novarocks_worker::TaskInboundCapabilityLimits::default(),
             novarocks_worker::TaskPreparationLimits::default(),
-            novarocks_worker::ScanPreparationConfig::try_new(
-                64 * 1024 * 1024,
-                4,
-                Duration::from_millis(500),
-                Duration::from_millis(500),
-                Duration::from_millis(100),
-            )
-            .expect("valid scan preparation configuration"),
+            novarocks_worker::ScanStreamHost::new(
+                novarocks_worker::ScanPreparationConfig::try_new(
+                    64 * 1024 * 1024,
+                    4,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                    Duration::from_millis(100),
+                )
+                .expect("valid scan preparation configuration"),
+                novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
+            ),
             CatalogManagerConfig::default(),
             &[],
         )

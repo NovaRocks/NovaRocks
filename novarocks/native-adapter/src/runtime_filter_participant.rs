@@ -451,15 +451,6 @@ impl RuntimeFilterParticipant {
         self.state.record_row_effect(fragment_instance_id, effect);
     }
 
-    pub fn record_scan_unit_outcome(
-        &self,
-        fragment_instance_id: UniqueId,
-        outcome: novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitOutcome,
-    ) {
-        self.state
-            .record_scan_unit_outcome(fragment_instance_id, outcome);
-    }
-
     #[doc(hidden)]
     pub fn with_close_hook_for_test(
         &self,
@@ -1721,10 +1712,10 @@ mod tests {
             )
             .expect("source close");
 
-        assert!(matches!(
-            subscription.acquire(Duration::from_millis(1)),
-            SnapshotAcquireOutcome::Published(_)
-        ));
+        let outcome = subscription.try_outcome().expect("published outcome");
+        assert!(matches!(outcome, SnapshotAcquireOutcome::Published(_)));
+        // The consumer records what it acted on, as its gate does.
+        subscription.record_consumer_outcome(&outcome);
         let source_snapshot = source.capture_runtime_filter_observation();
         assert_eq!(source_snapshot.producer_streams().len(), 1);
         assert_eq!(
@@ -2025,10 +2016,10 @@ mod tests {
             novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Accepted
         ));
         assert!(matches!(
-            subscription.acquire(Duration::from_millis(1)),
-            SnapshotAcquireOutcome::Unavailable(
+            subscription.try_outcome(),
+            Some(SnapshotAcquireOutcome::Unavailable(
                 novarocks_execution::runtime_filter::UnavailableReason::MaterializationFailed
-            )
+            ))
         ));
     }
 }

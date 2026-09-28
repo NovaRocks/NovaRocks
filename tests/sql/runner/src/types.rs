@@ -155,8 +155,6 @@ pub enum RuntimeFilterTotalMetric {
     ConsumerRowEvaluations,
     ConsumerInputRows,
     ConsumerOutputRows,
-    ConsumerScanEvaluated,
-    ConsumerScanPruned,
 }
 
 impl RuntimeFilterTotalMetric {
@@ -173,8 +171,6 @@ impl RuntimeFilterTotalMetric {
             "consumer_row_evaluations" => Some(Self::ConsumerRowEvaluations),
             "consumer_input_rows" => Some(Self::ConsumerInputRows),
             "consumer_output_rows" => Some(Self::ConsumerOutputRows),
-            "consumer_scan_evaluated" => Some(Self::ConsumerScanEvaluated),
-            "consumer_scan_pruned" => Some(Self::ConsumerScanPruned),
             _ => None,
         }
     }
@@ -192,13 +188,11 @@ impl RuntimeFilterTotalMetric {
             Self::ConsumerRowEvaluations => "consumer_row_evaluations",
             Self::ConsumerInputRows => "consumer_input_rows",
             Self::ConsumerOutputRows => "consumer_output_rows",
-            Self::ConsumerScanEvaluated => "consumer_scan_evaluated",
-            Self::ConsumerScanPruned => "consumer_scan_pruned",
         }
     }
 
     pub const fn valid_names() -> &'static str {
-        "channel_count, channel_completed_count, producer_stream_count, producer_accepted_count, transport_route_count, transport_sent_count, transport_acked_count, consumer_count, consumer_row_evaluations, consumer_input_rows, consumer_output_rows, consumer_scan_evaluated, consumer_scan_pruned"
+        "channel_count, channel_completed_count, producer_stream_count, producer_accepted_count, transport_route_count, transport_sent_count, transport_acked_count, consumer_count, consumer_row_evaluations, consumer_input_rows, consumer_output_rows"
     }
 }
 

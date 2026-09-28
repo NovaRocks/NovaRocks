@@ -27,7 +27,6 @@
 pub mod async_sink;
 pub(crate) mod async_writer;
 pub mod binding;
-pub mod blocked_driver_poller;
 pub mod builder;
 pub mod chunk_buffer_memory_manager;
 pub mod dependency;
@@ -43,5 +42,4 @@ pub mod operator_factory;
     reason = "The pipeline submodule name is part of the stable execution module layout."
 )]
 pub mod pipeline;
-pub mod scan;
 pub mod schedule;

@@ -30,7 +30,6 @@ use super::graph::{
     RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraphData,
 };
 use super::policy::{RuntimeFilterPolicyValidationError, validate_runtime_filter_policy};
-use crate::analysis::ExprKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyField {
@@ -89,7 +88,6 @@ pub(crate) enum GraphValidationErrorKind {
     ConsumerOwnedCoverageWitness(CoverageWitnessId),
     UnsupportedConsumerCapability(ArtifactCapability),
     BlockingFeedbackConsumer,
-    ConsumerScanDomainTargetMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,25 +191,6 @@ impl<A: ActivationContract> RuntimeFilterGraphData<A> {
                     binding,
                     GraphValidationErrorKind::RoleApplyPointMismatch,
                 ));
-            }
-            if let RuntimeFilterBindingRoleData::Consumer(requirement) = &binding.role
-                && let super::graph::ConsumerBindingTarget::SourceBoundary {
-                    scan_domain: Some(target),
-                } = &requirement.target
-            {
-                let exact_column = matches!(
-                    &binding.expression.kind,
-                    ExprKind::ColumnRef { column_id, .. }
-                        if *column_id == target.column_id
-                            && binding.expression.data_type == target.data_type
-                            && binding.expression.nullable == target.nullable
-                );
-                if !exact_column {
-                    return Err(binding_error(
-                        binding,
-                        GraphValidationErrorKind::ConsumerScanDomainTargetMismatch,
-                    ));
-                }
             }
             match (&binding.role, binding.coverage_witness_id) {
                 (RuntimeFilterBindingRoleData::Producer(_), None) => {

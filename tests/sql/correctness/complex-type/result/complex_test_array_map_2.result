@@ -19,7 +19,7 @@ count(array_map(x -> array_length(array_concat(arr_str, [])), arr_largeint))
 1
 
 -- query 10
-array_length(array_map((x, y) -> x > y, @arr, @arr))
+array_length(array_map((x, y) -> x > y, array_repeat('12345', 1000000), array_repeat('12345', 1000000)))
 1000000
 1000000
 1000000
@@ -167,7 +167,7 @@ array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> array_ma
 [[[[[2,3]]]]]
 
 -- query 40
-array_sum(array_map(x -> array_contains(@arr, x), array_generate(1, 100000)))
+array_sum(array_map(x -> array_contains(array_generate(1, 10000), x), array_generate(1, 100000)))
 10000
 
 -- query 43

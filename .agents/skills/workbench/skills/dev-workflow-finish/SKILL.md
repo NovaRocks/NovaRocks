@@ -49,8 +49,10 @@ PR 创建成功后，严格按 bundled contract：
 1. 搜索待归档 spec / plan 的所有 wikilink。
 2. 将 spec 移到 `archive/specs/`，plan 移到 `archive/plans/`。
 3. 项目启用 umbrella 时，保留其面板中的 spec / plan wikilink。
-4. 项目启用 roadmap / umbrella 时，把对应子任务标为 `✅ 已完成`，填写 PR 链接，并同步依赖图状态。
-5. 项目启用 umbrella 且整条 arc 全部完成时，归档 umbrella。
+4. 项目启用 roadmap / umbrella 时，把对应子任务标为 `✅ 已完成`，填写 PR 链接，并同步依赖图节点颜色、子任务 spec 的
+   `roadmap_status: done` 和 umbrella 的 `roadmap_status`。子任务按其 plan 拆成多个 PR 时，最后一个 PR 创建后才标 ✅
+   并归档其 spec/plan，此前保持 `⏳ 进行中`。
+5. 项目启用 umbrella 且整条 arc 全部完成时，归档 umbrella（它同时承载整体路线，没有另外的 umbrella 级 plan）。
 
 ## Goal 终态
 

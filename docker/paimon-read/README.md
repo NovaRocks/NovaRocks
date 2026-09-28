@@ -101,7 +101,7 @@ fixture 覆盖以下外部写入事实：
 - `stages/*.json`、`logs/*.log`、`rendered/*.sql`、`objects.json`：原始阶段证据；日志和命令失败在输出到终端或写盘前按当前凭据值脱敏；
 - `formats.json`：直接从远端对象读取的 Parquet footer codec 与 Avro OCF header codec 证据；
 - `catalog.sql`：NovaRocks 的正常 `type=paimon` Filesystem Catalog 注册语句，引用现有静态 credential binding；
-- `base-server.toml` 与 `sql-runner.toml`：从当前 generated runtime 派生的 system/SQL runner 输入；凭据值替换为 `${ENV:...}` 引用，发布 READY 前还会扫描全部产物，发现当前 access key 或 secret key 即失败。
+- `base-server.toml` 与 `sql-runner.toml`：从当前 generated runtime 派生的 system/SQL runner 输入。base config 保留 FE metadata 凭据并补齐同 name/generation 的 BE data 凭据，由 native cluster harness 按角色投影；场景 credential overlay 会替换凭据数组，不会追加重复条目。凭据值替换为 `${ENV:...}` 引用，发布 READY 前还会扫描全部产物，发现当前 access key 或 secret key 即失败。
 
 验证本地产物摘要：
 

@@ -16,12 +16,11 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
-use bytes::Bytes;
 use parquet::DecodeResult;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection};
@@ -29,13 +28,14 @@ use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder
 use parquet::basic::{SortOrder, Type as ParquetType};
 use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{
-    FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+    FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataPushDecoder,
+    ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::statistics::Statistics;
 
-use super::chunk_reader::{BoundChunkReader, ReaderMetrics};
-use super::range_io::{coalesce_ranges, read_decoder_ranges};
+use super::chunk_reader::{BoundChunkReader, ReaderMetrics, SmallFileBuffer};
+use super::range_io::{coalesce_ranges, read_decoder_ranges, read_decoder_ranges_async};
 use crate::{
     BoundFile, DataCacheContext, FileBatch, FileBatchReader, FileError, FileErrorKind, FileFormat,
     FileIdentity, FileMetricsSnapshot, FileProjection, FileReadContext, FileReadRange,
@@ -191,8 +191,10 @@ pub struct ParquetMetadataInspection {
     footer: Arc<ArrowReaderMetadata>,
     access_domain: StorageAccessDomainId,
     identity: FileIdentity,
-    indexed_footer: Arc<Mutex<Option<ArrowReaderMetadata>>>,
-    small_file: Arc<Mutex<Option<Bytes>>>,
+    /// The footer with its page indexes, loaded once for every reader of this
+    /// inspection that needs them.
+    indexed_footer: Arc<tokio::sync::OnceCell<ArrowReaderMetadata>>,
+    small_file: SmallFileBuffer,
     schema: SchemaRef,
     physical_columns: Vec<ParquetPhysicalColumn>,
     row_groups: Vec<ParquetRowGroupLayout>,
@@ -248,6 +250,48 @@ impl ParquetMetadataInspection {
         page_index_policy: PageIndexPolicy,
         context: &FileReadContext,
     ) -> FileResult<ArrowReaderMetadata> {
+        if let Some(metadata) = self.ready_metadata(file, page_index_policy, context)? {
+            return Ok(metadata);
+        }
+        let metadata = load_page_indexes_blocking(&self.footer, chunk_reader, page_index_policy)?;
+        context.check_active()?;
+        let _ = self.indexed_footer.set(metadata);
+        Ok(self
+            .indexed_footer
+            .get()
+            .expect("page indexes loaded")
+            .clone())
+    }
+
+    /// Awaited [`Self::metadata_for`]; concurrent readers share one load.
+    async fn metadata_for_async(
+        &self,
+        file: &BoundFile,
+        chunk_reader: &BoundChunkReader,
+        page_index_policy: PageIndexPolicy,
+        context: &FileReadContext,
+    ) -> FileResult<ArrowReaderMetadata> {
+        if let Some(metadata) = self.ready_metadata(file, page_index_policy, context)? {
+            return Ok(metadata);
+        }
+        let metadata = self
+            .indexed_footer
+            .get_or_try_init(|| {
+                load_page_indexes(&self.footer, chunk_reader, page_index_policy, context)
+            })
+            .await?
+            .clone();
+        context.check_active()?;
+        Ok(metadata)
+    }
+
+    /// The metadata a reader of `file` needs when it is already in hand.
+    fn ready_metadata(
+        &self,
+        file: &BoundFile,
+        page_index_policy: PageIndexPolicy,
+        context: &FileReadContext,
+    ) -> FileResult<Option<ArrowReaderMetadata>> {
         if self.access_domain != file.access_domain() || self.identity != *file.identity() {
             return Err(FileError::invalid(
                 "Parquet inspection belongs to a different file identity or access domain",
@@ -255,36 +299,111 @@ impl ParquetMetadataInspection {
         }
         context.check_active()?;
         if page_index_policy == PageIndexPolicy::Skip {
-            return Ok(self.footer.as_ref().clone());
+            return Ok(Some(self.footer.as_ref().clone()));
         }
-        let mut indexed = self.indexed_footer.lock().map_err(|_| {
-            FileError::new(
-                FileErrorKind::Internal,
-                "Parquet inspection index state is poisoned",
-            )
-        })?;
-        if let Some(metadata) = indexed.as_ref() {
-            return Ok(metadata.clone());
+        Ok(self.indexed_footer.get().cloned())
+    }
+}
+
+fn load_page_indexes_blocking(
+    footer: &ArrowReaderMetadata,
+    chunk_reader: &BoundChunkReader,
+    page_index_policy: PageIndexPolicy,
+) -> FileResult<ArrowReaderMetadata> {
+    let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
+    let mut reader = ParquetMetaDataReader::new_with_metadata(footer.metadata().as_ref().clone())
+        .with_page_index_policy(page_index_policy);
+    reader
+        .read_page_indexes(chunk_reader)
+        .map_err(|error| parquet_error("load Parquet page indexes", error))?;
+    ArrowReaderMetadata::try_new(
+        Arc::new(
+            reader
+                .finish()
+                .map_err(|error| parquet_error("finish Parquet page indexes", error))?,
+        ),
+        options,
+    )
+    .map_err(|error| parquet_error("bind Parquet page indexes", error))
+}
+
+/// Awaited [`load_page_indexes_blocking`]: the same single page-index range.
+async fn load_page_indexes(
+    footer: &ArrowReaderMetadata,
+    chunk_reader: &BoundChunkReader,
+    page_index_policy: PageIndexPolicy,
+    context: &FileReadContext,
+) -> FileResult<ArrowReaderMetadata> {
+    let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
+    let mut decoder = ParquetMetaDataPushDecoder::try_new_with_metadata(
+        chunk_reader.file_size(),
+        footer.metadata().as_ref().clone(),
+    )
+    .map_err(|error| parquet_error("load Parquet page indexes", error))?
+    .with_page_index_policy(page_index_policy);
+    let metadata = decode_metadata(
+        &mut decoder,
+        chunk_reader,
+        context,
+        "load Parquet page indexes",
+    )
+    .await?;
+    ArrowReaderMetadata::try_new(Arc::new(metadata), options)
+        .map_err(|error| parquet_error("bind Parquet page indexes", error))
+}
+
+/// Awaited `ArrowReaderMetadata::load`: the 8-byte footer, then the metadata,
+/// then the page indexes `options` ask for, each through the chunk reader.
+async fn load_arrow_metadata(
+    chunk_reader: &BoundChunkReader,
+    page_index_policy: PageIndexPolicy,
+    context: &FileReadContext,
+    operation: &'static str,
+) -> FileResult<ArrowReaderMetadata> {
+    let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
+    let mut decoder = ParquetMetaDataPushDecoder::try_new(chunk_reader.file_size())
+        .map_err(|error| parquet_error(operation, error))?
+        .with_page_index_policy(page_index_policy);
+    let metadata = decode_metadata(&mut decoder, chunk_reader, context, operation).await?;
+    ArrowReaderMetadata::try_new(Arc::new(metadata), options)
+        .map_err(|error| parquet_error(operation, error))
+}
+
+async fn decode_metadata(
+    decoder: &mut ParquetMetaDataPushDecoder,
+    chunk_reader: &BoundChunkReader,
+    context: &FileReadContext,
+    operation: &'static str,
+) -> FileResult<ParquetMetaData> {
+    loop {
+        match decoder
+            .try_decode()
+            .map_err(|error| parquet_error(operation, error))?
+        {
+            DecodeResult::Data(metadata) => return Ok(metadata),
+            DecodeResult::NeedsData(ranges) => {
+                context.check_active()?;
+                let mut data = Vec::with_capacity(ranges.len());
+                for range in &ranges {
+                    let length = usize::try_from(range.end - range.start).map_err(|_| {
+                        FileError::new(
+                            FileErrorKind::ResourceExhausted,
+                            "Parquet metadata range is too large",
+                        )
+                    })?;
+                    data.push(chunk_reader.read_bytes_async(range.start, length).await?);
+                }
+                decoder
+                    .push_ranges(ranges, data)
+                    .map_err(|error| parquet_error(operation, error))?;
+            }
+            DecodeResult::Finished => {
+                return Err(FileError::new(
+                    FileErrorKind::Internal,
+                    format!("{operation}: metadata decoder finished without metadata"),
+                ));
+            }
         }
-        let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
-        let mut reader =
-            ParquetMetaDataReader::new_with_metadata(self.footer.metadata().as_ref().clone())
-                .with_page_index_policy(page_index_policy);
-        reader
-            .read_page_indexes(chunk_reader)
-            .map_err(|error| parquet_error("load Parquet page indexes", error))?;
-        let metadata = ArrowReaderMetadata::try_new(
-            Arc::new(
-                reader
-                    .finish()
-                    .map_err(|error| parquet_error("finish Parquet page indexes", error))?,
-            ),
-            options,
-        )
-        .map_err(|error| parquet_error("bind Parquet page indexes", error))?;
-        context.check_active()?;
-        *indexed = Some(metadata.clone());
-        Ok(metadata)
     }
 }
 
@@ -434,6 +553,32 @@ pub fn inspect_parquet_metadata(
     inspect_parquet_metadata_inner(file, cache, context, None)
 }
 
+/// Awaited [`inspect_parquet_metadata`] for a caller that must not block: the
+/// footer's ranges are awaited through the chunk reader, which reads through
+/// the source's range service.
+pub async fn inspect_parquet_metadata_async(
+    file: BoundFile,
+    cache: Option<DataCacheContext>,
+    context: FileReadContext,
+) -> FileResult<ParquetMetadataInspection> {
+    let inspection = InspectionReader::try_new(file, cache, context, None)?;
+    let metadata = match inspection.cached() {
+        Some(metadata) => metadata,
+        None => {
+            let metadata = load_arrow_metadata(
+                &inspection.chunk_reader,
+                PageIndexPolicy::Skip,
+                &inspection.context,
+                "inspect Parquet metadata",
+            )
+            .await?;
+            inspection.remember(&metadata);
+            metadata
+        }
+    };
+    inspection.finish(metadata)
+}
+
 /// Determine the complete footer suffix from an authorized prepared tail.
 /// The caller can request this range with `try_start_with_present` so only the
 /// missing prefix reaches storage, then parse it on scan CPU.
@@ -498,8 +643,7 @@ pub fn inspect_parquet_metadata_from_prepared(
         ));
     }
     let mut context = context;
-    context.range_service = None;
-    context.range_scope = None;
+    context.range = None;
     inspect_parquet_metadata_inner(file, None, context, Some(prepared))
 }
 
@@ -509,36 +653,97 @@ fn inspect_parquet_metadata_inner(
     context: FileReadContext,
     prepared: Option<PreparedFileInput>,
 ) -> FileResult<ParquetMetadataInspection> {
-    context.check_active()?;
-    let cache_enabled = cache
-        .as_ref()
-        .is_some_and(crate::DataCacheContext::datacache_requested);
-    let access_domain = file.access_domain();
-    let identity = file.identity().clone();
-    let chunk_reader = BoundChunkReader::new(
-        file,
-        context.clone(),
-        cache,
-        crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
-        Arc::new(ReaderMetrics::default()),
-    )
-    .with_prepared_input(prepared)?;
-    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
-    let metadata = if let Some(metadata) =
-        crate::cache::parquet_cache::metadata_get(cache_enabled, access_domain, &identity, false)
-    {
-        metadata
-    } else {
-        let metadata = ArrowReaderMetadata::load(&chunk_reader, options)
-            .map_err(|error| parquet_error("inspect Parquet metadata", error))?;
-        crate::cache::parquet_cache::metadata_put(
+    let inspection = InspectionReader::try_new(file, cache, context, prepared)?;
+    let metadata = match inspection.cached() {
+        Some(metadata) => metadata,
+        None => {
+            let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+            let metadata = ArrowReaderMetadata::load(&inspection.chunk_reader, options)
+                .map_err(|error| parquet_error("inspect Parquet metadata", error))?;
+            inspection.remember(&metadata);
+            metadata
+        }
+    };
+    inspection.finish(metadata)
+}
+
+/// One footer inspection before and after its metadata is in hand; only
+/// obtaining the metadata differs between the blocking and awaited paths.
+struct InspectionReader {
+    chunk_reader: BoundChunkReader,
+    context: FileReadContext,
+    cache_enabled: bool,
+    access_domain: StorageAccessDomainId,
+    identity: FileIdentity,
+}
+
+impl InspectionReader {
+    fn try_new(
+        file: BoundFile,
+        cache: Option<DataCacheContext>,
+        context: FileReadContext,
+        prepared: Option<PreparedFileInput>,
+    ) -> FileResult<Self> {
+        context.check_active()?;
+        let cache_enabled = cache
+            .as_ref()
+            .is_some_and(crate::DataCacheContext::datacache_requested);
+        let access_domain = file.access_domain();
+        let identity = file.identity().clone();
+        let chunk_reader = BoundChunkReader::new(
+            file,
+            context.clone(),
+            cache,
+            crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
+            Arc::new(ReaderMetrics::default()),
+        )
+        .with_prepared_input(prepared)?;
+        Ok(Self {
+            chunk_reader,
+            context,
             cache_enabled,
             access_domain,
-            &identity,
+            identity,
+        })
+    }
+
+    fn cached(&self) -> Option<ArrowReaderMetadata> {
+        crate::cache::parquet_cache::metadata_get(
+            self.cache_enabled,
+            self.access_domain,
+            &self.identity,
+            false,
+        )
+    }
+
+    fn remember(&self, metadata: &ArrowReaderMetadata) {
+        crate::cache::parquet_cache::metadata_put(
+            self.cache_enabled,
+            self.access_domain,
+            &self.identity,
             metadata.clone(),
         );
-        metadata
-    };
+    }
+
+    fn finish(self, metadata: ArrowReaderMetadata) -> FileResult<ParquetMetadataInspection> {
+        let InspectionReader {
+            chunk_reader,
+            context,
+            access_domain,
+            identity,
+            ..
+        } = self;
+        finish_inspection(metadata, &chunk_reader, &context, access_domain, identity)
+    }
+}
+
+fn finish_inspection(
+    metadata: ArrowReaderMetadata,
+    chunk_reader: &BoundChunkReader,
+    context: &FileReadContext,
+    access_domain: StorageAccessDomainId,
+    identity: FileIdentity,
+) -> FileResult<ParquetMetadataInspection> {
     context.check_active()?;
     let parquet = metadata.metadata();
     if parquet.num_row_groups() > MAX_PARQUET_INSPECTION_ROW_GROUPS {
@@ -669,7 +874,7 @@ fn inspect_parquet_metadata_inner(
         footer: Arc::new(metadata),
         access_domain,
         identity,
-        indexed_footer: Arc::new(Mutex::new(None)),
+        indexed_footer: Arc::default(),
         small_file: chunk_reader.small_file_buffer(),
         schema,
         physical_columns,
@@ -694,9 +899,21 @@ struct PositionSpan {
     remaining: usize,
 }
 
-impl ParquetPhysicalReader {
-    pub(crate) fn try_new(
-        request: FileReadRequest,
+/// One reader open before and after its metadata is in hand; only obtaining
+/// the metadata differs between the blocking and awaited paths.
+struct ReaderOpen {
+    chunk_reader: BoundChunkReader,
+    metrics: Arc<ReaderMetrics>,
+    cache_enabled: bool,
+    access_domain: StorageAccessDomainId,
+    identity: FileIdentity,
+    automatic_page_pruning: bool,
+    page_index_policy: PageIndexPolicy,
+}
+
+impl ReaderOpen {
+    fn try_new(
+        request: &FileReadRequest,
         inspection: Option<&ParquetMetadataInspection>,
     ) -> FileResult<Self> {
         request.context.check_active()?;
@@ -710,7 +927,7 @@ impl ParquetPhysicalReader {
         let chunk_reader = BoundChunkReader::new(
             request.file.clone(),
             request.context.clone(),
-            request.cache,
+            request.cache.clone(),
             crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
             Arc::clone(&metrics),
         )
@@ -727,32 +944,40 @@ impl ParquetPhysicalReader {
         } else {
             PageIndexPolicy::Optional
         };
-        let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
-        let arrow_metadata = if let Some(inspection) = inspection {
-            inspection.metadata_for(
-                &request.file,
-                &chunk_reader,
-                page_index_policy,
-                &request.context,
-            )?
-        } else if let Some(metadata) = crate::cache::parquet_cache::metadata_get(
+        Ok(Self {
+            chunk_reader,
+            metrics,
             cache_enabled,
             access_domain,
-            &identity,
-            page_index_policy != PageIndexPolicy::Skip,
-        ) {
-            metadata
-        } else {
-            let metadata = ArrowReaderMetadata::load(&chunk_reader, options)
-                .map_err(|error| parquet_error("open Parquet metadata", error))?;
-            crate::cache::parquet_cache::metadata_put(
-                cache_enabled,
-                access_domain,
-                &identity,
-                metadata.clone(),
-            );
-            metadata
-        };
+            identity,
+            automatic_page_pruning,
+            page_index_policy,
+        })
+    }
+
+    fn cached(&self) -> Option<ArrowReaderMetadata> {
+        crate::cache::parquet_cache::metadata_get(
+            self.cache_enabled,
+            self.access_domain,
+            &self.identity,
+            self.page_index_policy != PageIndexPolicy::Skip,
+        )
+    }
+
+    fn remember(&self, metadata: &ArrowReaderMetadata) {
+        crate::cache::parquet_cache::metadata_put(
+            self.cache_enabled,
+            self.access_domain,
+            &self.identity,
+            metadata.clone(),
+        );
+    }
+
+    fn finish(
+        self,
+        request: FileReadRequest,
+        arrow_metadata: ArrowReaderMetadata,
+    ) -> FileResult<ParquetPhysicalReader> {
         let builder = ParquetPushDecoderBuilder::new_with_metadata(arrow_metadata.clone());
         request.context.check_active()?;
 
@@ -764,12 +989,14 @@ impl ParquetPhysicalReader {
             request.pruning.row_groups.as_deref(),
             &request.predicates,
         );
-        metrics.record_row_group_selection(metadata.num_row_groups(), row_groups.len());
-        let automatic_ranges = automatic_page_pruning
+        self.metrics
+            .record_row_group_selection(metadata.num_row_groups(), row_groups.len());
+        let automatic_ranges = self
+            .automatic_page_pruning
             .then(|| automatic_page_ranges(metadata.as_ref(), &row_groups, &request.predicates))
             .transpose()?;
         if let Some(automatic) = automatic_ranges.as_ref() {
-            metrics.record_page_index(
+            self.metrics.record_page_index(
                 automatic.fallback,
                 automatic.rows_considered,
                 automatic.rows_pruned,
@@ -789,15 +1016,80 @@ impl ParquetPhysicalReader {
             selection,
         )?;
 
-        Ok(Self {
+        Ok(ParquetPhysicalReader {
             decoder: Some(reader),
-            chunk_reader,
+            chunk_reader: self.chunk_reader,
             options: request.options,
             positions,
             context: request.context,
-            metrics,
+            metrics: self.metrics,
             closed: false,
         })
+    }
+}
+
+impl ParquetPhysicalReader {
+    pub(crate) fn try_new(
+        request: FileReadRequest,
+        inspection: Option<&ParquetMetadataInspection>,
+    ) -> FileResult<Self> {
+        let open = ReaderOpen::try_new(&request, inspection)?;
+        let metadata = match inspection {
+            Some(inspection) => inspection.metadata_for(
+                &request.file,
+                &open.chunk_reader,
+                open.page_index_policy,
+                &request.context,
+            )?,
+            None => match open.cached() {
+                Some(metadata) => metadata,
+                None => {
+                    let options =
+                        ArrowReaderOptions::new().with_page_index_policy(open.page_index_policy);
+                    let metadata = ArrowReaderMetadata::load(&open.chunk_reader, options)
+                        .map_err(|error| parquet_error("open Parquet metadata", error))?;
+                    open.remember(&metadata);
+                    metadata
+                }
+            },
+        };
+        open.finish(request, metadata)
+    }
+
+    /// Awaited [`Self::try_new`]: footer and page-index ranges are awaited
+    /// through the chunk reader.
+    pub(crate) async fn try_new_async(
+        request: FileReadRequest,
+        inspection: Option<&ParquetMetadataInspection>,
+    ) -> FileResult<Self> {
+        let open = ReaderOpen::try_new(&request, inspection)?;
+        let metadata = match inspection {
+            Some(inspection) => {
+                inspection
+                    .metadata_for_async(
+                        &request.file,
+                        &open.chunk_reader,
+                        open.page_index_policy,
+                        &request.context,
+                    )
+                    .await?
+            }
+            None => match open.cached() {
+                Some(metadata) => metadata,
+                None => {
+                    let metadata = load_arrow_metadata(
+                        &open.chunk_reader,
+                        open.page_index_policy,
+                        &request.context,
+                        "open Parquet metadata",
+                    )
+                    .await?;
+                    open.remember(&metadata);
+                    metadata
+                }
+            },
+        };
+        open.finish(request, metadata)
     }
 
     fn take_positions(&mut self, count: usize) -> FileResult<UInt64Array> {
@@ -818,6 +1110,69 @@ impl ParquetPhysicalReader {
             }
         }
         Ok(UInt64Array::from(output))
+    }
+}
+
+impl ParquetPhysicalReader {
+    /// Awaited [`FileBatchReader::next_batch`]: the decoder's input requests
+    /// are awaited through the chunk reader, and the decoder itself runs on
+    /// the calling task.
+    pub(crate) async fn next_batch_async(&mut self) -> FileResult<Option<FileBatch>> {
+        if self.closed {
+            return Ok(None);
+        }
+        self.context.check_active()?;
+        let began = Instant::now();
+        let next = loop {
+            let decoder = self
+                .decoder
+                .as_mut()
+                .expect("Parquet decoder must exist before close");
+            match decoder
+                .try_decode()
+                .map_err(|error| format_error("decode Parquet batch", error))?
+            {
+                DecodeResult::Data(batch) => break Some(batch),
+                DecodeResult::Finished => break None,
+                DecodeResult::NeedsData(ranges) => {
+                    if ranges.is_empty() {
+                        return Err(FileError::new(
+                            FileErrorKind::Corrupt,
+                            "Parquet decoder requested no data while waiting for input",
+                        ));
+                    }
+                    self.context.check_active()?;
+                    let data = read_decoder_ranges_async(&self.chunk_reader, &ranges, self.options)
+                        .await?;
+                    self.decoder
+                        .as_mut()
+                        .expect("Parquet decoder must exist before close")
+                        .push_ranges(ranges, data)
+                        .map_err(|error| format_error("push Parquet input", error))?;
+                }
+            }
+        };
+        self.deliver(next, began)
+    }
+
+    fn deliver(
+        &mut self,
+        next: Option<arrow::record_batch::RecordBatch>,
+        began: Instant,
+    ) -> FileResult<Option<FileBatch>> {
+        self.context.check_active()?;
+        let Some(batch) = next else {
+            self.close()?;
+            return Ok(None);
+        };
+        let positions = self.take_positions(batch.num_rows())?;
+        self.metrics
+            .record_decode(batch.num_rows(), began.elapsed().as_nanos());
+        self.metrics.record_delivery();
+        Ok(Some(FileBatch {
+            batch,
+            physical_row_positions: Some(positions),
+        }))
     }
 }
 
@@ -854,19 +1209,7 @@ impl FileBatchReader for ParquetPhysicalReader {
                 }
             }
         };
-        self.context.check_active()?;
-        let Some(batch) = next else {
-            self.close()?;
-            return Ok(None);
-        };
-        let positions = self.take_positions(batch.num_rows())?;
-        self.metrics
-            .record_decode(batch.num_rows(), began.elapsed().as_nanos());
-        self.metrics.record_delivery();
-        Ok(Some(FileBatch {
-            batch,
-            physical_row_positions: Some(positions),
-        }))
+        self.deliver(next, began)
     }
 
     fn close(&mut self) -> FileResult<()> {
