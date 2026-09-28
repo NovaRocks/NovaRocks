@@ -8417,6 +8417,151 @@ fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
 }
 
 #[test]
+fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_seal_intake() {
+    use crate::native::task_transport::SubscriptionState;
+
+    for result_consumer in [false, true] {
+        let harness = Harness::new(&[1], &[0], 64);
+        let leaf = harness.stage_tasks(1)[0];
+        let leaf_context = harness.execution.task(leaf).unwrap().context();
+        let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+        let source = result_consumer.then(|| round.take_root_status_source().unwrap());
+        if result_consumer {
+            assert!(round.take_root_status_source().is_none());
+        }
+        for create in &creates {
+            acks.publish(accepted_create_ack(create));
+        }
+        round.turn().unwrap();
+        let root = round.root_task();
+        let root_context = round.execution().task(root.task_id()).unwrap().context();
+        round.consume_root_result_packet(0, true).unwrap();
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                root_context,
+                SubscriptionState::BudgetExhausted
+            ),
+            Some(SubscriptionState::BudgetExhausted),
+            "EOS does not substitute for the root's terminal output fact"
+        );
+        for (version, state, output) in [
+            (2, TaskState::Running, false),
+            (3, TaskState::Flushing, false),
+            (4, TaskState::Finished, true),
+        ] {
+            status.publish(StatusEvent::Published(
+                TaskStatus::try_new(
+                    root,
+                    TaskStatusVersion::new(version).unwrap(),
+                    state,
+                    None,
+                    TaskOutputFacts::new(output),
+                )
+                .unwrap(),
+            ));
+        }
+        round.turn().unwrap();
+        assert!(round.execution().client_visible_completion());
+        assert!(!round.root_success_sealed());
+        let leaf_task = round.execution().task(leaf).unwrap();
+        assert!(!leaf_task.is_terminal());
+        assert!(
+            !leaf_task.normally_stood_down(),
+            "one-layer stage release has not withdrawn this deep leaf"
+        );
+        if !result_consumer {
+            let identity = leaf_task.identity();
+            round
+                .execution_mut()
+                .require_terminal_evidence([identity])
+                .unwrap();
+        }
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                leaf_context,
+                SubscriptionState::BudgetExhausted
+            ),
+            (!result_consumer).then_some(SubscriptionState::BudgetExhausted),
+            "only an attached Result consumer retires residual transport evidence before seal intake"
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                leaf_context,
+                SubscriptionState::ProcessMismatch
+            ),
+            Some(SubscriptionState::ProcessMismatch),
+            "root completion cannot excuse an exact identity violation"
+        );
+        if let Some(source) = source {
+            let mut reply = source.begin_success_seal_request().unwrap();
+            round.turn().unwrap();
+            assert_eq!(reply.try_recv().unwrap(), Ok(()));
+            assert!(round.root_success_sealed());
+        }
+    }
+}
+
+#[test]
+fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() {
+    use crate::native::task_transport::SubscriptionState;
+
+    let harness = Harness::new(&[1], &[0], 64);
+    let leaf = harness.stage_tasks(1)[0];
+    let leaf_context = harness.execution.task(leaf).unwrap().context();
+    let leaf_identity = harness.execution.task(leaf).unwrap().identity();
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let source = round.take_root_status_source().unwrap();
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    round.turn().unwrap();
+    let root = round.root_task();
+    round.consume_root_result_packet(0, true).unwrap();
+    status.publish(StatusEvent::Published(
+        TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .unwrap(),
+    ));
+    round.turn().unwrap();
+    assert_eq!(
+        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        None
+    );
+
+    let failure = TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
+        novarocks_execution::task_execution::TaskFailureCategory::Execution,
+        novarocks_execution::task_execution::SafeDetail::new("accepted deep-leaf failure").unwrap(),
+    ));
+    status.publish(StatusEvent::Published(
+        TaskStatus::try_new(
+            leaf_identity,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Failing,
+            Some(failure.clone()),
+            TaskOutputFacts::new(false),
+        )
+        .unwrap(),
+    ));
+    round.turn().unwrap();
+    assert_eq!(round.failure_cause(), Some(&failure));
+    assert_eq!(
+        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        Some(SubscriptionState::BudgetExhausted),
+        "an accepted failure cannot be hidden by the completed root"
+    );
+    let mut reply = source.begin_success_seal_request().unwrap();
+    round.turn().unwrap();
+    let error = reply.try_recv().unwrap().unwrap_err();
+    assert!(error.message().contains("empty attempt failure latch"));
+    assert!(!round.root_success_sealed());
+}
+
+#[test]
 fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadline() {
     for recover in [true, false] {
         let harness = Harness::new(&[0], &[1], 64);
@@ -8474,6 +8619,14 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
             ])
             .unwrap();
         round.consume_root_result_packet(0, true).unwrap();
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                crate::native::task_transport::SubscriptionState::BudgetExhausted
+            ),
+            None,
+            "retired transport evidence does not clear a real application gap"
+        );
         let mut reply = source.begin_success_seal_request().unwrap();
         round.turn().unwrap();
         assert!(matches!(

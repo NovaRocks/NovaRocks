@@ -224,6 +224,8 @@ pub(crate) struct TaskRound {
     connector_blocking_io: Option<ConnectorBlockingIoSupervisor>,
     root_status_sender: Option<AcceptedRootStatusSender>,
     root_status_source: Option<AcceptedRootStatusSource>,
+    /// Result consumes root output; other intents retain their Task evidence.
+    result_consumer_attached: bool,
     pending_success_seal:
         Option<novarocks_query_application::coordination::AcceptedRootSuccessSealRequest>,
     abort_effect_intake: Option<NativeAbortEffectIntake>,
@@ -287,6 +289,7 @@ impl TaskRound {
             connector_blocking_io: None,
             root_status_sender: Some(root_status_sender),
             root_status_source: Some(root_status_source),
+            result_consumer_attached: false,
             pending_success_seal: None,
             abort_effect_intake: None,
             abort_effects: BTreeMap::new(),
@@ -370,6 +373,26 @@ impl TaskRound {
                 if self.success_sealed || self.terminal_cleanup_started {
                     return None;
                 }
+                let root = self.execution.graph().root_identity();
+                if self.result_consumer_attached
+                    && self.execution.failure_cause().is_none()
+                    && self
+                        .execution
+                        .task(root.task_id())
+                        .and_then(|task| task.status())
+                        .is_some_and(|status| {
+                            status.identity() == root
+                                && status.state()
+                                    == novarocks_execution::task_execution::TaskState::Finished
+                                && status.output().responsibility_complete()
+                        })
+                {
+                    // Result fetch and its EOS acknowledgement have their own
+                    // owner. Once the exact root completed its output, residual
+                    // producer observation belongs to drain even before the
+                    // result consumer registers its success-seal request.
+                    return None;
+                }
                 self.execution
                     .graph()
                     .tasks()
@@ -401,9 +424,12 @@ impl TaskRound {
     }
 
     /// Transfers the single accepted-root projection to the result-pump
-    /// owner. The round retains only its sender and remains the sole publisher.
+    /// owner and attaches its Result evidence policy. The round retains only
+    /// its sender and remains the sole publisher.
     pub(crate) fn take_root_status_source(&mut self) -> Option<AcceptedRootStatusSource> {
-        self.root_status_source.take()
+        let source = self.root_status_source.take()?;
+        self.result_consumer_attached = true;
+        Some(source)
     }
 
     /// Installs the process owner used by blocking Connector calls.
