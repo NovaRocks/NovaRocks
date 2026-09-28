@@ -100,10 +100,13 @@ struct ResultBufferSinkOperator {
     finished: bool,
 }
 
-#[derive(Debug)]
 enum ResultSinkCreditState {
     Ready,
-    Blocked,
+    Blocked {
+        bytes: usize,
+        observable: Arc<Observable>,
+        generation: u64,
+    },
     Reserved(ResultWriteCredit),
 }
 
@@ -131,11 +134,19 @@ impl Operator for ResultBufferSinkOperator {
 
 impl ProcessorOperator for ResultBufferSinkOperator {
     fn need_input(&self) -> bool {
-        !self.finished
-            && !matches!(
-                *self.credit.lock().expect("result sink credit lock"),
-                ResultSinkCreditState::Blocked
-            )
+        if self.finished {
+            return false;
+        }
+        match &*self.credit.lock().expect("result sink credit lock") {
+            ResultSinkCreditState::Blocked {
+                observable,
+                generation,
+                ..
+            } => self.session.writable_observable().is_none_or(|current| {
+                !Arc::ptr_eq(observable, &current) || current.generation() != *generation
+            }),
+            _ => true,
+        }
     }
 
     fn can_accept_input(&self, chunk: &Chunk) -> Result<bool, String> {
@@ -156,6 +167,29 @@ impl ProcessorOperator for ResultBufferSinkOperator {
             }
             return Ok(true);
         }
+        // Freeze the event before the budget check. A release can race with a
+        // rejected acquisition and must invalidate that cached rejection even
+        // if the scheduler has not frozen its own wait generation yet.
+        let observable = self.session.writable_observable();
+        if let ResultSinkCreditState::Blocked {
+            bytes: blocked_bytes,
+            observable: blocked,
+            generation,
+        } = &*state
+        {
+            let current = observable.as_ref().ok_or_else(|| {
+                "RESULT_SINK blocked credit lost its readiness observable".to_string()
+            })?;
+            if !Arc::ptr_eq(blocked, current) {
+                return Err(
+                    "RESULT_SINK blocked credit changed its readiness observable".to_string(),
+                );
+            }
+            if bytes == *blocked_bytes && current.generation() == *generation {
+                return Ok(false);
+            }
+        }
+        let generation = observable.as_ref().map(|event| event.generation());
         match self
             .session
             .try_acquire(bytes)
@@ -172,7 +206,22 @@ impl ProcessorOperator for ResultBufferSinkOperator {
                 Ok(true)
             }
             ResultWriteAdmission::Blocked => {
-                *state = ResultSinkCreditState::Blocked;
+                let observable = observable.ok_or_else(|| {
+                    "RESULT_SINK blocked credit has no readiness observable".to_string()
+                })?;
+                let current = self.session.writable_observable().ok_or_else(|| {
+                    "RESULT_SINK blocked credit lost its readiness observable".to_string()
+                })?;
+                if !Arc::ptr_eq(&observable, &current) {
+                    return Err(
+                        "RESULT_SINK blocked credit changed its readiness observable".to_string(),
+                    );
+                }
+                *state = ResultSinkCreditState::Blocked {
+                    bytes,
+                    observable,
+                    generation: generation.expect("blocked credit observable generation"),
+                };
                 Ok(false)
             }
         }
@@ -201,7 +250,7 @@ impl ProcessorOperator for ResultBufferSinkOperator {
                         credit.bytes()
                     ));
                 }
-                ResultSinkCreditState::Ready | ResultSinkCreditState::Blocked => {
+                ResultSinkCreditState::Ready | ResultSinkCreditState::Blocked { .. } => {
                     drop(state);
                     match self
                         .session
@@ -268,13 +317,17 @@ impl ProcessorOperator for ResultBufferSinkOperator {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex, Weak};
+    use std::time::Duration;
 
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
     use crate::exec::chunk::ChunkSchema;
+    use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
+    use crate::exec::pipeline::operator::BlockedReason;
     use crate::runtime::fragment::io::{
         FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, ResultAbort,
     };
@@ -421,6 +474,10 @@ mod tests {
     }
 
     fn one_row_chunk() -> Chunk {
+        values_chunk(vec![7])
+    }
+
+    fn values_chunk(values: Vec<i32>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int32,
@@ -428,7 +485,7 @@ mod tests {
         )]));
         let batch = arrow::record_batch::RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![7]))],
+            vec![Arc::new(Int32Array::from(values))],
         )
         .expect("one row batch");
         let chunk_schema =
@@ -505,5 +562,182 @@ mod tests {
         assert_eq!(session.high_water(), bytes);
         session.consume_one();
         assert_eq!(session.retained(), 0);
+    }
+
+    #[test]
+    fn credit_rejection_does_not_block_a_smaller_reservation_without_a_release() {
+        let first = one_row_chunk();
+        let small = one_row_chunk();
+        let large = values_chunk(vec![7, 8]);
+        let bytes = first.logical_bytes();
+        assert_eq!(large.logical_bytes(), 2 * bytes);
+        let session = CreditSession::new(2 * bytes);
+        let factory = ResultBufferSinkFactory::new(session.clone(), None);
+        let mut operator = factory.create(1, 0);
+        let processor = operator.as_processor_mut().expect("result processor");
+        assert!(processor.can_accept_input(&first).expect("first admission"));
+        processor
+            .push_chunk(&runtime_state(), first)
+            .expect("write");
+        let generation = session.inner.writable.generation();
+        assert!(!processor.can_accept_input(&large).expect("large blocked"));
+        assert!(processor.can_accept_input(&small).expect("smaller fits"));
+        assert_eq!(session.inner.writable.generation(), generation);
+        processor
+            .push_chunk(&runtime_state(), small)
+            .expect("small write");
+        assert_eq!(session.high_water(), 2 * bytes);
+        session.consume_one();
+        session.consume_one();
+        assert_eq!(session.retained(), 0);
+    }
+
+    struct OneChunkSource(Option<Chunk>);
+
+    impl Operator for OneChunkSource {
+        fn name(&self) -> &str {
+            "OneChunkSource"
+        }
+        fn is_finished(&self) -> bool {
+            self.0.is_none()
+        }
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for OneChunkSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+        fn has_output(&self) -> bool {
+            self.0.is_some()
+        }
+        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> Result<(), String> {
+            Err("source cannot accept input".to_string())
+        }
+        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(self.0.take())
+        }
+        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct RacingCreditSession {
+        inner: Arc<CreditSession>,
+        notify_before_freeze: bool,
+        rejected: AtomicBool,
+        notified: AtomicBool,
+        attempts: AtomicUsize,
+        finished: AtomicBool,
+    }
+
+    impl RacingCreditSession {
+        fn new(bytes: usize, notify_before_freeze: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: CreditSession::new(bytes),
+                notify_before_freeze,
+                rejected: AtomicBool::new(false),
+                notified: AtomicBool::new(false),
+                attempts: AtomicUsize::new(0),
+                finished: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl FragmentResultSession for RacingCreditSession {
+        fn reservation_bytes(&self, chunk: &Chunk) -> Result<usize, FragmentIoError> {
+            self.inner.reservation_bytes(chunk)
+        }
+        fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, FragmentIoError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if !self.notified.load(Ordering::SeqCst) {
+                self.rejected.store(true, Ordering::SeqCst);
+                return Ok(ResultWriteAdmission::Blocked);
+            }
+            self.inner.try_acquire(bytes)
+        }
+        fn writable_observable(&self) -> Option<Arc<Observable>> {
+            let observable = self.inner.writable_observable().expect("credit observable");
+            // The sole release occurs after a rejected acquisition but before
+            // the driver's terminal-sink wait captures its generation. This
+            // also exercises production code that cached an unversioned reject.
+            if self.notify_before_freeze
+                && self.rejected.load(Ordering::SeqCst)
+                && !self.notified.swap(true, Ordering::SeqCst)
+            {
+                observable.notify_observers();
+            }
+            Some(observable)
+        }
+        fn write_with_credit(
+            &self,
+            chunk: Chunk,
+            credit: ResultWriteCredit,
+        ) -> Result<(), FragmentIoError> {
+            self.inner.write_with_credit(chunk, credit)
+        }
+        fn finish(&self) -> Result<(), FragmentIoError> {
+            self.finished.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn abort(&self, reason: ResultAbort) {
+            self.inner.abort(reason);
+        }
+    }
+
+    fn credit_driver(session: Arc<RacingCreditSession>, chunk: Chunk) -> PipelineDriver {
+        let factory = ResultBufferSinkFactory::new(session, None);
+        PipelineDriver::new(
+            0,
+            vec![Box::new(OneChunkSource(Some(chunk))), factory.create(1, 0)],
+            None,
+            Vec::new(),
+            Arc::new(runtime_state()),
+            None,
+        )
+    }
+
+    #[test]
+    fn driver_retries_credit_released_before_wait_generation_freeze() {
+        let chunk = one_row_chunk();
+        let bytes = chunk.logical_bytes();
+        let session = RacingCreditSession::new(bytes, true);
+        let mut driver = credit_driver(Arc::clone(&session), chunk);
+        let state = driver.process(Duration::from_secs(1));
+        assert!(matches!(state, DriverState::Finished), "actual: {state:?}");
+        assert!(session.finished.load(Ordering::SeqCst));
+        assert_eq!(session.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            session.inner.inner.writable.generation(),
+            1,
+            "only one writable event"
+        );
+        assert_eq!(session.inner.retained(), bytes);
+        assert_eq!(session.inner.high_water(), bytes);
+        session.inner.consume_one();
+        assert_eq!(session.inner.retained(), 0);
+    }
+
+    #[test]
+    fn driver_parks_unchanged_credit_rejection_without_retry_spin() {
+        let chunk = one_row_chunk();
+        let session = RacingCreditSession::new(chunk.logical_bytes(), false);
+        let mut driver = credit_driver(Arc::clone(&session), chunk);
+        let state = driver.process(Duration::from_secs(1));
+        assert!(
+            matches!(state, DriverState::Blocked(BlockedReason::OutputFull)),
+            "actual: {state:?}"
+        );
+        assert_eq!(session.attempts.load(Ordering::SeqCst), 1);
+        let (observable, generation, _) =
+            driver.blocked_observable_snapshot().expect("frozen wait");
+        assert_eq!(observable.generation(), generation);
+        assert_eq!(session.inner.retained(), 0);
+        assert!(!session.finished.load(Ordering::SeqCst));
     }
 }
