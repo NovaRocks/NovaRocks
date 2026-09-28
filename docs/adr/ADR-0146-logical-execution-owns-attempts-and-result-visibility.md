@@ -2,12 +2,11 @@
 id: ADR-0146
 title: "Logical execution owns attempts, result visibility and residual convergence"
 domain: [distributed-query-lifecycle, distributed-execution]
-status: active
+status: superseded
 supersedes: [ADR-0135]
-superseded-by: null
+superseded-by: ADR-0161
 date: 2026-09-11
 provenance:
-  - "accepted design: UEA-5D v6, 2026-09-24; local implementation receipt pending"
   - "PR: <backfill after merge>"
   - "discussion: 2026-09-11 logical execution recovery, delivery and worker convergence"
 code-anchors:
@@ -37,17 +36,21 @@ Task 仍是一次 attempt 内可独立创建、推进与终结的单位。ADR-01
 - Create/Update/Abort/Release 等 typed operation 各自携带 identity、deadline 和独立 operation id；每个 domain 只单调推进，accepted/idempotent/older 与 conflict/rejected 不折叠。receipt 只陈述被接受的事实，不成为第二条 TaskStatus authority。
 - `TaskStatus` 是 Task 生命周期和终态的唯一发布者；状态订阅按准确 cursor/version 前进。`TaskInfo` 只做有界诊断，transport keepalive、heartbeat 或 Backend membership 不证明 coordinator/Task 存活。
 - Query execution lease 与状态观察分离；只有准确 Context owner 续租。租约失效、状态流错误、控制 receipt 和精确 process replacement 按各自契约产生事实，互不伪造。
-- push exchange edge 初始关闭，只有所有冻结 destination 已有 Installed 正面事实或准确正常撤回输入需求后才开放；Accepted ACK 只证明接管。入站 frame 在 Arrow decode 和 receiver allocation 前按完整 Task/edge/sender/process identity 准入。
+- push exchange edge 初始关闭，只有所有冻结 destination 的 Create ACK 都证明 receiver/capability 已安装后才开放。入站 frame 在 Arrow decode 和 receiver allocation 前按完整 Task/edge/sender/process identity 准入。
 - split、Runtime Filter、credential、edge 与 Context 各自按独立 token/watermark 推进；同 token 的 replay 幂等，冲突显式失败。消费者已正常结束后的迟到投递是 no-op settlement；发送方在自己已经封口后继续产生内容仍是错误。
 - end-of-stream 代表一个 sender 的完整 driver 集合；持有未交付行的 driver 不得让另一个 driver 提前封口。正常下游结束可以关闭边，不能写成上游 failure。
-- 正常 Quiesce 先冻结累计接管集合并关闭新工作资格，显式 `ReleaseQueryContext` 在 Quiescing 和实际收敛后才闭合 Context；“当前看到的 Task 全部终态”不能推导未来没有合法 Create。retirement fence/tombstone 至少覆盖合法请求 horizon，过期请求不得复活历史 identity。
+- 显式 `ReleaseQueryContext` 才闭合 Context；“当前看到的 Task 全部终态”不能推导未来没有合法 Create。retirement fence/tombstone 至少覆盖合法请求 horizon，过期请求不得复活历史 identity。
 - descriptor 冻结完整协议事实；plan body 可以由 codec 私有 handle 持有其唯一 wire 表示，但 FE/BE application owner 不直接解释 generated message。不会为形式纯洁再建立一套完整 plan IR。
 
-当前创建载体由准确文件名的 [Task 创建 ADR-0158](ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md) 规定：静态 FrozenFragment 与每 Task metadata/assignment 各有唯一 owner，按准确身份重放，不比较内容。Worker 先原子接管 Accepted，再在有界 FIFO 内准备；Installed 是额外历史事实，准备失败保留实体。
-
-读 success seal 在唯一 FE 本地接受 cut 决定：root Finished、结果 EOS/最终 ACK、已接受失败及真实观察缺口满足要求后即可成功，不等待无用部署、围栏或全图退出。PendingRecovery 保留 move-only 请求并持续消费事实，必要证据按连续预算恢复；无关断流/覆盖债不形成全图新鲜度门。seal 同步封闭 Create、重投及普通输入；原 attempt owner 继续必要 Quiesce、正常停止、观察、续租和 Release，不新增第二清理 owner。seal 后残余清理错误不改已固定业务结局，写提交仍等待准确 prepared write set 和 writer 证据。
-
-Task terminal 与 actual_stopped 分开。正常 Context Release 既消费本 Context Task 的强化实际停止，也等待冻结入边的实际接管 sender Task 停止；未知 Create 由准确 Quiesce 集合结清，不从超时、Cancel 或 Gone 伪造停止。逐 destination typed NormallyClosed 只作用于准确冻结输入/Task/进程/sender，failure 不能改写为正常关闭。
+当前 `CreateTaskRequest` 以两个必需的 bytes 字段传输创建内容：`frozen_fragment` 解码为
+`FrozenFragment`，承载可按 fragment/version 冻结的 plan、契约版本和 DOP 域；
+`creation_metadata` 解码为 `CreationMetadata`，承载本次 Task 的 Context、descriptor、
+`InstanceParams` 与初始 domain。Task-local placement、exchange endpoint、sender 数及
+`sink_edge_ids` 从 metadata 的 topology/instance assignment 互校，不从静态 plan 的
+旧 destination 字段回退。codec 校验两段载体并投影中立 descriptor；BE 的执行解码
+只消费这次校验后的准确组合，Task 的创建判等覆盖迁移后的两段内容。`FrozenFragment`
+中的 provider requirement 字段已占位，完整物理计划派生仍属后续 UEA-5B 工作；
+本次载体切分不代表完整原始计划取证已经完成。
 
 结果是独立的数据面。root Fetch 使用准确 attempt、连续 sequence 与 ACK watermark；Backend 在准确 ACK 前保留 payload。FE 在 Fetch、decode、queued delivery 和 protocol write 之间转移同一份 byte credit，不能出现未计账空档。schema 只交付一次；batch/EOF 使用 move-only delivery 与 `Completed`、`Failed`、`Dropped` receipt。只有协议 adapter 确认完整接受后才能释放对应信用和推进可见状态，失败流不能生成成功 EOF。
 

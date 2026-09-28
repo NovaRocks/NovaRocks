@@ -2,12 +2,11 @@
 id: ADR-0157
 title: "Native RPC 接收保护为何分布在认证后入口、方法尺寸门和 codec"
 domain: [distributed-query-lifecycle, runtime-role]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0161
 date: 2026-09-23
 provenance:
-  - "accepted design: UEA-5D v6, 2026-09-24; local implementation receipt pending"
   - "discussion: 2026-09-23 native RPC ingress and control isolation"
 code-anchors:
   - "novarocks/native-adapter/src/native_ingress.rs (NativeIngressService)"
@@ -32,10 +31,6 @@ Native RPC 同时承载较大的 Task 创建请求和必须在普通工作拥塞
 
 入口资格、帧长上限、Worker context reservation、Exchange slot 的单位、owner 和释放事件不同，不能把它们合并成一份含糊的“容量”。运行期具名读数分别暴露普通/控制入口的占用、排队、拒绝原因和期限，以便现场判断当前是哪道门饱和。单消息字节上限乘以同时持有数及解码放大，仅是配置时必须登记的容量包络估算，并非精确 RSS 保证。
 
-Accepted 前的入口/Worker 准备容量拒绝必须区分长期 ResourceExhausted、短期 PreparationBusy 与 NotReady；入口拒绝不伪造 Worker terminal，但此前未知发送的接管责任仍需原 owner 结清。Accepted 后重任务在有界 Context FIFO 内完成，P/count/bytes 与实际退出尾部计账；普通入口许可、准备占用、正常关闭 active+retained 记录及控制进展预留分别归还，不使用 Context 生命周期 footprint grant。
-
-Native 的 SubscribeTaskStatus 只有一种生产语义：准确 Context、非零 generation、完整 cursor 与有限身份，统一覆盖流。codec 检查结构和边界；Worker 检查 future cursor 与源事实；FE 串行应用并区分传输存活、应用积压及真实缺口。Quiesce 属于独立小控制路径，累计回执有 count/bytes 上限；正常关闭 Update 使用原控制进展预留，仍保留每 Task 单 Update 在途约束。
-
 ## 考虑过的选项
 
 **只在 typed handler 内取得许可。** 接口简单，但 Tonic 已收完整 body 并构造 prost 树，无法保护前面的实际消耗；这是设计否决。
@@ -50,7 +45,7 @@ Native 的 SubscribeTaskStatus 只有一种生产语义：准确 Context、非�
 
 1. **成本前置规则。** 本地接收 running/waiting 资格在认证后、Tonic 读取 body 前取得；请求的资格随 body、handler、blocking closure、响应及其真实 backing 的最后持有者移动，不因某个 future 提前 Drop 就虚报释放。等待只取请求剩余期限，不重置到达时钟；Issued ticket 的 Establish 不得等过其真实剩余有效期，Redeemed 的准确重放按 Worker 合同判断。
 2. **按方法尺寸规则。** 控制方法走精确 path 与小 Tonic 解码上限，普通 Task 走其合法较大上限。分类与帧长必须在配置中联合校验；控制接收、执行和响应都须在普通路径饱和时可推进。Native async worker、普通 blocking 与独立控制执行容量使用正常角色配置及跨参数关系校验。
-3. **单一解码语义规则。** codec 只对可能引起对象展开的原始结构做资源预检，protobuf 编码合法性仍交 prost，身份、ticket、生命周期和创建接管、准备与身份重放仍交现有准确 owner。新增操作必须显式决定 FE 调度、FE transport 与 BE 方法分类，不靠通配默认。
+3. **单一解码语义规则。** codec 只对可能引起对象展开的原始结构做资源预检，protobuf 编码合法性仍交 prost，身份、ticket、生命周期和创建冲突仍交现有准确 owner。新增操作必须显式决定 FE 调度、FE transport 与 BE 方法分类，不靠通配默认。
 4. **分账与诊断规则。** Tower 计数资格和每条消息帧长的乘积按方法类别登记估算，并以真实饱和场景记录粗驻留峰值与限制；入口、Worker 和 Exchange 各自保留其准确单位与 owner。运维观察同时给出各入口门当前占用、排队和拒绝原因，不只记录每次失败的历史事件。
 
 ## 接受的妥协（诚实记录）
