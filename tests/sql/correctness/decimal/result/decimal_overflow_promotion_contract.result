@@ -1,0 +1,72 @@
+-- query 2
+seq	product
+1	NULL
+2	0.0000000000000000000
+3	NULL
+
+-- query 3
+seq	product
+1	1524157876695625600000000000
+2	0
+3	NULL
+
+-- query 4
+seq	product
+1	NULL
+2	0.0000000000000000000
+3	NULL
+
+-- query 5
+seq	product
+1	1524157876695625600000000000
+2	0
+3	NULL
+
+-- query 6
+seq	product
+1	1524157876695625600000000000
+2	0
+3	NULL
+
+-- query 7
+seq	product
+1	NULL
+2	0.0000000000000000000
+3	NULL
+
+-- query 8
+exact_product
+15241578780673678.515622620750190521
+
+-- query 13
+promoted	checked	outer_checked
+1524157876695625600000000000	NULL	NULL
+
+-- query 14
+checked	inherited
+NULL	1524157876695625600000000000
+
+-- query 15
+promoted	checked	outer_checked
+1524157876695625600000000000	NULL	NULL
+
+-- query 16
+branch	product
+1	1524157876695625600000000000
+2	NULL
+
+-- query 17
+enabled
+0
+
+-- query 18
+enabled
+1
+
+-- query 19
+enabled
+0
+
+-- query 27
+product
+NULL

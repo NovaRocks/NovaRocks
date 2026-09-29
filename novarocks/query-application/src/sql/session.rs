@@ -319,6 +319,12 @@ fn apply_session_system_variable(
         return Ok(SessionSetAssignmentOutcome::Applied);
     }
     match name {
+        "decimal_overflow_to_double" => {
+            state.sql_semantics = state
+                .sql_semantics
+                .clone()
+                .with_decimal_overflow_to_double(parse_bool(value)?);
+        }
         "query_timeout" => {
             let seconds = parse_value(value, "query_timeout")?;
             state.execution_settings.set_query_timeout_secs(seconds);
@@ -450,6 +456,7 @@ fn is_known_session_setting(name: &str) -> bool {
     matches!(
         name,
         "autocommit"
+            | "decimal_overflow_to_double"
             | "catalog"
             | "query_timeout"
             | "group_concat_max_len"
@@ -919,6 +926,48 @@ mod tests {
             b.sql_semantics(),
             &before,
             "GLOBAL retains its previously admitted no-op"
+        );
+    }
+
+    #[test]
+    fn decimal_setting_is_connection_local_strict_and_preserved_in_attempt_snapshot() {
+        let mut state = SessionSqlState::default();
+        assert!(!state.sql_semantics().decimal_overflow_to_double());
+        for value in ["1", "ON", "TRUE", "'true'"] {
+            let sql = format!("SET SESSION decimal_overflow_to_double={value}");
+            apply_session_set_assignment(&sql, &set_assignment(&sql), &mut state).unwrap();
+            assert!(state.sql_semantics().decimal_overflow_to_double());
+        }
+        let sql = "SET sql_mode='GROUP_CONCAT_LEGACY'";
+        apply_session_set_assignment(sql, &set_assignment(sql), &mut state).unwrap();
+        assert!(state.sql_semantics().decimal_overflow_to_double());
+        let frozen = state.clone().into_query_attempt_inputs().4;
+        for value in ["0", "OFF", "FALSE"] {
+            let sql = format!("SET LOCAL decimal_overflow_to_double={value}");
+            apply_session_set_assignment(&sql, &set_assignment(&sql), &mut state).unwrap();
+            assert!(!state.sql_semantics().decimal_overflow_to_double());
+            assert!(state.sql_semantics().sql_mode().group_concat_legacy());
+        }
+        assert!(frozen.decimal_overflow_to_double());
+        assert!(
+            !SessionSqlState::default()
+                .sql_semantics()
+                .decimal_overflow_to_double()
+        );
+        for sql in [
+            "SET decimal_overflow_to_double=2",
+            "SET decimal_overflow_to_double='unknown'",
+        ] {
+            let before = state.sql_semantics().clone();
+            assert!(apply_session_set_assignment(sql, &set_assignment(sql), &mut state).is_err());
+            assert_eq!(&before, state.sql_semantics());
+        }
+        let sql = "SET GLOBAL decimal_overflow_to_double=true";
+        let error =
+            apply_session_set_assignment(sql, &set_assignment(sql), &mut state).unwrap_err();
+        assert_eq!(
+            error.user_error().unwrap().code().as_str(),
+            "sql.admit.session_global_scope_unsupported"
         );
     }
 }

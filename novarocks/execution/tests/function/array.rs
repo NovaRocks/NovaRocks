@@ -1229,7 +1229,7 @@ fn test_array_generate_one_arg() {
     let chunk = common::chunk_len_1();
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     let expr = common::typed_null(&mut arena, list_type);
-    let stop = common::literal_i64(&mut arena, 3);
+    let stop = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(3)), DataType::Int64);
 
     let out = eval_array_function("array_generate", &arena, expr, &[stop], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
@@ -1243,8 +1243,8 @@ fn test_array_generate_two_args_desc() {
     let chunk = common::chunk_len_1();
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     let expr = common::typed_null(&mut arena, list_type);
-    let start = common::literal_i64(&mut arena, 3);
-    let stop = common::literal_i64(&mut arena, 1);
+    let start = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(3)), DataType::Int64);
+    let stop = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
 
     let out = eval_array_function("array_generate", &arena, expr, &[start, stop], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
@@ -1258,9 +1258,9 @@ fn test_array_generate_three_args_and_empty() {
     let chunk = common::chunk_len_1();
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     let expr = common::typed_null(&mut arena, list_type.clone());
-    let start = common::literal_i64(&mut arena, 1);
-    let stop = common::literal_i64(&mut arena, 5);
-    let step = common::literal_i64(&mut arena, 2);
+    let start = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
+    let stop = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(5)), DataType::Int64);
+    let step = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(2)), DataType::Int64);
 
     let out =
         eval_array_function("array_generate", &arena, expr, &[start, stop, step], &chunk).unwrap();
@@ -1269,9 +1269,9 @@ fn test_array_generate_three_args_and_empty() {
     assert_eq!(values.values(), &[1, 3, 5]);
 
     let expr2 = common::typed_null(&mut arena, list_type);
-    let start2 = common::literal_i64(&mut arena, 3);
-    let stop2 = common::literal_i64(&mut arena, 2);
-    let step2 = common::literal_i64(&mut arena, 1);
+    let start2 = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(3)), DataType::Int64);
+    let stop2 = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(2)), DataType::Int64);
+    let step2 = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
     let out2 = eval_array_function(
         "array_generate",
         &arena,
@@ -1302,6 +1302,14 @@ fn test_array_generate_date_with_unit_arg() {
     let stop = arena.push_typed(
         ExprNode::Literal(LiteralValue::Utf8("2025-10-05".to_string())),
         DataType::Utf8,
+    );
+    let start = arena.push_typed(
+        ExprNode::Cast(start),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+    );
+    let stop = arena.push_typed(
+        ExprNode::Cast(stop),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let step = common::literal_i64(&mut arena, 1);
     let unit = arena.push_typed(
@@ -1339,7 +1347,15 @@ fn test_array_generate_datetime_null_step_errors() {
         ExprNode::Literal(LiteralValue::Utf8("2025-10-05".to_string())),
         DataType::Utf8,
     );
-    let step = common::typed_null(&mut arena, DataType::Null);
+    let start = arena.push_typed(
+        ExprNode::Cast(start),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+    );
+    let stop = arena.push_typed(
+        ExprNode::Cast(stop),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+    );
+    let step = common::typed_null(&mut arena, DataType::Int64);
 
     let err = eval_array_function("array_generate", &arena, expr, &[start, stop, step], &chunk)
         .expect_err("NULL datetime step must error");
@@ -2292,6 +2308,69 @@ fn test_array_sortby_key_null_keeps_source() {
     let out = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = out.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.values(), &[2, 1]);
+}
+
+#[test]
+fn test_array_sortby_sliced_slots_keep_key_nulls_values_nulls_and_ties_separate() {
+    use arrow::datatypes::Int64Type;
+    use novarocks_types::SlotId;
+    // Guard rows force nonzero parent offsets; each output is independently
+    // derived from key tuples, never from the implementation's comparator.
+    let source = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(999)]),
+        Some(vec![Some(10), None, Some(30), Some(40)]),
+        Some(vec![Some(30), Some(10), Some(40), Some(20)]),
+        Some(vec![Some(9), Some(8), Some(7)]),
+        Some(vec![Some(30), Some(10), Some(20)]),
+        None,
+        Some(vec![]),
+        Some(vec![Some(888)]),
+    ])
+    .slice(1, 6);
+    let key1 = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(999)]),
+        Some(vec![Some(2), None, None, Some(1)]),
+        Some(vec![Some(1), Some(1), Some(1), Some(1)]),
+        None,
+        Some(vec![None, None, None]),
+        Some(vec![Some(100)]),
+        Some(vec![]),
+        Some(vec![Some(888)]),
+    ])
+    .slice(1, 6);
+    let key2 = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(999)]),
+        Some(vec![Some(0), Some(2), Some(1), Some(0)]),
+        Some(vec![Some(1), Some(1), Some(1), Some(1)]),
+        Some(vec![Some(3), Some(1), Some(2)]),
+        Some(vec![None, None, None]),
+        Some(vec![Some(100), Some(200)]),
+        Some(vec![]),
+        Some(vec![Some(888)]),
+    ])
+    .slice(1, 6);
+    let chunk = null_element_chunk(vec![Arc::new(source), Arc::new(key1), Arc::new(key2)]);
+    let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+    let mut arena = ExprArena::default();
+    let source = arena.push_typed(ExprNode::SlotId(SlotId::new(10)), list_type.clone());
+    let key1 = arena.push_typed(ExprNode::SlotId(SlotId::new(11)), list_type.clone());
+    let key2 = arena.push_typed(ExprNode::SlotId(SlotId::new(12)), list_type.clone());
+    let expr = common::typed_null(&mut arena, list_type);
+    let out =
+        eval_array_function("array_sortby", &arena, expr, &[source, key1, key2], &chunk).unwrap();
+    let out = out.as_any().downcast_ref::<ListArray>().unwrap();
+    let expected = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(30), None, Some(40), Some(10)]),
+        Some(vec![Some(30), Some(10), Some(40), Some(20)]),
+        Some(vec![Some(8), Some(7), Some(9)]),
+        Some(vec![Some(30), Some(10), Some(20)]),
+        None,
+        Some(vec![]),
+    ]);
+    assert_eq!(out, &expected);
+    // Source NULL suppresses key-size validation; non-NULL source does not.
+    assert!(out.is_null(4));
+    assert_eq!(out.value_length(5), 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -106,6 +106,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_raw_text_temporal_peer_has_a_distinct_plan_contract_digest() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
+                .unwrap();
+        // Catalog declarations and implementation profiles are identical here.
+        // Revision 1 admitted raw UTF8 bounds; the normalized contract must not.
+        let legacy = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            [0x41; 32],
+            1,
+        )
+        .unwrap();
+        assert_ne!(
+            current.plan_contract_revision(),
+            legacy.plan_contract_revision()
+        );
+        assert_ne!(
+            current.plan_contract_digest(),
+            legacy.plan_contract_digest()
+        );
+        assert_ne!(current.id(), legacy.id());
+        assert_eq!(current.descriptor_digest(), legacy.descriptor_digest());
+    }
+
+    #[test]
     fn static_manifest_contains_exact_private_provider_descriptors() {
         let manifest = server_manifest();
         let declarations =
