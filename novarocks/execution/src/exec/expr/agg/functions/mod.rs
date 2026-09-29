@@ -104,6 +104,7 @@ pub(super) enum AggKind {
         max_len: i64,
     },
     MultiDistinctSum,
+    MultiDistinctAvg,
     MapAgg,
     SumMap,
     ArrayAgg {
@@ -184,7 +185,7 @@ use max::MaxAgg;
 use max_by::MaxMinByAgg;
 use min::MinAgg;
 use minmax_n::MinMaxNAgg;
-use multi_distinct_sum::MultiDistinctSumAgg;
+use multi_distinct_sum::MultiDistinctNumericAgg;
 use percentile::PercentileAgg;
 use percentile_placeholder::PercentilePlaceholderAgg;
 use state_combinators::approx_count_distinct::{
@@ -351,7 +352,7 @@ static BOOL_OR: BoolOrAgg = BoolOrAgg;
 static BOOL_AND: BoolAndAgg = BoolAndAgg;
 static COVAR_CORR: CovarCorrAgg = CovarCorrAgg;
 static MAX_MIN_BY: MaxMinByAgg = MaxMinByAgg;
-static MULTI_DISTINCT_SUM: MultiDistinctSumAgg = MultiDistinctSumAgg;
+static DISTINCT_NUMERIC: MultiDistinctNumericAgg = MultiDistinctNumericAgg;
 static MAP_AGG: MapAggAgg = MapAggAgg;
 static SUM_MAP: SumMapAgg = SumMapAgg;
 static MANN_WHITNEY: MannWhitneyUTestAgg = MannWhitneyUTestAgg;
@@ -379,9 +380,12 @@ struct BuiltinAggregateImplementation {
 
 macro_rules! builtin_aggregate {
     ($name:literal, $function:expr) => {
+        builtin_aggregate!($name, $function, "legacy-exec-v1")
+    };
+    ($name:literal, $function:expr, $implementation:literal) => {
         BuiltinAggregateImplementation {
             canonical_name: $name,
-            implementation_contract: concat!("novarocks/", $name, "/legacy-exec-v1"),
+            implementation_contract: concat!("novarocks/", $name, "/", $implementation),
             expected_state_format: concat!("novarocks/", $name, "/state-v1"),
             function: $function,
         }
@@ -462,7 +466,16 @@ static BUILTIN_AGGREGATE_IMPLEMENTATIONS: &[BuiltinAggregateImplementation] = &[
     builtin_aggregate!("corr", &COVAR_CORR),
     builtin_aggregate!("max_by", &MAX_MIN_BY),
     builtin_aggregate!("min_by", &MAX_MIN_BY),
-    builtin_aggregate!("multi_distinct_sum", &MULTI_DISTINCT_SUM),
+    builtin_aggregate!(
+        "multi_distinct_sum",
+        &DISTINCT_NUMERIC,
+        "numeric-distinct-exec-v2"
+    ),
+    builtin_aggregate!(
+        "multi_distinct_avg",
+        &DISTINCT_NUMERIC,
+        "numeric-distinct-exec-v1"
+    ),
     builtin_aggregate!("map_agg", &MAP_AGG),
     builtin_aggregate!("sum_map", &SUM_MAP),
     builtin_aggregate!("mann_whitney_u_test", &MANN_WHITNEY),
@@ -592,7 +605,7 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::BoolAnd => &BOOL_AND,
         AggKind::CovarPop | AggKind::CovarSamp | AggKind::Corr => &COVAR_CORR,
         AggKind::MaxBy | AggKind::MinBy | AggKind::MaxByV2 | AggKind::MinByV2 => &MAX_MIN_BY,
-        AggKind::MultiDistinctSum => &MULTI_DISTINCT_SUM,
+        AggKind::MultiDistinctSum | AggKind::MultiDistinctAvg => &DISTINCT_NUMERIC,
         AggKind::MapAgg => &MAP_AGG,
         AggKind::SumMap => &SUM_MAP,
         AggKind::MannWhitneyUTest => &MANN_WHITNEY,
@@ -705,7 +718,7 @@ mod registry_tests {
         assert_eq!(names.len(), BUILTIN_AGGREGATE_IMPLEMENTATIONS.len());
         assert_eq!(
             names.len(),
-            85,
+            86,
             "update the executable-policy matrix deliberately"
         );
 
