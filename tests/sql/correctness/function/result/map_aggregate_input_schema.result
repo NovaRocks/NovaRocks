@@ -1,0 +1,14 @@
+-- query 3
+id	parent_null	value_at_one
+1	1	NULL
+2	0	NULL
+3	0	NULL
+4	0	7
+
+-- query 4
+rows_total	maps_present	values_present
+4	3	1
+
+-- query 5
+maps_present
+3
