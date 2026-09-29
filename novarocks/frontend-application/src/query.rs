@@ -1248,7 +1248,12 @@ impl FrontendQuerySession {
             sql_semantics,
         ) = state.into_query_attempt_inputs();
         let sql_semantics =
-            novarocks_sql::sql_mode::statement_sql_semantics(&sql_semantics, &parsed_statement);
+            novarocks_sql::sql_mode::statement_sql_semantics(&sql_semantics, &parsed_statement)
+                .map_err(|error| {
+                    GovernedPreparationError::Service(QueryServiceError::from_user_error(
+                        error.to_user_error(Some(sql)),
+                    ))
+                })?;
         if optimizer_settings.optimizer_query_mem_limit_bytes.is_none() {
             optimizer_settings.optimizer_query_mem_limit_bytes =
                 Some(self.service.optimizer_query_mem_limit_bytes as f64);
@@ -1709,7 +1714,10 @@ impl FrontendQuerySession {
             sql_semantics,
         ) = state.into_query_attempt_inputs();
         let sql_semantics =
-            novarocks_sql::sql_mode::statement_sql_semantics(&sql_semantics, &parsed_statement);
+            novarocks_sql::sql_mode::statement_sql_semantics(&sql_semantics, &parsed_statement)
+                .map_err(|error| {
+                    QueryServiceError::from_user_error(error.to_user_error(Some(&sql)))
+                })?;
         // A session `SET` wins; otherwise admission freezes the process budget so
         // SQL costing never consults a process-global configuration.
         if optimizer_settings.optimizer_query_mem_limit_bytes.is_none() {
@@ -2341,10 +2349,6 @@ fn with_query_hints(
     let mut raw = *query_options.as_proto();
     raw.allow_throw_exception = sql_semantics.sql_mode().allow_throw_exception();
     if let Some(query) = query {
-        raw.allow_throw_exception =
-            novarocks_sql::sql_mode::query_sql_semantics(sql_semantics, query)
-                .sql_mode()
-                .allow_throw_exception();
         if let Some(limit) = novarocks_sql::admission::query_mem_limit_hint(query) {
             raw.query_mem_limit = limit;
         }
@@ -4230,7 +4234,7 @@ mod tests {
         };
         let options = with_query_hints(
             QueryOptions::from_proto(Default::default()),
-            &session,
+            &novarocks_sql::sql_mode::query_sql_semantics(&session, query).unwrap(),
             Some(query),
         );
         assert!(!options.as_proto().allow_throw_exception);

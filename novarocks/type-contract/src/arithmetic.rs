@@ -74,6 +74,26 @@ pub fn decimal_arithmetic_result_type(
     Some(DataType::Decimal128(precision, scale))
 }
 
+/// Whether a supported Decimal128 multiplication exceeds its precision
+/// domain while retaining a representable scale. A SQL owner may select the
+/// Float64 arithmetic domain before planning when its session policy enables
+/// promotion. No runtime value or overflow result participates in this rule.
+///
+/// Integral operands use the same precision 19 as the frozen arithmetic rules.
+/// Unsupported pairs, including Decimal256, remain outside that existing domain.
+pub fn decimal_multiplication_requires_float64(left: &DataType, right: &DataType) -> bool {
+    let (p1, s1, p2, s2) = match (left, right) {
+        (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => (*p1, *s1, *p2, *s2),
+        (DataType::Decimal128(p, s), other) if is_integer(other) => (*p, *s, 19, 0),
+        (other, DataType::Decimal128(p, s)) if is_integer(other) => (19, 0, *p, *s),
+        _ => return false,
+    };
+    // Reuse the existing closed type rule so invalid metadata or an excessive
+    // result scale cannot be admitted by changing the arithmetic domain.
+    decimal_arithmetic_result_type(p1, s1, p2, s2, ArithmeticOperator::Multiply).is_some()
+        && u16::from(p1) + u16::from(p2) > 38
+}
+
 /// Canonical output for decimal-preserving aggregates.
 ///
 /// `None` means the aggregate or input is outside this closed rule and the
@@ -165,6 +185,74 @@ fn is_supported_arithmetic_type(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal_promotion_is_a_precision_decision_with_the_existing_scale_boundary() {
+        for (left, right, expected) in [
+            (
+                DataType::Decimal128(18, 9),
+                DataType::Decimal128(18, 9),
+                false,
+            ),
+            (
+                DataType::Decimal128(30, 10),
+                DataType::Decimal128(18, 9),
+                true,
+            ),
+            (
+                DataType::Decimal128(38, 15),
+                DataType::Decimal128(38, 15),
+                true,
+            ),
+            (
+                DataType::Decimal128(38, 19),
+                DataType::Decimal128(20, 19),
+                true,
+            ),
+            (
+                DataType::Decimal128(38, 20),
+                DataType::Decimal128(20, 19),
+                false,
+            ),
+            (DataType::Decimal128(20, 0), DataType::Int32, true),
+            (DataType::Int64, DataType::Decimal128(20, 0), true),
+            (DataType::Decimal128(19, 0), DataType::Int8, false),
+            (DataType::Decimal128(30, 10), DataType::Float64, false),
+            (
+                DataType::Decimal256(60, 10),
+                DataType::Decimal128(30, 10),
+                false,
+            ),
+            (
+                DataType::Decimal128(30, 31),
+                DataType::Decimal128(18, 0),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                decimal_multiplication_requires_float64(&left, &right),
+                expected,
+                "unexpected promotion eligibility for {left:?} * {right:?}"
+            );
+        }
+        // The false setting keeps the preexisting checked Decimal128 contract.
+        assert_eq!(
+            arithmetic_result_type_with_op(
+                &DataType::Decimal128(30, 10),
+                &DataType::Decimal128(18, 9),
+                ArithmeticOperator::Multiply
+            ),
+            Some(DataType::Decimal128(38, 19))
+        );
+        assert_eq!(
+            arithmetic_result_type_with_op(
+                &DataType::Decimal128(38, 20),
+                &DataType::Decimal128(20, 19),
+                ArithmeticOperator::Multiply
+            ),
+            None
+        );
+    }
 
     #[test]
     fn decimal_times_float_returns_float64() {
