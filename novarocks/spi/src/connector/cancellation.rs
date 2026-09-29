@@ -364,9 +364,12 @@ mod tests {
         for (index, counter) in counters.iter().enumerate() {
             assert_eq!(counter.0.load(Ordering::Relaxed), usize::from(index >= 32));
         }
-        for (index, (owner, wait)) in owners.iter().zip(&mut waits).enumerate() {
+        for (index, ((owner, wait), counter)) in
+            owners.iter().zip(&mut waits).zip(&counters).enumerate()
+        {
             assert_eq!(owner.is_stopped(), index >= 32);
-            assert_eq!(poll(wait, &noop_waker()).is_ready(), index >= 32);
+            // Keep the original observer registered for the later root stop.
+            assert_eq!(poll(wait, &waker(counter.clone())).is_ready(), index >= 32);
         }
         assert!(!sibling.is_stopped());
         root.request_stop();
@@ -511,8 +514,11 @@ mod tests {
             let (mut wait, first) = thread.join().unwrap();
             if first.is_pending() {
                 assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+                assert!(poll(&mut wait, &noop_waker()).is_ready());
             }
-            assert!(poll(&mut wait, &noop_waker()).is_ready());
+            // A completed Future must not be polled again. A fresh observer
+            // proves that the stop remains visible after either race outcome.
+            assert!(poll(&mut owner.view().stopped(), &noop_waker()).is_ready());
             assert_eq!(registrations(&owner), 0);
         }
     }
