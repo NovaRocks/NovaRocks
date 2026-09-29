@@ -217,29 +217,32 @@ fn convert_page(
         }
     }
 
-    let schema = chunk_schema_for(slot_ids, &columns, schema_cache)?;
-    let batch = if columns.is_empty() {
-        // A page with no channels still reports rows. Arrow only keeps that row
-        // count when it is stated explicitly, so a count-only scan would
-        // silently become an empty chunk without this branch.
-        let options = RecordBatchOptions::new().with_row_count(Some(positions));
-        RecordBatch::try_new_with_options(schema.arrow_schema_ref(), Vec::new(), &options)
+    let visible_bytes = columns
+        .iter()
+        .map(|column| column.get_array_memory_size() as u64)
+        .fold(0_u64, u64::saturating_add);
+    let mut chunk = if let Some(output_schema) = output_schema
+        && !columns.is_empty()
+    {
+        // A SourcePage has positional channels, not named Arrow fields. Bind
+        // those columns directly to the owner declaration before constructing
+        // the batch; synthetic slot names cannot become a competing contract.
+        Chunk::try_new_with_columns(Arc::clone(output_schema), columns)
     } else {
-        RecordBatch::try_new(schema.arrow_schema_ref(), columns)
+        let schema = match output_schema {
+            Some(schema) => Arc::clone(schema),
+            None => chunk_schema_for(slot_ids, &columns, schema_cache)?,
+        };
+        // A count-only page still reports rows. Preserve that count explicitly
+        // because the column constructor has no array from which to derive it.
+        let options = RecordBatchOptions::new().with_row_count(Some(positions));
+        RecordBatch::try_new_with_options(schema.arrow_schema_ref(), columns, &options)
+            .map_err(|error| format!("connector page record batch failed: {error}"))
+            .and_then(|batch| Chunk::try_new_with_chunk_schema(batch, schema))
     }
-    .map_err(|error| {
-        PageAdapterError::new(
-            PageAdapterErrorKind::Chunk,
-            format!("connector page record batch failed: {error}"),
-        )
-    })?;
+    .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
 
     let output_memory = if let Some(mut output_memory) = output_memory {
-        let visible_bytes = batch
-            .columns()
-            .iter()
-            .map(|column| column.get_array_memory_size() as u64)
-            .fold(0_u64, u64::saturating_add);
         output_memory.shrink_to(visible_bytes).map_err(|error| {
             PageAdapterError::from_connector(error, "connector page visible output accounting")
         })?;
@@ -251,9 +254,6 @@ fn convert_page(
     } else {
         None
     };
-    let mut chunk =
-        Chunk::try_new_with_chunk_schema(batch, output_schema.map(Arc::clone).unwrap_or(schema))
-            .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
     if let Some(output_memory) = output_memory {
         chunk
             .attach_connector_output_memory(output_memory)
