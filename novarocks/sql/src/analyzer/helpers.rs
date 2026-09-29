@@ -88,9 +88,56 @@ pub(super) fn sql_type_to_arrow(
             None,
         )),
         "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            let precision = type_numeric_argument(type_args, 0)?.unwrap_or(38) as u8;
-            let scale = type_numeric_argument(type_args, 1)?.unwrap_or(0) as i8;
-            Ok(DataType::Decimal128(precision, scale))
+            if type_args.len() > 2 {
+                return Err(AnalyzeError::invalid_argument(
+                    "DECIMAL type accepts at most precision and scale",
+                    sql_type.span,
+                ));
+            }
+            // Generic SQL DECIMAL chooses its carrier by precision. Explicit
+            // width aliases keep their declared domain; small decimals retain
+            // the engine's existing Decimal128 representation.
+            let (max_precision, default_precision) = match type_name.as_str() {
+                "decimal32" => (9_u64, 9_u64),
+                "decimal64" => (18, 18),
+                "decimal128" => (38, 38),
+                _ => (76, 38),
+            };
+            let precision = type_numeric_argument(type_args, 0)?.unwrap_or(default_precision);
+            let scale = type_numeric_argument(type_args, 1)?.unwrap_or(0);
+            if precision == 0 || precision > max_precision {
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "{type_name} precision {precision} must be between 1 and {max_precision}"
+                    ),
+                    sql_type.span,
+                ));
+            }
+            if scale > precision {
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "{type_name} scale {scale} must be between 0 and precision {precision}"
+                    ),
+                    sql_type.span,
+                ));
+            }
+            let precision = u8::try_from(precision).map_err(|_| {
+                AnalyzeError::invalid_argument(
+                    "DECIMAL precision exceeds its metadata domain",
+                    sql_type.span,
+                )
+            })?;
+            let scale = i8::try_from(scale).map_err(|_| {
+                AnalyzeError::invalid_argument(
+                    "DECIMAL scale exceeds its metadata domain",
+                    sql_type.span,
+                )
+            })?;
+            if precision > 38 {
+                Ok(DataType::Decimal256(precision, scale))
+            } else {
+                Ok(DataType::Decimal128(precision, scale))
+            }
         }
         "array" => {
             let element = type_type_argument(type_args, 0, "ARRAY", sql_type.span)?;
@@ -1244,6 +1291,77 @@ mod tests {
             sql_type_to_arrow(&data_type).expect("type"),
             DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
+    }
+
+    #[test]
+    fn sql_decimal_type_producer_preserves_width_precision_scale_and_alias_domains() {
+        for (type_name, expected) in [
+            ("DECIMAL", DataType::Decimal128(38, 0)),
+            ("DECIMAL32", DataType::Decimal128(9, 0)),
+            ("DECIMAL64", DataType::Decimal128(18, 0)),
+            ("DECIMAL128", DataType::Decimal128(38, 0)),
+            ("DECIMAL(38,38)", DataType::Decimal128(38, 38)),
+            ("DECIMAL(39,0)", DataType::Decimal256(39, 0)),
+            ("DEC(60,2)", DataType::Decimal256(60, 2)),
+            ("NUMERIC(76,76)", DataType::Decimal256(76, 76)),
+            ("DECIMAL32(9,9)", DataType::Decimal128(9, 9)),
+            ("DECIMAL64(18,18)", DataType::Decimal128(18, 18)),
+            ("DECIMAL128(38,38)", DataType::Decimal128(38, 38)),
+        ] {
+            let target = parse_native_cast_type(&format!("SELECT CAST(NULL AS {type_name})"));
+            assert_eq!(sql_type_to_arrow(&target).unwrap(), expected, "{type_name}");
+        }
+    }
+
+    #[test]
+    fn sql_decimal_type_producer_rejects_invalid_and_wrapping_parameters_at_type_span() {
+        for type_name in [
+            "DECIMAL(0,0)",
+            "DECIMAL(77,0)",
+            "DECIMAL(10,11)",
+            "DECIMAL(294,0)",
+            "DECIMAL(38,256)",
+            "DECIMAL32(10,0)",
+            "DECIMAL64(19,0)",
+            "DECIMAL128(39,0)",
+            "DECIMAL(10,2,3)",
+        ] {
+            let target = parse_native_cast_type(&format!("SELECT CAST(NULL AS {type_name})"));
+            let error = sql_type_to_arrow(&target)
+                .expect_err("invalid decimal type must fail before binding");
+            assert_eq!(error.span(), Some(target.span), "{type_name}: {error}");
+        }
+        let fractional = parse_native_cast_type("SELECT CAST(NULL AS DECIMAL(1.5,0))");
+        assert!(sql_type_to_arrow(&fractional).is_err());
+        // Signed parameters are already rejected by the native parser.
+        for type_name in ["DECIMAL(-1,0)", "DECIMAL(10,-1)"] {
+            assert!(
+                novarocks_parser::parse(&format!("SELECT CAST(NULL AS {type_name})")).is_err(),
+                "{type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_decimal_type_producer_preserves_nested_cast_carriers() {
+        let target = parse_native_cast_type(
+            "SELECT CAST(NULL AS STRUCT<a ARRAY<DECIMAL(60,2)>,m MAP<INT,DECIMAL(76,4)>>)",
+        );
+        let DataType::Struct(fields) = sql_type_to_arrow(&target).unwrap() else {
+            panic!("expected STRUCT");
+        };
+        let DataType::List(item) = fields[0].data_type() else {
+            panic!("expected ARRAY");
+        };
+        assert_eq!(item.data_type(), &DataType::Decimal256(60, 2));
+        let DataType::Map(entries, _) = fields[1].data_type() else {
+            panic!("expected MAP");
+        };
+        let DataType::Struct(entries) = entries.data_type() else {
+            panic!("expected MAP key/value fields");
+        };
+        assert_eq!(entries[0].data_type(), &DataType::Int32);
+        assert_eq!(entries[1].data_type(), &DataType::Decimal256(76, 4));
     }
 
     #[test]

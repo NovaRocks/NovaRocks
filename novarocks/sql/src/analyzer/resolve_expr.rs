@@ -5767,6 +5767,41 @@ mod tests {
     }
 
     #[test]
+    fn sql_decimal_type_producer_freezes_wide_cast_before_explicit_string_output() {
+        use crate::analysis::ExprKind;
+        let expression = analyze_projection_expr("SELECT CAST(CAST('1000000000000000000000000000000000000000000000000.00' AS DECIMAL(60,2)) AS VARCHAR)").unwrap();
+        assert_eq!(expression.data_type, DataType::Utf8);
+        let ExprKind::Cast {
+            expr: decimal,
+            target: DataType::Utf8,
+        } = &expression.kind
+        else {
+            panic!("expected explicit string output cast");
+        };
+        assert_eq!(decimal.data_type, DataType::Decimal256(60, 2));
+        assert!(matches!(
+            decimal.kind,
+            ExprKind::Cast {
+                target: DataType::Decimal256(60, 2),
+                ..
+            }
+        ));
+        let expression =
+            analyze_projection_expr("SELECT array_agg(CAST('1.00' AS DECIMAL(60,2)))").unwrap();
+        let ExprKind::AggregateCall { args, resolved, .. } = expression.kind else {
+            panic!("expected aggregate");
+        };
+        assert_eq!(args[0].data_type, DataType::Decimal256(60, 2));
+        let novarocks_functions::FunctionArgumentType::Value(bound) =
+            &resolved.selected.argument_types[0]
+        else {
+            panic!("expected bound value argument");
+        };
+        assert_eq!(bound.data_type, DataType::Decimal256(60, 2));
+        assert_eq!(bound.nullable, args[0].nullable);
+    }
+
+    #[test]
     fn negative_decimal_and_exponent_literals_keep_existing_numeric_types() {
         use crate::analysis::{ExprKind, LiteralValue, UnOp};
 
