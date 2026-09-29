@@ -959,7 +959,7 @@ impl SplitDeleteFilter {
                     .probe_groups
                     .iter()
                     .map(|group| {
-                        EqualityColumnBinding::bind(schema.clone(), &group.group)
+                        EqualityColumnBinding::bind_materialized_page(schema.clone(), &group.group)
                             .map(Arc::new)
                             .map_err(corrupt)
                     })

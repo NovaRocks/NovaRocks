@@ -91,6 +91,23 @@ impl EqualityColumnBinding {
         schema: SchemaRef,
         group: &crate::delete_semantics::EqualityFieldGroup,
     ) -> Result<Self, String> {
+        Self::bind_with_type_validator(schema, group, validate_physical_equality_type)
+    }
+
+    /// Bind a page already materialized under its verified connector columns.
+    /// This is not a physical Parquet artifact admission entry point.
+    pub(crate) fn bind_materialized_page(
+        schema: SchemaRef,
+        group: &crate::delete_semantics::EqualityFieldGroup,
+    ) -> Result<Self, String> {
+        Self::bind_with_type_validator(schema, group, validate_materialized_equality_type)
+    }
+
+    fn bind_with_type_validator(
+        schema: SchemaRef,
+        group: &crate::delete_semantics::EqualityFieldGroup,
+        validate_type: fn(&DataType, &crate::iceberg::spec::PrimitiveType) -> Result<(), String>,
+    ) -> Result<Self, String> {
         let mut field_indices = std::collections::HashMap::new();
         for (index, field) in schema.fields().iter().enumerate() {
             if let Some(id) = parse_parquet_field_id(field)? {
@@ -109,7 +126,7 @@ impl EqualityColumnBinding {
                         ));
                     }
                 };
-                validate_physical_equality_type(schema.field(index).data_type(), ty)?;
+                validate_type(schema.field(index).data_type(), ty)?;
                 Ok(index)
             })
             .collect::<Result<Vec<_>, String>>()?
@@ -166,8 +183,8 @@ fn validate_physical_equality_type(
     use crate::iceberg::spec::PrimitiveType as P;
     let valid = match (resolved, physical) {
         (P::Boolean, DataType::Boolean)
-        | (P::Int, DataType::Int8 | DataType::Int16 | DataType::Int32)
-        | (P::Long, DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64)
+        | (P::Int, DataType::Int32)
+        | (P::Long, DataType::Int32 | DataType::Int64)
         | (P::Float, DataType::Float32)
         | (P::Double, DataType::Float32 | DataType::Float64)
         | (P::Date, DataType::Date32)
@@ -195,6 +212,19 @@ fn validate_physical_equality_type(
             "Equality physical type {physical:?} does not match resolved Iceberg type {resolved:?}"
         ))
     }
+}
+
+fn validate_materialized_equality_type(
+    materialized: &DataType,
+    resolved: &crate::iceberg::spec::PrimitiveType,
+) -> Result<(), String> {
+    use crate::iceberg::spec::PrimitiveType as P;
+    if matches!(resolved, P::Int | P::Long)
+        && matches!(materialized, DataType::Int8 | DataType::Int16)
+    {
+        return Ok(());
+    }
+    validate_physical_equality_type(materialized, resolved)
 }
 
 fn canonical_equality_value(
@@ -593,7 +623,8 @@ mod tests {
                 Arc::new(Int16Array::from(vec![Some(-128), Some(127), None])) as ArrayRef,
             ] {
                 let page = batch(vec![(17, array)]);
-                let keys = EqualityColumnBinding::bind(page.schema(), &g)
+                assert!(EqualityColumnBinding::bind(page.schema(), &g).is_err());
+                let keys = EqualityColumnBinding::bind_materialized_page(page.schema(), &g)
                     .unwrap()
                     .keys(&page)
                     .unwrap();
@@ -607,5 +638,30 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn physical_binding_rejects_empty_and_all_null_narrow_carriers() {
+        for resolved in [PrimitiveType::Int, PrimitiveType::Long] {
+            let g = group(&[17], &[resolved]);
+            for array in [
+                Arc::new(Int8Array::from(vec![None::<i8>])) as ArrayRef,
+                Arc::new(Int16Array::from(vec![None::<i16>])) as ArrayRef,
+                Arc::new(Int8Array::from(Vec::<Option<i8>>::new())) as ArrayRef,
+                Arc::new(Int16Array::from(Vec::<Option<i16>>::new())) as ArrayRef,
+            ] {
+                let page = batch(vec![(17, array)]);
+                assert!(EqualityColumnBinding::bind(page.schema(), &g).is_err());
+                let keys = EqualityColumnBinding::bind_materialized_page(page.schema(), &g)
+                    .unwrap()
+                    .keys(&page)
+                    .unwrap();
+                assert_eq!(keys, vec![vec![None]; page.num_rows()]);
+            }
+        }
+        let wrong_group = group(&[17], &[PrimitiveType::Double]);
+        let page = batch(vec![(17, Arc::new(Int8Array::from(vec![None::<i8>])))]);
+        assert!(
+            EqualityColumnBinding::bind_materialized_page(page.schema(), &wrong_group).is_err()
+        );
     }
 }
