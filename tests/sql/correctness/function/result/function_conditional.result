@@ -41,14 +41,14 @@ CASE WHEN i = 1 THEN ai WHEN i = 3 THEN ass ELSE ai END
 NULL
 
 -- query 12
-CASE WHEN (i = 1) THEN mi WHEN (i = 3) THEN ms END
+CASE WHEN i = 1 THEN mi WHEN i = 3 THEN ms END
 {1:"1"}
 NULL
 {1:null}
 NULL
 
 -- query 13
-CASE WHEN (i = 1) THEN mi WHEN (i = 3) THEN ms ELSE ms END
+CASE WHEN i = 1 THEN mi WHEN i = 3 THEN ms ELSE ms END
 {1:"1"}
 {1:"b"}
 {1:null}

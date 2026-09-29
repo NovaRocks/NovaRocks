@@ -171,5 +171,5 @@ array_sum(array_map(x -> array_contains(array_generate(1, 10000), x), array_gene
 10000
 
 -- query 43
-l	array_map(x -> concat(x, CAST((if(1 > (rand()), '[]', '')) AS ARRAY<VARCHAR(65533)>)), arr_str)
+l	array_map(x -> concat(x, l), arr_str)
 []	[["abcdefghasdasdasirnqwrq"],["abcdefghasdasdasirnqwrq"]]
