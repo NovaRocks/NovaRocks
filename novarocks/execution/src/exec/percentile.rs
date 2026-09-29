@@ -320,7 +320,7 @@ impl<A: Allocator + Clone> TDigest<A> {
                 payload.len()
             ));
         }
-        Ok(Self {
+        let mut digest = Self {
             allocator,
             compression,
             min,
@@ -332,7 +332,14 @@ impl<A: Allocator + Clone> TDigest<A> {
             processed,
             unprocessed,
             cumulative,
-        })
+        };
+        // Serialized cumulative centers and running totals are derived caches.
+        // Rebuild them from the retained centroids once on state admission,
+        // including clean states produced before mass normalization.
+        if !digest.processed.is_empty() {
+            digest.update_cumulative()?;
+        }
+        Ok(digest)
     }
 
     fn have_unprocessed(&self) -> bool {
@@ -409,11 +416,11 @@ impl<A: Allocator + Clone> TDigest<A> {
             .map_err(|_| "ResourceExhausted: reserve processed TDigest centroids".to_string())?;
         self.processed = processed;
         self.processed.push(first);
-        let mut w_so_far = first.weight;
-        let mut w_limit = self.processed_weight * self.integrated_q(1.0);
+        let mut w_so_far = f64::from(first.weight);
+        let mut w_limit = f64::from(self.processed_weight) * f64::from(self.integrated_q(1.0));
 
         for centroid in self.unprocessed.iter().skip(1).copied() {
-            let projected = w_so_far + centroid.weight;
+            let projected = w_so_far + f64::from(centroid.weight);
             if projected <= w_limit {
                 w_so_far = projected;
                 self.processed
@@ -421,9 +428,10 @@ impl<A: Allocator + Clone> TDigest<A> {
                     .expect("processed has first centroid")
                     .add(&centroid);
             } else {
-                let k1 = self.integrated_location(w_so_far / self.processed_weight);
-                w_limit = self.processed_weight * self.integrated_q(k1 + 1.0);
-                w_so_far += centroid.weight;
+                let k1 =
+                    self.integrated_location((w_so_far / f64::from(self.processed_weight)) as f32);
+                w_limit = f64::from(self.processed_weight) * f64::from(self.integrated_q(k1 + 1.0));
+                w_so_far += f64::from(centroid.weight);
                 self.processed.try_reserve(1).map_err(|_| {
                     "ResourceExhausted: grow processed TDigest centroids".to_string()
                 })?;
@@ -513,6 +521,7 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn integrated_location(&self, q: f32) -> f32 {
+        debug_assert!(q.is_finite() && (0.0..=1.0).contains(&q));
         (f64::from(self.compression)
             * ((2.0 * f64::from(q) - 1.0).asin() + std::f64::consts::FRAC_PI_2)
             / std::f64::consts::PI) as f32
@@ -1055,7 +1064,7 @@ fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, String> {
     }
     let meta: PercentileStateMeta =
         serde_json::from_slice(&payload[6..6 + meta_len]).map_err(|e| e.to_string())?;
-    let digest = if payload.len() == 6 + meta_len {
+    let mut digest = if payload.len() == 6 + meta_len {
         TDigest::new_in(meta.compression as f32, Global)
     } else {
         let decoded: SerializableTDigest =
@@ -1074,6 +1083,9 @@ fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, String> {
             cumulative: decoded.cumulative.into_iter().collect(),
         }
     };
+    if !digest.processed.is_empty() {
+        digest.update_cumulative()?;
+    }
     Ok(PercentileState {
         allocator: Global,
         digest,
@@ -1217,6 +1229,107 @@ mod tests {
         assert_eq!(quantile_value(&empty, 0.5).unwrap(), None);
         assert!(add_weighted_value(&mut empty, 1.0, -1).is_err());
         assert_eq!(quantile_value(&empty, 0.5).unwrap(), None);
+    }
+
+    fn historical_clean_state_with_stale_mass() -> PercentileState {
+        let mut state = PercentileState::default();
+        set_quantile(&mut state, 1.0).unwrap();
+        for (mean, weight) in [(0.0, 16777216.0), (1.0, 1.0), (2.0, 1.0), (3.0, 1.0)] {
+            state.digest.processed.push(Centroid::new(mean, weight));
+        }
+        state.digest.min = 0.0;
+        state.digest.max = 3.0;
+        state.digest.update_cumulative().unwrap();
+        // A historical running f32 sum loses all three unit weights. Its CDF
+        // can still contain the once-rounded represented mass 16777220.
+        state.digest.processed_weight = 16777216.0;
+        assert_eq!(quantile_value(&state, 1.0).unwrap(), Some(1.0));
+        state
+    }
+
+    #[test]
+    fn clean_v4_state_rebuilds_mass_on_decode_and_first_bounded_merge() {
+        let source = historical_clean_state_with_stale_mass();
+        let payload = encode_state(&source);
+        let decoded = decode_state(&payload).unwrap();
+        assert!(decoded.digest.unprocessed.is_empty());
+        assert!(!decoded.digest.is_dirty());
+        assert_eq!(decoded.digest.processed_weight, 16777220.0);
+        assert_eq!(decoded.digest.cumulative.last(), Some(&16777220.0));
+        assert_eq!(quantile_from_state(&decoded, None).unwrap(), Some(3.0));
+        let mut target = PercentileState::default();
+        merge_bounded_serialized_state_into(&mut target, &payload).unwrap();
+        assert_eq!(quantile_from_state(&target, None).unwrap(), Some(3.0));
+        assert_eq!(target.digest.processed_weight, 16777220.0);
+    }
+
+    #[test]
+    fn clean_legacy_v3_scalar_state_rebuilds_mass_without_entering_bounded_merge() {
+        let source = historical_clean_state_with_stale_mass();
+        let metadata = serde_json::to_vec(&PercentileStateMeta {
+            compression: source.compression,
+            quantiles: Some(SerializableQuantileSpec::Scalar(1.0)),
+        })
+        .unwrap();
+        let digest = &source.digest;
+        let legacy = SerializableTDigest {
+            compression: digest.compression,
+            min: digest.min,
+            max: digest.max,
+            max_processed: digest.max_processed,
+            max_unprocessed: digest.max_unprocessed,
+            processed_weight: digest.processed_weight,
+            unprocessed_weight: digest.unprocessed_weight,
+            processed: digest.processed.to_vec(),
+            unprocessed: digest.unprocessed.to_vec(),
+            cumulative: digest.cumulative.to_vec(),
+        };
+        let mut payload = vec![PERCENTILE_STATE_MAGIC, 3];
+        payload.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&metadata);
+        payload.extend_from_slice(&serde_json::to_vec(&legacy).unwrap());
+        let decoded = decode_state(&payload).unwrap();
+        assert_eq!(decoded.digest.processed_weight, 16777220.0);
+        assert_eq!(quantile_from_state(&decoded, None).unwrap(), Some(3.0));
+        let mut target = PercentileState::default();
+        assert!(merge_bounded_serialized_state_into(&mut target, &payload).is_err());
+        assert_eq!(quantile_from_state(&target, Some(1.0)).unwrap(), None);
+    }
+
+    #[test]
+    fn compression_prefix_stays_in_the_scale_domain_after_large_weight() {
+        let mut state = PercentileState::default();
+        add_weighted_value(&mut state, 0.0, 16777216).unwrap();
+        for value in 1..=1000 {
+            add_weighted_value(&mut state, value as f64, 3).unwrap();
+        }
+        // Repeated f32 prefix additions round each small weight up to four,
+        // eventually exceeding the once-rounded represented total. Every
+        // integrated_location call must instead receive a finite q in [0,1].
+        // Its debug assertion checks this invariant during actual processing.
+        let value = state.digest.quantile(0.9999).unwrap().unwrap();
+        assert!(value.is_finite() && (0.0..=1000.0).contains(&value));
+        assert!(state.digest.processed.iter().all(|centroid| {
+            centroid.mean.is_finite() && centroid.weight.is_finite() && centroid.weight > 0.0
+        }));
+        assert!(
+            state
+                .digest
+                .cumulative
+                .iter()
+                .all(|center| center.is_finite())
+        );
+        assert_eq!(
+            state.digest.cumulative.last().copied(),
+            Some(state.digest.processed_weight)
+        );
+        let represented = state
+            .digest
+            .processed
+            .iter()
+            .map(|centroid| f64::from(centroid.weight))
+            .sum::<f64>() as f32;
+        assert_eq!(state.digest.processed_weight, represented);
     }
 
     #[test]
