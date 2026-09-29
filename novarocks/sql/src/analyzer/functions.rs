@@ -796,9 +796,6 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
             false,
         ),
 
-        // Math functions that return the same type as input
-        "abs" => arg_types.first().cloned().unwrap_or(DataType::Float64),
-
         // Math functions that return Int64
         "ceil" | "ceiling" | "dceil" | "floor" | "dfloor" => DataType::Int64,
 

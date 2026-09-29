@@ -462,16 +462,21 @@ mod tests {
 
     #[test]
     fn resolve_abs_picks_per_input_type_signature() {
-        // `abs` has multiple signatures; we expect strict-match to pick
-        // the one whose input type matches the actual argument.
-        assert_eq!(
-            resolve_scalar_function("abs", &[DataType::Int64]),
-            Ok(DataType::Int64)
-        );
-        assert_eq!(
-            resolve_scalar_function("abs", &[DataType::Float64]),
-            Ok(DataType::Float64)
-        );
+        for (input, output) in [
+            (DataType::Int8, DataType::Int16),
+            (DataType::Int16, DataType::Int32),
+            (DataType::Int32, DataType::Int64),
+            (DataType::Int64, DataType::FixedSizeBinary(16)),
+            (DataType::FixedSizeBinary(16), DataType::FixedSizeBinary(16)),
+            (DataType::Float32, DataType::Float32),
+            (DataType::Float64, DataType::Float64),
+            (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
+        ] {
+            let resolved = resolve_scalar_function_signature("abs", std::slice::from_ref(&input))
+                .expect("ABS must select the exact input signature");
+            assert_eq!(resolved.argument_types, [input]);
+            assert_eq!(resolved.return_type, output);
+        }
     }
 
     #[test]
