@@ -3119,4 +3119,33 @@ mod tests {
         assert_eq!(novarocks_types::largeint::value_at(keys, 0).unwrap(), 3);
         assert_eq!(novarocks_types::largeint::value_at(values, 0).unwrap(), -5);
     }
+    #[test]
+    fn scalar_integer_writer_widens_logical_values_to_iceberg_int_without_null_loss() {
+        use arrow::array::{ArrayRef, Int8Array, Int16Array, Int32Array};
+        use arrow::datatypes::DataType;
+        use std::sync::Arc;
+        for (source, expected) in [
+            (
+                Arc::new(Int8Array::from(vec![Some(-128), None, Some(127)])) as ArrayRef,
+                vec![Some(-128), None, Some(127)],
+            ),
+            (
+                Arc::new(Int16Array::from(vec![Some(-32768), None, Some(32767)])) as ArrayRef,
+                vec![Some(-32768), None, Some(32767)],
+            ),
+        ] {
+            let storage = reannotate_array(&source, &DataType::Int32).unwrap();
+            assert_eq!(storage.data_type(), &DataType::Int32);
+            assert_eq!(storage.null_count(), source.null_count());
+            assert_eq!(
+                storage
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
 }

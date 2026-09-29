@@ -375,6 +375,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             2 | 4 | 6 => singular(Scalar),
             3 => repeated(PackedVarint),
             5 => singular(Varint),
+            7 => singular(Scalar),
             _ => return None,
         },
         Transaction => match field {
@@ -394,7 +395,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             1 => singular(Message(SchemaName)),
             2 | 4 | 6 | 9 => singular(Varint),
             3 | 11 | 12 => singular(Scalar),
-            5 => repeated(MapI32String),
+            5 | 15 => repeated(MapI32String),
             7 | 8 => singular(Message(TupleDomain)),
             10 => repeated(Message(Column)),
             13 => repeated(MapStringString),
@@ -629,6 +630,11 @@ fn scan_message(
                 )?;
             }
             WireValue::MapI32String | WireValue::MapStringString => {
+                if matches!(schema, Schema::Table) && field == 15 {
+                    // A conservative bound covers one field-ID/domain entry,
+                    // including a sparsely occupied BTree node, before decode.
+                    context.ledger().charge_retained(256)?;
+                }
                 let len = usize::try_from(read_varint(&mut input, &path)?)
                     .map_err(|_| malformed(&path))?;
                 let entry = take(&mut input, len, &path)?;
@@ -1112,6 +1118,9 @@ fn encode_column(value: &IcebergColumnHandle) -> dto::IcebergColumnHandle {
         type_json: value.type_json().to_string(),
         nullable: value.nullable(),
         comment: value.comment().map(str::to_string),
+        scalar_integer_domain: value
+            .scalar_integer_domain()
+            .map(|domain| domain.name().to_string()),
     }
 }
 
@@ -1132,6 +1141,14 @@ fn decode_column(
         type_json: raw.type_json.clone(),
         nullable: raw.nullable,
         comment: raw.comment.clone(),
+    })
+    .and_then(|column| {
+        column.with_scalar_integer_domain(
+            raw.scalar_integer_domain
+                .as_deref()
+                .map(crate::scalar_integer_domain::ScalarIntegerDomain::parse)
+                .transpose()?,
+        )
     })
     .map_err(|error| domain_error("iceberg_column", error))
 }
@@ -1361,6 +1378,11 @@ fn decode_transaction(
 
 fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
     dto::IcebergTableHandle {
+        scalar_integer_domains: value
+            .scalar_integer_domains()
+            .iter()
+            .map(|(id, domain)| (*id, domain.name().to_string()))
+            .collect(),
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
         snapshot_id: value.snapshot_id(),
         table_schema_json: value.table_schema_json().to_string(),
@@ -1453,6 +1475,19 @@ fn decode_table(raw: &dto::IcebergTableHandle) -> Result<IcebergTableHandle, Con
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
         pinned_data_files,
+    })
+    .and_then(|table| {
+        table.with_scalar_integer_domains(
+            raw.scalar_integer_domains
+                .iter()
+                .map(|(id, value)| {
+                    Ok((
+                        *id,
+                        crate::scalar_integer_domain::ScalarIntegerDomain::parse(value)?,
+                    ))
+                })
+                .collect::<Result<_, novarocks_spi::connector::ConnectorError>>()?,
+        )
     })
     .map_err(|error| domain_error("iceberg_table", error))
 }
@@ -2677,6 +2712,7 @@ mod tests {
             type_json: "{}".to_string(),
             nullable: true,
             comment: None,
+            scalar_integer_domain: None,
         }
         .encode_to_vec();
         let header = header(ConnectorCodecCategory::ReadColumn);
@@ -2715,5 +2751,46 @@ mod tests {
                 value
             );
         }
+    }
+    #[test]
+    fn scalar_integer_private_payload_roundtrip_is_closed_and_preserves_authority() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+        use crate::scalar_integer_domain::ScalarIntegerDomain;
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                17,
+                "tiny",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let column = IcebergColumnHandle::base_column_of(&schema, 17)
+            .unwrap()
+            .with_scalar_integer_domain(Some(ScalarIntegerDomain::Int8))
+            .unwrap();
+        let payload = IcebergReadWireCodec.encode_private(&column).unwrap();
+        let decoded: IcebergColumnHandle =
+            decode_with(ConnectorCodecCategory::ReadColumn, &payload).unwrap();
+        assert_eq!(decoded, column);
+        assert_eq!(column.dereference(&[]).unwrap(), column);
+        let mut invalid = encode_column(&column);
+        invalid.scalar_integer_domain = Some("int32".to_string());
+        assert!(
+            decode_with::<IcebergColumnHandle>(
+                ConnectorCodecCategory::ReadColumn,
+                &invalid.encode_to_vec()
+            )
+            .is_err()
+        );
+        invalid.scalar_integer_domain = Some("tinyint".to_string());
+        invalid.type_json = serde_json::to_string(&Type::Primitive(PrimitiveType::Long)).unwrap();
+        invalid.base_type_json = invalid.type_json.clone();
+        assert!(
+            decode_with::<IcebergColumnHandle>(
+                ConnectorCodecCategory::ReadColumn,
+                &invalid.encode_to_vec()
+            )
+            .is_err()
+        );
     }
 }

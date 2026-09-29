@@ -153,6 +153,7 @@ pub struct IcebergTableHandle {
     schema_table_name: SchemaTableName,
     snapshot_id: Option<i64>,
     table_schema_json: Arc<str>,
+    scalar_integer_domains: crate::scalar_integer_domain::ScalarIntegerDomains,
     spec_id: Option<i32>,
     partition_spec_jsons: BTreeMap<i32, String>,
     format_version: i32,
@@ -255,6 +256,7 @@ impl IcebergTableHandle {
             schema_table_name,
             snapshot_id,
             table_schema_json: Arc::from(table_schema_json.as_str()),
+            scalar_integer_domains: BTreeMap::new(),
             spec_id,
             partition_spec_jsons,
             format_version,
@@ -288,6 +290,57 @@ impl IcebergTableHandle {
     /// own limit operator for such a read.
     pub const fn accepts_pushdown(&self) -> bool {
         self.pinned_data_files.is_none()
+    }
+
+    pub(crate) fn with_scalar_integer_domains(
+        mut self,
+        domains: crate::scalar_integer_domain::ScalarIntegerDomains,
+    ) -> Result<Self, ConnectorError> {
+        let schema = self.parse_table_schema()?;
+        crate::scalar_integer_domain::validate_schema(&schema, &domains)?;
+        if domains.keys().any(|id| {
+            !schema.as_struct().fields().iter().any(|field| {
+                field.id == *id
+                    && field.field_type.as_ref()
+                        == &crate::iceberg::spec::Type::Primitive(
+                            crate::iceberg::spec::PrimitiveType::Int,
+                        )
+            })
+        }) {
+            return Err(invalid(
+                "Iceberg relation declaration names an absent field",
+            ));
+        }
+        for column in self
+            .projected_columns
+            .iter()
+            .chain(
+                self.unenforced_predicate
+                    .domains()
+                    .into_iter()
+                    .flat_map(|map| map.keys()),
+            )
+            .chain(
+                self.enforced_predicate
+                    .domains()
+                    .into_iter()
+                    .flat_map(|map| map.keys()),
+            )
+        {
+            if column.scalar_integer_domain() != domains.get(&column.base_field_id()).copied() {
+                return Err(invalid(
+                    "Iceberg column declaration differs from its frozen relation",
+                ));
+            }
+        }
+        self.scalar_integer_domains = domains;
+        Ok(self)
+    }
+
+    pub(crate) fn scalar_integer_domains(
+        &self,
+    ) -> &crate::scalar_integer_domain::ScalarIntegerDomains {
+        &self.scalar_integer_domains
     }
 
     pub fn table_schema_json(&self) -> &str {
@@ -411,6 +464,19 @@ impl IcebergTableHandle {
         let mut unenforced: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         let mut remaining: BTreeMap<IcebergColumnHandle, Domain> = BTreeMap::new();
         for (column, domain) in summary_domains {
+            if column.scalar_integer_domain()
+                != self
+                    .scalar_integer_domains
+                    .get(&column.base_field_id())
+                    .copied()
+                || column
+                    .scalar_integer_domain()
+                    .is_some_and(|declaration| domain.value_type() != declaration.value_type())
+            {
+                return Err(invalid(
+                    "Iceberg filter differs from its frozen scalar integer declaration",
+                ));
+            }
             if !is_pushable(column) {
                 remaining.insert(column.clone(), domain.clone());
                 continue;
@@ -460,6 +526,18 @@ impl IcebergTableHandle {
 
         let mut handle = self.clone();
         handle.projected_columns = assignments.projected_column_set();
+        for column in &handle.projected_columns {
+            if column.scalar_integer_domain()
+                != handle
+                    .scalar_integer_domains
+                    .get(&column.base_field_id())
+                    .copied()
+            {
+                return Err(invalid(
+                    "Iceberg projection differs from its frozen scalar integer declaration",
+                ));
+            }
+        }
 
         Ok(ProjectionApplicationResult::new(
             handle,
@@ -510,6 +588,11 @@ impl IcebergTableHandle {
                 .map(|value| value.to_string()),
             table_location: self.table_location.to_string(),
             storage_properties: self.storage_properties.clone(),
+            scalar_integer_domains: self
+                .scalar_integer_domains
+                .iter()
+                .map(|(id, domain)| (*id, domain.name().to_string()))
+                .collect(),
             pinned_data_files: self
                 .pinned_data_files
                 .as_ref()
@@ -562,7 +645,18 @@ impl IcebergTableHandle {
                 .as_ref()
                 .map(IcebergPinnedDataFileSet::from_proto)
                 .transpose()?,
-        })
+        })?
+        .with_scalar_integer_domains(
+            raw.scalar_integer_domains
+                .iter()
+                .map(|(id, value)| {
+                    Ok((
+                        *id,
+                        crate::scalar_integer_domain::ScalarIntegerDomain::parse(value)?,
+                    ))
+                })
+                .collect::<Result<_, novarocks_spi::connector::ConnectorError>>()?,
+        )
     }
 }
 
@@ -1118,5 +1212,54 @@ pub(super) mod tests {
                 .is_some()
         );
         assert!(result.remaining_filter().domain_for(&amount).is_some());
+    }
+    #[test]
+    fn scalar_integer_table_payload_and_projection_keep_exact_field_authority() {
+        use crate::scalar_integer_domain::ScalarIntegerDomain;
+        let schema = Schema::builder()
+            .with_fields(vec![StdArc::new(NestedField::optional(
+                17,
+                "tiny",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let domains = BTreeMap::from([(17, ScalarIntegerDomain::Int8)]);
+        let handle = IcebergTableHandle::try_new(table_handle_params(&schema, None))
+            .unwrap()
+            .with_scalar_integer_domains(domains.clone())
+            .unwrap();
+        let column = IcebergColumnHandle::base_column_of(&schema, 17)
+            .unwrap()
+            .with_scalar_integer_domain(Some(ScalarIntegerDomain::Int8))
+            .unwrap();
+        let projected = handle
+            .apply_projection(
+                &OrderedAssignments::try_new(vec![
+                    Assignment::try_new("tiny", column.clone(), ConnectorValueType::TinyInt)
+                        .unwrap(),
+                ])
+                .unwrap(),
+            )
+            .unwrap()
+            .into_handle();
+        let decoded = IcebergTableHandle::from_proto(&projected.to_proto()).unwrap();
+        assert_eq!(decoded, projected);
+        assert_eq!(decoded.scalar_integer_domains(), &domains);
+        let storage = IcebergColumnHandle::base_column_of(&schema, 17).unwrap();
+        assert!(
+            handle
+                .apply_projection(
+                    &OrderedAssignments::try_new(vec![
+                        Assignment::try_new("tiny", storage, ConnectorValueType::Integer).unwrap()
+                    ])
+                    .unwrap()
+                )
+                .is_err()
+        );
+        let mut raw = projected.to_proto();
+        raw.scalar_integer_domains
+            .insert(99, "smallint".to_string());
+        assert!(IcebergTableHandle::from_proto(&raw).is_err());
     }
 }

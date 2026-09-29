@@ -124,6 +124,8 @@ impl IcebergThetaAggregateFamily {
     pub fn try_new() -> Result<Self, FunctionCatalogError> {
         let kinds = [
             CanonicalKind::Boolean,
+            CanonicalKind::TinyInt,
+            CanonicalKind::SmallInt,
             CanonicalKind::Int,
             CanonicalKind::Long,
             CanonicalKind::Float,
@@ -502,6 +504,51 @@ mod tests {
             .to_vec()
     }
 
+    #[test]
+    fn scalar_integer_domains_bind_exactly_and_share_iceberg_int_encoding() {
+        use arrow_array::{Int8Array, Int16Array, Int32Array};
+        let family = IcebergThetaAggregateFamily::try_new().expect("family");
+        for (input, data_type, suffix) in [
+            (
+                Arc::new(Int8Array::from(vec![
+                    Some(-128),
+                    None,
+                    Some(127),
+                    Some(-128),
+                ])) as ArrayRef,
+                DataType::Int8,
+                "tinyint",
+            ),
+            (
+                Arc::new(Int16Array::from(vec![
+                    Some(-128),
+                    None,
+                    Some(127),
+                    Some(-128),
+                ])) as ArrayRef,
+                DataType::Int16,
+                "smallint",
+            ),
+        ] {
+            let signature = family
+                .resolve_signature(&[data_type.clone()])
+                .expect("logical signature");
+            assert_eq!(signature.argument_types, vec![data_type]);
+            assert!(format!("{:?}", signature.overload).contains(suffix));
+            let wide = Arc::new(Int32Array::from(vec![
+                Some(-128),
+                None,
+                Some(127),
+                Some(-128),
+            ])) as ArrayRef;
+            assert_eq!(
+                run_update(input),
+                run_update(wide),
+                "standard Iceberg INT bytes, including negative sign extension"
+            );
+        }
+    }
+
     fn java_oracle_compact(label: &str) -> Vec<u8> {
         let row = include_str!(
             "../../../../tests/datasketches-tck/fixtures/theta/iceberg_java62_single_value_vectors.tsv"
@@ -560,7 +607,7 @@ mod tests {
     fn closed_signature_set_rejects_ambiguous_and_nested_types() {
         let family = IcebergThetaAggregateFamily::try_new().unwrap();
         for unsupported in [
-            DataType::Int8,
+            DataType::UInt8,
             DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
             DataType::Decimal128(38, -1),
             DataType::List(Arc::new(arrow_schema::Field::new(

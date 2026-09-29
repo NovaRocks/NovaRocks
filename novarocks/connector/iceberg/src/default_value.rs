@@ -534,7 +534,7 @@ fn arrow_type_to_iceberg_type(data_type: &DataType) -> Result<Type, String> {
     use crate::iceberg::spec::{ListType, MapType, NestedField};
     Ok(match data_type {
         DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
-        DataType::Int32 => Type::Primitive(PrimitiveType::Int),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => Type::Primitive(PrimitiveType::Int),
         DataType::Int64 => Type::Primitive(PrimitiveType::Long),
         DataType::Float32 => Type::Primitive(PrimitiveType::Float),
         DataType::Float64 => Type::Primitive(PrimitiveType::Double),
@@ -671,6 +671,22 @@ pub fn literal_to_constant_array(
     Ok(match (prim, target_type) {
         (PrimitiveLiteral::Boolean(v), DataType::Boolean) => {
             Arc::new(BooleanArray::from(vec![*v; row_count])) as ArrayRef
+        }
+        (PrimitiveLiteral::Int(v), DataType::Int8) => Arc::new(arrow::array::Int8Array::from(vec![
+                i8::try_from(*v)
+                    .map_err(|_| {
+                        "Iceberg integer default exceeds TINYINT domain".to_string()
+                    })?;
+                row_count
+            ])) as ArrayRef,
+        (PrimitiveLiteral::Int(v), DataType::Int16) => {
+            Arc::new(arrow::array::Int16Array::from(vec![
+                i16::try_from(*v)
+                    .map_err(|_| {
+                        "Iceberg integer default exceeds SMALLINT domain".to_string()
+                    })?;
+                row_count
+            ])) as ArrayRef
         }
         (PrimitiveLiteral::Int(v), DataType::Int32) => {
             Arc::new(Int32Array::from(vec![*v; row_count])) as ArrayRef

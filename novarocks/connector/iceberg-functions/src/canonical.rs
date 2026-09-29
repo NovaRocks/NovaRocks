@@ -17,8 +17,9 @@
 
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-    StringArray, Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 
@@ -27,6 +28,8 @@ use crate::theta::IcebergThetaError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CanonicalKind {
     Boolean,
+    TinyInt,
+    SmallInt,
     Int,
     Long,
     Float,
@@ -47,6 +50,8 @@ impl CanonicalKind {
     pub(crate) fn from_data_type(data_type: &DataType) -> Result<Self, IcebergThetaError> {
         match data_type {
             DataType::Boolean => Ok(Self::Boolean),
+            DataType::Int8 => Ok(Self::TinyInt),
+            DataType::Int16 => Ok(Self::SmallInt),
             DataType::Int32 => Ok(Self::Int),
             DataType::Int64 => Ok(Self::Long),
             DataType::Float32 => Ok(Self::Float),
@@ -72,6 +77,8 @@ impl CanonicalKind {
     pub(crate) const fn identity_suffix(self) -> &'static str {
         match self {
             Self::Boolean => "boolean",
+            Self::TinyInt => "tinyint",
+            Self::SmallInt => "smallint",
             Self::Int => "int",
             Self::Long => "long",
             Self::Float => "float",
@@ -92,6 +99,8 @@ impl CanonicalKind {
     pub(crate) const fn pattern(self) -> &'static str {
         match self {
             Self::Boolean => "boolean",
+            Self::TinyInt => "int8",
+            Self::SmallInt => "int16",
             Self::Int => "int32",
             Self::Long => "int64",
             Self::Float => "float32",
@@ -113,6 +122,8 @@ impl CanonicalKind {
 #[doc(hidden)]
 pub enum PreparedCanonicalBatch<'a> {
     Boolean(&'a BooleanArray),
+    TinyInt(&'a Int8Array),
+    SmallInt(&'a Int16Array),
     Int(&'a Int32Array),
     Long(&'a Int64Array),
     Float(&'a Float32Array),
@@ -142,6 +153,8 @@ impl<'a> PreparedCanonicalBatch<'a> {
         }
         match CanonicalKind::from_data_type(array.data_type())? {
             CanonicalKind::Boolean => downcast!(Boolean, BooleanArray),
+            CanonicalKind::TinyInt => downcast!(TinyInt, Int8Array),
+            CanonicalKind::SmallInt => downcast!(SmallInt, Int16Array),
             CanonicalKind::Int => downcast!(Int, Int32Array),
             CanonicalKind::Long => downcast!(Long, Int64Array),
             CanonicalKind::Float => downcast!(Float, Float32Array),
@@ -172,6 +185,14 @@ impl<'a> PreparedCanonicalBatch<'a> {
         }
         match self {
             Self::Boolean(array) => fixed!(array, [u8::from(array.value(row)); 16]),
+            Self::TinyInt(array) => fixed!(
+                array,
+                padded(i32::from(array.value(row)).to_le_bytes().as_slice())
+            ),
+            Self::SmallInt(array) => fixed!(
+                array,
+                padded(i32::from(array.value(row)).to_le_bytes().as_slice())
+            ),
             Self::Int(array) => {
                 fixed!(array, padded(array.value(row).to_le_bytes().as_slice()))
             }
@@ -249,7 +270,9 @@ impl CanonicalBytes<'_> {
 pub(crate) const fn canonical_width(batch: &PreparedCanonicalBatch<'_>) -> usize {
     match batch {
         PreparedCanonicalBatch::Boolean(_) => 1,
-        PreparedCanonicalBatch::Int(_)
+        PreparedCanonicalBatch::TinyInt(_)
+        | PreparedCanonicalBatch::SmallInt(_)
+        | PreparedCanonicalBatch::Int(_)
         | PreparedCanonicalBatch::Float(_)
         | PreparedCanonicalBatch::Date(_) => 4,
         PreparedCanonicalBatch::Long(_)
@@ -302,6 +325,27 @@ mod tests {
         ] {
             let bytes = value.to_be_bytes();
             assert_eq!(&bytes[minimal_twos_complement_start(&bytes)..], expected);
+        }
+    }
+    #[test]
+    fn narrow_scalar_values_use_exact_four_byte_iceberg_int_canonicalization() {
+        use super::{PreparedCanonicalBatch, canonical_width};
+        use arrow_array::{Int8Array, Int16Array};
+        for input in [
+            &Int8Array::from(vec![Some(-128), None, Some(127)]) as &dyn arrow_array::Array,
+            &Int16Array::from(vec![Some(-128), None, Some(127)]) as &dyn arrow_array::Array,
+        ] {
+            let prepared = PreparedCanonicalBatch::try_new(input).unwrap();
+            assert_eq!(canonical_width(&prepared), 4);
+            assert_eq!(
+                prepared.canonical_bytes(0).unwrap().as_slice(4),
+                &[0x80, 0xff, 0xff, 0xff]
+            );
+            assert!(prepared.canonical_bytes(1).is_none());
+            assert_eq!(
+                prepared.canonical_bytes(2).unwrap().as_slice(4),
+                &[0x7f, 0, 0, 0]
+            );
         }
     }
 }

@@ -406,8 +406,7 @@ fn execute_operation(
         }
         ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
             ensure_owner(provider, &table.instance_id)?;
-            alter_schema(provider.runtime(), table, changes, context)?;
-            Ok(ExternalMutationEffect::Applied)
+            alter_schema(provider.runtime(), table, changes, context)
         }
         ConnectorCatalogMutationOperation::AlterPartitionSpec { table, add, drop } => {
             ensure_owner(provider, &table.instance_id)?;
@@ -505,7 +504,7 @@ fn prepare_table_creation(
     partitioning: &[ConnectorPartitionTransform],
     properties: &[(Arc<str>, Arc<str>)],
 ) -> Result<(NamespaceIdent, TableCreation), ConnectorError> {
-    let (format_version, properties) = table_properties(columns, key, properties)?;
+    let (format_version, mut properties) = table_properties(columns, key, properties)?;
     if format_version != FormatVersion::V3
         && columns.iter().any(|column| {
             column.default.as_ref().is_some_and(|value| {
@@ -531,6 +530,20 @@ fn prepare_table_creation(
         .with_fields(super::type_mapping::schema_fields(columns).map_err(invalid)?)
         .build()
         .map_err(|error| invalid(format!("build Iceberg schema: {error}")))?;
+    let integer_domains = crate::scalar_integer_domain::declarations(
+        &schema,
+        &properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+    .map_err(|error| invalid(error.message().to_string()))?;
+    if !integer_domains.is_empty() {
+        properties.insert(
+            crate::scalar_integer_domain::PROPERTY.to_string(),
+            crate::scalar_integer_domain::encode(&integer_domains)?,
+        );
+    }
     let spec = initial_partition_spec(&schema, partitioning).map_err(invalid)?;
     let namespace = NamespaceIdent::new(normalize_identifier(&table.namespace).map_err(invalid)?);
     let table_name = normalize_identifier(&table.table).map_err(invalid)?;
@@ -869,6 +882,14 @@ pub(crate) fn table_properties(
     let mut format_version = FormatVersion::V2;
     let mut properties = BTreeMap::new();
     for (key, value) in input {
+        if key.as_ref() == crate::scalar_integer_domain::PROPERTY
+            || key.starts_with(LOGICAL_TYPE_PROPERTY_PREFIX)
+                && matches!(value.to_ascii_lowercase().as_str(), "tinyint" | "smallint")
+        {
+            return Err(invalid(
+                "Iceberg scalar integer declarations come from column definitions",
+            ));
+        }
         if key.eq_ignore_ascii_case("format-version") || key.eq_ignore_ascii_case("format_version")
         {
             format_version = match value.trim() {
@@ -1304,6 +1325,15 @@ fn property_updates(
             ConnectorPropertyChange::Set { key, .. }
             | ConnectorPropertyChange::Unset { key, .. } => key.as_ref(),
         };
+        let scalar_alias = key.strip_prefix(LOGICAL_TYPE_PROPERTY_PREFIX).is_some()
+            && (metadata.properties().get(key).is_some_and(|value| {
+                matches!(value.to_ascii_lowercase().as_str(), "tinyint" | "smallint")
+            }) || matches!(change, ConnectorPropertyChange::Set { value, .. } if matches!(value.to_ascii_lowercase().as_str(), "tinyint" | "smallint")));
+        if key == crate::scalar_integer_domain::PROPERTY || scalar_alias {
+            return Err(invalid(
+                "Iceberg scalar integer declarations are owned by schema mutations",
+            ));
+        }
         // Engine-owned writes are allowed into the engine's own namespace;
         // user statements are not. Every other reserved key (Iceberg internals)
         // stays rejected for both.
@@ -1392,7 +1422,7 @@ fn alter_schema(
     table: &ConnectorTableIdentity,
     changes: &[ConnectorSchemaChange],
     context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
+) -> Result<ExternalMutationEffect, ConnectorError> {
     let [change] = changes else {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
@@ -1446,6 +1476,10 @@ fn alter_schema(
     {
         return Err(invalid("Iceberg column defaults require format-version 3"));
     }
+    let integer_domains = crate::scalar_integer_domain::metadata_declarations(metadata)?;
+    if scalar_integer_modify_is_noop(metadata.current_schema(), &integer_domains, change)? {
+        return Ok(ExternalMutationEffect::NoOp);
+    }
     let mut next_id = metadata
         .last_column_id()
         .checked_add(1)
@@ -1461,7 +1495,7 @@ fn alter_schema(
         .with_identifier_field_ids(metadata.current_schema().identifier_field_ids())
         .build()
         .map_err(|error| invalid(format!("build evolved Iceberg schema: {error}")))?;
-    let next_last_column_id = metadata.last_column_id().max(new_schema.highest_field_id());
+    let updates = scalar_integer_schema_updates(metadata, change, new_schema, integer_domains)?;
     let commit = TableCommit::builder()
         .ident(table_ident(table).map_err(invalid)?)
         .requirements(vec![
@@ -1472,19 +1506,166 @@ fn alter_schema(
                 last_assigned_field_id: metadata.last_column_id(),
             },
         ])
-        .updates(vec![
-            TableUpdate::AddSchema {
-                schema: new_schema,
-                last_column_id: Some(next_last_column_id),
-            },
-            TableUpdate::SetCurrentSchema { schema_id: -1 },
-        ])
+        .updates(updates)
         .build();
     update_table(runtime, commit, "alter Iceberg schema")?;
     runtime
         .control_state()
         .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(())
+    Ok(ExternalMutationEffect::Applied)
+}
+
+fn scalar_integer_modify_is_noop(
+    schema: &Schema,
+    integer_domains: &crate::scalar_integer_domain::ScalarIntegerDomains,
+    change: &ConnectorSchemaChange,
+) -> Result<bool, ConnectorError> {
+    if let ConnectorSchemaChange::ModifyColumn { path, data_type } = change
+        && path.segments.len() == 1
+    {
+        let id = find_field_id(schema.as_struct().fields(), path)?;
+        if schema
+            .field_by_id(id)
+            .expect("resolved field")
+            .field_type
+            .as_ref()
+            != &Type::Primitive(PrimitiveType::Int)
+        {
+            return Ok(false);
+        }
+        let previous = integer_domains.get(&id).copied();
+        let next = match data_type {
+            ConnectorDataType::TinyInt => {
+                Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8)
+            }
+            ConnectorDataType::SmallInt => {
+                Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16)
+            }
+            _ => None,
+        };
+        if previous.is_some() || next.is_some() {
+            if previous == next {
+                return Ok(true);
+            }
+            if next.is_some() || matches!(data_type, ConnectorDataType::Int) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "Iceberg MODIFY cannot change a scalar integer domain without changing its physical schema",
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn scalar_integer_schema_updates(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    change: &ConnectorSchemaChange,
+    new_schema: Schema,
+    mut integer_domains: crate::scalar_integer_domain::ScalarIntegerDomains,
+) -> Result<Vec<TableUpdate>, ConnectorError> {
+    let mut domain_properties = HashMap::new();
+    let mut domain_removals = Vec::new();
+    let aliases = |name: &str| {
+        metadata
+            .properties()
+            .keys()
+            .filter(|key| {
+                key.strip_prefix(LOGICAL_TYPE_PROPERTY_PREFIX)
+                    .is_some_and(|column| column.eq_ignore_ascii_case(name))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let narrow = |data_type: &ConnectorDataType| match data_type {
+        ConnectorDataType::TinyInt => Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8),
+        ConnectorDataType::SmallInt => {
+            Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16)
+        }
+        _ => None,
+    };
+    match change {
+        ConnectorSchemaChange::AddColumn { parent, column, .. } if parent.segments.is_empty() => {
+            let name = normalize_identifier(&column.name).map_err(invalid)?;
+            if let Some(domain) = narrow(&column.data_type) {
+                let id = new_schema
+                    .field_by_name(&name)
+                    .ok_or_else(|| invalid("added scalar integer column is absent"))?
+                    .id;
+                integer_domains.insert(id, domain);
+                domain_properties.insert(
+                    format!("{LOGICAL_TYPE_PROPERTY_PREFIX}{name}"),
+                    domain.name().to_string(),
+                );
+            }
+        }
+        ConnectorSchemaChange::RenameColumn { path, to } if path.segments.len() == 1 => {
+            let id = find_field_id(metadata.current_schema().as_struct().fields(), path)?;
+            if let Some(domain) = integer_domains.get(&id)
+                && metadata
+                    .current_schema()
+                    .field_by_id(id)
+                    .expect("resolved field")
+                    .field_type
+                    .as_ref()
+                    == &Type::Primitive(PrimitiveType::Int)
+            {
+                domain_removals.extend(aliases(&path.segments[0]));
+                domain_properties.insert(
+                    format!(
+                        "{LOGICAL_TYPE_PROPERTY_PREFIX}{}",
+                        normalize_identifier(to).map_err(invalid)?
+                    ),
+                    domain.name().to_string(),
+                );
+            }
+        }
+        ConnectorSchemaChange::DropColumn { path } if path.segments.len() == 1 => {
+            let id = find_field_id(metadata.current_schema().as_struct().fields(), path)?;
+            if integer_domains.contains_key(&id) {
+                domain_removals.extend(aliases(&path.segments[0]));
+            }
+            // Retain the ID fact: a historical structural schema still owns it.
+        }
+        ConnectorSchemaChange::ModifyColumn { path, .. } if path.segments.len() == 1 => {
+            let id = find_field_id(metadata.current_schema().as_struct().fields(), path)?;
+            if integer_domains.contains_key(&id) {
+                domain_removals.extend(aliases(&path.segments[0]));
+            }
+        }
+        _ => {}
+    }
+    crate::scalar_integer_domain::validate_schema(&new_schema, &integer_domains)
+        .map_err(|error| invalid(error.message().to_string()))?;
+    if !integer_domains.is_empty()
+        || metadata
+            .properties()
+            .contains_key(crate::scalar_integer_domain::PROPERTY)
+    {
+        domain_properties.insert(
+            crate::scalar_integer_domain::PROPERTY.to_string(),
+            crate::scalar_integer_domain::encode(&integer_domains)?,
+        );
+    }
+    let next_last_column_id = metadata.last_column_id().max(new_schema.highest_field_id());
+    let mut updates = vec![
+        TableUpdate::AddSchema {
+            schema: new_schema,
+            last_column_id: Some(next_last_column_id),
+        },
+        TableUpdate::SetCurrentSchema { schema_id: -1 },
+    ];
+    if !domain_properties.is_empty() {
+        updates.push(TableUpdate::SetProperties {
+            updates: domain_properties,
+        });
+    }
+    if !domain_removals.is_empty() {
+        updates.push(TableUpdate::RemoveProperties {
+            removals: domain_removals,
+        });
+    }
+    Ok(updates)
 }
 
 /// Row lineage is owned by the table format, so a schema change may not touch
@@ -4872,5 +5053,353 @@ mod tests {
                 panic!("receipt overflow must be reported as failed finalization")
             }
         }
+    }
+    fn scalar_integer_metadata() -> crate::iceberg::spec::TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "tiny",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://scalar-domain".to_string(),
+            crate::iceberg::spec::FormatVersion::V3,
+            HashMap::from([(
+                "novarocks.logical_type.tiny".to_string(),
+                "tinyint".to_string(),
+            )]),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
+    fn scalar_integer_apply(
+        metadata: crate::iceberg::spec::TableMetadata,
+        change: &ConnectorSchemaChange,
+    ) -> crate::iceberg::spec::TableMetadata {
+        let domains = crate::scalar_integer_domain::metadata_declarations(&metadata).unwrap();
+        assert!(
+            !scalar_integer_modify_is_noop(metadata.current_schema(), &domains, change).unwrap()
+        );
+        let fields = apply_schema_change(
+            metadata.current_schema().as_struct().fields(),
+            change,
+            &mut (metadata.last_column_id() + 1),
+        )
+        .unwrap();
+        let next = Schema::builder()
+            .with_schema_id(metadata.current_schema_id())
+            .with_fields(fields)
+            .build()
+            .unwrap();
+        let updates = scalar_integer_schema_updates(&metadata, change, next, domains).unwrap();
+        let mut builder = metadata.into_builder(None);
+        for update in updates {
+            builder = update.apply(builder).unwrap();
+        }
+        builder.build().unwrap().metadata
+    }
+
+    #[test]
+    fn scalar_integer_schema_lifecycle_is_atomic_and_field_id_owned() {
+        let renamed = scalar_integer_apply(
+            scalar_integer_metadata(),
+            &ConnectorSchemaChange::RenameColumn {
+                path: ConnectorColumnPath {
+                    segments: vec!["tiny".into()],
+                },
+                to: "renamed".into(),
+            },
+        );
+        assert!(
+            !renamed
+                .properties()
+                .contains_key("novarocks.logical_type.tiny")
+        );
+        assert_eq!(
+            renamed
+                .properties()
+                .get("novarocks.logical_type.renamed")
+                .map(String::as_str),
+            Some("tinyint")
+        );
+        let domains = crate::scalar_integer_domain::declarations(
+            renamed.current_schema(),
+            renamed.properties(),
+        )
+        .unwrap();
+        assert_eq!(
+            domains.get(&1),
+            Some(&crate::scalar_integer_domain::ScalarIntegerDomain::Int8)
+        );
+        let dropped = scalar_integer_apply(
+            renamed,
+            &ConnectorSchemaChange::DropColumn {
+                path: ConnectorColumnPath {
+                    segments: vec!["renamed".into()],
+                },
+            },
+        );
+        assert!(
+            !dropped
+                .properties()
+                .contains_key("novarocks.logical_type.renamed")
+        );
+        let domains = crate::scalar_integer_domain::declarations(
+            dropped.current_schema(),
+            dropped.properties(),
+        )
+        .unwrap();
+        assert_eq!(
+            domains.get(&1),
+            Some(&crate::scalar_integer_domain::ScalarIntegerDomain::Int8),
+            "historical structural field keeps its own declaration"
+        );
+        let reused = scalar_integer_apply(
+            dropped,
+            &ConnectorSchemaChange::AddColumn {
+                parent: ConnectorColumnPath { segments: vec![] },
+                column: ConnectorColumnDefinition {
+                    name: "renamed".into(),
+                    data_type: ConnectorDataType::Int,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+                position: ConnectorColumnPosition::Default,
+            },
+        );
+        let field = reused.current_schema().field_by_name("renamed").unwrap();
+        assert_ne!(field.id, 1);
+        assert_eq!(
+            crate::scalar_integer_domain::sql_schema(reused.current_schema(), reused.properties())
+                .unwrap()
+                .field(0)
+                .data_type(),
+            &arrow::datatypes::DataType::Int32
+        );
+    }
+
+    #[test]
+    fn scalar_integer_modify_rejects_unfenced_changes_before_commit_and_physical_widen_is_fenced() {
+        let metadata = scalar_integer_metadata();
+        let domains = crate::scalar_integer_domain::metadata_declarations(&metadata).unwrap();
+        let change = |data_type| ConnectorSchemaChange::ModifyColumn {
+            path: ConnectorColumnPath {
+                segments: vec!["tiny".into()],
+            },
+            data_type,
+        };
+        assert!(
+            scalar_integer_modify_is_noop(
+                metadata.current_schema(),
+                &domains,
+                &change(ConnectorDataType::TinyInt)
+            )
+            .unwrap()
+        );
+        for target in [ConnectorDataType::SmallInt, ConnectorDataType::Int] {
+            assert_eq!(
+                scalar_integer_modify_is_noop(metadata.current_schema(), &domains, &change(target))
+                    .unwrap_err()
+                    .kind(),
+                ConnectorErrorKind::Unsupported,
+                "no update plan exists for an unfenced logical change"
+            );
+        }
+        assert!(
+            !scalar_integer_modify_is_noop(
+                metadata.current_schema(),
+                &std::collections::BTreeMap::new(),
+                &change(ConnectorDataType::BigInt),
+            )
+            .unwrap(),
+            "ordinary physical INT-to-LONG widening still reaches the established schema owner"
+        );
+        let stale = TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: metadata.current_schema_id(),
+        };
+        let widened = scalar_integer_apply(metadata, &change(ConnectorDataType::BigInt));
+        assert!(
+            stale.check(Some(&widened)).is_err(),
+            "a parallel stale schema commit cannot pass the existing fence"
+        );
+        assert!(
+            !widened
+                .properties()
+                .contains_key("novarocks.logical_type.tiny")
+        );
+        let retained = crate::scalar_integer_domain::metadata_declarations(&widened).unwrap();
+        assert_eq!(
+            retained.get(&1),
+            Some(&crate::scalar_integer_domain::ScalarIntegerDomain::Int8)
+        );
+        assert!(
+            crate::scalar_integer_domain::of_schema(widened.current_schema(), &retained)
+                .unwrap()
+                .is_empty(),
+            "current LONG does not carry an active narrow tag"
+        );
+        let historical = widened
+            .schemas_iter()
+            .find(|schema| {
+                schema.field_by_id(1).is_some_and(|field| {
+                    field.field_type.as_ref() == &Type::Primitive(PrimitiveType::Int)
+                })
+            })
+            .expect("old INT structural schema");
+        assert_eq!(
+            crate::scalar_integer_domain::metadata_sql_schema(&widened, historical)
+                .unwrap()
+                .field(0)
+                .data_type(),
+            &arrow::datatypes::DataType::Int8,
+            "old structural INT retains its declared narrow domain"
+        );
+        assert_eq!(
+            crate::scalar_integer_domain::sql_schema(
+                widened.current_schema(),
+                widened.properties()
+            )
+            .unwrap()
+            .field(0)
+            .data_type(),
+            &arrow::datatypes::DataType::Int64
+        );
+    }
+    #[test]
+    fn scalar_integer_creation_declarations_match_the_catalogs_fresh_field_ids() {
+        let table = ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+            namespace: "db".into(),
+            table: "fresh".into(),
+        };
+        let column = |name: &str, data_type| ConnectorColumnDefinition {
+            name: name.into(),
+            data_type,
+            nullable: true,
+            aggregation: None,
+            default: None,
+        };
+        let columns = vec![
+            column(
+                "nested",
+                ConnectorDataType::Array(Box::new(ConnectorDataType::Int)),
+            ),
+            column("tiny", ConnectorDataType::TinyInt),
+            column("age", ConnectorDataType::SmallInt),
+            column("ordinary", ConnectorDataType::Int),
+        ];
+        let (_, creation) = prepare_table_creation(&table, &columns, None, &[], &[]).unwrap();
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            creation.schema,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://fresh-domain".to_string(),
+            crate::iceberg::spec::FormatVersion::V3,
+            creation.properties,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let domains = crate::scalar_integer_domain::metadata_declarations(&metadata).unwrap();
+        assert_eq!(domains.keys().copied().collect::<Vec<_>>(), vec![2, 3]);
+        let schema =
+            crate::scalar_integer_domain::metadata_sql_schema(&metadata, metadata.current_schema())
+                .unwrap();
+        assert_eq!(
+            schema.field(1).data_type(),
+            &arrow::datatypes::DataType::Int8
+        );
+        assert_eq!(
+            schema.field(2).data_type(),
+            &arrow::datatypes::DataType::Int16
+        );
+        assert_eq!(
+            schema.field(3).data_type(),
+            &arrow::datatypes::DataType::Int32
+        );
+    }
+    #[test]
+    fn scalar_integer_noop_and_unfenced_modify_publish_no_metadata_file() {
+        let (_executor, _warehouse, provider) = provider();
+        create_namespace(&provider, "scalar_lifecycle");
+        let table = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "scalar_lifecycle".into(),
+            table: "tiny".into(),
+        };
+        create_table_fixture(
+            &provider,
+            &table,
+            &[ConnectorColumnDefinition {
+                name: "t".into(),
+                data_type: ConnectorDataType::TinyInt,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+            CreatePolicy::FailIfExists,
+        )
+        .unwrap();
+        let before = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let count = metadata_file_count(before.table.metadata().location());
+        let request = |data_type| ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorProviderBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: ConnectorCatalogMutationOperation::AlterSchema {
+                table: table.clone(),
+                changes: vec![ConnectorSchemaChange::ModifyColumn {
+                    path: ConnectorColumnPath {
+                        segments: vec!["t".into()],
+                    },
+                    data_type,
+                }],
+            },
+            context: context(),
+        };
+        assert!(matches!(
+            provider
+                .execute(request(ConnectorDataType::TinyInt))
+                .unwrap(),
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                ..
+            }
+        ));
+        assert!(
+            matches!(provider.execute(request(ConnectorDataType::Int)).unwrap(),ExternalMutationOutcome::KnownUncommitted {failure} if failure.kind()==ConnectorMutationFailureKind::Unsupported)
+        );
+        assert_eq!(
+            metadata_file_count(before.table.metadata().location()),
+            count,
+            "neither request reaches external metadata publication"
+        );
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
+        let after = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        assert_eq!(after.table.metadata(), before.table.metadata());
     }
 }

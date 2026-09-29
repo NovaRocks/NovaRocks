@@ -417,6 +417,15 @@ impl IcebergTypedBoundary {
         let table = table.clone();
         let control = self.request_context.clone();
         let schema = table.metadata().current_schema().clone();
+        let integer_domains = crate::scalar_integer_domain::of_schema(
+            schema.as_ref(),
+            &crate::scalar_integer_domain::metadata_declarations(table.metadata())?,
+        )?;
+        let partition_specs = table
+            .metadata()
+            .partition_specs_iter()
+            .map(|spec| (spec.spec_id(), spec.clone()))
+            .collect::<BTreeMap<_, _>>();
         let result = self
             .runtime
             .resources()
@@ -429,7 +438,30 @@ impl IcebergTypedBoundary {
             .files
             .into_iter()
             .map(|read_file| {
-                planned_data_file(read_file, &facts, schema.as_ref(), None, &BTreeSet::new())
+                let data_facts = facts.data.get(&read_file.path).ok_or_else(|| {
+                    corrupt("iceberg change-window file has no pinned manifest entry")
+                })?;
+                let partition_spec = read_file
+                    .partition_spec_id
+                    .map(|id| {
+                        partition_specs.get(&id).ok_or_else(|| {
+                            corrupt("iceberg change-window file names an absent partition spec")
+                        })
+                    })
+                    .transpose()?;
+                validate_scalar_integer_manifest_facts(
+                    &integer_domains,
+                    data_facts,
+                    partition_spec.map(Arc::as_ref),
+                    read_file.partition_values.as_ref(),
+                )?;
+                planned_data_file(
+                    read_file,
+                    &facts,
+                    schema.as_ref(),
+                    partition_spec.map(Arc::as_ref),
+                    &BTreeSet::new(),
+                )
             })
             .collect()
     }
@@ -997,7 +1029,10 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 for field in schema.as_struct().fields() {
                     columns.push((
                         field.name.to_string(),
-                        IcebergColumnHandle::base_column(field.as_ref())?,
+                        IcebergColumnHandle::base_column(field.as_ref())?
+                            .with_scalar_integer_domain(
+                                handle.scalar_integer_domains().get(&field.id).copied(),
+                            )?,
                         false,
                     ));
                 }
@@ -1530,7 +1565,25 @@ impl IcebergTypedBoundary {
                     continue;
                 }
                 pinned_seen += 1;
-            } else if !predicates.is_empty()
+            }
+            let partition_spec = read_file
+                .partition_spec_id
+                .map(|spec_id| handle.parse_partition_spec(spec_id))
+                .transpose()?;
+            let data_facts = facts
+                .data
+                .get(&read_file.path)
+                .ok_or_else(|| corrupt("iceberg data file has no pinned manifest entry"))?;
+            // Validate supplied narrow-domain facts before they can prove that
+            // a file is prunable. Missing bounds remain conservative.
+            validate_scalar_integer_manifest_facts(
+                handle.scalar_integer_domains(),
+                data_facts,
+                partition_spec.as_ref(),
+                read_file.partition_values.as_ref(),
+            )?;
+            if pinned.is_none()
+                && !predicates.is_empty()
                 && !file_may_satisfy_physical_predicates(
                     &pruning_view(handle, &schema, &read_file)?,
                     &predicates,
@@ -1538,10 +1591,6 @@ impl IcebergTypedBoundary {
             {
                 continue;
             }
-            let partition_spec = read_file
-                .partition_spec_id
-                .map(|spec_id| handle.parse_partition_spec(spec_id))
-                .transpose()?;
             planned.push(planned_data_file(
                 read_file,
                 &facts,
@@ -2126,7 +2175,11 @@ fn pinned_table_handle_with_schema(
         table_location: metadata.location().to_string(),
         storage_properties: reader_visible_storage_properties(metadata.properties()),
         pinned_data_files,
-    })
+    })?
+    .with_scalar_integer_domains(crate::scalar_integer_domain::of_schema(
+        &schema,
+        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+    )?)
 }
 
 /// Freeze one worker-visible change-window relation handle.
@@ -2183,7 +2236,21 @@ fn pinned_change_window_handle(
         )));
     }
 
-    let columns = change_window_columns(to_schema.as_ref(), row_lineage_enabled(metadata))?;
+    let domains = crate::scalar_integer_domain::metadata_declarations(metadata)?;
+    let from_domains = crate::scalar_integer_domain::of_schema(&from_schema, &domains)?;
+    let to_domains = crate::scalar_integer_domain::of_schema(&to_schema, &domains)?;
+    if from_domains != to_domains {
+        return Err(unsupported(
+            "Iceberg change-window endpoints have different declared scalar integer domains",
+        ));
+    }
+    let columns = change_window_columns(to_schema.as_ref(), row_lineage_enabled(metadata))?
+        .into_iter()
+        .map(|column| {
+            let domain = to_domains.get(&column.base_field_id()).copied();
+            column.with_scalar_integer_domain(domain)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let table_schema_json = serde_json::to_string(to_schema.as_ref())
         .map_err(|error| corrupt(format!("iceberg table schema cannot be encoded: {error}")))?;
 
@@ -2607,6 +2674,51 @@ async fn collect_manifest_facts(
 /// widens the domain to `ALL` and keeps the file.  In contrast, mutually
 /// impossible metrics are corruption: accepting them as a pruning proof could
 /// silently discard rows, so the query must fail rather than guess.
+/// Narrow logical declarations constrain every supplied physical INT fact,
+/// including facts used to discard a file before any rows are materialized.
+fn validate_scalar_integer_manifest_facts(
+    declarations: &crate::scalar_integer_domain::ScalarIntegerDomains,
+    facts: &DataFileManifestFacts,
+    partition_spec: Option<&PartitionSpec>,
+    partition_values: Option<&Struct>,
+) -> Result<(), ConnectorError> {
+    for (field_id, declaration) in declarations {
+        for bound in [
+            facts.lower_bounds.get(field_id),
+            facts.upper_bounds.get(field_id),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let PrimitiveLiteral::Int(value) = bound.literal() else {
+                return Err(corrupt(
+                    "iceberg scalar integer metric requires an INT32 carrier",
+                ));
+            };
+            declaration.value(*value)?;
+        }
+        if let (Some(spec), Some(values)) = (partition_spec, partition_values) {
+            for (index, field) in spec.fields().iter().enumerate() {
+                if field.source_id != *field_id || field.transform != Transform::Identity {
+                    continue;
+                }
+                let value = values.fields().get(index).ok_or_else(|| {
+                    corrupt("iceberg scalar integer identity partition value is missing")
+                })?;
+                if let Some(value) = value {
+                    let Literal::Primitive(PrimitiveLiteral::Int(value)) = value else {
+                        return Err(corrupt(
+                            "iceberg scalar integer identity partition requires an INT32 carrier",
+                        ));
+                    };
+                    declaration.value(*value)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn manifest_statistics_domain(
     schema: &Schema,
     partition_spec: Option<&PartitionSpec>,
@@ -2659,6 +2771,10 @@ fn manifest_statistics_domain(
             }
             (Some(domain), None) | (None, Some(domain)) => domain,
             (None, None) => Domain::all(value_type),
+        };
+        let domain = match column.scalar_integer_domain() {
+            Some(declaration) => declaration.domain(&domain)?,
+            None => domain,
         };
         if !domain.is_all() {
             domains.insert(column.clone(), domain);
@@ -3093,11 +3209,13 @@ fn physical_value(value: &ConnectorValue) -> Option<IcebergPhysicalPredicateValu
         ConnectorValue::Integer(value) => Some(IcebergPhysicalPredicateValue::Int32(*value)),
         ConnectorValue::BigInt(value) => Some(IcebergPhysicalPredicateValue::Int64(*value)),
         ConnectorValue::Date(value) => Some(IcebergPhysicalPredicateValue::Date32(*value)),
-        // No Iceberg field is eight-bit, so a tiny int can only be an
-        // engine-derived column, which no manifest carries statistics for.
-        ConnectorValue::TinyInt(_)
-        | ConnectorValue::SmallInt(_)
-        | ConnectorValue::Real(_)
+        ConnectorValue::TinyInt(value) => {
+            Some(IcebergPhysicalPredicateValue::Int32(i32::from(*value)))
+        }
+        ConnectorValue::SmallInt(value) => {
+            Some(IcebergPhysicalPredicateValue::Int32(i32::from(*value)))
+        }
+        ConnectorValue::Real(_)
         | ConnectorValue::Double(_)
         | ConnectorValue::Decimal { .. }
         | ConnectorValue::TimeMicros(_)
@@ -3723,5 +3841,154 @@ mod manifest_statistics_tests {
         )
         .expect_err("inverted bounds are corruption");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+    #[test]
+    fn scalar_integer_change_window_freezes_the_current_stable_id_domain_on_both_endpoints() {
+        use crate::scalar_integer_domain::ScalarIntegerDomain;
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                17,
+                "tiny",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let mut builder = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://change-domain".to_string(),
+            FormatVersion::V2,
+            HashMap::from([(
+                "novarocks.logical_type.tiny".to_string(),
+                "tinyint".to_string(),
+            )]),
+        )
+        .unwrap();
+        for (id, parent, sequence) in [(41, None, 1), (42, Some(41), 2)] {
+            let snapshot = crate::iceberg::spec::Snapshot::builder()
+                .with_snapshot_id(id)
+                .with_parent_snapshot_id(parent)
+                .with_sequence_number(sequence)
+                .with_timestamp_ms(1_700_000_000_000 + sequence)
+                .with_manifest_list(format!("memory://change-domain/snap-{id}.avro"))
+                .with_summary(crate::iceberg::spec::Summary {
+                    operation: crate::iceberg::spec::Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build();
+            builder = builder.add_snapshot(snapshot).unwrap();
+        }
+        let metadata = builder.build().unwrap().metadata;
+        let window = ConnectorReadChangeWindow::new(41, 42);
+        let handle = pinned_change_window_handle(
+            &SchemaTableName::try_new("db", "tiny").unwrap(),
+            &metadata,
+            window,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            handle.columns()[0].scalar_integer_domain(),
+            Some(ScalarIntegerDomain::Int8)
+        );
+        let decoded = IcebergChangeWindowHandle::from_proto(&handle.to_proto()).unwrap();
+        assert_eq!(decoded, handle);
+        assert_eq!(
+            decoded.columns()[0].scalar_integer_domain(),
+            Some(ScalarIntegerDomain::Int8)
+        );
+    }
+
+    #[test]
+    fn scalar_integer_manifest_bounds_reject_corruption_before_pruning() {
+        use crate::scalar_integer_domain::ScalarIntegerDomain;
+        let declarations = BTreeMap::from([(1, ScalarIntegerDomain::Int8)]);
+        validate_scalar_integer_manifest_facts(
+            &declarations,
+            &facts_for_int_bounds(-128, 127),
+            None,
+            None,
+        )
+        .expect("valid narrow bounds");
+        for (lower, upper) in [(-129, 0), (0, 128)] {
+            let error = validate_scalar_integer_manifest_facts(
+                &declarations,
+                &facts_for_int_bounds(lower, upper),
+                None,
+                None,
+            )
+            .expect_err(
+                "out-of-domain supplied bound is corrupt, even if a predicate would prune it",
+            );
+            assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        }
+        let mut missing = facts_for_int_bounds(-128, 127);
+        missing.lower_bounds.clear();
+        missing.upper_bounds.clear();
+        validate_scalar_integer_manifest_facts(&declarations, &missing, None, None)
+            .expect("absent bounds are unknown, not corrupt");
+        let mut wrong_carrier = missing;
+        wrong_carrier.lower_bounds.insert(1, Datum::long(0));
+        assert_eq!(
+            validate_scalar_integer_manifest_facts(&declarations, &wrong_carrier, None, None,)
+                .expect_err("wrong metric carrier")
+                .kind(),
+            ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn scalar_integer_identity_partition_facts_are_checked_before_pruning() {
+        use crate::scalar_integer_domain::ScalarIntegerDomain;
+        let declarations = BTreeMap::from([(1, ScalarIntegerDomain::Int8)]);
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "tiny",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let spec = PartitionSpec::builder(schema)
+            .with_spec_id(4)
+            .add_partition_field("tiny", "tiny_part", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut facts = facts_for_int_bounds(-128, 127);
+        facts.lower_bounds.clear();
+        facts.upper_bounds.clear();
+        for value in [
+            None,
+            Some(Literal::Primitive(PrimitiveLiteral::Int(-128))),
+            Some(Literal::Primitive(PrimitiveLiteral::Int(127))),
+        ] {
+            validate_scalar_integer_manifest_facts(
+                &declarations,
+                &facts,
+                Some(&spec),
+                Some(&Struct::from_iter([value])),
+            )
+            .expect("NULL and valid exact partition constants");
+        }
+        for value in [
+            Literal::Primitive(PrimitiveLiteral::Int(128)),
+            Literal::Primitive(PrimitiveLiteral::Long(0)),
+        ] {
+            assert_eq!(
+                validate_scalar_integer_manifest_facts(
+                    &declarations,
+                    &facts,
+                    Some(&spec),
+                    Some(&Struct::from_iter([Some(value)]))
+                )
+                .unwrap_err()
+                .kind(),
+                ConnectorErrorKind::CorruptData
+            );
+        }
     }
 }

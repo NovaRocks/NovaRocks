@@ -279,6 +279,7 @@ pub struct IcebergColumnHandle {
     type_json: Arc<str>,
     nullable: bool,
     comment: Option<Arc<str>>,
+    scalar_integer_domain: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
 }
 
 impl IcebergColumnHandle {
@@ -333,6 +334,7 @@ impl IcebergColumnHandle {
             type_json: Arc::from(type_json.as_str()),
             nullable,
             comment: comment.map(|comment| Arc::from(comment.as_str())),
+            scalar_integer_domain: None,
         })
     }
 
@@ -363,6 +365,11 @@ impl IcebergColumnHandle {
         let mut path = self.field_id_path.clone();
         path.extend_from_slice(field_ids);
         let (resolved_type, optional_on_path) = resolve_field_id_path(&base_type, &path)?;
+        let scalar_integer_domain = if path.is_empty() {
+            self.scalar_integer_domain
+        } else {
+            None
+        };
         Self::try_new(IcebergColumnHandleParams {
             base_column_identity: self.base_column_identity.clone(),
             base_type_json: self.base_type_json.to_string(),
@@ -373,7 +380,8 @@ impl IcebergColumnHandle {
             // the whole subtree as null.
             nullable: self.nullable || optional_on_path,
             comment: None,
-        })
+        })?
+        .with_scalar_integer_domain(scalar_integer_domain)
     }
 
     pub const fn base_column_identity(&self) -> &ColumnIdentity {
@@ -402,6 +410,29 @@ impl IcebergColumnHandle {
         &self.type_json
     }
 
+    pub(crate) fn with_scalar_integer_domain(
+        mut self,
+        domain: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
+    ) -> Result<Self, ConnectorError> {
+        if domain.is_some()
+            && (!self.is_base_column()
+                || parse_type(self.type_json(), "type_json")?
+                    != Type::Primitive(crate::iceberg::spec::PrimitiveType::Int))
+        {
+            return Err(invalid(
+                "Iceberg scalar integer declaration requires a base INT column",
+            ));
+        }
+        self.scalar_integer_domain = domain;
+        Ok(self)
+    }
+
+    pub(crate) const fn scalar_integer_domain(
+        &self,
+    ) -> Option<crate::scalar_integer_domain::ScalarIntegerDomain> {
+        self.scalar_integer_domain
+    }
+
     pub const fn nullable(&self) -> bool {
         self.nullable
     }
@@ -418,6 +449,9 @@ impl IcebergColumnHandle {
             type_json: self.type_json.to_string(),
             nullable: self.nullable,
             comment: self.comment.as_ref().map(|comment| comment.to_string()),
+            scalar_integer_domain: self
+                .scalar_integer_domain
+                .map(|domain| domain.name().to_string()),
         }
     }
 
@@ -433,7 +467,13 @@ impl IcebergColumnHandle {
             type_json: raw.type_json.clone(),
             nullable: raw.nullable,
             comment: raw.comment.clone(),
-        })
+        })?
+        .with_scalar_integer_domain(
+            raw.scalar_integer_domain
+                .as_deref()
+                .map(crate::scalar_integer_domain::ScalarIntegerDomain::parse)
+                .transpose()?,
+        )
     }
 }
 
@@ -455,6 +495,7 @@ impl Ord for IcebergColumnHandle {
             .then_with(|| self.base_column_identity.cmp(&other.base_column_identity))
             .then_with(|| self.base_type_json.cmp(&other.base_type_json))
             .then_with(|| self.type_json.cmp(&other.type_json))
+            .then_with(|| self.scalar_integer_domain.cmp(&other.scalar_integer_domain))
             .then_with(|| self.nullable.cmp(&other.nullable))
             .then_with(|| self.comment.cmp(&other.comment))
     }

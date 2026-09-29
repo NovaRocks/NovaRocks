@@ -195,9 +195,9 @@ fn file_predicate_value(value: &ConnectorValue) -> Option<MinMaxPredicateValue> 
         | ConnectorValue::TimestampTzMicros(value)
         | ConnectorValue::TimestampNanos(value)
         | ConnectorValue::TimestampTzNanos(value) => Some(MinMaxPredicateValue::Int64(*value)),
-        ConnectorValue::TinyInt(_)
-        | ConnectorValue::SmallInt(_)
-        | ConnectorValue::Real(_)
+        ConnectorValue::TinyInt(value) => Some(MinMaxPredicateValue::Int32(i32::from(*value))),
+        ConnectorValue::SmallInt(value) => Some(MinMaxPredicateValue::Int32(i32::from(*value))),
+        ConnectorValue::Real(_)
         | ConnectorValue::Double(_)
         | ConnectorValue::Decimal { .. }
         | ConnectorValue::Varchar(_)
@@ -756,6 +756,7 @@ pub struct IcebergReadRelation {
     partition_spec: PartitionSpec,
     name_mapping: Option<Arc<NameMapping>>,
     effective_predicate: TupleDomain<IcebergColumnHandle>,
+    scalar_integer_domains: crate::scalar_integer_domain::ScalarIntegerDomains,
 }
 
 impl IcebergReadRelation {
@@ -769,6 +770,7 @@ impl IcebergReadRelation {
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
             effective_predicate: handle.effective_predicate()?,
+            scalar_integer_domains: handle.scalar_integer_domains().clone(),
         })
     }
 
@@ -786,6 +788,15 @@ impl IcebergReadRelation {
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
             effective_predicate: TupleDomain::all(),
+            scalar_integer_domains: handle
+                .columns()
+                .iter()
+                .filter_map(|column| {
+                    column
+                        .scalar_integer_domain()
+                        .map(|domain| (column.base_field_id(), domain))
+                })
+                .collect(),
         })
     }
 
@@ -843,6 +854,18 @@ fn admit_split(request: &IcebergPageSourceRequest<'_>) -> Result<AdmittedSplit, 
         )?;
     }
 
+    for column in request.columns {
+        let declaration = request
+            .relation
+            .scalar_integer_domains
+            .get(&column.base_field_id())
+            .copied();
+        if column.scalar_integer_domain() != declaration {
+            return Err(invalid(
+                "Iceberg scan column declaration differs from its frozen relation",
+            ));
+        }
+    }
     let table_schema = Arc::clone(&request.relation.table_schema);
     let partition_spec = request.relation.partition_spec.clone();
     if partition_spec.spec_id() != split.partition_spec_id() {
@@ -1888,6 +1911,14 @@ impl IcebergParquetPageSource {
                 partition_spec: self.partition_spec.clone(),
                 name_mapping: self.name_mapping.clone(),
                 effective_predicate: self.effective_predicate.clone(),
+                scalar_integer_domains: self.bound_handles[..self.prefix_len]
+                    .iter()
+                    .filter_map(|column| {
+                        column
+                            .scalar_integer_domain()
+                            .map(|domain| (column.base_field_id(), domain))
+                    })
+                    .collect(),
             };
             let split = self.split.clone();
             let columns = self.bound_handles[..self.prefix_len].to_vec();
@@ -2300,12 +2331,8 @@ fn connector_value_at(
         ConnectorValueType::Boolean => {
             ConnectorValue::Boolean(downcast::<BooleanArray>(column, path)?.value(row))
         }
-        // Only an engine-derived column is eight-bit, and no such column is
-        // read from a file, so no predicate can name one here.
         ConnectorValueType::TinyInt => {
-            return Err(corrupt(format!(
-                "iceberg predicate column of {path} is eight-bit, which no iceberg field is"
-            )));
+            ConnectorValue::TinyInt(downcast::<arrow::array::Int8Array>(column, path)?.value(row))
         }
         ConnectorValueType::SmallInt => {
             ConnectorValue::SmallInt(downcast::<Int16Array>(column, path)?.value(row))

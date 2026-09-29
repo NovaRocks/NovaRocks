@@ -1,0 +1,36 @@
+-- query 1
+id	t	age	i
+-129	NULL	-129	-129
+-128	-128	-128	-128
+127	127	127	127
+128	NULL	128	128
+32767	NULL	32767	32767
+32768	NULL	NULL	32768
+
+-- query 2
+tiny_type	age_type	int_type	tiny_count	age_count	int_count	tiny_sum	age_sum	int_sum
+tinyint	smallint	int	2	5	6	-1	32765	65533
+
+-- query 3
+tiny_overflow	small_overflow	tiny_min	small_min
+NULL	NULL	-128	-32768
+
+-- query 4
+id
+127
+
+-- query 5
+id
+32767
+
+-- query 6
+renamed_type	reused_name_type	tiny_count	new_count
+tinyint	int	2	0
+
+-- query 8
+tiny_type	widened_sum	tiny_count
+tinyint	-1	2
+
+-- query 9
+wide_type	wide_sum	wide_count
+bigint	127	3

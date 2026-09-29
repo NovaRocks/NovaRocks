@@ -123,8 +123,33 @@ impl StatisticsReader for IcebergMetadata {
             });
         self.validate_context(&request.context)?;
         let files = files_result.map_err(unavailable)?.map_err(unavailable)?;
-        let arrow_schema = crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
-            .map_err(|error| corrupt(format!("convert Iceberg statistics schema: {error}")))?;
+        let arrow_schema =
+            crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
+        for file in &files {
+            for field in arrow_schema.fields() {
+                let domain = match field.data_type() {
+                    DataType::Int8 => Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8),
+                    DataType::Int16 => {
+                        Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16)
+                    }
+                    _ => None,
+                };
+                let Some(domain) = domain else {
+                    continue;
+                };
+                if let Some(metric) = column_stats(file, field.name()) {
+                    for bytes in [metric.lower_bound.as_deref(), metric.upper_bound.as_deref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let value = i32::from_le_bytes(bytes.try_into().map_err(|_| {
+                            corrupt("Iceberg scalar integer bound is not four bytes")
+                        })?);
+                        domain.value(value)?;
+                    }
+                }
+            }
+        }
         let field_ids = metadata
             .current_schema()
             .as_struct()

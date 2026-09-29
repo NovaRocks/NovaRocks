@@ -2717,6 +2717,25 @@ fn write_statistics_contract(
     let Some(data_recipe) = writer.data() else {
         return WriteStatisticsContract::try_new(input, Vec::new());
     };
+    if let Some(metadata) = metadata {
+        let declarations = crate::scalar_integer_domain::of_schema(
+            metadata.current_schema(),
+            &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+        )?;
+        for binding in input.fields() {
+            let field = binding.field();
+            if let Some(storage) = metadata
+                .current_schema()
+                .field_by_name_case_insensitive(field.name())
+                && let Some(domain) = declarations.get(&storage.id)
+                && field.data_type() != &domain.data_type()
+            {
+                return Err(invalid(
+                    "Iceberg write input differs from the authoritative scalar integer declaration",
+                ));
+            }
+        }
+    }
     if !enabled {
         return WriteStatisticsContract::try_new(input, Vec::new());
     }
@@ -2729,12 +2748,7 @@ fn write_statistics_contract(
     // rule shallowly -- it adapted the top-level primitives and cloned every
     // nested type verbatim -- and the two statements drifted apart the moment
     // one of them said something about a nested field.
-    let arrow_schema = crate::schema_mapping::sql_read_schema_from_iceberg(iceberg_schema)
-        .map_err(|error| {
-            invalid(format!(
-                "convert Iceberg statistics schema to Arrow: {error}"
-            ))
-        })?;
+    let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(metadata, iceberg_schema)?;
     let mut requirements = Vec::new();
     for (ordinal, binding) in input.fields().into_iter().enumerate() {
         let field = binding.field();

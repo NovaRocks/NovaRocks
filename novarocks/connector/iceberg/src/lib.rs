@@ -67,6 +67,7 @@ pub mod resources;
 /// Iceberg virtual-column and row-lineage facts. These names and reserved
 /// field IDs are defined by the table format, not by the execution engine.
 pub mod row_lineage_synth;
+pub(crate) mod scalar_integer_domain;
 pub mod scan_model;
 pub mod schema_facts;
 pub mod schema_mapping;

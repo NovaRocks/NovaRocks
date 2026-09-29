@@ -354,3 +354,40 @@ fn array_as<T: 'static>(array: &dyn Array) -> Result<&T, String> {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scalar_integer_semantic_pages_match_storage_int_equality_deletes() {
+        use std::sync::Arc;
+        let metadata = std::collections::HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "17".to_string(),
+        )]);
+        let delete_schema = Arc::new(Schema::new(vec![
+            Field::new("original", DataType::Int32, true).with_metadata(metadata.clone()),
+        ]));
+        let delete_batch = RecordBatch::try_new(
+            delete_schema,
+            vec![Arc::new(Int32Array::from(vec![Some(-128), None]))],
+        )
+        .unwrap();
+        let set = equality_delete_set_from_record_batches("memory://equality", vec![delete_batch])
+            .unwrap();
+        for input in [
+            Arc::new(Int8Array::from(vec![Some(-128), Some(127), None])) as arrow::array::ArrayRef,
+            Arc::new(Int16Array::from(vec![Some(-128), Some(127), None])) as arrow::array::ArrayRef,
+        ] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("renamed", input.data_type().clone(), true)
+                    .with_metadata(metadata.clone()),
+            ]));
+            let page = RecordBatch::try_new(schema, vec![input]).unwrap();
+            assert_eq!(
+                equality_delete_keep_mask(&page, std::slice::from_ref(&set)).unwrap(),
+                Some(vec![false, true, false])
+            );
+        }
+    }
+}

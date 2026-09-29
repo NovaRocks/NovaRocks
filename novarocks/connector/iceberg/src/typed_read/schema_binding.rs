@@ -401,7 +401,12 @@ impl IcebergSchemaBinding {
                     })?;
                     let base =
                         adapt_array(batch.column(index), bound.base_target.as_ref(), facts.path)?;
-                    dereference_struct_path(&base, bound.base_target.as_ref(), dereference)?
+                    let value =
+                        dereference_struct_path(&base, bound.base_target.as_ref(), dereference)?;
+                    match bound.handle.scalar_integer_domain() {
+                        Some(domain) => domain.array(&value)?,
+                        None => value,
+                    }
                 }
                 IcebergColumnSource::IdentityPartitionConstant(value) => {
                     partition_constant(value.as_ref(), bound.target.as_ref(), row_count)?
@@ -734,6 +739,10 @@ fn bind_one_column(
             ))
         })?;
     let target = dereference_target_field(&base_target, handle.field_id_path())?;
+    let target = match handle.scalar_integer_domain() {
+        Some(domain) => Arc::new(target.as_ref().clone().with_data_type(domain.data_type())),
+        None => target,
+    };
 
     // 1. a physical field with the same field id in the file schema.
     if let Some(index) = physical.index_of(base_field_id) {
@@ -1970,6 +1979,155 @@ mod tests {
         assert_eq!(
             error.kind(),
             novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+    }
+    #[test]
+    fn scalar_integer_binding_reads_one_physical_id_into_exact_logical_and_delete_occurrences() {
+        use crate::scalar_integer_domain::ScalarIntegerDomain;
+        use arrow::array::{Int8Array, Int32Array};
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![Arc::new(NestedField::optional(
+                31,
+                "tiny",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+        let physical_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("old_name", DataType::Int32, true).with_metadata(field_id_metadata(31)),
+        ]));
+        let plain = handle(&schema, 31);
+        let narrow = plain
+            .clone()
+            .with_scalar_integer_domain(Some(ScalarIntegerDomain::Int8))
+            .unwrap();
+        let columns = vec![narrow, plain];
+        let binding =
+            bind_scan_columns(empty_binding_request(&schema, &physical_schema, &columns)).unwrap();
+        assert_eq!(binding.physical_base_field_ids(), &[31]);
+        assert_eq!(binding.columns()[0].target().data_type(), &DataType::Int8);
+        assert_eq!(binding.columns()[1].target().data_type(), &DataType::Int32);
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(999),
+            Some(-128),
+            None,
+            Some(127),
+            Some(999),
+        ]));
+        let batch = RecordBatch::try_new(physical_schema.clone(), vec![array.slice(1, 3)]).unwrap();
+        let facts = IcebergSplitFacts {
+            path: "memory://tiny",
+            file_first_row_id: None,
+            data_sequence_number: None,
+        };
+        let values = binding.materialize(&batch, None, &facts).unwrap();
+        assert_eq!(
+            values[0]
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(-128), None, Some(127)]
+        );
+        assert_eq!(
+            values[1]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(-128), None, Some(127)]
+        );
+        assert!(
+            physical_adaptation(&DataType::Int32, &DataType::Int8).is_err(),
+            "unclaimed physical narrowing stays closed"
+        );
+        let corrupt_batch = RecordBatch::try_new(
+            physical_schema,
+            vec![Arc::new(Int32Array::from(vec![Some(128)]))],
+        )
+        .unwrap();
+        assert_eq!(
+            binding
+                .materialize(&corrupt_batch, None, &facts)
+                .unwrap_err()
+                .kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn scalar_integer_initial_defaults_and_missing_nulls_have_exact_domains() {
+        use crate::iceberg::spec::PrimitiveLiteral;
+        use crate::scalar_integer_domain::ScalarIntegerDomain;
+        use arrow::array::{Int8Array, Int16Array};
+        for (default, expected) in [(Some(32767), Some(32767_i16)), (None, None)] {
+            let mut field = NestedField::optional(21, "small", Type::Primitive(PrimitiveType::Int));
+            if let Some(value) = default {
+                field =
+                    field.with_initial_default(Literal::Primitive(PrimitiveLiteral::Int(value)));
+            }
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![Arc::new(field)])
+                .build()
+                .unwrap();
+            let columns = [handle(&schema, 21)
+                .with_scalar_integer_domain(Some(ScalarIntegerDomain::Int16))
+                .unwrap()];
+            let empty = Arc::new(ArrowSchema::empty());
+            let binding =
+                bind_scan_columns(empty_binding_request(&schema, &empty, &columns)).unwrap();
+            let batch = RecordBatch::try_new_with_options(
+                empty,
+                vec![],
+                &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(2)),
+            )
+            .unwrap();
+            let values = binding
+                .materialize(
+                    &batch,
+                    None,
+                    &IcebergSplitFacts {
+                        path: "memory://default",
+                        file_first_row_id: None,
+                        data_sequence_number: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                values[0]
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![expected, expected]
+            );
+        }
+        let field = Field::new("tiny", DataType::Int8, true);
+        let valid = partition_constant(
+            Some(&Literal::Primitive(PrimitiveLiteral::Int(-128))),
+            &field,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            valid
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(-128), Some(-128)]
+        );
+        assert!(
+            partition_constant(
+                Some(&Literal::Primitive(PrimitiveLiteral::Int(128))),
+                &field,
+                2
+            )
+            .is_err()
         );
     }
 }
