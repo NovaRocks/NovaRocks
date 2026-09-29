@@ -15,27 +15,29 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
+-- Test Objective: reject uncaptured VIEW/MV semantic settings before replay.
+-- Session views use the explicit default catalog; the shared REST fixture has no VIEW capability.
 -- @order_sensitive=true
 
 -- query 1
 -- @skip_result_check=true
-CREATE VIEW ${case_db}.v_persisted_mode AS SELECT 7 AS value;
+CREATE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT 7 AS value;
 SET sql_mode='GROUP_CONCAT_LEGACY';
 
 -- query 2
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
-CREATE VIEW ${case_db}.v_forbidden_mode AS SELECT 1;
+CREATE VIEW default_catalog.${case_db}.v_forbidden_mode AS SELECT 1;
 
 -- query 3
 -- @expect_error=GROUP_CONCAT_LEGACY is not captured
-SELECT * FROM ${case_db}.v_persisted_mode;
+SELECT * FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 4
-SELECT /*+ SET_VAR(sql_mode=32) */ value FROM ${case_db}.v_persisted_mode;
+SELECT /*+ SET_VAR(sql_mode=32) */ value FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 5
 -- @expect_error=GROUP_CONCAT_LEGACY is not captured
-EXPLAIN SELECT * FROM ${case_db}.v_persisted_mode;
+EXPLAIN SELECT * FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 6
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
@@ -53,19 +55,19 @@ SELECT group_concat('a','b') AS value;
 SET sql_mode=32;
 
 -- query 10
-SELECT value FROM ${case_db}.v_persisted_mode;
+SELECT value FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 11
 -- @expect_error=GROUP_CONCAT_LEGACY is not captured
-SELECT * FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ * FROM ${case_db}.v_persisted_mode) d;
+SELECT * FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ * FROM default_catalog.${case_db}.v_persisted_mode) d;
 
 -- query 12
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
-CREATE OR REPLACE VIEW ${case_db}.v_persisted_mode AS SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 9 AS value;
+CREATE OR REPLACE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 9 AS value;
 
 -- query 13
-SELECT value FROM ${case_db}.v_persisted_mode;
+SELECT value FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 14
 -- @skip_result_check=true
-DROP VIEW ${case_db}.v_persisted_mode;
+DROP VIEW default_catalog.${case_db}.v_persisted_mode;

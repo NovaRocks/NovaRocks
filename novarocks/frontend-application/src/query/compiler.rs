@@ -872,7 +872,6 @@ impl FrontendQueryCompiler {
             self.system_tables.system_catalog().as_ref(),
             connector_context,
             &mut prepared,
-            sql_semantics,
         )?;
         Ok(prepared)
     }
