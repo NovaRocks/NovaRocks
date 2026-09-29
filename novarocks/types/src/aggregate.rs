@@ -58,6 +58,8 @@ pub fn infer_agg_function_types(
             let out = match &first_arg {
                 DataType::Decimal128(..) => canonical_agg_decimal_type("avg", &first_arg)
                     .expect("avg decimal canonical type"),
+                // Decimal256 AVG preserves the bound input precision/scale.
+                DataType::Decimal256(..) => first_arg.clone(),
                 _ => DataType::Float64,
             };
             Ok((out, Some(DataType::Utf8)))
@@ -333,6 +335,16 @@ mod tests {
         );
         // A distinct function with no mangling rule keeps its lowercased name.
         assert_eq!(mangle_distinct_aggregate_name("MAX", true), "max");
+    }
+
+    #[test]
+    fn ordinary_decimal256_avg_retains_bound_precision_scale_and_utf8_state() {
+        for input in [DataType::Decimal256(50, 10), DataType::Decimal256(76, 0)] {
+            assert_eq!(
+                infer_agg_function_types("avg", std::slice::from_ref(&input), false).unwrap(),
+                (input, Some(DataType::Utf8))
+            );
+        }
     }
 
     #[test]

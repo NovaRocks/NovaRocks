@@ -1179,3 +1179,101 @@ fn build_avg_decimal256_array(
         .map_err(|e| e.to_string())?;
     Ok(Arc::new(array))
 }
+
+#[cfg(test)]
+mod decimal256_metadata_tests {
+    use super::*;
+    use crate::exec::expr::agg::{
+        AggStateArena, build_kernel_set, test_builtin_execution_function_set,
+    };
+    use crate::exec::node::aggregate::AggTypeSignature;
+    use novarocks_functions::AggregateInputBatch;
+
+    #[test]
+    fn ordinary_decimal256_avg_selected_binding_roundtrips_wide_partial_state() {
+        let functions = test_builtin_execution_function_set();
+        let input_type = DataType::Decimal256(60, 2);
+        let selected = functions
+            .catalog()
+            .resolve_aggregate_trusted("avg", &[input_type.clone()])
+            .unwrap();
+        assert_eq!(selected.output_type, input_type);
+        assert_eq!(selected.intermediate_type, DataType::Utf8);
+        let function = |merge| AggFunction {
+            name: "avg".to_string(),
+            input_is_intermediate: merge,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(DataType::Utf8),
+                output_type: Some(input_type.clone()),
+                input_arg_type: Some(input_type.clone()),
+            }),
+            ..Default::default()
+        };
+        let update = build_kernel_set(
+            &functions,
+            &[function(false)],
+            &[Some(input_type.clone())],
+            &[selected.clone()],
+        )
+        .unwrap();
+        let merge = build_kernel_set(
+            &functions,
+            &[function(true)],
+            &[Some(DataType::Utf8)],
+            &[selected],
+        )
+        .unwrap();
+        let mut arena = AggStateArena::new(4096);
+        let update = &update.entries[0];
+        let merge = &merge.entries[0];
+        let unit = pow10_i256(50).unwrap();
+        assert!(unit.to_i128().is_none());
+        let mut partials = Vec::new();
+        for coefficients in [
+            vec![Some(unit), Some(unit), Some(unit * i256::from_i128(3))],
+            vec![
+                Some(unit * i256::from_i128(3)),
+                Some(unit * i256::from_i128(5)),
+                None,
+            ],
+        ] {
+            let values = Arc::new(
+                Decimal256Array::from(coefficients)
+                    .with_precision_and_scale(60, 2)
+                    .unwrap(),
+            ) as ArrayRef;
+            let local = arena.alloc(update.state.size, update.state_align());
+            update.init_state(local).unwrap();
+            update
+                .update_batch(
+                    &vec![local; values.len()],
+                    AggregateInputBatch::try_new(Some(&values), values.len()).unwrap(),
+                )
+                .unwrap();
+            partials.push(update.build_array(&[local], true).unwrap());
+            update.drop_state(local);
+        }
+        let root = arena.alloc(merge.state.size, merge.state_align());
+        merge.init_state(root).unwrap();
+        for partial in partials {
+            merge
+                .merge_batch(
+                    &[root],
+                    AggregateInputBatch::try_new(Some(&partial), 1).unwrap(),
+                )
+                .unwrap();
+        }
+        let result = merge.build_array(&[root], false).unwrap();
+        merge.drop_state(root);
+        assert_eq!(result.data_type(), &DataType::Decimal256(60, 2));
+        // Ordinary AVG keeps duplicates: (1+1+3+3+5)/5 = 2.6 units.
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .unwrap()
+                .value(0),
+            pow10_i256(49).unwrap() * i256::from_i128(26)
+        );
+    }
+}
