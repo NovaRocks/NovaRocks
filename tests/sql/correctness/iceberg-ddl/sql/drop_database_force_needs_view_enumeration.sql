@@ -10,30 +10,34 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_drop_force_views;
-CREATE DATABASE sql_tests_drop_force_views;
-USE sql_tests_drop_force_views;
+DROP DATABASE IF EXISTS sql_tests_drop_force_views_${uuid0};
+CREATE DATABASE sql_tests_drop_force_views_${uuid0};
+USE sql_tests_drop_force_views_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
 CREATE TABLE force_probe (id BIGINT);
+INSERT INTO force_probe VALUES (42);
 
 -- query 3
 -- An absent target never reaches view enumeration: the namespace check runs
 -- first, and IF EXISTS makes it a no-op.
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_drop_force_absent FORCE;
+DROP DATABASE IF EXISTS sql_tests_drop_force_absent_${uuid0} FORCE;
 
 -- query 4
 -- The namespace exists, so FORCE must enumerate its views, and this catalog
 -- cannot answer that.
 -- @expect_error=not supported by this catalog
-DROP DATABASE sql_tests_drop_force_views FORCE;
+DROP DATABASE sql_tests_drop_force_views_${uuid0} FORCE;
 
 -- query 5
--- Dropping the children explicitly is how a namespace is removed on a catalog
--- that cannot enumerate views.
+-- The rejected FORCE must leave both the namespace and the child data intact.
+SELECT id FROM force_probe;
+
+-- query 6
+-- @cleanup=true
 -- @skip_result_check=true
-USE sql_tests_drop_force_views;
+USE sql_tests_drop_force_views_${uuid0};
 DROP TABLE IF EXISTS force_probe;
-DROP DATABASE IF EXISTS sql_tests_drop_force_views;
+DROP DATABASE IF EXISTS sql_tests_drop_force_views_${uuid0};
