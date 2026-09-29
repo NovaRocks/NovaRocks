@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{DataContentType, DataFileFormat, Struct};
-use arrow::array::ArrayRef;
+use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int32Builder};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -36,6 +36,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
+use super::frozen_write::scalar_integer_storage_schema;
 use super::types::WrittenFile;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,7 +58,10 @@ pub async fn write_equality_delete_file(
         return Ok(None);
     }
     let schema = equality_delete_schema(&columns)?;
+    // Validate the declared input before changing only its storage carrier.
     let batch = rewrap_batch_with_equality_schema(batch, schema.clone())?;
+    let schema = scalar_integer_storage_schema(&schema);
+    let batch = equality_delete_storage_batch(batch, schema.clone())?;
     let path = format!(
         "{staging_dir}/equality-delete-{:08x}-{}.parquet",
         0,
@@ -138,6 +142,50 @@ fn rewrap_batch_with_equality_schema(
         .collect::<Vec<_>>();
     RecordBatch::try_new(schema, columns)
         .map_err(|e| format!("equality-delete RecordBatch::try_new failed: {e}"))
+}
+
+/// Equality-delete keys retain their exact declared input signature. The only
+/// carrier change owned here is lossless signed I8/I16 to standard Iceberg INT.
+fn equality_delete_storage_batch(
+    batch: RecordBatch,
+    schema: ArrowSchemaRef,
+) -> Result<RecordBatch, String> {
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| match (column.data_type(), field.data_type()) {
+            (DataType::Int8, DataType::Int32) => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .ok_or_else(|| "equality-delete Int8 carrier downcast failed".to_string())?;
+                let mut builder = Int32Builder::with_capacity(values.len());
+                for value in values.iter() {
+                    builder.append_option(value.map(i32::from));
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
+            (DataType::Int16, DataType::Int32) => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .ok_or_else(|| "equality-delete Int16 carrier downcast failed".to_string())?;
+                let mut builder = Int32Builder::with_capacity(values.len());
+                for value in values.iter() {
+                    builder.append_option(value.map(i32::from));
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
+            (actual, target) if actual == target => Ok(Arc::clone(column)),
+            (actual, target) => Err(format!(
+                "unsupported equality-delete storage conversion for `{}`: {actual:?} to {target:?}",
+                field.name()
+            )),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    RecordBatch::try_new(schema, columns)
+        .map_err(|error| format!("build equality-delete storage batch failed: {error}"))
 }
 
 fn encode_equality_delete_parquet(
@@ -254,5 +302,212 @@ mod tests {
             .expect("category column");
         assert_eq!(categories.value(0), "B");
         assert!(categories.is_null(1));
+    }
+    fn local_file_io(location: &str) -> FileIO {
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+        let runtime = tokio::runtime::Handle::current();
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        );
+        crate::fs_io::build_file_io_for_location(location, binding)
+    }
+
+    #[tokio::test]
+    async fn equality_delete_public_writer_stores_narrow_keys_as_int32_with_exact_ids_and_nulls() {
+        use arrow::array::{BinaryArray, Int8Array, Int16Array};
+        use parquet::basic::{LogicalType, Type as PhysicalType};
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let columns = vec![
+            EqualityDeleteColumn {
+                name: "tiny".to_string(),
+                field_id: 11,
+                data_type: DataType::Int8,
+                nullable: true,
+            },
+            EqualityDeleteColumn {
+                name: "small".to_string(),
+                field_id: 27,
+                data_type: DataType::Int16,
+                nullable: true,
+            },
+            EqualityDeleteColumn {
+                name: "raw".to_string(),
+                field_id: 99,
+                data_type: DataType::Binary,
+                nullable: true,
+            },
+        ];
+        // Actual input is still the frozen SQL I8/I16 domain, not pre-cast I32.
+        let input_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("tiny", DataType::Int8, true),
+            Field::new("small", DataType::Int16, true),
+            Field::new("raw", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            input_schema,
+            vec![
+                Arc::new(Int8Array::from(vec![Some(-128), None, Some(127)])),
+                Arc::new(Int16Array::from(vec![Some(-32768), Some(32767), None])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(&[0xff, 0][..]),
+                    None,
+                    Some(&[][..]),
+                ])),
+            ],
+        )
+        .unwrap();
+        let written = write_equality_delete_file(
+            &local_file_io(&location),
+            &format!("{location}/data"),
+            7,
+            columns,
+            batch,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(written.content, DataContentType::EqualityDeletes);
+        assert_eq!(written.partition_spec_id, 7);
+        assert_eq!(written.record_count, 3);
+        assert_eq!(written.equality_ids, Some(vec![11, 27, 99]));
+        let builder = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(
+                written
+                    .path
+                    .strip_prefix("file://")
+                    .unwrap_or(&written.path),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for (index, id) in [11, 27].into_iter().enumerate() {
+            let column = &builder.parquet_schema().columns()[index];
+            assert_eq!(column.physical_type(), PhysicalType::INT32);
+            assert!(column.self_type().get_basic_info().has_id());
+            assert_eq!(column.self_type().get_basic_info().id(), id);
+            assert!(!matches!(
+                column.logical_type_ref(),
+                Some(LogicalType::Integer {
+                    bit_width: 8 | 16,
+                    ..
+                })
+            ));
+            assert_eq!(builder.schema().field(index).data_type(), &DataType::Int32);
+            assert!(builder.schema().field(index).is_nullable());
+            assert_eq!(
+                builder
+                    .schema()
+                    .field(index)
+                    .metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY),
+                Some(&id.to_string())
+            );
+        }
+        assert_eq!(builder.schema().field(2).data_type(), &DataType::Binary);
+        assert_eq!(
+            builder
+                .schema()
+                .field(2)
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"99".to_string())
+        );
+        let batches = builder
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let tiny = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let small = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            tiny.iter().collect::<Vec<_>>(),
+            vec![Some(-128), None, Some(127)]
+        );
+        assert_eq!(
+            small.iter().collect::<Vec<_>>(),
+            vec![Some(-32768), Some(32767), None]
+        );
+        let raw = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(raw.value(0), &[0xff, 0]);
+        assert!(raw.is_null(1));
+        assert_eq!(raw.value(2), &[] as &[u8]);
+    }
+
+    #[tokio::test]
+    async fn equality_delete_public_writer_rejects_input_signature_before_storage_conversion() {
+        use arrow::array::{Int8Array, Int16Array};
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let io = local_file_io(&location);
+        let columns = vec![EqualityDeleteColumn {
+            name: "key".to_string(),
+            field_id: 11,
+            data_type: DataType::Int8,
+            nullable: true,
+        }];
+        for values in [
+            Arc::new(Int32Array::from(vec![127])) as ArrayRef,
+            Arc::new(Int16Array::from(vec![127])) as ArrayRef,
+        ] {
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "key",
+                values.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+            let error = write_equality_delete_file(
+                &io,
+                &format!("{location}/data"),
+                7,
+                columns.clone(),
+                batch,
+            )
+            .await
+            .err()
+            .expect("wider caller input must not bypass the frozen I8 declaration");
+            assert!(error.contains("type mismatch: expected Int8"), "{error}");
+            assert!(
+                !dir.path().join("data").exists(),
+                "rejected input must not publish an output"
+            );
+        }
+        let columns = vec![EqualityDeleteColumn {
+            name: "key".to_string(),
+            field_id: 11,
+            data_type: DataType::Int8,
+            nullable: false,
+        }];
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "key",
+                DataType::Int8,
+                true,
+            )])),
+            vec![Arc::new(Int8Array::from(vec![None::<i8>]))],
+        )
+        .unwrap();
+        let error = write_equality_delete_file(&io, &format!("{location}/data"), 7, columns, batch)
+            .await
+            .err()
+            .expect("NULL must not satisfy a required input field");
+        assert!(error.contains("RecordBatch::try_new failed"), "{error}");
+        assert!(!dir.path().join("data").exists());
     }
 }

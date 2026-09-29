@@ -3050,3 +3050,219 @@ fn an_equality_delete_session_freezes_no_old_deletes() {
         &equality_delete_input_shape(),
     ));
 }
+
+fn scalar_integer_staged_target_handle(
+    runtime: &Arc<crate::metadata_context::IcebergMetadataContext>,
+    incarnation: ProviderBindingEpoch,
+    collect_statistics: bool,
+) -> novarocks_spi::connector::ConnectorTableHandle {
+    let location = "file:///tmp/novarocks-staged-session/table";
+    let schema = crate::iceberg::spec::Schema::builder()
+        .with_fields(vec![
+            Arc::new(crate::iceberg::spec::NestedField::required(
+                1,
+                "id",
+                crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Int),
+            )),
+            Arc::new(crate::iceberg::spec::NestedField::optional(
+                2,
+                "small",
+                crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Int),
+            )),
+            Arc::new(crate::iceberg::spec::NestedField::required(
+                3,
+                "plain",
+                crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Int),
+            )),
+        ])
+        .build()
+        .expect("schema");
+    let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+        schema,
+        crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+        crate::iceberg::spec::SortOrder::unsorted_order(),
+        location.to_string(),
+        crate::iceberg::spec::FormatVersion::V2,
+        std::collections::HashMap::from([
+            (
+                crate::scalar_integer_domain::PROPERTY.to_string(),
+                r#"{"1":"tinyint","2":"smallint"}"#.to_string(),
+            ),
+            (
+                crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
+                collect_statistics.to_string(),
+            ),
+        ]),
+    )
+    .expect("metadata builder")
+    .build()
+    .expect("metadata")
+    .metadata;
+    let table = crate::iceberg::table::Table::builder()
+        .identifier(crate::iceberg::TableIdent::from_strs(["db", "staged"]).expect("identifier"))
+        .file_io(crate::fs_io::build_file_io_for_location(
+            location,
+            runtime.resources().planning_binding().clone(),
+        ))
+        .metadata(metadata)
+        .build()
+        .expect("table");
+    let provider =
+        crate::metadata::IcebergMetadata::new(descriptor("unit"), incarnation, Arc::clone(runtime));
+    provider
+        .staged_write_table_handle(
+            &table,
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            &request_context(),
+        )
+        .expect("staged write table handle")
+}
+
+fn scalar_integer_fields() -> Vec<novarocks_spi::connector::ConnectorWriteFieldRequest> {
+    vec![
+        Field::new("id", DataType::Int8, false),
+        Field::new("small", DataType::Int16, true),
+        Field::new("plain", DataType::Int32, false),
+    ]
+    .into_iter()
+    .map(novarocks_spi::connector::ConnectorWriteFieldRequest::new)
+    .collect()
+}
+
+#[test]
+fn real_prepare_and_begin_preserve_the_same_scalar_integer_fields() {
+    use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
+    use novarocks_spi::connector::{
+        ConnectorProviderBindingKey, ConnectorWriteInputRequest, ConnectorWritePreparationOutcome,
+        ConnectorWritePreparationRequest,
+    };
+    for collect_statistics in [true, false] {
+        let incarnation = ProviderBindingEpoch::new();
+        let (_executor, runtime) = unreachable_rest_runtime();
+        let target = scalar_integer_staged_target_handle(&runtime, incarnation, collect_statistics);
+        let mut request = staged_begin_request(target.clone());
+        request.input = ConnectorWriteInputRequest::Data {
+            fields: scalar_integer_fields(),
+        };
+        let prepared = crate::commit::write_preparation::prepare_write(
+            ConnectorWritePreparationRequest {
+                table: target,
+                target_ref: request.target_ref.clone(),
+                intent: request.intent,
+                purpose: request.purpose,
+                input: request.input.clone(),
+                context: request_context(),
+            },
+            &ConnectorProviderBindingKey {
+                instance_id: ConnectorInstanceId::parse("unit").expect("instance"),
+                incarnation,
+            },
+        )
+        .expect("prepare");
+        let ConnectorWritePreparationOutcome::Prepared(prepared) = prepared else {
+            panic!("expected prepared scalar fields")
+        };
+        let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+            descriptor("unit"),
+            incarnation,
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("unit").expect("instance"),
+                CatalogVersion::from_bytes([1; 32]),
+            ),
+            Arc::clone(&runtime),
+        );
+        let session = control
+            .begin_write(request)
+            .expect("begin with authoritative scalar fields");
+        let expected = scalar_integer_fields()
+            .iter()
+            .map(|f| f.field().clone())
+            .collect::<Vec<_>>();
+        let prepared_fields = prepared
+            .input()
+            .fields()
+            .iter()
+            .map(|f| f.field().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(prepared_fields, expected);
+        assert_eq!(session.targets().len(), 1);
+        assert_eq!(
+            session.targets()[0]
+                .input()
+                .fields()
+                .iter()
+                .map(|f| f.field().clone())
+                .collect::<Vec<_>>(),
+            prepared_fields
+        );
+        // Staged create deliberately has no collect-on-write aggregates. The
+        // exact input-domain admission still applies before that eligibility gate.
+        assert!(session.targets()[0].statistics().is_empty());
+    }
+}
+
+#[test]
+fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
+    use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
+    use novarocks_spi::connector::{
+        ConnectorProviderBindingKey, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+        ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    };
+    for collect_statistics in [true, false] {
+        for forged_ordinal in [0, 1] {
+            let incarnation = ProviderBindingEpoch::new();
+            let (_executor, runtime) = unreachable_rest_runtime();
+            let target =
+                scalar_integer_staged_target_handle(&runtime, incarnation, collect_statistics);
+            let mut fields = scalar_integer_fields();
+            fields[forged_ordinal] = ConnectorWriteFieldRequest::new(
+                fields[forged_ordinal]
+                    .field()
+                    .clone()
+                    .with_data_type(DataType::Int32),
+            );
+            let mut request = staged_begin_request(target.clone());
+            request.input = ConnectorWriteInputRequest::Data { fields };
+            let outcome = crate::commit::write_preparation::prepare_write(
+                ConnectorWritePreparationRequest {
+                    table: target,
+                    target_ref: request.target_ref.clone(),
+                    intent: request.intent,
+                    purpose: request.purpose,
+                    input: request.input.clone(),
+                    context: request_context(),
+                },
+                &ConnectorProviderBindingKey {
+                    instance_id: ConnectorInstanceId::parse("unit").expect("instance"),
+                    incarnation,
+                },
+            )
+            .expect("prepare rebuilds from frozen metadata");
+            let ConnectorWritePreparationOutcome::Prepared(prepared) = outcome else {
+                panic!("expected preparation")
+            };
+            assert_eq!(
+                prepared.input().fields()[forged_ordinal].field(),
+                scalar_integer_fields()[forged_ordinal].field()
+            );
+            let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+                descriptor("unit"),
+                incarnation,
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("unit").expect("instance"),
+                    CatalogVersion::from_bytes([1; 32]),
+                ),
+                Arc::clone(&runtime),
+            );
+            let error = control
+                .begin_write(request)
+                .expect_err("session must reject a forged carrier");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert!(
+                error
+                    .message()
+                    .contains("authoritative scalar integer declaration")
+            );
+        }
+    }
+}

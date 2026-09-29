@@ -54,6 +54,7 @@ pub fn staged_write_context_from_frozen_facts(
 ) -> Result<StagedWriteContext, String> {
     let annotated_schema = annotate_schema_from_scan_model(input_schema, &facts.data_input_schema)?;
     let writer_schema = Arc::new(iceberg_schema_from_arrow_schema(annotated_schema.as_ref())?);
+    let annotated_schema = scalar_integer_storage_schema(&annotated_schema);
     let metadata = build_target_table_metadata(&facts, writer_schema.as_ref())?;
     let file_io = build_staged_file_io(binding, &facts.data_location)?;
     StagedWriteContext::from_parts_with_partition_spec_id(
@@ -63,6 +64,34 @@ pub fn staged_write_context_from_frozen_facts(
         annotated_schema,
         facts.target_partition_spec_id,
     )
+}
+
+/// Iceberg INT has a four-byte storage carrier even when the signed SQL input
+/// is TINYINT or SMALLINT. The writer's existing reannotation performs the
+/// lossless conversion; the Parquet schema must describe the same carrier.
+pub(super) fn scalar_integer_storage_schema(schema: &ArrowSchemaRef) -> ArrowSchemaRef {
+    fn field(field: &Field) -> Arc<Field> {
+        Arc::new(field.clone().with_data_type(data_type(field.data_type())))
+    }
+    fn data_type(value: &DataType) -> DataType {
+        match value {
+            DataType::Int8 | DataType::Int16 => DataType::Int32,
+            DataType::Struct(fields) => {
+                DataType::Struct(fields.iter().map(|value| field(value)).collect())
+            }
+            DataType::List(element) => DataType::List(field(element)),
+            DataType::Map(entries, sorted) => DataType::Map(field(entries), *sorted),
+            other => other.clone(),
+        }
+    }
+    Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|value| field(value))
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ))
 }
 
 fn build_target_table_metadata(
@@ -367,3 +396,7 @@ fn partition_spec_names_match(spec: &serde_json::Value, names: &[String]) -> boo
                 == Some(expected.as_str())
         })
 }
+
+#[cfg(test)]
+#[path = "frozen_write_tests.rs"]
+mod tests;

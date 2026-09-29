@@ -171,10 +171,14 @@ pub(crate) fn prepare_row_mutation(
         })
         .collect::<Vec<_>>();
     let target_schema = Schema::new(
-        exact_requested_write_fields_at_schema(&target_iceberg_schema, &requested_target_fields)?
-            .into_iter()
-            .map(|field| Arc::new(field.field().clone()))
-            .collect::<Vec<_>>(),
+        exact_requested_write_fields_at_schema(
+            &metadata,
+            &target_iceberg_schema,
+            &requested_target_fields,
+        )?
+        .into_iter()
+        .map(|field| Arc::new(field.field().clone()))
+        .collect::<Vec<_>>(),
     );
     // The match query must scan the exact target ref/base chosen above. The
     // ordinary admitted table handle names the provider's default/current ref,
@@ -1388,5 +1392,178 @@ mod tests {
             preparation.payload().as_ref(),
             b"iceberg/row-mutation-preparation/v1/ice/11111111-2222-3333-4444-555555555555/main/none/CopyOnWrite"
         );
+    }
+    fn scalar_integer_metadata_with_older_base_schema() -> TableMetadata {
+        let base_schema = Arc::new(
+            IcebergSchema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("base schema"),
+        );
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(41)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list("file:///tmp/row-mutation/snap-41.avro".to_string())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: BTreeMap::new().into_iter().collect(),
+            })
+            .with_schema_id(0)
+            .with_row_range(0, 0)
+            .build();
+        let evolved = IcebergSchema::builder()
+            .with_schema_id(2)
+            .with_fields(vec![
+                NestedField::required(1, "wide", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "renamed", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(3, "later", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .expect("evolved schema");
+        let evolved_metadata = TableMetadataBuilder::new(
+            base_schema.as_ref().clone(),
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/row-mutation".to_string(),
+            FormatVersion::V3,
+            [
+                (ROW_LINEAGE_ON.0.to_string(), ROW_LINEAGE_ON.1.to_string()),
+                (
+                    crate::scalar_integer_domain::PROPERTY.to_string(),
+                    r#"{"1":"tinyint","2":"smallint"}"#.to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("metadata builder")
+        .add_snapshot(snapshot)
+        .expect("base snapshot")
+        .set_ref(
+            "main",
+            SnapshotReference::new(
+                41,
+                SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            ),
+        )
+        .expect("main ref")
+        .add_schema(evolved)
+        .expect("evolved schema")
+        .set_current_schema(-1)
+        .expect("current schema")
+        .build()
+        .expect("evolved metadata")
+        .metadata;
+        // add_schema assigns the authoritative ID; the caller's requested
+        // schema_id is not a durable snapshot reference.
+        let evolved_snapshot = Snapshot::builder()
+            .with_snapshot_id(42)
+            .with_parent_snapshot_id(Some(41))
+            .with_sequence_number(2)
+            .with_timestamp_ms(2)
+            .with_manifest_list("file:///tmp/row-mutation/snap-42.avro".to_string())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: BTreeMap::new().into_iter().collect(),
+            })
+            .with_schema_id(evolved_metadata.current_schema_id())
+            .with_row_range(0, 0)
+            .build();
+        TableMetadataBuilder::new_from_metadata(evolved_metadata, None)
+            .add_snapshot(evolved_snapshot)
+            .expect("evolved snapshot")
+            .set_ref(
+                "main",
+                SnapshotReference::new(
+                    42,
+                    SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                ),
+            )
+            .expect("main ref")
+            .set_ref(
+                "dev",
+                SnapshotReference::new(
+                    41,
+                    SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                ),
+            )
+            .expect("dev ref")
+            .build()
+            .expect("metadata")
+            .metadata
+    }
+
+    #[test]
+    fn real_row_mutation_pins_scalar_domains_to_the_resolved_old_or_current_schema() {
+        let owner = owner();
+        let metadata = scalar_integer_metadata_with_older_base_schema();
+        for (target_ref, snapshot, expected) in [
+            (
+                "dev",
+                41,
+                vec![
+                    Field::new("id", DataType::Int8, false),
+                    Field::new("name", DataType::Int16, true),
+                ],
+            ),
+            (
+                "main",
+                42,
+                vec![
+                    Field::new("wide", DataType::Int64, false),
+                    Field::new("renamed", DataType::Int16, true),
+                    Field::new("later", DataType::Int32, true),
+                ],
+            ),
+        ] {
+            let preparation = prepared(
+                prepare_row_mutation(
+                    request(
+                        PayloadSpec::new(&metadata).handle(),
+                        target_ref,
+                        ConnectorRowMutationIntent::Delete,
+                    ),
+                    &owner,
+                )
+                .expect("prepare exact branch schema"),
+            );
+            assert_eq!(preparation.base_version_ordinal(), Some(snapshot));
+            let actual = preparation
+                .match_contract()
+                .after_fields()
+                .iter()
+                .map(|f| f.field().clone())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            let payload: IcebergTablePayload =
+                decode_payload(preparation.match_source().payload(), "frozen source")
+                    .expect("source payload");
+            let source = projected_schema(&payload, &[]).expect("source schema");
+            assert_eq!(
+                &source.fields()[..expected.len()],
+                &preparation.match_source_schema().fields()[..expected.len()]
+            );
+            for (ordinal, field) in expected.iter().enumerate() {
+                assert_eq!(source.field(ordinal).data_type(), field.data_type());
+                assert_eq!(source.field(ordinal).name(), field.name());
+                assert_eq!(source.field(ordinal).is_nullable(), field.is_nullable());
+            }
+        }
     }
 }

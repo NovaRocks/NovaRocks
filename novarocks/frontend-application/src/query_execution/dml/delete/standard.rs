@@ -787,6 +787,12 @@ fn validate_literal_for_column(
         lit_str.as_str()
     };
     match column_type {
+        DataType::Int8 => lit_str.parse::<i8>().map(|_| ()).map_err(|e| {
+            format!("parse TINYINT literal `{lit_str}` for column `{column_name}`: {e}")
+        }),
+        DataType::Int16 => lit_str.parse::<i16>().map(|_| ()).map_err(|e| {
+            format!("parse SMALLINT literal `{lit_str}` for column `{column_name}`: {e}")
+        }),
         DataType::Int32 => lit_str
             .parse::<i32>()
             .map(|_| ())
@@ -865,6 +871,26 @@ mod tests {
             column("id", DataType::Int32),
             column("v", DataType::LargeBinary),
         ]
+    }
+
+    #[test]
+    fn delete_validate_preserves_declared_scalar_integer_literal_domains() {
+        for (data_type, minimum, maximum, below, above) in [
+            (DataType::Int8, -128, 127, -129, 128),
+            (DataType::Int16, -32768, 32767, -32769, 32768),
+        ] {
+            let columns = [column("n", data_type)];
+            for literal in [minimum, maximum] {
+                super::validate_where(&where_expr(&format!("n = {literal}")), &columns)
+                    .expect("declared-domain literal is supported");
+            }
+            for literal in [below, above] {
+                let error = super::validate_where(&where_expr(&format!("n = {literal}")), &columns)
+                    .expect_err("the restricted DELETE surface retains exact-domain parsing");
+                assert!(error.contains(&format!("literal `{literal}`")), "{error}");
+                assert!(error.contains("fit in target type"), "{error}");
+            }
+        }
     }
 
     fn columns_with_timestamp() -> Vec<novarocks_types::schema::ColumnDef> {

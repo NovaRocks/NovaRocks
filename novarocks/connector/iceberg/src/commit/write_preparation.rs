@@ -429,6 +429,10 @@ fn exact_row_lineage_data_write_fields(
 fn position_delete_partition_field_requests(
     metadata: &TableMetadata,
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
+    let declarations = crate::scalar_integer_domain::of_schema(
+        metadata.current_schema(),
+        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+    )?;
     metadata
         .default_partition_spec()
         .fields()
@@ -446,6 +450,10 @@ fn position_delete_partition_field_requests(
             let data_type =
                 crate::metadata_batch_reader::iceberg_type_to_arrow_type(source.field_type.as_ref())
                 .map_err(invalid_write_activation)?;
+            let data_type = match declarations.get(&source.id) {
+                Some(domain) => domain.data_type(),
+                None => data_type,
+            };
             Ok(ConnectorWriteFieldRequest::new(Field::new(
                 &source.name,
                 data_type,
@@ -1444,6 +1452,74 @@ mod tests {
                 ConnectorErrorKind::InvalidRequest,
                 "connector write preparation table does not match the exact control owner",
             )
+        );
+    }
+    #[test]
+    fn deletion_vector_preparation_preserves_declared_i16_partition_source() {
+        let owner = owner();
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "region", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .expect("schema");
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field(
+                "region",
+                "region",
+                crate::iceberg::spec::Transform::Identity,
+            )
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            partition_spec.into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///warehouse/db/partitioned".to_string(),
+            FormatVersion::V2,
+            HashMap::from([(
+                crate::scalar_integer_domain::PROPERTY.to_string(),
+                r#"{"2":"smallint"}"#.to_string(),
+            )]),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let payload = table_payload(Some(table_info(&metadata)));
+        let request = ConnectorWritePreparationRequest {
+            table: table_handle(&owner, &payload),
+            target_ref: ConnectorWriteTargetRef::main(),
+            intent: ConnectorWriteIntent::RowDelta,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: ConnectorWriteInputRequest::DeletionVector {
+                identity_fields: vec![
+                    ConnectorWriteFieldRequest::new(Field::new("_file", DataType::Utf8, false)),
+                    ConnectorWriteFieldRequest::new(Field::new("_pos", DataType::Int64, false)),
+                ],
+                partition_source_fields: Vec::new(),
+            },
+            context: context(),
+        };
+        let preparation =
+            expect_prepared(prepare_write(request, &owner).expect("prepare deletion vector"));
+        let ConnectorWriteInputShape::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        } = preparation.input()
+        else {
+            panic!("deletion-vector input must sign a deletion-vector shape");
+        };
+        assert_eq!(identity_fields.len(), 2);
+        assert_eq!(
+            partition_source_fields
+                .iter()
+                .map(|binding| binding.field().clone())
+                .collect::<Vec<_>>(),
+            vec![Field::new("region", DataType::Int16, false)]
         );
     }
 }

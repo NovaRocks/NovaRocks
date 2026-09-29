@@ -531,6 +531,8 @@ fn ensure_supported_equality_key_type(
     if !matches!(
         data_type,
         DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
             | DataType::Int32
             | DataType::Int64
             | DataType::Float32
@@ -564,6 +566,28 @@ fn validate_equality_literals(column: &Field, values: &[&Literal]) -> Result<(),
                 other,
                 column.name()
             )),
+        }),
+        DataType::Int8 | DataType::Int16 => values.iter().try_for_each(|value| {
+            let parsed = match value {
+                Literal::Null => return Ok(()),
+                Literal::Int(v) => Some(*v),
+                Literal::String(v) => v.trim().parse::<i64>().ok(),
+                _ => None,
+            };
+            let valid = parsed.is_some_and(|value| match column.data_type() {
+                DataType::Int8 => i8::try_from(value).is_ok(),
+                DataType::Int16 => i16::try_from(value).is_ok(),
+                _ => unreachable!(),
+            });
+            if valid {
+                Ok(())
+            } else {
+                Err(format!(
+                    "literal {value:?} is not valid or is out of range for {:?} equality column `{}`",
+                    column.data_type(),
+                    column.name()
+                ))
+            }
         }),
         DataType::Int32 => values.iter().try_for_each(|value| match value {
             Literal::Null => Ok(()),
@@ -867,6 +891,36 @@ mod tests {
                 Field::new("category", DataType::Utf8, true),
             ]
         );
+    }
+
+    #[test]
+    fn equality_delete_key_columns_preserve_signed_narrow_domains_and_reject_overflow() {
+        for (data_type, minimum, maximum, below, above) in [
+            (DataType::Int8, -128, 127, -129, 128),
+            (DataType::Int16, -32768, 32767, -32769, 32768),
+        ] {
+            let field = Field::new("n", data_type, true);
+            let table = loaded_table(vec![(field.clone(), None)]);
+            let names = vec!["n".to_string()];
+            let rows = vec![
+                vec![Literal::Int(minimum)],
+                vec![Literal::String(format!(" {maximum} "))],
+                vec![Literal::Null],
+            ];
+            assert_eq!(
+                super::equality_delete_key_columns(&table, &names, &rows).expect("narrow keys"),
+                vec![field]
+            );
+            for value in [
+                Literal::Int(below),
+                Literal::String(above.to_string()),
+                Literal::Float(1.0),
+            ] {
+                let error = super::equality_delete_key_columns(&table, &names, &[vec![value]])
+                    .expect_err("invalid narrow key");
+                assert!(error.contains("out of range"), "{error}");
+            }
+        }
     }
 
     #[test]

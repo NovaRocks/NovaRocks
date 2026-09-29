@@ -60,4 +60,7 @@ ALTER TABLE ${case_db}.scalar_integer_domain MODIFY COLUMN renamed BIGINT;
 INSERT INTO ${case_db}.scalar_integer_domain (id,renamed) VALUES(999,128);
 SELECT typeof(renamed) AS wide_type,sum(renamed) AS wide_sum,count(renamed) AS wide_count
 FROM ${case_db}.scalar_integer_domain GROUP BY 1;
+
+-- query 10
+-- @skip_result_check=true
 DROP TABLE ${case_db}.scalar_integer_domain;

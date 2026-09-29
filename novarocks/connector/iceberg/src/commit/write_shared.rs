@@ -59,11 +59,12 @@ pub(crate) fn exact_requested_write_fields(
     metadata: &TableMetadata,
     requested: &[ConnectorWriteFieldRequest],
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
-    exact_requested_write_fields_at_schema(metadata.current_schema(), requested)
+    exact_requested_write_fields_at_schema(metadata, metadata.current_schema(), requested)
 }
 
 /// Resolve write fields against an already-frozen Iceberg schema.
 pub(crate) fn exact_requested_write_fields_at_schema(
+    metadata: &TableMetadata,
     iceberg_schema: &Schema,
     requested: &[ConnectorWriteFieldRequest],
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
@@ -73,6 +74,11 @@ pub(crate) fn exact_requested_write_fields_at_schema(
                 "convert frozen Iceberg write schema to Arrow: {error}"
             ))
         })?;
+    let arrow_schema = crate::scalar_integer_domain::apply_schema(
+        std::sync::Arc::new(arrow_schema),
+        iceberg_schema,
+        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
+    )?;
     requested
         .iter()
         .map(|request| {
