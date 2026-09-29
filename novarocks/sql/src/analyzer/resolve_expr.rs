@@ -230,13 +230,14 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
                 let dt = inner_typed.data_type.clone();
+                let nullable = inner_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::UnaryOp {
                         op: UnOp::Negate,
                         expr: Box::new(inner_typed),
                     },
                     data_type: dt,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -244,13 +245,14 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::BitwiseNot) => {
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
                 let dt = inner_typed.data_type.clone();
+                let nullable = inner_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::UnaryOp {
                         op: UnOp::BitwiseNot,
                         expr: Box::new(inner_typed),
                     },
                     data_type: dt,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -5610,7 +5612,7 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::super::analyze;
-    use crate::analysis::QueryBody;
+    use crate::analysis::{ExprKind, QueryBody, UnOp};
     use crate::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::catalog::PlannerTableProvider;
     use crate::planner::table::{
@@ -5688,13 +5690,21 @@ mod tests {
         sql: &str,
         function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     ) -> Result<crate::analysis::TypedExpr, String> {
+        analyze_projection_expr_with_catalog(sql, &EmptyCatalog, function_catalog)
+    }
+
+    fn analyze_projection_expr_with_catalog(
+        sql: &str,
+        catalog: &dyn PlannerTableProvider,
+        function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    ) -> Result<crate::analysis::TypedExpr, String> {
         let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
         let [ast::Statement::Query(query)] = statements.as_slice() else {
             return Err("expected query".to_string());
         };
         let (resolved, _registry, _factory) = super::super::analyze_with_function_catalog(
             query,
-            &EmptyCatalog,
+            catalog,
             "default",
             function_catalog,
         )
@@ -5708,6 +5718,170 @@ mod tests {
             .next()
             .map(|item| item.expr)
             .ok_or_else(|| "expected projection".to_string())
+    }
+
+    struct UnaryInputCatalog {
+        key_type: DataType,
+        nullable: bool,
+    }
+
+    impl PlannerTableProvider for UnaryInputCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            if table != "unary_input" {
+                return Err(format!("table not found: {table}"));
+            }
+            let column = |name: &str, data_type, nullable| novarocks_types::schema::ColumnDef {
+                name: name.to_string(),
+                data_type,
+                nullable,
+                write_default: None,
+                logical_type: None,
+            };
+            let planner = crate::planner::table::TableDef {
+                name: table.to_string(),
+                columns: vec![
+                    column("v", DataType::Int64, false),
+                    column("k", self.key_type.clone(), self.nullable),
+                ],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::Sql(SqlScanSource::new(
+                    SqlTableBindingId::new(
+                        SqlTableBindingScopeId::new(NonZeroU64::new(44).unwrap()),
+                        NonZeroU32::new(1).unwrap(),
+                    ),
+                    SqlTableIdentity {
+                        catalog: catalog.unwrap_or("default_catalog").to_string(),
+                        namespace: database.to_string(),
+                        table: table.to_string(),
+                    },
+                    SqlScanKind::Data {
+                        version: SqlTableVersionSelector::Current,
+                    },
+                )),
+            };
+            Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
+        }
+    }
+
+    #[test]
+    fn strict_unary_minus_preserves_column_type_and_null_domain() {
+        for key_type in [
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Decimal128(18, 9),
+            DataType::Decimal256(60, 2),
+        ] {
+            for nullable in [false, true] {
+                let catalog = UnaryInputCatalog {
+                    key_type: key_type.clone(),
+                    nullable,
+                };
+                let expression = analyze_projection_expr_with_catalog(
+                    "select -k from unary_input",
+                    &catalog,
+                    crate::functions::builtin_sql_function_catalog(),
+                )
+                .unwrap();
+                assert_eq!(expression.data_type, key_type);
+                assert_eq!(expression.nullable, nullable);
+                let ExprKind::UnaryOp {
+                    op: UnOp::Negate,
+                    expr: operand,
+                } = &expression.kind
+                else {
+                    panic!("expected numeric negation");
+                };
+                assert!(matches!(operand.kind, ExprKind::ColumnRef { .. }));
+                assert_eq!(operand.data_type, key_type);
+                assert_eq!(operand.nullable, nullable);
+            }
+        }
+        for nullable in [false, true] {
+            let catalog = UnaryInputCatalog {
+                key_type: DataType::Int64,
+                nullable,
+            };
+            let expression = analyze_projection_expr_with_catalog(
+                "select ~k from unary_input",
+                &catalog,
+                crate::functions::builtin_sql_function_catalog(),
+            )
+            .unwrap();
+            assert_eq!(expression.data_type, DataType::Int64);
+            assert_eq!(expression.nullable, nullable);
+        }
+    }
+
+    #[test]
+    fn strict_unary_typed_null_and_nonnull_literal_controls() {
+        for (sql, data_type, nullable) in [
+            (
+                "select -cast(null as decimal(18,9))",
+                DataType::Decimal128(18, 9),
+                true,
+            ),
+            ("select ~cast(null as bigint)", DataType::Int64, true),
+            ("select -1.25", DataType::Decimal128(3, 2), false),
+            ("select -1.25e2", DataType::Float64, false),
+            ("select ~1", DataType::Int64, false),
+        ] {
+            let expression = analyze_projection_expr(sql).unwrap();
+            assert_eq!(expression.data_type, data_type, "{sql}");
+            assert_eq!(expression.nullable, nullable, "{sql}");
+        }
+    }
+
+    #[test]
+    fn strict_unary_decimal_key_is_nullable_in_exact_aggregate_channels() {
+        let key_type = DataType::Decimal128(18, 9);
+        for nullable in [false, true] {
+            let catalog = UnaryInputCatalog {
+                key_type: key_type.clone(),
+                nullable,
+            };
+            for sql in [
+                "select max_by(v,-k) from unary_input",
+                "select min_by(v,-k) from unary_input",
+                "select array_agg(v order by -k) from unary_input",
+            ] {
+                let expression = analyze_projection_expr_with_catalog(
+                    sql,
+                    &catalog,
+                    crate::functions::builtin_sql_function_catalog(),
+                )
+                .unwrap();
+                let ExprKind::AggregateCall {
+                    args,
+                    order_by,
+                    resolved,
+                    ..
+                } = expression.kind
+                else {
+                    panic!("expected aggregate");
+                };
+                let key = if order_by.is_empty() {
+                    &args[1]
+                } else {
+                    &order_by[0].expr
+                };
+                assert_eq!(key.data_type, key_type, "{sql}");
+                assert_eq!(key.nullable, nullable, "{sql}");
+                let novarocks_functions::FunctionArgumentType::Value(bound) =
+                    &resolved.selected.argument_types[1]
+                else {
+                    panic!("expected scalar key channel");
+                };
+                assert_eq!(bound.data_type, key_type, "{sql}");
+                assert_eq!(bound.nullable, nullable, "{sql}");
+            }
+        }
     }
 
     #[test]
