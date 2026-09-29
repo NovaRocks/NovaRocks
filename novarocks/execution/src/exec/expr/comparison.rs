@@ -625,8 +625,9 @@ fn eq_value_recursive_nested(
     let left_is_null = left.is_null(left_idx);
     let right_is_null = right.is_null(right_idx);
     match (left_is_null, right_is_null) {
-        (true, true) => return Ok(NestedEq::Equal),
-        (true, false) | (false, true) => return Ok(NestedEq::Unknown),
+        // Ordinary equality remains unknown for every null leaf, including
+        // a pair of null leaves. Null-safe equality has its own recursion.
+        (true, true) | (true, false) | (false, true) => return Ok(NestedEq::Unknown),
         (false, false) => {}
     }
     if matches!(left.data_type(), DataType::List(_)) {
@@ -2641,11 +2642,75 @@ mod tests {
         let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), list_type.clone());
         let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), list_type);
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let frozen = arena.into_immutable().unwrap();
+        let arena = ExprArena::from_immutable(&frozen);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(out.value(0));
+        assert!(out.is_null(0));
         assert!(!out.value(1));
         assert!(out.is_null(2));
+    }
+
+    #[test]
+    fn prepared_nested_comparison_null_and_mismatch_contract() {
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let left = ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(vec![
+            Some(vec![Some(1), None]),
+            Some(vec![Some(1), None]),
+            Some(vec![Some(1), None, Some(3)]),
+            Some(vec![Some(1), None]),
+            Some(vec![]),
+            None,
+        ]);
+        let right = ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(vec![
+            Some(vec![Some(1), None]),
+            Some(vec![Some(2), None]),
+            Some(vec![Some(1), None, Some(4)]),
+            Some(vec![Some(1), None, Some(3)]),
+            Some(vec![]),
+            None,
+        ]);
+        let chunk = create_test_chunk_list_i64(left, right, list_type.clone());
+        let mut arena = ExprArena::default();
+        let left = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), list_type.clone());
+        let right = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), list_type);
+        let eq = arena.push_typed(ExprNode::Eq(left, right), DataType::Boolean);
+        let ne = arena.push_typed(ExprNode::Ne(left, right), DataType::Boolean);
+        let safe = arena.push_typed(ExprNode::EqForNull(left, right), DataType::Boolean);
+        let frozen = arena.into_immutable().unwrap();
+        let prepared = ExprArena::from_immutable(&frozen);
+        for (expr, expected) in [
+            (
+                eq,
+                vec![
+                    None,
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    None,
+                ],
+            ),
+            (
+                ne,
+                vec![None, Some(true), Some(true), Some(true), Some(false), None],
+            ),
+            (
+                safe,
+                vec![
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    Some(true),
+                ],
+            ),
+        ] {
+            let result = prepared.eval(expr, &chunk).unwrap();
+            let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert_eq!(result.iter().collect::<Vec<_>>(), expected);
+        }
     }
 
     #[test]
@@ -2699,9 +2764,11 @@ mod tests {
         let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), list_type.clone());
         let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), list_type);
         let expr = arena.push_typed(ExprNode::Ne(l, r), DataType::Boolean);
+        let frozen = arena.into_immutable().unwrap();
+        let arena = ExprArena::from_immutable(&frozen);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(!out.value(0));
+        assert!(out.is_null(0));
         assert!(out.value(1));
         assert!(out.is_null(2));
     }
@@ -2783,12 +2850,14 @@ mod tests {
         let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), struct_type.clone());
         let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), struct_type);
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let frozen = arena.into_immutable().unwrap();
+        let arena = ExprArena::from_immutable(&frozen);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(out.value(0));
         assert!(!out.value(1));
         assert!(out.value(2));
-        assert!(out.value(3));
+        assert!(out.is_null(3));
         assert!(out.is_null(4));
     }
 
@@ -2847,9 +2916,11 @@ mod tests {
         let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), map_type.clone());
         let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), map_type);
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let frozen = arena.into_immutable().unwrap();
+        let arena = ExprArena::from_immutable(&frozen);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(out.value(0));
+        assert!(out.is_null(0));
         assert!(out.is_null(1));
         assert!(out.is_null(2));
     }
