@@ -316,9 +316,9 @@ pub use crate::common::expr::{BinOp, LiteralValue, UnOp};
 /// decision, not an execution-layer one.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FoldNodeKind {
-    BinaryOp(BinOp),
+    BinaryOp(BinOp, novarocks_type_contract::DecimalOverflowPolicy),
     UnaryOp(UnOp),
-    Cast,
+    Cast(novarocks_type_contract::DecimalOverflowPolicy),
     Function { name: String },
 }
 
@@ -944,6 +944,21 @@ impl std::fmt::Display for SqlCompileError {
 
 impl std::error::Error for SqlCompileError {}
 
+/// Keep legacy runtime ALLOW_THROW semantics out of stateless numeric folding.
+/// The no-op port still permits structural reductions such as Nested(literal).
+/// This choice only controls optimization; it neither changes nor transports the
+/// separately frozen legacy runtime option.
+pub(crate) fn constant_evaluator_for_legacy_mode(
+    evaluator: Option<&'static dyn SqlConstantEvaluator>,
+    allow_throw_exception: bool,
+) -> Option<&'static dyn SqlConstantEvaluator> {
+    if allow_throw_exception {
+        evaluator.map(|_| noop_constant_evaluator())
+    } else {
+        evaluator
+    }
+}
+
 /// The canonical two-phase SQL compiler. Catalog materialization belongs only
 /// to [`SqlCompiler::analyze`]; optimization and plan sealing belong only to
 /// [`SqlCompiler::optimize`] after the application freezes statistics.
@@ -968,65 +983,85 @@ use completion_driver::{
 impl SqlCompiler {
     pub fn analyze(request: SqlAnalyzeRequest<'_>) -> Result<SqlAnalyzeOutput, SqlCompileError> {
         request.check_control()?;
-        let (mut logical_plan, mut factory, logical_input, consumer_requires_semantic_snapshot) =
-            match &request.statement.kind {
-                SqlStatementInputKind::LogicalPlan { plan, factory } => (
-                    plan.clone(),
-                    factory.clone(),
-                    true,
-                    (request
-                        .session
-                        .sql_semantics
-                        .sql_mode()
-                        .group_concat_legacy()
-                        || request.session.sql_semantics.decimal_overflow_to_double()),
-                ),
-                _ => {
-                    let query = parse_query(&request.statement)?;
-                    let catalog = request
-                        .catalog
-                        .ok_or_else(|| {
-                            SqlCompileError::InvalidRequest(
-                                "SQL analysis requires a catalog snapshot".to_string(),
-                            )
-                        })?
-                        .planner_table_provider();
-                    let functions = request.function_catalog().ok_or_else(|| {
+        let (
+            mut logical_plan,
+            mut factory,
+            logical_input,
+            consumer_requires_semantic_snapshot,
+            legacy_allow_throw_exception,
+        ) = match &request.statement.kind {
+            SqlStatementInputKind::LogicalPlan { plan, factory } => (
+                plan.clone(),
+                factory.clone(),
+                true,
+                (request
+                    .session
+                    .sql_semantics
+                    .sql_mode()
+                    .group_concat_legacy()
+                    || request.session.sql_semantics.decimal_overflow_to_double()
+                    || request.session.sql_semantics.sql_mode().error_if_overflow()),
+                request
+                    .session
+                    .sql_semantics
+                    .sql_mode()
+                    .allow_throw_exception(),
+            ),
+            _ => {
+                let query = parse_query(&request.statement)?;
+                let catalog = request
+                    .catalog
+                    .ok_or_else(|| {
                         SqlCompileError::InvalidRequest(
-                            "SQL analysis requires a function catalog".to_string(),
+                            "SQL analysis requires a catalog snapshot".to_string(),
                         )
-                    })?;
-                    let (resolved, ctes, mut factory) =
-                        crate::analyzer::analyze_with_function_catalog_and_sql_semantics(
-                            &query,
-                            catalog,
-                            &request.session.current_database,
-                            functions,
-                            &request.session.sql_semantics,
-                        )
-                        .map_err(SqlCompileError::Analyze)?;
-                    request.check_control()?;
-                    let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
-                        .map_err(SqlCompileError::Compilation)?;
-                    let consumer_requires_semantic_snapshot =
-                        crate::sql_mode::query_uses_group_concat_legacy(
+                    })?
+                    .planner_table_provider();
+                let functions = request.function_catalog().ok_or_else(|| {
+                    SqlCompileError::InvalidRequest(
+                        "SQL analysis requires a function catalog".to_string(),
+                    )
+                })?;
+                let (resolved, ctes, mut factory) =
+                    crate::analyzer::analyze_with_function_catalog_and_sql_semantics(
+                        &query,
+                        catalog,
+                        &request.session.current_database,
+                        functions,
+                        &request.session.sql_semantics,
+                    )
+                    .map_err(SqlCompileError::Analyze)?;
+                request.check_control()?;
+                let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
+                    .map_err(SqlCompileError::Compilation)?;
+                let consumer_requires_semantic_snapshot =
+                    crate::sql_mode::query_uses_group_concat_legacy(
+                        &request.session.sql_semantics,
+                        &query,
+                    )
+                    .map_err(SqlCompileError::Analyze)?
+                        || crate::sql_mode::query_uses_decimal_overflow_to_double(
                             &request.session.sql_semantics,
                             &query,
                         )
                         .map_err(SqlCompileError::Analyze)?
-                            || crate::sql_mode::query_uses_decimal_overflow_to_double(
-                                &request.session.sql_semantics,
-                                &query,
-                            )
-                            .map_err(SqlCompileError::Analyze)?;
-                    (
-                        logical_plan,
-                        factory,
-                        false,
-                        consumer_requires_semantic_snapshot,
-                    )
-                }
-            };
+                        || crate::sql_mode::query_uses_error_if_overflow(
+                            &request.session.sql_semantics,
+                            &query,
+                        )
+                        .map_err(SqlCompileError::Analyze)?;
+                (
+                    logical_plan,
+                    factory,
+                    false,
+                    consumer_requires_semantic_snapshot,
+                    crate::sql_mode::query_sql_semantics(&request.session.sql_semantics, &query)
+                        .map_err(SqlCompileError::Analyze)?
+                        .sql_mode()
+                        .allow_throw_exception(),
+                )
+            }
+        };
         request.check_control()?;
 
         if matches!(request.intent, SqlCompileIntent::AnalyzeOnly) {
@@ -1164,7 +1199,10 @@ impl SqlCompiler {
             change_stream,
             mv_rewrite,
             function_catalog,
-            constant_evaluator: request.constant_evaluator,
+            constant_evaluator: constant_evaluator_for_legacy_mode(
+                request.constant_evaluator,
+                legacy_allow_throw_exception,
+            ),
         }))
     }
 
@@ -2517,6 +2555,59 @@ mod tests {
             assert_eq!(result.fields.len(), 1);
             assert_eq!(result.fields[0].ty.data_type, expected);
             assert!(result.fields[0].ty.nullable);
+        }
+    }
+
+    #[test]
+    fn analyzed_root_allow_mode_freezes_only_the_numeric_fold_eligibility() {
+        struct NullableEvaluator;
+        impl SqlConstantEvaluator for NullableEvaluator {
+            fn eval_scalar(&self, _: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+                Ok(Some(LiteralValue::Null))
+            }
+        }
+        static EVALUATOR: NullableEvaluator = NullableEvaluator;
+        for (session_mode, sql, disabled) in [
+            ("32", "SELECT CAST(1000 AS DECIMAL(3,0))", false),
+            (
+                "32",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(1000 AS DECIMAL(3,0))",
+                true,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT CAST(1000 AS DECIMAL(3,0))",
+                true,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode=32) */ CAST(1000 AS DECIMAL(3,0))",
+                false,
+            ),
+        ] {
+            let cancellation = Arc::new(Cancellation::default());
+            let mut input = request(control(None, &cancellation));
+            input.statement = SqlStatementInput::sql(sql);
+            input.constant_evaluator = Some(&EVALUATOR);
+            input.session.sql_semantics = input
+                .session
+                .sql_semantics
+                .clone()
+                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
+            let pending = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+            let result = pending
+                .constant_evaluator
+                .unwrap()
+                .eval_scalar(&FoldRequest {
+                    kind: FoldNodeKind::Cast(
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    ),
+                    args: Vec::new(),
+                    out_type: arrow::datatypes::DataType::Decimal128(3, 0),
+                    out_nullable: true,
+                })
+                .unwrap();
+            assert_eq!(result.is_none(), disabled);
         }
     }
 }

@@ -146,7 +146,13 @@ fn cast_to_type_if_needed(
     if source_type == target_type {
         return Ok(expr);
     }
-    Ok(arena.push_typed(ExprNode::Cast(expr), target_type.clone()))
+    Ok(arena.push_typed(
+        ExprNode::Cast(
+            expr,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
+        target_type.clone(),
+    ))
 }
 
 pub(crate) fn lower_between(
@@ -265,7 +271,7 @@ mod tests {
         assert_eq!(arena.data_type(*child), Some(&DataType::Utf8));
         assert_eq!(values.len(), 1);
         assert_eq!(arena.data_type(values[0]), Some(&DataType::Utf8));
-        let Some(ExprNode::Cast(inner)) = arena.node(values[0]) else {
+        let Some(ExprNode::Cast(inner, _)) = arena.node(values[0]) else {
             panic!("expected numeric candidate cast to Utf8");
         };
         assert!(matches!(

@@ -795,7 +795,9 @@ fn estimate_selectivity_scalar(
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     match arena.node(expr) {
-        ScalarNode::BinaryOp { left, op, right } => match *op {
+        ScalarNode::BinaryOp {
+            left, op, right, ..
+        } => match *op {
             BinOp::And => {
                 let mut conjuncts = Vec::new();
                 flatten_and_scalar(arena, expr, &mut conjuncts);
@@ -886,6 +888,7 @@ fn flatten_and_scalar(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarI
             op: BinOp::And,
             left,
             right,
+            ..
         } => {
             flatten_and_scalar(arena, *left, out);
             flatten_and_scalar(arena, *right, out);
@@ -1761,6 +1764,7 @@ fn collect_equi_join_column_pairs_inner_scalar(
             left,
             op: BinOp::Eq | BinOp::EqForNull,
             right,
+            ..
         } => {
             if let (Some(left_id), Some(right_id)) = (
                 extract_column_id_scalar(arena, *left),
@@ -1773,6 +1777,7 @@ fn collect_equi_join_column_pairs_inner_scalar(
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             collect_equi_join_column_pairs_inner_scalar(arena, *left, pairs);
             collect_equi_join_column_pairs_inner_scalar(arena, *right, pairs);
@@ -1985,6 +1990,7 @@ fn collect_join_conjuncts_scalar(
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             collect_join_conjuncts_scalar(
                 arena,
@@ -2032,6 +2038,7 @@ fn try_collect_equi_key_scalar(
         left,
         op: BinOp::Eq | BinOp::EqForNull,
         right,
+        ..
     } = arena.node(expr)
     else {
         return false;
@@ -2101,6 +2108,7 @@ fn is_unknown_column_literal_eq_scalar(
         left,
         op: BinOp::Eq | BinOp::EqForNull,
         right,
+        ..
     } = arena.node(expr)
     else {
         return false;
@@ -3846,6 +3854,7 @@ mod tests {
                 left: Box::new(left),
                 op: crate::analysis::BinOp::Eq,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -3858,6 +3867,7 @@ mod tests {
                 left: Box::new(left),
                 op: crate::analysis::BinOp::And,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -5872,6 +5882,8 @@ mod tests {
                     op: BinOp::And,
                     left: Box::new(lit(1)),
                     right: Box::new(lit(2)),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             };
             intern_typed(&mut memo.scalars, &and)

@@ -1304,11 +1304,17 @@ fn test_array_generate_date_with_unit_arg() {
         DataType::Utf8,
     );
     let start = arena.push_typed(
-        ExprNode::Cast(start),
+        ExprNode::Cast(
+            start,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let stop = arena.push_typed(
-        ExprNode::Cast(stop),
+        ExprNode::Cast(
+            stop,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let step = common::literal_i64(&mut arena, 1);
@@ -1348,11 +1354,17 @@ fn test_array_generate_datetime_null_step_errors() {
         DataType::Utf8,
     );
     let start = arena.push_typed(
-        ExprNode::Cast(start),
+        ExprNode::Cast(
+            start,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let stop = arena.push_typed(
-        ExprNode::Cast(stop),
+        ExprNode::Cast(
+            stop,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let step = common::typed_null(&mut arena, DataType::Int64);
@@ -1655,7 +1667,13 @@ fn test_array_length_const_cast_json_array() {
         DataType::Utf8,
     );
     let arr_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-    let cast_expr = arena.push_typed(ExprNode::Cast(lit), arr_type);
+    let cast_expr = arena.push_typed(
+        ExprNode::Cast(
+            lit,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
+        arr_type,
+    );
 
     let array = Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef;
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1702,7 +1720,14 @@ fn eval_array_map_with_lambda() {
     let slot_y = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
 
     // Lambda body: x + y
-    let add_expr = arena.push_typed(ExprNode::Add(slot_x, slot_y), DataType::Int64);
+    let add_expr = arena.push_typed(
+        ExprNode::Add(
+            slot_x,
+            slot_y,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
+        DataType::Int64,
+    );
 
     let lambda = arena.push_typed(
         ExprNode::LambdaFunction {
@@ -2203,7 +2228,14 @@ fn test_array_sort_lambda_descending() {
 
     let x_slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), item_type.clone());
     let y_slot = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), item_type.clone());
-    let body = arena.push_typed(ExprNode::Sub(y_slot, x_slot), item_type.clone());
+    let body = arena.push_typed(
+        ExprNode::Sub(
+            y_slot,
+            x_slot,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
+        item_type.clone(),
+    );
     let lambda = arena.push_typed(
         ExprNode::LambdaFunction {
             body,

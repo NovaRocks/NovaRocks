@@ -77,7 +77,9 @@ fn lower_atom(
     predicate: &TypedExpr,
 ) -> Option<(u32, Domain)> {
     match &unnest(predicate).kind {
-        ExprKind::BinaryOp { left, op, right } => {
+        ExprKind::BinaryOp {
+            left, op, right, ..
+        } => {
             let (column, op, literal) = if let Some(column) = lower_column(scan, columns, left) {
                 (column, *op, right.as_ref())
             } else {
@@ -341,6 +343,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,

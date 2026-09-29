@@ -583,6 +583,7 @@ pub enum ExprKind {
         left: Box<TypedExpr>,
         op: BinOp,
         right: Box<TypedExpr>,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     /// Unary operation.
     UnaryOp { op: UnOp, expr: Box<TypedExpr> },
@@ -621,6 +622,7 @@ pub enum ExprKind {
     Cast {
         expr: Box<TypedExpr>,
         target: DataType,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     /// IS [NOT] NULL.
     IsNull { expr: Box<TypedExpr>, negated: bool },

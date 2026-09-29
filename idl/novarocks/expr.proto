@@ -73,10 +73,19 @@ message LiteralExpr {
 // Binary operator expression.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
+// Frozen decimal failure behavior. Zero is deliberately inadmissible; an
+// omitted proto3 field must not become an implicit OutputNull semantic default.
+enum DecimalOverflowPolicy {
+  DECIMAL_OVERFLOW_POLICY_UNSPECIFIED = 0;
+  DECIMAL_OVERFLOW_POLICY_OUTPUT_NULL = 1;
+  DECIMAL_OVERFLOW_POLICY_REPORT_ERROR = 2;
+}
+
 message BinaryOpExpr {
   BinaryOp op = 1;  // binary operator.
   Expr left = 2;    // left operand.
   Expr right = 3;   // right operand.
+  DecimalOverflowPolicy decimal_overflow_policy = 4; // mandatory frozen expression policy.
 }
 
 // Unary operator expression.
@@ -125,6 +134,7 @@ message WindowCall {
 message CastExpr {
   Expr operand = 1;                         // expression being cast.
   novarocks.common.TypeDesc target = 2;     // target SQL type.
+  DecimalOverflowPolicy decimal_overflow_policy = 3; // mandatory frozen expression policy.
 }
 
 // IS NULL / IS NOT NULL predicate.

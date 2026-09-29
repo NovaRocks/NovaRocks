@@ -106,7 +106,9 @@ fn as_range_conjunct(
         Some(value.clone())
     };
     match arena.node(expr) {
-        ScalarNode::BinaryOp { left, op, right } => {
+        ScalarNode::BinaryOp {
+            left, op, right, ..
+        } => {
             let (col, lit, op) = if let (Some(c), Some(l)) = (col_of(*left), lit_of(*right)) {
                 (c, l, *op)
             } else if let (Some(l), Some(c)) = (lit_of(*left), col_of(*right)) {
@@ -376,6 +378,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,

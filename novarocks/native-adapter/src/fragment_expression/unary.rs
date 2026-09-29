@@ -60,7 +60,14 @@ pub(crate) fn lower_unary_op(
             let zero = literal::push_zero_literal(arena, &zero_type).map_err(|error| {
                 super::NativeExpressionDecodeError::invalid_value(path.clone(), error)
             })?;
-            Ok(arena.push_typed(ExprNode::Sub(zero, operand), data_type))
+            Ok(arena.push_typed(
+                ExprNode::Sub(
+                    zero,
+                    operand,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
+                data_type,
+            ))
         }
         expr::UnaryOp::BitwiseNot => {
             let kind = lookup_function("bitnot").ok_or_else(|| {

@@ -399,6 +399,7 @@ impl<'a> QualifiedLineageCollector<'a> {
                 left,
                 op: BinOp::And,
                 right,
+                ..
             } => {
                 self.collect_join_predicates(left, sides, out)?;
                 self.collect_join_predicates(right, sides, out)
@@ -407,6 +408,7 @@ impl<'a> QualifiedLineageCollector<'a> {
                 left,
                 op: BinOp::Eq,
                 right,
+                ..
             } => {
                 let left_ref = self.single_qualified_column(left)?;
                 let right_ref = self.single_qualified_column(right)?;

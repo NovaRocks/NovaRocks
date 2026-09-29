@@ -365,6 +365,7 @@ fn collect_join_equality_pairs(
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             collect_join_equality_pairs(
                 arena,
@@ -389,6 +390,7 @@ fn collect_join_equality_pairs(
             left,
             op: BinOp::Eq,
             right,
+            ..
         } => {
             let left_ref =
                 classify_column_ref(arena, *left, left_ids, right_ids, left_names, right_names)?;
@@ -817,6 +819,7 @@ mod tests {
                 op: BinOp::Add,
                 left: left_key,
                 right: right_key,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Int64,
             false,
@@ -846,6 +849,7 @@ mod tests {
             ScalarNode::Cast {
                 child: right_key,
                 target: DataType::Int64,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Int64,
             false,
@@ -855,6 +859,7 @@ mod tests {
                 op: BinOp::Eq,
                 left: nested_left,
                 right: cast_right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             false,

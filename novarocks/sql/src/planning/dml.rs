@@ -1939,6 +1939,7 @@ fn merge_action_predicate(
             op: crate::common::BinOp::Eq,
             left: action_expr,
             right: literal,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         arrow::datatypes::DataType::Boolean,
         false,

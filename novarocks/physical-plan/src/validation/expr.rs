@@ -282,7 +282,27 @@ pub(crate) fn validate_expression(
                 }
             }
         }
-        ExprKind::Binary { left, op, right } => {
+        ExprKind::Binary {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } => {
+            if !matches!(
+                op,
+                crate::BinaryOperator::Add
+                    | crate::BinaryOperator::Subtract
+                    | crate::BinaryOperator::Multiply
+                    | crate::BinaryOperator::Divide
+                    | crate::BinaryOperator::Modulo
+            ) && *decimal_overflow_policy
+                != novarocks_type_contract::DecimalOverflowPolicy::OutputNull
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "non-arithmetic binary expression requires OutputNull decimal policy",
+                ));
+            }
             if let (Some(left), Some(right)) = (
                 fragment.expressions().get(*left),
                 fragment.expressions().get(*right),
@@ -369,7 +389,23 @@ pub(crate) fn validate_expression(
                 validate_window_frame(fragment, frame, &path, errors);
             }
         }
-        ExprKind::Cast { expr, target } => {
+        ExprKind::Cast {
+            expr,
+            target,
+            decimal_overflow_policy,
+        } => {
+            if let Some(input) = fragment.expressions().get(*expr)
+                && !novarocks_type_contract::decimal_error_policy_cast_supported(
+                    &input.ty.data_type,
+                    target,
+                    *decimal_overflow_policy,
+                )
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "ReportError decimal CAST does not support nested type conversion",
+                ));
+            }
             // A cast names the type it produces, and may admit null where its
             // input does not -- the conversion itself can fail, and the
             // statement may stand this value where null is admitted. It may

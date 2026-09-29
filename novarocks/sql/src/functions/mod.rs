@@ -1058,7 +1058,10 @@ fn validate_builtin_selected_domain(
                 | DataType::Utf8
                 | DataType::Decimal128(..)
         ),
-        "encode_sort_key" | "encode_row_id" => {
+        // ENCODE_ROW_ID is the installed fingerprint alias. Its owner ignores
+        // unencoded carriers; ENCODE_SORT_KEY instead rejects them.
+        "encode_fingerprint_sha256" | "encode_row_id" => true,
+        "encode_sort_key" => {
             matches!(
                 ty,
                 DataType::Null
@@ -3077,7 +3080,7 @@ mod tests {
     #[test]
     fn variadic_typed_encoders_close_unsupported_shape_before_optimization() {
         let catalog = build_builtin_engine_function_catalog().unwrap();
-        for name in ["mv_group_row_id", "encode_sort_key", "encode_row_id"] {
+        for name in ["mv_group_row_id", "encode_sort_key"] {
             let arguments = [value_argument(
                 DataType::List(Arc::new(arrow::datatypes::Field::new(
                     "item",
@@ -3135,6 +3138,75 @@ mod tests {
             novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
         );
     }
+    #[test]
+    fn fingerprint_alias_preserves_ignored_container_selected_profiles() {
+        use arrow::datatypes::{Field, Fields};
+        use novarocks_type_contract::FunctionIntrinsicRowError;
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let element = Arc::new(
+            Field::new("element", DataType::Int32, true).with_metadata(
+                [("PARQUET:field_id".to_string(), "5".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        let fields: Fields = vec![
+            Arc::new(Field::new("key", DataType::Int32, false)),
+            Arc::new(Field::new("value", DataType::Utf8, true)),
+        ]
+        .into();
+        for ignored in [
+            DataType::List(element),
+            DataType::Struct(fields.clone()),
+            DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                false,
+            ),
+        ] {
+            let arguments = [
+                value_argument(DataType::Int64, false, None),
+                value_argument(DataType::Utf8, true, None),
+                value_argument(ignored, true, None),
+            ];
+            for name in ["encode_row_id", "encode_fingerprint_sha256"] {
+                let bound = resolve_exact_scalar(&catalog, name, &arguments);
+                assert_eq!(
+                    bound.selected.argument_types.as_ref(),
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(scalar_result(&bound).data_type, DataType::Binary);
+                assert_eq!(
+                    bound.semantics.intrinsic_row_error,
+                    FunctionIntrinsicRowError::NoRowError
+                );
+                catalog
+                    .validate_bound(
+                        &bound,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len(),
+                        },
+                    )
+                    .unwrap();
+            }
+            assert!(
+                catalog
+                    .resolve_bound_user(
+                        "encode_sort_key",
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn field_exact_binding_rejects_containers_and_preserves_comparable_profiles() {
         use arrow::datatypes::{Field, Fields, TimeUnit};

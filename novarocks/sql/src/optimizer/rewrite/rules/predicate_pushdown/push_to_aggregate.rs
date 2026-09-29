@@ -112,6 +112,9 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
 
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
+        if scalar_expr::can_fail(&arena, filter_op.predicate) {
+            return Ok(RewriteResult::Unchanged);
+        }
 
         // GROUP BY key ColumnIds — only bare ColumnRef items contribute
         // pushable ids; computed GROUP BY expressions do not.
@@ -241,6 +244,7 @@ mod tests {
                 left: Box::new(a),
                 op: BinOp::Eq,
                 right: Box::new(b),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }

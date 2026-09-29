@@ -265,7 +265,7 @@ SELECT
     decimal256_50_15 + smallint_val as decimal256_plus_smallint,
     decimal256_50_15 + int_val as decimal256_plus_int,
     decimal256_50_15 + bigint_val as decimal256_plus_bigint,
-    decimal256_50_15 + largeint_val as decimal256_plus_largeint
+    CAST(decimal256_50_15 + largeint_val AS VARCHAR) as decimal256_plus_largeint
 FROM ${case_db}.cast_test_source
 WHERE decimal256_50_15 IS NOT NULL AND tinyint_val IS NOT NULL
 ORDER BY id;

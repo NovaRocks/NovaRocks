@@ -182,14 +182,17 @@ pub(super) fn expr_phys_eq(
                 left: la,
                 op: oa,
                 right: ra,
+                decimal_overflow_policy: pa,
             },
             ScalarNode::BinaryOp {
                 left: lb,
                 op: ob,
                 right: rb,
+                decimal_overflow_policy: pb,
             },
         ) => {
-            oa == ob
+            pa == pb
+                && oa == ob
                 && ((expr_phys_eq(arena, *la, *lb, map) && expr_phys_eq(arena, *ra, *rb, map))
                     || (matches!(oa, BinOp::Eq | BinOp::Ne)
                         && expr_phys_eq(arena, *la, *rb, map)
@@ -324,6 +327,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,

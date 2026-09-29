@@ -2,105 +2,69 @@
 274.97790000000000000000 * ((round(1103.00000000000000000000 * 1.0000, 16)) / (round(1103.00000000000000000000, 16)))
 NULL
 
--- query 3
-274.97790000000000000000 * ((round(1103.00000000000000000000 * 1.0000, 16)) / (round(1103.00000000000000000000, 16)))
-NULL
-
 -- query 4
 CAST((c_d32 * c_d32) AS DECIMAL128(38,0))
-999999980000
+NULL
 
 -- query 5
-CAST((c_d32 * c_d32) AS decimal32)
-999999980000
+CAST((c_d32 * c_d32) AS DECIMAL128(38,0))
+NULL
 
 -- query 6
-CAST((c_d64 * c_d64) AS decimal64)
+CAST((c_d64 * c_d64) AS DECIMAL128(38,0))
 NULL
 
 -- query 7
-CAST((c_d64 * c_d64) AS decimal64)
+CAST((c_d64 * c_d64) AS DECIMAL128(38,0))
 NULL
 
 -- query 8
-CAST((c_d128 * c_d128) AS decimal128)
+CAST((c_d128 * c_d128) AS DECIMAL128(38,0))
 NULL
 
 -- query 9
-CAST((c_d128 * c_d128) AS decimal128)
+CAST((c_d128 * c_d128) AS DECIMAL128(38,0))
 NULL
 
 -- query 10
-CAST((c_d32 * 1.000) AS decimal32)
+CAST((c_d32 * 1.000) AS DECIMAL128(38,0))
 1000000
 
 -- query 11
-CAST((c_d32 * 1.000) AS decimal32)
+CAST((c_d32 * 1.000) AS DECIMAL128(38,0))
 -1000000
 
 -- query 12
-CAST((c_d64 * 1.000000) AS decimal64)
+CAST((c_d64 * 1.000000) AS DECIMAL128(38,0))
 10000000000000
 
 -- query 13
-CAST((c_d64 * 1.000000) AS decimal64)
+CAST((c_d64 * 1.000000) AS DECIMAL128(38,0))
 -10000000000000
 
 -- query 14
-CAST((c_d128 * 1.000000000) AS decimal128)
+CAST((c_d128 * 1.000000000) AS DECIMAL128(38,0))
 NULL
 
 -- query 15
-CAST((c_d128 * 1.000000000) AS decimal128)
-NULL
-
--- query 16
-CAST((c_d32 * c_d32) AS decimal32)
-999999980000
-
--- query 17
-CAST((c_d32 * c_d32) AS decimal32)
-999999980000
-
--- query 18
-CAST((c_d64 * c_d64) AS decimal64)
-NULL
-
--- query 19
-CAST((c_d64 * c_d64) AS decimal64)
-NULL
-
--- query 20
-CAST((c_d128 * c_d128) AS decimal128)
-NULL
-
--- query 21
-CAST((c_d128 * c_d128) AS decimal128)
+CAST((c_d128 * 1.000000000) AS DECIMAL128(38,0))
 NULL
 
 -- query 22
-CAST((c_d32 * 1.000) AS decimal32)
+CAST((c_d32 * 1.000) AS DECIMAL128(38,0))
 1000000
 
 -- query 23
-CAST((c_d32 * 1.000) AS decimal32)
+CAST((c_d32 * 1.000) AS DECIMAL128(38,0))
 -1000000
 
 -- query 24
-CAST((c_d64 * 1.000000) AS decimal64)
+CAST((c_d64 * 1.000000) AS DECIMAL128(38,0))
 10000000000000
 
 -- query 25
-CAST((c_d64 * 1.000000) AS decimal64)
+CAST((c_d64 * 1.000000) AS DECIMAL128(38,0))
 -10000000000000
-
--- query 26
-CAST((c_d128 * 1.000000000) AS decimal128)
-NULL
-
--- query 27
-CAST((c_d128 * 1.000000000) AS decimal128)
-NULL
 
 -- query 28
 c_id - 1.12345678901234567890
@@ -113,11 +77,3 @@ adjust_lt
 -- query 30
 adjust_lt
 -291.2137392418358345703798959387468
-
--- query 31
-adjust_lt
-NULL
-
--- query 32
-adjust_lt
-NULL

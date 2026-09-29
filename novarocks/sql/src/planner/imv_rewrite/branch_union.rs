@@ -964,6 +964,8 @@ mod tests {
                             data_type: DataType::Int32,
                             nullable: false,
                         }),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -1022,6 +1024,7 @@ mod tests {
                 left: Box::new(col_expr(left_region_id, "region")),
                 op: BinOp::Eq,
                 right: Box::new(col_expr(right_region_id, "region")),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,

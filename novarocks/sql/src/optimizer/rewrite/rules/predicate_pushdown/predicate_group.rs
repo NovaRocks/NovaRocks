@@ -68,6 +68,7 @@ pub(crate) struct PredicateGroup {
     )]
     pub(crate) derived: PredicateDerivedKind,
     pub(crate) deterministic: bool,
+    pub(crate) can_fail: bool,
 }
 
 impl PredicateGroup {
@@ -90,6 +91,7 @@ impl PredicateGroup {
             origin,
             derived,
             deterministic,
+            can_fail: scalar_expr::can_fail(arena, expr),
         }
     }
 
@@ -118,13 +120,20 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             left,
             op: BinOp::And,
             right,
+            ..
         } => canonical_bool_key(arena, "AND", *left, *right),
         ScalarNode::BinaryOp {
             left,
             op: BinOp::Or,
             right,
+            ..
         } => canonical_bool_key(arena, "OR", *left, *right),
-        ScalarNode::BinaryOp { left, op, right } => {
+        ScalarNode::BinaryOp {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } => {
             // For commutative ops (Eq, Ne) canonicalize operand order so that
             // `a = b` and `b = a` produce the same key regardless of which
             // direction the arena normalization swapped them.
@@ -135,7 +144,7 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             } else {
                 (lk, rk)
             };
-            format!("BinaryOp({op:?},{lk},{rk})")
+            format!("BinaryOp({op:?},{decimal_overflow_policy:?},{lk},{rk})")
         }
         ScalarNode::UnaryOp { op, child } => {
             format!("UnaryOp({op:?},{})", canonical_expr_key(arena, *child))
@@ -165,8 +174,15 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             "AggregateCall({name},{distinct},{},{order_by:?})",
             canonical_expr_list_key(arena, args)
         ),
-        ScalarNode::Cast { child, target } => {
-            format!("Cast({},{target:?})", canonical_expr_key(arena, *child))
+        ScalarNode::Cast {
+            child,
+            target,
+            decimal_overflow_policy,
+        } => {
+            format!(
+                "Cast({},{target:?},{decimal_overflow_policy:?})",
+                canonical_expr_key(arena, *child)
+            )
         }
         ScalarNode::IsNull { child, negated } => {
             format!("IsNull({},{negated})", canonical_expr_key(arena, *child))
@@ -279,6 +295,7 @@ fn collect_bool_terms(arena: &ScalarArena, expr: ScalarId, op_name: &str, out: &
                 left,
                 op: BinOp::And,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             "AND",
         )
@@ -287,6 +304,7 @@ fn collect_bool_terms(arena: &ScalarArena, expr: ScalarId, op_name: &str, out: &
                 left,
                 op: BinOp::Or,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             "OR",
         ) => {
@@ -354,6 +372,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,

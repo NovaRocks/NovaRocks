@@ -36,6 +36,7 @@ use crate::exec::chunk::ChunkFieldSchema;
 use arrow::array::{ArrayRef, new_null_array};
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
+pub use novarocks_type_contract::DecimalOverflowPolicy;
 use novarocks_types::SlotId;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -95,14 +96,14 @@ pub enum ExprNode {
         child: ExprId,
         dict: Arc<HashMap<i32, Vec<u8>>>,
     },
-    Cast(ExprId),
-    CastTime(ExprId),
-    CastTimeFromDatetime(ExprId),
-    Add(ExprId, ExprId),
-    Sub(ExprId, ExprId),
-    Mul(ExprId, ExprId),
-    Div(ExprId, ExprId),
-    Mod(ExprId, ExprId),
+    Cast(ExprId, DecimalOverflowPolicy),
+    CastTime(ExprId, DecimalOverflowPolicy),
+    CastTimeFromDatetime(ExprId, DecimalOverflowPolicy),
+    Add(ExprId, ExprId, DecimalOverflowPolicy),
+    Sub(ExprId, ExprId, DecimalOverflowPolicy),
+    Mul(ExprId, ExprId, DecimalOverflowPolicy),
+    Div(ExprId, ExprId, DecimalOverflowPolicy),
+    Mod(ExprId, ExprId, DecimalOverflowPolicy),
     Eq(ExprId, ExprId),
     EqForNull(ExprId, ExprId),
     Ne(ExprId, ExprId),
@@ -146,6 +147,22 @@ pub struct ExprArena {
 }
 
 impl ExprArena {
+    /// Inspect an immutable expression fact; arithmetic kernels receive it
+    /// directly from their node and never consult query-wide throw settings.
+    pub fn decimal_overflow_policy(&self, id: ExprId) -> Option<DecimalOverflowPolicy> {
+        match self.node(id)? {
+            ExprNode::Cast(_, policy)
+            | ExprNode::CastTime(_, policy)
+            | ExprNode::CastTimeFromDatetime(_, policy)
+            | ExprNode::Add(_, _, policy)
+            | ExprNode::Sub(_, _, policy)
+            | ExprNode::Mul(_, _, policy)
+            | ExprNode::Div(_, _, policy)
+            | ExprNode::Mod(_, _, policy) => Some(*policy),
+            _ => None,
+        }
+    }
+
     /// Bind only the runtime arena, after static program materialization.
     pub(crate) fn bind_runtime_error(
         &mut self,
@@ -286,16 +303,16 @@ impl ExprArena {
             ExprNode::DictDecode { child, dict } => {
                 dict_decode::eval_dict_decode(self, id, *child, dict, chunk)
             }
-            ExprNode::Cast(child) => cast::eval(self, id, *child, chunk),
-            ExprNode::CastTime(child) => cast::eval_time(self, id, *child, chunk),
-            ExprNode::CastTimeFromDatetime(child) => {
+            ExprNode::Cast(child, policy) => cast::eval(self, id, *child, *policy, chunk),
+            ExprNode::CastTime(child, _) => cast::eval_time(self, id, *child, chunk),
+            ExprNode::CastTimeFromDatetime(child, _) => {
                 cast::eval_time_from_datetime(self, id, *child, chunk)
             }
-            ExprNode::Add(a, b) => arithmetic::eval_add(self, id, *a, *b, chunk),
-            ExprNode::Sub(a, b) => arithmetic::eval_sub(self, id, *a, *b, chunk),
-            ExprNode::Mul(a, b) => arithmetic::eval_mul(self, id, *a, *b, chunk),
-            ExprNode::Div(a, b) => arithmetic::eval_div(self, id, *a, *b, chunk),
-            ExprNode::Mod(a, b) => arithmetic::eval_mod(self, id, *a, *b, chunk),
+            ExprNode::Add(a, b, policy) => arithmetic::eval_add(self, id, *a, *b, *policy, chunk),
+            ExprNode::Sub(a, b, policy) => arithmetic::eval_sub(self, id, *a, *b, *policy, chunk),
+            ExprNode::Mul(a, b, policy) => arithmetic::eval_mul(self, id, *a, *b, *policy, chunk),
+            ExprNode::Div(a, b, policy) => arithmetic::eval_div(self, id, *a, *b, *policy, chunk),
+            ExprNode::Mod(a, b, policy) => arithmetic::eval_mod(self, id, *a, *b, *policy, chunk),
             ExprNode::Eq(a, b) => comparison::eval_eq(self, *a, *b, chunk),
             ExprNode::EqForNull(a, b) => comparison::eval_eq_for_null(self, *a, *b, chunk),
             ExprNode::Ne(a, b) => comparison::eval_ne(self, *a, *b, chunk),

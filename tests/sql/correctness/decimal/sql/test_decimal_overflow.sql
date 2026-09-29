@@ -47,6 +47,8 @@ insert into ${case_db}.avg_test values (1, [11, 12, 13, 14, 15, 16, 17, 18, 19, 
 select 274.97790000000000000000 * (round(1103.00000000000000000000 * 1.0000,16) /round(1103.00000000000000000000,16));
 
 -- query 3
+-- @skip_result_check=true
+-- @expect_error=The 'mul' operation involving decimal values overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ 274.97790000000000000000 * (round(1103.00000000000000000000 * 1.0000,16) /round(1103.00000000000000000000,16));
 
 -- query 4
@@ -86,21 +88,33 @@ select cast(c_d128 * 1.000000000 as decimal128) from ${case_db}.t_decimal_overfl
 select cast(c_d128 * 1.000000000 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 16
+-- @skip_result_check=true
+-- @expect_error=numeric type cast involving decimal overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * c_d32 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 17
+-- @skip_result_check=true
+-- @expect_error=numeric type cast involving decimal overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d32 * c_d32 as decimal32) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 18
+-- @skip_result_check=true
+-- @expect_error=numeric type cast involving decimal overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * c_d64 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 19
+-- @skip_result_check=true
+-- @expect_error=numeric type cast involving decimal overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * c_d64 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 20
+-- @skip_result_check=true
+-- @expect_error=The 'mul' operation involving decimal values overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * c_d128 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 21
+-- @skip_result_check=true
+-- @expect_error=The 'mul' operation involving decimal values overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * c_d128 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 22
@@ -116,9 +130,13 @@ select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * 1.000000 as deci
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d64 * 1.000000 as decimal64) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 26
+-- @skip_result_check=true
+-- @expect_error=The 'mul' operation involving decimal values overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * 1.000000000 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 1;
 
 -- query 27
+-- @skip_result_check=true
+-- @expect_error=The 'mul' operation involving decimal values overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ cast(c_d128 * 1.000000000 as decimal128) from ${case_db}.t_decimal_overflow where c_id = 2;
 
 -- query 28
@@ -131,7 +149,11 @@ select max(c0- 2.8665963056616452*(lt - 3.062472673706541)) as adjust_lt from (s
 select avg(c0- 2.8665963056616452*(lt - 3.062472673706541)) as adjust_lt from (select c0, array_sum(c1) lt, c2 from ${case_db}.avg_test) t group by c2;
 
 -- query 31
+-- @skip_result_check=true
+-- @expect_error=The 'mul' operation involving decimal values overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ max(lt- 2.8665963056616452*(c2 - 3.062472673706541)) as adjust_lt from (select c0, array_sum(c1) lt, c2 from ${case_db}.avg_test) t group by c0;
 
 -- query 32
+-- @skip_result_check=true
+-- @expect_error=The 'mul' operation involving decimal values overflows
 select /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW')*/ avg(lt- 2.8665963056616452*(c2 - 3.062472673706541)) as adjust_lt from (select c0, array_sum(c1) lt, c2 from ${case_db}.avg_test) t group by c0;

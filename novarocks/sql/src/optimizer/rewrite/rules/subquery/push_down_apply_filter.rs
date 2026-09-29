@@ -342,6 +342,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::Eq,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -354,6 +355,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::Gt,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -366,6 +368,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::And,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -544,6 +547,7 @@ mod tests {
             left,
             op: BinOp::Eq,
             right,
+            ..
         } = &conj.kind
         else {
             panic!("correlation conjunct must be a BinaryOp(Eq), got: {conj:?}");

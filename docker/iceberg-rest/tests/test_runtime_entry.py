@@ -255,7 +255,7 @@ class SharedEnvironmentTests(RendererCase):
             shutil.copytree(HERE / folder, fixture / folder)
         fakebin = self.root / 'bin'; fakebin.mkdir()
         fake_docker = fakebin / 'docker'; fake_docker.write_text('#!/bin/sh\necho unexpected-docker >&2\nexit 99\n'); fake_docker.chmod(0o755)
-        env = {**os.environ, 'PATH': str(fakebin) + ':' + os.environ['PATH'], 'NOVA_ENV_REST_PORT': '8181', 'NOVA_ENV_COMPOSE_PROJECT': 'nr-iceberg-rest', 'NOVA_ENV_REST_WAREHOUSE_URI': 's3://foreign/shared', 'NOVA_FIXTURE_RUNTIME_DIR': str(self.root / 'owner'), 'NOVAROCKS_WORKSPACE_ROOT': str(copied)}
+        env = {**os.environ, 'NOVA_ENV_CONFIG_FILE': str(fixture / 'shared.env'), 'PATH': str(fakebin) + ':' + os.environ['PATH'], 'NOVA_ENV_REST_PORT': '8181', 'NOVA_ENV_COMPOSE_PROJECT': 'nr-iceberg-rest', 'NOVA_ENV_REST_WAREHOUSE_URI': 's3://foreign/shared', 'NOVA_FIXTURE_RUNTIME_DIR': str(self.root / 'owner'), 'NOVAROCKS_WORKSPACE_ROOT': str(copied)}
         result = subprocess.run(['bash', str(fixture / 'up.sh'), '--prepare-only'], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
@@ -439,6 +439,28 @@ class DownPurgeTests(RendererCase):
         for prefixes in purges:
             self.assertEqual(prefixes, ['s3://warehouse/test-worktree/', 's3://novarocks/test-worktree/'])
             self.assertNotIn('shared/benchmarks', str(prefixes))
+
+
+class ConsumerInputVerificationTests(unittest.TestCase):
+    def test_runtime_requests_closed_iceberg_scope_and_publishes_its_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary)
+            (store / 'bom.json').write_text(json.dumps({'lock_sha256': 'current-lock'}))
+            config = {'repo_root': '/fixture-repository', 'fixture_inputs': {'bom': str(store / 'bom.json'), 'verified': False}}
+            with mock.patch.object(entry.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+                entry.verify_inputs(config)
+            command = run.call_args.args[0]
+            self.assertEqual(command, [str(HERE.parent / 'fixture-inputs/verify.sh'), '--store', str(store), '--repo-root', '/fixture-repository', '--consumer', 'iceberg-rest'])
+            self.assertEqual(config['fixture_inputs']['consumer'], 'iceberg-rest')
+            self.assertTrue(config['fixture_inputs']['verified'])
+            self.assertEqual(config['fixture_inputs']['lock_sha256'], 'current-lock')
+
+    def test_failed_input_verification_never_marks_publication_verified(self):
+        config = {'repo_root': '/fixture-repository', 'fixture_inputs': {'bom': '/fixture-store/bom.json', 'verified': False}}
+        with mock.patch.object(entry.subprocess, 'run', return_value=subprocess.CompletedProcess([], 75)), mock.patch.object(entry.runtime, 'read_json') as read, self.assertRaises(runtime.RuntimeFailure):
+            entry.verify_inputs(config)
+        read.assert_not_called()
+        self.assertFalse(config['fixture_inputs']['verified'])
 
 
 if __name__ == '__main__':

@@ -101,6 +101,7 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
         ExprKind::Cast {
             expr: inner,
             target,
+            ..
         } if matches!(target, arrow::datatypes::DataType::List(_))
             && matches!(
                 inner.kind,
@@ -115,6 +116,7 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
         ExprKind::Cast {
             expr: inner,
             target,
+            ..
         } => {
             format!("cast({} as {:?})", typed_expr_display_name(inner), target)
         }
@@ -129,7 +131,9 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
                 format!("{inner} IS NULL")
             }
         }
-        ExprKind::BinaryOp { left, op, right } => {
+        ExprKind::BinaryOp {
+            left, op, right, ..
+        } => {
             format!(
                 "{} {} {}",
                 typed_expr_display_name_with_parens(left),
@@ -484,6 +488,8 @@ mod tests {
                         left: Box::new(col("v4")),
                         op: BinOp::Add,
                         right: Box::new(col("v4")),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Int64,
                     nullable: true,

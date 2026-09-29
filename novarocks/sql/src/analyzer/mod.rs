@@ -986,7 +986,12 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 expr
             }
-            ExprKind::BinaryOp { left, op, right } => TypedExpr {
+            ExprKind::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy,
+            } => TypedExpr {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
                 kind: ExprKind::BinaryOp {
@@ -997,6 +1002,7 @@ impl<'a> AnalyzerContext<'a> {
                     right: Box::new(self.substitute_select_aliases_for_select_inner(
                         *right, projection, from_scope, inside_agg,
                     )),
+                    decimal_overflow_policy,
                 },
             },
             ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
@@ -1085,6 +1091,7 @@ impl<'a> AnalyzerContext<'a> {
             ExprKind::Cast {
                 expr: inner,
                 target,
+                decimal_overflow_policy,
             } => TypedExpr {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
@@ -1093,6 +1100,7 @@ impl<'a> AnalyzerContext<'a> {
                         *inner, projection, from_scope, inside_agg,
                     )),
                     target,
+                    decimal_overflow_policy,
                 },
             },
             ExprKind::Nested(inner) => TypedExpr {
@@ -1188,7 +1196,12 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 expr
             }
-            ExprKind::BinaryOp { left, op, right } => TypedExpr {
+            ExprKind::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy,
+            } => TypedExpr {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
                 kind: ExprKind::BinaryOp {
@@ -1199,6 +1212,7 @@ impl<'a> AnalyzerContext<'a> {
                     right: Box::new(
                         self.substitute_select_aliases_inner(*right, projection, inside_agg),
                     ),
+                    decimal_overflow_policy,
                 },
             },
             ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
@@ -1272,6 +1286,7 @@ impl<'a> AnalyzerContext<'a> {
             ExprKind::Cast {
                 expr: inner,
                 target,
+                decimal_overflow_policy,
             } => TypedExpr {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
@@ -1280,6 +1295,7 @@ impl<'a> AnalyzerContext<'a> {
                         self.substitute_select_aliases_inner(*inner, projection, inside_agg),
                     ),
                     target,
+                    decimal_overflow_policy,
                 },
             },
             ExprKind::Nested(inner) => TypedExpr {
@@ -2385,10 +2401,16 @@ impl<'a> AnalyzerContext<'a> {
                     .collect(),
                 resolved,
             },
-            ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
+            ExprKind::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy,
+            } => ExprKind::BinaryOp {
                 left: Box::new(self.rebind_order_by_agg_args(*left, from_scope, inside_agg)),
                 op,
                 right: Box::new(self.rebind_order_by_agg_args(*right, from_scope, inside_agg)),
+                decimal_overflow_policy,
             },
             ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
                 op,
@@ -2413,9 +2435,11 @@ impl<'a> AnalyzerContext<'a> {
             ExprKind::Cast {
                 expr: inner,
                 target,
+                decimal_overflow_policy,
             } => ExprKind::Cast {
                 expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
                 target,
+                decimal_overflow_policy,
             },
             ExprKind::IsNull {
                 expr: inner,
@@ -2740,7 +2764,12 @@ fn replace_grouping_markers_in_typed_expr(
             }
             expr.clone()
         }
-        ExprKind::BinaryOp { left, op, right } => TypedExpr {
+        ExprKind::BinaryOp {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
             kind: ExprKind::BinaryOp {
@@ -2757,6 +2786,7 @@ fn replace_grouping_markers_in_typed_expr(
                     grouping_fn_ids,
                     emitted_marker_count,
                 )),
+                decimal_overflow_policy: *decimal_overflow_policy,
             },
         },
         ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
@@ -2852,6 +2882,7 @@ fn replace_grouping_markers_in_typed_expr(
         ExprKind::Cast {
             expr: inner,
             target,
+            decimal_overflow_policy,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -2863,6 +2894,7 @@ fn replace_grouping_markers_in_typed_expr(
                     emitted_marker_count,
                 )),
                 target: target.clone(),
+                decimal_overflow_policy: *decimal_overflow_policy,
             },
         },
         ExprKind::IsNull {
@@ -4046,7 +4078,10 @@ mod tests {
             expr_has_qualified_column(cond, "l1", "l_suppkey"),
             "outer self-join column must keep its qualifier in correlated EXISTS filter: {cond:?}"
         );
-        let ExprKind::BinaryOp { left, op, right } = &cond.kind else {
+        let ExprKind::BinaryOp {
+            left, op, right, ..
+        } = &cond.kind
+        else {
             panic!("expected binary correlation condition, got: {cond:?}");
         };
         assert_eq!(*op, BinOp::Eq);
@@ -4200,7 +4235,10 @@ mod tests {
         let spec = only_predicate_spec(sel);
         let cond = apply_inner_filter(&spec.inner);
 
-        let ExprKind::BinaryOp { left, op, right } = &cond.kind else {
+        let ExprKind::BinaryOp {
+            left, op, right, ..
+        } = &cond.kind
+        else {
             panic!("expected binary correlation condition, got: {cond:?}");
         };
         assert_eq!(*op, BinOp::Eq);
@@ -5733,6 +5771,7 @@ mod tests {
             let ExprKind::Cast {
                 target,
                 expr: inner,
+                ..
             } = &args[0].kind
             else {
                 panic!("expected aggregate argument cast, got {:?}", args[0].kind);
@@ -5757,7 +5796,7 @@ mod tests {
             );
         };
         assert_eq!(name, "length");
-        let ExprKind::Cast { target, expr } = &args[0].kind else {
+        let ExprKind::Cast { target, expr, .. } = &args[0].kind else {
             panic!("expected length argument cast, got {:?}", args[0].kind);
         };
         assert_eq!(target, &arrow::datatypes::DataType::Utf8);
@@ -5779,7 +5818,7 @@ mod tests {
             );
         };
         assert_eq!(name, "left");
-        let ExprKind::Cast { target, expr } = &args[0].kind else {
+        let ExprKind::Cast { target, expr, .. } = &args[0].kind else {
             panic!("expected left value argument cast, got {:?}", args[0].kind);
         };
         assert_eq!(target, &arrow::datatypes::DataType::Utf8);
@@ -5819,7 +5858,7 @@ mod tests {
                 sel.projection[0].expr.kind
             );
         };
-        let ExprKind::Cast { target, expr } = &args[1].kind else {
+        let ExprKind::Cast { target, expr, .. } = &args[1].kind else {
             panic!(
                 "expected date_trunc value argument cast, got {:?}",
                 args[1].kind
@@ -6466,6 +6505,7 @@ mod tests {
             left,
             op: BinOp::And,
             right,
+            ..
         } = &filter.kind
         else {
             panic!("expected common correlation to be factored into top-level AND: {filter:?}");
@@ -6507,6 +6547,7 @@ mod tests {
             left,
             op: BinOp::Lt,
             right,
+            ..
         } = &filter.kind
         else {
             panic!("expected k1 < scalar subquery comparison, got {filter:?}");
@@ -6542,6 +6583,7 @@ mod tests {
             ExprKind::Cast {
                 expr: inner,
                 target: cast_target,
+                ..
             } => {
                 (cast_target == target && expr_refs_column(inner, column_id))
                     || expr_casts_column_to_type(inner, column_id, target)

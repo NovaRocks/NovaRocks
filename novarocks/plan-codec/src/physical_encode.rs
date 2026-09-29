@@ -5605,6 +5605,20 @@ mod tests {
     }
 
     fn finish_project_expression_plan(cast_depth: usize, diamond_depth: usize) -> PhysicalPlan {
+        finish_project_expression_plan_with_policies(
+            cast_depth,
+            diamond_depth,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
+    }
+
+    fn finish_project_expression_plan_with_policies(
+        cast_depth: usize,
+        diamond_depth: usize,
+        cast_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        binary_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> PhysicalPlan {
         let fragment_id = FragmentId::new(24);
         let mut builder = FragmentBuilder::new(fragment_id);
         let ty = ValueType::new(DataType::Int64, false);
@@ -5651,6 +5665,7 @@ mod tests {
                     project,
                     ty.clone(),
                     ExprKind::Cast {
+                        decimal_overflow_policy: cast_policy,
                         expr: expression,
                         target: DataType::Int64,
                     },
@@ -5663,6 +5678,7 @@ mod tests {
                     project,
                     ty.clone(),
                     ExprKind::Binary {
+                        decimal_overflow_policy: binary_policy,
                         op: novarocks_physical_plan::BinaryOperator::Add,
                         left: expression,
                         right: expression,
@@ -7201,5 +7217,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(encoded.group_key_column_ids, vec![wire_slot]);
+    }
+
+    #[test]
+    fn physical_codec_preserves_expression_local_decimal_policy() {
+        use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+        for (cast_policy, binary_policy) in [
+            (Policy::OutputNull, Policy::ReportError),
+            (Policy::ReportError, Policy::OutputNull),
+        ] {
+            let physical =
+                finish_project_expression_plan_with_policies(1, 1, cast_policy, binary_policy);
+            let (catalog, _) = exact_scalar_catalog();
+            let encoded =
+                encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts).unwrap();
+            let decoded =
+                plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(
+                physical.required().plan_contract_revision,
+                novarocks_physical_plan::PLAN_CONTRACT_REVISION
+            );
+            let root = decoded.fragments[0].root.as_ref().unwrap();
+            let Some(plan::distributed_node::Payload::Physical(node)) = &root.payload else {
+                panic!("expected physical project");
+            };
+            let Some(plan::plan_node::Kind::Project(project)) = &node.kind else {
+                panic!("expected project");
+            };
+            let expression = project.items[0].expr.as_ref().unwrap();
+            let Some(novarocks_proto_models::expr::expr::Kind::BinaryOp(binary)) = &expression.kind
+            else {
+                panic!("expected arithmetic");
+            };
+            let expected = |policy| match policy {
+                Policy::OutputNull => {
+                    novarocks_proto_models::expr::DecimalOverflowPolicy::OutputNull as i32
+                }
+                Policy::ReportError => {
+                    novarocks_proto_models::expr::DecimalOverflowPolicy::ReportError as i32
+                }
+            };
+            assert_eq!(binary.decimal_overflow_policy, expected(binary_policy));
+            for child in [
+                binary.left.as_ref().unwrap(),
+                binary.right.as_ref().unwrap(),
+            ] {
+                let Some(novarocks_proto_models::expr::expr::Kind::Cast(cast)) = &child.kind else {
+                    panic!("expected cast");
+                };
+                assert_eq!(cast.decimal_overflow_policy, expected(cast_policy));
+            }
+        }
     }
 }

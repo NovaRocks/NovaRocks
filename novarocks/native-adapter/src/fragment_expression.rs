@@ -240,6 +240,46 @@ fn decode_expr_type_at(
         .map_err(|error| NativeExpressionDecodeError::invalid_value(path.field("type"), error))
 }
 
+pub(crate) fn decode_decimal_overflow_policy(
+    value: i32,
+    path: FieldPath,
+) -> Result<novarocks_type_contract::DecimalOverflowPolicy, NativeExpressionDecodeError> {
+    use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+    match expr::DecimalOverflowPolicy::try_from(value) {
+        Ok(expr::DecimalOverflowPolicy::OutputNull) => Ok(Policy::OutputNull),
+        Ok(expr::DecimalOverflowPolicy::ReportError) => Ok(Policy::ReportError),
+        Ok(expr::DecimalOverflowPolicy::Unspecified) => Err(
+            NativeExpressionDecodeError::invalid_enum(path, "DecimalOverflowPolicy is unspecified"),
+        ),
+        Err(_) => Err(NativeExpressionDecodeError::invalid_enum(
+            path,
+            format!("unknown DecimalOverflowPolicy {value}"),
+        )),
+    }
+}
+
+pub(crate) fn require_binary_decimal_policy(
+    op: expr::BinaryOp,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    path: FieldPath,
+) -> Result<(), NativeExpressionDecodeError> {
+    if !matches!(
+        op,
+        expr::BinaryOp::Add
+            | expr::BinaryOp::Sub
+            | expr::BinaryOp::Mul
+            | expr::BinaryOp::Div
+            | expr::BinaryOp::Mod
+    ) && policy != novarocks_type_contract::DecimalOverflowPolicy::OutputNull
+    {
+        return Err(NativeExpressionDecodeError::invalid_value(
+            path,
+            "non-arithmetic binary expression requires OutputNull decimal policy",
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_proto_expr_shape_at(
     e: &expr::Expr,
     path: FieldPath,
@@ -289,6 +329,10 @@ pub fn validate_proto_expr_shape_at(
     match kind {
         expr::expr::Kind::BinaryOp(binary) => {
             let path = path.clone().field("binary_op");
+            let policy = decode_decimal_overflow_policy(
+                binary.decimal_overflow_policy,
+                path.clone().field("decimal_overflow_policy"),
+            )?;
             let op = expr::BinaryOp::try_from(binary.op).map_err(|_| {
                 NativeExpressionDecodeError::invalid_enum(
                     path.clone().field("op"),
@@ -301,6 +345,11 @@ pub fn validate_proto_expr_shape_at(
                     "BinaryOp.op is unspecified",
                 ));
             }
+            require_binary_decimal_policy(
+                op,
+                policy,
+                path.clone().field("decimal_overflow_policy"),
+            )?;
             required_boxed(path.clone(), &binary.left, "left")?;
             required_boxed(path, &binary.right, "right")?;
         }
@@ -343,16 +392,37 @@ pub fn validate_proto_expr_shape_at(
         }
         expr::expr::Kind::Cast(cast) => {
             let path = path.clone().field("cast");
-            required_boxed(path.clone(), &cast.operand, "operand")?;
+            let policy = decode_decimal_overflow_policy(
+                cast.decimal_overflow_policy,
+                path.clone().field("decimal_overflow_policy"),
+            )?;
+            let operand = cast.operand.as_ref().ok_or_else(|| {
+                NativeExpressionDecodeError::missing(
+                    path.clone().field("operand"),
+                    "native Cast requires operand",
+                )
+            })?;
             let target = cast.target.as_ref().ok_or_else(|| {
                 NativeExpressionDecodeError::missing(
                     path.clone().field("target"),
                     "native Cast requires target",
                 )
             })?;
-            decode_type(target).map_err(|error| {
+            let source_type = decode_expr_type_at(operand, path.clone().field("operand"))?;
+            let target_type = decode_type(target).map_err(|error| {
                 NativeExpressionDecodeError::invalid_value(path.clone().field("target"), error)
             })?;
+            if !novarocks_type_contract::decimal_error_policy_cast_supported(
+                &source_type,
+                &target_type,
+                policy,
+            ) {
+                return Err(NativeExpressionDecodeError::unsupported(
+                    path.clone().field("decimal_overflow_policy"),
+                    "ReportError decimal CAST does not support nested type conversion",
+                ));
+            }
+            required_boxed(path.clone(), &cast.operand, "operand")?;
         }
         expr::expr::Kind::IsNull(is_null) => {
             required_boxed(path.clone().field("is_null"), &is_null.operand, "operand")?
@@ -814,6 +884,7 @@ pub(crate) mod tests {
         let add = scalar_expr(
             DataType::Int64,
             expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 op: expr::BinaryOp::Add as i32,
                 left: Some(Box::new(col(7, DataType::Int64))),
                 right: Some(Box::new(int_lit(5))),
@@ -822,6 +893,7 @@ pub(crate) mod tests {
         let cast = scalar_expr(
             DataType::Utf8,
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(add)),
                 target: Some(type_desc(&DataType::Utf8)),
             })),
@@ -841,12 +913,12 @@ pub(crate) mod tests {
         };
         assert_eq!(*kind, FunctionKind::Upper);
         assert_eq!(args.len(), 1);
-        let Some(ExprNode::Cast(add_id)) = arena.node(args[0]) else {
+        let Some(ExprNode::Cast(add_id, _)) = arena.node(args[0]) else {
             panic!("expected cast arg");
         };
         assert!(matches!(
             arena.node(*add_id),
-            Some(ExprNode::Add(left, right))
+            Some(ExprNode::Add(left, right, novarocks_type_contract::DecimalOverflowPolicy::OutputNull))
                 if matches!(arena.node(*left), Some(ExprNode::SlotId(SlotId(7))))
                     && matches!(arena.node(*right), Some(ExprNode::Literal(LiteralValue::Int64(5))))
         ));
@@ -945,5 +1017,118 @@ pub(crate) mod tests {
             let err = decode_expr(&expr, &mut arena, &layout).unwrap_err();
             assert!(err.contains(needle), "{err}");
         }
+    }
+
+    fn policy_cast(child: expr::Expr, policy: i32) -> expr::Expr {
+        scalar_expr(
+            DataType::Decimal128(38, 0),
+            expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(child)),
+                target: Some(type_desc(&DataType::Decimal128(38, 0))),
+                decimal_overflow_policy: policy,
+            })),
+        )
+    }
+
+    #[test]
+    fn native_decimal_policy_survives_nested_scope_prost_decode_and_freeze() {
+        use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+        use prost::Message;
+        let null_cast = policy_cast(int_lit(1), expr::DecimalOverflowPolicy::OutputNull as i32);
+        let error_cast = policy_cast(null_cast, expr::DecimalOverflowPolicy::ReportError as i32);
+        let wire = scalar_expr(
+            DataType::Decimal128(38, 0),
+            expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                op: expr::BinaryOp::Add as i32,
+                left: Some(Box::new(error_cast)),
+                right: Some(Box::new(policy_cast(
+                    int_lit(1),
+                    expr::DecimalOverflowPolicy::OutputNull as i32,
+                ))),
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::ReportError as i32,
+            })),
+        );
+        let decoded = expr::Expr::decode(wire.encode_to_vec().as_slice()).unwrap();
+        let (arena, id) = lower_with_slots(&decoded, &[]);
+        let Some(ExprNode::Add(left, right, Policy::ReportError)) = arena.node(id) else {
+            panic!("missing arithmetic policy");
+        };
+        assert_eq!(
+            arena.decimal_overflow_policy(*left),
+            Some(Policy::ReportError)
+        );
+        assert_eq!(
+            arena.decimal_overflow_policy(*right),
+            Some(Policy::OutputNull)
+        );
+        let Some(ExprNode::Cast(inner, Policy::ReportError)) = arena.node(*left) else {
+            panic!("missing outer cast");
+        };
+        assert_eq!(
+            arena.decimal_overflow_policy(*inner),
+            Some(Policy::OutputNull)
+        );
+        let frozen = arena.into_immutable().unwrap();
+        let policies = frozen
+            .nodes()
+            .iter()
+            .filter_map(|node| node.kind().decimal_overflow_policy())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            policies,
+            vec![
+                Policy::OutputNull,
+                Policy::ReportError,
+                Policy::OutputNull,
+                Policy::ReportError
+            ]
+        );
+        assert!(!frozen.allow_throw_exception());
+    }
+
+    #[test]
+    fn native_rejects_absent_zero_unknown_and_irrelevant_error_policy() {
+        use prost::Message;
+        for policy in [0, 99, -1] {
+            for wire in [
+                policy_cast(int_lit(1), policy),
+                scalar_expr(
+                    DataType::Int64,
+                    expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                        op: expr::BinaryOp::Add as i32,
+                        left: Some(Box::new(int_lit(1))),
+                        right: Some(Box::new(int_lit(1))),
+                        decimal_overflow_policy: policy,
+                    })),
+                ),
+            ] {
+                // For zero, prost omits the scalar field: this covers genuinely
+                // absent policy bytes, not just a hand-constructed zero object.
+                let wire = expr::Expr::decode(wire.encode_to_vec().as_slice()).unwrap();
+                let mut arena = ExprArena::default();
+                let error = decode_expr(&wire, &mut arena, &NativeExpressionInputLayout::default())
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("decimal_overflow_policy"),
+                    "{error}"
+                );
+            }
+        }
+        let wire = scalar_expr(
+            DataType::Boolean,
+            expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                op: expr::BinaryOp::Eq as i32,
+                left: Some(Box::new(int_lit(1))),
+                right: Some(Box::new(int_lit(1))),
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::ReportError as i32,
+            })),
+        );
+        let error = decode_expr(
+            &wire,
+            &mut ExprArena::default(),
+            &NativeExpressionInputLayout::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires OutputNull"));
     }
 }

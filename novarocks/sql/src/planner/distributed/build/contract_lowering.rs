@@ -2911,6 +2911,8 @@ impl ContractLoweringVisitor {
                         ContractExprKind::Cast {
                             expr: read,
                             target: ty.data_type.clone(),
+                            decimal_overflow_policy:
+                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                     )?;
                     let converted = self.fragment_mut().add_value(
@@ -7189,6 +7191,8 @@ impl ContractLoweringVisitor {
                 ContractExprKind::Cast {
                     expr: lowered,
                     target: target.data_type.clone(),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             )?;
         }
@@ -7301,7 +7305,9 @@ impl ContractLoweringVisitor {
         let mut pending: Vec<&TypedExpr> = vec![root];
         while let Some(current) = pending.pop() {
             match &current.kind {
-                ExprKind::BinaryOp { left, op, right } if *op == connective => {
+                ExprKind::BinaryOp {
+                    left, op, right, ..
+                } if *op == connective => {
                     pending.push(right);
                     pending.push(left);
                 }
@@ -7351,7 +7357,12 @@ impl ContractLoweringVisitor {
                     ContractExprKind::Disjunction { args }
                 }
             }
-            ExprKind::BinaryOp { left, op, right } => {
+            ExprKind::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy,
+            } => {
                 let lowered_left = self.lower_expression(owner, left, visible)?;
                 let lowered_right = self.lower_expression(owner, right, visible)?;
                 // A comparison answers about one type. Its operands were
@@ -7376,19 +7387,25 @@ impl ContractLoweringVisitor {
                     left: lowered_left,
                     op: lower_binary_operator(*op),
                     right: lowered_right,
+                    decimal_overflow_policy: *decimal_overflow_policy,
                 }
             }
             ExprKind::UnaryOp { op, expr } => ContractExprKind::Unary {
                 op: lower_unary_operator(*op),
                 expr: self.lower_expression(owner, expr, visible)?,
             },
-            ExprKind::Cast { expr, target } => ContractExprKind::Cast {
+            ExprKind::Cast {
+                expr,
+                target,
+                decimal_overflow_policy,
+            } => ContractExprKind::Cast {
                 expr: self.lower_expression(owner, expr, visible)?,
                 // The type a conversion produces is stated in the plan's own
                 // vocabulary -- a list's element is named `item` there -- and
                 // that is the vocabulary the expression's own type is read in.
                 // The two are compared, so they are written the same way.
                 target: novarocks_types::undecorated_nested_type(target),
+                decimal_overflow_policy: *decimal_overflow_policy,
             },
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
                 expr: self.lower_expression(owner, expr, visible)?,
@@ -7803,6 +7820,7 @@ impl ContractLoweringVisitor {
             ContractExprKind::Cast {
                 expr,
                 target: target.clone(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         )
     }
@@ -7833,6 +7851,7 @@ impl ContractLoweringVisitor {
             ContractExprKind::Cast {
                 expr: literal_id,
                 target: target.data_type,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         )
     }
@@ -11115,6 +11134,7 @@ mod tests {
                 left: Box::new(column_ref(&input)),
                 op: BinOp::Gt,
                 right: Box::new(literal_int(0)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -11141,6 +11161,8 @@ mod tests {
                                 left: Box::new(column_ref(&input)),
                                 op: BinOp::Add,
                                 right: Box::new(literal_int(1)),
+                                decimal_overflow_policy:
+                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
                             data_type: DataType::Int64,
                             nullable: false,
@@ -11624,6 +11646,7 @@ mod tests {
         let ContractExprKind::Cast {
             expr: source,
             target,
+            ..
         } = &cast.kind
         else {
             panic!("expected explicit cast for narrowed integer literal");
@@ -11720,6 +11743,8 @@ mod tests {
                         left: Box::new(column_ref(&input)),
                         op: BinOp::Gt,
                         right: Box::new(literal_int(0)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -12535,6 +12560,8 @@ mod tests {
                 kind: ExprKind::Cast {
                     expr: Box::new(column_ref(&right)),
                     target: DataType::Int64,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
                 data_type: DataType::Int64,
                 nullable: false,

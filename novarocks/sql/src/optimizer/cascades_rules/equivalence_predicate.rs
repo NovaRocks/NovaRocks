@@ -382,7 +382,12 @@ mod tests {
 
     fn binary(memo: &mut Memo, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
         memo.scalars.intern(
-            ScalarNode::BinaryOp { left, op, right },
+            ScalarNode::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
             DataType::Boolean,
             false,
         )

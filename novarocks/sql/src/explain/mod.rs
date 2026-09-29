@@ -508,7 +508,9 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             LiteralValue::String(s) => format!("'{s}'"),
             LiteralValue::Binary(bytes) => format!("X'{}'", hex::encode_upper(bytes)),
         },
-        ExprKind::BinaryOp { left, op, right } => {
+        ExprKind::BinaryOp {
+            left, op, right, ..
+        } => {
             let op_str = match op {
                 BinOp::Add => "+",
                 BinOp::Sub => "-",
@@ -575,7 +577,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             let distinct_str = if *distinct { "DISTINCT " } else { "" };
             format!("{name}({distinct_str}{})", args_str.join(", "))
         }
-        ExprKind::Cast { expr, target } => {
+        ExprKind::Cast { expr, target, .. } => {
             format!("CAST({} AS {target:?})", format_expr(expr))
         }
         ExprKind::IsNull { expr, negated } => {
@@ -971,6 +973,7 @@ mod tests {
                 left: Box::new(column_expr(1, Some("t"), "k")),
                 op: BinOp::Gt,
                 right: Box::new(int_literal(10)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -1062,6 +1065,7 @@ mod tests {
                     data_type: DataType::Int64,
                     nullable: false,
                 }),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,

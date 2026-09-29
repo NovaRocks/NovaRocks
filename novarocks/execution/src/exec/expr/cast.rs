@@ -31,6 +31,9 @@ use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, Timelike};
+use novarocks_type_contract::{
+    DecimalOverflowPolicy, decimal_error_policy_cast_supported, is_checked_decimal_numeric_cast,
+};
 use novarocks_types::largeint;
 use num_traits::ToPrimitive;
 use serde_json::Value as JsonValue;
@@ -1088,7 +1091,7 @@ fn cast_float_to_decimal_with_rounding(
         })?;
         1.0 / (factor as f64)
     };
-    let effective_precision = if precision <= 18 { 18 } else { precision };
+    let effective_precision = precision;
     let abs_limit = decimal_precision_limit(effective_precision).ok_or_else(|| {
         format!(
             "decimal precision overflow while casting float to DECIMAL: precision={}",
@@ -1121,7 +1124,7 @@ fn cast_float_to_decimal_with_rounding(
             continue;
         }
         let unscaled = unscaled_f as i128;
-        if unscaled.abs() >= abs_limit {
+        if unscaled.unsigned_abs() >= abs_limit as u128 {
             values.push(None);
             continue;
         }
@@ -2393,6 +2396,10 @@ fn cast_integral_to_decimal128_relaxed(
         None
     };
 
+    let precision_limit = 10_u128
+        .checked_pow(u32::from(target_precision))
+        .filter(|_| (1..=38).contains(&target_precision))
+        .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
     let mut values = Vec::with_capacity(child_array.len());
     for row in 0..child_array.len() {
         if child_array.is_null(row) {
@@ -2438,22 +2445,9 @@ fn cast_integral_to_decimal128_relaxed(
             value /= factor;
         }
 
-        // For narrow targets (precision ≤ 18), StarRocks uses a BIGINT-compatible overflow
-        // window: any value that exceeds a 19-digit range is returned as NULL.  This matches
-        // the observed StarRocks behaviour for SELECT casts such as
-        //   cast(c_bigint as DECIMAL(9,1))  -- i64::MAX * 10 (20 digits) → NULL.
-        //
-        // For wider targets (precision > 18), the pipeline CAST does NOT enforce precision.
-        // Overflow values that fit in i128 pass through as non-null, and the write-path filter
-        // (filter_decimal_cast_overflow_rows) is responsible for detecting and dropping rows
-        // whose unscaled value exceeds the declared precision.  Values that truly overflow i128
-        // during upscaling are already NULL from the checked_mul guard above.
-        if target_precision <= 18 {
-            // BIGINT-window: reject values that exceed a 19-digit (i64) range.
-            if value.unsigned_abs().to_string().len() > 19 {
-                values.push(None);
-                continue;
-            }
+        if value.unsigned_abs() >= precision_limit {
+            values.push(None);
+            continue;
         }
         values.push(Some(value));
     }
@@ -2474,6 +2468,10 @@ fn cast_decimal_to_decimal_relaxed(
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+    let precision_limit = 10_u128
+        .checked_pow(u32::from(target_precision))
+        .filter(|_| (1..=38).contains(&target_precision))
+        .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
     let mut values = Vec::with_capacity(arr.len());
     for row in 0..arr.len() {
         if arr.is_null(row) {
@@ -2506,11 +2504,10 @@ fn cast_decimal_to_decimal_relaxed(
                 quotient
             };
         }
-        // StarRocks does not enforce decimal precision at query execution time:
-        // columns like DECIMAL64(4,3) can legitimately store values like 10.000 or
-        // 100.000 that exceed the declared precision. Imposing a precision check here
-        // would NULL out valid stored values during comparisons and aggregate functions.
-        // Overflow beyond i128 range is already guarded by the checked_mul above.
+        if value.unsigned_abs() >= precision_limit {
+            values.push(None);
+            continue;
+        }
         values.push(Some(value));
     }
 
@@ -2598,15 +2595,7 @@ fn cast_decimal256_to_decimal256_relaxed(
                 quotient
             };
         }
-        // For upscale casts (source_scale < target_scale) we multiplied the value and
-        // need to enforce precision so that values which would overflow the target type
-        // become NULL.  For same-scale and downscale casts the value is unchanged or
-        // smaller, so we skip pipeline-level precision enforcement and let the write-path
-        // filter (filter_decimal_cast_overflow_rows) detect and drop overflow rows.
-        // This matches StarRocks behaviour where the pipeline CAST is a pass-through and
-        // the BE write path owns the overflow-rejection decision.
-        let enforce_precision = source_scale < target_scale;
-        if enforce_precision && !decimal256_value_within_precision(value, target_precision) {
+        if !decimal256_value_within_precision(value, target_precision) {
             values.push(None);
             continue;
         }
@@ -3064,10 +3053,113 @@ fn cast_largeint_binary_to_utf8(child_array: &ArrayRef) -> Result<ArrayRef, Stri
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
+fn is_decimal_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Decimal128(..) | DataType::Decimal256(..)
+    )
+}
+
+fn checked_numeric_cast_has_overflow(source: &ArrayRef, casted: &ArrayRef) -> Result<bool, String> {
+    if source.len() != casted.len() {
+        return Err("checked decimal CAST length mismatch".to_string());
+    }
+    for row in 0..source.len() {
+        if source.is_null(row) || !casted.is_null(row) {
+            continue;
+        }
+        // Non-finite input is invalid input, distinct from overflow of a finite number.
+        let finite = match source.data_type() {
+            DataType::Float32 => source
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| "checked CAST Float32 downcast failed".to_string())?
+                .value(row)
+                .is_finite(),
+            DataType::Float64 => source
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| "checked CAST Float64 downcast failed".to_string())?
+                .value(row)
+                .is_finite(),
+            _ => true,
+        };
+        if finite {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Enforce a declared decimal target even on same-scale/retag conversion paths.
+/// Limits are frozen metadata and computed once, before iterating values.
+fn enforce_declared_decimal_precision(array: ArrayRef) -> Result<ArrayRef, String> {
+    match array.data_type() {
+        DataType::Decimal128(precision, scale) => {
+            let (precision, scale) = (*precision, *scale);
+            let limit = 10_u128
+                .checked_pow(u32::from(precision))
+                .filter(|_| (1..=38).contains(&precision))
+                .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
+            let source = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| "checked CAST Decimal128 downcast failed".to_string())?;
+            if (0..source.len())
+                .all(|row| source.is_null(row) || source.value(row).unsigned_abs() < limit)
+            {
+                return Ok(array);
+            }
+            let values = (0..source.len())
+                .map(|row| {
+                    if source.is_null(row) || source.value(row).unsigned_abs() >= limit {
+                        None
+                    } else {
+                        Some(source.value(row))
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(Arc::new(
+                Decimal128Array::from(values)
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|error| error.to_string())?,
+            ))
+        }
+        DataType::Decimal256(precision, scale) => {
+            let (precision, scale) = (*precision, *scale);
+            let limit = pow10_i256(usize::from(precision))?;
+            let source = array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| "checked CAST Decimal256 downcast failed".to_string())?;
+            let fits = |value: i256| value > -limit && value < limit;
+            if (0..source.len()).all(|row| source.is_null(row) || fits(source.value(row))) {
+                return Ok(array);
+            }
+            let values = (0..source.len())
+                .map(|row| {
+                    if source.is_null(row) || !fits(source.value(row)) {
+                        None
+                    } else {
+                        Some(source.value(row))
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(Arc::new(
+                Decimal256Array::from(values)
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|error| error.to_string())?,
+            ))
+        }
+        _ => Ok(array),
+    }
+}
+
 pub fn eval(
     arena: &ExprArena,
     cast_expr: ExprId,
     child: ExprId,
+    decimal_overflow_policy: DecimalOverflowPolicy,
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let target_type = arena
@@ -3075,8 +3167,43 @@ pub fn eval(
         .ok_or_else(|| "CAST missing target data type".to_string())?
         .clone();
     let target_field_schema = arena.field_schema(cast_expr);
+    let source_type = arena
+        .data_type(child)
+        .ok_or_else(|| "CAST missing source data type".to_string())?;
+    if !decimal_error_policy_cast_supported(source_type, &target_type, decimal_overflow_policy) {
+        return Err("ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST".to_string());
+    }
 
     let child_array = arena.eval(child, chunk)?;
+    if is_checked_decimal_numeric_cast(child_array.data_type(), &target_type) {
+        let casted = if child_array.data_type() == &target_type {
+            child_array.clone()
+        } else {
+            cast_with_special_rules_with_field_schema(
+                &child_array,
+                &target_type,
+                target_field_schema,
+            )
+            .map_err(|error| format_cast_error(child_array.data_type(), &target_type, &error))?
+        };
+        let casted = enforce_declared_decimal_precision(casted)?;
+        let overflow = checked_numeric_cast_has_overflow(&child_array, &casted)?;
+        // ALLOW_THROW retains its existing Decimal-to-Decimal contract; the new
+        // per-expression policy independently governs all checked numeric Decimal casts.
+        if overflow
+            && (decimal_overflow_policy == DecimalOverflowPolicy::ReportError
+                || (arena.allow_throw_exception()
+                    && is_decimal_type(child_array.data_type())
+                    && is_decimal_type(&target_type)))
+        {
+            return Err(
+                "Expr evaluate meet error: The numeric type cast involving decimal overflows"
+                    .to_string(),
+            );
+        }
+        return sanitize_non_finite_cast_result(casted, &target_type)
+            .map_err(|error| format_cast_error(child_array.data_type(), &target_type, &error));
+    }
     if child_array.data_type() == &target_type {
         return Ok(child_array);
     }
@@ -3391,8 +3518,8 @@ fn eval_time_internal(
     if matches!(
         arena.node(child),
         Some(
-            crate::exec::expr::ExprNode::CastTime(_)
-                | crate::exec::expr::ExprNode::CastTimeFromDatetime(_)
+            crate::exec::expr::ExprNode::CastTime(_, _)
+                | crate::exec::expr::ExprNode::CastTimeFromDatetime(_, _)
         )
     ) {
         if child_array.data_type() == &target_type {
@@ -4022,10 +4149,20 @@ mod tests {
         let mut arena = ExprArena::default();
         let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
         let target_type = DataType::Struct(vec![Field::new("a", DataType::Utf8, true)].into());
-        let cast_expr = arena.push_typed(ExprNode::Cast(child), target_type);
+        let cast_expr = arena.push_typed(
+            ExprNode::Cast(child, DecimalOverflowPolicy::OutputNull),
+            target_type,
+        );
         arena.set_field_schema(cast_expr, json_struct_field_schema());
 
-        let out = eval(&arena, cast_expr, child, &chunk).expect("cast");
+        let out = eval(
+            &arena,
+            cast_expr,
+            child,
+            DecimalOverflowPolicy::OutputNull,
+            &chunk,
+        )
+        .expect("cast");
         let out = out.as_any().downcast_ref::<StructArray>().expect("struct");
         let values = out
             .column(0)
@@ -4103,7 +4240,7 @@ mod tests {
             DataType::Utf8,
         );
         let cast_time = arena.push_typed(
-            ExprNode::CastTime(literal),
+            ExprNode::CastTime(literal, DecimalOverflowPolicy::OutputNull),
             DataType::Time64(TimeUnit::Microsecond),
         );
         let direct = arena.eval(cast_time, &chunk).expect("cast time eval");
@@ -4114,7 +4251,7 @@ mod tests {
         assert!(direct.is_null(0));
 
         let cast_time_from_dt = arena.push_typed(
-            ExprNode::CastTimeFromDatetime(literal),
+            ExprNode::CastTimeFromDatetime(literal, DecimalOverflowPolicy::OutputNull),
             DataType::Time64(TimeUnit::Microsecond),
         );
         let from_dt = arena
@@ -4138,7 +4275,7 @@ mod tests {
             DataType::Utf8,
         );
         let cast_time = arena.push_typed(
-            ExprNode::CastTime(literal),
+            ExprNode::CastTime(literal, DecimalOverflowPolicy::OutputNull),
             DataType::Time64(TimeUnit::Microsecond),
         );
         let out = arena.eval(cast_time, &chunk).expect("cast time eval");
@@ -4209,9 +4346,18 @@ mod tests {
             DataType::Utf8,
         );
 
-        let cast_empty = arena.push_typed(ExprNode::Cast(empty), DataType::Decimal128(10, 2));
-        let cast_blank = arena.push_typed(ExprNode::Cast(blank), DataType::Decimal128(10, 2));
-        let cast_zero = arena.push_typed(ExprNode::Cast(zero), DataType::Decimal128(10, 2));
+        let cast_empty = arena.push_typed(
+            ExprNode::Cast(empty, DecimalOverflowPolicy::OutputNull),
+            DataType::Decimal128(10, 2),
+        );
+        let cast_blank = arena.push_typed(
+            ExprNode::Cast(blank, DecimalOverflowPolicy::OutputNull),
+            DataType::Decimal128(10, 2),
+        );
+        let cast_zero = arena.push_typed(
+            ExprNode::Cast(zero, DecimalOverflowPolicy::OutputNull),
+            DataType::Decimal128(10, 2),
+        );
 
         let empty_out = arena.eval(cast_empty, &chunk).unwrap();
         let empty_out = empty_out
@@ -4362,7 +4508,10 @@ mod tests {
             ExprNode::Literal(LiteralValue::LargeInt(9_223_372_036_854_775_808_i128)),
             DataType::FixedSizeBinary(16),
         );
-        let cast_expr = arena.push_typed(ExprNode::Cast(lit), DataType::Decimal128(38, 0));
+        let cast_expr = arena.push_typed(
+            ExprNode::Cast(lit, DecimalOverflowPolicy::OutputNull),
+            DataType::Decimal128(38, 0),
+        );
 
         let out = arena.eval(cast_expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
@@ -4466,7 +4615,10 @@ mod tests {
         let chunk = chunk_len_1();
 
         let lit = arena.push_typed(ExprNode::Literal(LiteralValue::Int16(7)), DataType::Int16);
-        let cast_expr = arena.push_typed(ExprNode::Cast(lit), DataType::FixedSizeBinary(16));
+        let cast_expr = arena.push_typed(
+            ExprNode::Cast(lit, DecimalOverflowPolicy::OutputNull),
+            DataType::FixedSizeBinary(16),
+        );
 
         let out = arena.eval(cast_expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
@@ -4530,7 +4682,10 @@ mod tests {
             ExprNode::Literal(LiteralValue::Float64(2_147_483_648.0)),
             DataType::Float64,
         );
-        let cast_default = arena_default.push_typed(ExprNode::Cast(lit_default), DataType::Int32);
+        let cast_default = arena_default.push_typed(
+            ExprNode::Cast(lit_default, DecimalOverflowPolicy::OutputNull),
+            DataType::Int32,
+        );
         let out = arena_default.eval(cast_default, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<Int32Array>().unwrap();
         assert!(out.is_null(0));
@@ -4541,7 +4696,10 @@ mod tests {
             ExprNode::Literal(LiteralValue::Float64(2_147_483_648.0)),
             DataType::Float64,
         );
-        let cast_strict = arena_strict.push_typed(ExprNode::Cast(lit_strict), DataType::Int32);
+        let cast_strict = arena_strict.push_typed(
+            ExprNode::Cast(lit_strict, DecimalOverflowPolicy::OutputNull),
+            DataType::Int32,
+        );
         let err = arena_strict.eval(cast_strict, &chunk).unwrap_err();
         assert!(err.contains("conflict with range of INT"));
     }
@@ -4686,7 +4844,10 @@ mod tests {
         );
         let mut arena = ExprArena::default();
         let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), source_type);
-        let cast_expr = arena.push_typed(ExprNode::Cast(child), target_type);
+        let cast_expr = arena.push_typed(
+            ExprNode::Cast(child, DecimalOverflowPolicy::OutputNull),
+            target_type,
+        );
 
         let err = arena
             .eval(cast_expr, &chunk)
@@ -4763,5 +4924,400 @@ mod tests {
             .unwrap();
         // The last 3 digits (789) are the sub-microsecond part.
         assert_eq!(a.value(0) % 1_000, 789);
+    }
+}
+
+#[cfg(test)]
+mod overflow_policy_prepared_tests {
+    use super::*;
+    use crate::exec::expr::ExprNode;
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
+
+    fn prepare(source: ArrayRef, target: DataType) -> (ExprArena, Chunk, ExprId, ExprId) {
+        let source_type = source.data_type().clone();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "source",
+            source_type.clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![source]).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+        let mut arena = ExprArena::default();
+        let source = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), source_type);
+        let nullable = arena.push_typed(
+            ExprNode::Cast(source, DecimalOverflowPolicy::OutputNull),
+            target.clone(),
+        );
+        let throwing = arena.push_typed(
+            ExprNode::Cast(source, DecimalOverflowPolicy::ReportError),
+            target,
+        );
+        (arena, chunk, nullable, throwing)
+    }
+
+    #[test]
+    fn prepared_numeric_casts_respect_declared_precision_and_freeze_distinct_policies() {
+        let cases = vec![
+            (
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(1_000_000_000)])) as ArrayRef,
+                DataType::Decimal128(9, 0),
+                1,
+            ),
+            (
+                Arc::new(
+                    Decimal128Array::from(vec![Some(12_345), None, Some(999_995)])
+                        .with_precision_and_scale(6, 3)
+                        .unwrap(),
+                ) as ArrayRef,
+                DataType::Decimal128(5, 2),
+                1_235,
+            ),
+            (
+                Arc::new(
+                    Decimal128Array::from(vec![Some(12), None, Some(1_000)])
+                        .with_precision_and_scale(4, 0)
+                        .unwrap(),
+                ) as ArrayRef,
+                DataType::Decimal128(3, 0),
+                12,
+            ),
+            (
+                Arc::new(Float64Array::from(vec![
+                    Some(12.345),
+                    None,
+                    Some(1_000_000_000.0),
+                ])) as ArrayRef,
+                DataType::Decimal128(5, 2),
+                1_235,
+            ),
+            (
+                largeint::array_from_i128(&[Some(1), None, Some(1_000_000_000)]).unwrap(),
+                DataType::Decimal128(9, 0),
+                1,
+            ),
+            (
+                Arc::new(
+                    Decimal256Array::from(vec![
+                        Some(i256::from_i128(12)),
+                        None,
+                        Some(i256::from_i128(1000)),
+                    ])
+                    .with_precision_and_scale(4, 0)
+                    .unwrap(),
+                ) as ArrayRef,
+                DataType::Decimal256(3, 0),
+                12,
+            ),
+        ];
+        for (source, target, first) in cases {
+            let (arena, chunk, nullable, throwing) = prepare(source, target.clone());
+            let result = arena.eval(nullable, &chunk).unwrap();
+            assert_eq!(result.data_type(), &target);
+            assert_eq!(result.null_count(), 2);
+            if let Some(array) = result.as_any().downcast_ref::<Decimal128Array>() {
+                assert_eq!(array.value(0), first);
+            } else {
+                assert_eq!(
+                    result
+                        .as_any()
+                        .downcast_ref::<Decimal256Array>()
+                        .unwrap()
+                        .value(0),
+                    i256::from_i128(first)
+                );
+            }
+            assert!(
+                arena
+                    .eval(throwing, &chunk)
+                    .unwrap_err()
+                    .contains("numeric type cast involving decimal overflows")
+            );
+            assert_eq!(arena.eval(nullable, &chunk).unwrap().null_count(), 2);
+        }
+        let source = Arc::new(
+            Decimal128Array::from(vec![Some(12), None, Some(128)])
+                .with_precision_and_scale(3, 0)
+                .unwrap(),
+        ) as ArrayRef;
+        let (arena, chunk, nullable, throwing) = prepare(source, DataType::Int8);
+        let result = arena.eval(nullable, &chunk).unwrap();
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(0),
+            12
+        );
+        assert_eq!(result.null_count(), 2);
+        assert!(arena.eval(throwing, &chunk).is_err());
+    }
+
+    #[test]
+    fn prepared_invalid_parse_nonfinite_and_null_do_not_become_numeric_overflow() {
+        let sources = vec![
+            Arc::new(StringArray::from(vec![
+                Some("not-a-number"),
+                Some(""),
+                None,
+            ])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                None,
+            ])) as ArrayRef,
+        ];
+        for source in sources {
+            let (arena, chunk, nullable, throwing) = prepare(source, DataType::Decimal128(5, 2));
+            assert_eq!(arena.eval(nullable, &chunk).unwrap().null_count(), 3);
+            assert_eq!(arena.eval(throwing, &chunk).unwrap().null_count(), 3);
+        }
+    }
+
+    #[test]
+    fn prepared_signed_rounding_and_allow_throw_contract_remain_independent() {
+        let source = Arc::new(
+            Decimal128Array::from(vec![12_345, -12_345])
+                .with_precision_and_scale(5, 3)
+                .unwrap(),
+        ) as ArrayRef;
+        let (arena, chunk, nullable, throwing) = prepare(source, DataType::Decimal128(4, 2));
+        for id in [nullable, throwing] {
+            let result = arena.eval(id, &chunk).unwrap();
+            let array = result.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            assert_eq!(array.values().as_ref(), &[1235, -1235]);
+        }
+        let source = Arc::new(Int64Array::from(vec![1_000_000_000])) as ArrayRef;
+        let (mut arena, chunk, nullable, throwing) = prepare(source, DataType::Decimal128(9, 0));
+        arena.set_allow_throw_exception(true);
+        // Existing ALLOW governs Decimal-to-Decimal casts, not this integer input.
+        assert_eq!(arena.eval(nullable, &chunk).unwrap().null_count(), 1);
+        assert!(arena.eval(throwing, &chunk).is_err());
+        let source = Arc::new(
+            Decimal128Array::from(vec![1000])
+                .with_precision_and_scale(4, 0)
+                .unwrap(),
+        ) as ArrayRef;
+        let (mut arena, chunk, nullable, _) = prepare(source, DataType::Decimal128(3, 0));
+        arena.set_allow_throw_exception(true);
+        assert!(arena.eval(nullable, &chunk).is_err());
+    }
+    #[test]
+    fn prepared_nested_numeric_cast_rejects_report_before_recursive_execution() {
+        let field = Arc::new(Field::new("item", DataType::Decimal128(4, 0), true));
+        let source = Arc::new(ListArray::new(
+            field.clone(),
+            OffsetBuffer::new(vec![0_i32, 1].into()),
+            Arc::new(
+                Decimal128Array::from(vec![12])
+                    .with_precision_and_scale(4, 0)
+                    .unwrap(),
+            ),
+            None,
+        )) as ArrayRef;
+        let target = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(3, 0),
+            true,
+        )));
+        let (arena, chunk, nullable, throwing) = prepare(source.clone(), target);
+        assert_eq!(
+            arena.eval(throwing, &chunk).unwrap_err(),
+            "ERROR_IF_OVERFLOW is unsupported for nested Decimal numeric CAST"
+        );
+        let result = arena.eval(nullable, &chunk).unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(
+            list.values()
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            12
+        );
+        let (arena, chunk, _, same) = prepare(source, DataType::List(field));
+        assert_eq!(arena.eval(same, &chunk).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod intrinsic_cast_row_contract_tests {
+    use super::*;
+    use crate::exec::expr::ExprNode;
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
+
+    fn prepare(
+        source: ArrayRef,
+        target: DataType,
+        allow_throw: bool,
+        policy: DecimalOverflowPolicy,
+    ) -> (ExprArena, Chunk, ExprId) {
+        let ty = source.data_type().clone();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("source", ty.clone(), true)])),
+            vec![source],
+        )
+        .unwrap();
+        let layout = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, layout);
+        let mut arena = ExprArena::default();
+        arena.set_allow_throw_exception(allow_throw);
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), ty);
+        let cast = arena.push_typed(ExprNode::Cast(child, policy), target);
+        (arena, chunk, cast)
+    }
+
+    #[test]
+    fn typed_arena_temporal_rows_raise_own_errors_under_both_decimal_policies() {
+        // 200 million days fits Date32/i32 and the CE-day addition, but exceeds
+        // chrono's representable calendar range. No malformed carrier is used.
+        for target in [DataType::Utf8, DataType::Float32, DataType::Float64] {
+            for policy in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                let (arena, chunk, cast) = prepare(
+                    Arc::new(Date32Array::from(vec![Some(200_000_000), None])),
+                    target.clone(),
+                    false,
+                    policy,
+                );
+                assert!(arena.eval(cast, &chunk).is_err());
+            }
+        }
+        let source = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(i64::MAX / 2),
+            None,
+        ])) as ArrayRef;
+        let (arena, chunk, cast) = prepare(
+            source,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+            DecimalOverflowPolicy::OutputNull,
+        );
+        assert!(arena.eval(cast, &chunk).is_err());
+    }
+
+    #[test]
+    fn typed_arena_recursive_date_format_error_is_not_caught_by_parent_cast_policy() {
+        let item = Arc::new(Field::new("item", DataType::Date32, true));
+        let list = Arc::new(ListArray::new(
+            item,
+            OffsetBuffer::new(vec![0_i32, 1, 2].into()),
+            Arc::new(Date32Array::from(vec![Some(200_000_000), None])),
+            None,
+        )) as ArrayRef;
+        let target = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let (arena, chunk, cast) = prepare(list, target, false, DecimalOverflowPolicy::OutputNull);
+        assert!(arena.eval(cast, &chunk).is_err());
+    }
+
+    #[test]
+    fn typed_arena_struct_and_map_recursive_format_errors_propagate() {
+        let source_fields: Fields = vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new("i", DataType::Int64, true),
+        ]
+        .into();
+        let source = Arc::new(StructArray::new(
+            source_fields,
+            vec![
+                Arc::new(Date32Array::from(vec![Some(200_000_000), None])),
+                Arc::new(Int64Array::from(vec![Some(1), None])),
+            ],
+            None,
+        )) as ArrayRef;
+        let target = DataType::Struct(
+            vec![
+                Field::new("i", DataType::Int64, true),
+                Field::new("d", DataType::Utf8, true),
+            ]
+            .into(),
+        );
+        let (arena, chunk, cast) =
+            prepare(source, target, false, DecimalOverflowPolicy::OutputNull);
+        assert!(arena.eval(cast, &chunk).is_err());
+
+        let fields: Fields = vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", DataType::Date32, true),
+        ]
+        .into();
+        let entries = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(Date32Array::from(vec![Some(200_000_000)])),
+            ],
+            None,
+        );
+        let source = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+            OffsetBuffer::new(vec![0_i32, 1].into()),
+            entries,
+            None,
+            false,
+        )) as ArrayRef;
+        let fields: Fields = vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let target = DataType::Map(
+            Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+            false,
+        );
+        let (arena, chunk, cast) =
+            prepare(source, target, false, DecimalOverflowPolicy::OutputNull);
+        assert!(arena.eval(cast, &chunk).is_err());
+    }
+
+    #[test]
+    fn legacy_float_integer_mode_and_caught_invalid_utf8_remain_distinct() {
+        let source = Arc::new(Float64Array::from(vec![Some(127.0), Some(128.0), None])) as ArrayRef;
+        let (arena, chunk, cast) = prepare(
+            source.clone(),
+            DataType::Int8,
+            false,
+            DecimalOverflowPolicy::OutputNull,
+        );
+        let result = arena.eval(cast, &chunk).unwrap();
+        let result = result.as_any().downcast_ref::<Int8Array>().unwrap();
+        assert_eq!(
+            result.iter().collect::<Vec<_>>(),
+            vec![Some(127), None, None]
+        );
+        let (arena, chunk, cast) = prepare(
+            source,
+            DataType::Int8,
+            true,
+            DecimalOverflowPolicy::OutputNull,
+        );
+        assert!(arena.eval(cast, &chunk).is_err());
+        let source = Arc::new(arrow::array::BinaryArray::from(vec![
+            Some(&[0xff][..]),
+            None,
+        ])) as ArrayRef;
+        let (arena, chunk, cast) = prepare(
+            source,
+            DataType::Utf8,
+            true,
+            DecimalOverflowPolicy::OutputNull,
+        );
+        let result = arena.eval(cast, &chunk).unwrap();
+        assert_eq!(result.null_count(), 2);
     }
 }

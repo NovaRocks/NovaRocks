@@ -6027,11 +6027,13 @@ fn expr_kind_eq(left: &ExprKind, right: &ExprKind) -> bool {
                 left: left_left,
                 op: left_op,
                 right: left_right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             ExprKind::BinaryOp {
                 left: right_left,
                 op: right_op,
                 right: right_right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         ) => {
             left_op == right_op
@@ -6070,10 +6072,12 @@ fn expr_kind_eq(left: &ExprKind, right: &ExprKind) -> bool {
             ExprKind::Cast {
                 expr: left_expr,
                 target: left_target,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             ExprKind::Cast {
                 expr: right_expr,
                 target: right_target,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         ) => left_target == right_target && typed_expr_eq(left_expr, right_expr),
         (
@@ -6340,6 +6344,7 @@ fn count_equality_join_keys(
             left,
             op: BinOp::And,
             right,
+            ..
         } => Ok(
             count_equality_join_keys(left, left_qualifiers, right_qualifiers)?
                 + count_equality_join_keys(right, left_qualifiers, right_qualifiers)?,
@@ -6348,6 +6353,7 @@ fn count_equality_join_keys(
             left,
             op: BinOp::Eq,
             right,
+            ..
         } => {
             let left_side = join_key_side(left, left_qualifiers, right_qualifiers)?;
             let right_side = join_key_side(right, left_qualifiers, right_qualifiers)?;

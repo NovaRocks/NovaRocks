@@ -608,6 +608,7 @@ fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
             left: Box::new(left),
             op,
             right: Box::new(right),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         data_type: DataType::Boolean,
         nullable: false,

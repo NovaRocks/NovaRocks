@@ -1267,6 +1267,8 @@ mod tests {
                 ScalarNode::Cast {
                     child: right_input,
                     target: DataType::Int64,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
                 DataType::Int64,
                 false,

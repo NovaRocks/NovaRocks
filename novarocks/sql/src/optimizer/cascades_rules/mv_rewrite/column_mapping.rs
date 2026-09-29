@@ -60,7 +60,9 @@ pub(crate) fn normalize(
         // NOT match. This is fail-closed — it can only miss a rewrite, never
         // produce a wrong one.
         ScalarNode::Literal(HashableLiteral(value)) => NormExpr::Literal(format!("{value:?}")),
-        ScalarNode::BinaryOp { left, op, right } => {
+        ScalarNode::BinaryOp {
+            left, op, right, ..
+        } => {
             let mut l = normalize(arena, *left, base_names)?;
             let mut r = normalize(arena, *right, base_names)?;
             // Canonicalize comparisons: Gt/Ge become flipped Lt/Le.
@@ -127,7 +129,7 @@ pub(crate) fn normalize(
                 .map(|arg| normalize(arena, *arg, base_names))
                 .collect::<Option<Vec<_>>>()?,
         },
-        ScalarNode::Cast { child, target } => call(
+        ScalarNode::Cast { child, target, .. } => call(
             &format!("cast:{target:?}"),
             vec![normalize(arena, *child, base_names)?],
         ),
@@ -260,10 +262,16 @@ fn rewrite_children(
     mut rewrite: impl FnMut(&mut ScalarArena, ScalarId) -> Option<ScalarId>,
 ) -> Option<ScalarId> {
     let rewritten = match node {
-        ScalarNode::BinaryOp { op, left, right } => ScalarNode::BinaryOp {
+        ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy,
+        } => ScalarNode::BinaryOp {
             op,
             left: rewrite(arena, left)?,
             right: rewrite(arena, right)?,
+            decimal_overflow_policy,
         },
         ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
             op,
@@ -301,9 +309,14 @@ fn rewrite_children(
             order_by,
             resolved,
         },
-        ScalarNode::Cast { child, target } => ScalarNode::Cast {
+        ScalarNode::Cast {
+            child,
+            target,
+            decimal_overflow_policy,
+        } => ScalarNode::Cast {
             child: rewrite(arena, child)?,
             target,
+            decimal_overflow_policy,
         },
         ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
             child: rewrite(arena, child)?,
@@ -433,6 +446,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type,
             nullable: true,
@@ -582,7 +596,10 @@ mod tests {
 
         let rewritten = rewrite_typed(&map, &query_expr, &q_names).expect("rewrite ok");
         // Expect mv_s * 2: top is a Mul whose left is a ColumnRef to mv_s.
-        let ExprKind::BinaryOp { left, op, right } = &rewritten.kind else {
+        let ExprKind::BinaryOp {
+            left, op, right, ..
+        } = &rewritten.kind
+        else {
             panic!("expected BinaryOp, got {:?}", rewritten.kind);
         };
         assert_eq!(*op, BinOp::Mul);

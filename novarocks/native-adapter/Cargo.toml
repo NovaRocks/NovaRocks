@@ -12,6 +12,7 @@ workspace = true
 test-support = ["dep:novarocks-secret"]
 
 [dependencies]
+novarocks-type-contract.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-execution.workspace = true
 novarocks-execution-contract.workspace = true

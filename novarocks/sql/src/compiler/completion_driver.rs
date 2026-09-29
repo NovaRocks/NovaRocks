@@ -178,6 +178,11 @@ impl SqlFinalPlanCompileRequest {
                     &common.session.sql_semantics,
                     &query,
                 )
+                .map_err(SqlCompileError::Analyze)?
+                || crate::sql_mode::query_uses_error_if_overflow(
+                    &common.session.sql_semantics,
+                    &query,
+                )
                 .map_err(SqlCompileError::Analyze)?;
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;

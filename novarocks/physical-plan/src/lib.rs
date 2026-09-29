@@ -37,10 +37,10 @@ pub use identity::*;
 pub use novarocks_connector_contract::{ConnectorWriteRouteId, WriteTargetOrdinal};
 pub use novarocks_type_contract::FunctionValueType as ValueType;
 pub use novarocks_type_contract::{
-    AggregateStateFormatId, BucketLayoutAlgorithm, FunctionArgumentEvaluation,
-    FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIdentityError,
-    FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId, FunctionValueType,
-    FunctionVolatility, OrderedComparisonAlgorithm, PartitionCountParameterId,
+    AggregateStateFormatId, BucketLayoutAlgorithm, DecimalOverflowPolicy,
+    FunctionArgumentEvaluation, FunctionArgumentType, FunctionFailureBehavior, FunctionId,
+    FunctionIdentityError, FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId,
+    FunctionValueType, FunctionVolatility, OrderedComparisonAlgorithm, PartitionCountParameterId,
     PartitionCountParameterIdentityError, PartitionHashAlgorithm, PartitionSpaceId,
     PartitionSpaceIdentityError,
 };
@@ -60,7 +60,7 @@ pub use validation::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 4;
+pub const PLAN_CONTRACT_REVISION: u32 = 5;
 
 #[cfg(test)]
 mod tests;

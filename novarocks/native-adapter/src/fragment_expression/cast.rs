@@ -33,13 +33,16 @@ pub(crate) fn lower_cast(
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
+    let policy = super::decode_decimal_overflow_policy(
+        cast.decimal_overflow_policy,
+        path.clone().field("decimal_overflow_policy"),
+    )?;
     let operand = cast.operand.as_ref().ok_or_else(|| {
         super::NativeExpressionDecodeError::missing(
             path.clone().field("operand"),
             "native Cast requires operand",
         )
     })?;
-    let child = decode_expr_at(operand, path.clone().field("operand"), arena, input_layout)?;
     let target = cast.target.as_ref().ok_or_else(|| {
         super::NativeExpressionDecodeError::missing(
             path.clone().field("target"),
@@ -55,6 +58,19 @@ pub(crate) fn lower_cast(
             format!("Cast target type {target_type:?} does not match Expr.type {data_type:?}"),
         ));
     }
+
+    let source_type = super::decode_expr_type_at(operand, path.clone().field("operand"))?;
+    if !novarocks_type_contract::decimal_error_policy_cast_supported(
+        &source_type,
+        &target_type,
+        policy,
+    ) {
+        return Err(super::NativeExpressionDecodeError::unsupported(
+            path.clone().field("decimal_overflow_policy"),
+            "ReportError decimal CAST does not support nested type conversion",
+        ));
+    }
+    let child = decode_expr_at(operand, path.clone().field("operand"), arena, input_layout)?;
 
     if matches!(data_type, DataType::LargeBinary) {
         let child_type = arena.data_type(child).ok_or_else(|| {
@@ -106,12 +122,12 @@ pub(crate) fn lower_cast(
         .flatten();
     let node = if target_primitive == Some(common::PrimitiveType::Time) {
         if source_primitive == Some(common::PrimitiveType::Datetime) {
-            ExprNode::CastTimeFromDatetime(child)
+            ExprNode::CastTimeFromDatetime(child, policy)
         } else {
-            ExprNode::CastTime(child)
+            ExprNode::CastTime(child, policy)
         }
     } else {
-        ExprNode::Cast(child)
+        ExprNode::Cast(child, policy)
     };
     Ok(arena.push_typed(node, data_type))
 }
@@ -143,8 +159,10 @@ mod tests {
     use super::super::tests::{
         col, lower_err_with_slots, lower_with_slots, map_string_json_type, scalar_expr, type_desc,
     };
+    use super::{NativeExpressionInputLayout, lower_cast};
     use arrow::datatypes::{DataType, TimeUnit};
-    use novarocks_execution::exec::expr::ExprNode;
+    use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
+    use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::expr;
 
     #[test]
@@ -152,6 +170,7 @@ mod tests {
         let expr = scalar_expr(
             DataType::Float64,
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(1, DataType::Int64))),
                 target: Some(type_desc(&DataType::Utf8)),
             })),
@@ -168,6 +187,7 @@ mod tests {
         let datetime_to_time = scalar_expr(
             time_type.clone(),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(1, datetime_type))),
                 target: Some(type_desc(&time_type)),
             })),
@@ -175,6 +195,7 @@ mod tests {
         let int_to_time = scalar_expr(
             time_type.clone(),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(7, DataType::Int64))),
                 target: Some(type_desc(&time_type)),
             })),
@@ -183,11 +204,20 @@ mod tests {
         let (arena, id) = lower_with_slots(&datetime_to_time, &[1, 7]);
         assert!(matches!(
             arena.node(id),
-            Some(ExprNode::CastTimeFromDatetime(_))
+            Some(ExprNode::CastTimeFromDatetime(
+                _,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull
+            ))
         ));
 
         let (arena, id) = lower_with_slots(&int_to_time, &[1, 7]);
-        assert!(matches!(arena.node(id), Some(ExprNode::CastTime(_))));
+        assert!(matches!(
+            arena.node(id),
+            Some(ExprNode::CastTime(
+                _,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull
+            ))
+        ));
     }
 
     #[test]
@@ -196,6 +226,7 @@ mod tests {
         let cast = scalar_expr(
             map_type.clone(),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(1, DataType::Utf8))),
                 target: Some(type_desc(&map_type)),
             })),
@@ -215,6 +246,7 @@ mod tests {
         let scalar_to_variant = scalar_expr(
             DataType::LargeBinary,
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(1, DataType::Int64))),
                 target: Some(type_desc(&DataType::LargeBinary)),
             })),
@@ -222,6 +254,7 @@ mod tests {
         let variant_to_decimal = scalar_expr(
             DataType::Decimal128(10, 2),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(1, DataType::LargeBinary))),
                 target: Some(type_desc(&DataType::Decimal128(10, 2))),
             })),
@@ -231,5 +264,85 @@ mod tests {
         assert!(err.contains("CAST to VARIANT is not supported"));
         let err = lower_err_with_slots(&variant_to_decimal, &[1]);
         assert!(err.contains("CAST from VARIANT is not supported"));
+    }
+    #[test]
+    fn nested_reporting_decimal_cast_is_rejected_before_child_lowering() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+        use std::sync::Arc;
+        let source = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(10, 2),
+            true,
+        )));
+        let target = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(12, 3),
+            true,
+        )));
+        let cast = expr::CastExpr {
+            operand: Some(Box::new(col(1, source.clone()))),
+            target: Some(type_desc(&target)),
+            decimal_overflow_policy: expr::DecimalOverflowPolicy::ReportError as i32,
+        };
+        let mut arena = ExprArena::default();
+        let error = lower_cast(
+            &cast,
+            FieldPath::root("expr").field("cast"),
+            &mut arena,
+            &NativeExpressionInputLayout::default(),
+            target.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support nested type conversion"),
+            "{error}"
+        );
+        assert!(
+            arena.node(ExprId(0)).is_none(),
+            "policy is checked before mutating the arena"
+        );
+        let wire = scalar_expr(target.clone(), expr::expr::Kind::Cast(Box::new(cast)));
+        let error =
+            super::super::validate_proto_expr_shape_at(&wire, FieldPath::root("expr")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support nested type conversion"),
+            "{error}"
+        );
+        for (result_type, wire_policy, expected_policy) in [
+            (
+                target,
+                expr::DecimalOverflowPolicy::OutputNull,
+                Policy::OutputNull,
+            ),
+            (
+                source,
+                expr::DecimalOverflowPolicy::ReportError,
+                Policy::ReportError,
+            ),
+        ] {
+            let operand = col(
+                1,
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Decimal128(10, 2),
+                    true,
+                ))),
+            );
+            let wire = scalar_expr(
+                result_type.clone(),
+                expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                    operand: Some(Box::new(operand)),
+                    target: Some(type_desc(&result_type)),
+                    decimal_overflow_policy: wire_policy as i32,
+                })),
+            );
+            let (arena, id) = lower_with_slots(&wire, &[1]);
+            assert_eq!(arena.decimal_overflow_policy(id), Some(expected_policy));
+        }
     }
 }

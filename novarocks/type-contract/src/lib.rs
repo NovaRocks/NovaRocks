@@ -28,9 +28,10 @@ mod largeint;
 mod partition;
 
 pub use arithmetic::{
-    ArithmeticOperator, arithmetic_result_type, arithmetic_result_type_with_op,
-    canonical_agg_decimal_type, decimal_arithmetic_result_type,
-    decimal_multiplication_requires_float64,
+    ArithmeticOperator, DecimalOverflowPolicy, arithmetic_result_type,
+    arithmetic_result_type_with_op, canonical_agg_decimal_type, decimal_arithmetic_result_type,
+    decimal_error_policy_cast_supported, decimal_multiplication_requires_float64,
+    is_checked_decimal_numeric_cast,
 };
 pub use array_generate::array_generate_item_type;
 pub use comparison::OrderedComparisonAlgorithm;

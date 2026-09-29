@@ -332,6 +332,7 @@ fn walk_and_collect_equi(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<(Sca
             left,
             op: BinOp::Eq,
             right,
+            ..
         } => {
             if matches!(arena.node(*left), ScalarNode::ColumnRef(_))
                 && matches!(arena.node(*right), ScalarNode::ColumnRef(_))
@@ -343,6 +344,7 @@ fn walk_and_collect_equi(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<(Sca
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             walk_and_collect_equi(arena, *left, out);
             walk_and_collect_equi(arena, *right, out);
@@ -591,6 +593,7 @@ mod tests {
                 left: Box::new(col_ref_typed(a, DataType::Int64)),
                 op: BinOp::Eq,
                 right: Box::new(col_ref_typed(b, DataType::Int64)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -697,6 +700,7 @@ mod tests {
                 left: Box::new(col_ref_typed("a", DataType::Int64)),
                 op: BinOp::Add,
                 right: Box::new(col_ref_typed("b", DataType::Int64)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Int64,
             nullable: true,
@@ -910,6 +914,7 @@ mod tests {
                 )),
                 op: BinOp::Eq,
                 right: Box::new(qualified_col_ref_typed("d", "d_date_sk", DataType::Int64)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -1102,6 +1107,8 @@ mod tests {
                         left: Box::new(qualified_col_ref_typed("l", "c0", DataType::Int64)),
                         op: BinOp::Eq,
                         right: Box::new(qualified_col_ref_typed("r", "c0", DataType::Int64)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -1112,10 +1119,13 @@ mod tests {
                         left: Box::new(qualified_col_ref_typed("l", "c1", DataType::Utf8)),
                         op: BinOp::Eq,
                         right: Box::new(qualified_col_ref_typed("r", "c1", DataType::Utf8)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
                 }),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,

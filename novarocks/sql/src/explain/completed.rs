@@ -1635,7 +1635,9 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                     .collect::<Vec<_>>()
                     .join(" OR ")
             ),
-            ExprKind::Binary { left, op, right } => write!(
+            ExprKind::Binary {
+                left, op, right, ..
+            } => write!(
                 formatter,
                 "(e{} {} e{})",
                 expr(*left),
@@ -1675,6 +1677,7 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
             ExprKind::Cast {
                 expr: inner,
                 target,
+                ..
             } => {
                 write!(formatter, "CAST(e{} AS {target})", expr(*inner))
             }
@@ -4446,6 +4449,7 @@ mod tests {
                         left,
                         op: novarocks_physical_plan::BinaryOperator::Multiply,
                         right,
+                        ..
                     } = expression.kind
                     else {
                         return None;

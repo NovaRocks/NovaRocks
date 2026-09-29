@@ -573,7 +573,13 @@ mod tests {
             ExprNode::Literal(LiteralValue::Utf8("2025-10-01 14:28:31".to_string())),
             DataType::Utf8,
         );
-        let stop = arena.push_typed(ExprNode::Cast(text), timestamp.clone());
+        let stop = arena.push_typed(
+            ExprNode::Cast(
+                text,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            timestamp.clone(),
+        );
         let out = common::typed_null(
             &mut arena,
             DataType::List(Arc::new(Field::new("item", timestamp.clone(), true))),
@@ -613,8 +619,20 @@ mod tests {
             ExprNode::Literal(LiteralValue::Utf8("abc".to_string())),
             DataType::Utf8,
         );
-        let start = arena.push_typed(ExprNode::Cast(start), DataType::Date32);
-        let invalid = arena.push_typed(ExprNode::Cast(invalid), DataType::Date32);
+        let start = arena.push_typed(
+            ExprNode::Cast(
+                start,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            DataType::Date32,
+        );
+        let invalid = arena.push_typed(
+            ExprNode::Cast(
+                invalid,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            DataType::Date32,
+        );
         let zero = common::literal_i64(&mut arena, 0);
         let negative = common::literal_i64(&mut arena, -1);
         let unit = arena.push_typed(
@@ -667,7 +685,13 @@ mod tests {
             ExprNode::Literal(LiteralValue::Utf8("2025-10-01".to_string())),
             DataType::Utf8,
         );
-        let date = arena.push_typed(ExprNode::Cast(text), DataType::Date32);
+        let date = arena.push_typed(
+            ExprNode::Cast(
+                text,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            DataType::Date32,
+        );
         let step = common::literal_i64(&mut arena, 1);
         let unit = arena.push_typed(
             ExprNode::Literal(LiteralValue::Utf8("hour".to_string())),

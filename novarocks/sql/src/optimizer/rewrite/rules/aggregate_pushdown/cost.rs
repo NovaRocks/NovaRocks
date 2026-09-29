@@ -295,6 +295,7 @@ mod tests {
                     data_type: DataType::Int64,
                     nullable: false,
                 }),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,

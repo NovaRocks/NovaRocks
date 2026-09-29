@@ -797,6 +797,7 @@ impl<'a> AnalyzerContext<'a> {
                     data_type: sub_first_col.data_type.clone(),
                     nullable: sub_first_col.nullable,
                 }),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
         let join_cond = match sub_filter.clone() {
@@ -807,6 +808,8 @@ impl<'a> AnalyzerContext<'a> {
                     left: Box::new(eq_cond),
                     op: BinOp::And,
                     right: Box::new(f),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             }),
             None => Some(eq_cond),
@@ -1146,6 +1149,7 @@ impl<'a> AnalyzerContext<'a> {
                     data_type: sub_col.data_type.clone(),
                     nullable: true,
                 }),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
 
@@ -1186,6 +1190,8 @@ impl<'a> AnalyzerContext<'a> {
                         left: Box::new(is_null_expr(lhs_typed.clone(), false)),
                         op: BinOp::And,
                         right: Box::new(any_exists),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                 },
                 None => is_null_expr(lhs_typed.clone(), false),
@@ -1537,6 +1543,8 @@ impl<'a> AnalyzerContext<'a> {
                             kind: ExprKind::Cast {
                                 expr: Box::new(outer_expr),
                                 target: pred.inner_col.data_type.clone(),
+                                decimal_overflow_policy:
+                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
                         };
                     }
@@ -1547,6 +1555,8 @@ impl<'a> AnalyzerContext<'a> {
                             left: Box::new(outer_expr),
                             op: pred.op,
                             right: Box::new(maybe_unqualify_col(&pred.inner_col, same_bare_name)),
+                            decimal_overflow_policy:
+                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                     }
                 };
@@ -1560,6 +1570,8 @@ impl<'a> AnalyzerContext<'a> {
                                 left: Box::new(c),
                                 op: BinOp::And,
                                 right: Box::new(build_corr_cond(pred)),
+                                decimal_overflow_policy:
+                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
                         };
                     }
@@ -1577,6 +1589,8 @@ impl<'a> AnalyzerContext<'a> {
                             left: Box::new(corr_cond),
                             op: BinOp::And,
                             right: Box::new(rem),
+                            decimal_overflow_policy:
+                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                     }),
                     None => Some(corr_cond),
@@ -1870,6 +1884,8 @@ impl<'a> AnalyzerContext<'a> {
                     left: Box::new(lhs_i.clone()),
                     op: BinOp::Eq,
                     right: Box::new(rhs_ref),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             };
             eq_conjuncts.push(eq);
@@ -1885,6 +1901,8 @@ impl<'a> AnalyzerContext<'a> {
                         left: Box::new(acc),
                         op: BinOp::And,
                         right: Box::new(next),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                 };
             }
@@ -2045,6 +2063,8 @@ impl<'a> AnalyzerContext<'a> {
                             left: Box::new(is_null_expr(lhs_typed.clone(), false)),
                             op: BinOp::And,
                             right: Box::new(any_exists),
+                            decimal_overflow_policy:
+                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                     },
                     None => is_null_expr(lhs_typed.clone(), false),
@@ -2171,6 +2191,7 @@ impl<'a> AnalyzerContext<'a> {
                 left: Box::new(lhs_typed),
                 op: BinOp::Eq,
                 right: Box::new(rhs_expr),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
         let sub_filter = sub_filter
@@ -2215,6 +2236,8 @@ impl<'a> AnalyzerContext<'a> {
                     left: Box::new(key_cond),
                     op: BinOp::And,
                     right: Box::new(f),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             }),
             None => Some(key_cond),
@@ -2774,6 +2797,8 @@ impl<'a> AnalyzerContext<'a> {
                         data_type: inner_col.data_type.clone(),
                         nullable: inner_col.nullable,
                     }),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             });
         }
@@ -2914,6 +2939,7 @@ pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(expr),
                 target: DataType::Boolean,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
     }
@@ -2929,6 +2955,7 @@ pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
             left: Box::new(expr),
             op: BinOp::Ne,
             right: Box::new(zero),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
     }
 }
@@ -2962,7 +2989,12 @@ fn qualify_inner_shadowing_column_refs(
                 },
             }
         }
-        ExprKind::BinaryOp { left, op, right } => TypedExpr {
+        ExprKind::BinaryOp {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } => TypedExpr {
             data_type,
             nullable,
             kind: ExprKind::BinaryOp {
@@ -2977,6 +3009,7 @@ fn qualify_inner_shadowing_column_refs(
                     inner_scope,
                     outer_scope,
                 )),
+                decimal_overflow_policy,
             },
         },
         ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
@@ -3046,6 +3079,7 @@ fn qualify_inner_shadowing_column_refs(
         ExprKind::Cast {
             expr: inner,
             target,
+            decimal_overflow_policy,
         } => TypedExpr {
             data_type,
             nullable,
@@ -3056,6 +3090,7 @@ fn qualify_inner_shadowing_column_refs(
                     outer_scope,
                 )),
                 target,
+                decimal_overflow_policy,
             },
         },
         ExprKind::IsNull {
@@ -3522,6 +3557,7 @@ fn is_placeholder_top_level_and_conjunct(expr: &TypedExpr, id: usize) -> bool {
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             is_placeholder_top_level_and_conjunct(left, id)
                 || is_placeholder_top_level_and_conjunct(right, id)
@@ -3656,7 +3692,9 @@ fn extract_corr_preds_inner(
     out: &mut Vec<CorrelationPred>,
 ) {
     match &expr.kind {
-        ExprKind::BinaryOp { left, op, right } => match op {
+        ExprKind::BinaryOp {
+            left, op, right, ..
+        } => match op {
             BinOp::And | BinOp::Or => {
                 extract_corr_preds_inner(left, inner_scope, outer_scope, out);
                 extract_corr_preds_inner(right, inner_scope, outer_scope, out);
@@ -4535,7 +4573,12 @@ fn expr_contains_placeholder_in_relation(rel: &Relation, placeholder_id: usize) 
 
 fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> TypedExpr {
     match &expr.kind {
-        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::And | BinOp::Or) => {
+        ExprKind::BinaryOp {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } if matches!(op, BinOp::And | BinOp::Or) => {
             let identity = matches!(op, BinOp::And); // AND identity = true, OR identity = false
             let left_is = is_placeholder(left, placeholder_id);
             let right_is = is_placeholder(right, placeholder_id);
@@ -4559,6 +4602,7 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
                         left: Box::new(new_left),
                         op: *op,
                         right: Box::new(new_right),
+                        decimal_overflow_policy: *decimal_overflow_policy,
                     },
                 }
             }
@@ -4615,6 +4659,7 @@ fn cast_case_branch_if_needed(expr: TypedExpr, target: &DataType) -> TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(expr),
                 target: target.clone(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: target.clone(),
             nullable: true,
@@ -4634,7 +4679,12 @@ fn replace_placeholder_in_expr(
     }
 
     match &expr.kind {
-        ExprKind::BinaryOp { left, op, right } => TypedExpr {
+        ExprKind::BinaryOp {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
             kind: ExprKind::BinaryOp {
@@ -4649,6 +4699,7 @@ fn replace_placeholder_in_expr(
                     placeholder_id,
                     replacement,
                 )),
+                decimal_overflow_policy: *decimal_overflow_policy,
             },
         },
         ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
@@ -4715,6 +4766,7 @@ fn replace_placeholder_in_expr(
         ExprKind::Cast {
             expr: inner,
             target,
+            decimal_overflow_policy,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -4725,6 +4777,7 @@ fn replace_placeholder_in_expr(
                     replacement,
                 )),
                 target: target.clone(),
+                decimal_overflow_policy: *decimal_overflow_policy,
             },
         },
         ExprKind::IsNull {
@@ -4927,6 +4980,7 @@ fn remove_correlation_preds_from_expr(
             left,
             op: BinOp::And,
             right,
+            decimal_overflow_policy,
         } => {
             let left_remaining = remove_correlation_preds_from_expr(left, corr_preds);
             let right_remaining = remove_correlation_preds_from_expr(right, corr_preds);
@@ -4938,6 +4992,7 @@ fn remove_correlation_preds_from_expr(
                         left: Box::new(l),
                         op: BinOp::And,
                         right: Box::new(r),
+                        decimal_overflow_policy: *decimal_overflow_policy,
                     },
                 }),
                 (Some(l), None) => Some(l),
@@ -4956,11 +5011,13 @@ fn is_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
             left,
             op: BinOp::Or,
             right,
+            ..
         } => has_placeholder(left, id) || has_placeholder(right, id),
         ExprKind::BinaryOp {
             left,
             op: BinOp::And,
             right,
+            ..
         } => is_placeholder_inside_or(left, id) || is_placeholder_inside_or(right, id),
         ExprKind::Nested(inner) => is_placeholder_inside_or(inner, id),
         _ => false,
@@ -5062,6 +5119,7 @@ fn is_correlation_eq(
         left,
         op: BinOp::Eq,
         right,
+        ..
     } = &expr.kind
     {
         let l_outer = is_outer_only_ref(left, inner_scope, outer_scope);
@@ -5079,6 +5137,7 @@ fn split_and(expr: &TypedExpr) -> Vec<&TypedExpr> {
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             let mut v = split_and(left);
             v.extend(split_and(right));
@@ -5096,6 +5155,7 @@ fn split_or(expr: &TypedExpr) -> Vec<&TypedExpr> {
             left,
             op: BinOp::Or,
             right,
+            ..
         } => {
             let mut v = split_or(left);
             v.extend(split_or(right));
@@ -5119,6 +5179,7 @@ fn disjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
             left: Box::new(acc),
             op: BinOp::Or,
             right: Box::new(e),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
     })
 }
@@ -5136,6 +5197,7 @@ fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
             left: Box::new(acc),
             op: BinOp::And,
             right: Box::new(e),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
     })
 }

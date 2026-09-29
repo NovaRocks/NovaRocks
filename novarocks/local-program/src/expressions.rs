@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use arrow_buffer::i256;
 use arrow_schema::DataType;
+use novarocks_type_contract::DecimalOverflowPolicy;
 use novarocks_types::SlotId;
 use novarocks_types::logical::LogicalType;
 
@@ -143,14 +144,14 @@ pub enum StaticExprKind {
         child: ProgramExprId,
         dict: Arc<HashMap<i32, Vec<u8>>>,
     },
-    Cast(ProgramExprId),
-    CastTime(ProgramExprId),
-    CastTimeFromDatetime(ProgramExprId),
-    Add(ProgramExprId, ProgramExprId),
-    Sub(ProgramExprId, ProgramExprId),
-    Mul(ProgramExprId, ProgramExprId),
-    Div(ProgramExprId, ProgramExprId),
-    Mod(ProgramExprId, ProgramExprId),
+    Cast(ProgramExprId, DecimalOverflowPolicy),
+    CastTime(ProgramExprId, DecimalOverflowPolicy),
+    CastTimeFromDatetime(ProgramExprId, DecimalOverflowPolicy),
+    Add(ProgramExprId, ProgramExprId, DecimalOverflowPolicy),
+    Sub(ProgramExprId, ProgramExprId, DecimalOverflowPolicy),
+    Mul(ProgramExprId, ProgramExprId, DecimalOverflowPolicy),
+    Div(ProgramExprId, ProgramExprId, DecimalOverflowPolicy),
+    Mod(ProgramExprId, ProgramExprId, DecimalOverflowPolicy),
     Eq(ProgramExprId, ProgramExprId),
     EqForNull(ProgramExprId, ProgramExprId),
     Ne(ProgramExprId, ProgramExprId),
@@ -181,6 +182,20 @@ pub enum StaticExprKind {
 }
 
 impl StaticExprKind {
+    pub fn decimal_overflow_policy(&self) -> Option<DecimalOverflowPolicy> {
+        match self {
+            Self::Cast(_, policy)
+            | Self::CastTime(_, policy)
+            | Self::CastTimeFromDatetime(_, policy)
+            | Self::Add(_, _, policy)
+            | Self::Sub(_, _, policy)
+            | Self::Mul(_, _, policy)
+            | Self::Div(_, _, policy)
+            | Self::Mod(_, _, policy) => Some(*policy),
+            _ => None,
+        }
+    }
+
     fn references(&self) -> Vec<ProgramExprId> {
         match self {
             Self::Literal(_) | Self::SlotId(_) => Vec::new(),
@@ -195,18 +210,18 @@ impl StaticExprKind {
                 .chain(common_sub_exprs.iter().map(|(_, id)| *id))
                 .collect(),
             Self::DictDecode { child, .. }
-            | Self::Cast(child)
-            | Self::CastTime(child)
-            | Self::CastTimeFromDatetime(child)
+            | Self::Cast(child, _)
+            | Self::CastTime(child, _)
+            | Self::CastTimeFromDatetime(child, _)
             | Self::Not(child)
             | Self::IsNull(child)
             | Self::IsNotNull(child)
             | Self::Clone(child) => vec![*child],
-            Self::Add(a, b)
-            | Self::Sub(a, b)
-            | Self::Mul(a, b)
-            | Self::Div(a, b)
-            | Self::Mod(a, b)
+            Self::Add(a, b, _)
+            | Self::Sub(a, b, _)
+            | Self::Mul(a, b, _)
+            | Self::Div(a, b, _)
+            | Self::Mod(a, b, _)
             | Self::Eq(a, b)
             | Self::EqForNull(a, b)
             | Self::Ne(a, b)
@@ -299,6 +314,7 @@ pub enum StaticExpressionError {
     TooManyBytes,
     DuplicateLambdaSlot,
     InvalidMetadataArity,
+    UnsupportedDecimalCastPolicy,
 }
 
 impl fmt::Display for StaticExpressionError {
@@ -329,6 +345,17 @@ impl ImmutableExpressions {
                     return Err(StaticExpressionError::InvalidReference);
                 }
                 depth = depth.max(depths[child.index()] + 1);
+            }
+            if let StaticExprKind::Cast(child, policy)
+            | StaticExprKind::CastTime(child, policy)
+            | StaticExprKind::CastTimeFromDatetime(child, policy) = &node.kind
+                && !novarocks_type_contract::decimal_error_policy_cast_supported(
+                    &nodes[child.index()].data_type,
+                    &node.data_type,
+                    *policy,
+                )
+            {
+                return Err(StaticExpressionError::UnsupportedDecimalCastPolicy);
             }
             if depth > MAX_STATIC_EXPRESSION_DEPTH {
                 return Err(StaticExpressionError::TooDeep);
@@ -455,5 +482,64 @@ mod tests {
             panic!("expected dict decode")
         };
         assert!(Arc::ptr_eq(&dict, stored));
+    }
+    #[test]
+    fn static_binding_rejects_nested_reporting_decimal_casts() {
+        use arrow_schema::{Field, Fields};
+        use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+        fn containers(decimal: DataType) -> Vec<DataType> {
+            let field = Arc::new(Field::new("element", decimal.clone(), true));
+            let entries = Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", decimal.clone(), true),
+                ])),
+                false,
+            );
+            vec![
+                DataType::List(field.clone()),
+                DataType::LargeList(field.clone()),
+                DataType::FixedSizeList(field, 2),
+                DataType::Struct(Fields::from(vec![Field::new("value", decimal, true)])),
+                DataType::Map(Arc::new(entries), false),
+            ]
+        }
+        for (source, target) in containers(DataType::Decimal128(10, 2))
+            .into_iter()
+            .zip(containers(DataType::Decimal128(12, 3)))
+        {
+            for (result_type, policy, accepted) in [
+                (target.clone(), Policy::ReportError, false),
+                (target, Policy::OutputNull, true),
+                (source.clone(), Policy::ReportError, true),
+            ] {
+                let result = ImmutableExpressions::try_new(
+                    vec![
+                        StaticExprNode::new(
+                            StaticExprKind::SlotId(SlotId::new(1)),
+                            source.clone(),
+                            None,
+                        ),
+                        StaticExprNode::new(
+                            StaticExprKind::Cast(ProgramExprId::new(0), policy),
+                            result_type,
+                            None,
+                        ),
+                    ],
+                    false,
+                    HashMap::new(),
+                    None,
+                );
+                if accepted {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(StaticExpressionError::UnsupportedDecimalCastPolicy)
+                    ));
+                }
+            }
+        }
     }
 }

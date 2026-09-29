@@ -1,0 +1,15 @@
+-- query 1
+caught_range
+1
+
+-- query 3
+narrowed
+127
+
+-- query 4
+caught_utf8
+1
+
+-- query 5
+rendered
+2020-01-01

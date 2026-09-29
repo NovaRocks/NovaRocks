@@ -614,9 +614,16 @@ fn try_fold_node(
     // Gate 2: a volatile or DISTINCT function is never a constant.
     // Gate 3: an environment-sensitive function must stay on the backend.
     let kind = match &node {
-        ScalarNode::BinaryOp { op, .. } => FoldNodeKind::BinaryOp(*op),
+        ScalarNode::BinaryOp {
+            op,
+            decimal_overflow_policy,
+            ..
+        } => FoldNodeKind::BinaryOp(*op, *decimal_overflow_policy),
         ScalarNode::UnaryOp { op, .. } => FoldNodeKind::UnaryOp(*op),
-        ScalarNode::Cast { .. } => FoldNodeKind::Cast,
+        ScalarNode::Cast {
+            decimal_overflow_policy,
+            ..
+        } => FoldNodeKind::Cast(*decimal_overflow_policy),
         ScalarNode::FunctionCall {
             name,
             distinct,
@@ -742,7 +749,7 @@ mod tests {
                 FakeMode::Fold => {}
             }
             match &request.kind {
-                FoldNodeKind::BinaryOp(op @ (BinOp::Add | BinOp::Mul)) => {
+                FoldNodeKind::BinaryOp(op @ (BinOp::Add | BinOp::Mul), _) => {
                     let mut values = Vec::new();
                     for arg in &request.args {
                         let LiteralValue::Int(value) = arg.value else {
@@ -862,7 +869,13 @@ mod tests {
             nullable: bool,
         ) -> ScalarId {
             self.intern(
-                ScalarNode::BinaryOp { op, left, right },
+                ScalarNode::BinaryOp {
+                    op,
+                    left,
+                    right,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
                 data_type,
                 nullable,
             )
@@ -1009,7 +1022,10 @@ mod tests {
 
         // `1 + 2 + col` becomes `3 + col`: the constant sub-tree collapsed but
         // the outer node still references a column and stays put.
-        let ScalarNode::BinaryOp { op, left, right } = fixture.node(folded) else {
+        let ScalarNode::BinaryOp {
+            op, left, right, ..
+        } = fixture.node(folded)
+        else {
             panic!("expected a BinaryOp root, got {:?}", fixture.node(folded));
         };
         assert_eq!(op, BinOp::Add);
@@ -1389,5 +1405,139 @@ mod tests {
             matches!(fixture.apply(rewritten), RewriteResult::Unchanged),
             "folding must reach a fixed point in one pass"
         );
+    }
+}
+
+#[cfg(test)]
+mod overflow_policy_tests {
+    use super::*;
+    use crate::common::{BinOp, LiteralValue};
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+    struct CheckedEvaluator;
+    impl SqlConstantEvaluator for CheckedEvaluator {
+        fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+            match request.kind {
+                FoldNodeKind::BinaryOp(BinOp::Add, ReportError)
+                | FoldNodeKind::Cast(ReportError) => Err("checked overflow".to_string()),
+                FoldNodeKind::BinaryOp(BinOp::Add, OutputNull) | FoldNodeKind::Cast(OutputNull) => {
+                    Ok(Some(LiteralValue::Null))
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+    #[test]
+    fn throwing_fold_request_retains_original_node_and_policy_and_nullable_sibling_folds() {
+        static EVALUATOR: CheckedEvaluator = CheckedEvaluator;
+        let mut arena = ScalarArena::new();
+        let child = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Decimal(
+                "99999999999999999999999999999999999999".to_string(),
+            ))),
+            DataType::Decimal128(38, 0),
+            false,
+        );
+        for cast in [false, true] {
+            let node = |policy| {
+                if cast {
+                    ScalarNode::Cast {
+                        child,
+                        target: DataType::Decimal128(9, 0),
+                        decimal_overflow_policy: policy,
+                    }
+                } else {
+                    ScalarNode::BinaryOp {
+                        op: BinOp::Add,
+                        left: child,
+                        right: child,
+                        decimal_overflow_policy: policy,
+                    }
+                }
+            };
+            let data_type = if cast {
+                DataType::Decimal128(9, 0)
+            } else {
+                DataType::Decimal128(38, 0)
+            };
+            let nullable = arena.intern(node(OutputNull), data_type.clone(), true);
+            let throwing = arena.intern(node(ReportError), data_type, true);
+            let original = arena.node(throwing).clone();
+            assert!(try_fold_node(&mut arena, throwing, &EVALUATOR).is_none());
+            assert_eq!(arena.node(throwing), &original);
+            let folded = try_fold_node(&mut arena, nullable, &EVALUATOR).unwrap();
+            assert!(matches!(
+                arena.node(folded),
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Null))
+            ));
+            assert!(try_fold_node(&mut arena, throwing, &EVALUATOR).is_none());
+        }
+    }
+    #[test]
+    fn legacy_allow_disables_numeric_fold_without_disabling_pure_ast_reduction() {
+        use novarocks_type_contract::DecimalOverflowPolicy::OutputNull;
+        struct NullableEvaluator;
+        impl SqlConstantEvaluator for NullableEvaluator {
+            fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+                match request.kind {
+                    FoldNodeKind::BinaryOp(BinOp::Mul, OutputNull)
+                    | FoldNodeKind::Cast(OutputNull) => Ok(Some(LiteralValue::Null)),
+                    _ => Ok(None),
+                }
+            }
+        }
+        static NULLABLE: NullableEvaluator = NullableEvaluator;
+        for cast in [false, true] {
+            let mut arena = ScalarArena::new();
+            let literal = arena.intern(
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Decimal(
+                    "99999999999999999999999999999999999999".to_string(),
+                ))),
+                DataType::Decimal128(38, 0),
+                false,
+            );
+            let original = if cast {
+                ScalarNode::Cast {
+                    child: literal,
+                    target: DataType::Decimal128(9, 0),
+                    decimal_overflow_policy: OutputNull,
+                }
+            } else {
+                ScalarNode::BinaryOp {
+                    left: literal,
+                    right: literal,
+                    op: BinOp::Mul,
+                    decimal_overflow_policy: OutputNull,
+                }
+            };
+            let id = arena.intern(
+                original.clone(),
+                if cast {
+                    DataType::Decimal128(9, 0)
+                } else {
+                    DataType::Decimal128(38, 0)
+                },
+                true,
+            );
+            let guarded =
+                crate::compiler::constant_evaluator_for_legacy_mode(Some(&NULLABLE), true).unwrap();
+            assert!(try_fold_node(&mut arena, id, guarded).is_none());
+            assert_eq!(arena.node(id), &original);
+            let default =
+                crate::compiler::constant_evaluator_for_legacy_mode(Some(&NULLABLE), false)
+                    .unwrap();
+            let folded = try_fold_node(&mut arena, id, default).unwrap();
+            assert!(matches!(
+                arena.node(folded),
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Null))
+            ));
+            let nested = arena.intern(
+                ScalarNode::Nested(literal),
+                DataType::Decimal128(38, 0),
+                false,
+            );
+            let pure = try_fold_node(&mut arena, nested, guarded).unwrap();
+            assert!(matches!(arena.node(pure), ScalarNode::Literal(_)));
+        }
+        assert!(crate::compiler::constant_evaluator_for_legacy_mode(None, true).is_none());
     }
 }

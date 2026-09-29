@@ -190,7 +190,12 @@ pub(super) fn binary_op(
     nullable: bool,
 ) -> ScalarId {
     arena.intern(
-        ScalarNode::BinaryOp { op, left, right },
+        ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        },
         data_type,
         nullable,
     )
@@ -240,6 +245,7 @@ pub(super) fn orient_eq(
         left,
         op: BinOp::Eq,
         right,
+        ..
     } = arena.node(conjunct)
     else {
         return None;
@@ -370,10 +376,16 @@ where
     let data_type = arena.data_type(expr).clone();
     let nullable = arena.nullable(expr);
     let rebuilt = match node {
-        ScalarNode::BinaryOp { op, left, right } => ScalarNode::BinaryOp {
+        ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy,
+        } => ScalarNode::BinaryOp {
             op,
             left: rewrite(arena, left)?,
             right: rewrite(arena, right)?,
+            decimal_overflow_policy,
         },
         ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
             op,
@@ -409,9 +421,14 @@ where
             order_by: rewrite_sort_keys(arena, order_by, rewrite)?,
             resolved,
         },
-        ScalarNode::Cast { child, target } => ScalarNode::Cast {
+        ScalarNode::Cast {
+            child,
+            target,
+            decimal_overflow_policy,
+        } => ScalarNode::Cast {
             child: rewrite(arena, child)?,
             target,
+            decimal_overflow_policy,
         },
         ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
             child: rewrite(arena, child)?,

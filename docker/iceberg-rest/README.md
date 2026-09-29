@@ -33,6 +33,8 @@ docker/iceberg-rest/up.sh
 
 `NOVA_FIXTURE_STORE` 指定 BOM store。provision 可以下载、pull 和 build；verify、共享 runtime owner 和普通测试消费者只读取本机 BOM 与镜像。BOM 前置条件缺失/不一致返回 75；CI 归为 BLOCKED。端口不可用、身份不符、外部连接和其他 owner 失败归为 VERIFY FAILED，不进入 Cargo gates。
 
+`docker/fixture-inputs/verify.sh` 默认核验全量 BOM；Iceberg runtime owner 使用封闭的 `iceberg-rest` consumer，核验其服务镜像及由 lock 声明推导的 Spark base/JAR 闭包。两者都要求当前全局 READY/lock/BOM，且严格检查所需输入的定义、校验和、平台、标签与精确镜像 ID。独立 Paimon 输入的定义变化不会阻塞未消费它的 Iceberg runtime；所需输入失败仍返回 75，不自动供给或拉取。
+
 供给阶段仍可能移动 daemon 全局 derived-image alias，私有 BOM store 本身不隔离 alias。owner 为实例保存独立标签和真实 image ID；benchmark bootstrap 先 bind，再读取本次 publication，并核对实际 Spark 容器 image ID 与 BOM producer。精确供给快照的竞态消除属于后续工作，不能把当前核验描述为已经消除竞态。
 
 控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-runtime`，`NOVA_FIXTURE_RUNTIME_DIR` 可覆盖。owner locator 是控制目录加本机 daemon ID；实例的资源命名也包含该所有权命名空间。对象存储与 catalog 分别拥有项目、记录和卷；catalog 使用持久数据库，并连接到其对象存储。MinIO 恢复会重新接入全部仍有记录的 catalog 网络。

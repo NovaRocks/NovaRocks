@@ -969,6 +969,8 @@ pub(crate) mod tests {
                                 data_type: DataType::Int32,
                                 nullable: false,
                             }),
+                            decimal_overflow_policy:
+                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                         data_type: DataType::Boolean,
                         nullable: false,
@@ -1569,6 +1571,8 @@ pub(crate) mod tests {
                             left: Box::new(column_expr(1, "k", false)),
                             op: BinOp::Eq,
                             right: Box::new(column_expr(10, "k", false)),
+                            decimal_overflow_policy:
+                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                         data_type: DataType::Boolean,
                         nullable: false,
@@ -1592,6 +1596,8 @@ pub(crate) mod tests {
                         left: Box::new(column_expr(1, "k", false)),
                         op: BinOp::Eq,
                         right: Box::new(column_expr(10, "k", false)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -1639,6 +1645,8 @@ pub(crate) mod tests {
                         left: Box::new(column_expr(1, "k", false)),
                         op: BinOp::Eq,
                         right: Box::new(column_expr(10, "k", false)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -1658,6 +1666,8 @@ pub(crate) mod tests {
                             data_type: DataType::Int64,
                             nullable: false,
                         }),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -1689,6 +1699,8 @@ pub(crate) mod tests {
                             data_type: DataType::Int64,
                             nullable: false,
                         }),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -1707,6 +1719,8 @@ pub(crate) mod tests {
                         left: Box::new(column_expr(1, "k", false)),
                         op: BinOp::Eq,
                         right: Box::new(column_expr(10, "k", false)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,

@@ -928,19 +928,19 @@ fn expr_contains_slot(arena: &ExprArena, id: ExprId) -> bool {
         Some(ExprNode::StructExpr { fields }) => {
             fields.iter().any(|child| expr_contains_slot(arena, *child))
         }
-        Some(ExprNode::Cast(child))
-        | Some(ExprNode::CastTime(child))
-        | Some(ExprNode::CastTimeFromDatetime(child))
+        Some(ExprNode::Cast(child, _))
+        | Some(ExprNode::CastTime(child, _))
+        | Some(ExprNode::CastTimeFromDatetime(child, _))
         | Some(ExprNode::DictDecode { child, .. })
         | Some(ExprNode::Clone(child))
         | Some(ExprNode::Not(child))
         | Some(ExprNode::IsNull(child))
         | Some(ExprNode::IsNotNull(child)) => expr_contains_slot(arena, *child),
-        Some(ExprNode::Add(left, right))
-        | Some(ExprNode::Sub(left, right))
-        | Some(ExprNode::Mul(left, right))
-        | Some(ExprNode::Div(left, right))
-        | Some(ExprNode::Mod(left, right))
+        Some(ExprNode::Add(left, right, _))
+        | Some(ExprNode::Sub(left, right, _))
+        | Some(ExprNode::Mul(left, right, _))
+        | Some(ExprNode::Div(left, right, _))
+        | Some(ExprNode::Mod(left, right, _))
         | Some(ExprNode::Eq(left, right))
         | Some(ExprNode::EqForNull(left, right))
         | Some(ExprNode::Ne(left, right))
@@ -1522,10 +1522,22 @@ mod tests {
             ExprNode::Literal(LiteralValue::Utf8("2022-12-31 23:59:50".to_string())),
             DataType::Utf8,
         );
-        let match_cast = arena.push_typed(ExprNode::Cast(match_lit), ts_type.clone());
+        let match_cast = arena.push_typed(
+            ExprNode::Cast(
+                match_lit,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            ts_type.clone(),
+        );
         let rogue_lit =
             arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
-        let rogue_cast = arena.push_typed(ExprNode::Cast(rogue_lit), ts_type.clone());
+        let rogue_cast = arena.push_typed(
+            ExprNode::Cast(
+                rogue_lit,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            ts_type.clone(),
+        );
         let expr = arena.push_typed(
             ExprNode::In {
                 child,

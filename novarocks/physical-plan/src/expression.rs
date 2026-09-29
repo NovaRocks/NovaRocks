@@ -214,6 +214,7 @@ pub enum ExprKind {
         left: ExprId,
         op: BinaryOperator,
         right: ExprId,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     /// SQL `AND` over an ordered argument list.
     ///
@@ -247,6 +248,7 @@ pub enum ExprKind {
     Cast {
         expr: ExprId,
         target: DataType,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     IsNull {
         expr: ExprId,
@@ -456,7 +458,7 @@ pub fn join_key_source_value(arena: &ExprArena, expression: ExprId) -> Option<Va
     let node = arena.get(expression)?;
     match &node.kind {
         ExprKind::Value(value) => Some(*value),
-        ExprKind::Cast { expr, target } => {
+        ExprKind::Cast { expr, target, .. } => {
             let operand = arena.get(*expr)?;
             widening_keeps_key_identity(&operand.ty.data_type, target)
                 .then(|| join_key_source_value(arena, *expr))

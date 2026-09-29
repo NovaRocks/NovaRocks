@@ -95,6 +95,7 @@ pub(crate) enum ScalarNode {
         op: BinOp,
         left: ScalarId,
         right: ScalarId,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     UnaryOp {
         op: UnOp,
@@ -121,6 +122,7 @@ pub(crate) enum ScalarNode {
     Cast {
         child: ScalarId,
         target: DataType,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     },
     IsNull {
         child: ScalarId,
@@ -261,16 +263,28 @@ impl ScalarArena {
     /// `a AND b` and `b AND a` intern to one id. Mirrors StarRocks
     /// normalizeChildrenGroup.
     fn normalize(node: ScalarNode) -> ScalarNode {
-        if let ScalarNode::BinaryOp { op, left, right } = node {
+        if let ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy,
+        } = node
+        {
             let commutative = matches!(op, BinOp::And | BinOp::Or | BinOp::Eq);
             if commutative && left.0 > right.0 {
                 return ScalarNode::BinaryOp {
                     op,
                     left: right,
                     right: left,
+                    decimal_overflow_policy,
                 };
             }
-            return ScalarNode::BinaryOp { op, left, right };
+            return ScalarNode::BinaryOp {
+                op,
+                left,
+                right,
+                decimal_overflow_policy,
+            };
         }
         node
     }
@@ -692,6 +706,7 @@ mod tests {
                 op: BinOp::Add,
                 left: c,
                 right: lit,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             int(),
             false,
@@ -701,6 +716,7 @@ mod tests {
                 op: BinOp::Add,
                 left: c,
                 right: lit,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             int(),
             false,
@@ -776,6 +792,7 @@ mod tests {
                 op: BinOp::And,
                 left: x,
                 right: y,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             b.clone(),
             false,
@@ -785,6 +802,7 @@ mod tests {
                 op: BinOp::And,
                 left: y,
                 right: x,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             b.clone(),
             false,
@@ -796,6 +814,7 @@ mod tests {
                 op: BinOp::Sub,
                 left: x,
                 right: y,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             int(),
             false,
@@ -805,6 +824,7 @@ mod tests {
                 op: BinOp::Sub,
                 left: y,
                 right: x,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             int(),
             false,
@@ -860,6 +880,7 @@ mod bridge_tests {
                 left: Box::new(l),
                 op: BinOp::Eq,
                 right: Box::new(r),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -1157,6 +1178,8 @@ mod bridge_tests {
                         left: Box::new(lambda_param_ref.clone()),
                         op: BinOp::Add,
                         right: Box::new(lit_int(1)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     DataType::Int64,
                     false,
@@ -1193,6 +1216,8 @@ mod bridge_tests {
                 ExprKind::Cast {
                     expr: Box::new(col(1, DataType::Int64)),
                     target: DataType::Utf8,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
                 DataType::Utf8,
                 true,
@@ -1336,6 +1361,75 @@ mod bridge_tests {
         );
         let id2 = intern_typed(&mut a, &e);
         assert_eq!(id1, id2, "complex expr must dedup to one id");
+    }
+}
+
+#[cfg(test)]
+mod overflow_policy_tests {
+    use super::*;
+    use crate::analysis::ExprKind;
+    use crate::planner::optimizer_bridge::scalar::{intern_typed, materialize};
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+
+    #[test]
+    fn arithmetic_and_cast_interning_do_not_merge_different_error_policies() {
+        let mut arena = ScalarArena::new();
+        let child = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            DataType::Decimal128(38, 0),
+            true,
+        );
+        let mut ids = Vec::new();
+        for policy in [OutputNull, ReportError] {
+            ids.push(arena.intern(
+                ScalarNode::BinaryOp {
+                    op: BinOp::Add,
+                    left: child,
+                    right: child,
+                    decimal_overflow_policy: policy,
+                },
+                DataType::Decimal128(38, 0),
+                true,
+            ));
+            ids.push(arena.intern(
+                ScalarNode::Cast {
+                    child,
+                    target: DataType::Decimal128(9, 0),
+                    decimal_overflow_policy: policy,
+                },
+                DataType::Decimal128(9, 0),
+                true,
+            ));
+        }
+        assert_ne!(ids[0], ids[2]);
+        assert_ne!(ids[1], ids[3]);
+        for id in ids {
+            let typed = materialize(&arena, id);
+            assert_eq!(intern_typed(&mut arena, &typed), id);
+            let expected = match arena.node(id) {
+                ScalarNode::BinaryOp {
+                    decimal_overflow_policy,
+                    ..
+                }
+                | ScalarNode::Cast {
+                    decimal_overflow_policy,
+                    ..
+                } => *decimal_overflow_policy,
+                _ => panic!("arithmetic or cast"),
+            };
+            let actual = match typed.kind {
+                ExprKind::BinaryOp {
+                    decimal_overflow_policy,
+                    ..
+                }
+                | ExprKind::Cast {
+                    decimal_overflow_policy,
+                    ..
+                } => decimal_overflow_policy,
+                _ => panic!("typed arithmetic or cast"),
+            };
+            assert_eq!(actual, expected);
+        }
     }
 }
 

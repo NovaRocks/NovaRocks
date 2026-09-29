@@ -246,6 +246,7 @@ fn split_and_scalar_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<Sca
             op: crate::common::BinOp::And,
             left,
             right,
+            ..
         } => {
             split_and_scalar_inner(arena, *left, out);
             split_and_scalar_inner(arena, *right, out);
@@ -369,7 +370,12 @@ mod tests {
 
     fn binary(memo: &mut Memo, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
         memo.scalars.intern(
-            ScalarNode::BinaryOp { left, op, right },
+            ScalarNode::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
             DataType::Boolean,
             false,
         )

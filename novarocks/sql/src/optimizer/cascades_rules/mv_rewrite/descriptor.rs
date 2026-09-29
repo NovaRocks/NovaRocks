@@ -751,6 +751,7 @@ fn split_join_condition(
                 op: BinOp::Eq,
                 left,
                 right,
+                ..
             } => match (arena.node(*left), arena.node(*right)) {
                 (ScalarNode::ColumnRef(l), ScalarNode::ColumnRef(r)) => {
                     normalize_equi_edge(*l, *r, left_columns, right_columns)
@@ -847,10 +848,16 @@ pub(crate) fn substitute_scalar(
         ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
             return expr;
         }
-        ScalarNode::BinaryOp { op, left, right } => ScalarNode::BinaryOp {
+        ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy,
+        } => ScalarNode::BinaryOp {
             op,
             left: substitute_scalar(arena, left, defs),
             right: substitute_scalar(arena, right, defs),
+            decimal_overflow_policy,
         },
         ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
             op,
@@ -891,9 +898,14 @@ pub(crate) fn substitute_scalar(
                 .collect(),
             resolved,
         },
-        ScalarNode::Cast { child, target } => ScalarNode::Cast {
+        ScalarNode::Cast {
+            child,
+            target,
+            decimal_overflow_policy,
+        } => ScalarNode::Cast {
             child: substitute_scalar(arena, child, defs),
             target,
+            decimal_overflow_policy,
         },
         ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
             child: substitute_scalar(arena, child, defs),
@@ -1116,6 +1128,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,
@@ -1218,6 +1231,7 @@ mod tests {
                 op: BinOp::Eq,
                 left: a_ref,
                 right: b_ref,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,
@@ -1227,6 +1241,7 @@ mod tests {
                 op: BinOp::Gt,
                 left: a_ref,
                 right: b_ref,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,
@@ -1236,6 +1251,7 @@ mod tests {
                 op: BinOp::And,
                 left: eq,
                 right: gt,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,
@@ -1274,6 +1290,7 @@ mod tests {
                 op: BinOp::Eq,
                 left: c_ref,
                 right: a_ref,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,
@@ -1301,6 +1318,7 @@ mod tests {
                 op: BinOp::Eq,
                 left: a_ref,
                 right: b_ref,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,

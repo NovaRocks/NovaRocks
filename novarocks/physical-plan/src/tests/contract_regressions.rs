@@ -2180,6 +2180,8 @@ fn higher_order_function_fragment(
                 node,
                 parameter_type.clone(),
                 ExprKind::Binary {
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     left: call,
                     op: BinaryOperator::Add,
                     right: lambda,

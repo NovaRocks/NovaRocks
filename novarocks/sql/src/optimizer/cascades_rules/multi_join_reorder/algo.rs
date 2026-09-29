@@ -572,6 +572,8 @@ fn connecting_condition_scalars(
                     op: BinOp::Eq,
                     left: left_col,
                     right: right_col,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
                 DataType::Boolean,
                 nullable,
@@ -600,6 +602,7 @@ fn equi_columns(arena: &ScalarArena, expr: ScalarId) -> Option<(ColumnId, Column
             op: BinOp::Eq,
             left,
             right,
+            ..
         } => Some((column_of(arena, *left)?, column_of(arena, *right)?)),
         _ => None,
     }
@@ -622,11 +625,13 @@ fn has_equijoin_predicate(arena: &ScalarArena, expr: ScalarId) -> bool {
             left,
             op: BinOp::And,
             right,
+            ..
         } => has_equijoin_predicate(arena, *left) || has_equijoin_predicate(arena, *right),
         ScalarNode::BinaryOp {
             left,
             op: BinOp::Eq,
             right,
+            ..
         } => {
             matches!(arena.node(*left), ScalarNode::ColumnRef(_))
                 && matches!(arena.node(*right), ScalarNode::ColumnRef(_))
@@ -648,6 +653,7 @@ fn count_predicate_conjuncts(arena: &ScalarArena, expr: ScalarId) -> usize {
             left,
             op: BinOp::And,
             right,
+            ..
         } => count_predicate_conjuncts(arena, *left)
             .saturating_add(count_predicate_conjuncts(arena, *right)),
         _ => 1,
@@ -672,6 +678,7 @@ fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> Scal
                 op: BinOp::And,
                 left,
                 right: result,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             nullable,
@@ -787,6 +794,7 @@ mod tests {
                 left: Box::new(l),
                 op: BinOp::Eq,
                 right: Box::new(r),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: arrow::datatypes::DataType::Boolean,
             nullable: false,

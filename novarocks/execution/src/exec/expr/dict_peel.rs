@@ -161,20 +161,20 @@ fn collect_referenced_slots_with_bound(
                 })
         }
         ExprNode::DictDecode { child, .. }
-        | ExprNode::Cast(child)
-        | ExprNode::CastTime(child)
-        | ExprNode::CastTimeFromDatetime(child)
+        | ExprNode::Cast(child, _)
+        | ExprNode::CastTime(child, _)
+        | ExprNode::CastTimeFromDatetime(child, _)
         | ExprNode::Not(child)
         | ExprNode::IsNull(child)
         | ExprNode::IsNotNull(child)
         | ExprNode::Clone(child) => {
             collect_referenced_slots_with_bound(arena, *child, bound, slots)
         }
-        ExprNode::Add(left, right)
-        | ExprNode::Sub(left, right)
-        | ExprNode::Mul(left, right)
-        | ExprNode::Div(left, right)
-        | ExprNode::Mod(left, right)
+        ExprNode::Add(left, right, _)
+        | ExprNode::Sub(left, right, _)
+        | ExprNode::Mul(left, right, _)
+        | ExprNode::Div(left, right, _)
+        | ExprNode::Mod(left, right, _)
         | ExprNode::Eq(left, right)
         | ExprNode::EqForNull(left, right)
         | ExprNode::Ne(left, right)
@@ -219,7 +219,8 @@ fn is_peel_safe_expr(arena: &ExprArena, expr_id: ExprId) -> bool {
     match node {
         ExprNode::SlotId(_) => true,
         ExprNode::Literal(value) => !matches!(value, LiteralValue::Null),
-        ExprNode::Cast(child) | ExprNode::Clone(child) => is_peel_safe_expr(arena, *child),
+        ExprNode::Cast(child, novarocks_type_contract::DecimalOverflowPolicy::OutputNull)
+        | ExprNode::Clone(child) => is_peel_safe_expr(arena, *child),
         ExprNode::FunctionCall { kind, args } if is_peel_safe_function(*kind) => args
             .iter()
             .copied()
@@ -458,5 +459,22 @@ mod tests {
         assert!(is_supported_i32_string_dictionary(&utf8_dict));
         assert!(!is_supported_i32_string_dictionary(&int_dict));
         assert!(!is_supported_i32_string_dictionary(&int64_key_dict));
+    }
+
+    #[test]
+    fn dictionary_peel_requires_a_non_reporting_cast_policy() {
+        use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+        let mut arena = ExprArena::default();
+        let input = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let null_cast = arena.push_typed(
+            ExprNode::Cast(input, Policy::OutputNull),
+            DataType::Decimal128(10, 0),
+        );
+        let error_cast = arena.push_typed(
+            ExprNode::Cast(input, Policy::ReportError),
+            DataType::Decimal128(10, 0),
+        );
+        assert!(super::is_peel_safe_expr(&arena, null_cast));
+        assert!(!super::is_peel_safe_expr(&arena, error_cast));
     }
 }

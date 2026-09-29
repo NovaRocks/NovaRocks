@@ -467,7 +467,13 @@ fn assert_date_function_logic(name: &str) {
             } else {
                 DataType::Timestamp(TimeUnit::Microsecond, None)
             };
-            let dt = arena.push_typed(ExprNode::Cast(raw), domain);
+            let dt = arena.push_typed(
+                ExprNode::Cast(
+                    raw,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
+                domain,
+            );
             let interval =
                 arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int32);
             let unit = common::literal_string(
@@ -1324,7 +1330,10 @@ fn test_time_to_sec_recovers_from_failed_cast_time_literal() {
     let expr_i64: ExprId = common::typed_null(&mut arena, DataType::Int64);
     let literal = common::literal_string(&mut arena, "00:00:00");
     let cast_time = arena.push_typed(
-        ExprNode::Cast(literal),
+        ExprNode::Cast(
+            literal,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let parsed_from_source =
@@ -1347,7 +1356,10 @@ fn test_time_to_sec_cast_string_with_datetime_prefix_returns_null() {
     let expr_i64: ExprId = common::typed_null(&mut arena, DataType::Int64);
     let literal = common::literal_string(&mut arena, "1970-01-01 01:01:01");
     let cast_time = arena.push_typed(
-        ExprNode::Cast(literal),
+        ExprNode::Cast(
+            literal,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let out = eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk).expect("time_to_sec eval");
@@ -1366,11 +1378,17 @@ fn test_time_to_sec_explicit_datetime_cast_preserves_time_part() {
     let expr_i64: ExprId = common::typed_null(&mut arena, DataType::Int64);
     let literal = common::literal_string(&mut arena, "1970-01-01 01:01:01");
     let cast_datetime = arena.push_typed(
-        ExprNode::Cast(literal),
+        ExprNode::Cast(
+            literal,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let cast_time = arena.push_typed(
-        ExprNode::Cast(cast_datetime),
+        ExprNode::Cast(
+            cast_datetime,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     let out = eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk).expect("time_to_sec eval");
@@ -2441,7 +2459,10 @@ fn test_trunc_and_slice_and_alignment() {
     let unit_hour = common::literal_string(&mut arena, "hour");
     let dt2_raw = common::literal_string(&mut arena, "2020-01-02 03:04:05");
     let dt2 = arena.push_typed(
-        ExprNode::Cast(dt2_raw),
+        ExprNode::Cast(
+            dt2_raw,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     assert_eq!(
@@ -2455,7 +2476,13 @@ fn test_trunc_and_slice_and_alignment() {
         dt_micros("2020-01-02 03:00:00")
     );
     let dt3_raw = common::literal_string(&mut arena, "2020-01-02 03:04:05");
-    let dt3 = arena.push_typed(ExprNode::Cast(dt3_raw), DataType::Date32);
+    let dt3 = arena.push_typed(
+        ExprNode::Cast(
+            dt3_raw,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
+        DataType::Date32,
+    );
     let unit_day = common::literal_string(&mut arena, "day");
     let expr_date = common::typed_null(&mut arena, DataType::Date32);
     assert_eq!(
@@ -3006,7 +3033,13 @@ fn slice_typed_arena_canonicalizes_units_and_returns_exact_temporal_domains() {
             } else {
                 DataType::Timestamp(TimeUnit::Microsecond, None)
             };
-            let value = arena.push_typed(ExprNode::Cast(slot), domain.clone());
+            let value = arena.push_typed(
+                ExprNode::Cast(
+                    slot,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
+                domain.clone(),
+            );
             let count = arena.push_typed(
                 ExprNode::Literal(LiteralValue::Int64(i64::from(i32::MAX))),
                 DataType::Int32,
@@ -3057,7 +3090,13 @@ fn slice_typed_arena_ceil_is_right_edge_even_on_boundary_and_overflow_is_null() 
             } else {
                 DataType::Timestamp(TimeUnit::Microsecond, None)
             };
-            let value = arena.push_typed(ExprNode::Cast(raw), domain.clone());
+            let value = arena.push_typed(
+                ExprNode::Cast(
+                    raw,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
+                domain.clone(),
+            );
             let count = arena.push_typed(
                 ExprNode::Literal(LiteralValue::Int64(count)),
                 DataType::Int32,
@@ -3215,7 +3254,13 @@ fn slice_typed_arena_subsecond_coefficients_follow_year_one_epoch() {
         let chunk = common::chunk_len_1();
         let raw = common::literal_string(&mut arena, "2023-10-31 23:59:59.123456");
         let domain = DataType::Timestamp(TimeUnit::Microsecond, None);
-        let value = arena.push_typed(ExprNode::Cast(raw), domain.clone());
+        let value = arena.push_typed(
+            ExprNode::Cast(
+                raw,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            domain.clone(),
+        );
         let count = arena.push_typed(
             ExprNode::Literal(LiteralValue::Int64(count)),
             DataType::Int32,
@@ -3247,7 +3292,13 @@ fn slice_typed_arena_distinguishes_input_null_cast_failure_and_pre_epoch_error()
         let chunk = common::chunk_len_1();
         let raw = common::literal_string(&mut arena, input);
         let domain = DataType::Timestamp(TimeUnit::Microsecond, None);
-        let value = arena.push_typed(ExprNode::Cast(raw), domain.clone());
+        let value = arena.push_typed(
+            ExprNode::Cast(
+                raw,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            domain.clone(),
+        );
         let count = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(1)), DataType::Int32);
         let unit = common::literal_string(&mut arena, "day");
         let call = slice_call(

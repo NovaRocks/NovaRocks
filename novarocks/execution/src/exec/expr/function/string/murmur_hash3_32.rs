@@ -286,6 +286,7 @@ mod tests {
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow_buffer::i256;
+    use novarocks_type_contract::DecimalOverflowPolicy;
     use novarocks_types::{SlotId, largeint};
 
     fn assert_prepared_numeric_text(input: ArrayRef, expected_text: &[Option<&str>]) {
@@ -300,7 +301,10 @@ mod tests {
         let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
         let mut arena = ExprArena::default();
         let source = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), input_type);
-        let text = arena.push_typed(ExprNode::Cast(source), DataType::Utf8);
+        let text = arena.push_typed(
+            ExprNode::Cast(source, DecimalOverflowPolicy::OutputNull),
+            DataType::Utf8,
+        );
         let direct = arena.push_typed(
             ExprNode::FunctionCall {
                 kind: FunctionKind::String("murmur_hash3_32"),

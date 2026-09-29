@@ -224,6 +224,7 @@ mod tests {
                 left: Box::new(expr),
                 op: BinOp::Eq,
                 right: Box::new(int_literal(10)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,

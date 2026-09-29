@@ -298,6 +298,7 @@ mod tests {
                 left: Box::new(col_ref(INNER_K, "k", nullable)),
                 op: BinOp::Eq,
                 right: Box::new(col_ref(OUTER_K, "k", false)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable,
@@ -419,7 +420,10 @@ mod tests {
     }
 
     fn assert_eq_condition(condition: &TypedExpr, expected_a: ColumnId, expected_b: ColumnId) {
-        let ExprKind::BinaryOp { left, op, right } = &condition.kind else {
+        let ExprKind::BinaryOp {
+            left, op, right, ..
+        } = &condition.kind
+        else {
             panic!("expected bare Eq condition, got: {condition:?}");
         };
         assert_eq!(*op, BinOp::Eq);
@@ -444,7 +448,10 @@ mod tests {
     /// Returns true if `condition` is `a = b` (Eq BinaryOp) with the two
     /// expected column ids in either order.
     fn eq_condition_has_pair(condition: &TypedExpr, a: ColumnId, b: ColumnId) -> bool {
-        let ExprKind::BinaryOp { left, op, right } = &condition.kind else {
+        let ExprKind::BinaryOp {
+            left, op, right, ..
+        } = &condition.kind
+        else {
             return false;
         };
         if *op != BinOp::Eq {

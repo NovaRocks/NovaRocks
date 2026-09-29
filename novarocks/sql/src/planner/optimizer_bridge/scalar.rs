@@ -753,13 +753,19 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             slot_id: *slot_id,
         },
         ExprKind::Literal(v) => ScalarNode::Literal(HashableLiteral(v.clone())),
-        ExprKind::BinaryOp { left, op, right } => {
+        ExprKind::BinaryOp {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } => {
             let l = intern_typed(arena, left);
             let r = intern_typed(arena, right);
             ScalarNode::BinaryOp {
                 op: *op,
                 left: l,
                 right: r,
+                decimal_overflow_policy: *decimal_overflow_policy,
             }
         }
         ExprKind::UnaryOp { op, expr } => ScalarNode::UnaryOp {
@@ -802,9 +808,14 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
                 .collect(),
             resolved: resolved.clone(),
         },
-        ExprKind::Cast { expr, target } => ScalarNode::Cast {
+        ExprKind::Cast {
+            expr,
+            target,
+            decimal_overflow_policy,
+        } => ScalarNode::Cast {
             child: intern_typed(arena, expr),
             target: target.clone(),
+            decimal_overflow_policy: *decimal_overflow_policy,
         },
         ExprKind::IsNull { expr, negated } => ScalarNode::IsNull {
             child: intern_typed(arena, expr),
@@ -922,10 +933,16 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             slot_id: *slot_id,
         },
         ScalarNode::Literal(HashableLiteral(v)) => ExprKind::Literal(v.clone()),
-        ScalarNode::BinaryOp { op, left, right } => ExprKind::BinaryOp {
+        ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy,
+        } => ExprKind::BinaryOp {
             left: Box::new(materialize(arena, *left)),
             op: *op,
             right: Box::new(materialize(arena, *right)),
+            decimal_overflow_policy: *decimal_overflow_policy,
         },
         ScalarNode::UnaryOp { op, child } => ExprKind::UnaryOp {
             op: *op,
@@ -964,9 +981,14 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
                 .collect(),
             resolved: resolved.clone(),
         },
-        ScalarNode::Cast { child, target } => ExprKind::Cast {
+        ScalarNode::Cast {
+            child,
+            target,
+            decimal_overflow_policy,
+        } => ExprKind::Cast {
             expr: Box::new(materialize(arena, *child)),
             target: target.clone(),
+            decimal_overflow_policy: *decimal_overflow_policy,
         },
         ScalarNode::IsNull { child, negated } => ExprKind::IsNull {
             expr: Box::new(materialize(arena, *child)),

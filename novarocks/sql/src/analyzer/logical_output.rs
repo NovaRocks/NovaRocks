@@ -342,6 +342,7 @@ impl AnalyzerContext<'_> {
             kind: ExprKind::Cast {
                 expr: Box::new(expression),
                 target: target.clone(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: target,
             nullable,

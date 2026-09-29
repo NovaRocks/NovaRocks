@@ -402,19 +402,23 @@ fn exprs_equivalent(arena: &ExprArena, left: ExprId, right: ExprId) -> bool {
                 dict: right_dict,
             },
         ) => Arc::ptr_eq(left_dict, right_dict) && exprs_equivalent(arena, *left, *right),
-        (ExprNode::Cast(left), ExprNode::Cast(right))
-        | (ExprNode::CastTime(left), ExprNode::CastTime(right))
-        | (ExprNode::CastTimeFromDatetime(left), ExprNode::CastTimeFromDatetime(right))
-        | (ExprNode::Not(left), ExprNode::Not(right))
+        (ExprNode::Cast(left, lp), ExprNode::Cast(right, rp))
+        | (ExprNode::CastTime(left, lp), ExprNode::CastTime(right, rp))
+        | (ExprNode::CastTimeFromDatetime(left, lp), ExprNode::CastTimeFromDatetime(right, rp)) => {
+            lp == rp && exprs_equivalent(arena, *left, *right)
+        }
+        (ExprNode::Not(left), ExprNode::Not(right))
         | (ExprNode::IsNull(left), ExprNode::IsNull(right))
         | (ExprNode::IsNotNull(left), ExprNode::IsNotNull(right))
         | (ExprNode::Clone(left), ExprNode::Clone(right)) => exprs_equivalent(arena, *left, *right),
-        (ExprNode::Add(ll, lr), ExprNode::Add(rl, rr))
-        | (ExprNode::Sub(ll, lr), ExprNode::Sub(rl, rr))
-        | (ExprNode::Mul(ll, lr), ExprNode::Mul(rl, rr))
-        | (ExprNode::Div(ll, lr), ExprNode::Div(rl, rr))
-        | (ExprNode::Mod(ll, lr), ExprNode::Mod(rl, rr))
-        | (ExprNode::Eq(ll, lr), ExprNode::Eq(rl, rr))
+        (ExprNode::Add(ll, lr, lp), ExprNode::Add(rl, rr, rp))
+        | (ExprNode::Sub(ll, lr, lp), ExprNode::Sub(rl, rr, rp))
+        | (ExprNode::Mul(ll, lr, lp), ExprNode::Mul(rl, rr, rp))
+        | (ExprNode::Div(ll, lr, lp), ExprNode::Div(rl, rr, rp))
+        | (ExprNode::Mod(ll, lr, lp), ExprNode::Mod(rl, rr, rp)) => {
+            lp == rp && exprs_equivalent(arena, *ll, *rl) && exprs_equivalent(arena, *lr, *rr)
+        }
+        (ExprNode::Eq(ll, lr), ExprNode::Eq(rl, rr))
         | (ExprNode::EqForNull(ll, lr), ExprNode::EqForNull(rl, rr))
         | (ExprNode::Ne(ll, lr), ExprNode::Ne(rl, rr))
         | (ExprNode::Lt(ll, lr), ExprNode::Lt(rl, rr))
@@ -524,15 +528,32 @@ fn coerce_join_key_types(
         match common_type {
             Some(target_type) => {
                 if probe_type != target_type {
-                    probe_keys[idx] =
-                        arena.push_typed(ExprNode::Cast(probe_expr), target_type.clone());
+                    probe_keys[idx] = arena.push_typed(
+                        ExprNode::Cast(
+                            probe_expr,
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        ),
+                        target_type.clone(),
+                    );
                 }
                 if build_type != target_type {
-                    build_keys[idx] = arena.push_typed(ExprNode::Cast(build_expr), target_type);
+                    build_keys[idx] = arena.push_typed(
+                        ExprNode::Cast(
+                            build_expr,
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        ),
+                        target_type,
+                    );
                 }
             }
             None => {
-                build_keys[idx] = arena.push_typed(ExprNode::Cast(build_expr), probe_type);
+                build_keys[idx] = arena.push_typed(
+                    ExprNode::Cast(
+                        build_expr,
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    ),
+                    probe_type,
+                );
             }
         }
     }
@@ -563,5 +584,32 @@ fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<Data
             )))))
         }
         _ => Ok(Some(wider_type(left, right))),
+    }
+}
+
+#[cfg(test)]
+mod decimal_policy_tests {
+    use super::*;
+    use novarocks_execution::exec::expr::LiteralValue;
+    use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+
+    #[test]
+    fn join_expression_equivalence_preserves_decimal_policy_identity() {
+        let mut arena = ExprArena::default();
+        let input = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
+        let a = arena.push_typed(ExprNode::Cast(input, Policy::OutputNull), DataType::Int64);
+        let b = arena.push_typed(ExprNode::Cast(input, Policy::ReportError), DataType::Int64);
+        let c = arena.push_typed(ExprNode::Cast(input, Policy::OutputNull), DataType::Int64);
+        assert!(!exprs_equivalent(&arena, a, b));
+        assert!(exprs_equivalent(&arena, a, c));
+        let a = arena.push_typed(
+            ExprNode::Add(input, input, Policy::OutputNull),
+            DataType::Int64,
+        );
+        let b = arena.push_typed(
+            ExprNode::Add(input, input, Policy::ReportError),
+            DataType::Int64,
+        );
+        assert!(!exprs_equivalent(&arena, a, b));
     }
 }

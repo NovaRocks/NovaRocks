@@ -1176,7 +1176,12 @@ mod is_known_rule_name_tests {
     ) -> crate::optimizer::scalar::ScalarId {
         let right = scalar_int(arena, value);
         arena.intern(
-            ScalarNode::BinaryOp { left, op, right },
+            ScalarNode::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
             DataType::Boolean,
             true,
         )
@@ -1190,6 +1195,7 @@ mod is_known_rule_name_tests {
             ScalarNode::Cast {
                 child,
                 target: DataType::Int64,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Int64,
             true,
@@ -1206,6 +1212,7 @@ mod is_known_rule_name_tests {
                 left,
                 op: crate::common::BinOp::Or,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,

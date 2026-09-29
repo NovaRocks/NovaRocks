@@ -74,7 +74,14 @@ fn test_clone_expr_with_arithmetic() {
     // Create: 10 + 20
     let left = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(10)), DataType::Int64);
     let right = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(20)), DataType::Int64);
-    let add_id = arena.push_typed(ExprNode::Add(left, right), DataType::Int64);
+    let add_id = arena.push_typed(
+        ExprNode::Add(
+            left,
+            right,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
+        DataType::Int64,
+    );
 
     // Create: CLONE(10 + 20)
     let clone_id = arena.push_typed(ExprNode::Clone(add_id), DataType::Int64);

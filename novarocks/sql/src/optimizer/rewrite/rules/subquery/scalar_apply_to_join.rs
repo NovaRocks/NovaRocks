@@ -568,6 +568,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::Eq,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -1166,6 +1167,7 @@ mod tests {
             op: BinOp::Or,
             left: left_or,
             right: right_or,
+            ..
         } = &cond_arg.kind
         else {
             panic!("assert_true first arg must be OR; got: {:?}", cond_arg.kind);
@@ -1196,6 +1198,7 @@ mod tests {
             op: BinOp::Le,
             left: le_left,
             right: le_right,
+            ..
         } = &right_or.kind
         else {
             panic!("right OR branch must be <=; got: {:?}", right_or.kind);

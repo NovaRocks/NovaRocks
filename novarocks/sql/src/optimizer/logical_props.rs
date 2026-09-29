@@ -224,6 +224,7 @@ fn collect_strict_column_equalities_inner(
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             collect_strict_column_equalities_inner(scalars, *left, out);
             collect_strict_column_equalities_inner(scalars, *right, out);
@@ -232,6 +233,7 @@ fn collect_strict_column_equalities_inner(
             left,
             op: BinOp::Eq,
             right,
+            ..
         } => {
             if let (Some(left_id), Some(right_id)) = (
                 column_id_from_scalar(scalars, *left),
@@ -270,6 +272,7 @@ fn collect_literal_equalities_inner(
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             collect_literal_equalities_inner(scalars, *left, out);
             collect_literal_equalities_inner(scalars, *right, out);
@@ -278,6 +281,7 @@ fn collect_literal_equalities_inner(
             left,
             op: BinOp::Eq,
             right,
+            ..
         } => match (scalars.node(*left), scalars.node(*right)) {
             (ScalarNode::ColumnRef(column_id), ScalarNode::Literal(_))
                 if *column_id != ColumnId::UNSET =>
@@ -321,6 +325,7 @@ pub(crate) fn make_eq_literal_predicate(
             left,
             op: BinOp::Eq,
             right: literal,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         DataType::Boolean,
         column.nullable || arena.nullable(literal),
@@ -338,6 +343,7 @@ pub(crate) fn combine_with_and(
                 left,
                 op: BinOp::And,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             arena.nullable(left) || arena.nullable(right),
@@ -379,7 +385,12 @@ mod tests {
 
     fn binary(arena: &mut ScalarArena, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
         arena.intern(
-            ScalarNode::BinaryOp { left, op, right },
+            ScalarNode::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
             DataType::Boolean,
             false,
         )

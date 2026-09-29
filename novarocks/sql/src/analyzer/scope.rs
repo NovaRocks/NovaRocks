@@ -624,6 +624,7 @@ impl AnalyzerScope {
         using_cols: &[String],
         left_qual: &str,
         right_qual: &str,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<(), String> {
         use crate::analysis::{ExprKind, TypedExpr};
         for col in using_cols {
@@ -685,6 +686,7 @@ impl AnalyzerScope {
                 function_catalog,
                 "coalesce",
                 vec![left_ref, right_ref],
+                decimal_overflow_policy,
             )?;
             let data_type = bound.return_type().clone();
             let coalesce = TypedExpr {

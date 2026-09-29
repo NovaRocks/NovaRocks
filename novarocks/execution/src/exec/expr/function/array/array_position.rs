@@ -32,18 +32,18 @@ fn is_row_constant_expr(arena: &ExprArena, expr: ExprId) -> bool {
             .all(|child| is_row_constant_expr(arena, *child)),
         Some(ExprNode::LambdaFunction { .. }) => false,
         Some(ExprNode::DictDecode { child, .. }) => is_row_constant_expr(arena, *child),
-        Some(ExprNode::Cast(child))
-        | Some(ExprNode::CastTime(child))
-        | Some(ExprNode::CastTimeFromDatetime(child))
+        Some(ExprNode::Cast(child, _))
+        | Some(ExprNode::CastTime(child, _))
+        | Some(ExprNode::CastTimeFromDatetime(child, _))
         | Some(ExprNode::Not(child))
         | Some(ExprNode::IsNull(child))
         | Some(ExprNode::IsNotNull(child))
         | Some(ExprNode::Clone(child)) => is_row_constant_expr(arena, *child),
-        Some(ExprNode::Add(a, b))
-        | Some(ExprNode::Sub(a, b))
-        | Some(ExprNode::Mul(a, b))
-        | Some(ExprNode::Div(a, b))
-        | Some(ExprNode::Mod(a, b))
+        Some(ExprNode::Add(a, b, _))
+        | Some(ExprNode::Sub(a, b, _))
+        | Some(ExprNode::Mul(a, b, _))
+        | Some(ExprNode::Div(a, b, _))
+        | Some(ExprNode::Mod(a, b, _))
         | Some(ExprNode::Eq(a, b))
         | Some(ExprNode::EqForNull(a, b))
         | Some(ExprNode::Ne(a, b))

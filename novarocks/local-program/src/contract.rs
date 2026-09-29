@@ -82,7 +82,7 @@ impl LayoutIdentity {
 pub struct KernelAbiVersion(NonZeroU32);
 
 impl KernelAbiVersion {
-    pub const CURRENT: Self = Self(NonZeroU32::MIN);
+    pub const CURRENT: Self = Self(NonZeroU32::new(2).unwrap());
 
     pub const fn new(value: NonZeroU32) -> Self {
         Self(value)

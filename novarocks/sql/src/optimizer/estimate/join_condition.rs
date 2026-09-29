@@ -82,6 +82,7 @@ fn collect_join_conjuncts(
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             collect_join_conjuncts(arena, *left, left_stats, right_stats, estimate, residuals);
             collect_join_conjuncts(arena, *right, left_stats, right_stats, estimate, residuals);
@@ -108,6 +109,7 @@ fn try_collect_equi_key(
         left,
         op: BinOp::Eq | BinOp::EqForNull,
         right,
+        ..
     } = arena.node(expr)
     else {
         return false;
@@ -177,6 +179,7 @@ fn is_unknown_column_literal_eq(
         left,
         op: BinOp::Eq | BinOp::EqForNull,
         right,
+        ..
     } = arena.node(expr)
     else {
         return false;

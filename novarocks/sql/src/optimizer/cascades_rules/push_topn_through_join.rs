@@ -125,6 +125,15 @@ fn rewrite_topn_through_join(
         return Vec::new();
     }
 
+    // The pushed limit suppresses join-condition evaluation for removed rows.
+    // Keep an errorful condition above its original complete input domain.
+    if join
+        .condition
+        .is_some_and(|condition| crate::optimizer::scalar_expr::can_fail(&memo.scalars, condition))
+    {
+        return Vec::new();
+    }
+
     let Some(preserved_idx) = preserved_child_index(join.join_type) else {
         return Vec::new();
     };
@@ -377,6 +386,7 @@ mod tests {
                 op: BinOp::Eq,
                 left,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,
@@ -409,6 +419,7 @@ mod tests {
                 op: BinOp::Add,
                 left,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Int64,
             true,
@@ -947,5 +958,122 @@ mod tests {
             total_cost.is_finite(),
             "search should keep a feasible plan after adding the pushed join alternative"
         );
+    }
+
+    fn checked_decimal_join_condition(
+        memo: &mut Memo,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> crate::optimizer::scalar::ScalarId {
+        let equality = eq_condition(memo, 1, 2);
+        let source = memo
+            .scalars
+            .intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let cast = memo.scalars.intern(
+            ScalarNode::Cast {
+                child: source,
+                target: DataType::Decimal128(2, 0),
+                decimal_overflow_policy: policy,
+            },
+            DataType::Decimal128(2, 0),
+            true,
+        );
+        let checked = memo.scalars.intern(
+            ScalarNode::IsNull {
+                child: cast,
+                negated: true,
+            },
+            DataType::Boolean,
+            false,
+        );
+        memo.scalars.intern(
+            ScalarNode::BinaryOp {
+                left: equality,
+                op: BinOp::And,
+                right: checked,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            DataType::Boolean,
+            true,
+        )
+    }
+
+    #[test]
+    fn throwing_outer_join_condition_prevents_topn_input_reduction() {
+        use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+        for policy in [Policy::OutputNull, Policy::ReportError] {
+            let mut memo = Memo::new();
+            let left = values_group(&mut memo, &[1]);
+            let right = values_group(&mut memo, &[2]);
+            let condition = checked_decimal_join_condition(&mut memo, policy);
+            let join = join_group_with_condition(
+                &mut memo,
+                JoinKind::LeftOuter,
+                left,
+                right,
+                Some(condition),
+            );
+            let item = sort_key(&mut memo, 1);
+            let topn = topn_with_key(
+                &mut memo,
+                item,
+                Some(10),
+                Some(0),
+                TopNPhase::Final,
+                false,
+                join,
+            );
+            let groups_before = memo.groups.len();
+            let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+            if policy == Policy::ReportError {
+                assert!(out.is_empty());
+                assert_eq!(
+                    memo.groups.len(),
+                    groups_before,
+                    "rejected rule must not add pruned groups"
+                );
+            } else {
+                assert_eq!(out.len(), 1);
+                assert_rewrite_pushes_preserved_side(&memo, &out[0], left, right, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn bound_outer_join_rule_preserves_throwing_condition_domain() {
+        use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+        for policy in [Policy::OutputNull, Policy::ReportError] {
+            let mut memo = Memo::new();
+            let left = values_group(&mut memo, &[1]);
+            let right = values_group(&mut memo, &[2]);
+            let condition = checked_decimal_join_condition(&mut memo, policy);
+            let join = join_group_with_condition(
+                &mut memo,
+                JoinKind::LeftOuter,
+                left,
+                right,
+                Some(condition),
+            );
+            let item = sort_key(&mut memo, 1);
+            let topn = topn_group(
+                &mut memo,
+                item,
+                Some(10),
+                Some(0),
+                TopNPhase::Final,
+                false,
+                join,
+            );
+            let bindings = bind(&PushTopNThroughJoin.pattern(), &memo, topn, 0);
+            assert_eq!(bindings.len(), 1);
+            let groups_before = memo.groups.len();
+            let out = PushTopNThroughJoin.apply_bound(&bindings[0], &mut memo);
+            if policy == Policy::ReportError {
+                assert!(out.is_empty());
+                assert_eq!(memo.groups.len(), groups_before);
+            } else {
+                assert_eq!(out.len(), 1);
+                assert_rewrite_pushes_preserved_side(&memo, &out[0], left, right, 0);
+            }
+        }
     }
 }

@@ -427,7 +427,7 @@ FROM ${case_db}.test_progressive_boundary ORDER BY id;
 -- =============================================================================
 
 -- query 40
--- @expect_error=scale 76 is greater than max 38
+-- @expect_error=arithmetic operator `Multiply` has no frozen result rule for Decimal128(38, 38) and Decimal128(38, 38)
 -- Test 5.1: Scale overflow, tiny value (throw exception)
 SELECT
     'Test 5.1: Scale overflow, tiny value' as test_case,

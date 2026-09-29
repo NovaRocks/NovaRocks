@@ -1207,7 +1207,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             None,
             layout.identity().unwrap(),
-            lp::KernelAbiVersion::new(NonZeroU32::new(1).unwrap()),
+            lp::KernelAbiVersion::CURRENT,
         )
     }
 

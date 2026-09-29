@@ -520,6 +520,7 @@ mod tests {
                 r#type: Some(encode_type(&DataType::Boolean).expect("encode type")),
                 nullable: false,
                 kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                    decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                     op: expr::BinaryOp::Eq as i32,
                     left: None,
                     right: None,

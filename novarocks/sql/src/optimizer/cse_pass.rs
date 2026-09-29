@@ -184,6 +184,9 @@ fn subtree_size(scalars: &ScalarArena, id: ScalarId) -> usize {
 }
 
 fn eligible(scalars: &ScalarArena, id: ScalarId) -> bool {
+    if scalar_expr::can_fail(scalars, id) {
+        return false;
+    }
     match scalars.node(id) {
         ScalarNode::ColumnRef(_)
         | ScalarNode::Literal(_)
@@ -439,10 +442,16 @@ fn substitute(
     let data_type = scalars.data_type(id).clone();
     let nullable = scalars.nullable(id);
     let rewritten = match node {
-        ScalarNode::BinaryOp { op, left, right } => ScalarNode::BinaryOp {
+        ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy,
+        } => ScalarNode::BinaryOp {
             op,
             left: substitute(scalars, left, subst),
             right: substitute(scalars, right, subst),
+            decimal_overflow_policy,
         },
         ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
             op,
@@ -486,9 +495,14 @@ fn substitute(
                 .collect(),
             resolved,
         },
-        ScalarNode::Cast { child, target } => ScalarNode::Cast {
+        ScalarNode::Cast {
+            child,
+            target,
+            decimal_overflow_policy,
+        } => ScalarNode::Cast {
             child: substitute(scalars, child, subst),
             target,
+            decimal_overflow_policy,
         },
         ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
             child: substitute(scalars, child, subst),
@@ -1403,6 +1417,7 @@ mod tests {
                 op: BinOp::Add,
                 left,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Int64,
             true,
@@ -1415,6 +1430,7 @@ mod tests {
                 op: BinOp::Mul,
                 left,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Int64,
             true,
@@ -1427,6 +1443,7 @@ mod tests {
                 op: BinOp::Gt,
                 left,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,
@@ -1439,6 +1456,7 @@ mod tests {
                 op: BinOp::Lt,
                 left,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,
@@ -1451,6 +1469,7 @@ mod tests {
                 op: BinOp::And,
                 left,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             true,
@@ -1497,6 +1516,7 @@ mod tests {
             ScalarNode::Cast {
                 child,
                 target: DataType::Int64,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Int64,
             true,
@@ -1683,6 +1703,7 @@ mod tests {
             ScalarNode::Cast {
                 child: null_array,
                 target: array_map_type.clone(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             array_map_type.clone(),
             false,
@@ -3642,5 +3663,108 @@ mod tests {
             panic!("expected nested loop join");
         };
         assert_eq!(join.condition, Some(condition));
+    }
+}
+
+#[cfg(test)]
+mod intrinsic_eligibility_tests {
+    use super::*;
+    use novarocks_functions::{
+        FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
+        FunctionValueType,
+    };
+
+    #[test]
+    fn selected_own_error_excludes_cse_hoisting_while_caught_parse_is_eligible() {
+        let mut arena = ScalarArena::new();
+        let catalog = crate::functions::builtin_engine_function_catalog();
+        for (name, input_type, expected) in [
+            ("assert_true", DataType::Boolean, false),
+            ("parse_json", DataType::Utf8, true),
+        ] {
+            let child = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), input_type.clone(), true);
+            let arguments = [FunctionArgument::Value {
+                value_type: FunctionValueType::new(input_type, true),
+                constant: None,
+            }];
+            let binding = catalog
+                .resolve_bound_user(
+                    name,
+                    FunctionKind::Scalar,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 1,
+                    },
+                )
+                .unwrap();
+            catalog
+                .validate_bound(
+                    &binding,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 1,
+                    },
+                )
+                .unwrap();
+            let FunctionResultType::Scalar(output) = binding.selected.result_type.clone() else {
+                unreachable!()
+            };
+            let volatility = binding.semantics.volatility;
+            let call = arena.intern(
+                ScalarNode::FunctionCall {
+                    name: name.into(),
+                    args: vec![child],
+                    distinct: false,
+                    binding: binding.into(),
+                    volatility,
+                },
+                output.data_type,
+                output.nullable,
+            );
+            assert_eq!(eligible(&arena, call), expected, "{name}");
+            if !expected {
+                let condition = arena.intern(
+                    ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
+                        crate::analysis::LiteralValue::Bool(false),
+                    )),
+                    DataType::Boolean,
+                    false,
+                );
+                let branch = arena.intern(
+                    ScalarNode::Case {
+                        operand: None,
+                        when_then: vec![(condition, call)],
+                        else_expr: Some(child),
+                    },
+                    DataType::Boolean,
+                    true,
+                );
+                assert!(!eligible(&arena, branch));
+            }
+        }
+    }
+    #[test]
+    fn legacy_nullable_decimal_multiply_cannot_be_hoisted_as_an_error_free_expression() {
+        use crate::analysis::BinOp;
+        use novarocks_type_contract::DecimalOverflowPolicy::OutputNull;
+        let mut arena = ScalarArena::new();
+        let child = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            DataType::Decimal128(38, 0),
+            true,
+        );
+        for (op, expected) in [(BinOp::Mul, false), (BinOp::Add, true)] {
+            let expr = arena.intern(
+                ScalarNode::BinaryOp {
+                    op,
+                    left: child,
+                    right: child,
+                    decimal_overflow_policy: OutputNull,
+                },
+                DataType::Decimal128(38, 0),
+                true,
+            );
+            assert_eq!(eligible(&arena, expr), expected, "{op:?}");
+        }
     }
 }

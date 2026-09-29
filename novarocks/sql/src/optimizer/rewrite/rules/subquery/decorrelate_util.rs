@@ -104,6 +104,7 @@ mod legacy {
             left,
             op: BinOp::Eq,
             right,
+            ..
         } = &conjunct.kind
         else {
             return None;
@@ -148,6 +149,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,

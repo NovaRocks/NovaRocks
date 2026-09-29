@@ -382,7 +382,12 @@ fn rewrite_window_calls(
                 nullable: expr.nullable,
             }
         }
-        ExprKind::BinaryOp { left, right, op } => TypedExpr {
+        ExprKind::BinaryOp {
+            left,
+            right,
+            op,
+            decimal_overflow_policy,
+        } => TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(rewrite_window_calls(
                     left,
@@ -399,6 +404,7 @@ fn rewrite_window_calls(
                     window_exprs,
                     counter,
                 )),
+                decimal_overflow_policy: *decimal_overflow_policy,
             },
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -477,6 +483,7 @@ fn rewrite_window_calls(
         ExprKind::Cast {
             expr: inner,
             target,
+            decimal_overflow_policy,
         } => TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(rewrite_window_calls(
@@ -487,6 +494,7 @@ fn rewrite_window_calls(
                     counter,
                 )),
                 target: target.clone(),
+                decimal_overflow_policy: *decimal_overflow_policy,
             },
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,

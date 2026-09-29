@@ -86,6 +86,11 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         };
 
         let arena_rc = ctx.scalar_arena();
+        if scalar_expr::can_fail(&arena_rc.borrow(), filter.predicate) {
+            // Moving even a nonthrowing sibling below the checked predicate
+            // can suppress its error by removing rows before evaluation.
+            return Ok(RewriteResult::Unchanged);
+        }
         let mut conjuncts = Vec::new();
         {
             let arena = arena_rc.borrow();
@@ -113,6 +118,10 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         let mut pushed_any = false;
         let mut remaining = Vec::new();
         for conj in conjuncts {
+            if scalar_expr::can_fail(&arena_rc.borrow(), conj) {
+                remaining.push(conj);
+                continue;
+            }
             let Some(refs) = scalar_expr::collect_column_ids_strict(&arena_rc.borrow(), conj)
             else {
                 remaining.push(conj);
@@ -210,6 +219,7 @@ mod tests {
                 left: Box::new(a),
                 op: BinOp::Eq,
                 right: Box::new(b),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -222,6 +232,7 @@ mod tests {
                 left: Box::new(a),
                 op: BinOp::And,
                 right: Box::new(b),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }

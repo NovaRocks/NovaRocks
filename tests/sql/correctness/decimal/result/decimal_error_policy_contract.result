@@ -1,0 +1,92 @@
+-- query 2
+k	v
+1	2
+2	NULL
+3	NULL
+4	1
+
+-- query 4
+v
+NULL
+
+-- query 6
+k	v
+1	2
+2	NULL
+3	NULL
+4	0
+
+-- query 8
+k	v
+1	1.000000
+2	NULL
+3	NULL
+4	NULL
+
+-- query 10
+k	v
+1	0.0
+2	NULL
+3	NULL
+4	NULL
+
+-- query 13
+div_zero	mod_zero
+NULL	NULL
+
+-- query 14
+v
+NULL
+
+-- query 17
+narrowed
+NULL
+
+-- query 19
+carry
+NULL
+
+-- query 21
+input_null
+NULL
+
+-- query 22
+rounded
+12.35
+
+-- query 23
+branch	v
+1	NULL
+2	2
+
+-- query 26
+promoted
+1524157876695625600000000000
+
+-- query 29
+allowed_null_policy
+1
+
+-- query 30
+same_physical_type
+1
+
+-- query 35
+n
+1
+
+-- query 41
+id	f
+1	1
+2	0
+
+-- query 42
+left_id	right_id	merged_key
+1	10	1
+NULL	20	NULL
+NULL	30	NULL
+
+-- query 44
+left_id	right_id	merged_key
+2	NULL	NULL
+NULL	30	NULL

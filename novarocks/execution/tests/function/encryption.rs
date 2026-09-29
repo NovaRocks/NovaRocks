@@ -233,3 +233,77 @@ fn test_to_binary_utf8_format() {
     let out = out.as_any().downcast_ref::<BinaryArray>().unwrap();
     assert_eq!(out.value(0), b"AB");
 }
+
+#[test]
+fn fingerprint_alias_ignores_real_list_columns_without_ignoring_scalar_nulls() {
+    use arrow::array::ListArray;
+    use arrow::datatypes::{Field, Int32Type, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
+    use novarocks_types::SlotId;
+    use std::sync::Arc;
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![Some(7), None])),
+        Arc::new(StringArray::from(vec![Some("x"), None])),
+        Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            None,
+        ])),
+    ];
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, a)| Field::new(format!("c{i}"), a.data_type().clone(), true))
+            .collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(schema, columns.clone()).unwrap();
+    let slots = [SlotId::new(1), SlotId::new(2), SlotId::new(3)];
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
+    let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+    let mut arena = ExprArena::default();
+    let args: Vec<_> = slots
+        .iter()
+        .zip(&columns)
+        .map(|(slot, a)| arena.push_typed(ExprNode::SlotId(*slot), a.data_type().clone()))
+        .collect();
+    let output = common::typed_null(&mut arena, DataType::Binary);
+    // Independent SHA256 of [INT64 marker4, LE64(7), STRING marker8, b"x"]
+    // and of two scalar NULL marker bytes. The list contributes no bytes.
+    let expected = [
+        "4E3BB87E1137337244E0B6B279F59DBC01109E9DECD81D33283D5F06CCC7E11C",
+        "96A296D224F285C67BEE93C30F8A309157F0DAA35DC5B87E410B78630A09CFC7",
+    ];
+    for name in ["encode_row_id", "encode_fingerprint_sha256"] {
+        let with_list = eval_encryption_function(name, &arena, output, &args, &chunk).unwrap();
+        let without_list =
+            eval_encryption_function(name, &arena, output, &args[..2], &chunk).unwrap();
+        let list_only = eval_encryption_function(name, &arena, output, &args[2..], &chunk).unwrap();
+        let mixed = with_list.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let plain = without_list.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let ignored = list_only.as_any().downcast_ref::<BinaryArray>().unwrap();
+        for row in 0..2 {
+            assert!(!mixed.is_null(row));
+            assert_eq!(mixed.value(row), plain.value(row));
+            let hex: String = mixed
+                .value(row)
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            assert_eq!(hex, expected[row]);
+            let empty_hex: String = ignored
+                .value(row)
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            assert_eq!(
+                empty_hex,
+                "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+            );
+        }
+    }
+    let err =
+        eval_encryption_function("encode_sort_key", &arena, output, &args, &chunk).unwrap_err();
+    assert!(err.contains("unsupported argument type"), "{err}");
+}

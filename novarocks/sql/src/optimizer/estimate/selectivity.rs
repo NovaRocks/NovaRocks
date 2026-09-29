@@ -38,7 +38,9 @@ pub(crate) fn estimate_selectivity(
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     match arena.node(expr) {
-        ScalarNode::BinaryOp { left, op, right } => match op {
+        ScalarNode::BinaryOp {
+            left, op, right, ..
+        } => match op {
             BinOp::And => {
                 let mut conjuncts = Vec::new();
                 flatten_and(arena, expr, &mut conjuncts);
@@ -158,6 +160,7 @@ fn flatten_and(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
         op: BinOp::And,
         left,
         right,
+        ..
     } = arena.node(expr)
     {
         flatten_and(arena, *left, out);
@@ -342,6 +345,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::Eq,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -354,6 +358,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::And,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,

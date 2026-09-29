@@ -376,7 +376,14 @@ fn if_does_not_eagerly_eval_then_branch() {
         }),
         DataType::Decimal128(7, 2),
     );
-    let then_div = arena.push_typed(ExprNode::Div(one, zero), DataType::Decimal128(7, 2));
+    let then_div = arena.push_typed(
+        ExprNode::Div(
+            one,
+            zero,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
+        DataType::Decimal128(7, 2),
+    );
     let else_v = arena.push_typed(
         ExprNode::Literal(LiteralValue::Decimal128 {
             value: 100,

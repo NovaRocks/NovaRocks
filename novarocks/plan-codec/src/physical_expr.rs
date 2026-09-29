@@ -309,6 +309,17 @@ pub(crate) enum ValueResolution<'a> {
     Exact(&'a BTreeMap<ValueId, WireSlotId>),
 }
 
+fn encode_decimal_overflow_policy(policy: novarocks_type_contract::DecimalOverflowPolicy) -> i32 {
+    match policy {
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull => {
+            expr::DecimalOverflowPolicy::OutputNull as i32
+        }
+        novarocks_type_contract::DecimalOverflowPolicy::ReportError => {
+            expr::DecimalOverflowPolicy::ReportError as i32
+        }
+    }
+}
+
 pub(crate) fn encode_physical_expr(
     fragment: &Fragment,
     layout: &WireLayout,
@@ -395,6 +406,7 @@ fn encode_connective(
     let (left, right) = split_connective(args)?;
     Ok(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
         op: op as i32,
+        decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
         left: Some(Box::new(build(left)?)),
         right: Some(Box::new(build(right)?)),
     })))
@@ -477,6 +489,7 @@ fn encode_connective_range(
         nullable,
         kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
             op: op as i32,
+            decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
             left: Some(Box::new(encode_connective_range(
                 op,
                 left,
@@ -532,8 +545,14 @@ fn encode_kind(
             op: encode_unary(*op)? as i32,
             operand: Some(Box::new(child(*operand)?)),
         })),
-        ExprKind::Binary { left, op, right } => Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+        ExprKind::Binary {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } => Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
             op: encode_binary(*op)? as i32,
+            decimal_overflow_policy: encode_decimal_overflow_policy(*decimal_overflow_policy),
             left: Some(Box::new(child(*left)?)),
             right: Some(Box::new(child(*right)?)),
         })),
@@ -583,9 +602,11 @@ fn encode_kind(
         ExprKind::Cast {
             expr: operand,
             target,
+            decimal_overflow_policy,
         } => Kind::Cast(Box::new(expr::CastExpr {
             operand: Some(Box::new(child(*operand)?)),
             target: Some(encode_physical_type(target)?),
+            decimal_overflow_policy: encode_decimal_overflow_policy(*decimal_overflow_policy),
         })),
         ExprKind::IsNull {
             expr: operand,

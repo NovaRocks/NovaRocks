@@ -231,7 +231,12 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
     let nullable = arena.nullable(expr);
     let node = arena.node(expr).clone();
     match node {
-        ScalarNode::BinaryOp { op, left, right } => {
+        ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy,
+        } => {
             let new_left = rewrite_variant_request_scalar(arena, left, bindings, factory)?;
             let new_right = rewrite_variant_request_scalar(arena, right, bindings, factory)?;
             let changed = new_left.is_some() || new_right.is_some();
@@ -241,6 +246,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         op,
                         left: new_left.unwrap_or(left),
                         right: new_right.unwrap_or(right),
+                        decimal_overflow_policy,
                     },
                     data_type,
                     nullable,
@@ -311,14 +317,22 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                 )
             }))
         }
-        ScalarNode::Cast { child, target } => rewrite_unary_child(
+        ScalarNode::Cast {
+            child,
+            target,
+            decimal_overflow_policy,
+        } => rewrite_unary_child(
             arena,
             child,
             bindings,
             factory,
             data_type,
             nullable,
-            |child| ScalarNode::Cast { child, target },
+            |child| ScalarNode::Cast {
+                child,
+                target,
+                decimal_overflow_policy,
+            },
         ),
         ScalarNode::IsNull { child, negated } => rewrite_unary_child(
             arena,

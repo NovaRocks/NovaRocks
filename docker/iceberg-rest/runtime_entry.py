@@ -396,12 +396,12 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
 
 
 def verify_inputs(config: dict) -> dict:
-    command = [str(HERE.parent / 'fixture-inputs/verify.sh'), '--store', str(Path(config['fixture_inputs']['bom']).parent), '--repo-root', config['repo_root']]
+    command = [str(HERE.parent / 'fixture-inputs/verify.sh'), '--store', str(Path(config['fixture_inputs']['bom']).parent), '--repo-root', config['repo_root'], '--consumer', 'iceberg-rest']
     outcome = subprocess.run(command, env=runtime.controlled_environment(), stdout=sys.stderr, check=False)
     if outcome.returncode:
         raise runtime.RuntimeFailure('FixturePrerequisiteMissing', 'run fixture input provision explicitly before up')
     bom = runtime.read_json(Path(config['fixture_inputs']['bom']))
-    config['fixture_inputs'].update(lock_sha256=bom['lock_sha256'], verified=True)
+    config['fixture_inputs'].update(lock_sha256=bom['lock_sha256'], verified=True, consumer='iceberg-rest')
     return bom
 
 

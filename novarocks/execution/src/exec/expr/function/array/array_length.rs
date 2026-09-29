@@ -26,7 +26,7 @@ fn try_eval_cast_literal_json_array_length(
     arg_expr: ExprId,
     num_rows: usize,
 ) -> Option<Result<ArrayRef, String>> {
-    let ExprNode::Cast(child_expr) = arena.node(arg_expr)? else {
+    let ExprNode::Cast(child_expr, _) = arena.node(arg_expr)? else {
         return None;
     };
     let ExprNode::Literal(LiteralValue::Utf8(text)) = arena.node(*child_expr)? else {

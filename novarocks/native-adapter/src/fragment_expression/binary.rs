@@ -33,12 +33,21 @@ pub(crate) fn lower_binary_op(
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
+    let policy = super::decode_decimal_overflow_policy(
+        binary.decimal_overflow_policy,
+        path.clone().field("decimal_overflow_policy"),
+    )?;
     let op = expr::BinaryOp::try_from(binary.op).map_err(|_| {
         super::NativeExpressionDecodeError::invalid_enum(
             path.clone().field("op"),
             format!("unknown BinaryOp {}", binary.op),
         )
     })?;
+    super::require_binary_decimal_policy(
+        op,
+        policy,
+        path.clone().field("decimal_overflow_policy"),
+    )?;
     let left = lower_required_child(
         &binary.left,
         path.clone().field("left"),
@@ -58,11 +67,11 @@ pub(crate) fn lower_binary_op(
                 "BinaryOp.op is unspecified",
             ));
         }
-        expr::BinaryOp::Add => ExprNode::Add(left, right),
-        expr::BinaryOp::Sub => ExprNode::Sub(left, right),
-        expr::BinaryOp::Mul => ExprNode::Mul(left, right),
-        expr::BinaryOp::Div => ExprNode::Div(left, right),
-        expr::BinaryOp::Mod => ExprNode::Mod(left, right),
+        expr::BinaryOp::Add => ExprNode::Add(left, right, policy),
+        expr::BinaryOp::Sub => ExprNode::Sub(left, right, policy),
+        expr::BinaryOp::Mul => ExprNode::Mul(left, right, policy),
+        expr::BinaryOp::Div => ExprNode::Div(left, right, policy),
+        expr::BinaryOp::Mod => ExprNode::Mod(left, right, policy),
         expr::BinaryOp::Eq => ExprNode::Eq(left, right),
         expr::BinaryOp::Ne => ExprNode::Ne(left, right),
         expr::BinaryOp::Lt => ExprNode::Lt(left, right),

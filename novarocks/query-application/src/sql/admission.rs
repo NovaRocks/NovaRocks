@@ -42,7 +42,7 @@ pub fn admit_persisted_definition_semantics(
         }
         _ => None,
     };
-    let (legacy, numeric) = if let Some(query) = definition {
+    let (legacy, numeric, overflow_error) = if let Some(query) = definition {
         (
             novarocks_sql::sql_mode::query_uses_group_concat_legacy(session, query).map_err(
                 |error| QueryServiceError::from_user_error(error.to_user_error(Some(source))),
@@ -51,6 +51,9 @@ pub fn admit_persisted_definition_semantics(
                 .map_err(|error| {
                     QueryServiceError::from_user_error(error.to_user_error(Some(source)))
                 })?,
+            novarocks_sql::sql_mode::query_uses_error_if_overflow(session, query).map_err(
+                |error| QueryServiceError::from_user_error(error.to_user_error(Some(source))),
+            )?,
         )
     } else if matches!(
         statement,
@@ -62,15 +65,18 @@ pub fn admit_persisted_definition_semantics(
         (
             session.sql_mode().group_concat_legacy(),
             session.decimal_overflow_to_double(),
+            session.sql_mode().error_if_overflow(),
         )
     } else {
         return Ok(());
     };
-    if legacy || numeric {
+    if legacy || numeric || overflow_error {
         let message = if numeric {
             "unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"
-        } else {
+        } else if legacy {
             "unsupported semantic setting: GROUP_CONCAT_LEGACY is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"
+        } else {
+            "unsupported semantic setting: ERROR_IF_OVERFLOW is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"
         };
         return Err(QueryServiceError::from_user_error(
             crate::sql::session_admit::SessionAdmitError::PersistedDefinitionSemanticsUnsupported
@@ -429,5 +435,57 @@ mod tests {
             )
             .is_ok()
         );
+    }
+    #[test]
+    fn error_overflow_definition_admission_rejects_inherited_and_nested_policy_before_effects() {
+        use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
+        let default = SqlSemanticSettings::default();
+        let error = default
+            .clone()
+            .with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW"));
+        for prefix in [
+            "CREATE VIEW v AS ",
+            "CREATE OR REPLACE VIEW v AS ",
+            "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(x) BUCKETS 1 AS ",
+        ] {
+            for (snapshot, query, rejected) in [
+                (&default, "SELECT 1 x", false),
+                (&error, "SELECT 1 x", true),
+                (
+                    &default,
+                    "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1 x",
+                    true,
+                ),
+                (&error, "SELECT /*+ SET_VAR(sql_mode=32) */ 1 x", false),
+                (
+                    &default,
+                    "SELECT 1 x FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1 x) t",
+                    true,
+                ),
+                (
+                    &error,
+                    "SELECT /*+ SET_VAR(sql_mode=32) */ 1 x FROM (SELECT 1 x) t",
+                    false,
+                ),
+            ] {
+                let sql = format!("{prefix}{query}");
+                let statement = parse_single_statement(&sql).unwrap();
+                let outcome = admit_persisted_definition_semantics(&sql, &statement, snapshot);
+                assert_eq!(outcome.is_err(), rejected, "{sql}");
+                if rejected {
+                    let error = outcome.unwrap_err();
+                    assert_eq!(
+                        error.user_error().unwrap().code().as_str(),
+                        "sql.admit.persisted_definition_semantics_unsupported"
+                    );
+                    assert!(error.user_error().unwrap().location().is_some());
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("ERROR_IF_OVERFLOW is not captured")
+                    );
+                }
+            }
+        }
     }
 }

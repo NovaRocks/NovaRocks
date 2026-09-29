@@ -133,14 +133,16 @@ fn thaw_kind(kind: &StaticExprKind) -> ExprNode {
             child: old_id(*child),
             dict: Arc::clone(dict),
         },
-        Static::Cast(child) => ExprNode::Cast(old_id(*child)),
-        Static::CastTime(child) => ExprNode::CastTime(old_id(*child)),
-        Static::CastTimeFromDatetime(child) => ExprNode::CastTimeFromDatetime(old_id(*child)),
-        Static::Add(a, b) => ExprNode::Add(old_id(*a), old_id(*b)),
-        Static::Sub(a, b) => ExprNode::Sub(old_id(*a), old_id(*b)),
-        Static::Mul(a, b) => ExprNode::Mul(old_id(*a), old_id(*b)),
-        Static::Div(a, b) => ExprNode::Div(old_id(*a), old_id(*b)),
-        Static::Mod(a, b) => ExprNode::Mod(old_id(*a), old_id(*b)),
+        Static::Cast(child, policy) => ExprNode::Cast(old_id(*child), *policy),
+        Static::CastTime(child, policy) => ExprNode::CastTime(old_id(*child), *policy),
+        Static::CastTimeFromDatetime(child, policy) => {
+            ExprNode::CastTimeFromDatetime(old_id(*child), *policy)
+        }
+        Static::Add(a, b, policy) => ExprNode::Add(old_id(*a), old_id(*b), *policy),
+        Static::Sub(a, b, policy) => ExprNode::Sub(old_id(*a), old_id(*b), *policy),
+        Static::Mul(a, b, policy) => ExprNode::Mul(old_id(*a), old_id(*b), *policy),
+        Static::Div(a, b, policy) => ExprNode::Div(old_id(*a), old_id(*b), *policy),
+        Static::Mod(a, b, policy) => ExprNode::Mod(old_id(*a), old_id(*b), *policy),
         Static::Eq(a, b) => ExprNode::Eq(old_id(*a), old_id(*b)),
         Static::EqForNull(a, b) => ExprNode::EqForNull(old_id(*a), old_id(*b)),
         Static::Ne(a, b) => ExprNode::Ne(old_id(*a), old_id(*b)),
@@ -286,14 +288,16 @@ fn freeze_kind(node: ExprNode) -> StaticExprKind {
             child: id(child),
             dict,
         },
-        ExprNode::Cast(child) => StaticExprKind::Cast(id(child)),
-        ExprNode::CastTime(child) => StaticExprKind::CastTime(id(child)),
-        ExprNode::CastTimeFromDatetime(child) => StaticExprKind::CastTimeFromDatetime(id(child)),
-        ExprNode::Add(a, b) => StaticExprKind::Add(id(a), id(b)),
-        ExprNode::Sub(a, b) => StaticExprKind::Sub(id(a), id(b)),
-        ExprNode::Mul(a, b) => StaticExprKind::Mul(id(a), id(b)),
-        ExprNode::Div(a, b) => StaticExprKind::Div(id(a), id(b)),
-        ExprNode::Mod(a, b) => StaticExprKind::Mod(id(a), id(b)),
+        ExprNode::Cast(child, policy) => StaticExprKind::Cast(id(child), policy),
+        ExprNode::CastTime(child, policy) => StaticExprKind::CastTime(id(child), policy),
+        ExprNode::CastTimeFromDatetime(child, policy) => {
+            StaticExprKind::CastTimeFromDatetime(id(child), policy)
+        }
+        ExprNode::Add(a, b, policy) => StaticExprKind::Add(id(a), id(b), policy),
+        ExprNode::Sub(a, b, policy) => StaticExprKind::Sub(id(a), id(b), policy),
+        ExprNode::Mul(a, b, policy) => StaticExprKind::Mul(id(a), id(b), policy),
+        ExprNode::Div(a, b, policy) => StaticExprKind::Div(id(a), id(b), policy),
+        ExprNode::Mod(a, b, policy) => StaticExprKind::Mod(id(a), id(b), policy),
         ExprNode::Eq(a, b) => StaticExprKind::Eq(id(a), id(b)),
         ExprNode::EqForNull(a, b) => StaticExprKind::EqForNull(id(a), id(b)),
         ExprNode::Ne(a, b) => StaticExprKind::Ne(id(a), id(b)),
@@ -465,5 +469,50 @@ mod tests {
                 .kind(),
             StaticExprKind::DictDecode { .. }
         ));
+    }
+
+    #[test]
+    fn decimal_policy_is_per_expression_across_static_freeze_and_instances() {
+        use super::super::DecimalOverflowPolicy as Policy;
+        let mut arena = ExprArena::default();
+        let literal = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
+        let mut expected = Vec::new();
+        for policy in [Policy::OutputNull, Policy::ReportError] {
+            for node in [
+                ExprNode::Add(literal, literal, policy),
+                ExprNode::Sub(literal, literal, policy),
+                ExprNode::Mul(literal, literal, policy),
+                ExprNode::Div(literal, literal, policy),
+                ExprNode::Mod(literal, literal, policy),
+                ExprNode::Cast(literal, policy),
+                ExprNode::CastTime(literal, policy),
+                ExprNode::CastTimeFromDatetime(literal, policy),
+            ] {
+                expected.push((arena.push_typed(node, DataType::Int64), policy));
+            }
+        }
+        let frozen = arena.into_immutable().unwrap();
+        assert!(
+            !frozen.allow_throw_exception(),
+            "decimal policy is independent of global ALLOW_THROW"
+        );
+        for (id, policy) in &expected {
+            assert_eq!(
+                frozen
+                    .node(ProgramExprId::new(id.0))
+                    .unwrap()
+                    .kind()
+                    .decimal_overflow_policy(),
+                Some(*policy)
+            );
+        }
+        let mut first = ExprArena::from_immutable(&frozen);
+        let second = ExprArena::from_immutable(&frozen);
+        first.set_allow_throw_exception(true);
+        for (id, policy) in expected {
+            assert_eq!(first.decimal_overflow_policy(id), Some(policy));
+            assert_eq!(second.decimal_overflow_policy(id), Some(policy));
+        }
+        assert_eq!(second.decimal_overflow_policy(literal), None);
     }
 }

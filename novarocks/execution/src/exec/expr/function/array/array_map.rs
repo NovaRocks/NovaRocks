@@ -461,20 +461,20 @@ fn collect_slot_ids(
             ExprNode::DictDecode { child, .. } => {
                 stack.push(*child);
             }
-            ExprNode::Cast(child)
-            | ExprNode::CastTime(child)
-            | ExprNode::CastTimeFromDatetime(child)
+            ExprNode::Cast(child, _)
+            | ExprNode::CastTime(child, _)
+            | ExprNode::CastTimeFromDatetime(child, _)
             | ExprNode::Not(child)
             | ExprNode::IsNull(child)
             | ExprNode::IsNotNull(child)
             | ExprNode::Clone(child) => {
                 stack.push(*child);
             }
-            ExprNode::Add(a, b)
-            | ExprNode::Sub(a, b)
-            | ExprNode::Mul(a, b)
-            | ExprNode::Div(a, b)
-            | ExprNode::Mod(a, b)
+            ExprNode::Add(a, b, _)
+            | ExprNode::Sub(a, b, _)
+            | ExprNode::Mul(a, b, _)
+            | ExprNode::Div(a, b, _)
+            | ExprNode::Mod(a, b, _)
             | ExprNode::Eq(a, b)
             | ExprNode::EqForNull(a, b)
             | ExprNode::Ne(a, b)

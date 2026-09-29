@@ -92,6 +92,16 @@ impl LogicalRewriteRule for PushDownPredicateProject {
 
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
+        // Moving a filter below a throwing projection can suppress a required
+        // evaluation on filtered rows. Keep that evaluation at its owner.
+        if scalar_expr::can_fail(&arena, filter.predicate)
+            || proj
+                .items
+                .iter()
+                .any(|item| scalar_expr::can_fail(&arena, item.expr))
+        {
+            return Ok(RewriteResult::Unchanged);
+        }
 
         let mut conjuncts = Vec::new();
         scalar_expr::split_conjuncts(&arena, filter.predicate, &mut conjuncts);
@@ -168,11 +178,21 @@ fn remap_scalar(
     match node {
         ScalarNode::ColumnRef(column_id) => bindings.get(&column_id).copied().flatten(),
         ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => Some(expr),
-        ScalarNode::BinaryOp { op, left, right } => {
+        ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy,
+        } => {
             let left = remap_scalar(arena, left, bindings)?;
             let right = remap_scalar(arena, right, bindings)?;
             Some(arena.intern(
-                ScalarNode::BinaryOp { op, left, right },
+                ScalarNode::BinaryOp {
+                    op,
+                    left,
+                    right,
+                    decimal_overflow_policy,
+                },
                 data_type,
                 nullable,
             ))
@@ -230,9 +250,21 @@ fn remap_scalar(
                 nullable,
             ))
         }
-        ScalarNode::Cast { child, target } => {
+        ScalarNode::Cast {
+            child,
+            target,
+            decimal_overflow_policy,
+        } => {
             let child = remap_scalar(arena, child, bindings)?;
-            Some(arena.intern(ScalarNode::Cast { child, target }, data_type, nullable))
+            Some(arena.intern(
+                ScalarNode::Cast {
+                    child,
+                    target,
+                    decimal_overflow_policy,
+                },
+                data_type,
+                nullable,
+            ))
         }
         ScalarNode::IsNull { child, negated } => {
             let child = remap_scalar(arena, child, bindings)?;
@@ -495,6 +527,7 @@ mod tests {
                 left: Box::new(a),
                 op: BinOp::Eq,
                 right: Box::new(b),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -507,6 +540,7 @@ mod tests {
                 left: Box::new(a),
                 op: BinOp::And,
                 right: Box::new(b),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -703,6 +737,7 @@ mod tests {
                 left: Box::new(col_ref("a", a_id)),
                 op: BinOp::Add,
                 right: Box::new(int_lit(1)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
         let computed_id =
@@ -768,6 +803,7 @@ mod tests {
                 left: Box::new(col_ref("a", a_id)),
                 op: BinOp::Add,
                 right: Box::new(int_lit(1)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
         let passthrough_id =
@@ -822,6 +858,87 @@ mod tests {
                 other => panic!("expected outer Filter at top, got {:?}", other),
             },
             other => panic!("expected Changed, got {:?}", other),
+        }
+    }
+    #[test]
+    fn own_row_errors_block_filter_pushdown_but_caught_parse_errors_do_not() {
+        use novarocks_functions::{
+            FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
+            FunctionValueType,
+        };
+        for (name, input_type, expected_change) in [
+            ("assert_true", DataType::Boolean, false),
+            ("parse_json", DataType::Utf8, true),
+        ] {
+            let mut arena = ScalarArena::new();
+            let scan = scan_opt(&mut arena, &[("a", col_id(1))]);
+            let mut project = passthrough_project_opt(&mut arena, &[("a", col_id(1))], None, scan);
+            let literal = if input_type == DataType::Boolean {
+                LiteralValue::Bool(false)
+            } else {
+                LiteralValue::String("{".into())
+            };
+            let input = arena.intern(
+                ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(literal)),
+                input_type.clone(),
+                false,
+            );
+            let args = [FunctionArgument::Value {
+                value_type: FunctionValueType::new(input_type, false),
+                constant: None,
+            }];
+            let catalog = crate::functions::builtin_engine_function_catalog();
+            let bound = catalog
+                .resolve_bound_user(
+                    name,
+                    FunctionKind::Scalar,
+                    FunctionBindingRequest {
+                        arguments: &args,
+                        logical_argument_count: 1,
+                    },
+                )
+                .unwrap();
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &args,
+                        logical_argument_count: 1,
+                    },
+                )
+                .unwrap();
+            let FunctionResultType::Scalar(output) = bound.selected.result_type.clone() else {
+                unreachable!()
+            };
+            let volatility = bound.semantics.volatility;
+            let call = arena.intern(
+                ScalarNode::FunctionCall {
+                    name: name.into(),
+                    args: vec![input],
+                    distinct: false,
+                    binding: bound.into(),
+                    volatility,
+                },
+                output.data_type,
+                output.nullable,
+            );
+            let Operator::LogicalProject(proj) = &mut project.op else {
+                unreachable!()
+            };
+            proj.items.push(ScalarProjectItem {
+                expr: call,
+                output_name: "side".into(),
+                output_column_id: col_id(2),
+                expr_display: None,
+            });
+            let filter = filter_opt(&mut arena, eq(col_ref("a", col_id(1)), int_lit(1)), project);
+            let mut ctx = make_ctx(arena);
+            let result = PushDownPredicateProject.apply(filter, &mut ctx).unwrap();
+            assert_eq!(
+                matches!(result, RewriteResult::Changed(_)),
+                expected_change,
+                "{name}"
+            );
         }
     }
 }

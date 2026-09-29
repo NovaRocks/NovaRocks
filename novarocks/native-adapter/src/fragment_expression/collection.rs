@@ -149,7 +149,13 @@ fn coerce_map_constructor_child(
     if &child_type == expected_type || matches!(expected_type, DataType::Null) {
         return Ok(child);
     }
-    Ok(arena.push_typed(ExprNode::Cast(child), expected_type.clone()))
+    Ok(arena.push_typed(
+        ExprNode::Cast(
+            child,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
+        expected_type.clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -270,9 +276,9 @@ mod tests {
 
         assert_eq!(args.len(), 4);
         assert_eq!(arena.data_type(args[0]), Some(&DataType::Int64));
-        assert!(matches!(arena.node(args[0]), Some(ExprNode::Cast(_))));
+        assert!(matches!(arena.node(args[0]), Some(ExprNode::Cast(_, _))));
         assert_eq!(arena.data_type(args[3]), Some(&DataType::Int64));
-        assert!(matches!(arena.node(args[3]), Some(ExprNode::Cast(_))));
+        assert!(matches!(arena.node(args[3]), Some(ExprNode::Cast(_, _))));
     }
 
     #[test]

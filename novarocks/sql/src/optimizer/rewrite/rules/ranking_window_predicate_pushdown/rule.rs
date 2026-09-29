@@ -159,6 +159,26 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
             return Ok(RewriteResult::Unchanged);
         };
 
+        // A partition limit removes rows before the retained Filter/Project.
+        // Preserve throwing expressions at their original evaluation boundary.
+        let arena_rc = ctx.scalar_arena();
+        {
+            let arena = arena_rc.borrow();
+            if scalar_expr::can_fail(&arena, filter_predicate_id)
+                || project_expr_ref.is_some_and(|expr| {
+                    let Operator::LogicalProject(project) = &expr.op else {
+                        return false;
+                    };
+                    project
+                        .items
+                        .iter()
+                        .any(|item| scalar_expr::can_fail(&arena, item.expr))
+                })
+            {
+                return Ok(RewriteResult::Unchanged);
+            }
+        }
+
         // --- Step 2: Idempotency guard ---
         if sort_op.partition_limit.is_some() {
             return Ok(RewriteResult::Unchanged);
@@ -175,7 +195,6 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         }
 
         // --- Step 3b: Single-signature guard ---
-        let arena_rc = ctx.scalar_arena();
         if count_unique_signatures(&window_op.window_exprs) != 1 {
             return Ok(RewriteResult::Unchanged);
         }
@@ -325,7 +344,9 @@ fn int_lit(arena: &ScalarArena, expr: ScalarId) -> Option<i64> {
 
 fn conjunct_upper_bound(arena: &ScalarArena, expr: ScalarId, rank_col: ColumnId) -> Option<i64> {
     match arena.node(expr) {
-        ScalarNode::BinaryOp { left, op, right } => {
+        ScalarNode::BinaryOp {
+            left, op, right, ..
+        } => {
             let (lit, col_on_left) = if is_rank_col(arena, *left, rank_col) {
                 (int_lit(arena, *right)?, true)
             } else if is_rank_col(arena, *right, rank_col) {
@@ -420,6 +441,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -1217,5 +1239,130 @@ mod tests {
         let sort_node = extract_sort_from_changed(result);
         assert_eq!(sort_node.partition_limit, Some(3));
         assert_eq!(sort_node.topn_type, Some(SqlTopNType::Rank));
+    }
+
+    fn decimal_cast_typed(
+        value: TypedExpr,
+        policy: novarocks_type_contract::DecimalOverflowPolicy,
+    ) -> TypedExpr {
+        let target = DataType::Decimal128(2, 0);
+        TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(value),
+                target: target.clone(),
+                decimal_overflow_policy: policy,
+            },
+            data_type: target,
+            nullable: true,
+        }
+    }
+
+    #[test]
+    fn throwing_rank_residual_preserves_complete_window_input() {
+        use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+        for policy in [Policy::OutputNull, Policy::ReportError] {
+            let rank = ColumnId::new_for_test(1);
+            let partition = ColumnId::new_for_test(2);
+            let amount = ColumnId::new_for_test(3);
+            let mut arena = ScalarArena::new();
+            let sort = make_sort_opt(&mut arena, partition);
+            let spec = make_window_spec_opt(&mut arena, "row_number", rank, partition);
+            let window = window_opt(
+                sort,
+                vec![spec],
+                vec![
+                    output_col(partition, "p"),
+                    output_col(amount, "amount"),
+                    output_col(rank, "rn"),
+                ],
+            );
+            // A finite rank bound must not hide a CAST overflow on a later row.
+            let checked = TypedExpr {
+                kind: ExprKind::IsNull {
+                    expr: Box::new(decimal_cast_typed(col_typed(amount), policy)),
+                    negated: true,
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            };
+            let predicate = binop_typed(le_typed(col_typed(rank), 1), BinOp::And, checked);
+            let plan = filter_opt(&mut arena, window, predicate);
+            let original_sort = &plan.children[0].children[0];
+            let Operator::LogicalSort(original_sort) = &original_sort.op else {
+                panic!("Sort expected")
+            };
+            assert_eq!(original_sort.partition_limit, None);
+            let mut ctx = make_ctx(arena);
+            let rule = RankingWindowPredicatePushdownRule;
+            assert!(rule.matches(&plan, &ctx));
+            let result = rule.apply(plan, &mut ctx).unwrap();
+            if policy == Policy::ReportError {
+                assert!(matches!(result, RewriteResult::Unchanged));
+            } else {
+                assert_eq!(extract_sort_from_changed(result).partition_limit, Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn throwing_intermediate_project_preserves_complete_window_input() {
+        use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+        for policy in [Policy::OutputNull, Policy::ReportError] {
+            let rank = ColumnId::new_for_test(1);
+            let partition = ColumnId::new_for_test(2);
+            let amount = ColumnId::new_for_test(3);
+            let rank_alias = ColumnId::new_for_test(4);
+            let checked_alias = ColumnId::new_for_test(5);
+            let mut arena = ScalarArena::new();
+            let sort = make_sort_opt(&mut arena, partition);
+            let spec = make_window_spec_opt(&mut arena, "row_number", rank, partition);
+            let window = window_opt(
+                sort,
+                vec![spec],
+                vec![
+                    output_col(partition, "p"),
+                    output_col(amount, "amount"),
+                    output_col(rank, "rn"),
+                ],
+            );
+            let project = project_opt(
+                &mut arena,
+                window,
+                vec![
+                    (col_typed(rank), rank_alias),
+                    (decimal_cast_typed(col_typed(amount), policy), checked_alias),
+                ],
+            );
+            let plan = filter_opt(&mut arena, project, le_typed(col_typed(rank_alias), 1));
+            let mut ctx = make_ctx(arena);
+            let rule = RankingWindowPredicatePushdownRule;
+            assert!(rule.matches(&plan, &ctx));
+            let result = rule.apply(plan, &mut ctx).unwrap();
+            if policy == Policy::ReportError {
+                assert!(matches!(result, RewriteResult::Unchanged));
+            } else {
+                assert_eq!(extract_sort_from_changed(result).partition_limit, Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn pure_rank_bound_still_pushes_partition_limit() {
+        let mut arena = ScalarArena::new();
+        let plan = make_filter_window_sort_opt(
+            &mut arena,
+            "row_number",
+            ColumnId::new_for_test(1),
+            ColumnId::new_for_test(2),
+            1,
+        );
+        let mut ctx = make_ctx(arena);
+        let sort = extract_sort_from_changed(
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
+        );
+        assert_eq!(sort.partition_limit, Some(1));
+        assert_eq!(sort.topn_type, Some(crate::common::SqlTopNType::RowNumber));
     }
 }

@@ -232,27 +232,27 @@ SELECT FROM_BINARY(ENCODE_SORT_KEY(NULL, v1, v2), 'hex') FROM t1;
 
 -- query 50
 -- ENCODE_SORT_KEY with array column (unsupported, expects error)
--- @expect_error=unsupported argument type
+-- @expect_error=[sql.analyze.type_mismatch]
 USE ${case_db};
 SELECT FROM_BINARY(ENCODE_SORT_KEY(v1, v2, v3), 'hex') FROM t1;
 
 -- query 51
--- @expect_error=unsupported argument type
+-- @expect_error=[sql.analyze.type_mismatch]
 USE ${case_db};
 SELECT FROM_BINARY(ENCODE_SORT_KEY(NULL, v1, v2, v3), 'hex') FROM t1;
 
 -- query 52
--- @expect_error=unsupported argument type
+-- @expect_error=[sql.analyze.type_mismatch]
 USE ${case_db};
 SELECT FROM_BINARY(ENCODE_SORT_KEY(v1, NULL, v2, v3), 'hex') FROM t1;
 
 -- query 53
--- @expect_error=unsupported argument type
+-- @expect_error=[sql.analyze.type_mismatch]
 USE ${case_db};
 SELECT FROM_BINARY(ENCODE_SORT_KEY(v1, v2, NULL, v3), 'hex') FROM t1;
 
 -- query 54
--- @expect_error=unsupported argument type
+-- @expect_error=[sql.analyze.type_mismatch]
 USE ${case_db};
 SELECT FROM_BINARY(ENCODE_SORT_KEY(v1, v2, v3, NULL), 'hex') FROM t1;
 

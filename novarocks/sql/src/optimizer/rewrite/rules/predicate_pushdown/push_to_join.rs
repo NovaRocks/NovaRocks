@@ -66,6 +66,16 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
+        let throws = match &expr.op {
+            Operator::LogicalFilter(filter) => scalar_expr::can_fail(&arena, filter.predicate) || expr.children.first().is_some_and(|child| matches!(&child.op, Operator::LogicalJoin(join) if join.condition.is_some_and(|condition| scalar_expr::can_fail(&arena,condition)))),
+            Operator::LogicalJoin(join) => join.condition.is_some_and(|condition| scalar_expr::can_fail(&arena,condition)),
+            _ => false,
+        };
+        if throws {
+            // Moving a checked error below a join can evaluate unmatched rows;
+            // pushing a sibling filter can also suppress the existing error.
+            return Ok(RewriteResult::Unchanged);
+        }
 
         let OptExpr {
             op,
@@ -714,6 +724,7 @@ fn is_cross_side_eq(
         left,
         op: BinOp::Eq,
         right,
+        ..
     } = arena.node(expr)
     {
         let l_id = match arena.node(*left) {
@@ -785,6 +796,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::Eq,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,
@@ -797,6 +809,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::And,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,
@@ -949,5 +962,54 @@ mod tests {
         assert!(left_pred.contains("Int(7)"));
         assert!(right_pred.contains("\"b\""));
         assert!(right_pred.contains("Int(7)"));
+    }
+    #[test]
+    fn throwing_decimal_filter_stays_above_join_while_null_policy_can_push() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        for policy in [OutputNull, ReportError] {
+            let mut arena = ScalarArena::new();
+            let source = arena.intern(ScalarNode::ColumnRef(col_id(1)), DataType::Int64, true);
+            let cast = arena.intern(
+                ScalarNode::Cast {
+                    child: source,
+                    target: DataType::Decimal128(9, 0),
+                    decimal_overflow_policy: policy,
+                },
+                DataType::Decimal128(9, 0),
+                true,
+            );
+            let literal = arena.intern(
+                ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
+                    LiteralValue::Decimal("1".to_string()),
+                )),
+                DataType::Decimal128(9, 0),
+                false,
+            );
+            let predicate = arena.intern(
+                ScalarNode::BinaryOp {
+                    left: cast,
+                    right: literal,
+                    op: BinOp::Eq,
+                    decimal_overflow_policy: OutputNull,
+                },
+                DataType::Boolean,
+                true,
+            );
+            let join = OptExpr::new(
+                Operator::LogicalJoin(LogicalJoinOp {
+                    join_type: JoinKind::Inner,
+                    condition: None,
+                }),
+                vec![scan("l", &[("a", 1)]), scan("r", &[("b", 2)])],
+            );
+            let input = OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![join]);
+            let result = PushDownPredicateJoin
+                .apply(input, &mut make_ctx(arena))
+                .unwrap();
+            assert_eq!(
+                matches!(result, RewriteResult::Unchanged),
+                policy == ReportError
+            );
+        }
     }
 }

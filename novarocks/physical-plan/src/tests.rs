@@ -1201,6 +1201,8 @@ fn expression_semantic_depth_is_bounded_without_recursive_validation() {
                 node,
                 value_type.clone(),
                 ExprKind::Cast {
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     expr: expression,
                     target: DataType::Int64,
                 },
@@ -1829,6 +1831,7 @@ fn integer_division_keeps_its_resolved_float_result() {
             node,
             ty(DataType::Float64, false),
             ExprKind::Binary {
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 left,
                 op: BinaryOperator::Divide,
                 right,
@@ -2516,4 +2519,155 @@ fn independent_fragment_cut_types_share_the_same_resource_validation() {
     };
     let error = validate_fragment(&fragment, &cuts).unwrap_err().to_string();
     assert!(error.contains("Arrow decimal precision/scale"));
+}
+
+#[test]
+fn physical_binary_policy_rejects_reporting_comparisons_before_publication() {
+    use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+    for (op, policy, accepted) in [
+        (BinaryOperator::Eq, Policy::OutputNull, true),
+        (BinaryOperator::Eq, Policy::ReportError, false),
+        (BinaryOperator::Add, Policy::OutputNull, true),
+        (BinaryOperator::Add, Policy::ReportError, true),
+    ] {
+        let mut builder = FragmentBuilder::new(FragmentId::new(31));
+        let node = builder.reserve_node_id().unwrap();
+        let operand = builder
+            .add_expression(
+                node,
+                ty(DataType::Int64, false),
+                ExprKind::Literal(LiteralValue::Int64(1)),
+            )
+            .unwrap();
+        let result_type = if matches!(op, BinaryOperator::Eq) {
+            DataType::Boolean
+        } else {
+            DataType::Int64
+        };
+        let expr = builder
+            .add_expression(
+                node,
+                ty(result_type.clone(), false),
+                ExprKind::Binary {
+                    left: operand,
+                    op,
+                    right: operand,
+                    decimal_overflow_policy: policy,
+                },
+            )
+            .unwrap();
+        let value = builder
+            .add_value(
+                ty(result_type, false),
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: singleton(),
+                output: OutputPort {
+                    node,
+                    columns: Box::from([value]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([expr])]),
+                },
+            })
+            .unwrap();
+        let result = builder.finish_definition(node, FragmentSink::Noop, dop());
+        if accepted {
+            result.unwrap();
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires OutputNull decimal policy")
+            );
+        }
+    }
+}
+
+#[test]
+fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
+    use arrow_schema::Field;
+    use novarocks_type_contract::DecimalOverflowPolicy as Policy;
+    use std::sync::Arc;
+    let source = DataType::List(Arc::new(Field::new(
+        "element",
+        DataType::Decimal128(10, 2),
+        true,
+    )));
+    let target = DataType::List(Arc::new(Field::new(
+        "element",
+        DataType::Decimal128(12, 3),
+        true,
+    )));
+    for (result_type, policy, accepted) in [
+        (target.clone(), Policy::ReportError, false),
+        (target, Policy::OutputNull, true),
+        (source.clone(), Policy::ReportError, true),
+    ] {
+        let mut builder = FragmentBuilder::new(FragmentId::new(32));
+        let node = builder.reserve_node_id().unwrap();
+        let operand = builder
+            .add_expression(
+                node,
+                ty(source.clone(), true),
+                ExprKind::Literal(LiteralValue::Null),
+            )
+            .unwrap();
+        let expression = builder
+            .add_expression(
+                node,
+                ty(result_type.clone(), true),
+                ExprKind::Cast {
+                    expr: operand,
+                    target: result_type.clone(),
+                    decimal_overflow_policy: policy,
+                },
+            )
+            .unwrap();
+        let value = builder
+            .add_value(
+                ty(result_type, true),
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: node,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: singleton(),
+                output: OutputPort {
+                    node,
+                    columns: Box::from([value]),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([Box::from([expression])]),
+                },
+            })
+            .unwrap();
+        let result = builder.finish_definition(node, FragmentSink::Noop, dop());
+        if accepted {
+            result.unwrap();
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not support nested type conversion")
+            );
+        }
+    }
 }

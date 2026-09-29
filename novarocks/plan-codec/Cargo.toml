@@ -28,6 +28,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-type-contract.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true
 novarocks-functions.workspace = true

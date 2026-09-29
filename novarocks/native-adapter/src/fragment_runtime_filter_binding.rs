@@ -1172,6 +1172,7 @@ mod tests {
             r#type: Some(int64_type()),
             nullable: false,
             kind: Some(expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(operand)),
                 target: Some(int64_type()),
             }))),
@@ -1183,6 +1184,7 @@ mod tests {
             r#type: Some(int64_type()),
             nullable: false,
             kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 op,
                 left: Some(Box::new(expression(1))),
                 right: Some(Box::new(expression(2))),

@@ -108,17 +108,17 @@ fn single_row_chunk() -> Result<Chunk, String> {
 /// adapter must never emulate a missing kernel.
 fn root_node_for(kind: &FoldNodeKind, args: &[ExprId]) -> Option<ExprNode> {
     match kind {
-        FoldNodeKind::BinaryOp(op) => {
+        FoldNodeKind::BinaryOp(op, decimal_overflow_policy) => {
             let [lhs, rhs] = args else {
                 return None;
             };
             let (lhs, rhs) = (*lhs, *rhs);
             Some(match op {
-                BinOp::Add => ExprNode::Add(lhs, rhs),
-                BinOp::Sub => ExprNode::Sub(lhs, rhs),
-                BinOp::Mul => ExprNode::Mul(lhs, rhs),
-                BinOp::Div => ExprNode::Div(lhs, rhs),
-                BinOp::Mod => ExprNode::Mod(lhs, rhs),
+                BinOp::Add => ExprNode::Add(lhs, rhs, *decimal_overflow_policy),
+                BinOp::Sub => ExprNode::Sub(lhs, rhs, *decimal_overflow_policy),
+                BinOp::Mul => ExprNode::Mul(lhs, rhs, *decimal_overflow_policy),
+                BinOp::Div => ExprNode::Div(lhs, rhs, *decimal_overflow_policy),
+                BinOp::Mod => ExprNode::Mod(lhs, rhs, *decimal_overflow_policy),
                 BinOp::Eq => ExprNode::Eq(lhs, rhs),
                 BinOp::Ne => ExprNode::Ne(lhs, rhs),
                 BinOp::Lt => ExprNode::Lt(lhs, rhs),
@@ -142,13 +142,13 @@ fn root_node_for(kind: &FoldNodeKind, args: &[ExprId]) -> Option<ExprNode> {
                 UnOp::Negate | UnOp::BitwiseNot => None,
             }
         }
-        FoldNodeKind::Cast => {
+        FoldNodeKind::Cast(decimal_overflow_policy) => {
             let [child] = args else {
                 return None;
             };
             // The cast target is the node's own data type, which the caller
             // attaches through `push_typed(.., out_type)`.
-            Some(ExprNode::Cast(*child))
+            Some(ExprNode::Cast(*child, *decimal_overflow_policy))
         }
         FoldNodeKind::Function { name } => {
             let kind = lookup_function(name)?;
@@ -414,7 +414,10 @@ mod tests {
     #[test]
     fn folds_int32_addition() {
         let folded = fold(
-            FoldNodeKind::BinaryOp(BinOp::Add),
+            FoldNodeKind::BinaryOp(
+                BinOp::Add,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
             vec![
                 arg(SqlLiteralValue::Int(1), DataType::Int32),
                 arg(SqlLiteralValue::Int(1), DataType::Int32),
@@ -453,7 +456,7 @@ mod tests {
         // 1970-01-01 -> 2020-01-01 spans 50 years with 12 leap days
         // (1972..=2016 step 4, 2000 included), i.e. 50 * 365 + 12 = 18262.
         let folded = fold(
-            FoldNodeKind::Cast,
+            FoldNodeKind::Cast(novarocks_type_contract::DecimalOverflowPolicy::OutputNull),
             vec![arg(
                 SqlLiteralValue::String("2020-01-01".to_string()),
                 DataType::Utf8,
@@ -469,7 +472,10 @@ mod tests {
         // scales, so the kernel neither rescales nor rounds: 125 * 400 = 50000
         // at scale 4.
         let folded = fold(
-            FoldNodeKind::BinaryOp(BinOp::Mul),
+            FoldNodeKind::BinaryOp(
+                BinOp::Mul,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
             vec![
                 arg(
                     SqlLiteralValue::Decimal("1.25".to_string()),
@@ -489,20 +495,18 @@ mod tests {
     }
 
     #[test]
-    fn declines_decimal_result_wider_than_its_declared_precision() {
-        // `CAST(99999.999 AS DECIMAL(7,2))` rounds to 100000.00, which needs
-        // precision 8. The kernel still returns it, but rendering that through
-        // the declared precision 7 drops the leading digit and the fold would
-        // read 10000.00 — ten times smaller than what the runtime produces.
+    fn folds_checked_decimal_cast_overflow_to_null() {
+        // Half-up carry produces 100000.00, requiring precision 8; the frozen
+        // (7,2) cast therefore returns NULL under OutputNull.
         let folded = fold(
-            FoldNodeKind::Cast,
+            FoldNodeKind::Cast(novarocks_type_contract::DecimalOverflowPolicy::OutputNull),
             vec![arg(
                 SqlLiteralValue::Decimal("99999.999".to_string()),
                 DataType::Decimal128(8, 3),
             )],
             DataType::Decimal128(7, 2),
         );
-        assert_eq!(folded, Ok(None));
+        assert_eq!(folded, Ok(Some(SqlLiteralValue::Null)));
     }
 
     #[test]
@@ -510,7 +514,7 @@ mod tests {
         // Same rounding shape as above, one digit of headroom: the guard must
         // not reject a result the declared precision can hold.
         let folded = fold(
-            FoldNodeKind::Cast,
+            FoldNodeKind::Cast(novarocks_type_contract::DecimalOverflowPolicy::OutputNull),
             vec![arg(
                 SqlLiteralValue::Decimal("99999.999".to_string()),
                 DataType::Decimal128(8, 3),
@@ -558,7 +562,10 @@ mod tests {
         // A string value carried on an INT slot has no faithful execution
         // literal: the adapter must not parse or coerce it.
         let mismatched_kind = fold(
-            FoldNodeKind::BinaryOp(BinOp::Add),
+            FoldNodeKind::BinaryOp(
+                BinOp::Add,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
             vec![
                 arg(SqlLiteralValue::String("7".to_string()), DataType::Int32),
                 arg(SqlLiteralValue::Int(1), DataType::Int32),
@@ -570,7 +577,10 @@ mod tests {
         // An INT literal that does not fit its declared width is equally
         // unmappable.
         let out_of_range = fold(
-            FoldNodeKind::BinaryOp(BinOp::Add),
+            FoldNodeKind::BinaryOp(
+                BinOp::Add,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
             vec![
                 arg(SqlLiteralValue::Int(i64::MAX), DataType::Int32),
                 arg(SqlLiteralValue::Int(1), DataType::Int32),
@@ -582,7 +592,10 @@ mod tests {
         // More fraction digits than the column scale would be truncated, so
         // the decimal is declined rather than folded to a different value.
         let lossy_decimal = fold(
-            FoldNodeKind::BinaryOp(BinOp::Add),
+            FoldNodeKind::BinaryOp(
+                BinOp::Add,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
             vec![
                 arg(
                     SqlLiteralValue::Decimal("1.239".to_string()),
@@ -605,7 +618,10 @@ mod tests {
         // The adapter therefore folds `1 / 0` to a typed NULL literal instead
         // of surfacing an evaluation failure.
         let folded = fold(
-            FoldNodeKind::BinaryOp(BinOp::Div),
+            FoldNodeKind::BinaryOp(
+                BinOp::Div,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
             vec![
                 arg(SqlLiteralValue::Int(1), DataType::Int32),
                 arg(SqlLiteralValue::Int(0), DataType::Int32),
@@ -613,5 +629,59 @@ mod tests {
             DataType::Float64,
         );
         assert_eq!(folded, Ok(Some(SqlLiteralValue::Null)));
+    }
+}
+
+#[cfg(test)]
+mod overflow_policy_tests {
+    use super::*;
+    use novarocks_sql::compiler::FoldArg;
+    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+    #[test]
+    fn real_execution_fold_distinguishes_checked_decimal_error_from_null() {
+        let args = vec![
+            FoldArg {
+                value: SqlLiteralValue::Decimal(
+                    "99999999999999999999999999999999999999".to_string(),
+                ),
+                data_type: DataType::Decimal128(38, 0),
+                nullable: false,
+            },
+            FoldArg {
+                value: SqlLiteralValue::Int(1),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+        ];
+        for policy in [OutputNull, ReportError] {
+            let request = FoldRequest {
+                kind: FoldNodeKind::BinaryOp(BinOp::Add, policy),
+                args: args.clone(),
+                out_type: DataType::Decimal128(38, 0),
+                out_nullable: true,
+            };
+            let result = constant_evaluator().eval_scalar(&request);
+            if policy == OutputNull {
+                assert_eq!(result, Ok(Some(SqlLiteralValue::Null)));
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("'add' operation involving decimal values overflows")
+                );
+            }
+            let request = FoldRequest {
+                kind: FoldNodeKind::Cast(policy),
+                args: vec![args[0].clone()],
+                out_type: DataType::Decimal128(9, 0),
+                out_nullable: true,
+            };
+            let result = constant_evaluator().eval_scalar(&request);
+            if policy == OutputNull {
+                assert_eq!(result, Ok(Some(SqlLiteralValue::Null)));
+            } else {
+                assert!(result.unwrap_err().contains("overflows"));
+            }
+        }
     }
 }

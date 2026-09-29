@@ -603,10 +603,16 @@ pub(super) fn rewrite_expr_children(
     mut rewrite_child: impl FnMut(&TypedExpr) -> TypedExpr,
 ) -> TypedExpr {
     let kind = match &expr.kind {
-        ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
+        ExprKind::BinaryOp {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } => ExprKind::BinaryOp {
             left: Box::new(rewrite_child(left)),
             op: *op,
             right: Box::new(rewrite_child(right)),
+            decimal_overflow_policy: *decimal_overflow_policy,
         },
         ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
             op: *op,
@@ -632,9 +638,11 @@ pub(super) fn rewrite_expr_children(
         ExprKind::Cast {
             expr: inner,
             target,
+            decimal_overflow_policy,
         } => ExprKind::Cast {
             expr: Box::new(rewrite_child(inner)),
             target: target.clone(),
+            decimal_overflow_policy: *decimal_overflow_policy,
         },
         ExprKind::IsNull {
             expr: inner,
@@ -813,14 +821,17 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 left: left_left,
                 op: left_op,
                 right: left_right,
+                decimal_overflow_policy: left_policy,
             },
             ExprKind::BinaryOp {
                 left: right_left,
                 op: right_op,
                 right: right_right,
+                decimal_overflow_policy: right_policy,
             },
         ) => {
-            left_op == right_op
+            left_policy == right_policy
+                && left_op == right_op
                 && typed_expr_semantically_eq(left_left, right_left)
                 && typed_expr_semantically_eq(left_right, right_right)
         }
@@ -894,12 +905,18 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
             ExprKind::Cast {
                 expr: left_expr,
                 target: left_target,
+                decimal_overflow_policy: left_policy,
             },
             ExprKind::Cast {
                 expr: right_expr,
                 target: right_target,
+                decimal_overflow_policy: right_policy,
             },
-        ) => left_target == right_target && typed_expr_semantically_eq(left_expr, right_expr),
+        ) => {
+            left_policy == right_policy
+                && left_target == right_target
+                && typed_expr_semantically_eq(left_expr, right_expr)
+        }
         (
             ExprKind::IsNull {
                 expr: left_expr,

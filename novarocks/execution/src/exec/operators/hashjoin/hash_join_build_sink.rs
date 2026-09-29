@@ -1522,7 +1522,14 @@ mod tests {
         let mut arena = ExprArena::default();
         let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
         let zero = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(0)), DataType::Int32);
-        let build_key = arena.push_typed(ExprNode::Add(slot, zero), DataType::Int32);
+        let build_key = arena.push_typed(
+            ExprNode::Add(
+                slot,
+                zero,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            DataType::Int32,
+        );
         let arena = Arc::new(arena);
         let state = Arc::new(TestBuildState::default());
         let root = MemTracker::new_root("hash-build-test");
@@ -1631,7 +1638,14 @@ mod tests {
         let mut arena = ExprArena::default();
         let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
         let zero = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(0)), DataType::Int32);
-        let build_key = arena.push_typed(ExprNode::Add(slot, zero), DataType::Int32);
+        let build_key = arena.push_typed(
+            ExprNode::Add(
+                slot,
+                zero,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            DataType::Int32,
+        );
         let arena = Arc::new(arena);
         let state = Arc::new(TestBuildState::default());
         let root = MemTracker::new_root("hash-build-test");

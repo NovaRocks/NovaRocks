@@ -423,18 +423,18 @@ fn expr_references_slot(arena: &ExprArena, expr: ExprId, slot_id: SlotId) -> boo
                     .any(|(_, child)| expr_references_slot(arena, *child, slot_id))
         }
         ExprNode::DictDecode { child, .. }
-        | ExprNode::Cast(child)
-        | ExprNode::CastTime(child)
-        | ExprNode::CastTimeFromDatetime(child)
+        | ExprNode::Cast(child, _)
+        | ExprNode::CastTime(child, _)
+        | ExprNode::CastTimeFromDatetime(child, _)
         | ExprNode::Not(child)
         | ExprNode::IsNull(child)
         | ExprNode::IsNotNull(child)
         | ExprNode::Clone(child) => expr_references_slot(arena, *child, slot_id),
-        ExprNode::Add(left, right)
-        | ExprNode::Sub(left, right)
-        | ExprNode::Mul(left, right)
-        | ExprNode::Div(left, right)
-        | ExprNode::Mod(left, right)
+        ExprNode::Add(left, right, _)
+        | ExprNode::Sub(left, right, _)
+        | ExprNode::Mul(left, right, _)
+        | ExprNode::Div(left, right, _)
+        | ExprNode::Mod(left, right, _)
         | ExprNode::Eq(left, right)
         | ExprNode::EqForNull(left, right)
         | ExprNode::Ne(left, right)
@@ -2664,7 +2664,13 @@ mod tests {
             &DataType::Utf8,
         ));
 
-        let cast_expr = arena.push_typed(ExprNode::Cast(group_expr), DataType::Utf8);
+        let cast_expr = arena.push_typed(
+            ExprNode::Cast(
+                group_expr,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            DataType::Utf8,
+        );
         assert!(!super::aggregate_accepts_encoded_group_column(
             &arena,
             &[cast_expr],
@@ -2691,6 +2697,37 @@ mod tests {
             &arena,
             &[group_expr],
             &[function_using_group_slot],
+            slot,
+            &dict_type,
+        ));
+
+        // An aggregate input still consumes row values when the group key
+        // appears below a reporting cast and arithmetic expression. Keeping
+        // only dictionary keys would change the aggregate's input domain.
+        let parsed = arena.push_typed(
+            ExprNode::Cast(
+                group_expr,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
+            DataType::Decimal128(38, 0),
+        );
+        let arithmetic = arena.push_typed(
+            ExprNode::Add(
+                parsed,
+                parsed,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
+            DataType::Decimal128(38, 0),
+        );
+        let function_using_cast_group_slot = AggFunction {
+            name: "min".to_string(),
+            inputs: vec![arithmetic],
+            ..Default::default()
+        };
+        assert!(!super::aggregate_accepts_encoded_group_column(
+            &arena,
+            &[group_expr],
+            &[function_using_cast_group_slot],
             slot,
             &dict_type,
         ));

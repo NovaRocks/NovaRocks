@@ -957,6 +957,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
         kind: ExprKind::Cast {
             expr: Box::new(case),
             target: DataType::Int8,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         data_type: DataType::Int8,
         nullable: false,
@@ -1077,6 +1078,7 @@ fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
             left: Box::new(left),
             op,
             right: Box::new(right),
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         data_type: DataType::Boolean,
         nullable: false,
@@ -1215,6 +1217,8 @@ fn project_item_for_mapping(
                         kind: ExprKind::Cast {
                             expr: Box::new(column_ref(&desc.action_column)),
                             target: DataType::Int8,
+                            decimal_overflow_policy:
+                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                         data_type: DataType::Int8,
                         nullable: false,
@@ -1227,6 +1231,8 @@ fn project_item_for_mapping(
                             DataType::Int8,
                         )),
                         target: DataType::Int8,
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Int8,
                     nullable: false,
@@ -2314,7 +2320,7 @@ mod tests {
                 .eq_ignore_ascii_case(crate::common::CHANGE_OP_COLUMN)
         );
         assert_eq!(item.output_column_id, ColumnId(91));
-        let ExprKind::Cast { expr, target } = &item.expr.kind else {
+        let ExprKind::Cast { expr, target, .. } = &item.expr.kind else {
             panic!("expected action cast");
         };
         assert_eq!(target, &DataType::Int8);

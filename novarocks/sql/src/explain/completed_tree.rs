@@ -550,7 +550,9 @@ impl ExprText<'_> {
                     UnaryOperator::BitwiseNot => write!(formatter, "~{}", inner(*expr)),
                 }
             }
-            ExprKind::Binary { left, op, right } => write!(
+            ExprKind::Binary {
+                left, op, right, ..
+            } => write!(
                 formatter,
                 "{} {} {}",
                 inner(*left),
@@ -589,7 +591,7 @@ impl ExprText<'_> {
                 if *negated { "NOT " } else { "" },
                 if *value { "TRUE" } else { "FALSE" }
             ),
-            ExprKind::Cast { expr, target } => {
+            ExprKind::Cast { expr, target, .. } => {
                 write!(formatter, "CAST({} AS {target})", inner(*expr))
             }
             ExprKind::InList {

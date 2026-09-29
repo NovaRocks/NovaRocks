@@ -132,26 +132,40 @@ fn normalize_correlated_on_predicate_inner_opt(
     let data_type = arena.data_type(predicate).clone();
     let nullable = arena.nullable(predicate);
     match node {
-        ScalarNode::BinaryOp { left, op, right } if matches!(op, BinOp::And | BinOp::Or) => {
+        ScalarNode::BinaryOp {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } if matches!(op, BinOp::And | BinOp::Or) => {
             let left = normalize_correlated_on_predicate_inner_opt(arena, left, outer_ids);
             let right = normalize_correlated_on_predicate_inner_opt(arena, right, outer_ids);
             arena.intern(
-                ScalarNode::BinaryOp { left, op, right },
+                ScalarNode::BinaryOp {
+                    left,
+                    op,
+                    right,
+                    decimal_overflow_policy,
+                },
                 data_type,
                 nullable,
             )
         }
-        ScalarNode::BinaryOp { left, op, right }
-            if matches!(
-                op,
-                BinOp::Eq
-                    | BinOp::EqForNull
-                    | BinOp::Ne
-                    | BinOp::Lt
-                    | BinOp::Le
-                    | BinOp::Gt
-                    | BinOp::Ge
-            ) =>
+        ScalarNode::BinaryOp {
+            left,
+            op,
+            right,
+            decimal_overflow_policy,
+        } if matches!(
+            op,
+            BinOp::Eq
+                | BinOp::EqForNull
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+        ) =>
         {
             let left_outer_only = scalar_utils::scalar_refs_only(arena, left, outer_ids);
             let right_outer_only = scalar_utils::scalar_refs_only(arena, right, outer_ids);
@@ -170,6 +184,8 @@ fn normalize_correlated_on_predicate_inner_opt(
                             ScalarNode::Cast {
                                 child: right,
                                 target: inner_type.clone(),
+                                decimal_overflow_policy:
+                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
                             inner_type,
                             arena.nullable(right),
@@ -180,6 +196,7 @@ fn normalize_correlated_on_predicate_inner_opt(
                             left: outer_expr,
                             op: reverse_comparison_op(op),
                             right: left,
+                            decimal_overflow_policy,
                         },
                         data_type,
                         nullable,
@@ -381,28 +398,36 @@ mod legacy {
             nullable,
         } = predicate;
         match kind {
-            ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::And | BinOp::Or) => {
-                TypedExpr {
-                    kind: ExprKind::BinaryOp {
-                        left: Box::new(normalize_correlated_on_predicate_inner(*left, outer_ids)),
-                        op,
-                        right: Box::new(normalize_correlated_on_predicate_inner(*right, outer_ids)),
-                    },
-                    data_type,
-                    nullable,
-                }
-            }
-            ExprKind::BinaryOp { left, op, right }
-                if matches!(
+            ExprKind::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy,
+            } if matches!(op, BinOp::And | BinOp::Or) => TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(normalize_correlated_on_predicate_inner(*left, outer_ids)),
                     op,
-                    BinOp::Eq
-                        | BinOp::EqForNull
-                        | BinOp::Ne
-                        | BinOp::Lt
-                        | BinOp::Le
-                        | BinOp::Gt
-                        | BinOp::Ge
-                ) =>
+                    right: Box::new(normalize_correlated_on_predicate_inner(*right, outer_ids)),
+                    decimal_overflow_policy,
+                },
+                data_type,
+                nullable,
+            },
+            ExprKind::BinaryOp {
+                left,
+                op,
+                right,
+                decimal_overflow_policy,
+            } if matches!(
+                op,
+                BinOp::Eq
+                    | BinOp::EqForNull
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+            ) =>
             {
                 let left_outer_only = expr_refs_outer_only(&left, outer_ids);
                 let right_outer_only = expr_refs_outer_only(&right, outer_ids);
@@ -413,7 +438,12 @@ mod legacy {
                     right_outer_only && !left_has_outer,
                 ) {
                     (true, false) => TypedExpr {
-                        kind: ExprKind::BinaryOp { left, op, right },
+                        kind: ExprKind::BinaryOp {
+                            left,
+                            op,
+                            right,
+                            decimal_overflow_policy,
+                        },
                         data_type,
                         nullable,
                     },
@@ -428,6 +458,8 @@ mod legacy {
                                 kind: ExprKind::Cast {
                                     expr: Box::new(outer_expr),
                                     target: inner_type,
+                                    decimal_overflow_policy:
+                                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                                 },
                             };
                         }
@@ -436,13 +468,19 @@ mod legacy {
                                 left: Box::new(outer_expr),
                                 op: reverse_comparison_op(op),
                                 right: Box::new(inner_expr),
+                                decimal_overflow_policy,
                             },
                             data_type,
                             nullable,
                         }
                     }
                     _ => TypedExpr {
-                        kind: ExprKind::BinaryOp { left, op, right },
+                        kind: ExprKind::BinaryOp {
+                            left,
+                            op,
+                            right,
+                            decimal_overflow_policy,
+                        },
                         data_type,
                         nullable,
                     },
@@ -568,6 +606,7 @@ mod legacy {
                 left: Box::new(left),
                 op: BinOp::Eq,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -656,6 +695,7 @@ mod tests {
                 left: Box::new(col_ref(INNER_K, "k")),
                 op: BinOp::Eq,
                 right: Box::new(col_ref(OUTER_K, "k")),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -668,6 +708,7 @@ mod tests {
                 left: Box::new(typed_col_ref(INNER_K, "k", inner_type)),
                 op: BinOp::Eq,
                 right: Box::new(typed_col_ref(OUTER_K, "k", outer_type)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -680,6 +721,7 @@ mod tests {
                 left: Box::new(col_ref(MISSING_INNER, "missing_k")),
                 op: BinOp::Eq,
                 right: Box::new(col_ref(OUTER_K, "k")),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -808,11 +850,14 @@ mod tests {
         let predicate = lifted
             .on_predicate
             .expect("lifted predicate must be present");
-        let ExprKind::BinaryOp { left, op, right } = &predicate.kind else {
+        let ExprKind::BinaryOp {
+            left, op, right, ..
+        } = &predicate.kind
+        else {
             panic!("expected binary predicate, got: {predicate:?}");
         };
         assert_eq!(*op, BinOp::Eq);
-        let ExprKind::Cast { expr, target } = &left.kind else {
+        let ExprKind::Cast { expr, target, .. } = &left.kind else {
             panic!("expected outer key cast, got: {left:?}");
         };
         assert_eq!(target, &inner_type);

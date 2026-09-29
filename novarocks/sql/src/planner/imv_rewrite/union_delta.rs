@@ -391,6 +391,7 @@ fn normalize_top_level_union_branch_output(
                     nullable: false,
                 }),
                 target: arrow::datatypes::DataType::Int32,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: branch_output.data_type.clone(),
             nullable: false,
@@ -810,6 +811,8 @@ mod tests {
                         left: Box::new(col_expr(20, "k")),
                         op: BinOp::Eq,
                         right: Box::new(col_expr(30, "k")),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -832,6 +835,8 @@ mod tests {
                             data_type: DataType::Int32,
                             nullable: false,
                         }),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -1014,7 +1019,7 @@ mod tests {
         assert!(!branch.expr.nullable);
         assert!(matches!(
             &branch.expr.kind,
-            ExprKind::Cast { expr, target }
+            ExprKind::Cast { expr, target , .. }
                 if *target == DataType::Int32
                     && matches!(
                         &expr.kind,

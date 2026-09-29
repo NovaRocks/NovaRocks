@@ -258,12 +258,16 @@ fn collect_scalar_column_id_refs_inner(
         }
         ScalarNode::WindowCall {
             args,
+            function_order_by,
             partition_by,
             order_by,
             ..
         } => {
             for arg in args {
                 collect_scalar_column_id_refs_inner(arena, *arg, out);
+            }
+            for item in function_order_by {
+                collect_scalar_column_id_refs_inner(arena, item.expr, out);
             }
             for item in partition_by {
                 collect_scalar_column_id_refs_inner(arena, *item, out);
@@ -298,7 +302,7 @@ fn tag_project(
     // parent_needed: they carry runtime correctness checks (e.g. the per-group
     // row-check from ScalarApplyToJoin) whose column refs (e.g. the count
     // column from the grouping aggregate) must remain available to the child.
-    // This mirrors the StarRocks PruneProjectColumnsRule carve-out.
+    // Other potentially failing expressions need the same input-column retention.
     let child_needed: HashSet<ColumnId> = node
         .items
         .iter()
@@ -306,8 +310,9 @@ fn tag_project(
             None => true,
             Some(n) => {
                 let is_needed = n.contains(&item.output_column_id);
-                let is_assert_true = scalar_is_assert_true(arena, item.expr);
-                is_needed || is_assert_true
+                let must_evaluate = scalar_is_assert_true(arena, item.expr)
+                    || crate::optimizer::scalar_expr::can_fail(arena, item.expr);
+                is_needed || must_evaluate
             }
         })
         .flat_map(|item| collect_scalar_column_id_refs(arena, item.expr))
@@ -1060,6 +1065,7 @@ mod tests {
                 left: Box::new(left_typed),
                 op,
                 right: Box::new(right_typed),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -2757,5 +2763,99 @@ mod tests {
         assert!(req.contains(&ColumnId::new_for_test(101)), "p@101 kept");
         assert!(req.contains(&ColumnId::new_for_test(102)), "q@102 kept");
         assert_eq!(req.len(), 2, "both output ids kept");
+    }
+
+    #[test]
+    fn ordered_array_agg_window_retains_function_ordering_dependencies_and_error_effect() {
+        use novarocks_type_contract::DecimalOverflowPolicy::ReportError;
+        let mut arena = ScalarArena::new();
+        let arg = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(11)),
+            DataType::Int32,
+            true,
+        );
+        let key = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(12)),
+            DataType::Decimal128(38, 0),
+            true,
+        );
+        let order = arena.intern(
+            ScalarNode::Cast {
+                child: key,
+                target: DataType::Decimal128(9, 0),
+                decimal_overflow_policy: ReportError,
+            },
+            DataType::Decimal128(9, 0),
+            true,
+        );
+        let partition = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(13)),
+            DataType::Int32,
+            true,
+        );
+        let over_order = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::new_for_test(14)),
+            DataType::Int32,
+            true,
+        );
+        let binding =
+            crate::functions::test_resolved_aggregate("array_agg", &[DataType::Int32], false);
+        assert_eq!(
+            binding.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated
+        );
+        let sort = |expr| SortKey {
+            expr,
+            asc: true,
+            nulls_first: true,
+            display: None,
+        };
+        let window = arena.intern(
+            ScalarNode::WindowCall {
+                name: "array_agg".into(),
+                args: vec![arg],
+                distinct: false,
+                binding: binding.clone(),
+                function_order_by: vec![sort(order)],
+                aggregate_binding: Some(binding),
+                partition_by: vec![partition],
+                order_by: vec![sort(over_order)],
+                window_frame: None,
+                ignore_nulls: false,
+            },
+            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Int32,
+                true,
+            ))),
+            true,
+        );
+        assert_eq!(
+            collect_scalar_column_id_refs(&arena, window),
+            needed_set(&[11, 12, 13, 14])
+        );
+        assert!(crate::optimizer::scalar_expr::can_fail(&arena, window));
+        assert_eq!(
+            crate::optimizer::scalar_expr::collect_column_ids_strict(&arena, window),
+            Some(needed_set(&[11, 12, 13, 14]))
+        );
+        let unset = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::UNSET),
+            DataType::Decimal128(9, 0),
+            true,
+        );
+        let mut invalid = arena.node(window).clone();
+        let ScalarNode::WindowCall {
+            function_order_by, ..
+        } = &mut invalid
+        else {
+            unreachable!()
+        };
+        *function_order_by = vec![sort(unset)];
+        let invalid = arena.intern(invalid, arena.data_type(window).clone(), true);
+        assert_eq!(
+            crate::optimizer::scalar_expr::collect_column_ids_strict(&arena, invalid),
+            None
+        );
     }
 }

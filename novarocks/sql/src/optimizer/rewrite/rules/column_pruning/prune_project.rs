@@ -105,6 +105,7 @@ impl LogicalRewriteRule for PruneProjectColumns {
         // output_column_id appears in needed: they carry runtime correctness
         // checks (e.g. the per-group row-check from ScalarApplyToJoin) that
         // must not be silently dropped when nothing upstream references them.
+        // The same rule applies to every expression with a possible row error.
         let arena_rc = ctx.scalar_arena();
         let arena = arena_rc.borrow();
         let mut new_items: Vec<ScalarProjectItem> = node
@@ -114,6 +115,7 @@ impl LogicalRewriteRule for PruneProjectColumns {
                 item.output_column_id == ColumnId::UNSET
                     || needed.contains(&item.output_column_id)
                     || is_assert_true_item(&arena, item)
+                    || crate::optimizer::scalar_expr::can_fail(&arena, item.expr)
             })
             .collect();
         drop(arena);
@@ -521,5 +523,85 @@ mod tests {
             has_assert_true,
             "assert_true item must survive PruneProjectColumns (carve-out missing)"
         );
+    }
+    #[test]
+    fn unused_errorful_project_and_input_dependencies_survive_tagging_and_pruning() {
+        use crate::analysis::BinOp;
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        let input = ColumnId::new_for_test(1);
+        let unused_input = ColumnId::new_for_test(2);
+        let third_input = ColumnId::new_for_test(3);
+        let kept = ColumnId::new_for_test(4);
+        let side = ColumnId::new_for_test(5);
+        for (op, policy, must_keep) in [
+            (BinOp::Mul, OutputNull, true),
+            (BinOp::Add, ReportError, true),
+            (BinOp::Add, OutputNull, false),
+        ] {
+            let (mut ctx, arena_rc) = ctx_with_factory_and_arena();
+            let mut scan = make_scan(input, unused_input, third_input);
+            let Operator::LogicalScan(scan_op) = &mut scan.op else {
+                unreachable!()
+            };
+            scan_op.columns[1].data_type = DataType::Decimal128(38, 0);
+            scan_op.table.columns[1].data_type = DataType::Decimal128(38, 0);
+            let items = {
+                let mut arena = arena_rc.borrow_mut();
+                let mut plain = col_ref_item(&mut arena, input, "kept");
+                plain.output_column_id = kept;
+                let source = arena.intern(
+                    ScalarNode::ColumnRef(unused_input),
+                    DataType::Decimal128(38, 0),
+                    true,
+                );
+                let expr = arena.intern(
+                    ScalarNode::BinaryOp {
+                        op,
+                        left: source,
+                        right: source,
+                        decimal_overflow_policy: policy,
+                    },
+                    DataType::Decimal128(38, 0),
+                    true,
+                );
+                vec![
+                    plain,
+                    ScalarProjectItem {
+                        expr,
+                        output_name: "side".into(),
+                        output_column_id: side,
+                        expr_display: None,
+                    },
+                ]
+            };
+            let expr = project_expr(scan, items, None);
+            let tagged = crate::optimizer::rewrite::required_columns::tag_required_columns(
+                expr,
+                &arena_rc.borrow(),
+                Some(HashSet::from([kept])),
+            );
+            assert_eq!(
+                tagged.children[0].required_output_columns,
+                Some(if must_keep {
+                    HashSet::from([input, unused_input])
+                } else {
+                    HashSet::from([input])
+                }),
+                "{op:?}/{policy:?}"
+            );
+            let result = PruneProjectColumns.apply(tagged, &mut ctx).unwrap();
+            if must_keep {
+                assert!(matches!(result, RewriteResult::Unchanged));
+            } else {
+                let RewriteResult::Changed(changed) = result else {
+                    panic!("pure nullable add should be pruned")
+                };
+                let Operator::LogicalProject(project) = changed.op else {
+                    unreachable!()
+                };
+                assert_eq!(project.items.len(), 1);
+                assert_eq!(project.items[0].output_column_id, kept);
+            }
+        }
     }
 }

@@ -61,6 +61,51 @@ def load_lock(path: Path) -> tuple[dict[str, Any], str]:
     return lock, sha256_bytes(canonical_bytes(lock))
 
 
+# A consumer declares its runtime roots; build dependencies come from the lock.
+CONSUMER_INPUT_ROOTS = {
+    "iceberg-rest": (
+        ("images", "minio"),
+        ("images", "minio-mc"),
+        ("images", "iceberg-rest"),
+        ("derived_images", "iceberg-spark"),
+    ),
+}
+
+
+def required_input_names(
+    lock: Mapping[str, Any], consumer: str
+) -> tuple[set[str], set[str], set[str]]:
+    """Resolve a closed consumer's typed input dependency closure."""
+    if consumer == "all":
+        return set(lock["images"]), set(lock["artifacts"]), set(lock["derived_images"])
+    roots = CONSUMER_INPUT_ROOTS.get(consumer)
+    if roots is None:
+        raise FixtureInputError(f"unknown fixture input consumer: {consumer}")
+    selected: dict[str, set[str]] = {
+        "images": set(), "artifacts": set(), "derived_images": set()
+    }
+
+    def visit(kind: str, name: str) -> None:
+        if not isinstance(name, str) or not isinstance(lock[kind].get(name), dict):
+            raise FixtureInputError(f"fixture consumer input is missing: {kind}/{name}")
+        if name in selected[kind]:
+            return
+        selected[kind].add(name)
+        if kind == "derived_images":
+            item = lock[kind][name]
+            # The provisioner defines a base as an image, not another derived image.
+            visit("images", item.get("base"))
+            dependencies = item.get("artifacts")
+            if not isinstance(dependencies, list):
+                raise FixtureInputError(f"fixture consumer artifact dependencies are missing: {name}")
+            for artifact in dependencies:
+                visit("artifacts", artifact)
+
+    for kind, name in roots:
+        visit(kind, name)
+    return selected["images"], selected["artifacts"], selected["derived_images"]
+
+
 def fixture_store(value: str | None) -> Path:
     if value:
         return Path(value).expanduser().resolve()

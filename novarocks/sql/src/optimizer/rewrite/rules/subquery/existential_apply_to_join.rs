@@ -239,6 +239,7 @@ mod tests {
                 left: Box::new(col_ref(INNER_K, "k")),
                 op: BinOp::Eq,
                 right: Box::new(col_ref(OUTER_K, "k")),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -364,7 +365,10 @@ mod tests {
     }
 
     fn assert_correlation_condition(condition: &TypedExpr) {
-        let ExprKind::BinaryOp { left, op, right } = &condition.kind else {
+        let ExprKind::BinaryOp {
+            left, op, right, ..
+        } = &condition.kind
+        else {
             panic!("expected binary condition, got: {condition:?}");
         };
         assert_eq!(*op, BinOp::Eq);

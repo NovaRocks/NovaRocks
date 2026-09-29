@@ -691,6 +691,7 @@ pub enum LocalProgramError {
     LayoutMismatch,
     InvalidRequirement,
     InvalidSink,
+    UnsupportedKernelAbi,
 }
 
 impl fmt::Display for LocalProgramError {
@@ -720,6 +721,9 @@ impl LocalProgram {
         requirements: BindingRequirements,
         sink: Option<StaticSinkProgram>,
     ) -> Result<Self, LocalProgramError> {
+        if profile.kernel_abi() != crate::KernelAbiVersion::CURRENT {
+            return Err(LocalProgramError::UnsupportedKernelAbi);
+        }
         if nodes.is_empty() {
             return Err(LocalProgramError::Empty);
         }
@@ -1277,7 +1281,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             None,
             layout.identity().unwrap(),
-            KernelAbiVersion::new(NonZeroU32::new(1).unwrap()),
+            KernelAbiVersion::CURRENT,
         )
     }
 
@@ -1429,7 +1433,7 @@ mod tests {
                 NonZeroUsize::new(1).unwrap(),
                 None,
                 LayoutIdentity::from_sha256([9; 32]),
-                KernelAbiVersion::new(NonZeroU32::new(1).unwrap()),
+                KernelAbiVersion::CURRENT,
             ),
             BindingRequirements::try_new(vec![]).unwrap(),
         );
@@ -1578,5 +1582,40 @@ mod tests {
             Some(sink),
         );
         assert!(matches!(result, Err(LocalProgramError::InvalidSink)));
+    }
+
+    #[test]
+    fn local_program_rejects_the_pre_policy_kernel_abi() {
+        let (_, layout) = values();
+        let expressions =
+            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
+        let requirements = BindingRequirements::try_new(vec![]).unwrap();
+        let old = CompileProfile::new(
+            NonZeroUsize::new(1).unwrap(),
+            None,
+            layout.identity().unwrap(),
+            KernelAbiVersion::new(NonZeroU32::new(1).unwrap()),
+        );
+        assert!(matches!(
+            LocalProgram::try_new(
+                vec![],
+                ProgramNodeId::new(0),
+                expressions.clone(),
+                old,
+                requirements.clone()
+            ),
+            Err(LocalProgramError::UnsupportedKernelAbi)
+        ));
+        assert!(matches!(
+            LocalProgram::try_new(
+                vec![],
+                ProgramNodeId::new(0),
+                expressions,
+                profile(&layout),
+                requirements
+            ),
+            Err(LocalProgramError::Empty)
+        ));
+        assert_eq!(KernelAbiVersion::CURRENT.get(), 2);
     }
 }

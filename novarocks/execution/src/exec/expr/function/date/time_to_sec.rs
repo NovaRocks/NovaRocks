@@ -74,9 +74,9 @@ fn strip_cast_wrappers(arena: &ExprArena, mut expr_id: ExprId) -> ExprId {
     loop {
         match arena.node(expr_id) {
             Some(
-                ExprNode::Cast(child)
-                | ExprNode::CastTime(child)
-                | ExprNode::CastTimeFromDatetime(child),
+                ExprNode::Cast(child, _)
+                | ExprNode::CastTime(child, _)
+                | ExprNode::CastTimeFromDatetime(child, _),
             ) => expr_id = *child,
             _ => return expr_id,
         }
@@ -127,9 +127,9 @@ fn parse_from_immediate_cast_string_source(
 ) -> Result<Option<Vec<Option<i64>>>, String> {
     let child = match arena.node(arg_expr) {
         Some(
-            ExprNode::Cast(child)
-            | ExprNode::CastTime(child)
-            | ExprNode::CastTimeFromDatetime(child),
+            ExprNode::Cast(child, _)
+            | ExprNode::CastTime(child, _)
+            | ExprNode::CastTimeFromDatetime(child, _),
         ) => *child,
         _ => return Ok(None),
     };
@@ -145,7 +145,9 @@ pub fn parse_from_cast_source(
     let mut current = arg_expr;
     let mut seen_cast = false;
     while let Some(
-        ExprNode::Cast(child) | ExprNode::CastTime(child) | ExprNode::CastTimeFromDatetime(child),
+        ExprNode::Cast(child, _)
+        | ExprNode::CastTime(child, _)
+        | ExprNode::CastTimeFromDatetime(child, _),
     ) = arena.node(current)
     {
         current = *child;

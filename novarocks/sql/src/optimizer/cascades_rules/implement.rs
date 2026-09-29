@@ -161,6 +161,7 @@ fn eq_condition_to_expr(arena: &mut ScalarArena, eq: ScalarHashJoinEqCondition) 
                 BinOp::Eq
             },
             right: eq.right,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
         DataType::Boolean,
         if eq.null_safe {
@@ -182,6 +183,7 @@ fn append_residual_condition(
                 left: existing,
                 op: BinOp::And,
                 right: residual,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             false,
@@ -250,11 +252,14 @@ fn collect_conjuncts(
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             collect_conjuncts(arena, *left, eq_pairs, others);
             collect_conjuncts(arena, *right, eq_pairs, others);
         }
-        ScalarNode::BinaryOp { left, op, right } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
+        ScalarNode::BinaryOp {
+            left, op, right, ..
+        } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
             // Treat as equi-join key when BOTH sides reference at least
             // one column. A side that's purely literal/constant
             // (`col = 2002`) is a filter, not an equi-key; let it fall
@@ -1610,6 +1615,7 @@ mod join_demotion_tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -1711,7 +1717,9 @@ mod join_demotion_tests {
             .expect("demoted same-side pair must appear in other_condition");
         let other = mat(&memo, *other);
         match &other.kind {
-            ExprKind::BinaryOp { left, op, right } => {
+            ExprKind::BinaryOp {
+                left, op, right, ..
+            } => {
                 assert!(
                     matches!(op, BinOp::Eq),
                     "demoted condition should be BinaryOp::Eq, got {:?}",

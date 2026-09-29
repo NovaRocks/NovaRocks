@@ -389,4 +389,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn intrinsic_peer_without_expression_overflow_policy_has_a_distinct_plan_digest() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
+                .unwrap();
+        let prior = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            [0x41; 32],
+            4,
+        )
+        .unwrap();
+        assert_eq!(current.plan_contract_revision(), 5);
+        assert_eq!(prior.plan_contract_revision(), 4);
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+        assert_eq!(
+            current.function_catalog_digest(),
+            prior.function_catalog_digest()
+        );
+        assert_eq!(
+            current.execution_implementation_manifest_digest(),
+            prior.execution_implementation_manifest_digest()
+        );
+    }
 }

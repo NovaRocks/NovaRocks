@@ -586,6 +586,8 @@ mod tests {
                         kind: ExprKind::Cast {
                             expr: Box::new(column(1, "key", DataType::Int64, false)),
                             target: DataType::Int64,
+                            decimal_overflow_policy:
+                                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
                         data_type: DataType::Int64,
                         nullable: false,
@@ -1019,6 +1021,7 @@ mod tests {
             kind: ExprKind::Cast {
                 expr: Box::new(column(1, &key.name, key.data_type.clone(), key.nullable)),
                 target: DataType::Int32,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Int32,
             nullable: key.nullable,

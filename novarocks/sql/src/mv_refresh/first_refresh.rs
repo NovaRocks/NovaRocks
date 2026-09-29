@@ -1317,6 +1317,8 @@ fn add_join_incremental_change_stream_effect(
                     op: BinOp::Eq,
                     left: action_ref,
                     right: delete,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
                 arrow::datatypes::DataType::Boolean,
                 action.nullable,
@@ -1421,6 +1423,7 @@ fn conjoin(
                 op: crate::common::BinOp::And,
                 left,
                 right,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             arrow::datatypes::DataType::Boolean,
             false,

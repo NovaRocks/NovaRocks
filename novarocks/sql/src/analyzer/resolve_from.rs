@@ -125,6 +125,8 @@ impl<'a> super::AnalyzerContext<'a> {
                                 left: Box::new(left_ref),
                                 op: BinOp::Eq,
                                 right: Box::new(right_ref),
+                                decimal_overflow_policy:
+                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
                         });
                     }
@@ -140,6 +142,8 @@ impl<'a> super::AnalyzerContext<'a> {
                                     left: Box::new(prev),
                                     op: BinOp::And,
                                     right: Box::new(result),
+                                    decimal_overflow_policy:
+                                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                                 },
                             };
                         }
@@ -271,6 +275,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                         std::slice::from_ref(col),
                                         l_q,
                                         r_q,
+                                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
                                     )
                                     .map_err(|message| {
                                         AnalyzeError::type_mismatch(message, join.span)

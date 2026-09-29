@@ -2230,6 +2230,8 @@ mod tests {
                         left: Box::new(col_expr(left_key.column_id.0, &left_key.name)),
                         op: BinOp::Eq,
                         right: Box::new(col_expr(right_key.column_id.0, &right_key.name)),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -2499,6 +2501,7 @@ mod tests {
                 left: Box::new(col_expr(1, "left_k")),
                 op: BinOp::Eq,
                 right: Box::new(col_expr(10, "right_k")),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -2507,7 +2510,14 @@ mod tests {
 
     fn assert_condition_refs(condition: Option<&TypedExpr>) {
         let Some(TypedExpr {
-            kind: ExprKind::BinaryOp { left, op, right },
+            kind:
+                ExprKind::BinaryOp {
+                    left,
+                    op,
+                    right,
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
             ..
         }) = condition
         else {

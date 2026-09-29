@@ -11,6 +11,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-type-contract.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }

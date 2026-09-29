@@ -421,6 +421,7 @@ mod tests {
                 op: crate::analysis::BinOp::Gt,
                 left: col_b,
                 right: zero,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             false,

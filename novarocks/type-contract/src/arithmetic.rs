@@ -29,6 +29,109 @@ pub enum ArithmeticOperator {
     Modulo,
 }
 
+/// Frozen per-operation response to checked decimal numeric overflow.
+/// This is independent from parser failure and division-by-zero policy.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DecimalOverflowPolicy {
+    OutputNull,
+    ReportError,
+}
+
+/// Scalar numeric conversions whose finite values have checked Decimal overflow.
+/// String parsing, Decimal-to-float formatting and non-finite input are separate contracts.
+pub fn is_checked_decimal_numeric_cast(source: &DataType, target: &DataType) -> bool {
+    let decimal =
+        |dtype: &DataType| matches!(dtype, DataType::Decimal128(..) | DataType::Decimal256(..));
+    let integral = |dtype: &DataType| {
+        matches!(
+            dtype,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        ) || is_largeint_data_type(dtype)
+    };
+    (decimal(target)
+        && (decimal(source)
+            || integral(source)
+            || matches!(
+                source,
+                DataType::Boolean | DataType::Float32 | DataType::Float64
+            )))
+        || (decimal(source) && integral(target))
+}
+
+/// Until recursive checked numeric casting is implemented, reject its ReportError
+/// form before execution. Identical Arrow physical types only retag metadata and
+/// need no numerical conversion. OutputNull retains the existing nested caster.
+pub fn decimal_error_policy_cast_supported(
+    source: &DataType,
+    target: &DataType,
+    policy: DecimalOverflowPolicy,
+) -> bool {
+    if policy == DecimalOverflowPolicy::OutputNull || source == target {
+        return true;
+    }
+    fn children(dtype: &DataType) -> Vec<&DataType> {
+        match dtype {
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => vec![field.data_type()],
+            DataType::Struct(fields) => fields.iter().map(|field| field.data_type()).collect(),
+            _ => Vec::new(),
+        }
+    }
+    fn potential_numeric_change(source: &DataType, target: &DataType) -> bool {
+        if source == target {
+            return false;
+        }
+        let source_children = children(source);
+        let target_children = children(target);
+        if source_children.is_empty() && target_children.is_empty() {
+            return is_checked_decimal_numeric_cast(source, target);
+        }
+        // For matching layouts preserve field correspondence. For incompatible
+        // layouts use a conservative leaf relation; other cast validation still
+        // rejects unsupported shapes independently of this numeric policy.
+        let matching = matches!(
+            (source, target),
+            (DataType::List(_), DataType::List(_))
+                | (DataType::LargeList(_), DataType::LargeList(_))
+                | (DataType::FixedSizeList(..), DataType::FixedSizeList(..))
+                | (DataType::Map(..), DataType::Map(..))
+                | (DataType::Struct(_), DataType::Struct(_))
+        ) && source_children.len() == target_children.len();
+        if matching {
+            return source_children
+                .iter()
+                .zip(&target_children)
+                .any(|(s, t)| potential_numeric_change(s, t));
+        }
+        if source_children.is_empty() {
+            return target_children
+                .iter()
+                .any(|t| potential_numeric_change(source, t));
+        }
+        if target_children.is_empty() {
+            return source_children
+                .iter()
+                .any(|s| potential_numeric_change(s, target));
+        }
+        source_children.iter().any(|s| {
+            target_children
+                .iter()
+                .any(|t| potential_numeric_change(s, t))
+        })
+    }
+    (children(source).is_empty() && children(target).is_empty())
+        || !potential_numeric_change(source, target)
+}
+
 /// Computes the Decimal128 result of one binary arithmetic operation.
 ///
 /// Multiplication adds scales and precisions; division follows the frozen
@@ -496,5 +599,88 @@ mod tests {
             canonical_agg_decimal_type("sum", &DataType::Decimal256(40, 2)),
             None
         );
+    }
+    #[test]
+    fn nested_checked_decimal_error_policy_is_explicit_and_parse_domain_is_separate() {
+        use arrow_schema::Field;
+        use std::sync::Arc;
+        let containers = |leaf: DataType| {
+            let field = Arc::new(Field::new("item", leaf.clone(), true));
+            vec![
+                DataType::List(field.clone()),
+                DataType::LargeList(field.clone()),
+                DataType::FixedSizeList(field, 1),
+                DataType::Struct(vec![Field::new("a", leaf.clone(), true)].into()),
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Int32, false),
+                                Field::new("value", leaf, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+            ]
+        };
+        let source = containers(DataType::Decimal128(4, 0));
+        for (source, target) in source.iter().zip(containers(DataType::Decimal128(3, 0))) {
+            assert!(!decimal_error_policy_cast_supported(
+                source,
+                &target,
+                DecimalOverflowPolicy::ReportError
+            ));
+            assert!(decimal_error_policy_cast_supported(
+                source,
+                &target,
+                DecimalOverflowPolicy::OutputNull
+            ));
+            assert!(decimal_error_policy_cast_supported(
+                source,
+                source,
+                DecimalOverflowPolicy::ReportError
+            ));
+        }
+        for target in [DataType::Float64, DataType::Utf8] {
+            assert!(decimal_error_policy_cast_supported(
+                &containers(DataType::Decimal128(4, 0))[0],
+                &containers(target)[0],
+                DecimalOverflowPolicy::ReportError
+            ));
+        }
+        assert!(decimal_error_policy_cast_supported(
+            &containers(DataType::Utf8)[0],
+            &containers(DataType::Decimal128(4, 0))[0],
+            DecimalOverflowPolicy::ReportError
+        ));
+        assert!(!decimal_error_policy_cast_supported(
+            &containers(DataType::Decimal128(4, 0))[0],
+            &containers(DataType::Int8)[0],
+            DecimalOverflowPolicy::ReportError
+        ));
+        // A change in a nonnumeric sibling does not make the unchanged decimal leaf overflow.
+        let source = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Decimal128(4, 0), true),
+                Field::new("b", DataType::Int32, true),
+            ]
+            .into(),
+        );
+        let target = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Decimal128(4, 0), true),
+                Field::new("b", DataType::Int64, true),
+            ]
+            .into(),
+        );
+        assert!(decimal_error_policy_cast_supported(
+            &source,
+            &target,
+            DecimalOverflowPolicy::ReportError
+        ));
     }
 }

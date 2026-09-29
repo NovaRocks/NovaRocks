@@ -423,6 +423,7 @@ fn release_expr() -> expr::Expr {
         r#type: Some(scalar_type(common::PrimitiveType::Boolean)),
         nullable: false,
         kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+            decimal_overflow_policy: expr::DecimalOverflowPolicy::Unspecified as i32,
             op: expr::BinaryOp::Gt as i32,
             left: Some(Box::new(column_expr(1, "l_orderkey"))),
             right: Some(Box::new(expr::Expr {

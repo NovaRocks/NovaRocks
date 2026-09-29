@@ -101,6 +101,7 @@ mod tests {
         let body = scalar_expr(
             item_type.clone(),
             expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 op: expr::BinaryOp::Add as i32,
                 left: Some(Box::new(lambda_param)),
                 right: Some(Box::new(col(7, item_type.clone()))),
@@ -145,7 +146,7 @@ mod tests {
         assert_eq!(arg_slots, &[SlotId::new(lambda_slot as u32)]);
         assert!(common_sub_exprs.is_empty());
         assert!(!is_nondeterministic);
-        let Some(ExprNode::Add(left, right)) = arena.node(*body) else {
+        let Some(ExprNode::Add(left, right, _)) = arena.node(*body) else {
             panic!("expected lambda body to keep captured-column add");
         };
         assert!(matches!(

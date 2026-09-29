@@ -245,6 +245,7 @@ mod tests {
                 left: Box::new(a),
                 op: BinOp::Eq,
                 right: Box::new(b),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -257,6 +258,7 @@ mod tests {
                 left: Box::new(a),
                 op: BinOp::Gt,
                 right: Box::new(b),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }
@@ -269,6 +271,7 @@ mod tests {
                 left: Box::new(a),
                 op: BinOp::And,
                 right: Box::new(b),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         }
     }

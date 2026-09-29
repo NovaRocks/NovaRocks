@@ -54,7 +54,7 @@ pub fn eval_time_format(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    let time_seconds_override = if let Some(ExprNode::Cast(child)) = arena.node(args[0]) {
+    let time_seconds_override = if let Some(ExprNode::Cast(child, _)) = arena.node(args[0]) {
         if matches!(arena.data_type(*child), Some(DataType::Utf8)) {
             let raw_arr = arena.eval(*child, chunk)?;
             let raw_utf8 = raw_arr

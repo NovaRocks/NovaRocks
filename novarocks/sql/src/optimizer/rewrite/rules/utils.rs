@@ -214,6 +214,7 @@ fn collect_join_equi_keys_opt(
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             collect_join_equi_keys_opt(
                 arena, *left, left_ids, right_ids, left_cols, right_cols, keys,
@@ -229,6 +230,7 @@ fn collect_join_equi_keys_opt(
             left,
             op: BinOp::Eq,
             right,
+            ..
         } => match (
             classify_scalar_operand(arena, *left, left_ids, right_ids, left_cols, right_cols),
             classify_scalar_operand(arena, *right, left_ids, right_ids, left_cols, right_cols),
@@ -496,6 +498,7 @@ mod typed_legacy {
                 left,
                 op: BinOp::And,
                 right,
+                ..
             } => {
                 split_and_inner(*left, out);
                 split_and_inner(*right, out);
@@ -515,6 +518,8 @@ mod typed_legacy {
                     left: Box::new(left),
                     op: BinOp::And,
                     right: Box::new(result),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             };
         }
@@ -815,6 +820,7 @@ mod typed_legacy {
                 left,
                 op: BinOp::And,
                 right,
+                ..
             } => {
                 collect_join_equi_keys(left, left_ids, right_ids, left_cols, right_cols, keys);
                 collect_join_equi_keys(right, left_ids, right_ids, left_cols, right_cols, keys);
@@ -823,6 +829,7 @@ mod typed_legacy {
                 left,
                 op: BinOp::Eq,
                 right,
+                ..
             } => match (
                 classify_operand(left, left_ids, right_ids, left_cols, right_cols),
                 classify_operand(right, left_ids, right_ids, left_cols, right_cols),
@@ -891,6 +898,7 @@ mod column_id_helper_tests {
                 left: Box::new(col_ref_expr(id_left)),
                 op: crate::analysis::BinOp::Eq,
                 right: Box::new(col_ref_expr(id_right)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -1081,6 +1089,8 @@ mod column_id_helper_tests {
                     left: Box::new(col_ref_expr(pass_id)),
                     op: BinOp::Add,
                     right: Box::new(col_ref_expr(ColumnId::new_for_test(11))),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1238,6 +1248,7 @@ mod column_id_helper_tests {
                 left: Box::new(left),
                 op: crate::analysis::BinOp::Eq,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,
@@ -1250,6 +1261,7 @@ mod column_id_helper_tests {
                 left: Box::new(left),
                 op: crate::analysis::BinOp::And,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,
@@ -1339,6 +1351,7 @@ mod column_id_helper_tests {
                 left: Box::new(qcol("l", "a", 1)),
                 op: crate::analysis::BinOp::Gt,
                 right: Box::new(qcol("r", "b", 2)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,
@@ -1352,6 +1365,7 @@ mod column_id_helper_tests {
             kind: ExprKind::Cast {
                 expr: Box::new(qcol("l", "a", 1)),
                 target: DataType::Int64,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Int64,
             nullable: true,
@@ -1369,6 +1383,7 @@ mod column_id_helper_tests {
                 left: Box::new(qcol("l", "a", 1)),
                 op: crate::analysis::BinOp::EqForNull,
                 right: Box::new(qcol("r", "b", 2)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -1383,6 +1398,7 @@ mod column_id_helper_tests {
                 left: Box::new(qcol("l", "a", 1)),
                 op: crate::analysis::BinOp::EqForNull,
                 right: Box::new(qcol("r", "b", 2)),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: false,

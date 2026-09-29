@@ -186,6 +186,7 @@ fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> Scal
                 left,
                 op: BinOp::And,
                 right: result,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             DataType::Boolean,
             nullable,
@@ -241,6 +242,7 @@ fn record_not_null_conjuncts(arena: &ScalarArena, expr: ScalarId, ids: &mut Hash
             left,
             op: BinOp::And,
             right,
+            ..
         } => {
             record_not_null_conjuncts(arena, *left, ids);
             record_not_null_conjuncts(arena, *right, ids);
@@ -339,6 +341,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::Eq,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,
@@ -351,6 +354,7 @@ mod tests {
                 left: Box::new(left),
                 op: BinOp::And,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,
@@ -406,6 +410,7 @@ mod tests {
                 left,
                 op: BinOp::And,
                 right,
+                ..
             } => not_null_count_scalar(arena, *left) + not_null_count_scalar(arena, *right),
             ScalarNode::IsNull { negated: true, .. } => 1,
             _ => 0,
@@ -661,6 +666,8 @@ mod tests {
                     left: Box::new(col_typed("l", "a", 1, true)),
                     op: BinOp::Gt,
                     right: Box::new(col_typed("r", "b", 2, true)),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
                 data_type: DataType::Boolean,
                 nullable: true,

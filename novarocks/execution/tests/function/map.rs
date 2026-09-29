@@ -471,7 +471,14 @@ fn test_map_apply_transform_values_alias() {
     let key_slot = arena.push_typed(ExprNode::SlotId(SlotId::new(101)), DataType::Int64);
     let value_slot = arena.push_typed(ExprNode::SlotId(SlotId::new(102)), DataType::Int64);
     let one = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
-    let value_plus_one = arena.push_typed(ExprNode::Add(value_slot, one), DataType::Int64);
+    let value_plus_one = arena.push_typed(
+        ExprNode::Add(
+            value_slot,
+            one,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        ),
+        DataType::Int64,
+    );
     let key_arr = arena.push_typed(
         ExprNode::ArrayExpr {
             elements: vec![key_slot],

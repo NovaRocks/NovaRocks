@@ -43,6 +43,7 @@ enum IExprKind {
         op: i32,
         left: Box<IExpr>,
         right: Box<IExpr>,
+        decimal_overflow_policy: IPolicy,
     },
     FunctionCall {
         function_name: String,
@@ -52,6 +53,7 @@ enum IExprKind {
     Cast {
         operand: Box<IExpr>,
         target: IType,
+        decimal_overflow_policy: IPolicy,
     },
     Case {
         operand: Option<Box<IExpr>>,
@@ -63,6 +65,26 @@ enum IExprKind {
         list: Vec<IExpr>,
         negated: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum IPolicy {
+    OutputNull,
+    ReportError,
+}
+
+fn policy_to_proto(policy: IPolicy) -> i32 {
+    match policy {
+        IPolicy::OutputNull => expr_proto::DecimalOverflowPolicy::OutputNull as i32,
+        IPolicy::ReportError => expr_proto::DecimalOverflowPolicy::ReportError as i32,
+    }
+}
+fn policy_from_proto(policy: i32) -> Result<IPolicy, &'static str> {
+    match expr_proto::DecimalOverflowPolicy::try_from(policy) {
+        Ok(expr_proto::DecimalOverflowPolicy::OutputNull) => Ok(IPolicy::OutputNull),
+        Ok(expr_proto::DecimalOverflowPolicy::ReportError) => Ok(IPolicy::ReportError),
+        _ => Err("invalid or missing decimal overflow policy"),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,13 +173,17 @@ fn expr_to_proto(expr: &IExpr) -> expr_proto::Expr {
         IExprKind::Literal(value) => Kind::Literal(expr_proto::LiteralExpr {
             value: Some(literal_to_proto(value)),
         }),
-        IExprKind::BinaryOp { op, left, right } => {
-            Kind::BinaryOp(Box::new(expr_proto::BinaryOpExpr {
-                op: *op,
-                left: Some(Box::new(expr_to_proto(left))),
-                right: Some(Box::new(expr_to_proto(right))),
-            }))
-        }
+        IExprKind::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy,
+        } => Kind::BinaryOp(Box::new(expr_proto::BinaryOpExpr {
+            decimal_overflow_policy: policy_to_proto(*decimal_overflow_policy),
+            op: *op,
+            left: Some(Box::new(expr_to_proto(left))),
+            right: Some(Box::new(expr_to_proto(right))),
+        })),
         IExprKind::FunctionCall {
             function_name,
             args,
@@ -167,7 +193,12 @@ fn expr_to_proto(expr: &IExpr) -> expr_proto::Expr {
             args: args.iter().map(expr_to_proto).collect(),
             distinct: *distinct,
         }),
-        IExprKind::Cast { operand, target } => Kind::Cast(Box::new(expr_proto::CastExpr {
+        IExprKind::Cast {
+            operand,
+            target,
+            decimal_overflow_policy,
+        } => Kind::Cast(Box::new(expr_proto::CastExpr {
+            decimal_overflow_policy: policy_to_proto(*decimal_overflow_policy),
             operand: Some(Box::new(expr_to_proto(operand))),
             target: Some(type_to_proto(target)),
         })),
@@ -222,6 +253,7 @@ fn expr_from_proto(proto: &expr_proto::Expr) -> Result<IExpr, String> {
             literal.value.as_ref().ok_or("LiteralExpr.value missing")?,
         )?),
         Kind::BinaryOp(binary) => IExprKind::BinaryOp {
+            decimal_overflow_policy: policy_from_proto(binary.decimal_overflow_policy)?,
             op: binary.op,
             left: Box::new(expr_from_proto(
                 binary.left.as_ref().ok_or("BinaryOpExpr.left missing")?,
@@ -240,6 +272,7 @@ fn expr_from_proto(proto: &expr_proto::Expr) -> Result<IExpr, String> {
             distinct: call.distinct,
         },
         Kind::Cast(cast) => IExprKind::Cast {
+            decimal_overflow_policy: policy_from_proto(cast.decimal_overflow_policy)?,
             operand: Box::new(expr_from_proto(
                 cast.operand.as_ref().ok_or("CastExpr.operand missing")?,
             )?),
@@ -338,6 +371,7 @@ fn sample_internal_expr() -> IExpr {
                     ty: scalar_type(common::PrimitiveType::Boolean),
                     nullable: false,
                     kind: IExprKind::BinaryOp {
+                        decimal_overflow_policy: IPolicy::OutputNull,
                         op: expr_proto::BinaryOp::Gt as i32,
                         left: Box::new(quantity.clone()),
                         right: Box::new(int_expr(10)),
@@ -347,6 +381,7 @@ fn sample_internal_expr() -> IExpr {
                     ty: scalar_type(common::PrimitiveType::Bigint),
                     nullable: true,
                     kind: IExprKind::Cast {
+                        decimal_overflow_policy: IPolicy::OutputNull,
                         operand: Box::new(IExpr {
                             ty: scalar_type(common::PrimitiveType::Double),
                             nullable: true,
@@ -463,6 +498,7 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
             value: Some(literal_to_proto(&ILiteral::Null)),
         }),
         Kind::BinaryOp(Box::new(expr_proto::BinaryOpExpr {
+            decimal_overflow_policy: expr_proto::DecimalOverflowPolicy::OutputNull as i32,
             op: expr_proto::BinaryOp::Add as i32,
             left: Some(Box::new(expr.clone())),
             right: Some(Box::new(expr.clone())),
@@ -498,6 +534,7 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
             ignore_nulls: false,
         }),
         Kind::Cast(Box::new(expr_proto::CastExpr {
+            decimal_overflow_policy: expr_proto::DecimalOverflowPolicy::OutputNull as i32,
             operand: Some(Box::new(expr.clone())),
             target: ty.clone(),
         })),
@@ -556,4 +593,33 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
     assert_eq!(names.len(), 17);
     assert!(names.contains(&"column_ref"));
     assert!(names.contains(&"nested"));
+}
+
+#[test]
+fn decimal_policy_roundtrip_is_explicit_and_rejects_unspecified() {
+    for policy in [IPolicy::OutputNull, IPolicy::ReportError] {
+        let original = IExpr {
+            ty: scalar_type(common::PrimitiveType::Bigint),
+            nullable: true,
+            kind: IExprKind::Cast {
+                operand: Box::new(IExpr {
+                    ty: scalar_type(common::PrimitiveType::Bigint),
+                    nullable: true,
+                    kind: IExprKind::BinaryOp {
+                        op: expr_proto::BinaryOp::Add as i32,
+                        left: Box::new(int_expr(1)),
+                        right: Box::new(int_expr(2)),
+                        decimal_overflow_policy: policy,
+                    },
+                }),
+                target: scalar_type(common::PrimitiveType::Bigint),
+                decimal_overflow_policy: policy,
+            },
+        };
+        let decoded = roundtrip_message(&expr_to_proto(&original));
+        assert_eq!(expr_from_proto(&decoded).unwrap(), original);
+    }
+    for invalid in [0, -1, 99] {
+        assert!(policy_from_proto(invalid).is_err());
+    }
 }

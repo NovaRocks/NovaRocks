@@ -248,18 +248,18 @@ fn collect_slot_ids(arena: &ExprArena, expr: ExprId, out: &mut HashSet<SlotId>) 
             }
         }
         ExprNode::DictDecode { child, .. }
-        | ExprNode::Cast(child)
-        | ExprNode::CastTime(child)
-        | ExprNode::CastTimeFromDatetime(child)
+        | ExprNode::Cast(child, _)
+        | ExprNode::CastTime(child, _)
+        | ExprNode::CastTimeFromDatetime(child, _)
         | ExprNode::Not(child)
         | ExprNode::IsNull(child)
         | ExprNode::IsNotNull(child)
         | ExprNode::Clone(child) => collect_slot_ids(arena, *child, out),
-        ExprNode::Add(left, right)
-        | ExprNode::Sub(left, right)
-        | ExprNode::Mul(left, right)
-        | ExprNode::Div(left, right)
-        | ExprNode::Mod(left, right)
+        ExprNode::Add(left, right, _)
+        | ExprNode::Sub(left, right, _)
+        | ExprNode::Mul(left, right, _)
+        | ExprNode::Div(left, right, _)
+        | ExprNode::Mod(left, right, _)
         | ExprNode::Eq(left, right)
         | ExprNode::EqForNull(left, right)
         | ExprNode::Ne(left, right)
@@ -479,7 +479,13 @@ mod tests {
     fn filter_policy_hydrates_slots_used_inside_complex_expressions() {
         let mut arena = ExprArena::default();
         let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
-        let cast_status = arena.push_typed(ExprNode::Cast(status), DataType::Utf8);
+        let cast_status = arena.push_typed(
+            ExprNode::Cast(
+                status,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            DataType::Utf8,
+        );
         let paid = utf8_literal(&mut arena, "PAID");
         let predicate = arena.push_typed(ExprNode::Eq(cast_status, paid), DataType::Boolean);
 
@@ -495,7 +501,13 @@ mod tests {
         let mut arena = ExprArena::default();
         let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
         let paid = utf8_literal(&mut arena, "PAID");
-        let cast_paid = arena.push_typed(ExprNode::Cast(paid), DataType::Utf8);
+        let cast_paid = arena.push_typed(
+            ExprNode::Cast(
+                paid,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            DataType::Utf8,
+        );
         let predicate = arena.push_typed(ExprNode::Eq(status, cast_paid), DataType::Boolean);
 
         let policy = FilterEncodingPolicy::from_predicate(&arena, predicate);
@@ -524,7 +536,13 @@ mod tests {
 
         let mut complex_arena = ExprArena::default();
         let status = complex_arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
-        let cast_status = complex_arena.push_typed(ExprNode::Cast(status), DataType::Utf8);
+        let cast_status = complex_arena.push_typed(
+            ExprNode::Cast(
+                status,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            ),
+            DataType::Utf8,
+        );
         let null_pred = complex_arena.push_typed(ExprNode::IsNull(cast_status), DataType::Boolean);
         let complex = FilterEncodingPolicy::from_predicate(&complex_arena, null_pred);
         assert!(!complex.accepts_encoded_column(SlotId::new(1), &dict_utf8_type()));

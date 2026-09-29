@@ -27,7 +27,9 @@ use novarocks_parser::ast::{self, Fold};
 const ONLY_FULL_GROUP_BY: u64 = 1 << 5;
 const ALLOW_THROW_EXCEPTION: u64 = 1 << 9;
 const GROUP_CONCAT_LEGACY: u64 = 1 << 36;
-const CONSUMED_MASK: u64 = ONLY_FULL_GROUP_BY | ALLOW_THROW_EXCEPTION | GROUP_CONCAT_LEGACY;
+const ERROR_IF_OVERFLOW: u64 = 1 << 35;
+const CONSUMED_MASK: u64 =
+    ONLY_FULL_GROUP_BY | ALLOW_THROW_EXCEPTION | GROUP_CONCAT_LEGACY | ERROR_IF_OVERFLOW;
 
 /// One complete connection or statement setting. Successive assignments
 /// replace this value; comma-separated items within an assignment combine.
@@ -50,6 +52,7 @@ impl SqlMode {
                 "ONLY_FULL_GROUP_BY" => ONLY_FULL_GROUP_BY,
                 "ALLOW_THROW_EXCEPTION" => ALLOW_THROW_EXCEPTION,
                 "GROUP_CONCAT_LEGACY" => GROUP_CONCAT_LEGACY,
+                "ERROR_IF_OVERFLOW" => ERROR_IF_OVERFLOW,
                 _ => item.parse::<u64>().unwrap_or(0) & CONSUMED_MASK,
             };
             bits | code
@@ -70,6 +73,18 @@ impl SqlMode {
 
     pub const fn allow_throw_exception(&self) -> bool {
         self.consumed_bits & ALLOW_THROW_EXCEPTION != 0
+    }
+
+    pub const fn error_if_overflow(&self) -> bool {
+        self.consumed_bits & ERROR_IF_OVERFLOW != 0
+    }
+
+    pub const fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
+        if self.error_if_overflow() {
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        } else {
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull
+        }
     }
 
     /// Interpret a parser-admitted value without evaluating arbitrary SQL.
@@ -442,6 +457,63 @@ pub fn query_uses_group_concat_legacy(
     }
 }
 
+/// Detect uncaptured ERROR_IF_OVERFLOW at each actual SELECT in lexical scope.
+pub fn query_uses_error_if_overflow(
+    session: &SqlSemanticSettings,
+    query: &ast::Query,
+) -> Result<bool, crate::analyze_error::AnalyzeError> {
+    struct Detector {
+        settings: SqlSemanticSettings,
+        uses: bool,
+        error: Option<crate::analyze_error::AnalyzeError>,
+    }
+    impl Fold for Detector {
+        fn fold_query(&mut self, query: ast::Query) -> ast::Query {
+            if self.error.is_some() {
+                return query;
+            }
+            let enclosing = self.settings.clone();
+            match query_sql_semantics(&enclosing, &query) {
+                Ok(settings) => self.settings = settings,
+                Err(error) => {
+                    self.error = Some(error);
+                    return query;
+                }
+            }
+            let query = ast::fold_query(self, query);
+            self.settings = enclosing;
+            query
+        }
+        fn fold_select(&mut self, select: ast::Select) -> ast::Select {
+            if self.error.is_some() {
+                return select;
+            }
+            let enclosing = self.settings.clone();
+            match select_sql_semantics(&enclosing, &select) {
+                Ok(settings) => self.settings = settings,
+                Err(error) => {
+                    self.error = Some(error);
+                    return select;
+                }
+            }
+            self.uses |= self.settings.sql_mode().error_if_overflow();
+            let select = ast::fold_select(self, select);
+            self.settings = enclosing;
+            select
+        }
+    }
+    let mut detector = Detector {
+        settings: session.clone(),
+        uses: false,
+        error: None,
+    };
+    detector.fold_query(query.clone());
+    match detector.error {
+        Some(error) => Err(error),
+        None => Ok(detector.uses),
+    }
+}
+
 /// A v1 definition owns namespaces but does not capture SQL semantics.
 /// The borrowed caller snapshot is a consumer fact, never durable metadata.
 pub fn validate_persisted_query_semantics(
@@ -458,6 +530,11 @@ pub fn validate_persisted_query_semantics(
             .map_err(|error| error.to_string())?
     {
         return Err("Unsupported: decimal_overflow_to_double=true is not captured for persisted VIEW or MATERIALIZED VIEW definition replay".to_string());
+    }
+    if caller.sql_mode().error_if_overflow()
+        || query_uses_error_if_overflow(caller, query).map_err(|error| error.to_string())?
+    {
+        return Err("Unsupported: ERROR_IF_OVERFLOW is not captured for persisted VIEW or MATERIALIZED VIEW definition replay".to_string());
     }
     Ok(())
 }
@@ -824,5 +901,68 @@ mod tests {
         ] {
             assert!(query_uses_decimal_overflow_to_double(&off, &query(sql)).unwrap());
         }
+    }
+    #[test]
+    fn overflow_error_policy_is_independent_from_allow_throw_and_promotion() {
+        use novarocks_type_contract::DecimalOverflowPolicy;
+        let report = SqlMode::from_assignment("ERROR_IF_OVERFLOW");
+        assert!(report.error_if_overflow());
+        assert!(!report.allow_throw_exception());
+        assert_eq!(
+            report.decimal_overflow_policy(),
+            DecimalOverflowPolicy::ReportError
+        );
+        let allow = SqlMode::from_assignment("ALLOW_THROW_EXCEPTION");
+        assert!(allow.allow_throw_exception());
+        assert!(!allow.error_if_overflow());
+        assert_eq!(
+            allow.decimal_overflow_policy(),
+            DecimalOverflowPolicy::OutputNull
+        );
+        for mode in [
+            "34359738368",
+            "ERROR_IF_OVERFLOW,ALLOW_THROW_EXCEPTION",
+            "34359738880",
+        ] {
+            assert!(SqlMode::from_assignment(mode).error_if_overflow());
+        }
+        let both = SqlSemanticSettings::default()
+            .with_decimal_overflow_to_double(true)
+            .with_sql_mode(report);
+        assert!(both.decimal_overflow_to_double());
+        assert!(both.sql_mode().error_if_overflow());
+        let reassigned = both.clone().with_sql_mode(allow);
+        assert!(reassigned.decimal_overflow_to_double());
+        assert!(!reassigned.sql_mode().error_if_overflow());
+        assert!(both.sql_mode().error_if_overflow());
+    }
+
+    #[test]
+    fn overflow_definition_usage_observes_lexical_selects_and_replay_boundary() {
+        let ordinary = SqlSemanticSettings::default();
+        let strict = ordinary
+            .clone()
+            .with_sql_mode(SqlMode::from_assignment("ERROR_IF_OVERFLOW"));
+        for sql in [
+            "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+            "SELECT /*+ SET_VAR(sql_mode=32) */ 1 UNION ALL SELECT /*+ SET_VAR(sql_mode=32) */ 2",
+        ] {
+            assert!(!query_uses_error_if_overflow(&strict, &query(sql)).unwrap());
+        }
+        for sql in [
+            "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1",
+            "SELECT 1 UNION ALL SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 2",
+            "WITH c AS (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1) SELECT * FROM c",
+            "SELECT (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1)",
+        ] {
+            assert!(query_uses_error_if_overflow(&ordinary, &query(sql)).unwrap());
+            assert!(
+                validate_persisted_query_semantics(&query(sql), &ordinary)
+                    .unwrap_err()
+                    .contains("ERROR_IF_OVERFLOW is not captured")
+            );
+        }
+        assert!(validate_persisted_query_semantics(&query("SELECT 1"), &strict).is_err());
+        assert!(validate_persisted_query_semantics(&query("SELECT 1"), &ordinary).is_ok());
     }
 }

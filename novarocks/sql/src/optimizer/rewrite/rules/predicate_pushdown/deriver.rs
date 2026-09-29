@@ -38,7 +38,7 @@ pub(crate) fn derive_inner_join_predicates(
     if join_groups
         .iter()
         .chain(filter_groups.iter())
-        .any(|group| !group.deterministic)
+        .any(|group| !group.deterministic || group.can_fail)
     {
         return Vec::new();
     }
@@ -112,6 +112,7 @@ fn extract_column_pair_equality(
             left,
             op: BinOp::Eq,
             right,
+            ..
         } if is_column_ref(arena, *left) && is_column_ref(arena, *right) => Some((*left, *right)),
         _ => None,
     }
@@ -123,7 +124,9 @@ fn extract_column_literal_constraint(
 ) -> Option<ColumnConstraint> {
     match arena.node(expr) {
         ScalarNode::Nested(inner) => extract_column_literal_constraint(arena, *inner),
-        ScalarNode::BinaryOp { left, op, right } => {
+        ScalarNode::BinaryOp {
+            left, op, right, ..
+        } => {
             if is_column_ref(arena, *left) && is_literal(arena, *right) {
                 return build_binary_constraint(*left, *op, *right);
             }
@@ -222,7 +225,7 @@ fn derive_or_branch_side_filters(
     right_ids: &HashSet<ColumnId>,
     group: &PredicateGroup,
 ) -> Vec<PredicateGroup> {
-    if !group.deterministic {
+    if !group.deterministic || group.can_fail {
         return Vec::new();
     }
 
@@ -725,7 +728,12 @@ fn is_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
 fn binary_bool(arena: &mut ScalarArena, left: ScalarId, op: BinOp, right: ScalarId) -> ScalarId {
     let nullable = arena.nullable(left) || arena.nullable(right);
     arena.intern(
-        ScalarNode::BinaryOp { op, left, right },
+        ScalarNode::BinaryOp {
+            op,
+            left,
+            right,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        },
         DataType::Boolean,
         nullable,
     )
@@ -819,6 +827,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             data_type: DataType::Boolean,
             nullable: true,
