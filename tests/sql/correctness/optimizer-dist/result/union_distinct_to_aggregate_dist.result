@@ -1,2 +1,10 @@
+-- query 9
+k	s
+1	a
+2	NULL
+3	c
+NULL	n
+
+-- query 10
 distinct_rows
 4

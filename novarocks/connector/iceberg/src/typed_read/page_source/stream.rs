@@ -106,12 +106,14 @@ impl ParquetStreamInit {
             .open_split(
                 &self.request.split,
                 &self.admitted.table_schema,
-                self.delete_mode,
+                &self.request.delete_domains,
+                self.delete_mode.clone(),
             )
             .await?;
         Ok(Box::new(self.request.into_source(
             self.admitted,
             delete_filter,
+            self.delete_mode,
             self.successor_control,
         )))
     }

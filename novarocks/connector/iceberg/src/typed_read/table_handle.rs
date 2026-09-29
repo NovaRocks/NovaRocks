@@ -125,6 +125,9 @@ pub struct IcebergTableHandleParams {
     /// The pinned snapshot. `None` is a table that has no snapshot yet, which
     /// reads as zero rows rather than as "resolve the current snapshot".
     pub snapshot_id: Option<i64>,
+    /// The FE observation shared by this relation and its sibling splits.
+    /// Only a table without a snapshot has no read domain.
+    pub read_domain: Option<Arc<crate::delete_semantics::ReadDomain>>,
     pub table_schema_json: String,
     /// The table's default partition spec at plan time, when it has one.
     pub spec_id: Option<i32>,
@@ -152,6 +155,7 @@ pub struct IcebergTableHandleParams {
 pub struct IcebergTableHandle {
     schema_table_name: SchemaTableName,
     snapshot_id: Option<i64>,
+    read_domain: Option<Arc<crate::delete_semantics::ReadDomain>>,
     table_schema_json: Arc<str>,
     scalar_integer_domains: crate::scalar_integer_domain::ScalarIntegerDomains,
     spec_id: Option<i32>,
@@ -172,6 +176,7 @@ impl IcebergTableHandle {
         let IcebergTableHandleParams {
             schema_table_name,
             snapshot_id,
+            read_domain,
             table_schema_json,
             spec_id,
             partition_spec_jsons,
@@ -208,7 +213,7 @@ impl IcebergTableHandle {
         // Parsing here is the fail-fast point: a handle that cannot be turned
         // back into a schema would only fail later, on a worker, after the
         // split has already been scheduled.
-        serde_json::from_str::<Schema>(&table_schema_json)
+        let schema = serde_json::from_str::<Schema>(&table_schema_json)
             .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
 
         if table_location.is_empty() || table_location.len() > MAX_PATH_BYTES {
@@ -252,9 +257,47 @@ impl IcebergTableHandle {
             ));
         }
 
+        match (snapshot_id, read_domain.as_ref()) {
+            (None, None) => {}
+            (Some(snapshot), Some(domain)) => {
+                let endpoint = domain.endpoint();
+                if endpoint.snapshot_id() != snapshot
+                    || endpoint
+                        .schema()
+                        .map_err(|error| invalid(error.to_string()))?
+                        != schema
+                    || endpoint.partition_spec_jsons().len() != partition_spec_jsons.len()
+                {
+                    return Err(invalid(
+                        "iceberg read domain differs from the pinned table facts",
+                    ));
+                }
+                for (spec_id, json) in &partition_spec_jsons {
+                    let Some(expected) = endpoint.partition_spec_jsons().get(spec_id) else {
+                        return Err(invalid("iceberg read domain omits a pinned partition spec"));
+                    };
+                    let expected: serde_json::Value = serde_json::from_str(expected)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    let received: serde_json::Value =
+                        serde_json::from_str(json).map_err(|error| invalid(error.to_string()))?;
+                    if expected != received {
+                        return Err(invalid(
+                            "iceberg read domain partition spec differs from the table",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "iceberg pinned snapshot requires its explicit read domain",
+                ));
+            }
+        }
+
         Ok(Self {
             schema_table_name,
             snapshot_id,
+            read_domain,
             table_schema_json: Arc::from(table_schema_json.as_str()),
             scalar_integer_domains: BTreeMap::new(),
             spec_id,
@@ -273,6 +316,10 @@ impl IcebergTableHandle {
 
     pub const fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
+    }
+
+    pub fn read_domain(&self) -> Option<&Arc<crate::delete_semantics::ReadDomain>> {
+        self.read_domain.as_ref()
     }
 
     /// The exact file set this read is restricted to, when it has one.
@@ -570,6 +617,10 @@ impl IcebergTableHandle {
                 table_name: self.schema_table_name.table_name().to_string(),
             }),
             snapshot_id: self.snapshot_id,
+            read_domain: self
+                .read_domain
+                .as_deref()
+                .map(super::split::encode_read_domain),
             table_schema_json: self.table_schema_json.to_string(),
             spec_id: self.spec_id,
             partition_spec_jsons: self.partition_spec_jsons.clone(),
@@ -629,6 +680,11 @@ impl IcebergTableHandle {
                 &schema_table_name.table_name,
             )?,
             snapshot_id: raw.snapshot_id,
+            read_domain: raw
+                .read_domain
+                .as_ref()
+                .map(super::split::decode_read_domain)
+                .transpose()?,
             table_schema_json: raw.table_schema_json.clone(),
             spec_id: raw.spec_id,
             partition_spec_jsons: raw.partition_spec_jsons.clone(),
@@ -798,6 +854,11 @@ pub(super) mod tests {
         IcebergTableHandleParams {
             schema_table_name: SchemaTableName::try_new("db", "t").expect("name"),
             snapshot_id: Some(11),
+            read_domain: Some(crate::delete_semantics::test_read_domain(
+                schema,
+                &spec.cloned().into_iter().collect::<Vec<_>>(),
+                11,
+            )),
             table_schema_json: serde_json::to_string(schema).expect("schema json"),
             spec_id,
             partition_spec_jsons,
@@ -1045,6 +1106,11 @@ pub(super) mod tests {
             bucket_spec.spec_id(),
             serde_json::to_string(&bucket_spec).expect("json"),
         );
+        params.read_domain = Some(crate::delete_semantics::test_read_domain(
+            &schema,
+            &[identity_spec, bucket_spec],
+            11,
+        ));
         let handle = IcebergTableHandle::try_new(params).expect("handle");
         assert!(
             handle
@@ -1156,6 +1222,7 @@ pub(super) mod tests {
         let spec = identity_partition_spec(&schema);
         let mut params = table_handle_params(&schema, Some(&spec));
         params.snapshot_id = None;
+        params.read_domain = None;
         params.pinned_data_files =
             Some(IcebergPinnedDataFileSet::try_new(["s3://w/db/t/a.parquet"]).expect("set"));
         assert!(IcebergTableHandle::try_new(params).is_err());
@@ -1174,6 +1241,30 @@ pub(super) mod tests {
                 .expect("empty set")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn pinned_domain_is_required_and_cannot_change_snapshot_or_scope() {
+        let schema = partitioned_schema();
+        let spec = identity_partition_spec(&schema);
+        let coherent = table_handle_params(&schema, Some(&spec));
+        let handle = IcebergTableHandle::try_new(coherent.clone()).unwrap();
+        let decoded = IcebergTableHandle::from_proto(&handle.to_proto()).unwrap();
+        assert_eq!(decoded.read_domain(), handle.read_domain());
+
+        let mut missing = coherent.clone();
+        missing.read_domain = None;
+        assert!(IcebergTableHandle::try_new(missing).is_err());
+        let mut other_snapshot = coherent.clone();
+        other_snapshot.read_domain = Some(crate::delete_semantics::test_read_domain(
+            &schema,
+            &[spec.clone()],
+            12,
+        ));
+        assert!(IcebergTableHandle::try_new(other_snapshot).is_err());
+        let mut other_scope = coherent;
+        other_scope.read_domain = Some(crate::delete_semantics::test_read_domain(&schema, &[], 11));
+        assert!(IcebergTableHandle::try_new(other_scope).is_err());
     }
 
     #[test]

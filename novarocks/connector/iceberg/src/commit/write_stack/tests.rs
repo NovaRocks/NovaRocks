@@ -1730,6 +1730,8 @@ fn rewrite_deletion_vector(
     data_file: &str,
 ) -> crate::scan_model::IcebergDeleteFileInfo {
     crate::scan_model::IcebergDeleteFileInfo {
+        record_count: Some(1),
+        partition_data_json: Some(r#"{"version":1,"values":[]}"#.to_string()),
         path: path.to_string(),
         file_format: crate::scan_model::IcebergDeleteFileFormat::Puffin,
         file_content: crate::scan_model::IcebergDeleteFileContent::Position,

@@ -43,6 +43,7 @@ authoritative current list.
 | `function` | Scalar, bitmap, HLL and binary functions, signature resolution | `novarocks/execution/src/exec/expr/function/**`, `novarocks/sql/src/functions/registry.rs` | — |
 | `iceberg` | Iceberg read path, metadata tables, branches and tags | `novarocks/connector/iceberg/**` | — |
 | `iceberg-compatibility` | Cross-engine reads of tables Spark wrote through REST Catalog | `novarocks/connector/iceberg/**` | provisioned REST Catalog + Spark fixture |
+| `iceberg-compatibility` / `spark_rest_delete_applicability` | 同提交 position/DV/equality 的序号边界与独立 Java 行袋 | `novarocks/connector/iceberg/src/delete_semantics/**`、`typed_read/**` | 真实 Java writer + manifest 闭包；native 1FE+3BE |
 | `iceberg-ddl` | Iceberg DDL, schema evolution, CREATE TABLE LIKE | `novarocks/connector/iceberg/**`, `novarocks/sql/src/planning/**` | — |
 | `iceberg-dml` | INSERT / DELETE / UPDATE / MERGE against Iceberg, type round-trips | `novarocks/connector/iceberg/**`, `novarocks/execution/src/exec/operators/table_writer.rs` | — |
 | `iceberg-hms` | Native Hive Metastore catalog admission for document-managed MVs | `novarocks/connector/iceberg/src/document_storage/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; start the separate `docker/iceberg-hive/` fixture |
@@ -175,3 +176,9 @@ DDL, DML, or a session command without a rowset. The runner uses the same SQL
 statement splitter as execution: `USE db; SELECT ...` requires a recorded
 result and comparison, while `USE db; SET ...` remains implicitly skipped.
 An explicit `@skip_result_check=true` still skips comparison for the whole step.
+
+UEA-4G 的额外原生验收入口是 system scenario `connector/iceberg-delete-applicability`，属于显式阶段。`NOVAROCKS_UEA4G_NATIVE_MANIFEST` 指向已冻结输入清单，清单以 SHA-256 绑定独立 Java corpus 和规模收据；S3 凭证从现有 fixture 环境注入，清单不保存密钥。场景重放准确 snapshot 的行袋，并以真实多文件输入检查三个 BE 的 split/page-source/退出事实，保存对象范围与资源收敛收据。性能对照及 provider 内闭包、union、完成屏障和物理范围测试分别验收，不能由 SQL 行数或空闲 BE 数代替。
+
+`iceberg-ivm/iceberg_ivm_delete_applicability` 使用官方 Iceberg writer 构造五个端点阶段，检查 same-commit DV/equality、同一不可变 Puffin 的不同 blob、删除 artifact 等价替代与整个数据文件移除；每阶段比较增量 MV、独立 FULL MV 和关闭 MV rewrite 的基表行袋。该 suite 使用隔离 REST fixture，需单独运行。
+
+release 对照入口为 `connector/iceberg-delete-performance` 和 `tests/system-test-runner/scripts/uea4g-performance.py`。驱动在执行前冻结二进制、源码、配置、输入与八次运行顺序；同一 cold/warm 配置在 baseline/candidate 间交替，第二遍反转顺序。全部 raw samples 保留，baseline 错行的非 control case 不计算性能比例，candidate 错行直接失败；control 噪声超过冻结门限时要求按同一参数重做实验。性能场景只能使用 `--launch-profile performance`；行袋、闭包与性能收据各自证明对应契约。

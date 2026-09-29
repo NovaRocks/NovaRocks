@@ -1,0 +1,20 @@
+-- query 2
+id	p	value
+7	1	old7
+8	1	new8
+9	1	new9
+10	1	old10
+
+-- query 3
+id	p	value
+7	1	new7
+8	1	new8
+9	1	new9
+10	1	old10
+
+-- query 4
+id	p	value
+7	1	old7
+8	1	new8
+9	1	new9
+10	1	old10

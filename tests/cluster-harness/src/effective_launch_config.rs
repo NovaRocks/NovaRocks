@@ -37,6 +37,8 @@ const FORMAL_SECRET_ENVIRONMENT: &[&str] = &[
     "NOVAROCKS_UEA4A2_S3_SECRET_ACCESS_KEY",
     "NOVAROCKS_UEA4A3_S3_ACCESS_KEY_ID",
     "NOVAROCKS_UEA4A3_S3_SECRET_ACCESS_KEY",
+    "NOVAROCKS_UEA4G_FIXTURE_ACCESS",
+    "NOVAROCKS_UEA4G_FIXTURE_SECRET",
 ];
 
 /// Secret-free evidence derived from the exact TOML passed to every process.
@@ -809,6 +811,29 @@ mod tests {
                 .to_string()
                 .contains("no typed allowlist classification")
         );
+    }
+
+    #[test]
+    fn delete_fixture_credentials_record_presence_without_values() {
+        let environment = BTreeMap::from([
+            (
+                "NOVAROCKS_UEA4G_FIXTURE_ACCESS".to_string(),
+                "access-canary".to_string(),
+            ),
+            (
+                "NOVAROCKS_UEA4G_FIXTURE_SECRET".to_string(),
+                "secret-canary".to_string(),
+            ),
+        ]);
+        let bindings = environment_contract(LaunchProfile::Performance, &environment).unwrap();
+        let encoded = serde_json::to_string(&bindings).unwrap();
+        assert!(bindings.iter().all(|binding| binding.present));
+        assert!(bindings.iter().all(|binding| matches!(
+            binding.classification,
+            EnvironmentClassification::SecretPresence
+        )));
+        assert!(!encoded.contains("access-canary"));
+        assert!(!encoded.contains("secret-canary"));
     }
 
     #[test]

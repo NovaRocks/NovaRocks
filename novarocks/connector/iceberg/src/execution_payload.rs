@@ -26,7 +26,6 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorPrep
 use serde::{Deserialize, Serialize};
 
 use crate::access_binding::IcebergReadBinding;
-use crate::delta::IcebergDeltaSplitPayload;
 use crate::metadata_batch_reader::MetadataTableType;
 use crate::scan_model::{IcebergDataFileInfo, IcebergPhysicalPredicate};
 
@@ -53,8 +52,6 @@ pub struct SplitPayload {
     pub fact_columns: Vec<IcebergScanFactColumnV1>,
     #[serde(default)]
     pub name_mapping: Option<String>,
-    #[serde(default)]
-    pub delta: Option<IcebergDeltaSplitPayload>,
     #[serde(default)]
     pub metadata: Option<IcebergMetadataSplitPayloadV1>,
 }

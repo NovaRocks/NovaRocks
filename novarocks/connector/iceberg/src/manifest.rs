@@ -24,6 +24,7 @@ use crate::iceberg::spec::{
     ManifestStatus, PrimitiveLiteral, TableMetadata, Transform,
 };
 use crate::iceberg::table::Table;
+#[cfg(test)]
 use crate::read_model::{IcebergReadDeleteFormat, IcebergReadDeleteKind};
 use crate::scan_model::{
     IcebergColumnStats, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
@@ -219,6 +220,7 @@ pub(crate) async fn current_equality_delete_column_names_with_control(
     Ok(columns)
 }
 
+#[cfg(test)]
 fn read_delete_to_catalog_delete(
     delete_file: crate::read_model::IcebergReadDeleteFile,
 ) -> Result<IcebergDeleteFileInfo, String> {
@@ -246,6 +248,8 @@ fn read_delete_to_catalog_delete(
     };
     Ok(IcebergDeleteFileInfo {
         path: delete_file.path,
+        record_count: None,
+        partition_data_json: None,
         file_format,
         file_content,
         length: delete_file.length,
@@ -256,6 +260,60 @@ fn read_delete_to_catalog_delete(
         partition_key: delete_file.partition_key,
         referenced_data_file: delete_file.referenced_data_file,
         equality_column_names,
+        equality_field_ids,
+    })
+}
+
+fn canonical_delete_to_catalog_delete(
+    fact: &crate::delete_semantics::DeleteFact,
+) -> Result<IcebergDeleteFileInfo, String> {
+    use crate::delete_semantics::{DeleteContentAddress, DeleteFormat, DeleteKind};
+    let bounded = |value: u64| {
+        i64::try_from(value)
+            .map_err(|_| "Iceberg delete size exceeds the catalog representation".to_owned())
+    };
+    let file_format = match fact.read().format {
+        DeleteFormat::Parquet => IcebergDeleteFileFormat::Parquet,
+        DeleteFormat::Puffin => IcebergDeleteFileFormat::Puffin,
+        other => return Err(format!("unsupported Iceberg delete format {other:?}")),
+    };
+    let (file_content, equality_field_ids, referenced_data_file) = match fact.kind() {
+        DeleteKind::Position { exact_target } => (
+            IcebergDeleteFileContent::Position,
+            Vec::new(),
+            exact_target.as_deref().map(str::to_owned),
+        ),
+        DeleteKind::DeletionVector { exact_target } => (
+            IcebergDeleteFileContent::Position,
+            Vec::new(),
+            Some(exact_target.to_string()),
+        ),
+        DeleteKind::Equality(group) => (
+            IcebergDeleteFileContent::Equality,
+            group.fields().iter().map(|(id, _)| *id).collect(),
+            None,
+        ),
+    };
+    let (content_offset, content_size_in_bytes) = match fact.address() {
+        DeleteContentAddress::File(_) => (None, None),
+        DeleteContentAddress::PuffinBlob { offset, length, .. } => {
+            (Some(bounded(*offset)?), Some(bounded(*length)?))
+        }
+    };
+    Ok(IcebergDeleteFileInfo {
+        path: fact.address().path().to_owned(),
+        record_count: Some(bounded(fact.read().record_count)?),
+        partition_data_json: Some(fact.partition().to_json_string()),
+        file_format,
+        file_content,
+        length: Some(bounded(fact.read().file_size)?),
+        content_offset,
+        content_size_in_bytes,
+        sequence_number: Some(fact.sequence().get()),
+        partition_spec_id: Some(fact.partition().spec_id()),
+        partition_key: Some(fact.partition().to_json_string()),
+        referenced_data_file,
+        equality_column_names: Vec::new(),
         equality_field_ids,
     })
 }
@@ -300,8 +358,8 @@ pub(crate) async fn extract_data_files_with_stats_at_with_control(
                 };
             let delete_files = file
                 .deletes
-                .into_iter()
-                .map(read_delete_to_catalog_delete)
+                .members()
+                .map(|fact| canonical_delete_to_catalog_delete(fact))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(DataFileWithStats {
                 path: file.path,

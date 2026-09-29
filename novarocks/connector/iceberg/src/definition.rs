@@ -50,34 +50,34 @@ pub fn iceberg_contract_definition() -> Result<ProviderContractDefinition, Conne
             declaration(
                 ConnectorCodecCategory::ReadTable,
                 read_revision,
-                "novarocks.iceberg.read-table.v1",
+                "novarocks.iceberg.read-table.v2",
             )?,
             declaration(
                 ConnectorCodecCategory::ReadView,
                 read_revision,
-                "novarocks.iceberg.read-view.v1",
+                "novarocks.iceberg.read-view.v2",
             )?,
             declaration(
                 ConnectorCodecCategory::ReadColumn,
                 read_revision,
-                "novarocks.iceberg.read-column.v1",
+                "novarocks.iceberg.read-column.v2",
             )?,
             declaration(
                 ConnectorCodecCategory::ReadSplit,
                 read_revision,
-                "novarocks.iceberg.read-split.v1",
+                "novarocks.iceberg.read-split.v2",
             )?,
         )?),
         ProviderWriteContractDefinition::new(ProviderWriteCodecDefinitions::try_new(
             declaration(
                 ConnectorCodecCategory::WriteHandle,
                 write_revision,
-                "novarocks.iceberg.write-handle.v1",
+                "novarocks.iceberg.write-handle.v2",
             )?,
             declaration(
                 ConnectorCodecCategory::CommitFragment,
                 write_revision,
-                "novarocks.iceberg.commit-fragment.v1",
+                "novarocks.iceberg.commit-fragment.v2",
             )?,
         )?),
     )
@@ -97,7 +97,10 @@ mod tests {
         assert_eq!(declarations.len(), 6);
         for declaration in declarations {
             assert_eq!(declaration.provider_id(), contract.provider_id());
-            assert_eq!(declaration.revision().get(), 1);
+            assert_eq!(
+                declaration.revision().get(),
+                crate::contract_revision::ICEBERG_CONTRACT_REVISION
+            );
             assert_eq!(declaration.descriptor(), FILE_DESCRIPTOR_SET);
             assert_eq!(
                 declaration.descriptor_sha256(),

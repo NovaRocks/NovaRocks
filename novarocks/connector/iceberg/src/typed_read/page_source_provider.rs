@@ -209,6 +209,7 @@ impl IcebergPreparedPageSource {
             &relation,
             &self.split,
             &self.columns,
+            &super::delete_manager::DeleteEvaluationMode::ExcludeDeleted,
             footer,
             &self.access_binding,
             self.context.clone(),
@@ -863,6 +864,11 @@ mod tests {
         let table = IcebergTableHandle::try_new(IcebergTableHandleParams {
             schema_table_name: SchemaTableName::try_new("sales", "orders").unwrap(),
             snapshot_id: Some(11),
+            read_domain: Some(crate::delete_semantics::test_read_domain(
+                &schema,
+                &[partition_spec.clone()],
+                11,
+            )),
             table_schema_json: serde_json::to_string(&schema).unwrap(),
             spec_id: Some(0),
             partition_spec_jsons: [(0, serde_json::to_string(&partition_spec).unwrap())].into(),
@@ -879,6 +885,7 @@ mod tests {
         .expect("table handle");
         let path = path.to_string_lossy().to_string();
         let split = IcebergSplit::try_new(IcebergSplitParams {
+            read_domain: Arc::clone(table.read_domain().unwrap()),
             path,
             start: 0,
             length: file_size as i64,
@@ -886,8 +893,8 @@ mod tests {
             file_record_count: 3,
             file_format: IcebergFileFormat::Parquet,
             partition_spec_id: 0,
-            partition_data_json: "{}".to_owned(),
-            deletes: Vec::new(),
+            partition_data_json: r#"{"version":1,"values":[]}"#.to_owned(),
+            deletes: Vec::new().into(),
             file_statistics_domain: TupleDomain::all(),
             data_sequence_number: Some(3),
             file_first_row_id: None,

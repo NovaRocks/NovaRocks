@@ -217,6 +217,13 @@ pub fn map_file_error(error: novarocks_fs::FileError) -> ConnectorError {
     ConnectorError::from(error)
 }
 
+pub(crate) fn corrupt_delete_content(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(
+        novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+        message,
+    )
+}
+
 pub fn read_parquet_batches(
     access: &FsAccessHandle,
     path: &str,
@@ -282,6 +289,110 @@ pub async fn read_parquet_batches_async(
     Ok(batches)
 }
 
+/// Visit projected batches without retaining the complete delete file.
+pub(crate) fn visit_parquet_batches(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    projection: FileProjection,
+    predicates: Vec<ScanPredicate>,
+    context: FileReadContext,
+    mut visit: impl FnMut(FileBatch) -> Result<(), String>,
+) -> Result<(), String> {
+    context.check_active().map_err(|e| e.to_string())?;
+    let size = match known_size(file_size) {
+        Some(size) => size,
+        None => context
+            .runtime
+            .block_on_u64(Box::pin(stat_size(bind(access, path, 0)?, context.clone())))
+            .map_err(|e| e.to_string())?,
+    };
+    let mut request = whole_file_request(bind(access, path, size)?, projection, context);
+    request.predicates = predicates;
+    let mut reader = open_file_reader(request).map_err(|e| e.to_string())?;
+    let outcome = (|| {
+        while let Some(batch) = reader.next_batch().map_err(|e| e.to_string())? {
+            visit(batch)?;
+        }
+        Ok(())
+    })();
+    let closed = reader.close().map_err(|e| e.to_string());
+    outcome.and(closed)
+}
+
+pub(crate) async fn visit_parquet_batches_async(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    projection: FileProjection,
+    predicates: Vec<ScanPredicate>,
+    context: FileReadContext,
+    visit: impl FnMut(FileBatch) -> Result<(), ConnectorError>,
+) -> Result<(), ConnectorError> {
+    visit_parquet_batches_async_with_options(
+        access,
+        path,
+        file_size,
+        projection,
+        predicates,
+        context,
+        Default::default(),
+        visit,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub(crate) async fn visit_parquet_batches_async_with_options(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    projection: FileProjection,
+    predicates: Vec<ScanPredicate>,
+    context: FileReadContext,
+    options: novarocks_fs::FileReaderOptions,
+    mut visit: impl FnMut(FileBatch) -> Result<(), ConnectorError>,
+) -> Result<novarocks_fs::FileMetricsSnapshot, ConnectorError> {
+    context.check_active().map_err(map_file_error)?;
+    let size = match known_size(file_size) {
+        Some(size) => size,
+        None => stat_size(
+            access
+                .bind_location(path, FileIdentity::new(path, 0, None))
+                .map_err(map_file_error)?,
+            context.clone(),
+        )
+        .await
+        .map_err(map_file_error)?,
+    };
+    let mut request = whole_file_request(
+        access
+            .bind_location(path, FileIdentity::new(path, size, None))
+            .map_err(map_file_error)?,
+        projection,
+        context.clone(),
+    );
+    request.predicates = predicates;
+    request.options = options;
+    let mut reader = open_file_reader_async(request, None)
+        .await
+        .map_err(map_file_error)?;
+    let outcome = async {
+        while let Some(batch) = reader.next_batch().await.map_err(map_file_error)? {
+            context.check_active().map_err(map_file_error)?;
+            visit(batch)?;
+            // Cached input may make next_batch immediately ready. Release the
+            // driver after each bounded batch, preserving full artifact validation.
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+    .await;
+    let metrics = reader.metrics_snapshot();
+    let closed = reader.close().map_err(map_file_error);
+    outcome.and(closed).map(|_| metrics)
+}
+
 pub fn read_bytes(
     access: &FsAccessHandle,
     path: &str,
@@ -292,9 +403,10 @@ pub fn read_bytes(
     context.check_active().map_err(|error| error.to_string())?;
     context
         .runtime
-        .block_on_bytes(Box::pin(read_range(
-            access, path, file_size, range, context,
-        )?))
+        .block_on_bytes(Box::pin(
+            read_range(access, path, file_size, range, context)
+                .map_err(|error| error.to_string())?,
+        ))
         .map_err(|error| error.to_string())
 }
 
@@ -306,10 +418,24 @@ pub async fn read_bytes_async(
     range: FileReadRange,
     context: &FileReadContext,
 ) -> Result<Bytes, String> {
-    context.check_active().map_err(|error| error.to_string())?;
-    read_range(access, path, file_size, range, context)?
+    // Historical non-delete callers retain their string boundary explicitly.
+    read_bytes_async_typed(access, path, file_size, range, context)
         .await
         .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn read_bytes_async_typed(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    range: FileReadRange,
+    context: &FileReadContext,
+) -> Result<Bytes, ConnectorError> {
+    context.check_active().map_err(map_file_error)?;
+    read_range(access, path, file_size, range, context)
+        .map_err(map_file_error)?
+        .await
+        .map_err(map_file_error)
 }
 
 fn known_size(file_size: Option<u64>) -> Option<u64> {
@@ -369,8 +495,11 @@ fn read_range(
     file_size: Option<u64>,
     range: FileReadRange,
     context: &FileReadContext,
-) -> Result<impl std::future::Future<Output = FileResult<Bytes>> + Send + 'static, String> {
-    let provisional = bind(access, path, file_size.unwrap_or_default())?;
+) -> FileResult<impl std::future::Future<Output = FileResult<Bytes>> + Send + 'static> {
+    let provisional = access.bind_location(
+        path,
+        FileIdentity::new(path, file_size.unwrap_or_default(), None),
+    )?;
     let access = access.clone();
     let path = path.to_string();
     let context = context.clone();
@@ -399,14 +528,93 @@ fn read_range(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use arrow::array::{Array, Int32Array, Int64Array, MapArray, StringArray, StructArray};
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Fields};
+    use arrow::record_batch::RecordBatch;
 
     use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct RangeReceipts(
+        pub(crate) Arc<std::sync::Mutex<Vec<(String, u64, Option<u64>)>>>,
+        Option<opendal::ErrorKind>,
+    );
+    #[derive(Debug)]
+    pub(crate) struct RangeReceiptAccessor<A: opendal::raw::Access> {
+        inner: A,
+        receipts: RangeReceipts,
+    }
+    impl<A: opendal::raw::Access> opendal::raw::Layer<A> for RangeReceipts {
+        type LayeredAccess = RangeReceiptAccessor<A>;
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            RangeReceiptAccessor {
+                inner,
+                receipts: self.clone(),
+            }
+        }
+    }
+    impl<A: opendal::raw::Access> opendal::raw::LayeredAccess for RangeReceiptAccessor<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+        async fn write(
+            &self,
+            path: &str,
+            args: opendal::raw::OpWrite,
+        ) -> opendal::Result<(opendal::raw::RpWrite, Self::Writer)> {
+            self.inner.write(path, args).await
+        }
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+        async fn list(
+            &self,
+            path: &str,
+            args: opendal::raw::OpList,
+        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
+            self.inner.list(path, args).await
+        }
+        async fn read(
+            &self,
+            path: &str,
+            args: opendal::raw::OpRead,
+        ) -> opendal::Result<(opendal::raw::RpRead, Self::Reader)> {
+            self.receipts.0.lock().unwrap().push((
+                path.to_string(),
+                args.range().offset(),
+                args.range().size(),
+            ));
+            if let Some(kind) = self.receipts.1 {
+                return Err(opendal::Error::new(
+                    kind,
+                    "identified delete-object read failure",
+                ));
+            }
+            self.inner.read(path, args).await
+        }
+    }
+    pub(crate) fn recorded_access(
+        access: &FsAccessHandle,
+        receipts: &RangeReceipts,
+    ) -> FsAccessHandle {
+        FsAccessHandle::new(
+            access.access_domain(),
+            access.scheme(),
+            access.operator().layer(receipts.clone()),
+            access.authority().map(str::to_string),
+            access.root().map(str::to_string),
+            access.paths().to_vec(),
+        )
+    }
 
     #[test]
     fn lowers_static_predicates_by_iceberg_field_id() {
@@ -495,5 +703,530 @@ mod tests {
         assert!(fields[0].is_nullable());
         let map = out.as_any().downcast_ref::<MapArray>().expect("map array");
         assert!(map.keys().is_null(1));
+    }
+    #[test]
+    fn position_path_predicate_reads_related_groups_and_reports_layout_degradation() {
+        use arrow::array::BinaryArray;
+        use novarocks_fs::{
+            FileCancellation, FileReaderOptions, FsAccessResolver, TokioFileIoRuntime,
+            TokioFileTaskSpawner,
+        };
+        use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+        use parquet::basic::Compression;
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(
+                [(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID.to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Field::new("pos", DataType::Int64, false).with_metadata(
+                [(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    (i32::MAX - 102).to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Field::new("unrelated_payload", DataType::Binary, false),
+        ]));
+        let paths = (0..16)
+            .map(|group| format!("/warehouse/{}-{group:03}.parquet", "p".repeat(1000)))
+            .collect::<Vec<_>>();
+        let target = paths[7].clone();
+        let mut metrics = Vec::new();
+        for layout in ["full", "missing", "truncated"] {
+            let path = directory.path().join(format!("{layout}.parquet"));
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(512))
+                .set_dictionary_enabled(false)
+                .set_compression(Compression::UNCOMPRESSED)
+                .set_statistics_enabled(if layout == "missing" {
+                    EnabledStatistics::None
+                } else {
+                    EnabledStatistics::Chunk
+                })
+                .set_statistics_truncate_length(if layout == "truncated" {
+                    Some(16)
+                } else {
+                    None
+                })
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(&path).unwrap(),
+                schema.clone(),
+                Some(props),
+            )
+            .unwrap();
+            let payload = vec![17u8; 2048];
+            for data_path in &paths {
+                let batch = arrow::record_batch::RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                            data_path.as_str(),
+                            512,
+                        ))),
+                        Arc::new(Int64Array::from_iter_values(0..512)),
+                        Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                            payload.as_slice(),
+                            512,
+                        ))),
+                    ],
+                )
+                .unwrap();
+                writer.write(&batch).unwrap();
+                writer.flush().unwrap();
+            }
+            writer.close().unwrap();
+            let size = std::fs::metadata(&path).unwrap().len();
+            let access = FsAccessResolver::new()
+                .resolve_location(
+                    novarocks_spi::connector::StorageAccessDomainId::from_bytes([1; 32]),
+                    path.to_string_lossy(),
+                    None,
+                )
+                .unwrap();
+            assert!(
+                size > 64 * 1024,
+                "fixture exceeds the whole-file probe threshold"
+            );
+            for coalesce in [false, true] {
+                let receipts = RangeReceipts::default();
+                let access = recorded_access(&access, &receipts);
+                let context = FileReadContext {
+                    cancellation: FileCancellation::new(),
+                    deadline: None,
+                    runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+                    task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+                    range: None,
+                };
+                let predicate = ScanPredicate::new(
+                    "file_path",
+                    ScanPredicateDomain::Range {
+                        op: MinMaxPredicateOp::Eq,
+                        value: MinMaxPredicateValue::ByteArray(target.as_bytes().to_vec()),
+                    },
+                    ScanPredicateSource::Static,
+                )
+                .with_physical_field_id(crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID);
+                let mut matched = Vec::new();
+                let m = runtime
+                    .block_on(visit_parquet_batches_async_with_options(
+                        &access,
+                        &path.to_string_lossy(),
+                        Some(size),
+                        FileProjection::RootNames(vec!["file_path".into(), "pos".into()]),
+                        vec![predicate],
+                        context,
+                        FileReaderOptions {
+                            coalesce_reads: coalesce,
+                            ..Default::default()
+                        },
+                        |batch| {
+                            let file_paths = batch
+                                .batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap();
+                            let positions = batch
+                                .batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            for row in 0..batch.batch.num_rows() {
+                                if file_paths.value(row) == target {
+                                    matched.push(positions.value(row));
+                                }
+                            }
+                            Ok(())
+                        },
+                    ))
+                    .unwrap();
+                assert_eq!(matched, (0..512).collect::<Vec<i64>>());
+                if layout == "full" {
+                    assert_eq!(
+                        (m.row_groups_read, m.row_groups_pruned, m.rows_decoded),
+                        (1, 15, 512)
+                    );
+                    assert!(
+                        m.bytes_read < size / 8,
+                        "related ranges plus footer stay below an unrelated-file scan"
+                    );
+                } else {
+                    assert_eq!(
+                        (m.row_groups_read, m.row_groups_pruned, m.rows_decoded),
+                        (16, 0, 8192)
+                    );
+                }
+                let ranges = receipts.0.lock().unwrap();
+                let range_bytes: u64 = ranges
+                    .iter()
+                    .map(|(_, start, length)| length.unwrap_or(size - start))
+                    .sum();
+                assert_eq!(
+                    range_bytes, m.bytes_read,
+                    "metrics count every footer and coalesced physical read"
+                );
+                assert_eq!(ranges.len() as u64, m.read_requests);
+                assert!(
+                    ranges
+                        .iter()
+                        .all(|(_, start, length)| start + length.unwrap_or(size - start) <= size)
+                );
+                assert!(
+                    ranges
+                        .iter()
+                        .any(|(_, start, length)| start + length.unwrap_or(size - start) == size),
+                    "footer tail is a physical range"
+                );
+                if layout == "full" {
+                    assert!(
+                        ranges
+                            .iter()
+                            .all(|(_, start, length)| !(*start == 0 && *length == Some(size))),
+                        "large selective file is not probed whole"
+                    );
+                }
+                eprintln!(
+                    "POSITION_RANGE_RECEIPT layout={layout} coalesce={coalesce} file_bytes={size} physical_ranges={:?} metrics={m:?}",
+                    *ranges
+                );
+                assert!(m.read_requests > 0);
+                metrics.push((layout, coalesce, m));
+            }
+        }
+        for coalesce in [false, true] {
+            let full = metrics
+                .iter()
+                .find(|(layout, c, _)| *layout == "full" && *c == coalesce)
+                .unwrap()
+                .2;
+            let missing = metrics
+                .iter()
+                .find(|(layout, c, _)| *layout == "missing" && *c == coalesce)
+                .unwrap()
+                .2;
+            assert!(missing.bytes_read > full.bytes_read * 8);
+        }
+    }
+    #[test]
+    fn small_position_file_reports_whole_probe_even_when_one_group_matches() {
+        use novarocks_fs::{
+            FileCancellation, FileReaderOptions, FsAccessResolver, TokioFileIoRuntime,
+            TokioFileTaskSpawner,
+        };
+        use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+        use parquet::file::properties::WriterProperties;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("small-position.parquet");
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(
+                [(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID.to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Field::new("pos", DataType::Int64, false).with_metadata(
+                [(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    (i32::MAX - 102).to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        ]));
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            schema.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(1))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        for group in 0..16 {
+            writer
+                .write(
+                    &RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(StringArray::from(vec![format!("/data/{group:03}.parquet")])),
+                            Arc::new(Int64Array::from(vec![group])),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size <= 64 * 1024);
+        let access = FsAccessResolver::new()
+            .resolve_location(
+                novarocks_spi::connector::StorageAccessDomainId::from_bytes([1; 32]),
+                path.to_string_lossy(),
+                None,
+            )
+            .unwrap();
+        for coalesce in [false, true] {
+            let receipts = RangeReceipts::default();
+            let access = recorded_access(&access, &receipts);
+            let context = FileReadContext {
+                cancellation: FileCancellation::new(),
+                deadline: None,
+                runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+                task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+                range: None,
+            };
+            let predicate = ScanPredicate::new(
+                "file_path",
+                ScanPredicateDomain::Range {
+                    op: MinMaxPredicateOp::Eq,
+                    value: MinMaxPredicateValue::ByteArray(b"/data/007.parquet".to_vec()),
+                },
+                ScanPredicateSource::Static,
+            )
+            .with_physical_field_id(crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID);
+            let mut positions = Vec::new();
+            let metrics = runtime
+                .block_on(visit_parquet_batches_async_with_options(
+                    &access,
+                    &path.to_string_lossy(),
+                    Some(size),
+                    FileProjection::RootNames(vec!["file_path".into(), "pos".into()]),
+                    vec![predicate],
+                    context,
+                    FileReaderOptions {
+                        coalesce_reads: coalesce,
+                        ..Default::default()
+                    },
+                    |batch| {
+                        positions.extend(
+                            batch
+                                .batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .values()
+                                .iter()
+                                .copied(),
+                        );
+                        Ok(())
+                    },
+                ))
+                .unwrap();
+            assert_eq!(positions, vec![7]);
+            assert_eq!(
+                (metrics.row_groups_read, metrics.row_groups_pruned),
+                (1, 15)
+            );
+            assert!(
+                receipts
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, offset, length)| *offset == 0 && *length == Some(size)),
+                "small-file footer probe reads the full object"
+            );
+            assert!(metrics.bytes_read >= size);
+            eprintln!(
+                "POSITION_SMALL_PROBE coalesce={coalesce} file_bytes={size} physical_ranges={:?} metrics={metrics:?}",
+                receipts.0.lock().unwrap()
+            );
+        }
+    }
+    #[test]
+    fn delete_async_boundaries_preserve_physical_failure_kinds_and_content_corruption() {
+        use novarocks_fs::{
+            FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+        };
+        use novarocks_spi::connector::ConnectorErrorKind;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identified-delete-object.parquet");
+        std::fs::write(&path, b"invalid-parquet-payload").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let access = FsAccessResolver::new()
+            .resolve_location(
+                novarocks_spi::connector::StorageAccessDomainId::from_bytes([1; 32]),
+                path.to_string_lossy(),
+                None,
+            )
+            .unwrap();
+        let context = FileReadContext {
+            cancellation: FileCancellation::new(),
+            deadline: None,
+            runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            range: None,
+        };
+        for (physical, expected) in [
+            (opendal::ErrorKind::NotFound, ConnectorErrorKind::NotFound),
+            (
+                opendal::ErrorKind::PermissionDenied,
+                ConnectorErrorKind::PermissionDenied,
+            ),
+            (
+                opendal::ErrorKind::Unexpected,
+                ConnectorErrorKind::Unavailable,
+            ),
+        ] {
+            let receipts = RangeReceipts(Arc::default(), Some(physical));
+            let injected = recorded_access(&access, &receipts);
+            let raw = runtime
+                .block_on(read_bytes_async_typed(
+                    &injected,
+                    &path.to_string_lossy(),
+                    Some(size),
+                    FileReadRange::bounded(0, size).unwrap(),
+                    &context,
+                ))
+                .unwrap_err();
+            assert_eq!(raw.kind(), expected);
+            let parquet = runtime
+                .block_on(visit_parquet_batches_async(
+                    &injected,
+                    &path.to_string_lossy(),
+                    Some(size),
+                    FileProjection::All,
+                    Vec::new(),
+                    context.clone(),
+                    |_| Ok(()),
+                ))
+                .unwrap_err();
+            assert_eq!(parquet.kind(), expected);
+            assert!(
+                receipts.0.lock().unwrap().len() >= 2,
+                "both active physical boundaries reached the identified object"
+            );
+        }
+        let malformed = runtime
+            .block_on(visit_parquet_batches_async(
+                &access,
+                &path.to_string_lossy(),
+                Some(size),
+                FileProjection::All,
+                Vec::new(),
+                context.clone(),
+                |_| Ok(()),
+            ))
+            .unwrap_err();
+        assert_eq!(malformed.kind(), ConnectorErrorKind::CorruptData);
+        let missing = directory.path().join("missing-delete.parquet");
+        let unknown_size = runtime
+            .block_on(visit_parquet_batches_async(
+                &access,
+                &missing.to_string_lossy(),
+                None,
+                FileProjection::All,
+                Vec::new(),
+                context,
+                |_| Ok(()),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            unknown_size.kind(),
+            ConnectorErrorKind::NotFound,
+            "HEAD errors keep their physical taxonomy"
+        );
+    }
+
+    struct RejectRangeSpawner;
+    impl novarocks_fs::FileTaskSpawner for RejectRangeSpawner {
+        fn spawn(
+            &self,
+            _task: novarocks_fs::FileTaskFuture,
+        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+            Err(novarocks_fs::FileError::new(
+                novarocks_fs::FileErrorKind::ResourceExhausted,
+                "identified range admission is exhausted",
+            ))
+        }
+        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+            job();
+        }
+    }
+    #[test]
+    fn delete_async_range_admission_retains_resource_exhausted_and_physical_exit() {
+        use novarocks_fs::{FileCancellation, FsAccessResolver, TokioFileIoRuntime};
+        use std::num::NonZeroUsize;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("required-delete-exhausted.parquet");
+        std::fs::write(&path, b"immutable-delete-content").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let access = FsAccessResolver::new()
+            .resolve_location(
+                novarocks_spi::connector::StorageAccessDomainId::from_bytes([1; 32]),
+                path.to_string_lossy(),
+                None,
+            )
+            .unwrap();
+        let spawner = Arc::new(RejectRangeSpawner);
+        let service = novarocks_fs::FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            spawner.clone(),
+            runtime.handle().clone(),
+        );
+        let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        let range = service.bind(
+            novarocks_fs::FileRangeScope::try_new(1, 2, 1, 3, 4, 5).unwrap(),
+            operations.clone(),
+        );
+        let context = FileReadContext {
+            cancellation: FileCancellation::new(),
+            deadline: None,
+            runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            task_spawner: spawner,
+            range: Some(range),
+        };
+        let raw = runtime
+            .block_on(read_bytes_async_typed(
+                &access,
+                &path.to_string_lossy(),
+                Some(size),
+                FileReadRange::bounded(0, size).unwrap(),
+                &context,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            raw.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+        );
+        let parquet = runtime
+            .block_on(visit_parquet_batches_async(
+                &access,
+                &path.to_string_lossy(),
+                Some(size),
+                FileProjection::All,
+                Vec::new(),
+                context,
+                |_| Ok(()),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            parquet.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+        );
+        operations.seal();
+        runtime.block_on(operations.exited()).unwrap();
+        assert_eq!(operations.live_operations(), 0);
     }
 }

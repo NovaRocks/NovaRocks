@@ -31,9 +31,10 @@ INSERT INTO ${case_db}.union_distinct_dist_r VALUES
 ANALYZE TABLE ${case_db}.union_distinct_dist_l;
 ANALYZE TABLE ${case_db}.union_distinct_dist_r;
 
--- @skip_result_check=true
 -- @explain_contains=HASH AGGREGATE (LOCAL,
--- @explain_contains=HASH AGGREGATE (GLOBAL,
+-- @explain_contains=HASH AGGREGATE (DISTINCT_GLOBAL, group by: [k, s])
+-- @explain_contains=HASH EXCHANGE
+-- @explain_contains=PARTITION: HASH_PARTITIONED (k, s)
 -- @explain_contains=UNION ALL
 -- @explain_not_contains=UNION DISTINCT
 SELECT k, s

@@ -20,8 +20,6 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-#[cfg(not(target_os = "linux"))]
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -710,19 +708,11 @@ fn read_process_resources(pid: u32) -> Result<ProcessReadings> {
         u64::try_from(u128::from(ticks) * u128::from(timebase.numer) / u128::from(timebase.denom))
             .context("macOS process CPU time exceeds nanosecond range")
     };
-    let thread_output = Command::new("ps")
-        .args(["-M", &pid.to_string()])
-        .output()
-        .context("run ps for process threads")?;
-    let threads = thread_output.status.success().then(|| {
-        String::from_utf8_lossy(&thread_output.stdout)
-            .lines()
-            .count()
-            .saturating_sub(1) as u64
-    });
     Ok(ProcessReadings {
         rss_bytes: info.pti_resident_size,
-        threads,
+        // Read the thread count from the same libproc snapshot as RSS/CPU.
+        // Launching `ps` for every role on every sweep perturbs timed probes.
+        threads: Some(u64::try_from(info.pti_threadnum).context("negative macOS thread count")?),
         cpu_user_nanos: nanos(info.pti_total_user)?,
         cpu_system_nanos: nanos(info.pti_total_system)?,
     })
@@ -743,6 +733,7 @@ mod tests {
         sampler.sample_cluster().expect("sample current process");
         let high = sampler.high_water("fe").expect("high water exists");
         assert!(high.rss_bytes > 0);
+        assert!(high.threads.is_some_and(|threads| threads > 0));
         assert_eq!(sampler.samples().len(), 1);
         assert!(sampler.samples()[0].unavailable_reason.is_none());
         assert!(sampler.samples()[0].cpu_user_nanos.is_some());

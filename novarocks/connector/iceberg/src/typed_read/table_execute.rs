@@ -718,6 +718,8 @@ mod tests {
 
     fn deletion_vector(path: &str) -> IcebergDeleteFile {
         IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            partition_spec_id: 0,
+            partition_data_json: r#"{"version":1,"values":[]}"#.to_string(),
             content: IcebergDeleteFileContent::PositionDeletes,
             path: path.to_string(),
             format: IcebergFileFormat::Puffin,
@@ -775,7 +777,7 @@ mod tests {
                 data_file_path: "s3://warehouse/db/t/data/a.parquet".to_string(),
                 data_file_size: 8192,
                 partition_spec_id: 7,
-                partition_data_json: "{}".to_string(),
+                partition_data_json: r#"{"version":1,"values":[]}"#.to_string(),
                 selected_position_deletes: deletes,
                 split_weight: SplitWeight::STANDARD,
             },
@@ -1028,6 +1030,7 @@ mod tests {
             let mut params =
                 super::super::table_handle::tests::table_handle_params(&schema, Some(&spec));
             params.snapshot_id = None;
+            params.read_domain = None;
             IcebergTableHandle::try_new(params).expect("handle")
         };
         assert!(IcebergOptimizeHandle::try_new(unpinned.clone(), 1).is_err());

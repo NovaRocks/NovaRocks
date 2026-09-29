@@ -30,10 +30,8 @@
 //! * the reverse (`-1`) output is `Visible(from) - Visible(to)`;
 //! * a data file that is gone at `to` contributes all of its `from`-visible
 //!   rows through [`IcebergDeletedDataFileRows`];
-//! * for a data file that is still present, [`IcebergPositionDeletedRows`]
-//!   owns the exact positions that newly became invisible;
-//! * [`IcebergEqualityDeletedRows`] owns only the *remaining* newly invisible
-//!   equality matches, never rows the first two already own.
+//! * for a surviving data file, [`IcebergVisibilityDifferenceRows`] evaluates
+//!   both complete endpoint closures and owns every newly invisible row once.
 //!
 //! Replaying manifest entries instead would double count every row a
 //! copy-on-write rewrite touched, because the same logical row leaves one file
@@ -59,10 +57,7 @@ use novarocks_spi::connector::{
 use crate::iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Type};
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, unsupported};
-use super::split::{
-    IcebergDeleteFile, IcebergDeleteFileContent, IcebergFileFormat, IcebergSplit,
-    ParquetFileDecryptionData,
-};
+use super::split::{IcebergDeleteFile, IcebergFileFormat, IcebergSplit, ParquetFileDecryptionData};
 
 /// The exact metadata columns Trino's `table_changes` appends.
 pub const TABLE_CHANGES_METADATA_COLUMNS: [&str; 4] = [
@@ -529,6 +524,8 @@ pub struct IcebergChangeWindowHandleParams {
     pub name_mapping_json: Option<String>,
     pub from_snapshot_id_exclusive: i64,
     pub to_snapshot_id_inclusive: i64,
+    pub from_read_domain: Arc<crate::delete_semantics::ReadDomain>,
+    pub to_read_domain: Arc<crate::delete_semantics::ReadDomain>,
     /// Every partition spec a split of this window may name. A window spans
     /// two snapshots, so files written under different specs appear on both
     /// sides of the difference and each must decode without resolving the
@@ -551,6 +548,8 @@ pub struct IcebergChangeWindowHandle {
     name_mapping_json: Option<Arc<str>>,
     from_snapshot_id_exclusive: i64,
     to_snapshot_id_inclusive: i64,
+    from_read_domain: Arc<crate::delete_semantics::ReadDomain>,
+    to_read_domain: Arc<crate::delete_semantics::ReadDomain>,
     partition_spec_jsons: BTreeMap<i32, String>,
 }
 
@@ -563,10 +562,53 @@ impl IcebergChangeWindowHandle {
             name_mapping_json,
             from_snapshot_id_exclusive,
             to_snapshot_id_inclusive,
+            from_read_domain,
+            to_read_domain,
             partition_spec_jsons,
         } = params;
 
         validate_change_columns(&table_schema_json, &columns, name_mapping_json.as_deref())?;
+        let schema: Schema =
+            serde_json::from_str(&table_schema_json).map_err(|error| invalid(error.to_string()))?;
+        for (snapshot, domain) in [
+            (from_snapshot_id_exclusive, &from_read_domain),
+            (to_snapshot_id_inclusive, &to_read_domain),
+        ] {
+            let endpoint = domain.endpoint();
+            if endpoint.snapshot_id() != snapshot
+                || endpoint
+                    .schema()
+                    .map_err(|error| invalid(error.to_string()))?
+                    != schema
+                || endpoint.partition_spec_jsons().len() != partition_spec_jsons.len()
+            {
+                return Err(invalid(
+                    "iceberg change-window domain differs from its pinned endpoint",
+                ));
+            }
+            for (spec_id, json) in &partition_spec_jsons {
+                let expected = endpoint
+                    .partition_spec_jsons()
+                    .get(spec_id)
+                    .ok_or_else(|| {
+                        invalid("iceberg change-window domain omits a partition spec")
+                    })?;
+                let expected: serde_json::Value =
+                    serde_json::from_str(expected).map_err(|error| invalid(error.to_string()))?;
+                let received: serde_json::Value =
+                    serde_json::from_str(json).map_err(|error| invalid(error.to_string()))?;
+                if expected != received {
+                    return Err(invalid(
+                        "iceberg change-window domain partition spec differs",
+                    ));
+                }
+            }
+        }
+        if from_read_domain.endpoint().table_uuid() != to_read_domain.endpoint().table_uuid() {
+            return Err(invalid(
+                "iceberg change-window endpoints belong to different tables",
+            ));
+        }
         Ok(Self {
             schema_table_name,
             table_schema_json: Arc::from(table_schema_json.as_str()),
@@ -574,6 +616,8 @@ impl IcebergChangeWindowHandle {
             name_mapping_json: name_mapping_json.map(|value| Arc::from(value.as_str())),
             from_snapshot_id_exclusive,
             to_snapshot_id_inclusive,
+            from_read_domain,
+            to_read_domain,
             partition_spec_jsons,
         })
     }
@@ -605,6 +649,14 @@ impl IcebergChangeWindowHandle {
 
     pub const fn to_snapshot_id_inclusive(&self) -> i64 {
         self.to_snapshot_id_inclusive
+    }
+
+    pub fn from_read_domain(&self) -> &Arc<crate::delete_semantics::ReadDomain> {
+        &self.from_read_domain
+    }
+
+    pub fn to_read_domain(&self) -> &Arc<crate::delete_semantics::ReadDomain> {
+        &self.to_read_domain
     }
 
     pub fn parse_table_schema(&self) -> Result<Schema, ConnectorError> {
@@ -659,6 +711,8 @@ impl IcebergChangeWindowHandle {
                 .map(|value| value.to_string()),
             from_snapshot_id_exclusive: self.from_snapshot_id_exclusive,
             to_snapshot_id_inclusive: self.to_snapshot_id_inclusive,
+            from_read_domain: Some(super::split::encode_read_domain(&self.from_read_domain)),
+            to_read_domain: Some(super::split::encode_read_domain(&self.to_read_domain)),
             partition_spec_jsons: self.partition_spec_jsons.clone(),
         }
     }
@@ -678,6 +732,16 @@ impl IcebergChangeWindowHandle {
             name_mapping_json: raw.name_mapping_json.clone(),
             from_snapshot_id_exclusive: raw.from_snapshot_id_exclusive,
             to_snapshot_id_inclusive: raw.to_snapshot_id_inclusive,
+            from_read_domain: super::split::decode_read_domain(
+                raw.from_read_domain.as_ref().ok_or_else(|| {
+                    invalid("iceberg change-window handle requires its From domain")
+                })?,
+            )?,
+            to_read_domain: super::split::decode_read_domain(
+                raw.to_read_domain.as_ref().ok_or_else(|| {
+                    invalid("iceberg change-window handle requires its To domain")
+                })?,
+            )?,
             partition_spec_jsons: raw.partition_spec_jsons.clone(),
         })
     }
@@ -742,148 +806,70 @@ impl IcebergAddedRows {
     }
 }
 
-/// Rows of a still-present data file that became invisible by row position.
+/// The complete endpoint delete closures of a surviving immutable data file.
 ///
-/// The split names delete artifacts, never positions. The backend loads those
-/// artifacts and builds a private `IncludedRowPositions` (a Roaring64 set) to
-/// select rows *inclusively*; that set is a reader-local structure, not an
-/// `IcebergSplit`, not a wire value, and not the generic delete-exclusion
-/// semantics. Putting the positions on the wire would make the plan grow with
-/// the number of deleted rows and would duplicate a fact the delete artifact
-/// already states exactly.
+/// The reader evaluates both closures once and emits rows visible only at From.
+/// Artifact replacement and overlapping delete kinds never create separate row owners.
 #[derive(Clone, Debug)]
-pub struct IcebergPositionDeletedRows {
+pub struct IcebergVisibilityDifferenceRows {
     data: IcebergSplit,
-    newly_applied_deletes: Vec<IcebergDeleteFile>,
-    previously_applied_deletes: Vec<IcebergDeleteFile>,
+    from_deletes: Arc<[IcebergDeleteFile]>,
+    to_deletes: Arc<[IcebergDeleteFile]>,
 }
 
-impl IcebergPositionDeletedRows {
+impl IcebergVisibilityDifferenceRows {
     pub fn try_new(
         data: IcebergSplit,
-        newly_applied_deletes: Vec<IcebergDeleteFile>,
-        previously_applied_deletes: Vec<IcebergDeleteFile>,
+        from_deletes: Vec<IcebergDeleteFile>,
+        to_deletes: Vec<IcebergDeleteFile>,
     ) -> Result<Self, ConnectorError> {
-        validate_reverse_side_data_split(&data)?;
-        bounded_deletes(&newly_applied_deletes)?;
-        bounded_deletes(&previously_applied_deletes)?;
-        if newly_applied_deletes.is_empty() {
-            return Err(invalid(
-                "iceberg position-deleted rows require at least one newly applied delete",
-            ));
+        Self::try_new_shared(data, from_deletes.into(), to_deletes.into())
+    }
+
+    pub(crate) fn try_new_shared(
+        data: IcebergSplit,
+        from_deletes: Arc<[IcebergDeleteFile]>,
+        to_deletes: Arc<[IcebergDeleteFile]>,
+    ) -> Result<Self, ConnectorError> {
+        bounded_deletes(&from_deletes)?;
+        bounded_deletes(&to_deletes)?;
+        let mut same = data.deletes().len() == to_deletes.len();
+        for (actual, expected) in data.deletes().iter().zip(to_deletes.iter()) {
+            same &= actual?.as_ref() == expected;
         }
-        for delete in &newly_applied_deletes {
-            if delete.content() != IcebergDeleteFileContent::PositionDeletes {
-                return Err(invalid(
-                    "iceberg position-deleted rows accept only position-delete artifacts",
-                ));
-            }
+        if !same {
+            return Err(invalid(
+                "iceberg visibility difference must carry the complete To closure in its data split",
+            ));
         }
         Ok(Self {
             data,
-            newly_applied_deletes,
-            previously_applied_deletes,
+            from_deletes,
+            to_deletes,
         })
     }
-
     pub const fn data(&self) -> &IcebergSplit {
         &self.data
     }
-
-    /// Artifacts that made rows invisible between the two endpoints.
-    pub fn newly_applied_deletes(&self) -> &[IcebergDeleteFile] {
-        &self.newly_applied_deletes
+    pub fn from_deletes(&self) -> &[IcebergDeleteFile] {
+        &self.from_deletes
     }
-
-    /// Artifacts that were already applied at the lower endpoint. Their rows
-    /// were never visible at `from`, so they are subtracted, not emitted.
-    pub fn previously_applied_deletes(&self) -> &[IcebergDeleteFile] {
-        &self.previously_applied_deletes
+    pub fn to_deletes(&self) -> &[IcebergDeleteFile] {
+        &self.to_deletes
     }
 }
 
-/// Rows of a still-present data file that became invisible by equality match.
-///
-/// This variant owns only what the position variant did not. Every position
-/// delete that newly applies to the same data file must appear in
-/// `previously_applied_deletes` here, so the reader subtracts those rows before
-/// it emits an equality match. The plan-level check in
-/// [`IcebergChangeWindowPlan`] is what proves it.
-#[derive(Clone, Debug)]
-pub struct IcebergEqualityDeletedRows {
-    data: IcebergSplit,
-    newly_applied_equality_deletes: Vec<IcebergDeleteFile>,
-    previously_applied_deletes: Vec<IcebergDeleteFile>,
-}
-
-impl IcebergEqualityDeletedRows {
-    pub fn try_new(
-        data: IcebergSplit,
-        newly_applied_equality_deletes: Vec<IcebergDeleteFile>,
-        previously_applied_deletes: Vec<IcebergDeleteFile>,
-    ) -> Result<Self, ConnectorError> {
-        validate_reverse_side_data_split(&data)?;
-        bounded_deletes(&newly_applied_equality_deletes)?;
-        bounded_deletes(&previously_applied_deletes)?;
-        if newly_applied_equality_deletes.is_empty() {
-            return Err(invalid(
-                "iceberg equality-deleted rows require at least one newly applied equality delete",
-            ));
-        }
-        for delete in &newly_applied_equality_deletes {
-            if delete.content() != IcebergDeleteFileContent::EqualityDeletes {
-                return Err(invalid(
-                    "iceberg equality-deleted rows accept only equality-delete artifacts",
-                ));
-            }
-        }
-        Ok(Self {
-            data,
-            newly_applied_equality_deletes,
-            previously_applied_deletes,
-        })
-    }
-
-    pub const fn data(&self) -> &IcebergSplit {
-        &self.data
-    }
-
-    pub fn newly_applied_equality_deletes(&self) -> &[IcebergDeleteFile] {
-        &self.newly_applied_equality_deletes
-    }
-
-    pub fn previously_applied_deletes(&self) -> &[IcebergDeleteFile] {
-        &self.previously_applied_deletes
-    }
-}
-
-/// Every row of a data file that disappeared between the two endpoints, minus
-/// the rows that were already invisible at the lower endpoint.
+/// A removed file reads its complete From exclusion closure.
 #[derive(Clone, Debug)]
 pub struct IcebergDeletedDataFileRows {
     data: IcebergSplit,
-    previously_applied_deletes: Vec<IcebergDeleteFile>,
 }
-
 impl IcebergDeletedDataFileRows {
-    pub fn try_new(
-        data: IcebergSplit,
-        previously_applied_deletes: Vec<IcebergDeleteFile>,
-    ) -> Result<Self, ConnectorError> {
-        validate_reverse_side_data_split(&data)?;
-        bounded_deletes(&previously_applied_deletes)?;
-        Ok(Self {
-            data,
-            previously_applied_deletes,
-        })
+    pub fn try_new(data: IcebergSplit) -> Result<Self, ConnectorError> {
+        Ok(Self { data })
     }
-
     pub const fn data(&self) -> &IcebergSplit {
         &self.data
-    }
-
-    pub fn previously_applied_deletes(&self) -> &[IcebergDeleteFile] {
-        &self.previously_applied_deletes
     }
 }
 
@@ -892,147 +878,90 @@ impl IcebergDeletedDataFileRows {
 #[derive(Clone, Debug)]
 pub enum IcebergChangeSplit {
     AddedRows(IcebergAddedRows),
-    PositionDeletedRows(IcebergPositionDeletedRows),
-    EqualityDeletedRows(IcebergEqualityDeletedRows),
+    VisibilityDifference(IcebergVisibilityDifferenceRows),
     DeletedDataFileRows(IcebergDeletedDataFileRows),
 }
 
 impl IcebergChangeSplit {
-    /// The data file this split reads.
     pub const fn data(&self) -> &IcebergSplit {
         match self {
             Self::AddedRows(rows) => rows.data(),
-            Self::PositionDeletedRows(rows) => rows.data(),
-            Self::EqualityDeletedRows(rows) => rows.data(),
+            Self::VisibilityDifference(rows) => rows.data(),
             Self::DeletedDataFileRows(rows) => rows.data(),
         }
     }
-
     pub const fn side(&self) -> IcebergChangeSide {
         match self {
             Self::AddedRows(_) => IcebergChangeSide::Forward,
-            Self::PositionDeletedRows(_)
-            | Self::EqualityDeletedRows(_)
-            | Self::DeletedDataFileRows(_) => IcebergChangeSide::Reverse,
+            Self::VisibilityDifference(_) | Self::DeletedDataFileRows(_) => {
+                IcebergChangeSide::Reverse
+            }
         }
     }
-
-    /// `__change_op`, derived from the variant.
-    ///
-    /// It is no longer an optional field on a data file: an optional sign can
-    /// be absent, and an absent sign has no safe default. A variant always has
-    /// exactly one.
     pub const fn change_op(&self) -> i8 {
         match self.side() {
             IcebergChangeSide::Forward => 1,
             IcebergChangeSide::Reverse => -1,
         }
     }
-
     const fn variant(&self) -> ChangeVariant {
         match self {
             Self::AddedRows(_) => ChangeVariant::AddedRows,
-            Self::PositionDeletedRows(_) => ChangeVariant::PositionDeletedRows,
-            Self::EqualityDeletedRows(_) => ChangeVariant::EqualityDeletedRows,
+            Self::VisibilityDifference(_) => ChangeVariant::VisibilityDifference,
             Self::DeletedDataFileRows(_) => ChangeVariant::DeletedDataFileRows,
         }
     }
-
-    pub fn to_proto(&self) -> dto::IcebergChangeSplit {
+    pub fn to_proto(&self) -> Result<dto::IcebergChangeSplit, ConnectorError> {
+        use dto::iceberg_change_split::Rows;
         let rows = match self {
-            Self::AddedRows(rows) => dto::iceberg_change_split::Rows::AddedRows(
-                // The exhaustive struct literal is the proof that nothing else
-                // reaches the wire: a new proto field would fail to compile
-                // here rather than be filled in silently.
-                dto::IcebergAddedRows {
-                    data: Some(rows.data().to_proto()),
-                    restricted_row_ids: rows.restricted_row_ids().to_vec(),
-                },
-            ),
-            Self::PositionDeletedRows(rows) => {
-                dto::iceberg_change_split::Rows::PositionDeletedRows(
-                    dto::IcebergPositionDeletedRows {
-                        data: Some(rows.data().to_proto()),
-                        newly_applied_deletes: encode_deletes(rows.newly_applied_deletes()),
-                        previously_applied_deletes: encode_deletes(
-                            rows.previously_applied_deletes(),
-                        ),
-                    },
-                )
-            }
-            Self::EqualityDeletedRows(rows) => {
-                dto::iceberg_change_split::Rows::EqualityDeletedRows(
-                    dto::IcebergEqualityDeletedRows {
-                        data: Some(rows.data().to_proto()),
-                        newly_applied_equality_deletes: encode_deletes(
-                            rows.newly_applied_equality_deletes(),
-                        ),
-                        previously_applied_deletes: encode_deletes(
-                            rows.previously_applied_deletes(),
-                        ),
-                    },
-                )
+            Self::AddedRows(rows) => Rows::AddedRows(dto::IcebergAddedRows {
+                data: Some(rows.data().to_proto()?),
+                restricted_row_ids: rows.restricted_row_ids().to_vec(),
+            }),
+            Self::VisibilityDifference(rows) => {
+                Rows::VisibilityDifference(dto::IcebergVisibilityDifference {
+                    data: Some(rows.data().to_proto()?),
+                    from_deletes: encode_deletes(rows.from_deletes()),
+                    to_deletes: encode_deletes(rows.to_deletes()),
+                })
             }
             Self::DeletedDataFileRows(rows) => {
-                dto::iceberg_change_split::Rows::DeletedDataFileRows(
-                    dto::IcebergDeletedDataFileRows {
-                        data: Some(rows.data().to_proto()),
-                        previously_applied_deletes: encode_deletes(
-                            rows.previously_applied_deletes(),
-                        ),
-                    },
-                )
+                Rows::DeletedDataFileRows(dto::IcebergDeletedDataFileRows {
+                    data: Some(rows.data().to_proto()?),
+                })
             }
         };
-        dto::IcebergChangeSplit { rows: Some(rows) }
+        Ok(dto::IcebergChangeSplit { rows: Some(rows) })
     }
-
     pub fn from_proto(
         raw: &dto::IcebergChangeSplit,
         split_weight: SplitWeight,
         affinity_key: Option<String>,
     ) -> Result<Self, ConnectorError> {
-        let rows = raw
+        use dto::iceberg_change_split::Rows;
+        match raw
             .rows
             .as_ref()
-            .ok_or_else(|| invalid("iceberg change split variant must be present"))?;
-        match rows {
-            dto::iceberg_change_split::Rows::AddedRows(added) => {
-                let data = decode_data_split(added.data.as_ref(), split_weight, affinity_key)?;
-                Ok(Self::AddedRows(IcebergAddedRows::try_new(
-                    data,
-                    added.restricted_row_ids.clone(),
-                )?))
-            }
-            dto::iceberg_change_split::Rows::PositionDeletedRows(position) => {
-                let data = decode_data_split(position.data.as_ref(), split_weight, affinity_key)?;
-                Ok(Self::PositionDeletedRows(
-                    IcebergPositionDeletedRows::try_new(
-                        data,
-                        decode_deletes(&position.newly_applied_deletes)?,
-                        decode_deletes(&position.previously_applied_deletes)?,
-                    )?,
-                ))
-            }
-            dto::iceberg_change_split::Rows::EqualityDeletedRows(equality) => {
-                let data = decode_data_split(equality.data.as_ref(), split_weight, affinity_key)?;
-                Ok(Self::EqualityDeletedRows(
-                    IcebergEqualityDeletedRows::try_new(
-                        data,
-                        decode_deletes(&equality.newly_applied_equality_deletes)?,
-                        decode_deletes(&equality.previously_applied_deletes)?,
-                    )?,
-                ))
-            }
-            dto::iceberg_change_split::Rows::DeletedDataFileRows(deleted) => {
-                let data = decode_data_split(deleted.data.as_ref(), split_weight, affinity_key)?;
-                Ok(Self::DeletedDataFileRows(
-                    IcebergDeletedDataFileRows::try_new(
-                        data,
-                        decode_deletes(&deleted.previously_applied_deletes)?,
-                    )?,
-                ))
-            }
+            .ok_or_else(|| invalid("iceberg change split variant must be present"))?
+        {
+            Rows::AddedRows(rows) => Ok(Self::AddedRows(IcebergAddedRows::try_new(
+                decode_data_split(rows.data.as_ref(), split_weight, affinity_key)?,
+                rows.restricted_row_ids.clone(),
+            )?)),
+            Rows::VisibilityDifference(rows) => Ok(Self::VisibilityDifference(
+                IcebergVisibilityDifferenceRows::try_new(
+                    decode_data_split(rows.data.as_ref(), split_weight, affinity_key)?,
+                    decode_deletes(&rows.from_deletes)?,
+                    decode_deletes(&rows.to_deletes)?,
+                )?,
+            )),
+            Rows::DeletedDataFileRows(rows) => Ok(Self::DeletedDataFileRows(
+                IcebergDeletedDataFileRows::try_new(decode_data_split(
+                    rows.data.as_ref(),
+                    split_weight,
+                    affinity_key,
+                )?)?,
+            )),
         }
     }
 }
@@ -1058,15 +987,10 @@ impl ConnectorSplit for IcebergChangeSplit {
         let inner = ConnectorSplit::retained_size_in_bytes(self.data());
         let deletes = match self {
             Self::AddedRows(rows) => size_of_val(rows.restricted_row_ids()) as u64,
-            Self::PositionDeletedRows(rows) => {
-                retained_deletes(rows.newly_applied_deletes())
-                    + retained_deletes(rows.previously_applied_deletes())
+            Self::VisibilityDifference(rows) => {
+                retained_deletes(rows.from_deletes()) + retained_deletes(rows.to_deletes())
             }
-            Self::EqualityDeletedRows(rows) => {
-                retained_deletes(rows.newly_applied_equality_deletes())
-                    + retained_deletes(rows.previously_applied_deletes())
-            }
-            Self::DeletedDataFileRows(rows) => retained_deletes(rows.previously_applied_deletes()),
+            Self::DeletedDataFileRows(_) => 0,
         };
         size_of::<Self>() as u64 + inner + deletes
     }
@@ -1119,6 +1043,19 @@ impl IcebergChangeWindowPlan {
             IcebergEndpointVisibility::Proven => {}
         }
 
+        for split in &splits {
+            let expected = match split {
+                IcebergChangeSplit::DeletedDataFileRows(_) => handle.from_read_domain(),
+                IcebergChangeSplit::AddedRows(_) | IcebergChangeSplit::VisibilityDifference(_) => {
+                    handle.to_read_domain()
+                }
+            };
+            if split.data().read_domain() != expected {
+                return Err(invalid(
+                    "iceberg change split is bound to the wrong endpoint read domain",
+                ));
+            }
+        }
         validate_disjoint_splits(&splits)?;
         Ok(IcebergChangeWindowPlanOutcome::Incremental(Self {
             handle,
@@ -1139,126 +1076,55 @@ impl IcebergChangeWindowPlan {
     }
 }
 
-/// The four output kinds, as a value the disjointness proof can group by.
-///
-/// The shared `Rows` suffix is the contract's own vocabulary -- each variant
-/// names a *set of rows*, and renaming them here would make this enum and
-/// [`IcebergChangeSplit`] disagree about what the same four kinds are called.
-#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ChangeVariant {
     AddedRows,
-    PositionDeletedRows,
-    EqualityDeletedRows,
+    VisibilityDifference,
     DeletedDataFileRows,
 }
-
 impl ChangeVariant {
     const fn name(self) -> &'static str {
         match self {
             Self::AddedRows => "added rows",
-            Self::PositionDeletedRows => "position-deleted rows",
-            Self::EqualityDeletedRows => "equality-deleted rows",
+            Self::VisibilityDifference => "visibility difference",
             Self::DeletedDataFileRows => "deleted data file rows",
         }
     }
 }
-
-/// One data file's splits, grouped by variant.
 #[derive(Default)]
-struct FileVariants<'a> {
+struct FileVariants {
     file_size: Option<i64>,
-    /// Byte ranges per variant present for this data file.
     ranges: BTreeMap<ChangeVariant, Vec<(i64, i64)>>,
-    position: Vec<&'a IcebergPositionDeletedRows>,
-    equality: Vec<&'a IcebergEqualityDeletedRows>,
 }
-
 fn validate_disjoint_splits(splits: &[IcebergChangeSplit]) -> Result<(), ConnectorError> {
-    let mut by_path: BTreeMap<&str, FileVariants<'_>> = BTreeMap::new();
+    let mut by_path: BTreeMap<&str, FileVariants> = BTreeMap::new();
     for split in splits {
         let data = split.data();
         let entry = by_path.entry(data.path()).or_default();
-        match entry.file_size {
-            // Two splits of one path that disagree about the file cannot both
-            // be describing the same frozen file, and neither one can be
-            // trusted to cover it.
-            Some(file_size) if file_size != data.file_size() => {
-                return Err(corrupt(format!(
-                    "iceberg change-window splits of {} disagree about the file size",
-                    data.path()
-                )));
-            }
-            Some(_) => {}
-            None => entry.file_size = Some(data.file_size()),
+        if entry.file_size.is_some_and(|size| size != data.file_size()) {
+            return Err(corrupt(format!(
+                "iceberg change-window splits of {} disagree about the file size",
+                data.path()
+            )));
         }
+        entry.file_size = Some(data.file_size());
         entry
             .ranges
             .entry(split.variant())
             .or_default()
             .push((data.start(), data.length()));
-        match split {
-            IcebergChangeSplit::PositionDeletedRows(rows) => entry.position.push(rows),
-            IcebergChangeSplit::EqualityDeletedRows(rows) => entry.equality.push(rows),
-            IcebergChangeSplit::AddedRows(_) | IcebergChangeSplit::DeletedDataFileRows(_) => {}
-        }
     }
-
     for (path, entry) in by_path {
+        if entry.ranges.len() != 1 {
+            return Err(corrupt(format!(
+                "iceberg data file {path} has multiple change-window row owners"
+            )));
+        }
         let file_size = entry
             .file_size
-            .ok_or_else(|| corrupt(format!("iceberg change-window split of {path} has no file")))?;
-        let present = |variant: ChangeVariant| entry.ranges.contains_key(&variant);
-        let added = present(ChangeVariant::AddedRows);
-        let position = present(ChangeVariant::PositionDeletedRows);
-        let equality = present(ChangeVariant::EqualityDeletedRows);
-        let deleted_file = present(ChangeVariant::DeletedDataFileRows);
-
-        // A file that is gone at the upper endpoint owns all of its
-        // `from`-visible rows through one variant. Any other variant for the
-        // same path would emit some of those rows a second time.
-        if deleted_file && (added || position || equality) {
-            return Err(corrupt(format!(
-                "iceberg data file {path} is both removed and otherwise changed in one window"
-            )));
-        }
-        // Iceberg data files are immutable, so a file added inside the window
-        // had no `from`-visible rows at all and can contribute nothing to the
-        // reverse side.
-        if added && (position || equality) {
-            return Err(corrupt(format!(
-                "iceberg data file {path} is both added and row-deleted in one window"
-            )));
-        }
-
-        for (variant, ranges) in &entry.ranges {
-            validate_tiling(path, variant.name(), ranges, file_size)?;
-        }
-
-        if position && equality {
-            // The equality variant must subtract every position delete the
-            // position variant already owns; otherwise a row invisible for both
-            // reasons is emitted twice.
-            let mut newly_position = Vec::new();
-            for rows in &entry.position {
-                for delete in rows.newly_applied_deletes() {
-                    newly_position.push(delete);
-                }
-            }
-            for rows in &entry.equality {
-                for delete in &newly_position {
-                    if !rows
-                        .previously_applied_deletes()
-                        .iter()
-                        .any(|previous| previous == *delete)
-                    {
-                        return Err(corrupt(format!(
-                            "iceberg equality-deleted rows of {path} do not exclude position delete {}",
-                            delete.path()
-                        )));
-                    }
-                }
-            }
+            .ok_or_else(|| corrupt("iceberg change split has no file size"))?;
+        for (variant, ranges) in entry.ranges {
+            validate_tiling(path, variant.name(), &ranges, file_size)?;
         }
     }
     Ok(())
@@ -1389,21 +1255,6 @@ fn validate_data_file_range(
     Ok(())
 }
 
-/// A reverse-side split names its delete artifacts explicitly, so the data
-/// split's own exclusion closure must be empty.
-///
-/// Otherwise one split would carry two contradictory delete meanings: the
-/// ordinary closure says "hide these rows", while the variant fields say
-/// "these are exactly the rows to emit".
-fn validate_reverse_side_data_split(data: &IcebergSplit) -> Result<(), ConnectorError> {
-    if !data.deletes().is_empty() {
-        return Err(invalid(
-            "a reverse-side change split carries its deletes as typed variant facts, not as a data-split exclusion closure",
-        ));
-    }
-    Ok(())
-}
-
 fn bounded_deletes(deletes: &[IcebergDeleteFile]) -> Result<(), ConnectorError> {
     if deletes.len() > MAX_DELETES_PER_SPLIT {
         return Err(ConnectorError::new(
@@ -1515,78 +1366,81 @@ mod tests {
         IcebergColumnHandle::base_column_of(&partitioned_schema(), field_id).expect("column")
     }
 
-    fn data_split(path: &str, start: i64, length: i64, file_size: i64) -> IcebergSplit {
-        data_split_with_deletes(path, start, length, file_size, Vec::new())
+    fn domain(snapshot: i64) -> Arc<crate::delete_semantics::ReadDomain> {
+        crate::delete_semantics::test_read_domain(
+            &partitioned_schema(),
+            &[PartitionSpec::unpartition_spec()],
+            snapshot,
+        )
     }
-
-    fn data_split_with_deletes(
+    fn data_split(
         path: &str,
         start: i64,
         length: i64,
         file_size: i64,
+        snapshot: i64,
         deletes: Vec<IcebergDeleteFile>,
     ) -> IcebergSplit {
         IcebergSplit::try_new(IcebergSplitParams {
-            path: path.to_string(),
+            read_domain: domain(snapshot),
+            path: path.into(),
             start,
             length,
             file_size,
             file_record_count: 100,
             file_format: IcebergFileFormat::Parquet,
-            partition_spec_id: 7,
-            partition_data_json: "{}".to_string(),
-            deletes,
+            partition_spec_id: 0,
+            partition_data_json: r#"{"version":1,"values":[]}"#.into(),
+            deletes: deletes.into(),
             file_statistics_domain: TupleDomain::all(),
             data_sequence_number: Some(4),
             file_first_row_id: Some(1000),
             decryption_data: None,
             split_weight: SplitWeight::STANDARD,
-            affinity_key: Some(path.to_string()),
+            affinity_key: Some(path.into()),
         })
         .expect("data split")
     }
-
-    fn equality_delete_of(path: &str) -> IcebergDeleteFile {
-        super::super::split::tests::equality_delete(path, 4)
-    }
-
     fn change_window_handle() -> IcebergChangeWindowHandle {
         IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
-            schema_table_name: SchemaTableName::try_new("db", "t").expect("name"),
-            table_schema_json: serde_json::to_string(&partitioned_schema()).expect("schema json"),
+            schema_table_name: SchemaTableName::try_new("db", "t").unwrap(),
+            table_schema_json: serde_json::to_string(&partitioned_schema()).unwrap(),
             columns: vec![column(1), column(2)],
             name_mapping_json: None,
             from_snapshot_id_exclusive: 10,
             to_snapshot_id_inclusive: 20,
-            partition_spec_jsons: BTreeMap::new(),
+            from_read_domain: domain(10),
+            to_read_domain: domain(20),
+            partition_spec_jsons: BTreeMap::from([(
+                0,
+                serde_json::to_string(&PartitionSpec::unpartition_spec()).unwrap(),
+            )]),
         })
-        .expect("handle")
+        .unwrap()
     }
-
     fn added(path: &str) -> IcebergChangeSplit {
         IcebergChangeSplit::AddedRows(
-            IcebergAddedRows::try_new(data_split(path, 0, 100, 100), Vec::new()).expect("added"),
+            IcebergAddedRows::try_new(data_split(path, 0, 100, 100, 20, vec![]), vec![]).unwrap(),
         )
     }
-
-    fn position_deleted(path: &str, delete_path: &str) -> IcebergChangeSplit {
-        IcebergChangeSplit::PositionDeletedRows(
-            IcebergPositionDeletedRows::try_new(
-                data_split(path, 0, 100, 100),
-                vec![position_delete(delete_path)],
-                Vec::new(),
-            )
-            .expect("position deleted"),
-        )
-    }
-
-    fn removed(path: &str) -> IcebergChangeSplit {
+    fn removed(path: &str, start: i64, length: i64) -> IcebergChangeSplit {
         IcebergChangeSplit::DeletedDataFileRows(
-            IcebergDeletedDataFileRows::try_new(data_split(path, 0, 100, 100), Vec::new())
-                .expect("removed"),
+            IcebergDeletedDataFileRows::try_new(data_split(path, start, length, 100, 10, vec![]))
+                .unwrap(),
         )
     }
-
+    fn difference(path: &str) -> IcebergChangeSplit {
+        let before = vec![position_delete("old.parquet")];
+        let after = vec![position_delete("replacement.parquet")];
+        IcebergChangeSplit::VisibilityDifference(
+            IcebergVisibilityDifferenceRows::try_new(
+                data_split(path, 0, 100, 100, 20, after.clone()),
+                before,
+                after,
+            )
+            .unwrap(),
+        )
+    }
     fn plan(
         splits: Vec<IcebergChangeSplit>,
     ) -> Result<IcebergChangeWindowPlanOutcome, ConnectorError> {
@@ -1596,365 +1450,73 @@ mod tests {
             splits,
         )
     }
-
-    fn expect_incremental(splits: Vec<IcebergChangeSplit>) -> IcebergChangeWindowPlan {
-        let outcome = plan(splits).expect("admitted");
-        match outcome {
-            IcebergChangeWindowPlanOutcome::Incremental(plan) => plan,
-            IcebergChangeWindowPlanOutcome::FullRebuild(reason) => {
-                panic!("expected an incremental plan, got {reason:?}")
-            }
+    #[test]
+    fn complete_endpoint_variants_round_trip_with_derived_signs() {
+        for split in [added("a"), removed("b", 0, 100), difference("c")] {
+            let raw = split.to_proto().unwrap();
+            let decoded =
+                IcebergChangeSplit::from_proto(&raw, SplitWeight::STANDARD, None).unwrap();
+            assert_eq!(decoded.to_proto().unwrap(), raw);
+            assert_eq!(decoded.change_op(), split.change_op());
+            assert_eq!(
+                split.change_op(),
+                if matches!(split, IcebergChangeSplit::AddedRows(_)) {
+                    1
+                } else {
+                    -1
+                }
+            );
+        }
+        assert!(matches!(
+            plan(vec![added("a"), removed("b", 0, 100), difference("c")]).unwrap(),
+            IcebergChangeWindowPlanOutcome::Incremental(_)
+        ));
+    }
+    #[test]
+    fn surviving_file_has_one_row_owner_and_exact_range_tiling() {
+        assert!(plan(vec![added("a"), difference("a")]).is_err());
+        assert!(plan(vec![removed("a", 0, 50), removed("a", 50, 50)]).is_ok());
+        assert!(plan(vec![removed("a", 0, 60), removed("a", 50, 50)]).is_err());
+        assert!(plan(vec![removed("a", 0, 40), removed("a", 50, 50)]).is_err());
+    }
+    #[test]
+    fn endpoint_domain_and_complete_to_description_are_required() {
+        let wrong = IcebergChangeSplit::AddedRows(
+            IcebergAddedRows::try_new(data_split("a", 0, 100, 100, 10, vec![]), vec![]).unwrap(),
+        );
+        assert!(plan(vec![wrong]).is_err());
+        assert!(
+            IcebergVisibilityDifferenceRows::try_new(
+                data_split("a", 0, 100, 100, 20, vec![]),
+                vec![],
+                vec![position_delete("to")]
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn restricted_row_ids_remain_a_strict_set() {
+        for ids in [vec![2, 2], vec![2, 1], vec![-1]] {
+            assert!(
+                IcebergAddedRows::try_new(data_split("a", 0, 100, 100, 20, vec![]), ids).is_err()
+            );
         }
     }
-
     #[test]
-    fn the_change_op_is_derived_from_the_split_variant() {
-        let added = added("a.parquet");
-        assert_eq!(added.change_op(), 1);
-        assert_eq!(added.side(), IcebergChangeSide::Forward);
-        for reverse in [
-            position_deleted("b.parquet", "d.parquet"),
-            IcebergChangeSplit::EqualityDeletedRows(
-                IcebergEqualityDeletedRows::try_new(
-                    data_split("c.parquet", 0, 100, 100),
-                    vec![equality_delete_of("e.parquet")],
-                    Vec::new(),
-                )
-                .expect("equality deleted"),
-            ),
-            removed("f.parquet"),
-        ] {
-            assert_eq!(reverse.change_op(), -1);
-            assert_eq!(reverse.side(), IcebergChangeSide::Reverse);
-        }
-    }
-
-    #[test]
-    fn the_change_op_column_is_a_reserved_identity_no_table_field_can_claim() {
-        let handle = change_op_column_handle().expect("change op column");
-        assert_eq!(handle.base_field_id(), ICEBERG_CHANGE_OP_FIELD_ID);
-        assert_eq!(
-            handle.base_column_identity().name(),
-            ICEBERG_CHANGE_OP_COLUMN
-        );
-        // A base column with no dereference path, and required: a change row
-        // whose sign were absent would say nothing at all.
-        assert!(handle.is_base_column());
-        assert!(!handle.nullable());
-        // Iceberg keeps real table fields below the reserved metadata block, so
-        // no rename of a table column can ever collide with the sign.
-        assert!(
-            partitioned_schema()
-                .as_struct()
-                .fields()
-                .iter()
-                .all(|field| field.id < ICEBERG_CHANGE_OP_FIELD_ID)
-        );
-        // The sign is this connector's own IMV vocabulary, not one of Trino's
-        // `table_changes` metadata columns.
-        assert!(!TABLE_CHANGES_METADATA_COLUMNS.contains(&ICEBERG_CHANGE_OP_COLUMN));
-    }
-
-    #[test]
-    fn no_row_position_list_crosses_the_wire() {
-        let delete = position_delete("d.parquet");
-        let split = position_deleted("a.parquet", "d.parquet");
-        let rows = split.to_proto().rows.expect("rows variant");
-        let dto::iceberg_change_split::Rows::PositionDeletedRows(actual) = rows else {
-            panic!("expected the position-deleted variant");
-        };
-        // This exhaustive literal is the proof: the wire message carries the
-        // data split and the delete artifacts, and nothing else. A positions
-        // field would fail to compile here rather than slip through.
-        let expected = dto::IcebergPositionDeletedRows {
-            data: Some(split.data().to_proto()),
-            newly_applied_deletes: vec![delete.to_proto()],
-            previously_applied_deletes: Vec::new(),
-        };
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn a_reverse_side_split_never_doubles_as_a_delete_exclusion_closure() {
-        // The reverse side names its deletes as typed variant facts. Letting
-        // the data split also carry an exclusion closure would give one split
-        // two contradictory delete meanings.
-        let data =
-            data_split_with_deletes("a.parquet", 0, 100, 100, vec![position_delete("d.parquet")]);
-        assert!(
-            IcebergPositionDeletedRows::try_new(
-                data.clone(),
-                vec![position_delete("d.parquet")],
-                Vec::new()
-            )
-            .is_err()
-        );
-        assert!(IcebergDeletedDataFileRows::try_new(data.clone(), Vec::new()).is_err());
-        assert!(
-            IcebergEqualityDeletedRows::try_new(
-                data,
-                vec![equality_delete_of("e.parquet")],
-                Vec::new()
-            )
-            .is_err()
-        );
-        // The forward side does carry the upper endpoint's closure: those are
-        // exactly the rows that survive at `to`.
-        assert!(
-            IcebergAddedRows::try_new(
-                data_split_with_deletes(
-                    "a.parquet",
-                    0,
-                    100,
-                    100,
-                    vec![position_delete("d.parquet")]
-                ),
-                Vec::new()
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn each_variant_accepts_only_the_delete_artifacts_it_can_own() {
-        assert!(
-            IcebergPositionDeletedRows::try_new(
-                data_split("a.parquet", 0, 100, 100),
-                vec![equality_delete_of("e.parquet")],
-                Vec::new()
-            )
-            .is_err()
-        );
-        assert!(
-            IcebergEqualityDeletedRows::try_new(
-                data_split("a.parquet", 0, 100, 100),
-                vec![position_delete("d.parquet")],
-                Vec::new()
-            )
-            .is_err()
-        );
-        // Nothing newly invisible means nothing to emit.
-        assert!(
-            IcebergPositionDeletedRows::try_new(
-                data_split("a.parquet", 0, 100, 100),
-                Vec::new(),
-                Vec::new()
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn restricted_row_ids_are_a_strictly_increasing_set() {
-        let data = data_split("a.parquet", 0, 100, 100);
-        assert!(IcebergAddedRows::try_new(data.clone(), vec![1, 2, 9]).is_ok());
-        assert!(IcebergAddedRows::try_new(data.clone(), vec![2, 2]).is_err());
-        assert!(IcebergAddedRows::try_new(data.clone(), vec![9, 1]).is_err());
-        assert!(IcebergAddedRows::try_new(data, vec![-1]).is_err());
-    }
-
-    #[test]
-    fn an_endpoint_add_delete_and_re_add_stay_disjoint() {
-        // Three different files: one newly visible, one gone, one still
-        // present with newly invisible positions. Nothing overlaps.
-        let admitted = expect_incremental(vec![
-            added("added.parquet"),
-            removed("removed.parquet"),
-            position_deleted("kept.parquet", "d.parquet"),
-        ]);
-        assert_eq!(admitted.splits().len(), 3);
-        assert_eq!(
-            admitted
-                .splits()
-                .iter()
-                .filter(|split| split.side() == IcebergChangeSide::Forward)
-                .count(),
-            1
-        );
-
-        // A file cannot be both added inside the window and row-deleted in it:
-        // Iceberg files are immutable, so it had no `from`-visible rows.
-        let error = plan(vec![
-            added("a.parquet"),
-            position_deleted("a.parquet", "d.parquet"),
-        ])
-        .expect_err("added and row-deleted");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-
-        // A file that is gone at `to` owns all of its rows through one variant.
-        let error =
-            plan(vec![removed("a.parquet"), added("a.parquet")]).expect_err("removed and added");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-        let error = plan(vec![
-            removed("a.parquet"),
-            position_deleted("a.parquet", "d.parquet"),
-        ])
-        .expect_err("removed and position-deleted");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn a_removed_data_file_must_cover_its_planned_scan_region_exactly_once() {
-        // Two ranges that tile the file are fine.
-        let tiled = expect_incremental(vec![
-            IcebergChangeSplit::DeletedDataFileRows(
-                IcebergDeletedDataFileRows::try_new(
-                    data_split("a.parquet", 0, 40, 100),
-                    Vec::new(),
-                )
-                .expect("removed"),
-            ),
-            IcebergChangeSplit::DeletedDataFileRows(
-                IcebergDeletedDataFileRows::try_new(
-                    data_split("a.parquet", 40, 60, 100),
-                    Vec::new(),
-                )
-                .expect("removed"),
-            ),
-        ]);
-        assert_eq!(tiled.splits().len(), 2);
-
-        // Parquet manifest offsets begin at the first row group, commonly
-        // after the four-byte file header. That header contains no row the
-        // change window could own.
-        let offset_tiled = expect_incremental(vec![
-            IcebergChangeSplit::DeletedDataFileRows(
-                IcebergDeletedDataFileRows::try_new(
-                    data_split("offset.parquet", 4, 36, 100),
-                    Vec::new(),
-                )
-                .expect("removed"),
-            ),
-            IcebergChangeSplit::DeletedDataFileRows(
-                IcebergDeletedDataFileRows::try_new(
-                    data_split("offset.parquet", 40, 60, 100),
-                    Vec::new(),
-                )
-                .expect("removed"),
-            ),
-        ]);
-        assert_eq!(offset_tiled.splits().len(), 2);
-
-        // A gap silently drops rows the difference owns.
-        let error = plan(vec![IcebergChangeSplit::DeletedDataFileRows(
-            IcebergDeletedDataFileRows::try_new(data_split("a.parquet", 0, 40, 100), Vec::new())
-                .expect("removed"),
-        )])
-        .expect_err("partial coverage");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-
-        // An overlap emits them twice.
-        let error =
-            plan(vec![removed("a.parquet"), removed("a.parquet")]).expect_err("duplicate coverage");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn position_and_equality_output_of_one_file_never_overlap() {
-        let position_artifact = position_delete("d.parquet");
-        let overlapping = plan(vec![
-            position_deleted("a.parquet", "d.parquet"),
-            IcebergChangeSplit::EqualityDeletedRows(
-                IcebergEqualityDeletedRows::try_new(
-                    data_split("a.parquet", 0, 100, 100),
-                    vec![equality_delete_of("e.parquet")],
-                    Vec::new(),
-                )
-                .expect("equality deleted"),
-            ),
-        ])
-        .expect_err("equality does not exclude the position deletes");
-        assert_eq!(overlapping.kind(), ConnectorErrorKind::CorruptData);
-
-        // Carrying the position artifact as already applied is the proof that
-        // the equality output excludes those rows.
-        let disjoint = expect_incremental(vec![
-            position_deleted("a.parquet", "d.parquet"),
-            IcebergChangeSplit::EqualityDeletedRows(
-                IcebergEqualityDeletedRows::try_new(
-                    data_split("a.parquet", 0, 100, 100),
-                    vec![equality_delete_of("e.parquet")],
-                    vec![position_artifact],
-                )
-                .expect("equality deleted"),
-            ),
-        ]);
-        assert_eq!(disjoint.splits().len(), 2);
-    }
-
-    #[test]
-    fn splits_of_one_file_that_disagree_about_it_fail_closed() {
-        let error = plan(vec![
-            IcebergChangeSplit::DeletedDataFileRows(
-                IcebergDeletedDataFileRows::try_new(
-                    data_split("a.parquet", 0, 100, 100),
-                    Vec::new(),
-                )
-                .expect("removed"),
-            ),
-            IcebergChangeSplit::DeletedDataFileRows(
-                IcebergDeletedDataFileRows::try_new(
-                    data_split("a.parquet", 0, 200, 200),
-                    Vec::new(),
-                )
-                .expect("removed"),
-            ),
-        ])
-        .expect_err("inconsistent file size");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn an_unprovable_window_is_a_typed_full_rebuild_and_emits_nothing() {
+    fn unproven_visibility_emits_only_the_typed_full_rebuild() {
         let reason = ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
-            snapshot_id: 15,
-            failure: ConnectorChangeWindowReplaceFailure::RecordCountChanged,
+            snapshot_id: 20,
+            failure: ConnectorChangeWindowReplaceFailure::MissingOrInvalidSummary,
         };
-        // Even a split set that would fail disjointness never runs: an
-        // unproven window produces no rows at all, only the rebuild signal.
         let outcome = IcebergChangeWindowPlan::try_plan(
             change_window_handle(),
-            IcebergEndpointVisibility::Unproven(reason),
-            vec![
-                added("a.parquet"),
-                position_deleted("a.parquet", "d.parquet"),
-            ],
+            IcebergEndpointVisibility::Unproven(reason.clone()),
+            vec![],
         )
-        .expect("outcome");
-        match outcome {
-            IcebergChangeWindowPlanOutcome::FullRebuild(actual) => assert_eq!(actual, reason),
-            IcebergChangeWindowPlanOutcome::Incremental(_) => {
-                panic!("an unproven window must not be admitted")
-            }
-        }
-    }
-
-    #[test]
-    fn change_splits_round_trip_through_the_closed_wire_variant() {
-        let splits = vec![
-            added("a.parquet"),
-            position_deleted("b.parquet", "d.parquet"),
-            IcebergChangeSplit::EqualityDeletedRows(
-                IcebergEqualityDeletedRows::try_new(
-                    data_split("c.parquet", 0, 100, 100),
-                    vec![equality_delete_of("e.parquet")],
-                    vec![position_delete("d.parquet")],
-                )
-                .expect("equality deleted"),
-            ),
-            removed("f.parquet"),
-        ];
-        for split in splits {
-            let decoded = IcebergChangeSplit::from_proto(
-                &split.to_proto(),
-                ConnectorSplit::split_weight(&split),
-                ConnectorSplit::affinity_key(&split).map(ToOwned::to_owned),
-            )
-            .expect("decoded");
-            assert_eq!(decoded.change_op(), split.change_op());
-            assert_eq!(decoded.data().path(), split.data().path());
-            assert_eq!(decoded.to_proto(), split.to_proto());
-        }
+        .unwrap();
+        assert!(
+            matches!(outcome, IcebergChangeWindowPlanOutcome::FullRebuild(actual) if actual == reason)
+        );
     }
 
     #[test]
@@ -2032,7 +1594,12 @@ mod tests {
                 name_mapping_json: None,
                 from_snapshot_id_exclusive: 10,
                 to_snapshot_id_inclusive: 20,
-                partition_spec_jsons: BTreeMap::new(),
+                from_read_domain: domain(10),
+                to_read_domain: domain(20),
+                partition_spec_jsons: BTreeMap::from([(
+                    0,
+                    serde_json::to_string(&PartitionSpec::unpartition_spec()).unwrap()
+                )]),
             })
             .is_err()
         );
@@ -2044,7 +1611,12 @@ mod tests {
                 name_mapping_json: None,
                 from_snapshot_id_exclusive: 10,
                 to_snapshot_id_inclusive: 10,
-                partition_spec_jsons: BTreeMap::new(),
+                from_read_domain: domain(10),
+                to_read_domain: domain(10),
+                partition_spec_jsons: BTreeMap::from([(
+                    0,
+                    serde_json::to_string(&PartitionSpec::unpartition_spec()).unwrap()
+                )]),
             })
             .is_ok()
         );
@@ -2056,7 +1628,12 @@ mod tests {
                 name_mapping_json: None,
                 from_snapshot_id_exclusive: 10,
                 to_snapshot_id_inclusive: 20,
-                partition_spec_jsons: BTreeMap::new(),
+                from_read_domain: domain(10),
+                to_read_domain: domain(20),
+                partition_spec_jsons: BTreeMap::from([(
+                    0,
+                    serde_json::to_string(&PartitionSpec::unpartition_spec()).unwrap()
+                )]),
             })
             .is_err()
         );
@@ -2075,7 +1652,7 @@ mod tests {
             file_size: 100,
             file_record_count: 10,
             file_format: IcebergFileFormat::Parquet,
-            partition_spec_id: 7,
+            partition_spec_id: 0,
             partition_data_json: "{}".to_string(),
             decryption_data: None,
             split_weight: SplitWeight::STANDARD,
@@ -2100,7 +1677,7 @@ mod tests {
                 file_size: 100,
                 file_record_count: 10,
                 file_format: IcebergFileFormat::Puffin,
-                partition_spec_id: 7,
+                partition_spec_id: 0,
                 partition_data_json: "{}".to_string(),
                 decryption_data: None,
                 split_weight: SplitWeight::STANDARD,

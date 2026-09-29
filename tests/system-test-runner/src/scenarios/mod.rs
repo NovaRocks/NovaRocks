@@ -6,6 +6,9 @@ mod connector;
 mod distributed_writer;
 mod exchange_normal_close;
 mod frontend_lifecycle;
+mod iceberg_delete_applicability;
+mod iceberg_delete_oracle;
+mod iceberg_delete_performance;
 mod mv_recovery;
 mod mv_uea7;
 mod mv_uea7_handover;
@@ -47,6 +50,12 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(runtime_filter::scenarios());
     scenarios.extend(runtime_filter::native_trust_directional_scenarios());
     scenarios.extend(connector::scenarios());
+    scenarios.push(Box::new(
+        iceberg_delete_applicability::IcebergDeleteApplicability::default(),
+    ));
+    scenarios.push(Box::new(
+        iceberg_delete_performance::IcebergDeletePerformance::default(),
+    ));
     scenarios.extend(distributed_writer::scenarios());
     scenarios.extend(frontend_lifecycle::scenarios());
     scenarios.extend(catalog_state::scenarios());

@@ -397,6 +397,7 @@ mod tests {
         let spec = identity_partition_spec(&schema);
         let mut params = table_handle_params(&schema, Some(&spec));
         params.snapshot_id = None;
+        params.read_domain = None;
         let unpinned = IcebergTableHandle::try_new(params).expect("handle");
         assert!(IcebergMergeTableHandle::try_new(unpinned.clone(), insert_handle()).is_err());
         assert!(

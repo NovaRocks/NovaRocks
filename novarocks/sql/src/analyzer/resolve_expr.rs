@@ -6916,6 +6916,104 @@ mod tests {
     }
 
     #[test]
+    fn abs_analysis_preserves_input_binding_and_freezes_promoted_result() {
+        for (input, output) in [
+            (DataType::Int8, DataType::Int16),
+            (DataType::Int16, DataType::Int32),
+            (DataType::Int32, DataType::Int64),
+            (DataType::Int64, DataType::FixedSizeBinary(16)),
+            (DataType::FixedSizeBinary(16), DataType::FixedSizeBinary(16)),
+            (DataType::Float32, DataType::Float32),
+            (DataType::Float64, DataType::Float64),
+            (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
+        ] {
+            for nullable in [false, true] {
+                let catalog = UnaryInputCatalog {
+                    key_type: input.clone(),
+                    nullable,
+                };
+                let expression = analyze_projection_expr_with_catalog(
+                    "select abs(k) from unary_input",
+                    &catalog,
+                    crate::functions::builtin_sql_function_catalog(),
+                )
+                .unwrap();
+                assert_eq!(expression.data_type, output);
+                assert_eq!(expression.nullable, nullable);
+                let ExprKind::FunctionCall {
+                    name,
+                    args,
+                    binding,
+                    ..
+                } = &expression.kind
+                else {
+                    panic!("ABS must remain a bound scalar call");
+                };
+                assert_eq!(name, "abs");
+                let [arg] = args.as_slice() else {
+                    panic!("ABS must have one argument")
+                };
+                assert!(
+                    matches!(arg.kind, ExprKind::ColumnRef { .. }),
+                    "exact signed overloads must not receive a speculative input CAST"
+                );
+                assert_eq!(arg.data_type, input);
+                assert_eq!(arg.nullable, nullable);
+                assert_eq!(
+                    binding.selected.argument_types.as_ref(),
+                    &[novarocks_functions::FunctionArgumentType::Value(
+                        novarocks_functions::FunctionValueType::new(input.clone(), nullable)
+                    )]
+                );
+                let novarocks_functions::FunctionResultType::Scalar(result) =
+                    &binding.selected.result_type
+                else {
+                    panic!("ABS has a scalar result");
+                };
+                assert_eq!(result.data_type, output);
+                assert_eq!(result.nullable, nullable);
+            }
+        }
+    }
+
+    #[test]
+    fn abs_typed_null_and_outer_decimal_cast_keep_the_promoted_child() {
+        for (spelling, input, output) in [
+            ("tinyint", DataType::Int8, DataType::Int16),
+            ("smallint", DataType::Int16, DataType::Int32),
+            ("int", DataType::Int32, DataType::Int64),
+            ("bigint", DataType::Int64, DataType::FixedSizeBinary(16)),
+            (
+                "largeint",
+                DataType::FixedSizeBinary(16),
+                DataType::FixedSizeBinary(16),
+            ),
+        ] {
+            let expression =
+                analyze_projection_expr(&format!("select abs(cast(null as {spelling}))")).unwrap();
+            assert_eq!(expression.data_type, output);
+            assert!(expression.nullable);
+            let ExprKind::FunctionCall { args, .. } = expression.kind else {
+                panic!("expected ABS call");
+            };
+            assert_eq!(args[0].data_type, input);
+            assert!(args[0].nullable);
+        }
+        let expression =
+            analyze_projection_expr("select cast(abs(cast(-128 as tinyint)) as decimal(38,15))")
+                .unwrap();
+        assert_eq!(expression.data_type, DataType::Decimal128(38, 15));
+        let ExprKind::Cast { expr, .. } = expression.kind else {
+            panic!("expected outer Decimal CAST")
+        };
+        assert_eq!(expr.data_type, DataType::Int16);
+        let ExprKind::FunctionCall { args, .. } = expr.kind else {
+            panic!("expected inner ABS")
+        };
+        assert_eq!(args[0].data_type, DataType::Int8);
+    }
+
+    #[test]
     fn concat_modes_control_argument_channels_ordinals_and_output_names() {
         fn resolved(
             sql: &str,

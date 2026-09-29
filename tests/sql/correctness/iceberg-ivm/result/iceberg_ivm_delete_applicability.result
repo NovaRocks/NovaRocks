@@ -1,0 +1,72 @@
+-- query 3
+source	id	p	value
+base	1	1	one
+base	2	1	dup
+base	2	1	dup
+base	3	1	three
+base	4	1	four
+full	1	1	one
+full	2	1	dup
+full	2	1	dup
+full	3	1	three
+full	4	1	four
+incremental	1	1	one
+incremental	2	1	dup
+incremental	2	1	dup
+incremental	3	1	three
+incremental	4	1	four
+
+-- query 7
+source	id	p	value
+base	1	1	one
+base	2	1	new-two
+base	3	1	three
+base	4	1	four
+base	6	1	six
+full	1	1	one
+full	2	1	new-two
+full	3	1	three
+full	4	1	four
+full	6	1	six
+incremental	1	1	one
+incremental	2	1	new-two
+incremental	3	1	three
+incremental	4	1	four
+incremental	6	1	six
+
+-- query 11
+source	id	p	value
+base	1	1	one
+base	3	1	three
+base	4	1	four
+full	1	1	one
+full	3	1	three
+full	4	1	four
+incremental	1	1	one
+incremental	3	1	three
+incremental	4	1	four
+
+-- query 15
+source	id	p	value
+base	1	1	one
+base	3	1	three
+base	4	1	four
+full	1	1	one
+full	3	1	three
+full	4	1	four
+incremental	1	1	one
+incremental	3	1	three
+incremental	4	1	four
+
+-- query 19
+source	id	p	value
+base	7	1	seven
+base	8	1	eight
+base	8	1	eight
+full	7	1	seven
+full	8	1	eight
+full	8	1	eight
+incremental	7	1	seven
+incremental	8	1	eight
+incremental	8	1	eight
+

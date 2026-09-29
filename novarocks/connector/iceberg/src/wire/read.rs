@@ -42,20 +42,21 @@ use crate::typed_read::{
     HiveTransactionHandle, IcebergAddedRows, IcebergChangeSplit, IcebergChangeWindowHandle,
     IcebergChangeWindowHandleParams, IcebergColumnHandle, IcebergColumnHandleParams,
     IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams,
-    IcebergDeletedDataFileRows, IcebergEqualityDeletedRows, IcebergFileFormat,
-    IcebergInsertTableHandle, IcebergInsertTableHandleParams, IcebergMergeTableHandle,
-    IcebergOptimizeHandle, IcebergPositionDeletedRows, IcebergProcedureId, IcebergReadSplit,
-    IcebergRewriteArtifactContentId, IcebergRewritePositionDeleteFilesHandle,
-    IcebergRewritePositionDeleteFilesSplit, IcebergRewritePositionDeleteFilesSplitParams,
-    IcebergRuntimeRelation, IcebergSplit, IcebergSplitParams, IcebergSystemTableReference,
-    IcebergSystemTableReferenceParams, IcebergSystemTableType, IcebergTableExecuteHandle,
-    IcebergTableExecuteHandleParams, IcebergTableExecuteProcedureHandle, IcebergTableHandle,
-    IcebergTableHandleParams, ParquetFileDecryptionData, TableChangesChangeType,
+    IcebergDeletedDataFileRows, IcebergFileFormat, IcebergInsertTableHandle,
+    IcebergInsertTableHandleParams, IcebergMergeTableHandle, IcebergOptimizeHandle,
+    IcebergProcedureId, IcebergReadSplit, IcebergRewriteArtifactContentId,
+    IcebergRewritePositionDeleteFilesHandle, IcebergRewritePositionDeleteFilesSplit,
+    IcebergRewritePositionDeleteFilesSplitParams, IcebergRuntimeRelation, IcebergSplit,
+    IcebergSplitParams, IcebergSystemTableReference, IcebergSystemTableReferenceParams,
+    IcebergSystemTableType, IcebergTableExecuteHandle, IcebergTableExecuteHandleParams,
+    IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
+    IcebergVisibilityDifferenceRows, ParquetFileDecryptionData, TableChangesChangeType,
     TableChangesFunctionHandle, TableChangesFunctionHandleParams, TableChangesSplit,
     TableChangesSplitParams, TrinoManifestContent, TrinoManifestFile, TrinoManifestFileParams,
 };
 
 use super::dto;
+use crate::typed_read::split::{decode_read_domain, encode_read_domain};
 
 const MAX_PRIVATE_READ_BYTES: usize = 16 * 1024 * 1024;
 
@@ -147,7 +148,7 @@ impl ConnectorPrivateDecoder<IcebergColumnHandle> for IcebergReadWireCodec {
 
 impl ConnectorPrivateEncoder<IcebergReadSplit> for IcebergReadWireCodec {
     fn encode_private(&self, value: &IcebergReadSplit) -> Result<Bytes, ConnectorCodecError> {
-        Ok(Bytes::from(encode_split(value).encode_to_vec()))
+        Ok(Bytes::from(encode_split(value)?.encode_to_vec()))
     }
 }
 
@@ -242,6 +243,7 @@ enum Schema {
     Transaction,
     ReadView,
     Pinned,
+    ReadDomain,
     Table,
     TableFunction,
     ChangeWindowHandle,
@@ -258,8 +260,7 @@ enum Schema {
     DataSplit,
     TableChangesSplit,
     AddedRows,
-    PositionDeletedRows,
-    EqualityDeletedRows,
+    VisibilityDifference,
     DeletedDataFileRows,
     ChangeSplit,
     Manifest,
@@ -391,15 +392,22 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             1 => repeated(Scalar),
             _ => return None,
         },
+        ReadDomain => match field {
+            1..=3 | 5 => singular(Scalar),
+            4 => singular(Varint),
+            6 | 7 => repeated(MapI32String),
+            _ => return None,
+        },
         Table => match field {
             1 => singular(Message(SchemaName)),
             2 | 4 | 6 | 9 => singular(Varint),
             3 | 11 | 12 => singular(Scalar),
-            5 | 15 => repeated(MapI32String),
+            5 | 16 => repeated(MapI32String),
             7 | 8 => singular(Message(TupleDomain)),
             10 => repeated(Message(Column)),
             13 => repeated(MapStringString),
             14 => singular(Message(Pinned)),
+            15 => singular(Message(ReadDomain)),
             _ => return None,
         },
         TableFunction => match field {
@@ -410,6 +418,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             _ => return None,
         },
         ChangeWindowHandle => match field {
+            8 | 9 => singular(Message(ReadDomain)),
             1 => singular(Message(SchemaName)),
             2 | 4 => singular(Scalar),
             3 => repeated(Message(Column)),
@@ -471,13 +480,14 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             _ => return None,
         },
         Delete => match field {
-            1 | 3 | 4 | 5 | 7..=11 => singular(Varint),
-            2 | 13 => singular(Scalar),
+            1 | 3 | 4 | 5 | 7..=11 | 14 => singular(Varint),
+            2 | 13 | 15 => singular(Scalar),
             6 => repeated(PackedVarint),
             12 => singular(Message(Decryption)),
             _ => return None,
         },
         DataSplit => match field {
+            14 => singular(Message(ReadDomain)),
             1 | 8 => singular(Scalar),
             2..=7 | 11 | 12 => singular(Varint),
             9 => repeated(Message(Delete)),
@@ -496,20 +506,18 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             2 => repeated(PackedVarint),
             _ => return None,
         },
-        PositionDeletedRows | EqualityDeletedRows => match field {
+        VisibilityDifference => match field {
             1 => singular(Message(DataSplit)),
             2 | 3 => repeated(Message(Delete)),
             _ => return None,
         },
         DeletedDataFileRows => match field {
             1 => singular(Message(DataSplit)),
-            2 => repeated(Message(Delete)),
             _ => return None,
         },
         ChangeSplit => match field {
             10 => oneof(Message(AddedRows)),
-            11 => oneof(Message(PositionDeletedRows)),
-            12 => oneof(Message(EqualityDeletedRows)),
+            14 => oneof(Message(VisibilityDifference)),
             13 => oneof(Message(DeletedDataFileRows)),
             _ => return None,
         },
@@ -630,7 +638,7 @@ fn scan_message(
                 )?;
             }
             WireValue::MapI32String | WireValue::MapStringString => {
-                if matches!(schema, Schema::Table) && field == 15 {
+                if matches!(schema, Schema::Table) && field == 16 {
                     // A conservative bound covers one field-ID/domain entry,
                     // including a sparsely occupied BTree node, before decode.
                     context.ledger().charge_retained(256)?;
@@ -1383,6 +1391,7 @@ fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
             .iter()
             .map(|(id, domain)| (*id, domain.name().to_string()))
             .collect(),
+        read_domain: value.read_domain().map(|domain| encode_read_domain(domain)),
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
         snapshot_id: value.snapshot_id(),
         table_schema_json: value.table_schema_json().to_string(),
@@ -1429,6 +1438,12 @@ fn decode_table(raw: &dto::IcebergTableHandle) -> Result<IcebergTableHandle, Con
         .transpose()
         .map_err(|error| domain_error("iceberg_table.pinned_data_files", error))?;
     IcebergTableHandle::try_new(IcebergTableHandleParams {
+        read_domain: raw
+            .read_domain
+            .as_ref()
+            .map(decode_read_domain)
+            .transpose()
+            .map_err(|e| domain_error("iceberg_table.read_domain", e))?,
         schema_table_name: decode_schema_name(raw.schema_table_name.as_ref().ok_or_else(
             || {
                 codec_error(
@@ -1531,6 +1546,8 @@ fn decode_table_function(
 
 fn encode_change_window(value: &IcebergChangeWindowHandle) -> dto::IcebergChangeWindowHandle {
     dto::IcebergChangeWindowHandle {
+        from_read_domain: Some(encode_read_domain(value.from_read_domain())),
+        to_read_domain: Some(encode_read_domain(value.to_read_domain())),
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
         table_schema_json: value.table_schema_json().to_string(),
         columns: value.columns().iter().map(encode_column).collect(),
@@ -1549,6 +1566,22 @@ fn decode_change_window(
     raw: &dto::IcebergChangeWindowHandle,
 ) -> Result<IcebergChangeWindowHandle, ConnectorCodecError> {
     IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
+        from_read_domain: decode_read_domain(raw.from_read_domain.as_ref().ok_or_else(|| {
+            codec_error(
+                "change_window.from_read_domain",
+                ConnectorCodecErrorKind::MissingField,
+                "change window requires From domain",
+            )
+        })?)
+        .map_err(|e| domain_error("change_window.from_read_domain", e))?,
+        to_read_domain: decode_read_domain(raw.to_read_domain.as_ref().ok_or_else(|| {
+            codec_error(
+                "change_window.to_read_domain",
+                ConnectorCodecErrorKind::MissingField,
+                "change window requires To domain",
+            )
+        })?)
+        .map_err(|e| domain_error("change_window.to_read_domain", e))?,
         schema_table_name: decode_schema_name(raw.schema_table_name.as_ref().ok_or_else(
             || {
                 codec_error(
@@ -1926,6 +1959,8 @@ fn decode_decryption(
 
 fn encode_delete(value: &IcebergDeleteFile) -> dto::IcebergDeleteFile {
     dto::IcebergDeleteFile {
+        partition_spec_id: Some(value.partition_spec_id()),
+        partition_data_json: value.partition_data_json().to_string(),
         content: match value.content() {
             IcebergDeleteFileContent::PositionDeletes => {
                 dto::IcebergDeleteFileContent::PositionDeletes
@@ -1966,6 +2001,14 @@ fn decode_delete(raw: &dto::IcebergDeleteFile) -> Result<IcebergDeleteFile, Conn
         }
     };
     IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+        partition_spec_id: raw.partition_spec_id.ok_or_else(|| {
+            codec_error(
+                "iceberg_delete.partition_spec_id",
+                ConnectorCodecErrorKind::MissingField,
+                "Iceberg delete requires its own spec",
+            )
+        })?,
+        partition_data_json: raw.partition_data_json.clone(),
         content,
         path: raw.path.clone(),
         format: decode_file_format(raw.format)?,
@@ -1987,8 +2030,9 @@ fn decode_delete(raw: &dto::IcebergDeleteFile) -> Result<IcebergDeleteFile, Conn
     .map_err(|error| domain_error("iceberg_delete", error))
 }
 
-fn encode_data_split(value: &IcebergSplit) -> dto::IcebergSplit {
-    dto::IcebergSplit {
+fn encode_data_split(value: &IcebergSplit) -> Result<dto::IcebergSplit, ConnectorCodecError> {
+    Ok(dto::IcebergSplit {
+        read_domain: Some(encode_read_domain(value.read_domain())),
         path: value.path().to_string(),
         start: value.start(),
         length: value.length(),
@@ -1997,12 +2041,20 @@ fn encode_data_split(value: &IcebergSplit) -> dto::IcebergSplit {
         file_format: encode_file_format(value.file_format()),
         partition_spec_id: value.partition_spec_id(),
         partition_data_json: value.partition_data_json().to_string(),
-        deletes: value.deletes().iter().map(encode_delete).collect(),
+        deletes: value
+            .deletes()
+            .iter()
+            .map(|member| {
+                member
+                    .map(|member| encode_delete(&member))
+                    .map_err(|e| domain_error("iceberg_split.deletes", e))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         file_statistics_domain: Some(encode_tuple_domain(value.file_statistics_domain())),
         data_sequence_number: value.data_sequence_number(),
         file_first_row_id: value.file_first_row_id(),
         decryption_data: value.decryption_data().map(encode_decryption),
-    }
+    })
 }
 
 fn decode_data_split(
@@ -2011,6 +2063,14 @@ fn decode_data_split(
     affinity_key: Option<String>,
 ) -> Result<IcebergSplit, ConnectorCodecError> {
     IcebergSplit::try_new(IcebergSplitParams {
+        read_domain: decode_read_domain(raw.read_domain.as_ref().ok_or_else(|| {
+            codec_error(
+                "iceberg_split.read_domain",
+                ConnectorCodecErrorKind::MissingField,
+                "Iceberg split requires its domain",
+            )
+        })?)
+        .map_err(|e| domain_error("iceberg_split.read_domain", e))?,
         path: raw.path.clone(),
         start: raw.start,
         length: raw.length,
@@ -2023,7 +2083,8 @@ fn decode_data_split(
             .deletes
             .iter()
             .map(decode_delete)
-            .collect::<Result<Vec<_>, _>>()?,
+            .collect::<Result<Vec<_>, _>>()?
+            .into(),
         file_statistics_domain: decode_tuple_domain(
             raw.file_statistics_domain.as_ref().ok_or_else(|| {
                 codec_error(
@@ -2105,55 +2166,29 @@ fn decode_table_changes_split(
     .map_err(|error| domain_error("table_changes_split", error))
 }
 
-fn encode_change_split(value: &IcebergChangeSplit) -> dto::IcebergChangeSplit {
+fn encode_change_split(
+    value: &IcebergChangeSplit,
+) -> Result<dto::IcebergChangeSplit, ConnectorCodecError> {
     use dto::iceberg_change_split::Rows;
     let rows = match value {
         IcebergChangeSplit::AddedRows(rows) => Rows::AddedRows(dto::IcebergAddedRows {
-            data: Some(encode_data_split(rows.data())),
+            data: Some(encode_data_split(rows.data())?),
             restricted_row_ids: rows.restricted_row_ids().to_vec(),
         }),
-        IcebergChangeSplit::PositionDeletedRows(rows) => {
-            Rows::PositionDeletedRows(dto::IcebergPositionDeletedRows {
-                data: Some(encode_data_split(rows.data())),
-                newly_applied_deletes: rows
-                    .newly_applied_deletes()
-                    .iter()
-                    .map(encode_delete)
-                    .collect(),
-                previously_applied_deletes: rows
-                    .previously_applied_deletes()
-                    .iter()
-                    .map(encode_delete)
-                    .collect(),
-            })
-        }
-        IcebergChangeSplit::EqualityDeletedRows(rows) => {
-            Rows::EqualityDeletedRows(dto::IcebergEqualityDeletedRows {
-                data: Some(encode_data_split(rows.data())),
-                newly_applied_equality_deletes: rows
-                    .newly_applied_equality_deletes()
-                    .iter()
-                    .map(encode_delete)
-                    .collect(),
-                previously_applied_deletes: rows
-                    .previously_applied_deletes()
-                    .iter()
-                    .map(encode_delete)
-                    .collect(),
+        IcebergChangeSplit::VisibilityDifference(rows) => {
+            Rows::VisibilityDifference(dto::IcebergVisibilityDifference {
+                data: Some(encode_data_split(rows.data())?),
+                from_deletes: rows.from_deletes().iter().map(encode_delete).collect(),
+                to_deletes: rows.to_deletes().iter().map(encode_delete).collect(),
             })
         }
         IcebergChangeSplit::DeletedDataFileRows(rows) => {
             Rows::DeletedDataFileRows(dto::IcebergDeletedDataFileRows {
-                data: Some(encode_data_split(rows.data())),
-                previously_applied_deletes: rows
-                    .previously_applied_deletes()
-                    .iter()
-                    .map(encode_delete)
-                    .collect(),
+                data: Some(encode_data_split(rows.data())?),
             })
         }
     };
-    dto::IcebergChangeSplit { rows: Some(rows) }
+    Ok(dto::IcebergChangeSplit { rows: Some(rows) })
 }
 
 fn required_data<'a>(
@@ -2192,54 +2227,30 @@ fn decode_change_split(
             )
             .map_err(|error| domain_error("change_window_split.added_rows", error))?,
         )),
-        Rows::PositionDeletedRows(rows) => Ok(IcebergChangeSplit::PositionDeletedRows(
-            IcebergPositionDeletedRows::try_new(
+        Rows::VisibilityDifference(rows) => Ok(IcebergChangeSplit::VisibilityDifference(
+            IcebergVisibilityDifferenceRows::try_new(
                 decode_data_split(
                     required_data(rows.data.as_ref())?,
                     split_weight,
                     affinity_key,
                 )?,
-                rows.newly_applied_deletes
+                rows.from_deletes
                     .iter()
                     .map(decode_delete)
                     .collect::<Result<Vec<_>, _>>()?,
-                rows.previously_applied_deletes
-                    .iter()
-                    .map(decode_delete)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .map_err(|error| domain_error("change_window_split.position_deleted_rows", error))?,
-        )),
-        Rows::EqualityDeletedRows(rows) => Ok(IcebergChangeSplit::EqualityDeletedRows(
-            IcebergEqualityDeletedRows::try_new(
-                decode_data_split(
-                    required_data(rows.data.as_ref())?,
-                    split_weight,
-                    affinity_key,
-                )?,
-                rows.newly_applied_equality_deletes
-                    .iter()
-                    .map(decode_delete)
-                    .collect::<Result<Vec<_>, _>>()?,
-                rows.previously_applied_deletes
+                rows.to_deletes
                     .iter()
                     .map(decode_delete)
                     .collect::<Result<Vec<_>, _>>()?,
             )
-            .map_err(|error| domain_error("change_window_split.equality_deleted_rows", error))?,
+            .map_err(|error| domain_error("change_window_split.visibility_difference", error))?,
         )),
         Rows::DeletedDataFileRows(rows) => Ok(IcebergChangeSplit::DeletedDataFileRows(
-            IcebergDeletedDataFileRows::try_new(
-                decode_data_split(
-                    required_data(rows.data.as_ref())?,
-                    split_weight,
-                    affinity_key,
-                )?,
-                rows.previously_applied_deletes
-                    .iter()
-                    .map(decode_delete)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
+            IcebergDeletedDataFileRows::try_new(decode_data_split(
+                required_data(rows.data.as_ref())?,
+                split_weight,
+                affinity_key,
+            )?)
             .map_err(|error| domain_error("change_window_split.deleted_data_file_rows", error))?,
         )),
     }
@@ -2371,20 +2382,22 @@ fn decode_rewrite_split(
     .map_err(|error| domain_error("rewrite_position_delete_files_split", error))
 }
 
-fn encode_split(value: &IcebergReadSplit) -> dto::IcebergReadSplitPayload {
+fn encode_split(
+    value: &IcebergReadSplit,
+) -> Result<dto::IcebergReadSplitPayload, ConnectorCodecError> {
     use dto::iceberg_read_split_payload::Split;
     let split = match value {
-        IcebergReadSplit::Data(value) => Split::Data(encode_data_split(value)),
+        IcebergReadSplit::Data(value) => Split::Data(encode_data_split(value)?),
         IcebergReadSplit::TableChanges(value) => {
             Split::TableChanges(encode_table_changes_split(value))
         }
-        IcebergReadSplit::ChangeWindow(value) => Split::ChangeWindow(encode_change_split(value)),
+        IcebergReadSplit::ChangeWindow(value) => Split::ChangeWindow(encode_change_split(value)?),
         IcebergReadSplit::SystemFiles(value) => Split::SystemFiles(encode_files_split(value)),
         IcebergReadSplit::RewritePositionDeleteFiles(value) => {
             Split::RewritePositionDeleteFiles(encode_rewrite_split(value))
         }
     };
-    dto::IcebergReadSplitPayload { split: Some(split) }
+    Ok(dto::IcebergReadSplitPayload { split: Some(split) })
 }
 
 fn decode_split(
@@ -2499,7 +2512,8 @@ mod tests {
                 CatalogVersion::from_bytes([7; 32]),
             ),
             category,
-            ConnectorCodecRevision::try_new(1).unwrap(),
+            ConnectorCodecRevision::try_new(crate::contract_revision::ICEBERG_CONTRACT_REVISION)
+                .unwrap(),
         )
     }
 
@@ -2588,8 +2602,9 @@ mod tests {
                 file_record_count: 1,
                 file_format: IcebergFileFormat::Parquet,
                 partition_spec_id: 0,
-                partition_data_json: "{}".to_string(),
-                deletes: vec![],
+                read_domain: crate::typed_read::split::tests::read_domain(),
+                partition_data_json: crate::typed_read::split::tests::partition_json(),
+                deletes: vec![].into(),
                 file_statistics_domain: TupleDomain::all(),
                 data_sequence_number: Some(1),
                 file_first_row_id: None,
@@ -2634,6 +2649,211 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind(), ConnectorCodecErrorKind::InconsistentFields);
+    }
+
+    #[test]
+    fn planned_suffix_wire_expansion_preserves_public_descriptor_charge() {
+        use crate::delete_semantics::*;
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use crate::typed_read::split::IcebergSplitDeletes;
+        use std::sync::Arc;
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "tenant",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .with_identifier_field_ids([2, 1])
+            .build()
+            .unwrap();
+        let spec = crate::iceberg::spec::PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+        let domain = Arc::new(ReadDomain::new(
+            ReadObservationId::try_new([31; 16]).unwrap(),
+            PinnedEndpointFacts::try_new(
+                uuid::Uuid::from_bytes([32; 16]),
+                "s3://warehouse/metadata/identifiers.json",
+                11,
+                &schema,
+                &[spec.clone()],
+            )
+            .unwrap(),
+        ));
+        let table = IcebergRuntimeRelation::Table(
+            IcebergTableHandle::try_new(IcebergTableHandleParams {
+                schema_table_name: SchemaTableName::try_new("db", "identifier_events").unwrap(),
+                snapshot_id: Some(11),
+                read_domain: Some(domain.clone()),
+                table_schema_json: domain.endpoint().schema_json().to_string(),
+                spec_id: Some(0),
+                partition_spec_jsons: domain
+                    .endpoint()
+                    .partition_spec_jsons()
+                    .iter()
+                    .map(|(id, json)| (*id, json.to_string()))
+                    .collect(),
+                format_version: 2,
+                unenforced_predicate: TupleDomain::all(),
+                enforced_predicate: TupleDomain::all(),
+                limit: None,
+                projected_columns: Default::default(),
+                name_mapping_json: None,
+                table_location: "s3://warehouse/identifier_events".to_string(),
+                storage_properties: Default::default(),
+                pinned_data_files: None,
+            })
+            .unwrap(),
+        );
+        let table_payload = IcebergReadWireCodec.encode_private(&table).unwrap();
+        let decoded: IcebergRuntimeRelation =
+            decode_with(ConnectorCodecCategory::ReadTable, &table_payload).unwrap();
+        let IcebergRuntimeRelation::Table(decoded_table) = decoded else {
+            unreachable!()
+        };
+        assert_eq!(decoded_table.read_domain(), Some(&domain));
+        let identifiers = decoded_table
+            .read_domain()
+            .unwrap()
+            .endpoint()
+            .schema()
+            .unwrap();
+        assert_eq!(
+            identifiers
+                .identifier_field_ids()
+                .collect::<std::collections::HashSet<_>>(),
+            [1, 2].into_iter().collect()
+        );
+        let partition =
+            TypedPartition::bind(&spec, &schema, &crate::iceberg::spec::Struct::empty()).unwrap();
+        let data_path = "s3://warehouse/independently-frozen/data.parquet";
+        let files = [
+            (
+                "s3://warehouse/delete/short.parquet",
+                DeleteKind::Equality(EqualityFieldGroup::bind(&[2, 1], &schema).unwrap()),
+                2,
+            ),
+            (
+                "s3://warehouse/delete/a-much-longer-path.parquet",
+                DeleteKind::Equality(EqualityFieldGroup::bind(&[2, 1], &schema).unwrap()),
+                7,
+            ),
+            (
+                "s3://warehouse/delete/position.parquet",
+                DeleteKind::Position {
+                    exact_target: Some(Arc::from(data_path)),
+                },
+                1,
+            ),
+        ];
+        let observation = DeleteObservation::from_manifests([ManifestDeleteObservation {
+            manifest_path: Arc::from("s3://warehouse/metadata/delete-manifest.avro"),
+            entries: files
+                .into_iter()
+                .map(|(path, kind, sequence)| RawDeleteEntry {
+                    sequence: EntrySequence {
+                        format_version: crate::iceberg::spec::FormatVersion::V2,
+                        status: crate::iceberg::spec::ManifestStatus::Existing,
+                        data_sequence: Some(sequence),
+                        manifest_sequence: 9,
+                    },
+                    file: RawDeleteFile {
+                        address: DeleteContentAddress::file(path).unwrap(),
+                        kind,
+                        partition: partition.clone(),
+                        read: DeleteReadFacts {
+                            format: DeleteFormat::Parquet,
+                            file_size: 32,
+                            record_count: 2,
+                            key_metadata: Arc::from([3u8, 9]),
+                        },
+                        metrics: FileMetrics::default(),
+                    },
+                })
+                .collect(),
+        }])
+        .unwrap();
+        let index = DeleteCandidateIndex::try_new(domain.clone(), observation).unwrap();
+        for sequence in [1, 3, 8] {
+            let data = DataFileFact::try_new(
+                data_path,
+                DataSequenceNumber::try_new(sequence).unwrap(),
+                partition.clone(),
+                10,
+                FileMetrics::default(),
+            )
+            .unwrap();
+            let view = index
+                .for_data(&data)
+                .unwrap()
+                .load_view(StatisticsPolicy::Disabled);
+            let split = IcebergReadSplit::Data(
+                IcebergSplit::try_new(IcebergSplitParams {
+                    read_domain: domain.clone(),
+                    path: data_path.to_string(),
+                    start: 0,
+                    length: 64,
+                    file_size: 64,
+                    file_record_count: 10,
+                    file_format: IcebergFileFormat::Parquet,
+                    partition_spec_id: 0,
+                    partition_data_json: partition.to_json_string(),
+                    deletes: IcebergSplitDeletes::Planned(view),
+                    file_statistics_domain: TupleDomain::all(),
+                    data_sequence_number: Some(sequence),
+                    file_first_row_id: None,
+                    decryption_data: None,
+                    split_weight: SplitWeight::STANDARD,
+                    affinity_key: None,
+                })
+                .unwrap(),
+            );
+            let payload = IcebergReadWireCodec.encode_private(&split).unwrap();
+            let facts = ConnectorReadSplitFacts::new(
+                true,
+                vec![],
+                None::<String>,
+                SplitWeight::STANDARD,
+                split.retained_size_in_bytes(),
+            );
+            let header = header(ConnectorCodecCategory::ReadSplit);
+            let mut ledger = ConnectorDecodeLedger::new(limits());
+            let decoded = IcebergReadWireCodec
+                .decode_split_private(
+                    &payload,
+                    &facts,
+                    &mut ConnectorDecodeContext::new(&header, &mut ledger),
+                )
+                .unwrap();
+            assert_eq!(
+                decoded.retained_size_in_bytes(),
+                split.retained_size_in_bytes()
+            );
+            let IcebergReadSplit::Data(before) = &split else {
+                unreachable!()
+            };
+            let IcebergReadSplit::Data(after) = decoded else {
+                unreachable!()
+            };
+            assert_eq!(
+                before.deletes().to_vec().unwrap(),
+                after.deletes().to_vec().unwrap()
+            );
+            assert!(matches!(after.deletes(), IcebergSplitDeletes::Decoded(_)));
+            assert_eq!(after.read_domain(), decoded_table.read_domain().unwrap());
+            assert_eq!(
+                after.read_domain().endpoint().schema_json(),
+                decoded_table.table_schema_json()
+            );
+        }
     }
 
     fn decode_view_bytes(payload: &[u8], limits: ConnectorDecodeLimits) -> ConnectorCodecError {
@@ -2792,5 +3012,87 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod change_window_wire_tests {
+    use super::*;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+        ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEnvelopeHeader, ConnectorInstanceId,
+        ConnectorProviderId,
+    };
+
+    fn scan<T: Message + Default>(bytes: &[u8], schema: Schema) -> Result<T, ConnectorCodecError> {
+        let header = ConnectorEnvelopeHeader::new(
+            ConnectorProviderId::parse(crate::PROVIDER_ID).unwrap(),
+            CatalogHandle::new(
+                ConnectorInstanceId::try_from_canonical("lake").unwrap(),
+                CatalogVersion::from_bytes([7; 32]),
+            ),
+            ConnectorCodecCategory::ReadSplit,
+            ConnectorCodecRevision::try_new(crate::contract_revision::ICEBERG_CONTRACT_REVISION)
+                .unwrap(),
+        );
+        let mut ledger = ConnectorDecodeLedger::new(
+            ConnectorDecodeLimits::try_new(1 << 20, 1 << 20, 1 << 20, 100_000, 64).unwrap(),
+        );
+        decode_root(
+            bytes,
+            &mut ConnectorDecodeContext::new(&header, &mut ledger),
+            ConnectorFieldPath::root("change_split"),
+            schema,
+        )
+    }
+
+    #[test]
+    fn retired_partial_change_variants_and_removed_file_prior_field_are_rejected() {
+        for retired in [11_u8, 12_u8] {
+            let error =
+                scan::<dto::IcebergChangeSplit>(&[(retired << 3) | 2, 0], Schema::ChangeSplit)
+                    .unwrap_err();
+            assert_eq!(error.kind(), ConnectorCodecErrorKind::UnknownField);
+        }
+        let error =
+            scan::<dto::IcebergDeletedDataFileRows>(&[0x12, 0], Schema::DeletedDataFileRows)
+                .unwrap_err();
+        assert_eq!(error.kind(), ConnectorCodecErrorKind::UnknownField);
+    }
+
+    #[test]
+    fn complete_endpoint_wire_has_one_owner_and_validates_both_delete_lists() {
+        let difference = dto::IcebergVisibilityDifference {
+            data: None,
+            from_deletes: vec![],
+            to_deletes: vec![],
+        };
+        let raw = dto::IcebergChangeSplit {
+            rows: Some(dto::iceberg_change_split::Rows::VisibilityDifference(
+                difference,
+            )),
+        };
+        let encoded = raw.encode_to_vec();
+        let decoded: dto::IcebergChangeSplit = scan(&encoded, Schema::ChangeSplit).unwrap();
+        assert_eq!(decoded, raw);
+        let mut duplicated = encoded.clone();
+        duplicated.extend_from_slice(&encoded);
+        assert_eq!(
+            scan::<dto::IcebergChangeSplit>(&duplicated, Schema::ChangeSplit)
+                .unwrap_err()
+                .kind(),
+            ConnectorCodecErrorKind::DuplicateField
+        );
+        // Both complete endpoint lists recurse through the strict delete schema.
+        for field in [2_u8, 3_u8] {
+            let invalid_delete = [(field << 3) | 2, 2, 0xf8, 0x01];
+            assert!(
+                scan::<dto::IcebergVisibilityDifference>(
+                    &invalid_delete,
+                    Schema::VisibilityDifference
+                )
+                .is_err()
+            );
+        }
     }
 }

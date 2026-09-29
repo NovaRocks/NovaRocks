@@ -40,7 +40,7 @@ use super::{HiveTransactionHandle, IcebergColumnHandle, IcebergReadSplit, Iceber
 mod recipe;
 pub use recipe::IcebergReadRecipeCompiler;
 
-pub(crate) const ICEBERG_READ_CODEC_REVISION: u32 = 1;
+pub(crate) use crate::contract_revision::ICEBERG_CONTRACT_REVISION as ICEBERG_READ_CODEC_REVISION;
 const MAX_PRIVATE_READ_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PRIVATE_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 

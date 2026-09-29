@@ -133,6 +133,9 @@ pub struct IcebergDeleteFileInfo {
     pub path: String,
     pub file_format: IcebergDeleteFileFormat,
     pub file_content: IcebergDeleteFileContent,
+    /// Exact manifest facts; synthetic descriptors may explicitly lack them.
+    pub record_count: Option<i64>,
+    pub partition_data_json: Option<String>,
     pub length: Option<i64>,
     pub content_offset: Option<i64>,
     pub content_size_in_bytes: Option<i64>,

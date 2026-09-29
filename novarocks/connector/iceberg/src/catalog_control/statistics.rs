@@ -2270,6 +2270,8 @@ mod tests {
             data_sequence_number: None,
             delete_files: if has_deletes {
                 vec![crate::scan_model::IcebergDeleteFileInfo {
+                    record_count: None,
+                    partition_data_json: None,
                     path: "delete.parquet".to_string(),
                     file_format: crate::scan_model::IcebergDeleteFileFormat::Parquet,
                     file_content: crate::scan_model::IcebergDeleteFileContent::Position,

@@ -85,19 +85,15 @@ impl DeletionVector {
         self.bitmaps.values().all(RoaringBitmap::is_empty)
     }
 
-    /// Convert this deletion vector into a flat [`RoaringTreemap`] over the
-    /// full 64-bit position space. Used by the IVM-changelog-scan path
-    /// (`scan_deletes`) to reuse the v2-style `RoaringTreemap`-based
-    /// position-set machinery without having to introduce a new bitmap type.
+    /// Copy the compressed bitmaps into a [`RoaringTreemap`] for synchronous
+    /// callers without enumerating the represented positions. Async readers
+    /// use the cooperative decoder so each poll performs bounded work.
     pub fn to_roaring_treemap(&self) -> roaring::RoaringTreemap {
-        let mut out = roaring::RoaringTreemap::new();
-        for (high_word, bitmap) in &self.bitmaps {
-            let high = (*high_word as u64) << 32;
-            for low in bitmap {
-                out.insert(high | low as u64);
-            }
-        }
-        out
+        roaring::RoaringTreemap::from_bitmaps(
+            self.bitmaps
+                .iter()
+                .map(|(high_word, bitmap)| (*high_word, bitmap.clone())),
+        )
     }
 
     pub fn to_iceberg_payload(&self) -> Result<Vec<u8>> {
@@ -170,6 +166,249 @@ impl DeletionVector {
         );
 
         Ok(Self { bitmaps })
+    }
+}
+
+/// Envelope and bitmap boundaries for the cooperative private read path.
+/// Container values remain validated by the same roaring crate as sync reads.
+pub(crate) struct DeletionVectorPayloadReader<'a> {
+    body: &'a [u8],
+    expected_crc: u32,
+    cursor: usize,
+    remaining: u64,
+    keys: std::collections::HashSet<u32>,
+}
+impl<'a> DeletionVectorPayloadReader<'a> {
+    pub(crate) fn new(payload: &'a [u8]) -> Result<Self> {
+        ensure!(
+            payload.len() >= 4 + MAGIC.len() + 8 + 4,
+            "deletion vector payload is too short"
+        );
+        let declared = read_be_u32(&payload[..4])? as usize;
+        ensure!(
+            payload.len()
+                == declared
+                    .checked_add(8)
+                    .ok_or_else(|| anyhow!("deletion vector length overflows"))?,
+            "deletion vector payload length mismatch"
+        );
+        let body = &payload[4..4 + declared];
+        ensure!(
+            body.starts_with(&MAGIC),
+            "invalid deletion vector magic bytes"
+        );
+        let expected_crc = read_be_u32(&payload[4 + declared..])?;
+        let mut cursor = MAGIC.len();
+        let remaining = u64::from_le_bytes(take_payload_bytes(body, &mut cursor, 8)?.try_into()?);
+        Ok(Self {
+            body,
+            expected_crc,
+            cursor,
+            remaining,
+            keys: Default::default(),
+        })
+    }
+    pub(crate) fn crc_bytes(&self) -> &'a [u8] {
+        self.body
+    }
+    pub(crate) fn validate_crc(&self, actual: u32) -> Result<()> {
+        ensure!(
+            actual == self.expected_crc,
+            "deletion vector CRC mismatch: expected {:#010x}, actual {actual:#010x}",
+            self.expected_crc
+        );
+        Ok(())
+    }
+    pub(crate) fn begin_bitmap(&mut self) -> Result<Option<(u32, RoaringBitmapPayload<'a>)>> {
+        if self.remaining == 0 {
+            ensure!(
+                self.cursor == self.body.len(),
+                "deletion vector payload contains trailing bytes"
+            );
+            return Ok(None);
+        }
+        let key =
+            u32::from_le_bytes(take_payload_bytes(self.body, &mut self.cursor, 4)?.try_into()?);
+        ensure!(
+            key < (1u32 << 31),
+            "deletion vector position exceeds positive 63-bit range"
+        );
+        ensure!(
+            self.keys.insert(key),
+            "deletion vector payload contains duplicate key {key}"
+        );
+        Ok(Some((
+            key,
+            RoaringBitmapPayload::new(&self.body[self.cursor..])?,
+        )))
+    }
+    pub(crate) fn finish_bitmap(&mut self, bitmap: RoaringBitmapPayload<'a>) -> Result<()> {
+        ensure!(
+            bitmap.index == bitmap.count,
+            "deletion vector bitmap was not fully decoded"
+        );
+        self.cursor = self
+            .cursor
+            .checked_add(bitmap.cursor)
+            .ok_or_else(|| anyhow!("deletion vector cursor overflows"))?;
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+fn take_payload_bytes<'a>(bytes: &'a [u8], cursor: &mut usize, count: usize) -> Result<&'a [u8]> {
+    let end = cursor
+        .checked_add(count)
+        .ok_or_else(|| anyhow!("deletion vector cursor overflows"))?;
+    let out = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow!("deletion vector payload is truncated"))?;
+    *cursor = end;
+    Ok(out)
+}
+
+/// A borrowed standard portable Roaring bitmap header. At most one container
+/// is reconstructed at a time; its interpretation is delegated to roaring.
+pub(crate) struct RoaringBitmapPayload<'a> {
+    body: &'a [u8],
+    run_flags: Option<&'a [u8]>,
+    descriptions: &'a [u8],
+    offsets: Option<&'a [u8]>,
+    cursor: usize,
+    count: usize,
+    index: usize,
+    previous_key: Option<u16>,
+}
+impl<'a> RoaringBitmapPayload<'a> {
+    fn new(body: &'a [u8]) -> Result<Self> {
+        const NO_RUN_COOKIE: u32 = 12346;
+        const RUN_COOKIE: u16 = 12347;
+        let mut cursor = 0;
+        let cookie = u32::from_le_bytes(take_payload_bytes(body, &mut cursor, 4)?.try_into()?);
+        let (count, runs) = if cookie == NO_RUN_COOKIE {
+            (
+                u32::from_le_bytes(take_payload_bytes(body, &mut cursor, 4)?.try_into()?) as usize,
+                false,
+            )
+        } else if cookie as u16 == RUN_COOKIE {
+            (((cookie >> 16) + 1) as usize, true)
+        } else {
+            return Err(anyhow!("unknown deletion vector roaring cookie"));
+        };
+        ensure!(
+            count <= 65536,
+            "deletion vector roaring container count exceeds supported size"
+        );
+        let run_flags = if runs {
+            Some(take_payload_bytes(body, &mut cursor, count.div_ceil(8))?)
+        } else {
+            None
+        };
+        let descriptions = take_payload_bytes(body, &mut cursor, count * 4)?;
+        let offsets = if !runs || count >= 4 {
+            Some(take_payload_bytes(body, &mut cursor, count * 4)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            body,
+            run_flags,
+            descriptions,
+            offsets,
+            cursor,
+            count,
+            index: 0,
+            previous_key: None,
+        })
+    }
+    pub(crate) fn next_container(&mut self) -> Result<Option<(RoaringBitmap, usize)>> {
+        if self.index == self.count {
+            return Ok(None);
+        }
+        let start_cursor = self.cursor;
+        let desc = &self.descriptions[self.index * 4..self.index * 4 + 4];
+        let key = u16::from_le_bytes(desc[..2].try_into()?);
+        let cardinality = u64::from(u16::from_le_bytes(desc[2..].try_into()?)) + 1;
+        ensure!(
+            self.previous_key.is_none_or(|previous| previous < key),
+            "deletion vector roaring container keys are not strictly increasing"
+        );
+        if let Some(offsets) = self.offsets {
+            let offset = u32::from_le_bytes(offsets[self.index * 4..self.index * 4 + 4].try_into()?)
+                as usize;
+            ensure!(
+                offset == self.cursor,
+                "deletion vector roaring container offset differs from physical layout"
+            );
+        }
+        let is_run = self
+            .run_flags
+            .is_some_and(|flags| flags[self.index / 8] & (1 << (self.index % 8)) != 0);
+        let values = if is_run {
+            let start = self.cursor;
+            let runs =
+                u16::from_le_bytes(take_payload_bytes(self.body, &mut self.cursor, 2)?.try_into()?)
+                    as usize;
+            let intervals = take_payload_bytes(self.body, &mut self.cursor, runs * 4)?;
+            let mut previous_end = None;
+            let mut actual = 0u64;
+            for interval in intervals.chunks_exact(4) {
+                let first = u16::from_le_bytes(interval[..2].try_into()?);
+                let length = u16::from_le_bytes(interval[2..].try_into()?);
+                let last = first
+                    .checked_add(length)
+                    .ok_or_else(|| anyhow!("deletion vector roaring run exceeds container"))?;
+                ensure!(
+                    previous_end.is_none_or(|previous| previous < first),
+                    "deletion vector roaring runs overlap or are not sorted"
+                );
+                previous_end = Some(last);
+                actual += u64::from(length) + 1;
+            }
+            ensure!(
+                actual == cardinality,
+                "deletion vector roaring run cardinality mismatch"
+            );
+            &self.body[start..self.cursor]
+        } else {
+            let bytes = if cardinality <= 4096 {
+                cardinality as usize * 2
+            } else {
+                8192
+            };
+            take_payload_bytes(self.body, &mut self.cursor, bytes)?
+        };
+        // Preserve the original key and declared cardinality. Standard single
+        // run containers omit offsets; standard non-run containers include one.
+        let mut encoded = Vec::with_capacity(values.len() + 16);
+        if is_run {
+            encoded.extend_from_slice(&12347u32.to_le_bytes());
+            encoded.push(1);
+            encoded.extend_from_slice(desc);
+        } else {
+            encoded.extend_from_slice(&12346u32.to_le_bytes());
+            encoded.extend_from_slice(&1u32.to_le_bytes());
+            encoded.extend_from_slice(desc);
+            encoded.extend_from_slice(&16u32.to_le_bytes());
+        }
+        encoded.extend_from_slice(values);
+        let mut cursor = Cursor::new(encoded.as_slice());
+        let decoded = RoaringBitmap::deserialize_from(&mut cursor)
+            .context("failed to deserialize deletion vector container")?;
+        ensure!(
+            cursor.position() as usize == encoded.len(),
+            "deletion vector container contains trailing bytes"
+        );
+        ensure!(
+            decoded.len() == cardinality,
+            "deletion vector roaring container cardinality mismatch"
+        );
+        self.index += 1;
+        self.previous_key = Some(key);
+        let physical_work_bytes = self.cursor - start_cursor
+            + 4
+            + if self.offsets.is_some() { 4 } else { 0 }
+            + usize::from(self.run_flags.is_some());
+        Ok(Some((decoded, physical_work_bytes)))
     }
 }
 

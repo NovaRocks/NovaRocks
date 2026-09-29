@@ -805,27 +805,13 @@ impl ConnectorScanPlanning for IcebergMetadata {
                     "Iceberg change-window scan drifted from its exact table pin",
                 ));
             }
-            let (admission, batch) = crate::change_planning::plan_change_window(
+            let admission = crate::change_planning::plan_change_window(
                 &physical.table,
                 window.from_exclusive(),
                 window.to_inclusive(),
                 self.runtime.resources().catalog_runtime(),
                 &request.context,
             )?;
-            let delta = if matches!(
-                admission,
-                novarocks_spi::connector::ConnectorChangeWindowAdmission::FullRebuild(_)
-            ) {
-                None
-            } else {
-                Some(crate::change_planning::freeze_delta_scan_plan(
-                    &physical.table,
-                    &batch,
-                    self.runtime.resources().catalog_runtime(),
-                    self.runtime.resources().planning_binding(),
-                    &request.context,
-                )?)
-            };
             let predicate_dispositions = request
                 .static_predicates
                 .iter()
@@ -844,9 +830,7 @@ impl ConnectorScanPlanning for IcebergMetadata {
                 purpose: request.purpose.into(),
                 fact_columns,
                 physical_predicates: Vec::new(),
-                mode: IcebergScanModeV1::ChangeWindow {
-                    delta: Box::new(delta),
-                },
+                mode: IcebergScanModeV1::ChangeWindowAdmission,
             };
             return ConnectorScan::try_new_change_window(
                 ConnectorProviderBindingKey {
@@ -940,8 +924,11 @@ impl ConnectorScanPlanning for IcebergMetadata {
         if scan.table.metadata_table_type.is_some() {
             return self.plan_metadata_splits(scan, request);
         }
-        if let IcebergScanModeV1::ChangeWindow { delta } = &scan.mode {
-            return self.plan_change_window_splits(&scan, delta.as_ref().as_ref(), request);
+        if matches!(scan.mode, IcebergScanModeV1::ChangeWindowAdmission) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg change-window admission is not an executable legacy scan; use the typed read adapter",
+            ));
         }
         let files = self.scan_files(&scan, &request.context)?;
         if !matches!(scan.purpose, IcebergReadPurposeV1::Query)
@@ -1110,107 +1097,6 @@ impl ConnectorScanPlanning for IcebergMetadata {
 }
 
 impl IcebergMetadata {
-    fn plan_change_window_splits(
-        &self,
-        scan: &IcebergScanPayload,
-        delta: Option<&crate::change_planning::IcebergDeltaScanPlan>,
-        request: ConnectorSplitPlanningRequest,
-    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
-        let delta = delta.ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg full-rebuild change-window admission cannot plan incremental splits",
-            )
-        })?;
-        let name_mapping = split_name_mapping(&scan.table)?;
-        let mut total_payload_bytes = 0_usize;
-        let mut splits = Vec::with_capacity(delta.sources.len());
-        for source in delta.sources.iter().cloned() {
-            self.validate_context(&request.context)?;
-            let estimated_bytes = u64::try_from(source.size).map_err(|_| {
-                corrupt(format!(
-                    "Iceberg delta source {} has a negative size",
-                    source.path
-                ))
-            })?;
-            let data_file = IcebergDataFileInfo {
-                path: source.path.clone(),
-                size: source.size,
-                row_count: None,
-                column_stats: None,
-                partition_spec_id: source.partition_spec_id,
-                partition_key: source.partition_key.clone(),
-                first_row_id: source.first_row_id,
-                data_sequence_number: source.data_sequence_number,
-                ivm_change_op: None,
-                included_positions: None,
-                delete_files: Vec::new(),
-                manifest_path: None,
-                partition_values: Vec::new(),
-            };
-            let payload = SplitPayload {
-                version: ICEBERG_SPLIT_V5,
-                owner_instance_id: self.descriptor.instance_id.as_str().to_string(),
-                incarnation: self.incarnation.to_bytes(),
-                namespace: scan.table.namespace.clone(),
-                table: scan.table.table.clone(),
-                snapshot_id: scan.snapshot_id,
-                table_uuid: scan.table_uuid.clone(),
-                schema_id: scan.table.table_info.as_ref().map(|table| table.schema_id),
-                units: vec![IcebergFrozenScanUnitPayload {
-                    data_file,
-                    row_groups: None,
-                    estimated_bytes: Some(estimated_bytes),
-                }],
-                projection: scan.projection.clone(),
-                limit: scan.limit,
-                physical_predicates: Vec::new(),
-                fact_columns: scan.fact_columns.clone(),
-                name_mapping: name_mapping.clone(),
-                delta: Some(crate::delta::IcebergDeltaSplitPayload {
-                    source,
-                    delete_side: delta.delete_side.clone(),
-                }),
-                metadata: None,
-            };
-            let payload = encode_payload(
-                &payload,
-                "delta split",
-                request.context.max_handle_payload_bytes(),
-            )?;
-            total_payload_bytes = total_payload_bytes
-                .checked_add(payload.len())
-                .filter(|total| *total <= request.context.max_total_payload_bytes())
-                .ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        "Iceberg delta split payloads exceed the request budget",
-                    )
-                })?;
-            splits.push(ConnectorSplit::try_new(
-                self.descriptor.instance_id.clone(),
-                format!("delta-{}", splits.len()),
-                payload,
-                Some(estimated_bytes),
-            )?);
-        }
-        let count = u64::try_from(splits.len()).map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "Iceberg delta split count overflows u64",
-            )
-        })?;
-        ConnectorSplitPlanningResult::try_new(
-            splits,
-            ConnectorSplitPlanningMetrics {
-                candidate_units_considered: count,
-                candidate_units_pruned: 0,
-                composite_splits_planned: count,
-                scan_units_planned: count,
-            },
-        )
-    }
-
     fn plan_metadata_splits(
         &self,
         scan: IcebergScanPayload,
@@ -1259,7 +1145,6 @@ impl IcebergMetadata {
             physical_predicates: Vec::new(),
             fact_columns: Vec::new(),
             name_mapping: None,
-            delta: None,
             metadata: Some(IcebergMetadataSplitPayloadV1 {
                 metadata_table_type,
                 serialized_table,
@@ -1516,9 +1401,7 @@ struct IcebergScanPayload {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum IcebergScanModeV1 {
     Snapshot,
-    ChangeWindow {
-        delta: Box<Option<crate::change_planning::IcebergDeltaScanPlan>>,
-    },
+    ChangeWindowAdmission,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -1854,7 +1737,6 @@ fn push_data_split(
         physical_predicates: scan.physical_predicates.clone(),
         fact_columns: scan.fact_columns.clone(),
         name_mapping: name_mapping.clone(),
-        delta: None,
         metadata: None,
     };
     let payload = encode_payload(&payload, "split", context.max_handle_payload_bytes())?;

@@ -15,26 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![allow(dead_code)]
-
 //! Provider-owned Iceberg read-view model and delete applicability.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::delete_semantics::{DeleteSet, LoadView, ReadDomain};
+use crate::iceberg::spec::{DataFileFormat, Datum};
 
 use crate::scan_model::IcebergColumnStats;
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IcebergReadDeleteFormat {
     Parquet,
     Puffin,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IcebergReadDeleteKind {
     Position,
     Equality { equality_field_ids: Vec<i32> },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcebergReadDeleteFile {
     pub path: String,
@@ -49,6 +54,19 @@ pub struct IcebergReadDeleteFile {
     pub referenced_data_file: Option<String>,
 }
 
+/// Complete data-file facts from the same manifest observation as its deletes.
+#[derive(Clone, Debug)]
+pub struct IcebergDataFileMetadata {
+    pub file_format: DataFileFormat,
+    pub split_offsets: Vec<i64>,
+    pub key_metadata: Vec<u8>,
+    pub value_counts: HashMap<i32, u64>,
+    pub null_value_counts: HashMap<i32, u64>,
+    pub nan_value_counts: HashMap<i32, u64>,
+    pub lower_bounds: HashMap<i32, Datum>,
+    pub upper_bounds: HashMap<i32, Datum>,
+}
+
 #[derive(Clone, Debug)]
 pub struct IcebergReadFile {
     pub path: String,
@@ -61,97 +79,25 @@ pub struct IcebergReadFile {
     pub manifest_path: Option<String>,
     pub first_row_id: Option<i64>,
     pub data_sequence_number: Option<i64>,
-    pub deletes: Vec<IcebergReadDeleteFile>,
+    pub manifest: Arc<IcebergDataFileMetadata>,
+    /// Statistics may reduce required loads, but never the logical closure.
+    pub deletes: LoadView,
+}
+
+impl IcebergReadFile {
+    pub fn logical_delete_set(&self) -> &DeleteSet {
+        self.deletes.logical()
+    }
+
+    pub fn read_domain(&self) -> &Arc<ReadDomain> {
+        self.logical_delete_set().domain()
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct IcebergReadSnapshot {
     pub snapshot_id: Option<i64>,
     pub files: Vec<IcebergReadFile>,
-}
-
-pub fn delete_applies_to_data_file(
-    delete_file: &IcebergReadDeleteFile,
-    data_file: &IcebergReadFile,
-) -> bool {
-    if let (Some(delete_sequence), Some(data_sequence)) =
-        (delete_file.sequence_number, data_file.data_sequence_number)
-        && delete_sequence <= data_sequence
-    {
-        return false;
-    }
-
-    if let Some(referenced) = delete_file.referenced_data_file.as_deref()
-        && referenced != data_file.path
-    {
-        return false;
-    }
-
-    if let Some(delete_partition) = delete_file.partition_key.as_deref() {
-        let Some(delete_spec_id) = delete_file.partition_spec_id else {
-            return false;
-        };
-        let Some(data_spec_id) = data_file.partition_spec_id else {
-            return false;
-        };
-        if delete_spec_id != data_spec_id {
-            return false;
-        }
-        if data_file.partition_key.as_deref() != Some(delete_partition) {
-            return false;
-        }
-    }
-
-    true
-}
-
-pub fn attach_applicable_deletes(
-    data_file: &mut IcebergReadFile,
-    delete_files: &[IcebergReadDeleteFile],
-) {
-    let applicable = delete_files
-        .iter()
-        .filter(|delete_file| delete_applies_to_data_file(delete_file, data_file))
-        .cloned()
-        .collect::<Vec<_>>();
-    data_file.deletes.extend(applicable);
-}
-
-pub fn data_files_matching_delete<'a>(
-    snapshot: &'a IcebergReadSnapshot,
-    delete_file: &IcebergReadDeleteFile,
-) -> Vec<&'a IcebergReadFile> {
-    snapshot
-        .files
-        .iter()
-        .filter(|data_file| delete_applies_to_data_file(delete_file, data_file))
-        .collect()
-}
-
-#[derive(Default)]
-pub struct DeleteApplicabilityIndex {
-    by_referenced_data_path: HashMap<String, Vec<IcebergReadDeleteFile>>,
-    global: Vec<IcebergReadDeleteFile>,
-}
-
-impl DeleteApplicabilityIndex {
-    pub fn push(&mut self, delete_file: IcebergReadDeleteFile) {
-        if let Some(referenced_data_file) = delete_file.referenced_data_file.clone() {
-            self.by_referenced_data_path
-                .entry(referenced_data_file)
-                .or_default()
-                .push(delete_file);
-        } else {
-            self.global.push(delete_file);
-        }
-    }
-
-    pub fn attach_to(&self, data_file: &mut IcebergReadFile) {
-        if let Some(delete_files) = self.by_referenced_data_path.get(&data_file.path) {
-            attach_applicable_deletes(data_file, delete_files);
-        }
-        attach_applicable_deletes(data_file, &self.global);
-    }
 }
 
 pub fn iceberg_partition_key(partition: &crate::iceberg::spec::Struct) -> Option<String> {

@@ -107,7 +107,7 @@ fn add_for_every<T>(
 }
 
 /// Numeric types where many functions preserve the input width
-/// (e.g. `abs(Int32) -> Int32`). Excludes `Decimal128`, which needs
+/// (e.g. `negative(Int32) -> Int32`). Excludes `Decimal128`, which needs
 /// precision/scale propagation that the registry does not yet handle.
 const NUMERIC_PRESERVING_TYPES: &[TypeSpec] = &[
     TypeSpec::Int8,
@@ -464,32 +464,40 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // Preserve-input-type: abs, negative.
-    // Legacy: `arg_types.first().cloned().unwrap_or(DataType::Float64)`,
-    // i.e. preserves the input type. NOTE: `positive` is *not* here even
-    // though it sounds like a unary plus — NovaRocks's legacy path
-    // groups it with the Float64-returning math family, so we register
-    // it below alongside `pow` / `log` / etc.
-    for name in ["abs", "negative"] {
-        add_for_every(m, name, NUMERIC_PRESERVING_TYPES, |t| {
-            Signature::new(vec![t.clone()], t.clone())
-        });
-        // DECIMAL and LARGEINT are numeric here too, and both executors
-        // already handle them; only the registry could not name them.
-        add(
-            m,
-            name,
-            Signature::new(
-                vec![TypeSpec::Decimal128Of("D")],
-                TypeSpec::Decimal128Of("D"),
-            ),
-        );
-        add(
-            m,
-            name,
-            Signature::new(vec![TypeSpec::LargeInt], TypeSpec::LargeInt),
-        );
+    // Integer ABS widens before taking the absolute value, so each signed
+    // minimum has a representable result. LARGEINT has no wider integer
+    // carrier and preserves its existing two's-complement ABS contract.
+    for (input, output) in [
+        (TypeSpec::Int8, TypeSpec::Int16),
+        (TypeSpec::Int16, TypeSpec::Int32),
+        (TypeSpec::Int32, TypeSpec::Int64),
+        (TypeSpec::Int64, TypeSpec::LargeInt),
+        (TypeSpec::LargeInt, TypeSpec::LargeInt),
+        (TypeSpec::Float32, TypeSpec::Float32),
+        (TypeSpec::Float64, TypeSpec::Float64),
+        (TypeSpec::Decimal128Of("D"), TypeSpec::Decimal128Of("D")),
+    ] {
+        add(m, "abs", Signature::new(vec![input], output));
     }
+
+    // NEGATIVE preserves the input type. POSITIVE remains in the
+    // Float64-returning math family below.
+    add_for_every(m, "negative", NUMERIC_PRESERVING_TYPES, |t| {
+        Signature::new(vec![t.clone()], t.clone())
+    });
+    add(
+        m,
+        "negative",
+        Signature::new(
+            vec![TypeSpec::Decimal128Of("D")],
+            TypeSpec::Decimal128Of("D"),
+        ),
+    );
+    add(
+        m,
+        "negative",
+        Signature::new(vec![TypeSpec::LargeInt], TypeSpec::LargeInt),
+    );
 
     // ceil / ceiling / floor: any numeric input, returns Int64.
     for name in ["ceil", "ceiling", "dceil", "floor", "dfloor"] {

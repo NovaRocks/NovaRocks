@@ -40,7 +40,7 @@ pub mod connector_factory;
 pub mod default_value;
 pub mod definition;
 pub mod delete_file;
-pub mod delta;
+pub mod delete_semantics;
 pub mod distributed_rewrite;
 pub mod document_storage;
 mod execution_authority;
@@ -109,3 +109,5 @@ pub mod role_binding;
 
 pub use novarocks_fs;
 pub use novarocks_spi;
+
+mod contract_revision;

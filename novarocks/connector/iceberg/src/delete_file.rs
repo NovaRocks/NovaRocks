@@ -245,6 +245,8 @@ mod tests {
         let mut file = IcebergDataFileInfo::for_test("data.parquet", 10, 1);
         file.included_positions = Some(vec![3, 7]);
         file.delete_files.push(IcebergDeleteFileInfo {
+            record_count: None,
+            partition_data_json: None,
             path: "delete.parquet".to_string(),
             file_format: IcebergDeleteFileFormat::Parquet,
             file_content: IcebergDeleteFileContent::Position,

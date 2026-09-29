@@ -118,6 +118,7 @@ code-anchors:
 - ADR-0006 — 可替换 provider 契约为何统一进入一个系统 SPI，而普通跨 crate port 不进入（active；其中「Connector 与 StateStore 共用同一个物理 SPI package」这一条前提已由 ADR-0140 替换，其余原则仍有效）
 - ADR-0014 — 共享文件访问与 Parquet/ORC 物理解码为何属于无 Connector identity 的独立基础（active）
 - ADR-0015 — table-format Connector 为何拥有 read correctness，native fragment 只绑定已安装真实 instance（active）
+- ADR-0164 — Iceberg 删除成员为何由 FE 冻结闭包、BE 以 task-local union 执行，并分离逻辑集合、加载视图与完整端点（active）
 - ADR-0016 — Connector 为何共享逻辑 identity、但不共享 FE control 与 BE execution runtime（active）
 - ADR-0017 — Connector catalog mutation 为何使用 FE-only lease 与三态 external outcome（active）
 - ADR-0018 — 静态 Connector predicate 为何以 Exact/PruningOnly/Unsupported 协商、而不扩展 native wire（active）

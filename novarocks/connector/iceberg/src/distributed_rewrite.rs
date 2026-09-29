@@ -1489,6 +1489,8 @@ mod tests {
 
     fn dv(path: &str) -> IcebergDeleteFileInfo {
         IcebergDeleteFileInfo {
+            record_count: Some(1),
+            partition_data_json: Some(r#"{"version":1,"values":[]}"#.to_string()),
             path: path.to_string(),
             file_format: IcebergDeleteFileFormat::Puffin,
             file_content: IcebergDeleteFileContent::Position,
@@ -1629,6 +1631,8 @@ mod tests {
     #[test]
     fn shared_delete_file_has_one_canonical_owner() {
         let delete = IcebergDeleteFileInfo {
+            record_count: Some(1),
+            partition_data_json: Some(r#"{"version":1,"values":[]}"#.to_string()),
             path: "s3://bucket/shared-delete.parquet".to_string(),
             file_format: IcebergDeleteFileFormat::Parquet,
             file_content: IcebergDeleteFileContent::Equality,
@@ -1678,6 +1682,8 @@ mod tests {
     fn position_rewrite_rejects_v2_parquet_deletes() {
         let mut data = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
         data.delete_files.push(IcebergDeleteFileInfo {
+            record_count: Some(1),
+            partition_data_json: Some(r#"{"version":1,"values":[]}"#.to_string()),
             path: "s3://bucket/delete.parquet".to_string(),
             file_format: IcebergDeleteFileFormat::Parquet,
             file_content: IcebergDeleteFileContent::Position,

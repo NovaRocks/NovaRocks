@@ -1709,7 +1709,10 @@ mod tests {
                     CatalogVersion::from_bytes([1; 32]),
                 ),
                 ConnectorCodecCategory::WriteHandle,
-                ConnectorCodecRevision::try_new(2).expect("revision"),
+                ConnectorCodecRevision::try_new(
+                    crate::contract_revision::ICEBERG_CONTRACT_REVISION + 1,
+                )
+                .expect("revision"),
             ),
         ] {
             let mut ledger = ConnectorDecodeLedger::new(private_limits());

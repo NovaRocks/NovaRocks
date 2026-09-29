@@ -53,7 +53,7 @@ const MAX_OLD_DELETE_REFERENCES: usize = 1024;
 const MAX_MERGED_OLD_REFERENCES: usize = 1024;
 const MAX_EQUALITY_DELETE_COLUMNS: usize = 4096;
 
-pub(crate) const WRITE_CODEC_REVISION: u32 = 1;
+pub(crate) use crate::contract_revision::ICEBERG_CONTRACT_REVISION as WRITE_CODEC_REVISION;
 
 pub(crate) fn decode_writer_handle(
     payload: &[u8],

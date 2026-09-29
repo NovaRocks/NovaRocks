@@ -2664,4 +2664,74 @@ mod tests {
             Err(FunctionResolutionError::HiddenFunction)
         );
     }
+
+    #[test]
+    fn abs_exact_bindings_freeze_input_and_promoted_output_widths() {
+        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
+        for (input, output) in [
+            (DataType::Int8, DataType::Int16),
+            (DataType::Int16, DataType::Int32),
+            (DataType::Int32, DataType::Int64),
+            (DataType::Int64, DataType::FixedSizeBinary(16)),
+            (DataType::FixedSizeBinary(16), DataType::FixedSizeBinary(16)),
+            (DataType::Float32, DataType::Float32),
+            (DataType::Float64, DataType::Float64),
+            (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
+        ] {
+            for nullable in [false, true] {
+                let arguments = [value_argument(input.clone(), nullable, None)];
+                let binding = resolve_exact_scalar(&catalog, "abs", &arguments);
+                assert_eq!(scalar_result(&binding).data_type, output);
+                assert_eq!(scalar_result(&binding).nullable, nullable);
+                assert_eq!(
+                    binding.selected.argument_types.as_ref(),
+                    &[FunctionArgumentType::Value(FunctionValueType::new(
+                        input.clone(),
+                        nullable
+                    ))]
+                );
+                catalog
+                    .validate_bound(
+                        &binding,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: 1,
+                        },
+                    )
+                    .expect("the frozen ABS profile must validate without changing the input type");
+
+                let negative = resolve_exact_scalar(&catalog, "negative", &arguments);
+                assert_eq!(scalar_result(&negative).data_type, input);
+                assert_eq!(scalar_result(&negative).nullable, nullable);
+            }
+        }
+    }
+
+    #[test]
+    fn abs_exact_binding_rejects_a_stale_same_width_integer_result() {
+        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
+        for input in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            let arguments = [value_argument(input.clone(), true, None)];
+            let mut binding = resolve_exact_scalar(&catalog, "abs", &arguments);
+            binding.selected.result_type =
+                FunctionResultType::Scalar(FunctionValueType::new(input, true));
+            assert!(
+                catalog
+                    .validate_bound(
+                        &binding,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: 1,
+                        }
+                    )
+                    .is_err(),
+                "a stale same-width result must fail exact catalog validation before encoding"
+            );
+        }
+    }
 }

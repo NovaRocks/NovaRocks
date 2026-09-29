@@ -165,6 +165,16 @@ message IcebergPinnedDataFileSet {
   repeated string paths = 1;
 }
 
+message IcebergReadDomain {
+  bytes observation_id = 1;
+  bytes table_uuid = 2;
+  string metadata_identity = 3;
+  optional int64 snapshot_id = 4;
+  string schema_json = 5;
+  map<int32, string> partition_spec_jsons = 6;
+  map<int32, string> partition_type_jsons = 7;
+}
+
 message IcebergTableHandle {
   SchemaTableName schema_table_name = 1;
   optional int64 snapshot_id = 2;
@@ -180,7 +190,8 @@ message IcebergTableHandle {
   string table_location = 12;
   map<string, string> storage_properties = 13;
   IcebergPinnedDataFileSet pinned_data_files = 14;
-  map<int32, string> scalar_integer_domains = 15;
+  optional IcebergReadDomain read_domain = 15;
+  map<int32, string> scalar_integer_domains = 16;
 }
 
 message TableChangesFunctionHandle {
@@ -200,6 +211,8 @@ message IcebergChangeWindowHandle {
   int64 from_snapshot_id_exclusive = 5;
   int64 to_snapshot_id_inclusive = 6;
   map<int32, string> partition_spec_jsons = 7;
+  optional IcebergReadDomain from_read_domain = 8;
+  optional IcebergReadDomain to_read_domain = 9;
 }
 
 enum IcebergSystemTableType {
@@ -317,9 +330,12 @@ message IcebergDeleteFile {
   optional int64 content_size_in_bytes = 11;
   optional ParquetFileDecryptionData decryption_data = 12;
   optional string referenced_data_file = 13;
+  optional int32 partition_spec_id = 14;
+  string partition_data_json = 15;
 }
 
 message IcebergSplit {
+  optional IcebergReadDomain read_domain = 14;
   string path = 1;
   int64 start = 2;
   int64 length = 3;
@@ -362,29 +378,23 @@ message IcebergAddedRows {
   repeated int64 restricted_row_ids = 2;
 }
 
-message IcebergPositionDeletedRows {
+message IcebergVisibilityDifference {
   IcebergSplit data = 1;
-  repeated IcebergDeleteFile newly_applied_deletes = 2;
-  repeated IcebergDeleteFile previously_applied_deletes = 3;
-}
-
-message IcebergEqualityDeletedRows {
-  IcebergSplit data = 1;
-  repeated IcebergDeleteFile newly_applied_equality_deletes = 2;
-  repeated IcebergDeleteFile previously_applied_deletes = 3;
+  repeated IcebergDeleteFile from_deletes = 2;
+  repeated IcebergDeleteFile to_deletes = 3;
 }
 
 message IcebergDeletedDataFileRows {
   IcebergSplit data = 1;
-  repeated IcebergDeleteFile previously_applied_deletes = 2;
+  reserved 2;
 }
 
 message IcebergChangeSplit {
+  reserved 11, 12;
   oneof rows {
     IcebergAddedRows added_rows = 10;
-    IcebergPositionDeletedRows position_deleted_rows = 11;
-    IcebergEqualityDeletedRows equality_deleted_rows = 12;
     IcebergDeletedDataFileRows deleted_data_file_rows = 13;
+    IcebergVisibilityDifference visibility_difference = 14;
   }
 }
 

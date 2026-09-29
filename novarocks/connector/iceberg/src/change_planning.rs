@@ -17,7 +17,7 @@
 
 //! Provider-owned Iceberg change-window admission and manifest planning.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -30,39 +30,16 @@ use novarocks_spi::connector::{
     ConnectorOperationControl, ConnectorRequestContext,
 };
 
-use crate::delta::{
-    BaseDataFileLineage, ChangePartitionFieldValue, ChangePartitionValue, DataFileRef,
-    DeleteVisibilityDataFileDescriptor, DeleteVisibilityDeleteFileContent,
-    DeleteVisibilityDeleteFileDescriptor, DeleteVisibilityDeleteFileFormat, DeletedDataFileRef,
-    DeltaScanDeleteSide, DeltaSourceFile, EqualityDeleteRef, EqualityDeleteTargetData,
-    IcebergChangeBatch, PositionDeleteRef, change_partition_field_values,
-    delta_source_files_from_change_batch,
-};
 use crate::iceberg::spec::{
-    DataContentType, DataFileFormat, FormatVersion, ManifestContentType, ManifestStatus,
-    NestedField, Operation, Schema, Snapshot, TableMetadata, Type,
+    FormatVersion, NestedField, Operation, Schema, Snapshot, TableMetadata, Type,
 };
 use crate::iceberg::table::Table;
 use crate::resources::IcebergCatalogRuntime;
 
-#[derive(Clone, serde::Deserialize, serde::Serialize)]
-pub(crate) struct IcebergDeltaScanPlan {
-    pub(crate) sources: Vec<DeltaSourceFile>,
-    pub(crate) delete_side: Option<DeltaScanDeleteSide>,
-}
-
-#[allow(clippy::enum_variant_names)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LineageAction {
-    CollectInserts { snapshot_id: i64 },
-    CollectDeletes { snapshot_id: i64 },
-    CollectOverwriteDiff { snapshot_id: i64 },
-}
-
 #[derive(Debug)]
 enum LineageAdmission {
     MetadataOnly,
-    Incremental(Vec<LineageAction>),
+    Incremental,
     FullRebuild(ConnectorChangeWindowFullRebuildReason),
 }
 
@@ -74,7 +51,7 @@ pub(crate) fn plan_change_window(
     to_inclusive: i64,
     runtime: &IcebergCatalogRuntime,
     context: &ConnectorRequestContext,
-) -> Result<(ConnectorChangeWindowAdmission, IcebergChangeBatch), ConnectorError> {
+) -> Result<ConnectorChangeWindowAdmission, ConnectorError> {
     check_active(context)?;
     let metadata = table.metadata();
     if !matches!(
@@ -85,467 +62,132 @@ pub(crate) fn plan_change_window(
             "Iceberg change-window scans require table format v2 or v3",
         ));
     }
-    let lineage = classify_lineage(metadata, from_exclusive, to_inclusive)?;
-    let actions = match lineage {
-        LineageAdmission::MetadataOnly => {
-            return Ok((
-                ConnectorChangeWindowAdmission::MetadataOnly,
-                empty_batch(from_exclusive, to_inclusive),
-            ));
-        }
+    match classify_lineage(metadata, from_exclusive, to_inclusive)? {
+        LineageAdmission::MetadataOnly => return Ok(ConnectorChangeWindowAdmission::MetadataOnly),
         LineageAdmission::FullRebuild(reason) => {
-            return Ok((
-                ConnectorChangeWindowAdmission::FullRebuild(reason),
-                empty_batch(from_exclusive, to_inclusive),
-            ));
+            return Ok(ConnectorChangeWindowAdmission::FullRebuild(reason));
         }
-        LineageAdmission::Incremental(actions) => actions,
-    };
-
-    let collect_metadata = metadata.clone();
-    let file_io = table.file_io().clone();
-    let collect_context = context.clone();
-    let collected = runtime.block_on(async move {
-        collect_files(&collect_metadata, &file_io, &actions, &collect_context).await
-    });
-    check_active(context)?;
-    let collected = collected.map_err(unavailable)??;
-    // A multi-snapshot window can contain a COW file that was both created and
-    // replaced before the upper endpoint. Iceberg files are immutable, so the
-    // same path on both sides is an intermediate artifact, not a net row
-    // change. Cancel it before freezing delta sources; otherwise the refresh
-    // reads and retracts transient rows that are absent from both endpoints.
-    let (inserts, deleted_data_files) = cancel_exact_transient_data_files(collected.0, collected.3);
-    let batch = IcebergChangeBatch {
-        previous_snapshot_id: from_exclusive,
-        current_snapshot_id: to_inclusive,
-        inserts,
-        deletes: collected.1,
-        equality_deletes: collected.2,
-        deleted_data_files,
-    };
-    if batch.inserts.is_empty()
-        && batch.deletes.is_empty()
-        && batch.equality_deletes.is_empty()
-        && batch.deleted_data_files.is_empty()
-    {
-        return Ok((ConnectorChangeWindowAdmission::MetadataOnly, batch));
+        LineageAdmission::Incremental => {}
     }
-    let admission = ConnectorChangeWindowAdmission::Incremental {
-        has_inserts: !batch.inserts.is_empty(),
-        has_deletes: !batch.deletes.is_empty()
-            || !batch.equality_deletes.is_empty()
-            || !batch.deleted_data_files.is_empty(),
-        partition_impact: partition_impact(metadata, &batch, context)?,
-    };
-    Ok((admission, batch))
+    // Admission and execution observe the same complete endpoint semantics.
+    // No manifest event or newly introduced delete artifact is a row delta.
+    let schema = resolved_window_schema(metadata, to_inclusive)?;
+    let from = build_snapshot_controlled(table, from_exclusive, &schema, runtime, context)?;
+    let to = build_snapshot_controlled(table, to_inclusive, &schema, runtime, context)?;
+    endpoint_admission(metadata, &from.files, &to.files, context)
 }
 
-fn cancel_exact_transient_data_files(
-    inserts: Vec<DataFileRef>,
-    deleted: Vec<DeletedDataFileRef>,
-) -> (Vec<DataFileRef>, Vec<DeletedDataFileRef>) {
-    #[derive(Hash, PartialEq, Eq)]
-    struct ExactIdentity<'a> {
-        path: &'a str,
-        size: i64,
-        record_count: Option<i64>,
-        partition_spec_id: Option<i32>,
-        partition_key: Option<&'a str>,
-        partition_values: &'a [ChangePartitionFieldValue],
-        first_row_id: Option<i64>,
-        data_sequence_number: Option<i64>,
-    }
-
-    fn insert_identity(file: &DataFileRef) -> ExactIdentity<'_> {
-        ExactIdentity {
-            path: &file.path,
-            size: file.size,
-            record_count: file.record_count,
-            partition_spec_id: file.partition_spec_id,
-            partition_key: file.partition_key.as_deref(),
-            partition_values: &file.partition_values,
-            first_row_id: file.first_row_id,
-            data_sequence_number: file.data_sequence_number,
-        }
-    }
-
-    fn deleted_identity(file: &DeletedDataFileRef) -> ExactIdentity<'_> {
-        ExactIdentity {
-            path: &file.path,
-            size: file.size,
-            record_count: file.record_count,
-            partition_spec_id: file.partition_spec_id,
-            partition_key: file.partition_key.as_deref(),
-            partition_values: &file.partition_values,
-            first_row_id: file.first_row_id,
-            data_sequence_number: file.data_sequence_number,
-        }
-    }
-
-    let mut insert_is_transient = vec![false; inserts.len()];
-    let mut delete_is_transient = vec![false; deleted.len()];
-    let mut delete_indices_by_identity = HashMap::<ExactIdentity<'_>, Vec<usize>>::new();
-    for (index, file) in deleted.iter().enumerate() {
-        delete_indices_by_identity
-            .entry(deleted_identity(file))
-            .or_default()
-            .push(index);
-    }
-    for (insert_index, insert) in inserts.iter().enumerate() {
-        if insert.row_id_allow_list.is_some() {
-            continue;
-        }
-        if let Some(delete_index) = delete_indices_by_identity
-            .get_mut(&insert_identity(insert))
-            .and_then(Vec::pop)
-        {
-            insert_is_transient[insert_index] = true;
-            delete_is_transient[delete_index] = true;
-        }
-    }
-    (
-        inserts
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, file)| (!insert_is_transient[index]).then_some(file))
-            .collect(),
-        deleted
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, file)| (!delete_is_transient[index]).then_some(file))
-            .collect(),
-    )
+/// Admission and execution use the same pinned upper-endpoint interpretation.
+/// Later table schema changes cannot reinterpret an already selected window.
+pub(crate) fn resolved_window_schema(
+    metadata: &TableMetadata,
+    to: i64,
+) -> Result<Arc<Schema>, ConnectorError> {
+    metadata
+        .snapshot_by_id(to)
+        .ok_or_else(|| corrupt("Iceberg change-window To snapshot is absent"))?
+        .schema(metadata)
+        .map_err(|e| corrupt(e.to_string()))
 }
 
-pub(crate) fn freeze_delta_scan_plan(
-    table: &Table,
-    batch: &IcebergChangeBatch,
-    runtime: &IcebergCatalogRuntime,
-    binding: &crate::access_binding::IcebergReadBinding,
+pub(crate) fn same_immutable_data_facts(
+    a: &crate::read_model::IcebergReadFile,
+    b: &crate::read_model::IcebergReadFile,
+) -> bool {
+    a.path == b.path
+        && a.size == b.size
+        && a.record_count == b.record_count
+        && a.data_sequence_number == b.data_sequence_number
+        && a.first_row_id == b.first_row_id
+        && a.partition_spec_id == b.partition_spec_id
+        && a.partition_values == b.partition_values
+        && a.manifest.file_format == b.manifest.file_format
+        && a.manifest.key_metadata == b.manifest.key_metadata
+}
+
+fn index_endpoint_files(
+    files: &[crate::read_model::IcebergReadFile],
+) -> Result<BTreeMap<&str, &crate::read_model::IcebergReadFile>, ConnectorError> {
+    let mut indexed = BTreeMap::new();
+    for file in files {
+        if indexed.insert(file.path.as_str(), file).is_some() {
+            return Err(corrupt(format!(
+                "Iceberg endpoint contains duplicate data file {}",
+                file.path
+            )));
+        }
+    }
+    Ok(indexed)
+}
+
+fn endpoint_admission(
+    metadata: &TableMetadata,
+    from: &[crate::read_model::IcebergReadFile],
+    to: &[crate::read_model::IcebergReadFile],
     context: &ConnectorRequestContext,
-) -> Result<IcebergDeltaScanPlan, ConnectorError> {
-    check_active(context)?;
-    let equality_targets = equality_delete_targets_at(
-        table,
-        batch.current_snapshot_id,
-        &batch.equality_deletes,
-        runtime,
-        context,
-    )?;
-    let sources =
-        delta_source_files_from_change_batch(batch, &equality_targets).map_err(corrupt)?;
-    let has_deletes = !batch.deletes.is_empty()
-        || !batch.equality_deletes.is_empty()
-        || !batch.deleted_data_files.is_empty();
-    let delete_side = if has_deletes {
-        let base_data_file_lineage =
-            data_file_lineage_index_at(table, batch.current_snapshot_id, runtime, context)?;
-        let previous_data_file_lineage = if batch.deleted_data_files.is_empty() {
-            HashMap::new()
+) -> Result<ConnectorChangeWindowAdmission, ConnectorError> {
+    let from = index_endpoint_files(from)?;
+    let to = index_endpoint_files(to)?;
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut row_deletes = false;
+    for (path, file) in &to {
+        if let Some(previous) = from.get(path) {
+            if !same_immutable_data_facts(previous, file) {
+                return Err(corrupt(format!(
+                    "Iceberg data file {path} changes immutable facts across endpoints"
+                )));
+            }
+            let before = previous.logical_delete_set();
+            let after = file.logical_delete_set();
+            row_deletes |= !before.same_addresses(after) || !before.same_applications(after);
         } else {
-            data_file_lineage_index_at(table, batch.previous_snapshot_id, runtime, context)?
-        };
-        let touched: HashSet<String> = batch
-            .deletes
-            .iter()
-            .filter_map(|delete| delete.referenced_data_file.clone())
-            .collect();
-        let previously_deleted_positions_per_file = if touched.is_empty() {
-            HashMap::new()
-        } else {
-            previously_deleted_positions(
-                table,
-                batch.previous_snapshot_id,
-                &touched,
-                runtime,
-                binding,
-                context,
-            )?
-        };
-        Some(DeltaScanDeleteSide {
-            base_data_file_lineage,
-            previous_data_file_lineage,
-            previous_delete_visibility_data_files: delete_visibility_data_files_at(
-                table,
-                batch.previous_snapshot_id,
-                runtime,
-                context,
-            )?,
-            previously_deleted_positions_per_file,
-            deleted_data_file_paths: batch
-                .deleted_data_files
-                .iter()
-                .map(|file| file.path.clone())
-                .collect(),
-        })
-    } else {
-        None
-    };
-    check_active(context)?;
-    Ok(IcebergDeltaScanPlan {
-        sources,
-        delete_side,
+            added.push(*file);
+        }
+    }
+    for (path, file) in &from {
+        if !to.contains_key(path) {
+            removed.push(*file);
+        }
+    }
+    if added.is_empty() && removed.is_empty() && !row_deletes {
+        return Ok(ConnectorChangeWindowAdmission::MetadataOnly);
+    }
+    Ok(ConnectorChangeWindowAdmission::Incremental {
+        has_inserts: !added.is_empty(),
+        has_deletes: !removed.is_empty() || row_deletes,
+        partition_impact: endpoint_partition_impact(
+            metadata,
+            &added,
+            &removed,
+            row_deletes,
+            context,
+        )?,
     })
 }
 
 fn build_snapshot_controlled(
     table: &Table,
     snapshot_id: i64,
+    schema: &Schema,
     runtime: &IcebergCatalogRuntime,
     context: &ConnectorRequestContext,
 ) -> Result<crate::read_model::IcebergReadSnapshot, ConnectorError> {
     check_active(context)?;
     let table = table.clone();
     let control = context.clone();
+    let domain = crate::read_snapshot::mint_read_domain(table.metadata(), snapshot_id, schema)
+        .map_err(corrupt)?;
     let result = runtime.block_on(async move {
-        crate::read_snapshot::build_read_snapshot_at_with_control(
+        crate::read_snapshot::build_read_snapshot_in_domain(
             &table,
-            snapshot_id,
+            domain,
             Some(&control as &dyn ConnectorOperationControl),
         )
         .await
     });
     check_active(context)?;
     result.map_err(unavailable)?.map_err(unavailable)
-}
-
-fn equality_delete_targets_at(
-    table: &Table,
-    snapshot_id: i64,
-    deletes: &[EqualityDeleteRef],
-    runtime: &IcebergCatalogRuntime,
-    context: &ConnectorRequestContext,
-) -> Result<HashMap<String, Vec<EqualityDeleteTargetData>>, ConnectorError> {
-    if deletes.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let snapshot = build_snapshot_controlled(table, snapshot_id, runtime, context)?;
-    Ok(deletes
-        .iter()
-        .map(|delete| {
-            let read_delete = equality_read_delete(delete);
-            let targets = crate::read_model::data_files_matching_delete(&snapshot, &read_delete)
-                .into_iter()
-                .map(|file| EqualityDeleteTargetData {
-                    data_file_path: file.path.clone(),
-                    data_file_size: file.size,
-                    data_file_first_row_id: file.first_row_id,
-                    data_file_sequence_number: file.data_sequence_number,
-                })
-                .collect();
-            (delete.delete_file_path.clone(), targets)
-        })
-        .collect())
-}
-
-fn equality_read_delete(delete: &EqualityDeleteRef) -> crate::read_model::IcebergReadDeleteFile {
-    crate::read_model::IcebergReadDeleteFile {
-        path: delete.delete_file_path.clone(),
-        file_format: crate::read_model::IcebergReadDeleteFormat::Parquet,
-        kind: crate::read_model::IcebergReadDeleteKind::Equality {
-            equality_field_ids: delete.equality_ids.clone(),
-        },
-        length: Some(delete.delete_file_size),
-        content_offset: None,
-        content_size_in_bytes: None,
-        sequence_number: delete.sequence_number,
-        partition_spec_id: delete.partition_spec_id,
-        partition_key: delete.partition_key.clone(),
-        referenced_data_file: None,
-    }
-}
-
-fn data_file_lineage_index_at(
-    table: &Table,
-    snapshot_id: i64,
-    runtime: &IcebergCatalogRuntime,
-    context: &ConnectorRequestContext,
-) -> Result<HashMap<String, BaseDataFileLineage>, ConnectorError> {
-    let snapshot = build_snapshot_controlled(table, snapshot_id, runtime, context)?;
-    snapshot
-        .files
-        .iter()
-        .map(|file| {
-            let first_row_id = file.first_row_id.ok_or_else(|| {
-                unsupported(format!(
-                    "Iceberg delta delete requires first_row_id for data file {}",
-                    file.path
-                ))
-            })?;
-            let data_sequence_number = file.data_sequence_number.ok_or_else(|| {
-                corrupt(format!(
-                    "Iceberg delta delete requires data_sequence_number for data file {}",
-                    file.path
-                ))
-            })?;
-            Ok((
-                file.path.clone(),
-                BaseDataFileLineage {
-                    first_row_id,
-                    data_sequence_number,
-                },
-            ))
-        })
-        .collect()
-}
-
-fn delete_visibility_data_files_at(
-    table: &Table,
-    snapshot_id: i64,
-    runtime: &IcebergCatalogRuntime,
-    context: &ConnectorRequestContext,
-) -> Result<Vec<DeleteVisibilityDataFileDescriptor>, ConnectorError> {
-    check_active(context)?;
-    let table = table.clone();
-    let control = context.clone();
-    let files = runtime
-        .block_on(async move {
-            crate::manifest::extract_data_files_with_stats_at_with_control(
-                &table,
-                snapshot_id,
-                Some(&control as &dyn ConnectorOperationControl),
-            )
-            .await
-        })
-        .map_err(unavailable)?;
-    check_active(context)?;
-    files
-        .map_err(unavailable)?
-        .into_iter()
-        .map(|file| {
-            let delete_files = file
-                .delete_files
-                .into_iter()
-                .map(|delete| DeleteVisibilityDeleteFileDescriptor {
-                    path: delete.path,
-                    file_format: match delete.file_format {
-                        crate::scan_model::IcebergDeleteFileFormat::Parquet => {
-                            DeleteVisibilityDeleteFileFormat::Parquet
-                        }
-                        crate::scan_model::IcebergDeleteFileFormat::Puffin => {
-                            DeleteVisibilityDeleteFileFormat::Puffin
-                        }
-                    },
-                    file_content: match delete.file_content {
-                        crate::scan_model::IcebergDeleteFileContent::Position => {
-                            DeleteVisibilityDeleteFileContent::Position
-                        }
-                        crate::scan_model::IcebergDeleteFileContent::Equality => {
-                            DeleteVisibilityDeleteFileContent::Equality
-                        }
-                    },
-                    length: delete.length,
-                    content_offset: delete.content_offset,
-                    content_size_in_bytes: delete.content_size_in_bytes,
-                })
-                .collect();
-            Ok(DeleteVisibilityDataFileDescriptor {
-                path: file.path,
-                size: file.size,
-                first_row_id: file.first_row_id,
-                data_sequence_number: file.data_sequence_number,
-                delete_files,
-            })
-        })
-        .collect()
-}
-
-fn previously_deleted_positions(
-    table: &Table,
-    snapshot_id: i64,
-    touched: &HashSet<String>,
-    runtime: &IcebergCatalogRuntime,
-    binding: &crate::access_binding::IcebergReadBinding,
-    context: &ConnectorRequestContext,
-) -> Result<HashMap<String, Vec<u64>>, ConnectorError> {
-    let snapshot = build_snapshot_controlled(table, snapshot_id, runtime, context)?;
-    let mut result = HashMap::new();
-    for file in snapshot.files {
-        if !touched.contains(&file.path) {
-            continue;
-        }
-        check_active(context)?;
-        let specs = file
-            .deletes
-            .iter()
-            .filter_map(position_delete_spec)
-            .collect::<Result<Vec<_>, _>>()?;
-        if specs.is_empty() {
-            continue;
-        }
-        let access = binding.resolve_access_for_locations(
-            std::iter::once(file.path.as_str()).chain(specs.iter().map(|spec| spec.path.as_str())),
-        )?;
-        let read_context = binding.file_read_context(
-            novarocks_fs::FileCancellation::from_connector_request(context),
-            context.deadline(),
-        )?;
-        let positions = crate::position_delete::load_position_deletes_with_context(
-            &specs,
-            &file.path,
-            &access,
-            &read_context,
-        )
-        .map_err(|error| match check_active(context) {
-            Ok(()) => unavailable(error),
-            Err(stopped) => stopped,
-        })?;
-        check_active(context)?;
-        if !positions.is_empty() {
-            result.insert(file.path, positions.iter().collect());
-        }
-    }
-    Ok(result)
-}
-
-fn position_delete_spec(
-    delete: &crate::read_model::IcebergReadDeleteFile,
-) -> Option<Result<crate::delete_file::IcebergDeleteFileSpec, ConnectorError>> {
-    if !matches!(
-        delete.kind,
-        crate::read_model::IcebergReadDeleteKind::Position
-    ) {
-        return None;
-    }
-    Some(match delete.file_format {
-        crate::read_model::IcebergReadDeleteFormat::Parquet => Ok(
-            crate::delete_file::IcebergDeleteFileSpec::parquet_position_delete(
-                delete.path.clone(),
-                delete.length.and_then(|value| u64::try_from(value).ok()),
-            ),
-        ),
-        crate::read_model::IcebergReadDeleteFormat::Puffin => {
-            let offset = delete
-                .content_offset
-                .ok_or_else(|| corrupt("Iceberg Puffin deletion vector has no offset"));
-            let size = delete
-                .content_size_in_bytes
-                .ok_or_else(|| corrupt("Iceberg Puffin deletion vector has no size"));
-            match (offset, size) {
-                (Ok(offset), Ok(size)) => Ok(
-                    crate::delete_file::IcebergDeleteFileSpec::puffin_position_delete(
-                        delete.path.clone(),
-                        delete.length.and_then(|value| u64::try_from(value).ok()),
-                        offset,
-                        size,
-                    ),
-                ),
-                (Err(error), _) | (_, Err(error)) => Err(error),
-            }
-        }
-    })
-}
-
-fn empty_batch(from_exclusive: i64, to_inclusive: i64) -> IcebergChangeBatch {
-    IcebergChangeBatch {
-        previous_snapshot_id: from_exclusive,
-        current_snapshot_id: to_inclusive,
-        inserts: Vec::new(),
-        deletes: Vec::new(),
-        equality_deletes: Vec::new(),
-        deleted_data_files: Vec::new(),
-    }
 }
 
 fn classify_lineage(
@@ -569,7 +211,7 @@ fn classify_lineage(
         ));
     }
 
-    let mut actions = Vec::new();
+    let mut changed = false;
     loop {
         let snapshot = current.as_ref();
         let parent_id = snapshot.parent_snapshot_id();
@@ -577,7 +219,7 @@ fn classify_lineage(
             .and_then(|id| metadata.snapshot_by_id(id))
             .map(|value| value.as_ref());
         match classify_snapshot(snapshot, parent)? {
-            SnapshotDecision::Action(action) => actions.push(action),
+            SnapshotDecision::Changed => changed = true,
             SnapshotDecision::MetadataOnly => {}
             SnapshotDecision::FullRebuild(reason) => {
                 return Ok(LineageAdmission::FullRebuild(reason));
@@ -629,18 +271,20 @@ fn classify_lineage(
             }
         }
     }
-    actions.reverse();
-    Ok(if actions.is_empty() {
+    Ok(if !changed {
         LineageAdmission::MetadataOnly
     } else {
-        LineageAdmission::Incremental(actions)
+        LineageAdmission::Incremental
     })
 }
 
 fn schema_differs_only_by_field_names(previous: &Schema, next: &Schema) -> bool {
     previous
         .identifier_field_ids()
-        .eq(next.identifier_field_ids())
+        .collect::<std::collections::BTreeSet<_>>()
+        == next
+            .identifier_field_ids()
+            .collect::<std::collections::BTreeSet<_>>()
         && fields_differ_only_by_names(previous.as_struct().fields(), next.as_struct().fields())
 }
 
@@ -679,7 +323,7 @@ fn type_differs_only_by_field_names(previous: &Type, next: &Type) -> bool {
 }
 
 enum SnapshotDecision {
-    Action(LineageAction),
+    Changed,
     MetadataOnly,
     FullRebuild(ConnectorChangeWindowFullRebuildReason),
 }
@@ -690,15 +334,7 @@ fn classify_snapshot(
 ) -> Result<SnapshotDecision, ConnectorError> {
     let snapshot_id = snapshot.snapshot_id();
     Ok(match snapshot.summary().operation {
-        Operation::Append => {
-            SnapshotDecision::Action(LineageAction::CollectInserts { snapshot_id })
-        }
-        Operation::Delete => {
-            SnapshotDecision::Action(LineageAction::CollectDeletes { snapshot_id })
-        }
-        Operation::Overwrite => {
-            SnapshotDecision::Action(LineageAction::CollectOverwriteDiff { snapshot_id })
-        }
+        Operation::Append | Operation::Delete | Operation::Overwrite => SnapshotDecision::Changed,
         Operation::Replace => {
             let Some(parent) = parent else {
                 return Ok(SnapshotDecision::FullRebuild(unproven_replace(
@@ -779,39 +415,43 @@ fn unproven_replace(
     }
 }
 
-fn partition_impact(
+fn endpoint_partition_impact(
     metadata: &TableMetadata,
-    batch: &IcebergChangeBatch,
+    added: &[&crate::read_model::IcebergReadFile],
+    removed: &[&crate::read_model::IcebergReadFile],
+    row_deletes: bool,
     context: &ConnectorRequestContext,
 ) -> Result<ConnectorChangeWindowPartitionImpact, ConnectorError> {
-    // The current default spec does not describe files written under an older
-    // spec. Only the table's full spec history can prove an unpartitioned
-    // change window without inspecting individual file partition values.
     if metadata
         .partition_specs_iter()
         .all(|spec| spec.is_unpartitioned())
     {
         return Ok(ConnectorChangeWindowPartitionImpact::Unpartitioned);
     }
-    let added = batch
-        .inserts
-        .iter()
-        .map(|file| connector_partition(file.partition_spec_id, &file.partition_values))
-        .collect::<Result<Option<Vec<_>>, _>>()?;
-    let removed = batch
-        .deleted_data_files
-        .iter()
-        .map(|file| connector_partition(file.partition_spec_id, &file.partition_values))
-        .collect::<Result<Option<Vec<_>>, _>>()?;
-    let (Some(added), Some(removed)) = (added, removed) else {
-        return Ok(ConnectorChangeWindowPartitionImpact::Unavailable);
+    let project = |file: &&crate::read_model::IcebergReadFile| {
+        let (Some(spec), Some(values)) = (file.partition_spec_id, file.partition_values.as_ref())
+        else {
+            return Ok(None);
+        };
+        connector_partition(
+            Some(spec),
+            &change_partition_field_values(metadata, spec, values)?,
+        )
     };
-    ConnectorChangeWindowPartitionImpact::try_exact(
-        !batch.deletes.is_empty() || !batch.equality_deletes.is_empty(),
-        added,
-        removed,
-        context,
-    )
+    let added = added
+        .iter()
+        .map(project)
+        .collect::<Result<Option<Vec<_>>, _>>()?;
+    let removed = removed
+        .iter()
+        .map(project)
+        .collect::<Result<Option<Vec<_>>, _>>()?;
+    match (added, removed) {
+        (Some(added), Some(removed)) => {
+            ConnectorChangeWindowPartitionImpact::try_exact(row_deletes, added, removed, context)
+        }
+        _ => Ok(ConnectorChangeWindowPartitionImpact::Unavailable),
+    }
 }
 
 fn connector_partition(
@@ -875,322 +515,96 @@ fn connector_transform(value: &str) -> Option<ConnectorChangePartitionTransform>
     }
 }
 
-type CollectedFiles = (
-    Vec<DataFileRef>,
-    Vec<PositionDeleteRef>,
-    Vec<EqualityDeleteRef>,
-    Vec<DeletedDataFileRef>,
-);
-
-async fn collect_files(
-    metadata: &TableMetadata,
-    file_io: &crate::iceberg::io::FileIO,
-    actions: &[LineageAction],
-    context: &ConnectorRequestContext,
-) -> Result<CollectedFiles, ConnectorError> {
-    let mut inserts = Vec::new();
-    let mut deletes = Vec::new();
-    let mut equality_deletes = Vec::new();
-    let mut deleted_data_files = Vec::new();
-    for action in actions {
-        check_active(context)?;
-        let snapshot_id = match action {
-            LineageAction::CollectInserts { snapshot_id }
-            | LineageAction::CollectDeletes { snapshot_id }
-            | LineageAction::CollectOverwriteDiff { snapshot_id } => *snapshot_id,
-        };
-        let snapshot = metadata
-            .snapshot_by_id(snapshot_id)
-            .ok_or_else(|| corrupt(format!("Iceberg snapshot {snapshot_id} disappeared")))?;
-        let manifest_list_result = snapshot.load_manifest_list(file_io, metadata).await;
-        check_active(context)?;
-        let manifest_list = manifest_list_result
-            .map_err(|error| unavailable(format!("load Iceberg manifest list: {error}")))?;
-        match action {
-            LineageAction::CollectInserts { .. } => {
-                collect_added_data(
-                    metadata,
-                    snapshot_id,
-                    file_io,
-                    &manifest_list,
-                    &mut inserts,
-                    context,
-                )
-                .await?;
-            }
-            LineageAction::CollectDeletes { .. } => {
-                collect_added_data(
-                    metadata,
-                    snapshot_id,
-                    file_io,
-                    &manifest_list,
-                    &mut inserts,
-                    context,
-                )
-                .await?;
-                collect_added_deletes(
-                    metadata,
-                    snapshot_id,
-                    file_io,
-                    &manifest_list,
-                    &mut deletes,
-                    &mut equality_deletes,
-                    context,
-                )
-                .await?;
-            }
-            LineageAction::CollectOverwriteDiff { .. } => {
-                collect_added_data(
-                    metadata,
-                    snapshot_id,
-                    file_io,
-                    &manifest_list,
-                    &mut inserts,
-                    context,
-                )
-                .await?;
-                collect_deleted_data(
-                    metadata,
-                    snapshot_id,
-                    file_io,
-                    &manifest_list,
-                    &mut deleted_data_files,
-                    context,
-                )
-                .await?;
-            }
-        }
-    }
-    check_active(context)?;
-    Ok((inserts, deletes, equality_deletes, deleted_data_files))
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ChangePartitionFieldValue {
+    source_field_id: i32,
+    source_column: Option<String>,
+    field_name: String,
+    transform: String,
+    value: ChangePartitionValue,
 }
 
-async fn collect_added_data(
-    metadata: &TableMetadata,
-    snapshot_id: i64,
-    file_io: &crate::iceberg::io::FileIO,
-    manifest_list: &crate::iceberg::spec::ManifestList,
-    out: &mut Vec<DataFileRef>,
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    for manifest_file in manifest_list.entries() {
-        check_active(context)?;
-        if manifest_file.content != ManifestContentType::Data
-            || manifest_file.added_snapshot_id != snapshot_id
-        {
-            continue;
-        }
-        let mut next_first_row_id = manifest_file
-            .first_row_id
-            .map(|value| {
-                i64::try_from(value).map_err(|_| corrupt("Iceberg first_row_id overflows i64"))
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ChangePartitionValue {
+    Null,
+    Primitive(String),
+    Unsupported(String),
+}
+
+fn change_partition_field_values(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    spec_id: i32,
+    partition: &crate::iceberg::spec::Struct,
+) -> Result<Vec<ChangePartitionFieldValue>, ConnectorError> {
+    let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
+        return Err(corrupt(format!(
+            "iceberg table metadata missing partition spec id {spec_id}"
+        )));
+    };
+    let schema = metadata.current_schema();
+    spec.fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let literal = partition.fields().get(idx).ok_or_else(|| {
+                corrupt(format!(
+                    "iceberg partition struct for spec id {spec_id} is missing field {} at index {idx}",
+                    field.name
+                ))
+            })?;
+            Ok(ChangePartitionFieldValue {
+                source_field_id: field.source_id,
+                source_column: schema.field_by_id(field.source_id).map(|source| source.name.clone()),
+                field_name: field.name.clone(),
+                transform: change_partition_transform_name(&field.transform),
+                value: change_partition_value(literal.as_ref()),
             })
-            .transpose()?;
-        let manifest_result = manifest_file.load_manifest(file_io).await;
-        check_active(context)?;
-        let manifest = manifest_result
-            .map_err(|error| unavailable(format!("load Iceberg data manifest: {error}")))?;
-        for entry in manifest.entries() {
-            check_active(context)?;
-            if entry.status != ManifestStatus::Added
-                || entry.snapshot_id() != Some(snapshot_id)
-                || entry.data_file().content_type() != DataContentType::Data
-            {
-                continue;
-            }
-            let file = entry.data_file();
-            let record_count = i64::try_from(file.record_count()).unwrap_or(i64::MAX);
-            let first_row_id = file.first_row_id().or(next_first_row_id);
-            if let Some(next) = next_first_row_id.as_mut() {
-                *next = next
-                    .checked_add(record_count)
-                    .ok_or_else(|| corrupt("Iceberg first_row_id range overflows i64"))?;
-            }
-            out.push(DataFileRef {
-                path: file.file_path().to_string(),
-                size: i64::try_from(file.file_size_in_bytes()).unwrap_or(i64::MAX),
-                record_count: Some(record_count),
-                partition_spec_id: Some(manifest_file.partition_spec_id),
-                partition_key: partition_key(file.partition()),
-                partition_values: change_partition_field_values(
-                    metadata,
-                    manifest_file.partition_spec_id,
-                    file.partition(),
-                )
-                .map_err(change_error)?,
-                first_row_id,
-                data_sequence_number: Some(
-                    entry
-                        .sequence_number()
-                        .unwrap_or(manifest_file.sequence_number),
-                ),
-                row_id_allow_list: None,
-            });
-        }
-    }
-    Ok(())
+        })
+        .collect()
 }
 
-async fn collect_deleted_data(
-    metadata: &TableMetadata,
-    snapshot_id: i64,
-    file_io: &crate::iceberg::io::FileIO,
-    manifest_list: &crate::iceberg::spec::ManifestList,
-    out: &mut Vec<DeletedDataFileRef>,
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    for manifest_file in manifest_list.entries() {
-        check_active(context)?;
-        if manifest_file.content != ManifestContentType::Data
-            || manifest_file.added_snapshot_id != snapshot_id
-        {
-            continue;
-        }
-        let manifest_result = manifest_file.load_manifest(file_io).await;
-        check_active(context)?;
-        let manifest = manifest_result
-            .map_err(|error| unavailable(format!("load Iceberg overwrite manifest: {error}")))?;
-        for entry in manifest.entries() {
-            check_active(context)?;
-            if entry.status != ManifestStatus::Deleted
-                || entry.snapshot_id() != Some(snapshot_id)
-                || entry.data_file().content_type() != DataContentType::Data
-            {
-                continue;
-            }
-            let file = entry.data_file();
-            out.push(DeletedDataFileRef {
-                path: file.file_path().to_string(),
-                size: i64::try_from(file.file_size_in_bytes()).unwrap_or(i64::MAX),
-                record_count: Some(i64::try_from(file.record_count()).unwrap_or(i64::MAX)),
-                partition_spec_id: Some(manifest_file.partition_spec_id),
-                partition_key: partition_key(file.partition()),
-                partition_values: change_partition_field_values(
-                    metadata,
-                    manifest_file.partition_spec_id,
-                    file.partition(),
-                )
-                .map_err(change_error)?,
-                first_row_id: file.first_row_id(),
-                data_sequence_number: Some(
-                    entry
-                        .sequence_number()
-                        .unwrap_or(manifest_file.sequence_number),
-                ),
-            });
-        }
+fn change_partition_transform_name(transform: &crate::iceberg::spec::Transform) -> String {
+    match transform {
+        crate::iceberg::spec::Transform::Identity => "identity".to_string(),
+        other => format!("{other:?}").to_ascii_lowercase(),
     }
-    Ok(())
 }
 
-async fn collect_added_deletes(
-    metadata: &TableMetadata,
-    snapshot_id: i64,
-    file_io: &crate::iceberg::io::FileIO,
-    manifest_list: &crate::iceberg::spec::ManifestList,
-    positions: &mut Vec<PositionDeleteRef>,
-    equalities: &mut Vec<EqualityDeleteRef>,
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    for manifest_file in manifest_list.entries() {
-        check_active(context)?;
-        if manifest_file.content != ManifestContentType::Deletes
-            || manifest_file.added_snapshot_id != snapshot_id
-        {
-            continue;
-        }
-        let manifest_result = manifest_file.load_manifest(file_io).await;
-        check_active(context)?;
-        let manifest = manifest_result
-            .map_err(|error| unavailable(format!("load Iceberg delete manifest: {error}")))?;
-        for entry in manifest.entries() {
-            check_active(context)?;
-            if entry.status != ManifestStatus::Added || entry.snapshot_id() != Some(snapshot_id) {
-                continue;
+fn change_partition_value(literal: Option<&crate::iceberg::spec::Literal>) -> ChangePartitionValue {
+    let Some(crate::iceberg::spec::Literal::Primitive(value)) = literal else {
+        return match literal {
+            None => ChangePartitionValue::Null,
+            Some(_) => {
+                ChangePartitionValue::Unsupported("non-primitive partition value".to_string())
             }
-            let file = entry.data_file();
-            match file.content_type() {
-                DataContentType::PositionDeletes => {
-                    let (referenced, offset, size) = match file.file_format() {
-                        DataFileFormat::Parquet => (file.referenced_data_file(), None, None),
-                        DataFileFormat::Puffin => (
-                            Some(file.referenced_data_file().ok_or_else(|| {
-                                corrupt("Iceberg Puffin deletion vector has no referenced file")
-                            })?),
-                            Some(file.content_offset().ok_or_else(|| {
-                                corrupt("Iceberg Puffin deletion vector has no offset")
-                            })?),
-                            Some(file.content_size_in_bytes().ok_or_else(|| {
-                                corrupt("Iceberg Puffin deletion vector has no size")
-                            })?),
-                        ),
-                        _ => {
-                            return Err(corrupt(
-                                "Iceberg position-delete manifest uses an unsupported format",
-                            ));
-                        }
-                    };
-                    let delete = PositionDeleteRef {
-                        delete_file_path: file.file_path().to_string(),
-                        delete_file_size: i64::try_from(file.file_size_in_bytes())
-                            .unwrap_or(i64::MAX),
-                        record_count: Some(i64::try_from(file.record_count()).unwrap_or(i64::MAX)),
-                        referenced_data_file: referenced,
-                        file_format: file.file_format(),
-                        content_offset: offset,
-                        content_size_in_bytes: size,
-                        partition_values: change_partition_field_values(
-                            metadata,
-                            manifest_file.partition_spec_id,
-                            file.partition(),
-                        )
-                        .map_err(change_error)?,
-                    };
-                    delete.validate_invariants().map_err(change_error)?;
-                    positions.push(delete);
-                }
-                DataContentType::EqualityDeletes => {
-                    if file.file_format() != DataFileFormat::Parquet {
-                        return Err(corrupt(
-                            "Iceberg equality-delete manifest uses an unsupported format",
-                        ));
-                    }
-                    let equality_ids = file
-                        .equality_ids()
-                        .filter(|values| !values.is_empty())
-                        .ok_or_else(|| corrupt("Iceberg equality-delete file has no field IDs"))?;
-                    equalities.push(EqualityDeleteRef {
-                        delete_file_path: file.file_path().to_string(),
-                        delete_file_size: i64::try_from(file.file_size_in_bytes())
-                            .unwrap_or(i64::MAX),
-                        record_count: Some(i64::try_from(file.record_count()).unwrap_or(i64::MAX)),
-                        equality_ids,
-                        sequence_number: Some(
-                            entry
-                                .sequence_number()
-                                .unwrap_or(manifest_file.sequence_number),
-                        ),
-                        partition_spec_id: Some(manifest_file.partition_spec_id),
-                        partition_key: partition_key(file.partition()),
-                        partition_values: change_partition_field_values(
-                            metadata,
-                            manifest_file.partition_spec_id,
-                            file.partition(),
-                        )
-                        .map_err(change_error)?,
-                    });
-                }
-                DataContentType::Data => {
-                    return Err(corrupt("Iceberg delete manifest contains a data file"));
-                }
-            }
+        };
+    };
+    let value = match value {
+        crate::iceberg::spec::PrimitiveLiteral::Boolean(v) => v.to_string(),
+        crate::iceberg::spec::PrimitiveLiteral::Int(v) => v.to_string(),
+        crate::iceberg::spec::PrimitiveLiteral::Long(v) => v.to_string(),
+        crate::iceberg::spec::PrimitiveLiteral::Float(v) => v.0.to_string(),
+        crate::iceberg::spec::PrimitiveLiteral::Double(v) => v.0.to_string(),
+        crate::iceberg::spec::PrimitiveLiteral::String(v) => {
+            return ChangePartitionValue::Primitive(v.clone());
         }
-    }
-    Ok(())
-}
-
-fn partition_key(partition: &crate::iceberg::spec::Struct) -> Option<String> {
-    (!partition.fields().is_empty()).then(|| format!("{partition:?}"))
+        crate::iceberg::spec::PrimitiveLiteral::Binary(_) => {
+            return ChangePartitionValue::Unsupported("binary partition value".to_string());
+        }
+        crate::iceberg::spec::PrimitiveLiteral::Int128(_) => {
+            return ChangePartitionValue::Unsupported("int128 partition value".to_string());
+        }
+        crate::iceberg::spec::PrimitiveLiteral::UInt128(_) => {
+            return ChangePartitionValue::Unsupported("uint128 partition value".to_string());
+        }
+        crate::iceberg::spec::PrimitiveLiteral::AboveMax => {
+            return ChangePartitionValue::Unsupported("above-max partition value".to_string());
+        }
+        crate::iceberg::spec::PrimitiveLiteral::BelowMin => {
+            return ChangePartitionValue::Unsupported("below-min partition value".to_string());
+        }
+    };
+    ChangePartitionValue::Primitive(value)
 }
 
 fn check_active(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
@@ -1207,10 +621,6 @@ fn check_active(context: &ConnectorRequestContext) -> Result<(), ConnectorError>
         ));
     }
     Ok(())
-}
-
-fn change_error(error: crate::delta::ChangeError) -> ConnectorError {
-    corrupt(error.to_string())
 }
 
 fn corrupt(message: impl Into<String>) -> ConnectorError {
@@ -1477,41 +887,185 @@ mod tests {
         assert!(schema_differs_only_by_field_names(&previous, &renamed));
         assert!(!schema_differs_only_by_field_names(&previous, &widened));
     }
+    #[test]
+    fn rename_only_identifier_sets_ignore_independent_hash_iteration_order() {
+        let schema = |name: &str, ids: &[i32]| {
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        name,
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        2,
+                        "second",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .with_identifier_field_ids(ids.iter().copied())
+                .build()
+                .unwrap()
+        };
+        let original = schema("first", &[1, 2]);
+        for _ in 0..64 {
+            assert!(schema_differs_only_by_field_names(
+                &original,
+                &schema("renamed", &[2, 1])
+            ));
+        }
+        assert!(!schema_differs_only_by_field_names(
+            &original,
+            &schema("renamed", &[1])
+        ));
+    }
+
+    fn request_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            256 * 1024,
+            1024 * 1024,
+        )
+        .unwrap()
+    }
+
+    fn endpoint_file(
+        metadata: &TableMetadata,
+        snapshot: i64,
+        delete_sequence: i64,
+        prune: bool,
+    ) -> crate::read_model::IcebergReadFile {
+        use crate::delete_semantics::*;
+        use crate::iceberg::spec::{DataFileFormat, Datum, Struct};
+        let schema = metadata.current_schema();
+        let spec = PartitionSpec::unpartition_spec();
+        let partition = TypedPartition::bind(&spec, schema, &Struct::empty()).unwrap();
+        let metrics = |lo, hi| {
+            FileMetrics::new(BTreeMap::from([(
+                1,
+                FieldMetrics {
+                    resolved_type: PrimitiveType::Long,
+                    value_count: Some(10),
+                    null_count: Some(0),
+                    nan_count: None,
+                    lower_bound: Some(Datum::long(lo)),
+                    upper_bound: Some(Datum::long(hi)),
+                },
+            )]))
+        };
+        let data = DataFileFact::try_new(
+            "data",
+            DataSequenceNumber::try_new(1).unwrap(),
+            partition.clone(),
+            10,
+            metrics(8, 9),
+        )
+        .unwrap();
+        let fact = DeleteFact::try_new(DeleteFactParams {
+            address: DeleteContentAddress::file("same.parquet").unwrap(),
+            kind: DeleteKind::Equality(EqualityFieldGroup::bind(&[1], schema).unwrap()),
+            sequence: DataSequenceNumber::try_new(delete_sequence).unwrap(),
+            partition,
+            read: DeleteReadFacts {
+                format: DeleteFormat::Parquet,
+                record_count: 10,
+                file_size: 100,
+                key_metadata: Arc::from([]),
+            },
+            metrics: metrics(1, 2),
+        })
+        .unwrap();
+        let index = DeleteCandidateIndex::try_new(
+            test_read_domain(schema, &[spec], snapshot),
+            DeleteObservation::from_normalized_recall([Arc::new(fact)]).unwrap(),
+        )
+        .unwrap();
+        crate::read_model::IcebergReadFile {
+            path: "data".into(),
+            size: 100,
+            record_count: Some(10),
+            column_stats: None,
+            partition_spec_id: Some(0),
+            partition_key: None,
+            partition_values: Some(Struct::empty()),
+            manifest_path: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            manifest: Arc::new(crate::read_model::IcebergDataFileMetadata {
+                file_format: DataFileFormat::Parquet,
+                split_offsets: vec![],
+                key_metadata: vec![],
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+            }),
+            deletes: index.for_data(&data).unwrap().load_view(if prune {
+                StatisticsPolicy::MetadataBudget {
+                    max_candidate_members: 10,
+                    max_field_comparisons: 10,
+                }
+            } else {
+                StatisticsPolicy::Disabled
+            }),
+        }
+    }
 
     #[test]
-    fn transient_file_netting_requires_exact_iceberg_identity() {
-        let inserted = DataFileRef {
-            path: "warehouse/orders/data/file.parquet".to_string(),
-            size: 128,
-            record_count: Some(3),
-            partition_spec_id: Some(1),
-            partition_key: Some("region=us".to_string()),
-            partition_values: Vec::new(),
-            first_row_id: Some(10),
-            data_sequence_number: Some(7),
-            row_id_allow_list: None,
-        };
-        let exact_delete = DeletedDataFileRef {
-            path: inserted.path.clone(),
-            size: inserted.size,
-            record_count: inserted.record_count,
-            partition_spec_id: inserted.partition_spec_id,
-            partition_key: inserted.partition_key.clone(),
-            partition_values: inserted.partition_values.clone(),
-            first_row_id: inserted.first_row_id,
-            data_sequence_number: inserted.data_sequence_number,
-        };
-        let mut different_delete = exact_delete.clone();
-        different_delete.data_sequence_number = Some(8);
+    fn admission_uses_logical_applications_and_ignores_optional_load_pruning() {
+        let metadata = metadata_with_snapshots(vec![]);
+        let from = endpoint_file(&metadata, 10, 2, false);
+        let pruned = endpoint_file(&metadata, 20, 2, true);
+        assert_eq!(from.deletes.member_count(), 1);
+        assert_eq!(pruned.deletes.member_count(), 0);
+        assert!(matches!(
+            endpoint_admission(&metadata, &[from.clone()], &[pruned], &request_context()).unwrap(),
+            ConnectorChangeWindowAdmission::MetadataOnly
+        ));
+        let changed = endpoint_file(&metadata, 20, 3, false);
+        assert!(matches!(
+            endpoint_admission(&metadata, &[from], &[changed], &request_context()).unwrap(),
+            ConnectorChangeWindowAdmission::Incremental {
+                has_inserts: false,
+                has_deletes: true,
+                ..
+            }
+        ));
+    }
 
-        let (remaining_inserts, remaining_deletes) =
-            cancel_exact_transient_data_files(vec![inserted.clone()], vec![exact_delete]);
-        assert!(remaining_inserts.is_empty());
-        assert!(remaining_deletes.is_empty());
-
-        let (remaining_inserts, remaining_deletes) =
-            cancel_exact_transient_data_files(vec![inserted], vec![different_delete]);
-        assert_eq!(remaining_inserts.len(), 1);
-        assert_eq!(remaining_deletes.len(), 1);
+    #[test]
+    fn admission_endpoint_membership_excludes_transient_files_and_checks_data_identity() {
+        let metadata = metadata_with_snapshots(vec![]);
+        let file = endpoint_file(&metadata, 10, 2, false);
+        assert!(matches!(
+            endpoint_admission(&metadata, &[], &[], &request_context()).unwrap(),
+            ConnectorChangeWindowAdmission::MetadataOnly
+        ));
+        assert!(matches!(
+            endpoint_admission(&metadata, &[], &[file.clone()], &request_context()).unwrap(),
+            ConnectorChangeWindowAdmission::Incremental {
+                has_inserts: true,
+                has_deletes: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            endpoint_admission(&metadata, &[file.clone()], &[], &request_context()).unwrap(),
+            ConnectorChangeWindowAdmission::Incremental {
+                has_inserts: false,
+                has_deletes: true,
+                ..
+            }
+        ));
+        let mut mutated = file.clone();
+        mutated.record_count = Some(11);
+        assert_eq!(
+            endpoint_admission(&metadata, &[file], &[mutated], &request_context())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::CorruptData
+        );
     }
 }

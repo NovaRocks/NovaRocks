@@ -120,12 +120,75 @@ mod tests {
                 .iter()
                 .map(|declaration| (declaration.provider_id(), declaration.contract_revision()))
                 .collect::<Vec<_>>(),
-            vec![("iceberg", 1), ("paimon", 1)]
+            vec![("iceberg", 2), ("paimon", 1)]
         );
         assert!(
             declarations
                 .iter()
                 .all(|declaration| { declaration.private_descriptor_digest() != [0; 32] })
+        );
+    }
+
+    #[test]
+    fn iceberg_revision_alone_changes_the_native_compatibility_island() {
+        let manifest = server_manifest();
+        let declarations = native_carrier_declarations(manifest.contracts()).unwrap();
+        let iceberg = manifest
+            .contracts()
+            .definitions()
+            .iter()
+            .find(|contract| contract.provider_id().as_str() == "iceberg")
+            .expect("sealed Iceberg contract");
+        let descriptor = iceberg.declarations()[0].descriptor();
+        let changed = declarations
+            .iter()
+            .map(|declaration| {
+                if declaration.provider_id() == "iceberg" {
+                    novarocks_version::NativeCarrierDeclaration::try_new_with_private_descriptor(
+                        "iceberg",
+                        declaration.contract_revision().checked_add(1).unwrap(),
+                        descriptor,
+                    )
+                    .unwrap()
+                } else {
+                    declaration.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        for (before, after) in declarations.iter().zip(&changed) {
+            assert_eq!(before.provider_id(), after.provider_id());
+            assert_eq!(
+                before.private_descriptor_digest(),
+                after.private_descriptor_digest()
+            );
+            if before.provider_id() != "iceberg" {
+                assert_eq!(before, after);
+            }
+        }
+        let derive = |carriers| {
+            novarocks_version::derive_repository_native_compatibility_material(
+                carriers,
+                [0x31; 32],
+                [0x41; 32],
+                novarocks_physical_plan::PLAN_CONTRACT_REVISION,
+            )
+            .unwrap()
+        };
+        let original = derive(declarations);
+        let revised = derive(changed);
+        assert_ne!(original.id(), revised.id());
+        assert_eq!(original.descriptor_digest(), revised.descriptor_digest());
+        assert_eq!(
+            original.function_catalog_digest(),
+            revised.function_catalog_digest()
+        );
+        assert_eq!(
+            original.execution_implementation_manifest_digest(),
+            revised.execution_implementation_manifest_digest()
+        );
+        assert_eq!(
+            original.plan_contract_digest(),
+            revised.plan_contract_digest()
         );
     }
 

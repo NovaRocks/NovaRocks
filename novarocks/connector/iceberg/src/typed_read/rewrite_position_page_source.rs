@@ -387,6 +387,8 @@ mod tests {
         let delete_path = delete_path.to_string_lossy().to_string();
         let delete = |offset: usize, payload: &[u8]| {
             IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+                partition_spec_id: 0,
+                partition_data_json: r#"{"version":1,"values":[]}"#.to_string(),
                 content: IcebergDeleteFileContent::PositionDeletes,
                 path: delete_path.clone(),
                 format: IcebergFileFormat::Puffin,
@@ -408,7 +410,7 @@ mod tests {
                 data_file_path: data_file_path.clone(),
                 data_file_size: 0,
                 partition_spec_id: 0,
-                partition_data_json: "{}".to_string(),
+                partition_data_json: r#"{"version":1,"values":[]}"#.to_string(),
                 selected_position_deletes: vec![
                     delete(0, &first_payload),
                     delete(first_payload.len(), &second_payload),

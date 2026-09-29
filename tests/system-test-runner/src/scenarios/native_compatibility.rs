@@ -438,12 +438,14 @@ impl Scenario for OtherIslandHardCut {
         // The other-island binary is either this build at the test-alternate
         // epoch or a real earlier release; the evidence names which one.
         let excluded_build = other[0].build_identity.clone();
+        let primary_compatibility_id = decode_hex_32(&live[0].native_compatibility_id)?;
         assert_island_ready(context, 200)?;
         run_distributed_queries(context, &[0, 1])?;
         context
             .handle()
             .assert_be_log(2, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)
             .expect_err("OtherIsland BE must never be given a query context by the FE");
+        assert_other_island_admission_cut(context, primary_compatibility_id)?;
         assert_raw_ingress_hard_cuts(context)?;
         context.action(format!(
             "excluded BE (build {excluded_build}) remained OtherIsland while SQL admitted only compatible BEs"
@@ -606,6 +608,71 @@ impl Scenario for IslandDrainAndReplacement {
 /// Raw Establish compatibility admission has its own scenario because it must
 /// also prove the registry stays untouched after a well-formed foreign-island
 /// request.
+fn assert_other_island_admission_cut(
+    context: &mut ScenarioContext,
+    primary_compatibility_id: [u8; 32],
+) -> Result<()> {
+    let endpoint = context.handle().native_be_endpoint(2)?;
+    let mode = context.handle().native_trust_mode();
+    let connector = context.handle().native_probe_connector(endpoint, mode)?;
+    let trust = context.handle().native_probe_trust()?;
+    let authorization = authorization_header(&trust)?;
+    let rows = context.handle().frontend_backend_topology()?;
+    let target_port = context.handle().runtime().be[2].grpc;
+    let target = rows
+        .iter()
+        .find(|row| row.grpc_port == target_port)
+        .context("SHOW BACKENDS omitted OtherIsland admission target")?;
+    let backend = target.process_id.parse::<BackendProcessId>()?;
+    let heartbeat: proto::HeartbeatResponse = raw_unary(
+        connector.clone(),
+        HEARTBEAT_PATH,
+        &authorization,
+        proto::HeartbeatRequest {
+            expected_process_id: Some(proto::BackendProcessId {
+                value: backend.to_bytes().to_vec(),
+            }),
+        },
+    )?;
+    let admission_epoch_capability = heartbeat
+        .admission_epoch_capability
+        .context("OtherIsland heartbeat omitted its admission epoch capability")?;
+    let metrics_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let metrics_port = context.handle().runtime().be[2].http;
+    let reservations_before = admission_reservation_used(&metrics_client, metrics_port)?;
+    let response = raw_apply_task_operations(
+        &connector,
+        &authorization,
+        vec![raw_acquire_admission_ticket(
+            raw_query_context(backend),
+            primary_compatibility_id,
+            admission_epoch_capability,
+        )],
+    )?;
+    let receipt = only_successful_receipt(response, "OtherIsland admission acquisition")?;
+    ensure!(
+        proto::TaskOperationOutcome::try_from(receipt.outcome)
+            == Ok(proto::TaskOperationOutcome::CompatibilityMismatch),
+        "OtherIsland admission must reject the primary island identity, got {receipt:?}"
+    );
+    ensure!(
+        receipt.ack.is_none(),
+        "rejected admission must not issue a ticket"
+    );
+    ensure!(
+        admission_reservation_used(&metrics_client, metrics_port)? == reservations_before,
+        "OtherIsland rejection must not acquire a Worker reservation"
+    );
+    context
+        .handle()
+        .assert_be_log(2, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)
+        .expect_err("rejected OtherIsland admission must not establish a query context");
+    context.action("OtherIsland BE rejected the exact primary compatibility identity before ticket reservation or query-context establishment");
+    Ok(())
+}
+
 fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
     let endpoint = context.handle().native_be_endpoint(2)?;
     let mode = context.handle().native_trust_mode();

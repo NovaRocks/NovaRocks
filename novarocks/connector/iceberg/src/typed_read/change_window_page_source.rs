@@ -33,8 +33,8 @@
 //!   column handle has to declare `int` because the table format has no
 //!   eight-bit integer;
 //! * the reverse side *selects* the rows a delete removed instead of hiding
-//!   them, which is [`DeleteEvaluationMode::SelectRemovedRows`]. The forward
-//!   side is an ordinary exclusion read of the upper endpoint's own closure.
+//!   them by comparing both complete endpoint closures. Added and removed
+//!   files use ordinary exclusion at their independently pinned endpoint.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -57,7 +57,7 @@ use super::change_window::{
     change_op_column_handle,
 };
 use super::column_handle::{IcebergColumnHandle, invalid, unsupported};
-use super::delete_manager::{DeleteEvaluationMode, DeleteManager, RemovedRowSelection};
+use super::delete_manager::{DeleteEvaluationMode, DeleteManager, EndpointDeleteClosure};
 use super::page_source::{
     IcebergDynamicFilter, IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache,
     create_iceberg_page_stream,
@@ -117,11 +117,20 @@ impl ChangeWindowRead {
             base_columns,
         } = ChangeOpProjection::of(request.columns)?;
         Ok(Self {
-            relation: IcebergReadRelation::of_change_window(
-                request.handle,
-                split.data().partition_spec_id(),
-            )?,
-            delete_mode: delete_mode_of(split)?,
+            relation: match split {
+                IcebergChangeSplit::VisibilityDifference(_) => {
+                    IcebergReadRelation::of_change_window(
+                        request.handle,
+                        split.data().partition_spec_id(),
+                    )?
+                }
+                _ => IcebergReadRelation::of_change_window_endpoint(
+                    request.handle,
+                    split.data().partition_spec_id(),
+                    matches!(split, IcebergChangeSplit::DeletedDataFileRows(_)),
+                )?,
+            },
+            delete_mode: delete_mode_of(split, request.handle)?,
             output: ChangeOpOutput {
                 slots,
                 base_channel_count: base_columns.len(),
@@ -164,7 +173,10 @@ fn data_request<'a>(
 /// removed. Leaving that out would emit rows that were invisible at both
 /// endpoints, which is exactly the double counting the set-difference contract
 /// exists to prevent.
-fn delete_mode_of(split: &IcebergChangeSplit) -> Result<DeleteEvaluationMode, ConnectorError> {
+fn delete_mode_of(
+    split: &IcebergChangeSplit,
+    handle: &IcebergChangeWindowHandle,
+) -> Result<DeleteEvaluationMode, ConnectorError> {
     match split {
         IcebergChangeSplit::AddedRows(rows) => {
             if !rows.restricted_row_ids().is_empty() {
@@ -181,29 +193,19 @@ fn delete_mode_of(split: &IcebergChangeSplit) -> Result<DeleteEvaluationMode, Co
             // what it deletes leaves exactly the rows that survive at `to`.
             Ok(DeleteEvaluationMode::ExcludeDeleted)
         }
-        IcebergChangeSplit::PositionDeletedRows(rows) => {
-            Ok(DeleteEvaluationMode::SelectRemovedRows {
-                selected: RemovedRowSelection::NamedBy(rows.newly_applied_deletes().to_vec()),
-                previously_applied: rows.previously_applied_deletes().to_vec(),
+        IcebergChangeSplit::VisibilityDifference(rows) => {
+            Ok(DeleteEvaluationMode::VisibleDifference {
+                from: EndpointDeleteClosure {
+                    read_domain: handle.from_read_domain().clone(),
+                    deletes: rows.from_deletes().to_vec(),
+                },
+                to: EndpointDeleteClosure {
+                    read_domain: handle.to_read_domain().clone(),
+                    deletes: rows.to_deletes().to_vec(),
+                },
             })
         }
-        IcebergChangeSplit::EqualityDeletedRows(rows) => {
-            Ok(DeleteEvaluationMode::SelectRemovedRows {
-                selected: RemovedRowSelection::NamedBy(
-                    rows.newly_applied_equality_deletes().to_vec(),
-                ),
-                // Every position delete that newly applies to this data file
-                // is here too, so a row both a position delete and an equality
-                // delete named is emitted once, by the position variant.
-                previously_applied: rows.previously_applied_deletes().to_vec(),
-            })
-        }
-        IcebergChangeSplit::DeletedDataFileRows(rows) => {
-            Ok(DeleteEvaluationMode::SelectRemovedRows {
-                selected: RemovedRowSelection::WholeFile,
-                previously_applied: rows.previously_applied_deletes().to_vec(),
-            })
-        }
+        IcebergChangeSplit::DeletedDataFileRows(_) => Ok(DeleteEvaluationMode::ExcludeDeleted),
     }
 }
 
@@ -356,7 +358,7 @@ mod tests {
     use crate::position_delete::{FILE_PATH_COLUMN, POS_COLUMN};
     use crate::typed_read::change_window::{
         IcebergAddedRows, IcebergChangeWindowHandleParams, IcebergDeletedDataFileRows,
-        IcebergEqualityDeletedRows, IcebergPositionDeletedRows,
+        IcebergVisibilityDifferenceRows,
     };
     use crate::typed_read::split::{
         IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergFileFormat,
@@ -487,10 +489,18 @@ mod tests {
         equality_field_ids: Vec<i32>,
     ) -> IcebergDeleteFile {
         IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            partition_spec_id: 0,
+            partition_data_json: r#"{"version":1,"values":[]}"#.to_string(),
             content,
             path: path.to_string_lossy().to_string(),
             format: IcebergFileFormat::Parquet,
-            record_count: 1,
+            record_count: parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                fs::File::open(path).unwrap(),
+            )
+            .unwrap()
+            .metadata()
+            .file_metadata()
+            .num_rows(),
             file_size_in_bytes: file_size_of(path),
             equality_field_ids,
             row_position_lower_bound: None,
@@ -519,6 +529,12 @@ mod tests {
             name_mapping_json: None,
             from_snapshot_id_exclusive: 11,
             to_snapshot_id_inclusive: 12,
+            from_read_domain: crate::delete_semantics::test_read_domain(
+                schema,
+                &[spec.clone()],
+                11,
+            ),
+            to_read_domain: crate::delete_semantics::test_read_domain(schema, &[spec.clone()], 12),
             partition_spec_jsons: BTreeMap::from([(
                 0,
                 serde_json::to_string(&spec).expect("spec json"),
@@ -593,7 +609,22 @@ mod tests {
             deletes: Vec<IcebergDeleteFile>,
             file_format: IcebergFileFormat,
         ) -> IcebergSplit {
+            self.data_split_at(deletes, file_format, 12)
+        }
+
+        fn data_split_at(
+            &self,
+            deletes: Vec<IcebergDeleteFile>,
+            file_format: IcebergFileFormat,
+            snapshot: i64,
+        ) -> IcebergSplit {
+            let schema = iceberg_schema();
             IcebergSplit::try_new(IcebergSplitParams {
+                read_domain: crate::delete_semantics::test_read_domain(
+                    &schema,
+                    &[PartitionSpec::unpartition_spec()],
+                    snapshot,
+                ),
                 path: self.data_file(),
                 start: 0,
                 length: self.data_file_size as i64,
@@ -601,8 +632,8 @@ mod tests {
                 file_record_count: self.record_count,
                 file_format,
                 partition_spec_id: 0,
-                partition_data_json: "{}".to_owned(),
-                deletes,
+                partition_data_json: r#"{"version":1,"values":[]}"#.to_owned(),
+                deletes: deletes.into(),
                 file_statistics_domain: TupleDomain::all(),
                 data_sequence_number: Some(DATA_SEQUENCE_NUMBER),
                 file_first_row_id: None,
@@ -794,157 +825,143 @@ mod tests {
         );
     }
 
+    fn difference(
+        fixture: &Fixture,
+        from: Vec<IcebergDeleteFile>,
+        to: Vec<IcebergDeleteFile>,
+    ) -> IcebergChangeSplit {
+        IcebergChangeSplit::VisibilityDifference(
+            IcebergVisibilityDifferenceRows::try_new(fixture.data_split(to.clone()), from, to)
+                .unwrap(),
+        )
+    }
+    fn removed(fixture: &Fixture, from: Vec<IcebergDeleteFile>) -> IcebergChangeSplit {
+        IcebergChangeSplit::DeletedDataFileRows(
+            IcebergDeletedDataFileRows::try_new(fixture.data_split_at(
+                from,
+                IcebergFileFormat::Parquet,
+                11,
+            ))
+            .unwrap(),
+        )
+    }
     #[test]
-    fn deleted_data_file_rows_emit_what_was_visible_at_the_lower_endpoint_with_a_minus_one_sign() {
-        // The whole file is gone at the upper endpoint, so every row it still
-        // had at the lower one left the relation -- but position 0 was already
-        // invisible there and was never part of `Visible(from)`.
+    fn removed_files_exclude_the_complete_from_closure() {
         let fixture = Fixture::new(&[20, 21, 22]);
         let schema = iceberg_schema();
         let handle = change_window_handle(&schema);
-        let previously = fixture.path("already-applied.parquet");
-        write_position_delete(&previously, &fixture.data_file(), &[0]);
-        let split = IcebergChangeSplit::DeletedDataFileRows(
-            IcebergDeletedDataFileRows::try_new(
-                fixture.data_split(Vec::new()),
-                vec![position_delete_descriptor(
-                    &previously,
-                    DATA_SEQUENCE_NUMBER + 1,
-                )],
-            )
-            .expect("deleted data file rows"),
+        let old = fixture.path("old.parquet");
+        write_position_delete(&old, &fixture.data_file(), &[0]);
+        let split = removed(
+            &fixture,
+            vec![position_delete_descriptor(&old, DATA_SEQUENCE_NUMBER + 1)],
         );
-
-        let mut source = fixture
-            .page_source(&handle, &split, &id_and_change_op(&schema))
-            .expect("page source");
-        assert_eq!(drain(&mut source), vec![(21, -1), (22, -1)]);
-    }
-
-    #[test]
-    fn deleted_data_file_rows_without_a_prior_closure_emit_the_whole_file() {
-        let fixture = Fixture::new(&[20, 21]);
-        let schema = iceberg_schema();
-        let handle = change_window_handle(&schema);
-        let split = IcebergChangeSplit::DeletedDataFileRows(
-            IcebergDeletedDataFileRows::try_new(fixture.data_split(Vec::new()), Vec::new())
-                .expect("deleted data file rows"),
+        assert_eq!(
+            read_streamed(&fixture, &handle, &split, &schema),
+            vec![(21, -1), (22, -1)]
         );
-
-        let mut source = fixture
-            .page_source(&handle, &split, &id_and_change_op(&schema))
-            .expect("page source");
-        assert_eq!(drain(&mut source), vec![(20, -1), (21, -1)]);
+        assert_eq!(
+            read_streamed(&fixture, &handle, &removed(&fixture, vec![]), &schema),
+            vec![(20, -1), (21, -1), (22, -1)]
+        );
     }
-
     #[test]
-    fn position_deleted_rows_select_exactly_the_newly_deleted_rows_and_not_the_surviving_ones() {
-        // The reverse side is the inverse of exclusion: the newly applied
-        // artifact names the rows to emit. Position 0 was already gone at the
-        // lower endpoint, so naming it again removes nothing new.
+    fn replacement_closure_emits_only_the_endpoint_row_bag_difference() {
         let fixture = Fixture::new(&[30, 31, 32, 33]);
         let schema = iceberg_schema();
         let handle = change_window_handle(&schema);
-        let previously = fixture.path("previously.parquet");
-        let newly = fixture.path("newly.parquet");
-        write_position_delete(&previously, &fixture.data_file(), &[0]);
-        write_position_delete(&newly, &fixture.data_file(), &[0, 2]);
-        let split = IcebergChangeSplit::PositionDeletedRows(
-            IcebergPositionDeletedRows::try_new(
-                fixture.data_split(Vec::new()),
-                vec![position_delete_descriptor(&newly, DATA_SEQUENCE_NUMBER + 2)],
-                vec![position_delete_descriptor(
-                    &previously,
-                    DATA_SEQUENCE_NUMBER + 1,
-                )],
-            )
-            .expect("position deleted rows"),
+        let old = fixture.path("old.parquet");
+        let new = fixture.path("replacement.parquet");
+        write_position_delete(&old, &fixture.data_file(), &[0]);
+        write_position_delete(&new, &fixture.data_file(), &[0, 2]);
+        let split = difference(
+            &fixture,
+            vec![position_delete_descriptor(&old, 4)],
+            vec![position_delete_descriptor(&new, 5)],
         );
-
-        let mut source = fixture
-            .page_source(&handle, &split, &id_and_change_op(&schema))
-            .expect("page source");
-        // 32 alone: 30 was already invisible at the lower endpoint, and 31/33
-        // survive at the upper one.
-        assert_eq!(drain(&mut source), vec![(32, -1)]);
+        assert_eq!(
+            read_streamed(&fixture, &handle, &split, &schema),
+            vec![(32, -1)]
+        );
     }
-
     #[test]
-    fn equality_deleted_rows_do_not_re_emit_a_row_a_position_delete_of_the_same_window_named() {
-        // The window applies both a position delete naming position 1 and an
-        // equality delete naming ids 41 and 42. The position variant owns
-        // position 1, so the equality variant is handed it as already applied
-        // and emits only what the first one did not.
-        let fixture = Fixture::new(&[40, 41, 42, 43]);
+    fn overlapping_kinds_and_duplicate_row_values_preserve_signed_bag_multiplicity() {
+        let fixture = Fixture::new(&[40, 41, 42, 42, 43]);
         let schema = iceberg_schema();
         let handle = change_window_handle(&schema);
-        let positions = fixture.path("newly-positions.parquet");
-        let equality = fixture.path("newly-equality.parquet");
-        write_position_delete(&positions, &fixture.data_file(), &[1]);
-        write_equality_delete(&equality, &[41, 42]);
-
-        let newly_position = position_delete_descriptor(&positions, DATA_SEQUENCE_NUMBER + 1);
-        let newly_equality = equality_delete_descriptor(&equality, DATA_SEQUENCE_NUMBER + 1);
-
-        let position_split = IcebergChangeSplit::PositionDeletedRows(
-            IcebergPositionDeletedRows::try_new(
-                fixture.data_split(Vec::new()),
-                vec![newly_position.clone()],
-                Vec::new(),
-            )
-            .expect("position deleted rows"),
+        let pos = fixture.path("pos.parquet");
+        let eq = fixture.path("eq.parquet");
+        write_position_delete(&pos, &fixture.data_file(), &[1, 2]);
+        write_equality_delete(&eq, &[41, 42]);
+        let split = difference(
+            &fixture,
+            vec![],
+            vec![
+                position_delete_descriptor(&pos, 4),
+                equality_delete_descriptor(&eq, 4),
+            ],
         );
-        let equality_split = IcebergChangeSplit::EqualityDeletedRows(
-            IcebergEqualityDeletedRows::try_new(
-                fixture.data_split(Vec::new()),
-                vec![newly_equality],
-                vec![newly_position],
-            )
-            .expect("equality deleted rows"),
+        assert_eq!(
+            read_streamed(&fixture, &handle, &split, &schema),
+            vec![(41, -1), (42, -1), (42, -1)]
         );
-
-        let mut position_source = fixture
-            .page_source(&handle, &position_split, &id_and_change_op(&schema))
-            .expect("position page source");
-        let mut equality_source = fixture
-            .page_source(&handle, &equality_split, &id_and_change_op(&schema))
-            .expect("equality page source");
-
-        assert_eq!(drain(&mut position_source), vec![(41, -1)]);
-        // 41 is not emitted a second time, and 42 is emitted exactly once.
-        assert_eq!(drain(&mut equality_source), vec![(42, -1)]);
     }
-
     #[test]
-    fn a_previously_applied_equality_delete_is_read_through_the_pages_hidden_suffix() {
-        // The lower endpoint had already lost id 41 to an equality delete, so
-        // the newly applied position delete naming its row removes nothing new.
-        // Proving it needs the equality key column on the page, which only the
-        // previously applied side asked for.
+    fn from_equality_keys_remain_in_the_hidden_projection() {
         let fixture = Fixture::new(&[40, 41, 42]);
         let schema = iceberg_schema();
         let handle = change_window_handle(&schema);
-        let previously = fixture.path("previously-equality.parquet");
-        let newly = fixture.path("newly-positions.parquet");
-        write_equality_delete(&previously, &[41]);
-        write_position_delete(&newly, &fixture.data_file(), &[1, 2]);
-
-        let split = IcebergChangeSplit::PositionDeletedRows(
-            IcebergPositionDeletedRows::try_new(
-                fixture.data_split(Vec::new()),
-                vec![position_delete_descriptor(&newly, DATA_SEQUENCE_NUMBER + 2)],
-                vec![equality_delete_descriptor(
-                    &previously,
-                    DATA_SEQUENCE_NUMBER + 1,
-                )],
-            )
-            .expect("position deleted rows"),
+        let old = fixture.path("old-eq.parquet");
+        let new = fixture.path("new-pos.parquet");
+        write_equality_delete(&old, &[41]);
+        write_position_delete(&new, &fixture.data_file(), &[1, 2]);
+        let split = difference(
+            &fixture,
+            vec![equality_delete_descriptor(&old, 4)],
+            vec![position_delete_descriptor(&new, 5)],
         );
+        assert_eq!(
+            read_streamed(&fixture, &handle, &split, &schema),
+            vec![(42, -1)]
+        );
+    }
+    #[test]
+    fn repeated_output_field_ids_do_not_duplicate_the_equality_binding() {
+        let fixture = Fixture::new(&[10, 11]);
+        let schema = iceberg_schema();
+        let handle = change_window_handle(&schema);
+        let eq = fixture.path("eq.parquet");
+        write_equality_delete(&eq, &[11]);
+        let split = difference(&fixture, vec![], vec![equality_delete_descriptor(&eq, 4)]);
+        let id = IcebergColumnHandle::base_column_of(&schema, 1).unwrap();
+        let columns = vec![id.clone(), id, change_op_column_handle().unwrap()];
+        let mut source = fixture.page_source(&handle, &split, &columns).unwrap();
+        let mut rows = Vec::new();
+        while let Some(page) = source.next_page().unwrap() {
+            let (count, columns) = page.into_columns().unwrap();
+            assert_eq!(columns.len(), 3);
+            let a = columns[0].as_any().downcast_ref::<Int64Array>().unwrap();
+            let b = columns[1].as_any().downcast_ref::<Int64Array>().unwrap();
+            let sign = columns[2].as_any().downcast_ref::<Int8Array>().unwrap();
+            rows.extend((0..count).map(|i| (a.value(i), b.value(i), sign.value(i))));
+        }
+        assert_eq!(rows, vec![(11, 11, -1)]);
+    }
 
-        let mut source = fixture
-            .page_source(&handle, &split, &id_and_change_op(&schema))
-            .expect("page source");
-        assert_eq!(drain(&mut source), vec![(42, -1)]);
+    #[test]
+    fn actual_row_reappearance_remains_explicitly_unsupported() {
+        let fixture = Fixture::new(&[40, 41]);
+        let schema = iceberg_schema();
+        let handle = change_window_handle(&schema);
+        let old = fixture.path("old.parquet");
+        write_position_delete(&old, &fixture.data_file(), &[0]);
+        let split = difference(&fixture, vec![position_delete_descriptor(&old, 4)], vec![]);
+        let columns = id_and_change_op(&schema);
+        let mut source = fixture.page_source(&handle, &split, &columns).unwrap();
+        assert_eq!(
+            source.next_page().unwrap_err().kind(),
+            ConnectorErrorKind::Unsupported
+        );
     }
 
     #[test]
@@ -1067,94 +1084,19 @@ mod tests {
     }
 
     #[test]
-    fn a_change_window_stream_emits_what_its_page_source_emits_for_every_variant() {
+    fn an_equivalent_rewrite_of_delete_artifacts_emits_no_rows() {
+        let fixture = Fixture::new(&[10, 11, 12]);
         let schema = iceberg_schema();
         let handle = change_window_handle(&schema);
-
-        // Added rows, less a row written and deleted inside the window.
-        let fixture = Fixture::new(&[10, 11, 12]);
-        let inside = fixture.path("inside-window.parquet");
-        write_position_delete(&inside, &fixture.data_file(), &[1]);
-        let added = IcebergChangeSplit::AddedRows(
-            IcebergAddedRows::try_new(
-                fixture.data_split(vec![position_delete_descriptor(
-                    &inside,
-                    DATA_SEQUENCE_NUMBER + 1,
-                )]),
-                Vec::new(),
-            )
-            .expect("added rows"),
+        let before = fixture.path("before.parquet");
+        let after = fixture.path("after.parquet");
+        write_position_delete(&before, &fixture.data_file(), &[0, 1]);
+        write_equality_delete(&after, &[10, 11]);
+        let split = difference(
+            &fixture,
+            vec![position_delete_descriptor(&before, 4)],
+            vec![equality_delete_descriptor(&after, 5)],
         );
-        assert_eq!(
-            read_streamed(&fixture, &handle, &added, &schema),
-            vec![(10, 1), (12, 1)]
-        );
-
-        // A deleted data file, less what the lower endpoint already hid.
-        let fixture = Fixture::new(&[20, 21, 22]);
-        let previously = fixture.path("already-applied.parquet");
-        write_position_delete(&previously, &fixture.data_file(), &[0]);
-        let deleted_file = IcebergChangeSplit::DeletedDataFileRows(
-            IcebergDeletedDataFileRows::try_new(
-                fixture.data_split(Vec::new()),
-                vec![position_delete_descriptor(
-                    &previously,
-                    DATA_SEQUENCE_NUMBER + 1,
-                )],
-            )
-            .expect("deleted data file rows"),
-        );
-        assert_eq!(
-            read_streamed(&fixture, &handle, &deleted_file, &schema),
-            vec![(21, -1), (22, -1)]
-        );
-
-        // The rows a newly applied position delete removed.
-        let fixture = Fixture::new(&[30, 31, 32, 33]);
-        let previously = fixture.path("previously.parquet");
-        let newly = fixture.path("newly.parquet");
-        write_position_delete(&previously, &fixture.data_file(), &[0]);
-        write_position_delete(&newly, &fixture.data_file(), &[0, 2]);
-        let position_deleted = IcebergChangeSplit::PositionDeletedRows(
-            IcebergPositionDeletedRows::try_new(
-                fixture.data_split(Vec::new()),
-                vec![position_delete_descriptor(&newly, DATA_SEQUENCE_NUMBER + 2)],
-                vec![position_delete_descriptor(
-                    &previously,
-                    DATA_SEQUENCE_NUMBER + 1,
-                )],
-            )
-            .expect("position deleted rows"),
-        );
-        assert_eq!(
-            read_streamed(&fixture, &handle, &position_deleted, &schema),
-            vec![(32, -1)]
-        );
-
-        // The rows a newly applied equality delete removed that no position
-        // delete of the same window already named.
-        let fixture = Fixture::new(&[40, 41, 42, 43]);
-        let positions = fixture.path("newly-positions.parquet");
-        let equality = fixture.path("newly-equality.parquet");
-        write_position_delete(&positions, &fixture.data_file(), &[1]);
-        write_equality_delete(&equality, &[41, 42]);
-        let equality_deleted = IcebergChangeSplit::EqualityDeletedRows(
-            IcebergEqualityDeletedRows::try_new(
-                fixture.data_split(Vec::new()),
-                vec![equality_delete_descriptor(
-                    &equality,
-                    DATA_SEQUENCE_NUMBER + 1,
-                )],
-                vec![position_delete_descriptor(
-                    &positions,
-                    DATA_SEQUENCE_NUMBER + 1,
-                )],
-            )
-            .expect("equality deleted rows"),
-        );
-        assert_eq!(
-            read_streamed(&fixture, &handle, &equality_deleted, &schema),
-            vec![(42, -1)]
-        );
+        assert!(read_streamed(&fixture, &handle, &split, &schema).is_empty());
     }
 }

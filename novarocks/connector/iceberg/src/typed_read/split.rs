@@ -33,7 +33,94 @@ use novarocks_proto_codec::connector_read::{
 use novarocks_spi::connector::read_stack::{ConnectorSplit, HostAddress, SplitWeight, TupleDomain};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
-use crate::iceberg::spec::DataFileFormat;
+use crate::delete_semantics::{PinnedEndpointFacts, ReadDomain, ReadObservationId};
+use crate::iceberg::spec::{DataFileFormat, PartitionSpec, Schema};
+
+pub(crate) fn encode_read_domain(domain: &ReadDomain) -> dto::IcebergReadDomain {
+    let endpoint = domain.endpoint();
+    dto::IcebergReadDomain {
+        observation_id: domain.observation().as_bytes().to_vec(),
+        table_uuid: endpoint.table_uuid().as_bytes().to_vec(),
+        metadata_identity: endpoint.metadata_identity().to_string(),
+        snapshot_id: Some(endpoint.snapshot_id()),
+        schema_json: endpoint.schema_json().to_string(),
+        partition_type_jsons: endpoint
+            .partition_type_jsons()
+            .iter()
+            .map(|(id, json)| (*id, json.to_string()))
+            .collect(),
+        partition_spec_jsons: endpoint
+            .partition_spec_jsons()
+            .iter()
+            .map(|(id, json)| (*id, json.to_string()))
+            .collect(),
+    }
+}
+
+pub(crate) fn decode_read_domain(
+    raw: &dto::IcebergReadDomain,
+) -> Result<Arc<ReadDomain>, ConnectorError> {
+    if raw.schema_json.len() > MAX_JSON_BYTES
+        || raw.metadata_identity.len() > MAX_PATH_BYTES
+        || raw.partition_type_jsons.len() > MAX_EQUALITY_FIELD_IDS
+        || raw
+            .partition_type_jsons
+            .values()
+            .any(|json| json.len() > MAX_JSON_BYTES)
+        || raw.partition_spec_jsons.len() > MAX_EQUALITY_FIELD_IDS
+        || raw
+            .partition_spec_jsons
+            .values()
+            .any(|json| json.len() > MAX_JSON_BYTES)
+    {
+        return Err(invalid("Iceberg read domain exceeds its field limits"));
+    }
+    let observation = ReadObservationId::try_new(
+        raw.observation_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("Iceberg read observation identity must contain 16 bytes"))?,
+    )
+    .map_err(|e| invalid(e.to_string()))?;
+    let table_uuid = uuid::Uuid::from_slice(&raw.table_uuid)
+        .map_err(|_| invalid("Iceberg read table UUID must contain 16 bytes"))?;
+    let schema: Schema =
+        serde_json::from_str(&raw.schema_json).map_err(|e| invalid(e.to_string()))?;
+    let specs = raw
+        .partition_spec_jsons
+        .iter()
+        .map(|(id, json)| {
+            let spec: PartitionSpec =
+                serde_json::from_str(json).map_err(|e| invalid(e.to_string()))?;
+            if spec.spec_id() != *id {
+                return Err(invalid(
+                    "Iceberg domain spec key differs from its definition",
+                ));
+            }
+            Ok(spec)
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    let partition_types = raw
+        .partition_type_jsons
+        .iter()
+        .map(|(id, json)| {
+            serde_json::from_str(json)
+                .map(|ty| (*id, ty))
+                .map_err(|e| invalid(format!("invalid partition storage type: {e}")))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, ConnectorError>>()?;
+    let endpoint = PinnedEndpointFacts::try_new_with_partition_types(
+        table_uuid,
+        raw.metadata_identity.clone(),
+        raw.snapshot_id
+            .ok_or_else(|| invalid("Iceberg read domain requires a snapshot"))?,
+        &schema,
+        &specs,
+        &partition_types,
+    )
+    .map_err(|e| invalid(e.to_string()))?;
+    Ok(Arc::new(ReadDomain::new(observation, endpoint)))
+}
 
 use super::column_handle::{
     IcebergColumnHandle, decode_tuple_domain, encode_tuple_domain, invalid, unsupported,
@@ -198,12 +285,14 @@ impl std::fmt::Debug for ParquetFileDecryptionData {
 /// The exact facts one delete descriptor carries.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergDeleteFileParams {
+    pub partition_spec_id: i32,
+    pub partition_data_json: String,
     pub content: IcebergDeleteFileContent,
     pub path: String,
     pub format: IcebergFileFormat,
     pub record_count: i64,
     pub file_size_in_bytes: i64,
-    /// Equality field IDs in table-schema order.
+    /// Equality field IDs in canonical ascending field-ID order.
     pub equality_field_ids: Vec<i32>,
     pub row_position_lower_bound: Option<i64>,
     pub row_position_upper_bound: Option<i64>,
@@ -220,6 +309,8 @@ pub struct IcebergDeleteFileParams {
 /// One delete file that applies to the data file a split reads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergDeleteFile {
+    partition_spec_id: i32,
+    partition_data_json: Arc<str>,
     content: IcebergDeleteFileContent,
     path: Arc<str>,
     format: IcebergFileFormat,
@@ -236,8 +327,71 @@ pub struct IcebergDeleteFile {
 }
 
 impl IcebergDeleteFile {
+    pub fn from_fact(fact: &crate::delete_semantics::DeleteFact) -> Result<Self, ConnectorError> {
+        use crate::delete_semantics::{DeleteContentAddress, DeleteFormat, DeleteKind};
+        let (content, equality_field_ids, referenced_data_file) = match fact.kind() {
+            DeleteKind::Equality(group) => (
+                IcebergDeleteFileContent::EqualityDeletes,
+                group.fields().iter().map(|(id, _)| *id).collect(),
+                None,
+            ),
+            DeleteKind::Position { exact_target } => (
+                IcebergDeleteFileContent::PositionDeletes,
+                Vec::new(),
+                exact_target.as_ref().map(ToString::to_string),
+            ),
+            DeleteKind::DeletionVector { exact_target } => (
+                IcebergDeleteFileContent::PositionDeletes,
+                Vec::new(),
+                Some(exact_target.to_string()),
+            ),
+        };
+        let convert = |value: u64| {
+            i64::try_from(value).map_err(|_| {
+                invalid("Iceberg physical count or range is not representable by the private wire")
+            })
+        };
+        let (content_offset, content_size_in_bytes) = match fact.address() {
+            DeleteContentAddress::File(_) => (None, None),
+            DeleteContentAddress::PuffinBlob { offset, length, .. } => {
+                (Some(convert(*offset)?), Some(convert(*length)?))
+            }
+        };
+        Self::try_new(IcebergDeleteFileParams {
+            partition_spec_id: fact.partition().spec_id(),
+            partition_data_json: fact.partition().to_json_string(),
+            content,
+            path: fact.address().path().to_string(),
+            format: match fact.read().format {
+                DeleteFormat::Parquet => IcebergFileFormat::Parquet,
+                DeleteFormat::Avro => IcebergFileFormat::Avro,
+                DeleteFormat::Orc => IcebergFileFormat::Orc,
+                DeleteFormat::Puffin => IcebergFileFormat::Puffin,
+            },
+            record_count: convert(fact.read().record_count)?,
+            file_size_in_bytes: convert(fact.read().file_size)?,
+            equality_field_ids,
+            row_position_lower_bound: None,
+            row_position_upper_bound: None,
+            data_sequence_number: fact.sequence().get(),
+            content_offset,
+            content_size_in_bytes,
+            referenced_data_file,
+            decryption_data: if fact.read().key_metadata.is_empty() {
+                None
+            } else {
+                Some(ParquetFileDecryptionData::try_new(
+                    fact.read().key_metadata.to_vec(),
+                    Vec::new(),
+                )?)
+            },
+        })
+    }
+
     pub fn try_new(params: IcebergDeleteFileParams) -> Result<Self, ConnectorError> {
         let IcebergDeleteFileParams {
+            partition_spec_id,
+            partition_data_json,
             content,
             path,
             format,
@@ -253,6 +407,11 @@ impl IcebergDeleteFile {
             decryption_data,
         } = params;
 
+        if partition_data_json.is_empty() || partition_data_json.len() > MAX_JSON_BYTES {
+            return Err(invalid(
+                "Iceberg delete partition tuple must be present and bounded",
+            ));
+        }
         if path.is_empty() || path.len() > MAX_PATH_BYTES {
             return Err(invalid(
                 "iceberg delete file path must be non-empty and bounded",
@@ -335,6 +494,8 @@ impl IcebergDeleteFile {
         }
 
         Ok(Self {
+            partition_spec_id,
+            partition_data_json: Arc::from(partition_data_json),
             content,
             path: Arc::from(path.as_str()),
             format,
@@ -349,6 +510,13 @@ impl IcebergDeleteFile {
             referenced_data_file: referenced_data_file.map(Arc::from),
             decryption_data,
         })
+    }
+
+    pub const fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
+    pub fn partition_data_json(&self) -> &str {
+        &self.partition_data_json
     }
 
     pub const fn content(&self) -> IcebergDeleteFileContent {
@@ -406,6 +574,7 @@ impl IcebergDeleteFile {
     fn retained_size_in_bytes(&self) -> usize {
         size_of::<Self>()
             + self.path.len()
+            + self.partition_data_json.len()
             + self
                 .referenced_data_file
                 .as_ref()
@@ -419,6 +588,8 @@ impl IcebergDeleteFile {
 
     pub fn to_proto(&self) -> dto::IcebergDeleteFile {
         dto::IcebergDeleteFile {
+            partition_spec_id: Some(self.partition_spec_id),
+            partition_data_json: self.partition_data_json.to_string(),
             content: self.content.to_proto() as i32,
             path: self.path.to_string(),
             format: self.format.to_proto() as i32,
@@ -440,6 +611,10 @@ impl IcebergDeleteFile {
 
     pub fn from_proto(raw: &dto::IcebergDeleteFile) -> Result<Self, ConnectorError> {
         Self::try_new(IcebergDeleteFileParams {
+            partition_spec_id: raw
+                .partition_spec_id
+                .ok_or_else(|| invalid("Iceberg delete requires its own partition spec"))?,
+            partition_data_json: raw.partition_data_json.clone(),
             content: IcebergDeleteFileContent::from_proto(raw.content)?,
             path: raw.path.clone(),
             format: IcebergFileFormat::from_proto(raw.format)?,
@@ -461,9 +636,90 @@ impl IcebergDeleteFile {
     }
 }
 
+/// FE keeps shared suffix views; only the private wire expands their members.
+#[derive(Clone, Debug)]
+pub enum IcebergSplitDeletes {
+    Planned(crate::delete_semantics::LoadView),
+    Decoded(Arc<[IcebergDeleteFile]>),
+}
+impl Default for IcebergSplitDeletes {
+    fn default() -> Self {
+        Self::Decoded(Arc::from([]))
+    }
+}
+impl From<Vec<IcebergDeleteFile>> for IcebergSplitDeletes {
+    fn from(value: Vec<IcebergDeleteFile>) -> Self {
+        Self::Decoded(value.into())
+    }
+}
+impl IcebergSplitDeletes {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Planned(view) => view.member_count(),
+            Self::Decoded(members) => members.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn iter(
+        &self,
+    ) -> Box<
+        dyn Iterator<Item = Result<std::borrow::Cow<'_, IcebergDeleteFile>, ConnectorError>> + '_,
+    > {
+        match self {
+            Self::Planned(view) => Box::new(
+                view.members()
+                    .map(|fact| IcebergDeleteFile::from_fact(fact).map(std::borrow::Cow::Owned)),
+            ),
+            Self::Decoded(members) => Box::new(
+                members
+                    .iter()
+                    .map(|member| Ok(std::borrow::Cow::Borrowed(member))),
+            ),
+        }
+    }
+    pub fn to_vec(&self) -> Result<Vec<IcebergDeleteFile>, ConnectorError> {
+        self.iter()
+            .map(|member| member.map(std::borrow::Cow::into_owned))
+            .collect()
+    }
+    fn cost_shape(&self) -> (bool, usize) {
+        match self {
+            Self::Planned(view) => (
+                !matches!(
+                    view.logical().position(),
+                    crate::delete_semantics::PositionSource::None
+                ),
+                view.logical().equality().len(),
+            ),
+            Self::Decoded(members) => {
+                let position = members
+                    .iter()
+                    .any(|member| member.content() == IcebergDeleteFileContent::PositionDeletes);
+                let groups = members
+                    .iter()
+                    .filter(|member| member.content() == IcebergDeleteFileContent::EqualityDeletes)
+                    .map(|member| member.equality_field_ids())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                (position, groups)
+            }
+        }
+    }
+}
+impl<'a> IntoIterator for &'a IcebergSplitDeletes {
+    type Item = Result<std::borrow::Cow<'a, IcebergDeleteFile>, ConnectorError>;
+    type IntoIter = Box<dyn Iterator<Item = Self::Item> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// The exact facts one Iceberg data split carries.
 #[derive(Clone, Debug)]
 pub struct IcebergSplitParams {
+    pub read_domain: Arc<ReadDomain>,
     pub path: String,
     pub start: i64,
     pub length: i64,
@@ -473,7 +729,7 @@ pub struct IcebergSplitParams {
     pub partition_spec_id: i32,
     pub partition_data_json: String,
     /// The complete applicable delete closure, in planner order.
-    pub deletes: Vec<IcebergDeleteFile>,
+    pub deletes: IcebergSplitDeletes,
     pub file_statistics_domain: TupleDomain<IcebergColumnHandle>,
     pub data_sequence_number: Option<i64>,
     pub file_first_row_id: Option<i64>,
@@ -486,6 +742,7 @@ pub struct IcebergSplitParams {
 /// One byte range of one Iceberg data file.
 #[derive(Clone, Debug)]
 pub struct IcebergSplit {
+    read_domain: Arc<ReadDomain>,
     path: Arc<str>,
     start: i64,
     length: i64,
@@ -494,7 +751,7 @@ pub struct IcebergSplit {
     file_format: IcebergFileFormat,
     partition_spec_id: i32,
     partition_data_json: Arc<str>,
-    deletes: Vec<IcebergDeleteFile>,
+    deletes: IcebergSplitDeletes,
     file_statistics_domain: TupleDomain<IcebergColumnHandle>,
     data_sequence_number: Option<i64>,
     file_first_row_id: Option<i64>,
@@ -507,6 +764,7 @@ pub struct IcebergSplit {
 impl IcebergSplit {
     pub fn try_new(params: IcebergSplitParams) -> Result<Self, ConnectorError> {
         let IcebergSplitParams {
+            read_domain,
             path,
             start,
             length,
@@ -573,6 +831,7 @@ impl IcebergSplit {
         }
 
         let mut split = Self {
+            read_domain,
             path: Arc::from(path.as_str()),
             start,
             length,
@@ -592,6 +851,10 @@ impl IcebergSplit {
         };
         split.retained_size_in_bytes = split.compute_retained_size_in_bytes();
         Ok(split)
+    }
+
+    pub fn read_domain(&self) -> &Arc<ReadDomain> {
+        &self.read_domain
     }
 
     pub fn path(&self) -> &str {
@@ -626,7 +889,7 @@ impl IcebergSplit {
         &self.partition_data_json
     }
 
-    pub fn deletes(&self) -> &[IcebergDeleteFile] {
+    pub fn deletes(&self) -> &IcebergSplitDeletes {
         &self.deletes
     }
 
@@ -653,6 +916,7 @@ impl IcebergSplit {
 
     fn compute_retained_size_in_bytes(&self) -> u64 {
         let mut retained = size_of::<Self>()
+            + self.read_domain.expanded_descriptor_bytes()
             + self.path.len()
             + self.partition_data_json.len()
             + self.affinity_key.as_ref().map_or(0, |key| key.len())
@@ -660,9 +924,17 @@ impl IcebergSplit {
                 .decryption_data
                 .as_ref()
                 .map_or(0, ParquetFileDecryptionData::retained_size_in_bytes);
-        for delete in &self.deletes {
-            retained += delete.retained_size_in_bytes();
-        }
+        // This public scheduling charge is the canonical expanded descriptor
+        // footprint. FE's shared suffix representation may retain less memory.
+        retained += match &self.deletes {
+            IcebergSplitDeletes::Planned(view) => {
+                view.expanded_descriptor_bytes(size_of::<IcebergDeleteFile>())
+            }
+            IcebergSplitDeletes::Decoded(members) => members
+                .iter()
+                .map(IcebergDeleteFile::retained_size_in_bytes)
+                .sum(),
+        };
         if let Some(domains) = self.file_statistics_domain.domains() {
             for (column, domain) in domains {
                 retained += size_of::<IcebergColumnHandle>()
@@ -683,8 +955,9 @@ impl IcebergSplit {
         retained as u64
     }
 
-    pub fn to_proto(&self) -> dto::IcebergSplit {
-        dto::IcebergSplit {
+    pub fn to_proto(&self) -> Result<dto::IcebergSplit, ConnectorError> {
+        Ok(dto::IcebergSplit {
+            read_domain: Some(encode_read_domain(&self.read_domain)),
             path: self.path.to_string(),
             start: self.start,
             length: self.length,
@@ -696,8 +969,8 @@ impl IcebergSplit {
             deletes: self
                 .deletes
                 .iter()
-                .map(IcebergDeleteFile::to_proto)
-                .collect(),
+                .map(|member| member.map(|member| member.to_proto()))
+                .collect::<Result<Vec<_>, _>>()?,
             file_statistics_domain: Some(encode_tuple_domain(&self.file_statistics_domain)),
             data_sequence_number: self.data_sequence_number,
             file_first_row_id: self.file_first_row_id,
@@ -705,7 +978,7 @@ impl IcebergSplit {
                 .decryption_data
                 .as_ref()
                 .map(ParquetFileDecryptionData::to_proto),
-        }
+        })
     }
 
     pub fn from_proto(
@@ -723,6 +996,11 @@ impl IcebergSplit {
             .ok_or_else(|| invalid("iceberg split requires a file statistics domain"))?;
 
         Self::try_new(IcebergSplitParams {
+            read_domain: decode_read_domain(
+                raw.read_domain
+                    .as_ref()
+                    .ok_or_else(|| invalid("Iceberg split requires its read domain"))?,
+            )?,
             path: raw.path.clone(),
             start: raw.start,
             length: raw.length,
@@ -731,7 +1009,7 @@ impl IcebergSplit {
             file_format: IcebergFileFormat::from_proto(raw.file_format)?,
             partition_spec_id: raw.partition_spec_id,
             partition_data_json: raw.partition_data_json.clone(),
-            deletes,
+            deletes: deletes.into(),
             file_statistics_domain: decode_tuple_domain(file_statistics_domain)?,
             data_sequence_number: raw.data_sequence_number,
             file_first_row_id: raw.file_first_row_id,
@@ -798,7 +1076,7 @@ impl IcebergSplitWeightParameters {
     }
 }
 
-/// Trino's Iceberg split-weight formula.
+/// Cost shape for the bucket-union reader.
 ///
 /// The data weight is the range's share of one target-sized split. Position
 /// deletes double it once, because the whole delete set is read alongside the
@@ -808,37 +1086,70 @@ impl IcebergSplitWeightParameters {
 /// a heavily deleted one never outweighs a full standard split.
 pub fn iceberg_split_weight(
     length: i64,
-    deletes: &[IcebergDeleteFile],
+    deletes: &IcebergSplitDeletes,
     parameters: IcebergSplitWeightParameters,
 ) -> Result<SplitWeight, ConnectorError> {
     if length < 0 {
         return Err(invalid("iceberg split length must be nonnegative"));
     }
     let data_weight = length as f64 / parameters.target_split_size as f64;
-    let mut weight = data_weight;
-    if deletes
-        .iter()
-        .any(|delete| delete.content() == IcebergDeleteFileContent::PositionDeletes)
-    {
-        weight += data_weight;
-    }
-    let equality_delete_records: i64 = deletes
-        .iter()
-        .filter(|delete| delete.content() == IcebergDeleteFileContent::EqualityDeletes)
-        .map(IcebergDeleteFile::record_count)
-        .sum();
-    weight += equality_delete_records as f64 * data_weight;
+    let (position, groups) = deletes.cost_shape();
+    // Row probes scale with applicable buckets/field groups, not delete rows.
+    // Planned views expose this shape in O(bucket count), independent of suffix length.
+    let weight = data_weight * (1.0 + usize::from(position) as f64 + groups as f64);
     SplitWeight::from_proportion(weight.clamp(parameters.minimum_assigned_split_weight, 1.0))
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use novarocks_spi::connector::read_stack::STANDARD_SPLIT_WEIGHT_RAW;
 
     use super::*;
+    pub(crate) fn read_domain() -> Arc<ReadDomain> {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                1,
+                "id",
+                crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+        Arc::new(ReadDomain::new(
+            ReadObservationId::try_new([7; 16]).unwrap(),
+            PinnedEndpointFacts::try_new(
+                uuid::Uuid::from_bytes([8; 16]),
+                "metadata.json",
+                11,
+                &schema,
+                &[spec],
+            )
+            .unwrap(),
+        ))
+    }
+    pub(crate) fn partition_json() -> String {
+        let domain = read_domain();
+        let schema = domain.endpoint().schema().unwrap();
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+        crate::delete_semantics::TypedPartition::bind(
+            &spec,
+            &schema,
+            &crate::iceberg::spec::Struct::empty(),
+        )
+        .unwrap()
+        .to_json_string()
+    }
 
     pub(in crate::typed_read) fn position_delete(path: &str) -> IcebergDeleteFile {
         IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            partition_spec_id: 0,
+            partition_data_json: partition_json(),
             content: IcebergDeleteFileContent::PositionDeletes,
             path: path.to_string(),
             format: IcebergFileFormat::Parquet,
@@ -861,6 +1172,8 @@ pub(super) mod tests {
         record_count: i64,
     ) -> IcebergDeleteFile {
         IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            partition_spec_id: 0,
+            partition_data_json: partition_json(),
             content: IcebergDeleteFileContent::EqualityDeletes,
             path: path.to_string(),
             format: IcebergFileFormat::Parquet,
@@ -880,6 +1193,7 @@ pub(super) mod tests {
 
     fn split_params(path: &str, start: i64, length: i64, file_size: i64) -> IcebergSplitParams {
         IcebergSplitParams {
+            read_domain: read_domain(),
             path: path.to_string(),
             start,
             length,
@@ -888,7 +1202,7 @@ pub(super) mod tests {
             file_format: IcebergFileFormat::Parquet,
             partition_spec_id: 0,
             partition_data_json: "{}".to_string(),
-            deletes: Vec::new(),
+            deletes: Vec::new().into(),
             file_statistics_domain: TupleDomain::all(),
             data_sequence_number: Some(4),
             file_first_row_id: Some(1000),
@@ -919,6 +1233,8 @@ pub(super) mod tests {
     #[test]
     fn delete_descriptors_reject_contradictory_content_facts() {
         let mut params = IcebergDeleteFileParams {
+            partition_spec_id: 0,
+            partition_data_json: partition_json(),
             content: IcebergDeleteFileContent::EqualityDeletes,
             path: "d.parquet".to_string(),
             format: IcebergFileFormat::Parquet,
@@ -966,14 +1282,14 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn split_weight_follows_the_trino_formula_and_its_clamp() {
+    fn split_weight_counts_probe_groups_and_preserves_its_clamp() {
         let parameters =
             IcebergSplitWeightParameters::try_new(100, DEFAULT_MINIMUM_ASSIGNED_SPLIT_WEIGHT)
                 .expect("parameters");
 
         // A half-target range is half a standard split, rounded up.
         assert_eq!(
-            iceberg_split_weight(50, &[], parameters)
+            iceberg_split_weight(50, &IcebergSplitDeletes::default(), parameters)
                 .expect("weight")
                 .raw_value(),
             STANDARD_SPLIT_WEIGHT_RAW / 2
@@ -981,10 +1297,11 @@ pub(super) mod tests {
 
         // Position deletes add the data weight once, however many there are.
         let one_position =
-            iceberg_split_weight(25, &[position_delete("p0.parquet")], parameters).expect("weight");
+            iceberg_split_weight(25, &vec![position_delete("p0.parquet")].into(), parameters)
+                .expect("weight");
         let two_positions = iceberg_split_weight(
             25,
-            &[position_delete("p0.parquet"), position_delete("p1.parquet")],
+            &vec![position_delete("p0.parquet"), position_delete("p1.parquet")].into(),
             parameters,
         )
         .expect("weight");
@@ -994,35 +1311,40 @@ pub(super) mod tests {
         // Equality deletes scale the data weight by their total record count:
         // a quarter-target range plus two equality rows is 0.25 + 2 * 0.25.
         assert_eq!(
-            iceberg_split_weight(25, &[equality_delete("e0.parquet", 2)], parameters)
-                .expect("weight")
-                .raw_value(),
-            75
+            iceberg_split_weight(
+                25,
+                &vec![equality_delete("e0.parquet", 2)].into(),
+                parameters
+            )
+            .expect("weight")
+            .raw_value(),
+            50
         );
         // Record counts sum across equality delete files.
         assert_eq!(
             iceberg_split_weight(
                 25,
-                &[
+                &vec![
                     equality_delete("e0.parquet", 1),
                     equality_delete("e1.parquet", 1)
-                ],
+                ]
+                .into(),
                 parameters,
             )
             .expect("weight")
             .raw_value(),
-            75
+            50
         );
 
         // Clamped below by the minimum and above by one standard split.
         assert_eq!(
-            iceberg_split_weight(1, &[], parameters)
+            iceberg_split_weight(1, &IcebergSplitDeletes::default(), parameters)
                 .expect("weight")
                 .raw_value(),
             5
         );
         assert_eq!(
-            iceberg_split_weight(1_000, &[], parameters)
+            iceberg_split_weight(1_000, &IcebergSplitDeletes::default(), parameters)
                 .expect("weight")
                 .raw_value(),
             STANDARD_SPLIT_WEIGHT_RAW
@@ -1034,16 +1356,136 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn domain_charge_covers_full_private_binding_and_survives_planned_wire_roundtrip() {
+        use crate::delete_semantics::*;
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Struct, Transform, Type};
+        use prost::Message;
+        fn split_with_binding(padding: &str) -> IcebergSplit {
+            let field_name = format!("key_{padding}");
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    &field_name,
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap();
+            let empty = PartitionSpec::unpartition_spec();
+            let partitioned = PartitionSpec::builder(Arc::new(schema.clone()))
+                .with_spec_id(1)
+                .add_partition_field(
+                    &field_name,
+                    format!("stored_{padding}"),
+                    Transform::Identity,
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let seed = read_domain();
+            let domain = Arc::new(ReadDomain::new(
+                seed.observation(),
+                PinnedEndpointFacts::try_new(
+                    seed.endpoint().table_uuid(),
+                    format!("metadata:{padding}"),
+                    11,
+                    &schema,
+                    &[empty.clone(), partitioned],
+                )
+                .unwrap(),
+            ));
+            let partition = TypedPartition::bind(&empty, &schema, &Struct::empty()).unwrap();
+            let data = DataFileFact::try_new(
+                "data.parquet",
+                DataSequenceNumber::try_new(4).unwrap(),
+                partition.clone(),
+                100,
+                FileMetrics::default(),
+            )
+            .unwrap();
+            let fact = Arc::new(
+                DeleteFact::try_new(DeleteFactParams {
+                    address: DeleteContentAddress::file("eq.parquet").unwrap(),
+                    kind: DeleteKind::Equality(EqualityFieldGroup::bind(&[1], &schema).unwrap()),
+                    sequence: DataSequenceNumber::try_new(5).unwrap(),
+                    partition,
+                    read: DeleteReadFacts {
+                        format: DeleteFormat::Parquet,
+                        file_size: 128,
+                        record_count: 4,
+                        key_metadata: Arc::from([]),
+                    },
+                    metrics: FileMetrics::default(),
+                })
+                .unwrap(),
+            );
+            let index = DeleteCandidateIndex::try_new(
+                domain.clone(),
+                DeleteObservation::from_normalized_recall([fact]).unwrap(),
+            )
+            .unwrap();
+            let view = index
+                .for_data(&data)
+                .unwrap()
+                .load_view(StatisticsPolicy::Disabled);
+            let mut params = split_params("data.parquet", 0, 128, 128);
+            params.read_domain = domain;
+            params.partition_data_json = data.partition().to_json_string();
+            params.deletes = IcebergSplitDeletes::Planned(view);
+            IcebergSplit::try_new(params).unwrap()
+        }
+        let short = split_with_binding("short");
+        let long = split_with_binding(&"x".repeat(2048));
+        assert!(
+            long.retained_size_in_bytes() > short.retained_size_in_bytes() + 8_000,
+            "schema, spec, result-type and metadata strings all contribute to the expanded charge"
+        );
+        for planned in [short, long] {
+            let encoded = planned.to_proto().unwrap();
+            assert_eq!(
+                encoded
+                    .read_domain
+                    .as_ref()
+                    .unwrap()
+                    .partition_type_jsons
+                    .len(),
+                2
+            );
+            let bytes = encoded.encode_to_vec();
+            let decoded_dto = dto::IcebergSplit::decode(bytes.as_slice()).unwrap();
+            let decoded = IcebergSplit::from_proto(
+                &decoded_dto,
+                planned.split_weight(),
+                planned.affinity_key().map(str::to_owned),
+            )
+            .unwrap();
+            assert!(matches!(decoded.deletes(), IcebergSplitDeletes::Decoded(_)));
+            assert_eq!(planned.read_domain(), decoded.read_domain());
+            assert_eq!(
+                planned.retained_size_in_bytes(),
+                decoded.retained_size_in_bytes()
+            );
+            assert!(
+                planned.retained_size_in_bytes()
+                    >= encoded.read_domain.as_ref().unwrap().encoded_len() as u64
+            );
+            let charge = planned.retained_size_in_bytes();
+            let _shared = vec![planned.read_domain().clone(); 32];
+            assert_eq!(planned.clone().retained_size_in_bytes(), charge);
+        }
+    }
+
+    #[test]
     fn splits_round_trip_through_the_private_wire_value() {
         let mut params = split_params("s3://bucket/a.parquet", 0, 128, 256);
         params.deletes = vec![
             position_delete("p0.parquet"),
             equality_delete("e0.parquet", 4),
-        ];
+        ]
+        .into();
         params.split_weight = SplitWeight::try_from_raw(37).expect("weight");
         let split = IcebergSplit::try_new(params).expect("split");
 
-        let encoded = split.to_proto();
+        let encoded = split.to_proto().unwrap();
         let decoded = IcebergSplit::from_proto(
             &encoded,
             ConnectorSplit::split_weight(&split),
@@ -1053,7 +1495,10 @@ pub(super) mod tests {
         assert_eq!(decoded.path(), split.path());
         assert_eq!(decoded.start(), split.start());
         assert_eq!(decoded.length(), split.length());
-        assert_eq!(decoded.deletes(), split.deletes());
+        assert_eq!(
+            decoded.deletes().to_vec().unwrap(),
+            split.deletes().to_vec().unwrap()
+        );
         assert_eq!(decoded.file_format(), split.file_format());
         assert_eq!(decoded.data_sequence_number(), split.data_sequence_number());
         assert_eq!(decoded.file_first_row_id(), split.file_first_row_id());
@@ -1070,7 +1515,7 @@ pub(super) mod tests {
     #[test]
     fn an_unspecified_private_wire_split_is_rejected() {
         let split = IcebergSplit::try_new(split_params("a.parquet", 0, 10, 10)).expect("split");
-        let mut raw = split.to_proto();
+        let mut raw = split.to_proto().unwrap();
         raw.file_format = dto::IcebergFileFormat::Unspecified as i32;
         assert!(IcebergSplit::from_proto(&raw, SplitWeight::STANDARD, None).is_err());
     }
