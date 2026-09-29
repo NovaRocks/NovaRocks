@@ -20,46 +20,44 @@
 -- Preserve array test coverage migrated from dev/test.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_arrays_zip FORCE;
-CREATE DATABASE sql_tests_complex_test_arrays_zip;
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 
 -- name: test_arrays_zip @mac
 -- query 2
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT arrays_zip([1, 2], ['1b', '2b']) AS result;
 
 -- query 3
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT arrays_zip([1, 2], ['1b', null, '3b']) AS result;
 
 -- query 4
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT arrays_zip([1, 2, 3], ['a', 'b', 'c'], [10, 20, 30]) AS result;
 
 -- query 5
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT arrays_zip([], []) AS result;
 
 -- query 6
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT arrays_zip([1, 2, 3]) AS result;
 
 -- query 7
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT arrays_zip(null, [1, 2]) AS result;
 
 -- query 8
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT arrays_zip([1, null, 3], ['a', 'b', null]) AS result;
 
 -- query 9
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT * FROM (SELECT 1 AS id) a WHERE a.id = 1 AND arrays_zip([1], ['a']) IS NOT NULL;
 
 -- query 10
 -- @skip_result_check=true
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 CREATE TABLE arrays_zip_test (
   pk bigint not null,
   int_array Array<BigInt>,
@@ -76,7 +74,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 INSERT INTO arrays_zip_test VALUES
   (1, [1, 2, 3], ['a', 'b', 'c'], [1.1, 2.2, 3.3], NULL, [1, 2, 3], [], [100], ['x1', 'x2', 'x3'], [10.50, 20.75, 30.25]),
   (2, [10, 20], ['hello', 'world'], [10.5, 20.5], NULL, [10, null, 30], [], [200], ['y1', 'y2'], [100.00, 200.00]),
@@ -100,84 +98,84 @@ INSERT INTO arrays_zip_test VALUES
   (20, [42], ['answer'], [42.0], NULL, [42], [], [1900], ['fortytwo'], [42.00]);
 
 -- query 12
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(int_array, str_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 13
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(int_array, str_array, double_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 14
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(null_array, int_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 15
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(mixed_null_array, str_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 16
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(empty_array, int_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 17
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(single_element_array, str_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 18
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(large_array, double_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 19
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(int_array, str_array, double_array, decimal_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 20
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(int_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 21
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk FROM arrays_zip_test WHERE arrays_zip(int_array, str_array) IS NOT NULL ORDER BY pk;
 
 -- query 22
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk FROM arrays_zip_test WHERE arrays_zip(null_array, str_array) IS NULL ORDER BY pk;
 
 -- query 23
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(int_array, ['const1', 'const2', 'const3']) FROM arrays_zip_test ORDER BY pk;
 
 -- query 24
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(['const_a', 'const_b', 'const_c'], str_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 25
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(int_array, decimal_array) FROM arrays_zip_test ORDER BY pk;
 
 -- query 26
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(int_array, str_array) AS zipped 
 FROM arrays_zip_test 
 WHERE pk > 5 AND pk <= 15
 ORDER BY pk;
 
 -- query 27
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(str_array, double_array, decimal_array) 
 FROM arrays_zip_test 
 WHERE int_array IS NOT NULL
 ORDER BY pk;
 
 -- query 28
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, int_array, str_array, arrays_zip(mixed_null_array, str_array, double_array) 
 FROM arrays_zip_test 
 WHERE pk IN (1, 6, 7, 12)
 ORDER BY pk;
 
 -- query 29
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, 
   CASE 
     WHEN pk <= 5 THEN arrays_zip(int_array, str_array)
@@ -188,29 +186,29 @@ FROM arrays_zip_test
 ORDER BY pk;
 
 -- query 30
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(int_array, CASE WHEN pk > 10 THEN str_array ELSE empty_array END) 
 FROM arrays_zip_test 
 ORDER BY pk;
 
 -- query 31
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, arrays_zip(CAST(int_array AS Array<String>), str_array) 
 FROM arrays_zip_test 
 ORDER BY pk;
 
 -- query 32
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT pk, array_length(arrays_zip(int_array, str_array)) AS zip_length
 FROM arrays_zip_test
 ORDER BY pk;
 
 -- query 33
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT DISTINCT arrays_zip([1, 2], ['a', 'b']) FROM arrays_zip_test LIMIT 5;
 
 -- query 34
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 SELECT COUNT(*) AS cnt, arrays_zip([1], ['test']) 
 FROM arrays_zip_test 
 GROUP BY arrays_zip([1], ['test']);
@@ -220,6 +218,5 @@ GROUP BY arrays_zip([1], ['test']);
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming
 -- the namespace holds none. Drop the tables explicitly instead.
-USE sql_tests_complex_test_arrays_zip;
+USE ${case_db};
 DROP TABLE IF EXISTS arrays_zip_test;
-DROP DATABASE IF EXISTS sql_tests_complex_test_arrays_zip;

@@ -20,14 +20,12 @@
 -- Preserve array test coverage migrated from dev/test.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_intersect FORCE;
-CREATE DATABASE sql_tests_complex_test_array_intersect;
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 
 -- name: test_array_intersect @mac
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 CREATE TABLE test_array_intersect (
     id INT,
     array_boolean ARRAY<BOOLEAN>,
@@ -50,7 +48,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 INSERT INTO test_array_intersect VALUES
 (1, [true, false], [1, 2, 3], [100, 200, 300], [1000, 2000, 3000], [10000, 20000, 30000],
  [123456789012345678901234567890, 123456789012345678901234567891], [1.1, 2.2, 3.3],
@@ -68,63 +66,63 @@ INSERT INTO test_array_intersect VALUES
  ['peach', 'plum'], ['2025-01-03'], ['2025-01-03 14:00:00']);
 
 -- query 4
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_boolean, [true, false]) AS intersect_boolean FROM test_array_intersect order by id;
 
 -- query 5
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_tinyint, [2, 8, 10]) AS intersect_tinyint FROM test_array_intersect order by id;
 
 -- query 6
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_smallint, [100, 300, 900]) AS intersect_smallint FROM test_array_intersect order by id;
 
 -- query 7
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_int, [123, 303, 707]) AS intersect_int FROM test_array_intersect order by id;
 
 -- query 8
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_bigint, [1000000000, 6000000000, 10000000000]) AS intersect_bigint FROM test_array_intersect order by id;
 
 -- query 9
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_largeint, [1234, 5678]) AS intersect_largeint FROM test_array_intersect order by id;
 
 -- query 10
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_float, [1.1, 3.3, 9.9]) AS intersect_float FROM test_array_intersect order by id;
 
 -- query 11
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_double, [1.11, 4.44, 10.01]) AS intersect_double FROM test_array_intersect order by id;
 
 -- query 12
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_decimalv2, [123.45, 456.78, 789.01]) AS intersect_decimalv2 FROM test_array_intersect order by id;
 
 -- query 13
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_decimal32, [123.45, 890.12]) AS intersect_decimal32 FROM test_array_intersect order by id;
 
 -- query 14
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_decimal64, [123.4567, 345.6789]) AS intersect_decimal64 FROM test_array_intersect order by id;
 
 -- query 15
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_decimal128, [1234567890.1234567890, 3344556677.8899001122]) AS intersect_decimal128 FROM test_array_intersect order by id;
 
 -- query 16
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_varchar, ['apple', 'banana', 'cherry']) AS intersect_varchar FROM test_array_intersect order by id;
 
 -- query 17
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_date, ['2025-01-01', '2025-01-08']) AS intersect_date FROM test_array_intersect order by id;
 
 -- query 18
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 SELECT id, array_intersect(array_datetime, ['2025-01-01 12:00:00', '2025-01-08 19:00:00']) AS intersect_datetime FROM test_array_intersect order by id;
 
 -- query 19
@@ -132,6 +130,5 @@ SELECT id, array_intersect(array_datetime, ['2025-01-01 12:00:00', '2025-01-08 1
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming
 -- the namespace holds none. Drop the tables explicitly instead.
-USE sql_tests_complex_test_array_intersect;
+USE ${case_db};
 DROP TABLE IF EXISTS test_array_intersect;
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_intersect;

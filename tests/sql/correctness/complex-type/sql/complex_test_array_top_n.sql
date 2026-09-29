@@ -20,14 +20,12 @@
 -- Preserve array test coverage migrated from dev/test.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_top_n FORCE;
-CREATE DATABASE sql_tests_complex_test_array_top_n;
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 
 -- name: test_array_top_n_all_types @no_arrow_flight_sql
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 CREATE TABLE test_array_top_n (
     id INT,
     array_int ARRAY<INT>,
@@ -44,7 +42,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 INSERT INTO test_array_top_n VALUES
 (1, [100, 1, NULL, 5, 100, 1], [100, 1, NULL, 5, 100, 1], [100.0, 1.0, NULL, 5.0, 100.0, 1.0],
  [100.0, 1.0, NULL, 5.0, 100.0, 1.0], [100.0, 1.0, NULL, 5.0, 100.0, 1.0], [true, false, NULL, true, true, false],
@@ -63,92 +61,92 @@ INSERT INTO test_array_top_n VALUES
  ['eee', 'eee', 'eee', 'ccc', 'ccc']);
 
 -- query 4
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_int, 3) AS result FROM test_array_top_n ORDER BY id;
 
 -- query 5
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_bigint, 3) AS result FROM test_array_top_n ORDER BY id;
 
 -- query 6
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_float, 3) AS result FROM test_array_top_n ORDER BY id;
 
 -- query 7
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_double, 3) AS result FROM test_array_top_n ORDER BY id;
 
 -- query 8
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_decimalv2, 3) AS result FROM test_array_top_n ORDER BY id;
 
 -- query 9
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_boolean, 3) AS result FROM test_array_top_n ORDER BY id;
 
 -- query 10
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_date, 3) AS result FROM test_array_top_n ORDER BY id;
 
 -- query 11
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_datetime, 3) AS result FROM test_array_top_n ORDER BY id;
 
 -- query 12
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_varchar, 3) AS result FROM test_array_top_n ORDER BY id;
 
 -- query 13
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_int, 0) AS result FROM test_array_top_n WHERE id = 1 ORDER BY id;
 
 -- query 14
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_int, -1) AS result FROM test_array_top_n WHERE id = 1 ORDER BY id;
 
 -- query 15
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_int, 10) AS result FROM test_array_top_n WHERE id = 1 ORDER BY id;
 
 -- query 16
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_int, 1) AS result FROM test_array_top_n WHERE id = 1 ORDER BY id;
 
 -- query 17
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_int, 1) AS result FROM test_array_top_n WHERE id = 4 ORDER BY id;
 
 -- query 18
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT id, array_top_n(array_int, 3) AS result FROM test_array_top_n WHERE id = 6 ORDER BY id;
 
 -- query 19
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT array_top_n([1, 100, 2, 5, 3], 3) AS result;
 
 -- query 20
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT array_top_n([1, 100, 2, 5, 3], 3) AS result;
 
 -- query 21
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT array_top_n(['hello', 'world', 'aaa', 'zzz', 'mmm'], 3) AS result;
 
 -- query 22
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT array_top_n([1, NULL, 100, NULL, 5], 3) AS result;
 
 -- query 23
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT array_top_n([], 3) AS result;
 
 -- query 24
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 SELECT array_top_n(NULL, 3) AS result;
 
 -- query 25
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 DROP TABLE test_array_top_n;
 
 -- query 26
@@ -156,6 +154,5 @@ DROP TABLE test_array_top_n;
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming
 -- the namespace holds none. Drop the tables explicitly instead.
-USE sql_tests_complex_test_array_top_n;
+USE ${case_db};
 DROP TABLE IF EXISTS test_array_top_n;
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_top_n;
