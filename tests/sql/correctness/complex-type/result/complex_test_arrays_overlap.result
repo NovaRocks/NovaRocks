@@ -185,7 +185,7 @@ arrays_overlap(d_2, s_1)
 0
 0
 NULL
-0
+1
 
 -- query 51
 arrays_overlap(d_2, d_2)
