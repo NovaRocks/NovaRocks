@@ -1,0 +1,18 @@
+-- query 3
+max_v	min_v	max_negkey	min_negkey	max_decimal	min_decimal
+9	NULL	NULL	9	9.000000000	NULL
+
+-- query 4
+seq	max_v	min_v
+1	4	4
+2	9	4
+3	9	NULL
+4	9	NULL
+
+-- query 5
+max_null_key	min_null_key
+NULL	NULL
+
+-- query 6
+max_empty	min_empty
+NULL	NULL

@@ -52,10 +52,6 @@ fn is_max_kind(kind: &AggKind) -> bool {
     matches!(kind, AggKind::MaxBy | AggKind::MaxByV2)
 }
 
-fn allow_null_value(kind: &AggKind) -> bool {
-    matches!(kind, AggKind::MaxByV2 | AggKind::MinByV2)
-}
-
 fn kind_from_name(name: &str) -> Option<AggKind> {
     match name {
         "max_by" => Some(AggKind::MaxBy),
@@ -435,16 +431,12 @@ impl AggregateFunction for MaxMinByAgg {
         let value_arr = struct_arr.column(0);
         let key_arr = struct_arr.column(1);
         let is_max = is_max_kind(&spec.kind);
-        let allow_null = allow_null_value(&spec.kind);
 
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MaxMinByState) };
             let key = tracked_scalar_from_array(key_arr, row, &state.allocator)?;
             let Some(key) = key else { continue };
             let value = tracked_scalar_from_array(value_arr, row, &state.allocator)?;
-            if value.is_none() && !allow_null {
-                continue;
-            }
 
             let should_update = match state.key.as_ref() {
                 None => true,
@@ -476,7 +468,6 @@ impl AggregateFunction for MaxMinByAgg {
             return Err("max_by/min_by merge input type mismatch".to_string());
         };
         let is_max = is_max_kind(&spec.kind);
-        let allow_null = allow_null_value(&spec.kind);
         for (row, &base) in state_ptrs.iter().enumerate() {
             if arr.is_null(row) {
                 continue;
@@ -489,9 +480,6 @@ impl AggregateFunction for MaxMinByAgg {
             let value = decode_tracked_scalar(&mut slice, &state.allocator)?;
             if !slice.is_empty() {
                 return Err("max_by/min_by merge input has trailing bytes".to_string());
-            }
-            if value.is_none() && !allow_null {
-                continue;
             }
             let should_update = match state.key.as_ref() {
                 None => true,
@@ -558,9 +546,252 @@ impl AggregateFunction for MaxMinByAgg {
 mod tests {
     use super::super::common::AggScalarValue;
     use super::*;
-    use arrow::array::{Array, Int64Array, ListArray, MapArray, StringArray, StructArray};
+    use crate::exec::expr::ExprId;
+    use crate::exec::expr::agg::{
+        AggKernelSet, AggStateArena, build_kernel_set, test_builtin_execution_function_set,
+    };
+    use crate::exec::node::aggregate::AggTypeSignature;
+    use arrow::array::{
+        Array, Decimal128Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
+    };
     use arrow::datatypes::{DataType, Field, Fields};
+    use novarocks_functions::AggregateInputBatch;
     use std::mem::MaybeUninit;
+
+    fn bound_max_min_by(
+        name: &str,
+        value_type: DataType,
+        key_type: DataType,
+        merge: bool,
+    ) -> AggKernelSet {
+        let function_set = test_builtin_execution_function_set();
+        let selected = function_set
+            .catalog()
+            .resolve_aggregate_trusted(name, &[value_type.clone(), key_type.clone()])
+            .expect("resolve public max_by/min_by");
+        let evaluated_type = if merge {
+            DataType::Binary
+        } else {
+            DataType::Struct(
+                vec![
+                    Field::new("value", value_type.clone(), true),
+                    Field::new("key", key_type, true),
+                ]
+                .into(),
+            )
+        };
+        let func = AggFunction {
+            name: name.to_string(),
+            // The resolved signature has two logical arguments; execution packs them into one struct.
+            inputs: vec![ExprId(0)],
+            input_is_intermediate: merge,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(selected.intermediate_type.clone()),
+                output_type: Some(selected.output_type.clone()),
+                input_arg_type: Some(value_type),
+            }),
+            ..Default::default()
+        };
+        build_kernel_set(&function_set, &[func], &[Some(evaluated_type)], &[selected])
+            .expect("bind public max_by/min_by kernel")
+    }
+
+    fn bound_max_min_states(
+        kernels: &AggKernelSet,
+        count: usize,
+    ) -> (AggStateArena, Vec<AggStatePtr>) {
+        let tracker = MemTracker::new_root("max-min-by-null-value-test");
+        let mut arena = AggStateArena::new(1024);
+        arena.set_mem_tracker(Arc::clone(&tracker));
+        let kernel = &kernels.entries[0];
+        let states = (0..count)
+            .map(|_| {
+                let base = arena.alloc(kernels.layout.total_size, kernel.state_align());
+                kernel
+                    .init_state_with_tracker(base, Arc::clone(&tracker))
+                    .expect("init tracked state");
+                base
+            })
+            .collect();
+        (arena, states)
+    }
+
+    fn packed_value_key(values: ArrayRef, keys: ArrayRef) -> ArrayRef {
+        let fields = Fields::from(vec![
+            Field::new("value", values.data_type().clone(), true),
+            Field::new("key", keys.data_type().clone(), true),
+        ]);
+        Arc::new(StructArray::new(fields, vec![values, keys], None))
+    }
+
+    #[test]
+    fn bound_max_min_by_keeps_null_value_winner_and_ignores_null_key() {
+        for (name, null_key, worse_key) in [("min_by", 6, 7), ("max_by", 10000, 9500)] {
+            let kernels = bound_max_min_by(name, DataType::Int64, DataType::Int64, false);
+            let kernel = &kernels.entries[0];
+            let (_arena, states) = bound_max_min_states(&kernels, 4);
+            // Group zero has a NULL winner followed by a worse non-NULL row.
+            // Group one is untouched, group two has only NULL keys, group three is a control.
+            let input = packed_value_key(
+                Arc::new(Int64Array::from(vec![
+                    Some(4),
+                    Some(9),
+                    None,
+                    Some(999),
+                    Some(5),
+                    Some(7),
+                    None,
+                    Some(8),
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    Some(4008),
+                    Some(9006),
+                    Some(null_key),
+                    None,
+                    Some(worse_key),
+                    None,
+                    None,
+                    Some(1),
+                ])),
+            );
+            let destinations = [
+                states[0], states[0], states[0], states[0], states[0], states[2], states[2],
+                states[3],
+            ];
+            kernel
+                .update_batch(
+                    &destinations,
+                    AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
+                )
+                .unwrap();
+            let output = kernel.build_array(&states, false).unwrap();
+            let output = output.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(output.len(), 4);
+            assert!(output.is_null(0));
+            assert!(output.is_null(1));
+            assert!(output.is_null(2));
+            assert!(!output.is_null(3));
+            assert_eq!(output.value(3), 8);
+            let partial = kernel.build_array(&states, true).unwrap();
+            // A selected NULL value must retain a non-NULL partial carrying its valid key.
+            assert!(!partial.is_null(0));
+            assert!(partial.is_null(1));
+            assert!(partial.is_null(2));
+            assert!(!partial.is_null(3));
+            for base in states {
+                kernel.drop_state(base);
+            }
+        }
+    }
+
+    #[test]
+    fn bound_max_min_by_merges_null_value_winner_in_both_orders() {
+        for (name, winner_key, worse_key) in [("min_by", 6, 4008), ("max_by", 10000, 9006)] {
+            let local = bound_max_min_by(name, DataType::Int64, DataType::Int64, false);
+            let local_kernel = &local.entries[0];
+            let (_local_arena, local_states) = bound_max_min_states(&local, 3);
+            let input = packed_value_key(
+                Arc::new(Int64Array::from(vec![None, Some(4), Some(999)])),
+                Arc::new(Int64Array::from(vec![
+                    Some(winner_key),
+                    Some(worse_key),
+                    None,
+                ])),
+            );
+            local_kernel
+                .update_batch(
+                    &local_states,
+                    AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
+                )
+                .unwrap();
+            let partial = local_kernel.build_array(&local_states, true).unwrap();
+            let partial = partial.as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert!(!partial.is_null(0));
+            assert!(!partial.is_null(1));
+            assert!(partial.is_null(2));
+            let input: ArrayRef = Arc::new(BinaryArray::from(vec![
+                Some(partial.value(0)),
+                Some(partial.value(1)),
+                None,
+                Some(partial.value(1)),
+                Some(partial.value(0)),
+                None,
+            ]));
+            let merged = bound_max_min_by(name, DataType::Int64, DataType::Int64, true);
+            let merged_kernel = &merged.entries[0];
+            let (_merged_arena, merged_states) = bound_max_min_states(&merged, 2);
+            let destinations = [
+                merged_states[0],
+                merged_states[0],
+                merged_states[0],
+                merged_states[1],
+                merged_states[1],
+                merged_states[1],
+            ];
+            merged_kernel
+                .merge_batch(
+                    &destinations,
+                    AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
+                )
+                .unwrap();
+            let output = merged_kernel.build_array(&merged_states, false).unwrap();
+            assert_eq!(output.len(), 2);
+            assert_eq!(output.null_count(), 2);
+            let partial = merged_kernel.build_array(&merged_states, true).unwrap();
+            assert_eq!(partial.null_count(), 0);
+            for base in local_states {
+                local_kernel.drop_state(base);
+            }
+            for base in merged_states {
+                merged_kernel.drop_state(base);
+            }
+        }
+    }
+
+    #[test]
+    fn bound_max_min_by_preserves_decimal_type_and_exact_nullable_key_selection() {
+        let decimal = DataType::Decimal128(18, 9);
+        let coefficient = 111111111111111111_i128;
+        let low = 123456789123456788_i128;
+        let high = low + 1;
+        for (name, first_key, null_key) in [("min_by", high, low), ("max_by", low, high)] {
+            let kernels = bound_max_min_by(name, decimal.clone(), decimal.clone(), false);
+            let kernel = &kernels.entries[0];
+            let (_arena, states) = bound_max_min_states(&kernels, 2);
+            // Adjacent Decimal(18,9) keys differ by 1e-9, below binary64 resolution here.
+            let values: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![
+                    Some(coefficient),
+                    None,
+                    Some(coefficient),
+                    Some(coefficient),
+                ])
+                .with_precision_and_scale(18, 9)
+                .unwrap(),
+            );
+            let keys: ArrayRef = Arc::new(
+                Decimal128Array::from(vec![Some(first_key), Some(null_key), None, Some(first_key)])
+                    .with_precision_and_scale(18, 9)
+                    .unwrap(),
+            );
+            let input = packed_value_key(values, keys);
+            kernel
+                .update_batch(
+                    &[states[0], states[0], states[0], states[1]],
+                    AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
+                )
+                .unwrap();
+            let output = kernel.build_array(&states, false).unwrap();
+            assert_eq!(output.data_type(), &decimal);
+            let output = output.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            assert!(output.is_null(0));
+            assert!(!output.is_null(1));
+            assert_eq!(output.value(1), coefficient);
+            for base in states {
+                kernel.drop_state(base);
+            }
+        }
+    }
 
     fn utf8_max_by_spec() -> (AggSpec, DataType) {
         let struct_type = DataType::Struct(

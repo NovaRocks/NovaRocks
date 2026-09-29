@@ -3324,6 +3324,79 @@ mod tests {
     }
 
     #[test]
+    fn max_min_by_window_keeps_null_value_winner_in_full_and_running_frames() {
+        for (kind, name, keys) in [
+            (
+                WindowFunctionKind::MaxBy,
+                "max_by",
+                vec![Some(10_i64), Some(20), None],
+            ),
+            (
+                WindowFunctionKind::MinBy,
+                "min_by",
+                vec![Some(20_i64), Some(10), None],
+            ),
+        ] {
+            let input = Chunk::try_new_with_columns(
+                value_key_chunk_schema(),
+                vec![
+                    Arc::new(StringArray::from(vec![
+                        Some("first"),
+                        None,
+                        Some("ignored"),
+                    ])),
+                    Arc::new(Int64Array::from(keys)),
+                ],
+            )
+            .unwrap();
+            for running in [false, true] {
+                let (arena, _value, _key, packed) = value_key_arena();
+                let frame = running.then_some(WindowFrame {
+                    start: None,
+                    end: Some(WindowBoundary::CurrentRow),
+                    window_type: WindowType::Rows,
+                });
+                let state = AnalyticSharedState::new(
+                    arena,
+                    vec![],
+                    vec![],
+                    vec![WindowFunctionSpec {
+                        kind: kind.clone(),
+                        args: vec![packed],
+                        return_type: DataType::Utf8,
+                        aggregate_binding: Some(aggregate_binding(
+                            name,
+                            &[DataType::Utf8, DataType::Int64],
+                        )),
+                    }],
+                    frame,
+                    vec![AnalyticOutputColumn::Window(0)],
+                    window_output_schema(DataType::Utf8),
+                    empty_function_set(),
+                    1,
+                )
+                .unwrap();
+                let output = state
+                    .compute_outputs(std::slice::from_ref(&input), None)
+                    .unwrap();
+                let values = output[0].columns()[0]
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(values.len(), 3);
+                if running {
+                    assert!(!values.is_null(0));
+                    assert_eq!(values.value(0), "first");
+                } else {
+                    assert!(values.is_null(0));
+                }
+                assert!(values.is_null(1));
+                assert!(values.is_null(2));
+            }
+        }
+    }
+
+    #[test]
     fn array_agg_function_order_is_independent_from_over_order() {
         let input = value_key_chunk(&["a", "b", "c"], &[1, 2, 3]);
         let (arena, _value, over_order_key, packed) = value_key_arena();
