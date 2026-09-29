@@ -268,6 +268,19 @@ fn to_decimal256_values(arr: &ArrayRef, context: &str) -> Result<(Vec<Option<i25
             }
             Ok((out, 0))
         }
+        ty if largeint::is_largeint_data_type(ty) => {
+            let typed = largeint::as_fixed_size_binary_array(arr, context)?;
+            let values = (0..typed.len())
+                .map(|row| {
+                    if typed.is_null(row) {
+                        Ok(None)
+                    } else {
+                        largeint::value_at(typed, row).map(|value| Some(i256::from_i128(value)))
+                    }
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok((values, 0))
+        }
         DataType::Null => Ok((vec![None; arr.len()], 0)),
         other => Err(format!(
             "{context}: unsupported Decimal256 operand type: {:?}",
@@ -345,6 +358,31 @@ fn eval_decimal_binop(
     op: DecimalOp,
     strict_overflow: bool,
 ) -> Result<Option<ArrayRef>, String> {
+    let is_decimal =
+        |ty: &DataType| matches!(ty, DataType::Decimal128(_, _) | DataType::Decimal256(_, _));
+    if (largeint::is_largeint_data_type(lhs.data_type()) && is_decimal(rhs.data_type()))
+        || (largeint::is_largeint_data_type(rhs.data_type()) && is_decimal(lhs.data_type()))
+    {
+        let operation = match &op {
+            DecimalOp::Add => novarocks_type_contract::ArithmeticOperator::Add,
+            DecimalOp::Sub => novarocks_type_contract::ArithmeticOperator::Subtract,
+            DecimalOp::Mul => novarocks_type_contract::ArithmeticOperator::Multiply,
+            DecimalOp::Div => novarocks_type_contract::ArithmeticOperator::Divide,
+            DecimalOp::Mod => novarocks_type_contract::ArithmeticOperator::Modulo,
+        };
+        if novarocks_type_contract::arithmetic_result_type_with_op(
+            lhs.data_type(),
+            rhs.data_type(),
+            operation,
+        )
+        .as_ref()
+            != Some(output_type)
+        {
+            return Err(
+                "Decimal/LARGEINT arithmetic differs from its frozen add/subtract rule".to_string(),
+            );
+        }
+    }
     match output_type {
         DataType::Decimal128(out_precision, out_scale) => {
             if !matches!(
@@ -1126,6 +1164,148 @@ mod tests {
             .expect("chunk schema");
             Chunk::new_with_chunk_schema(batch, chunk_schema)
         }
+    }
+
+    #[test]
+    fn mixed_decimal_largeint_prepared_columns_preserve_extrema_and_nulls() {
+        let decimal = Arc::new(
+            Decimal128Array::from(vec![
+                Some(1250000000000000_i128),
+                Some(-1250000000000000),
+                None,
+                Some(1),
+            ])
+            .with_precision_and_scale(38, 15)
+            .unwrap(),
+        ) as ArrayRef;
+        let integers =
+            largeint::array_from_i128(&[Some(i128::MAX), Some(i128::MIN), Some(1), None]).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("decimal", decimal.data_type().clone(), true),
+                Field::new("integer", integers.data_type().clone(), true),
+            ])),
+            vec![decimal, integers],
+        )
+        .unwrap();
+        let schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, schema);
+        let mut arena = ExprArena::default();
+        let decimal = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            DataType::Decimal128(38, 15),
+        );
+        let integer = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(2)),
+            DataType::FixedSizeBinary(16),
+        );
+        let out = DataType::Decimal256(55, 15);
+        let add = arena.push_typed(ExprNode::Add(decimal, integer), out.clone());
+        let add_reverse = arena.push_typed(ExprNode::Add(integer, decimal), out.clone());
+        let sub = arena.push_typed(ExprNode::Sub(decimal, integer), out.clone());
+        let reverse = arena.push_typed(ExprNode::Sub(integer, decimal), out.clone());
+        let unsupported = arena.push_typed(ExprNode::Mul(decimal, integer), out);
+        let frozen = arena.into_immutable().unwrap();
+        let prepared = ExprArena::from_immutable(&frozen);
+        let factor = pow10_i256(15).unwrap();
+        let scaled = [
+            i256::from_i128(i128::MAX).checked_mul(factor).unwrap(),
+            i256::from_i128(i128::MIN).checked_mul(factor).unwrap(),
+        ];
+        let coefficient = [
+            i256::from_i128(1250000000000000),
+            i256::from_i128(-1250000000000000),
+        ];
+        for (expr, expected) in [
+            (
+                add,
+                vec![
+                    Some(scaled[0].checked_add(coefficient[0]).unwrap()),
+                    Some(scaled[1].checked_add(coefficient[1]).unwrap()),
+                    None,
+                    None,
+                ],
+            ),
+            (
+                add_reverse,
+                vec![
+                    Some(scaled[0].checked_add(coefficient[0]).unwrap()),
+                    Some(scaled[1].checked_add(coefficient[1]).unwrap()),
+                    None,
+                    None,
+                ],
+            ),
+            (
+                sub,
+                vec![
+                    Some(coefficient[0].checked_sub(scaled[0]).unwrap()),
+                    Some(coefficient[1].checked_sub(scaled[1]).unwrap()),
+                    None,
+                    None,
+                ],
+            ),
+            (
+                reverse,
+                vec![
+                    Some(scaled[0].checked_sub(coefficient[0]).unwrap()),
+                    Some(scaled[1].checked_sub(coefficient[1]).unwrap()),
+                    None,
+                    None,
+                ],
+            ),
+        ] {
+            let output = prepared.eval(expr, &chunk).unwrap();
+            assert_eq!(output.data_type(), &DataType::Decimal256(55, 15));
+            let output = output.as_any().downcast_ref::<Decimal256Array>().unwrap();
+            assert_eq!(output.iter().collect::<Vec<_>>(), expected);
+        }
+        assert!(
+            prepared
+                .eval(unsupported, &chunk)
+                .unwrap_err()
+                .contains("frozen add/subtract rule")
+        );
+    }
+
+    #[test]
+    fn mixed_decimal_largeint_scale36_fits_precision76() {
+        let decimal = Arc::new(
+            Decimal128Array::from(vec![Some(1_i128)])
+                .with_precision_and_scale(38, 36)
+                .unwrap(),
+        ) as ArrayRef;
+        let integer = largeint::array_from_i128(&[Some(i128::MAX)]).unwrap();
+        let expected = i256::from_i128(i128::MAX)
+            .checked_mul(pow10_i256(36).unwrap())
+            .unwrap()
+            .checked_add(i256::ONE)
+            .unwrap();
+        let output = eval_decimal_binop(
+            &decimal,
+            &integer,
+            &DataType::Decimal256(76, 36),
+            DecimalOp::Add,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let output = output.as_any().downcast_ref::<Decimal256Array>().unwrap();
+        assert_eq!(output.value(0), expected);
+        assert!(
+            eval_decimal_binop(
+                &decimal,
+                &integer,
+                &DataType::Decimal128(38, 36),
+                DecimalOp::Add,
+                false
+            )
+            .unwrap_err()
+            .contains("frozen add/subtract rule")
+        );
     }
 
     #[test]

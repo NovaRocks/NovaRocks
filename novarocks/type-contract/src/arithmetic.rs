@@ -128,6 +128,25 @@ pub fn arithmetic_result_type_with_op(
     right: &DataType,
     op: ArithmeticOperator,
 ) -> Option<DataType> {
+    // This separately frozen pair preserves both exact input carriers.
+    if let Some((precision, scale)) = mixed_decimal_largeint(left, right) {
+        if !matches!(op, ArithmeticOperator::Add | ArithmeticOperator::Subtract)
+            || precision == 0
+            || precision > 76
+            || scale > precision as i8
+        {
+            return None;
+        }
+        let scale_out = i16::from(scale.max(0));
+        let precision_out = (i16::from(precision) - i16::from(scale)).max(39) + scale_out + 1;
+        if precision_out > 76 {
+            return None;
+        }
+        return Some(DataType::Decimal256(
+            u8::try_from(precision_out).ok()?,
+            i8::try_from(scale_out).ok()?,
+        ));
+    }
     if !is_supported_arithmetic_type(left) || !is_supported_arithmetic_type(right) {
         return None;
     }
@@ -166,6 +185,21 @@ pub fn arithmetic_result_type_with_op(
     })
 }
 
+fn mixed_decimal_largeint(left: &DataType, right: &DataType) -> Option<(u8, i8)> {
+    let decimal = if is_largeint_data_type(left) {
+        right
+    } else if is_largeint_data_type(right) {
+        left
+    } else {
+        return None;
+    };
+    match decimal {
+        DataType::Decimal128(precision, scale) if *precision <= 38 => Some((*precision, *scale)),
+        DataType::Decimal256(precision, scale) => Some((*precision, *scale)),
+        _ => None,
+    }
+}
+
 fn is_integer(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -185,6 +219,73 @@ fn is_supported_arithmetic_type(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_decimal_largeint_add_sub_have_exact_bounded_width() {
+        let largeint = DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH);
+        for (decimal, expected) in [
+            (
+                DataType::Decimal128(38, 15),
+                Some(DataType::Decimal256(55, 15)),
+            ),
+            (
+                DataType::Decimal128(38, 36),
+                Some(DataType::Decimal256(76, 36)),
+            ),
+            (DataType::Decimal128(38, 37), None),
+            (
+                DataType::Decimal128(38, -36),
+                Some(DataType::Decimal256(75, 0)),
+            ),
+            (DataType::Decimal128(38, -38), None),
+            (
+                DataType::Decimal256(55, 15),
+                Some(DataType::Decimal256(56, 15)),
+            ),
+            (DataType::Decimal256(76, 0), None),
+        ] {
+            for op in [ArithmeticOperator::Add, ArithmeticOperator::Subtract] {
+                assert_eq!(
+                    arithmetic_result_type_with_op(&decimal, &largeint, op),
+                    expected
+                );
+                assert_eq!(
+                    arithmetic_result_type_with_op(&largeint, &decimal, op),
+                    expected
+                );
+            }
+            for op in [
+                ArithmeticOperator::Multiply,
+                ArithmeticOperator::Divide,
+                ArithmeticOperator::Modulo,
+            ] {
+                assert_eq!(
+                    arithmetic_result_type_with_op(&decimal, &largeint, op),
+                    None
+                );
+                assert_eq!(
+                    arithmetic_result_type_with_op(&largeint, &decimal, op),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            arithmetic_result_type_with_op(
+                &DataType::Decimal256(55, 15),
+                &DataType::Int64,
+                ArithmeticOperator::Add
+            ),
+            None
+        );
+        assert_eq!(
+            arithmetic_result_type_with_op(
+                &DataType::Decimal256(55, 15),
+                &DataType::Decimal256(55, 15),
+                ArithmeticOperator::Add
+            ),
+            None
+        );
+    }
 
     #[test]
     fn decimal_promotion_is_a_precision_decision_with_the_existing_scale_boundary() {
