@@ -1744,6 +1744,13 @@ impl ContractLoweringVisitor {
                 });
             }
         }
+        self.annotate_output_display_names(lowered);
+        Ok(())
+    }
+
+    /// Publish a value's frozen display name where that value is introduced.
+    /// An ExchangeImport is a new identity even when its SQL column is unchanged.
+    fn annotate_output_display_names(&mut self, lowered: &LoweredNode) {
         for (value, display_name) in lowered.output.iter().zip(&lowered.display_names) {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 self.annotated_values.entry((lowered.fragment, *value))
@@ -1759,7 +1766,6 @@ impl ContractLoweringVisitor {
                 });
             }
         }
-        Ok(())
     }
 
     fn allocate_fragment(&mut self) -> Result<FragmentId, ContractLoweringError> {
@@ -3796,7 +3802,7 @@ impl ContractLoweringVisitor {
         self.plan_builder.add_edge(edge_contract.clone())?;
         self.edges.insert(edge, edge_contract);
         self.complete_fragment(source.fragment, source.node, FragmentSink::Stream { edge })?;
-        Ok(LoweredNode {
+        let lowered = LoweredNode {
             fragment: destination,
             node: receiver,
             output: output.into_boxed_slice(),
@@ -3816,7 +3822,12 @@ impl ContractLoweringVisitor {
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-        })
+        };
+        // Shared-scheme joins lower Redistribute directly, so they do not
+        // pass through lower_node's annotation step. Publish every receiver
+        // value now, including keys hidden by SEMI/ANTI or null extension.
+        self.annotate_output_display_names(&lowered);
+        Ok(lowered)
     }
 
     fn ensure_singleton(
@@ -12413,6 +12424,81 @@ mod tests {
             other => panic!("expected right hash distribution, got {other:?}"),
         };
         assert_eq!(left_scheme, right_scheme);
+    }
+
+    #[test]
+    fn shared_shuffle_imports_preserve_hidden_join_key_display_names() {
+        for kind in [
+            crate::common::JoinKind::Inner,
+            crate::common::JoinKind::LeftOuter,
+            crate::common::JoinKind::LeftSemi,
+            crate::common::JoinKind::LeftAnti,
+        ] {
+            let left = column(1, "l.k", DataType::Int64, false);
+            let right = column(2, "r.k", DataType::Int64, false);
+            let mut output = vec![left.clone()];
+            if matches!(
+                kind,
+                crate::common::JoinKind::Inner | crate::common::JoinKind::LeftOuter
+            ) {
+                let mut visible_right = right.clone();
+                visible_right.nullable = kind == crate::common::JoinKind::LeftOuter;
+                output.push(visible_right);
+            }
+            let plan = hash_join(
+                kind,
+                PhysicalHashJoinBuildSide::Right,
+                SqlJoinDistribution::Shuffle,
+                Some(JoinExecutionMode::Partitioned),
+                redistribute(
+                    values(vec![left.clone()], vec![vec![literal_int(1)]]),
+                    RedistributeMode::Hash {
+                        cols: vec![left.column_id],
+                        source: crate::planner::physical::HashSource::ShuffleJoin,
+                    },
+                ),
+                redistribute(
+                    values(vec![right.clone()], vec![vec![literal_int(1)]]),
+                    RedistributeMode::Hash {
+                        cols: vec![right.column_id],
+                        source: crate::planner::physical::HashSource::ShuffleJoin,
+                    },
+                ),
+                output,
+            );
+            let completed = finish_for_test(&plan).unwrap();
+            let text = crate::explain::completed_tree::render_completed_plan_tree(
+                &completed,
+                crate::explain::ExplainLevel::Verbose,
+            )
+            .unwrap()
+            .join("\n");
+            assert!(text.contains("eq: [l.k = r.k]"), "{kind:?}: {text}");
+            // Check the import contract itself rather than just the final text:
+            // each new receiver identity carries exactly its sender's name.
+            for edge in completed.edges().values() {
+                for (source, destination) in edge.destination.receive_mapping.iter() {
+                    let name = |fragment, value| {
+                        completed
+                            .annotations()
+                            .iter()
+                            .find(|annotation| {
+                                annotation.subject
+                                    == novarocks_physical_plan::AnnotationSubject::Value(
+                                        fragment, value,
+                                    )
+                                    && annotation.key.as_ref() == "sql.display_name"
+                            })
+                            .map(|annotation| annotation.value.as_ref())
+                            .expect("named exchange value")
+                    };
+                    assert_eq!(
+                        name(edge.source.fragment, *source),
+                        name(edge.destination.fragment, *destination)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
