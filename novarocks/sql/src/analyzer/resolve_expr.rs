@@ -5623,7 +5623,7 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
 mod tests {
     use super::super::analyze;
     use super::{AnalyzeError, BinOp, TypedExpr};
-    use crate::analysis::{ExprKind, QueryBody, UnOp};
+    use crate::analysis::{ExprKind, LiteralValue, QueryBody, UnOp};
     use crate::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::catalog::PlannerTableProvider;
     use crate::planner::table::{
@@ -6720,6 +6720,21 @@ mod tests {
             };
             Ok(select.projection.into_iter().next().unwrap().expr)
         }
+        for prefix in ["", "session.", "local."] {
+            for enabled in [false, true] {
+                let value = projection(
+                    &format!("SELECT @@{prefix}decimal_overflow_to_double"),
+                    enabled,
+                )
+                .unwrap();
+                assert_eq!(value.data_type, DataType::Int64);
+                assert!(!value.nullable);
+                assert!(
+                    matches!(value.kind, ExprKind::Literal(LiteralValue::Int(v)) if v == i64::from(enabled))
+                );
+            }
+        }
+        assert!(projection("SELECT @@global.decimal_overflow_to_double", true).is_err());
         let expression = "CAST(0 AS DECIMAL(30,10))*CAST(0 AS DECIMAL(18,9))";
         let checked = projection(&format!("SELECT {expression}"), false).unwrap();
         assert_eq!(checked.data_type, DataType::Decimal128(38, 19));
