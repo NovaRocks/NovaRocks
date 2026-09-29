@@ -2033,6 +2033,7 @@ mod tests {
                 SqlStatementInput::sql(sql),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
+                    sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                     current_catalog: None,
                     current_database: "default".into(),
                     optimizer_settings: SessionOptimizerSettings::default(),
