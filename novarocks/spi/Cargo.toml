@@ -21,7 +21,6 @@ sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 url.workspace = true
 uuid = { workspace = true, features = ["serde", "v7"] }
-tokio-util.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
