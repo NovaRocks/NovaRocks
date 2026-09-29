@@ -16,7 +16,7 @@
 -- under the License.
 
 -- @order_sensitive=true
--- Validate Iceberg complex-type readback and nested-field pruning explain text.
+-- Validate Iceberg complex-type readback and the frozen provider schema.
 -- query 1
 CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0};
 CREATE TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} (
@@ -34,8 +34,18 @@ SELECT array_filter(x -> x.`user` = 'official', name)[1].family AS family_name
 FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
 
 -- query 2
--- @result_contains=Pruned type: 1 <-> [ARRAY<struct<`user` varchar(1073741824), `family` varchar(1073741824), `given` array<varchar(1073741824)>, `prefix` array<varchar(1073741824)>, `suffix` array<varchar(1073741824)>>>]
-EXPLAIN VERBOSE
+-- The previous label listed all five fields, so it did not prove pruning.
+-- Assert the admitted ARRAY/STRUCT schema in the level that exposes types.
+-- @skip_result_check=true
+-- @result_contains=relation-field[0] column=
+-- @result_contains=provider-output[0] column=
+-- @result_contains=type=List(Struct(
+-- @result_contains="user": Utf8
+-- @result_contains="family": Utf8
+-- @result_contains="given": List(Utf8
+-- @result_contains="prefix": List(Utf8
+-- @result_contains="suffix": List(Utf8
+EXPLAIN CONTRACT
 SELECT array_filter(x -> x.`user` = 'official', name)[1].family AS family_name
 FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
 SET catalog default_catalog;
