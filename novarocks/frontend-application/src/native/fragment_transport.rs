@@ -1054,7 +1054,7 @@ mod tests {
     use novarocks_execution::{
         exec::chunk::{Chunk, ChunkSchema},
         runtime::exchange::encode_chunks,
-        task_execution::ResultByteLimit,
+        task_execution::{ResultByteLimit, ResultPacketSequence},
     };
     use novarocks_proto_models::novarocks::{FetchResultResponse, fetch_result_response::Status};
     use novarocks_query_application::coordination::{
@@ -1395,7 +1395,7 @@ mod tests {
             classify_root_result_response(
                 "be",
                 response.clone(),
-                Some(7),
+                Some(ResultPacketSequence::new(7)),
                 ResultByteLimit::new(1024).unwrap()
             )
             .unwrap(),
