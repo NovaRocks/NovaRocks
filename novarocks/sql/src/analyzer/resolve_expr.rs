@@ -217,15 +217,16 @@ impl<'a> super::AnalyzerContext<'a> {
                     kind: ast::LiteralKind::Number(number),
                     span,
                 }) = unary.expression.as_ref()
+                    && !number.contains('.')
+                    && !number.contains('e')
+                    && !number.contains('E')
                 {
-                    if !number.contains('.') && !number.contains('e') && !number.contains('E') {
-                        // Check the signed value before the positive magnitude:
-                        // the absolute value of an integer minimum is out of range.
-                        return self.analyze_literal(&ast::Literal {
-                            kind: ast::LiteralKind::Number(format!("-{number}")),
-                            span: *span,
-                        });
-                    }
+                    // Check the signed value before the positive magnitude:
+                    // the absolute value of an integer minimum is out of range.
+                    return self.analyze_literal(&ast::Literal {
+                        kind: ast::LiteralKind::Number(format!("-{number}")),
+                        span: *span,
+                    });
                 }
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
                 let dt = inner_typed.data_type.clone();

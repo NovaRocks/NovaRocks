@@ -221,14 +221,14 @@ fn constrain_literal(mut expr: ast::Expr, target: &DataType) -> Result<ast::Expr
         // Explicit CAST is a semantic boundary. Only its own VARIANT declaration
         // authorizes the existing constant JSON representation conversion.
         ast::Expr::Cast(cast) => {
-            if printer::print_object_name(&cast.data_type.name).eq_ignore_ascii_case("variant") {
-                if let Some(encoded) = constant_variant(&cast.expr)? {
-                    cast.expr = Box::new(encoded);
-                }
+            if printer::print_object_name(&cast.data_type.name).eq_ignore_ascii_case("variant")
+                && let Some(encoded) = constant_variant(&cast.expr)?
+            {
+                *cast.expr = encoded;
             }
         }
         ast::Expr::Nested(nested) => {
-            nested.expression = Box::new(constrain_literal((*nested.expression).clone(), target)?);
+            *nested.expression = constrain_literal((*nested.expression).clone(), target)?;
         }
         ast::Expr::Literal(value) => {
             if matches!(target, DataType::Binary | DataType::LargeBinary)
