@@ -725,6 +725,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_coupon_union_with_typed_sql_string_is_two_and_replay_is_idempotent() {
+        use crate::exec::sketch_hash::prehash_array_value;
+        use arrow::array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        // Independent Java 6.2.0 reference: the old coupon is 0x1cf59c3d,
+        // while SQL UTF-8 "1" prehashes to 0xd68cfa33ac865d67 and coupon 0x069586f8.
+        let values: ArrayRef = Arc::new(StringArray::from(vec![Some("1"), None]));
+        let hash = prehash_array_value(&values, 0, "test").unwrap().unwrap();
+        assert_eq!(hash, 0xd68c_fa33_ac86_5d67);
+        assert_eq!(prehash_array_value(&values, 1, "test").unwrap(), None);
+        let legacy = STANDARD.decode("AgEHEQMIAQQ9nPUc").unwrap();
+        let mut string = HllHandle::new_unreserved(10, HllTargetType::Hll6).unwrap();
+        string.update_hash_unreserved(hash).unwrap();
+        let string_payload = string.serialize().unwrap();
+        assert_eq!(string_payload[6], 1);
+        assert_eq!(&string_payload[8..12], &[0xf8, 0x86, 0x95, 0x06]);
+        assert_eq!(string.estimate().unwrap(), 1);
+        for reverse in [false, true] {
+            let (first, second) = if reverse {
+                (&string_payload, &legacy)
+            } else {
+                (&legacy, &string_payload)
+            };
+            let mut merged = HllHandle::from_payload_unreserved(first).unwrap();
+            merged.merge_payload_unreserved(second).unwrap();
+            merged.merge_payload_unreserved(first).unwrap();
+            merged.merge_payload_unreserved(second).unwrap();
+            assert_eq!(merged.estimate().unwrap(), 2);
+            let payload = merged.serialize().unwrap();
+            assert_eq!(payload[6], 2);
+            let mut coupons: Vec<_> = payload[8..16]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect();
+            coupons.sort_unstable();
+            assert_eq!(coupons, vec![0x0695_86f8, 0x1cf5_9c3d]);
+            assert_eq!(hll_estimate(&payload).unwrap(), 2);
+        }
+    }
+
+    #[test]
     fn native_hll_roundtrip_merges_without_cpp() {
         let mut left = HllHandle::new_unreserved(10, HllTargetType::Hll6).expect("left handle");
         for value in 0_u64..64 {

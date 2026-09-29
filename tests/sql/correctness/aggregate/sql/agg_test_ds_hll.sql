@@ -166,7 +166,7 @@ USE ${case_db};
 SELECT
   IFNULL(CAST(id AS STRING), 'NULL') AS id_key,
   CASE WHEN id = 1 THEN DS_HLL_ESTIMATE(ds_id) = 2 ELSE DS_HLL_ESTIMATE(ds_id) = 1 END AS id_ok,
-  CASE WHEN id = 1 THEN DS_HLL_ESTIMATE(ds_province) = 1 ELSE DS_HLL_ESTIMATE(ds_province) = 1 END AS province_ok,
+  CASE WHEN id = 1 THEN DS_HLL_ESTIMATE(ds_province) = 2 ELSE DS_HLL_ESTIMATE(ds_province) = 1 END AS province_ok,
   CASE WHEN id = 1 THEN DS_HLL_ESTIMATE(ds_age) = 2 ELSE DS_HLL_ESTIMATE(ds_age) = 1 END AS age_ok,
   CASE WHEN id = 1 THEN DS_HLL_ESTIMATE(ds_dt) = 2 ELSE DS_HLL_ESTIMATE(ds_dt) = 1 END AS dt_ok
 FROM t2
