@@ -34,9 +34,11 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,9 +78,10 @@ static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 /// How long one `up.sh` or `down.sh` run may take before the fixture stops
 /// waiting on it and reclaims its Docker project directly.
 ///
-/// This is deliberately generous rather than tight: `up.sh` may rebuild the
-/// Spark image when its Dockerfile or build arguments changed, and it then
-/// polls MinIO and the REST Catalog for up to a minute each. The bound exists
+/// This covers local BOM verification, isolated service creation and readiness.
+/// Fixture inputs are provisioned separately; `up.sh` never builds or pulls.
+/// Creating the publication-hook profile also uses this bound for its explicit
+/// test image build before any fixture service starts. The bound exists
 /// to convert a wedged script into a reported failure the fixture can clean up
 /// after, not to police how long a cold machine takes.
 const FIXTURE_SCRIPT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -222,6 +225,7 @@ pub struct IsolatedIcebergRestFixture {
     minio_root_identity: IsolatedS3Identity,
     vended_s3_identities: Option<IsolatedVendedS3Identities>,
     publication_control_uri: Option<String>,
+    profile: FixtureProfile,
     active: bool,
 }
 
@@ -230,6 +234,36 @@ pub struct IsolatedIcebergRestFixture {
 struct RuntimeEntry {
     id: String,
     directory: PathBuf,
+    configuration_directory: PathBuf,
+}
+
+#[derive(Debug)]
+enum FixtureProfile {
+    Stock,
+    PublicationHook { image: String, control_port: u16 },
+}
+
+impl FixtureProfile {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Stock => "stock",
+            Self::PublicationHook { .. } => "publication-hook",
+        }
+    }
+
+    fn apply(&self, command: &mut Command) {
+        command.args(["--profile", self.name()]);
+        if let Self::PublicationHook {
+            image,
+            control_port,
+        } = self
+        {
+            command.args(["--hook-image", image]).env(
+                "NOVA_ENV_PUBLICATION_HOOK_CONTROL_PORT",
+                control_port.to_string(),
+            );
+        }
+    }
 }
 
 impl IsolatedIcebergRestFixture {
@@ -237,13 +271,48 @@ impl IsolatedIcebergRestFixture {
     /// `scenario_root`.  The caller must retain the fixture for the entire
     /// lifetime of any cluster that uses the returned endpoints.
     pub fn start(scenario_root: impl AsRef<Path>) -> Result<Self> {
+        Self::start_profile(
+            repository_root()?,
+            scenario_root.as_ref(),
+            FixtureProfile::Stock,
+        )
+    }
+
+    /// Creates the REST service with its publication hook already installed.
+    /// The returned control URI belongs to this fixture's initial REST container.
+    pub fn start_with_publication_hook(scenario_root: impl AsRef<Path>) -> Result<(Self, String)> {
         let repo_root = repository_root()?;
+        let image = build_publication_hook_image(&repo_root)?;
+        let reservation = TcpListener::bind("127.0.0.1:0")
+            .context("reserve isolated publication control port")?;
+        let control_port = reservation.local_addr()?.port();
+        // Docker must bind the port itself. A competing bind is a startup
+        // failure, never permission to switch an existing fixture's port.
+        drop(reservation);
+        let mut fixture = Self::start_profile(
+            repo_root,
+            scenario_root.as_ref(),
+            FixtureProfile::PublicationHook {
+                image,
+                control_port,
+            },
+        )?;
+        let control_uri = fixture.observe_publication_hook()?;
+        fixture.publication_control_uri = Some(control_uri.clone());
+        Ok((fixture, control_uri))
+    }
+
+    fn start_profile(
+        repo_root: PathBuf,
+        scenario_root: &Path,
+        profile: FixtureProfile,
+    ) -> Result<Self> {
         // A previous run that crashed, timed out, or was interrupted leaves its
         // Docker project and generated runtime entry behind with nothing left to
         // reclaim them.  Sweep those before adding another one, so one bad run
         // cannot accumulate into an unusable machine.
         sweep_stale_fixtures(&repo_root);
-        let scenario_root = ensure_absolute_directory(scenario_root.as_ref())?;
+        let scenario_root = ensure_absolute_directory(scenario_root)?;
         let fixture_id = unique_fixture_id();
         let workspace_root = scenario_root.join(&fixture_id);
         let config_file = workspace_root.join("isolated-compose.env");
@@ -279,6 +348,7 @@ impl IsolatedIcebergRestFixture {
             },
             vended_s3_identities: None,
             publication_control_uri: None,
+            profile,
             active: true,
         };
 
@@ -325,113 +395,14 @@ impl IsolatedIcebergRestFixture {
         &self.endpoints
     }
 
-    /// Replaces only this fixture's REST service with the local publication
-    /// hook. The regular REST endpoint and private MinIO stay in this project.
-    pub fn enable_publication_hook(&mut self) -> Result<&str> {
-        self.assert_owned_paths()?;
-        ensure!(self.active, "isolated provider runtime is no longer active");
-        ensure!(
-            self.publication_control_uri.is_none(),
-            "isolated publication hook is already active"
-        );
-        let entry = self
-            .runtime_entry
-            .as_ref()
-            .context("isolated provider runtime has no generated entry")?;
-        let hook_root = self
-            .repo_root
-            .join("tests/fixtures/iceberg-rest-publication");
-        let mut inputs = vec![hook_root.join("Dockerfile")];
-        let source_root = hook_root.join("src/main/java/org/apache/iceberg/rest/fixture");
-        for entry in fs::read_dir(&source_root).context("read publication hook sources")? {
-            let path = entry?.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "java")
-            {
-                inputs.push(path);
-            }
-        }
-        let source_hash = hash_named_files(&self.repo_root, &inputs)?;
-        let image = format!(
-            "novarocks/iceberg-rest-publication-fixture:uea7-{}",
-            &source_hash[..16]
-        );
-        let mut build_command = Command::new("docker");
-        build_command
-            .current_dir(&self.repo_root)
-            .args(["build", "--pull=false", "-t", &image])
-            .arg(&hook_root);
-        let built = run_bounded_command(
-            build_command,
-            FIXTURE_SCRIPT_TIMEOUT,
-            "build publication hook image from checked-in sources",
-            &[],
-        )?;
-        ensure!(
-            built.status.success(),
-            "build publication hook image {image}: {}",
-            safe_diagnostics(&built, &[])
-        );
-        let override_file = self.workspace_root.join("publication-hook.compose.yml");
-        fs::write(
-            &override_file,
-            format!(
-                "services:\n  rest:\n    image: {image}\n    environment:\n      CATALOG_IO__IMPL: org.apache.iceberg.rest.fixture.TracingFileIO\n      UEA7_DELEGATE_FILE_IO: s3\n    ports:\n      - '127.0.0.1::8182'\n"
-            ),
-        )
-        .context("write isolated publication hook Compose override")?;
-        let mut compose_command = Command::new("docker");
-        compose_command
-            .current_dir(&self.repo_root)
-            .args(["compose", "--env-file"])
-            .arg(entry.directory.join("compose.env"))
-            .args(["-p"])
-            .arg(&self.compose_project)
-            .args(["-f"])
-            .arg(self.repo_root.join("docker/iceberg-rest/compose.yml"))
-            .args(["-f"])
-            .arg(&override_file)
-            .args(["up", "-d", "--no-deps", "--force-recreate", "rest"]);
-        // Compose gives inherited variables precedence over --env-file. The
-        // caller may have sourced a different worktree's shared runtime.
-        for inherited in [
-            "NOVA_ENV_REST_PORT",
-            "NOVA_ENV_REST_WAREHOUSE_URI",
-            "NOVA_ENV_MINIO_PORT",
-            "NOVA_ENV_MINIO_CONSOLE_PORT",
-            "NOVA_ENV_SPARK_UI_PORT",
-            "MINIO_ROOT_USER",
-            "MINIO_ROOT_PASSWORD",
-            "MINIO_IMAGE",
-            "MINIO_MC_IMAGE",
-            "ICEBERG_REST_IMAGE",
-            "SPARK_ICEBERG_IMAGE",
-        ] {
-            compose_command.env_remove(inherited);
-        }
-        let output = run_bounded_command(
-            compose_command,
-            FIXTURE_DOCKER_TIMEOUT,
-            "start isolated publication hook REST service",
-            &[&self.minio_root_identity.secret_access_key],
-        )?;
-        ensure!(
-            output.status.success(),
-            "start isolated publication hook REST service: {}",
-            safe_diagnostics(&output, &[&self.minio_root_identity.secret_access_key])
-        );
+    fn observe_publication_hook(&self) -> Result<String> {
+        let FixtureProfile::PublicationHook { control_port, .. } = &self.profile else {
+            bail!("isolated fixture does not have a publication hook profile");
+        };
+        let manifest = read_manifest(&self.find_manifest()?)?;
+        self.assert_isolated_manifest(&manifest)?;
         let container = live_service_container(&self.repo_root, &self.compose_project, "rest")?;
-        let mut port_command = Command::new("docker");
-        port_command
-            .current_dir(&self.repo_root)
-            .args(["port", &container, "8182/tcp"]);
-        let port_output = run_bounded_command(
-            port_command,
-            FIXTURE_DOCKER_TIMEOUT,
-            "resolve publication hook control port",
-            &[],
-        )?;
+        let port_output = run_docker(&self.repo_root, &["port", &container, "8182/tcp"])?;
         ensure!(
             port_output.status.success(),
             "publication hook control port is not published"
@@ -444,7 +415,15 @@ impl IsolatedIcebergRestFixture {
             .and_then(|line| line.rsplit_once(':'))
             .and_then(|(_, port)| port.parse::<u16>().ok())
             .context("publication hook control port has no valid host binding")?;
+        ensure!(
+            port == *control_port,
+            "publication hook control port differs from its creation request"
+        );
         let control_uri = format!("http://127.0.0.1:{port}");
+        ensure!(
+            manifest.runtime.control_uri.as_deref() == Some(control_uri.as_str()),
+            "publication hook manifest control URI differs from its live binding"
+        );
         let client = fixture_http_client()?;
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -465,8 +444,7 @@ impl IsolatedIcebergRestFixture {
             );
             thread::sleep(Duration::from_millis(100));
         }
-        self.publication_control_uri = Some(control_uri);
-        Ok(self.publication_control_uri.as_deref().unwrap())
+        Ok(control_uri)
     }
 
     /// The fixture's exact generated environment for Spark helpers. Using
@@ -479,7 +457,7 @@ impl IsolatedIcebergRestFixture {
             .runtime_entry
             .as_ref()
             .context("isolated provider runtime has no generated entry")?;
-        let path = entry.directory.join("env.sh");
+        let path = entry.configuration_directory.join("env.sh");
         ensure!(path.is_file(), "isolated provider environment is missing");
         Ok(path)
     }
@@ -543,14 +521,19 @@ impl IsolatedIcebergRestFixture {
         );
 
         let fixture_root = self.repo_root.join("docker/iceberg-rest");
-        let compose_path = fixture_root.join("compose.yml");
-        let compose_sha256 = hash_named_files(&self.repo_root, &[compose_path.clone()])?;
+        let templates = fixture_template_paths(&self.repo_root);
+        let compose_sha256 = hash_named_files(&self.repo_root, &templates)?;
+        let manifest = read_manifest(&self.find_manifest()?)?;
+        self.assert_isolated_manifest(&manifest)?;
         let mut scripts = Vec::new();
         for entry in fs::read_dir(&fixture_root)
             .with_context(|| format!("read fixture scripts from {}", fixture_root.display()))?
         {
             let path = entry.context("read fixture script entry")?.path();
-            if path.extension().is_some_and(|extension| extension == "sh") {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "sh" || extension == "py")
+            {
                 scripts.push(path);
             }
         }
@@ -560,10 +543,7 @@ impl IsolatedIcebergRestFixture {
             "isolated fixture has no checked-in scripts"
         );
         let scripts_sha256 = hash_named_files(&self.repo_root, &scripts)?;
-        let model_sha256 = hash_named_files(
-            &self.repo_root,
-            &[compose_path, fixture_root.join("spark/Dockerfile")],
-        )?;
+        let model_sha256 = fixture_template_model_hash(&self.repo_root)?;
         let capabilities = [
             "iceberg-rest-v1",
             "minio-s3",
@@ -708,22 +688,14 @@ impl IsolatedIcebergRestFixture {
         let Ok(manifest_path) = self.find_manifest() else {
             return;
         };
-        let Some(directory) = manifest_path.parent().map(Path::to_path_buf) else {
+        let Ok(manifest) = read_manifest(&manifest_path) else {
             return;
         };
-        let Some(id) = directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-        else {
-            return;
-        };
-        // Strict on purpose: this records the entry this fixture just
-        // created, and a legacy-named one can only belong to someone else.
-        if !id.starts_with(FIXTURE_ENTRY_PREFIX) {
-            return;
+        // The manifest carries the stable entry identity. A publication
+        // directory name is never a worktree id or a cleanup target.
+        if let Ok(entry) = runtime_entry_from_manifest(&self.repo_root, &manifest) {
+            self.runtime_entry = Some(entry);
         }
-        self.runtime_entry = Some(RuntimeEntry { id, directory });
     }
 
     fn read_endpoints(&self) -> Result<(IsolatedIcebergRestEndpoints, IsolatedS3Identity)> {
@@ -741,18 +713,7 @@ impl IsolatedIcebergRestFixture {
                 manifest_path.display()
             )
         })?;
-        ensure!(
-            !manifest.shared_docker,
-            "isolated fixture manifest unexpectedly enables shared Docker"
-        );
-        ensure!(
-            manifest.compose_project == self.compose_project,
-            "isolated fixture manifest compose project mismatch"
-        );
-        ensure!(
-            manifest.workspace_root == self.workspace_root.to_string_lossy(),
-            "isolated fixture manifest workspace root mismatch"
-        );
+        self.assert_isolated_manifest(&manifest)?;
         ensure!(
             !manifest.iceberg_rest.uri.trim().is_empty()
                 && !manifest.iceberg_rest.warehouse.trim().is_empty()
@@ -789,7 +750,9 @@ impl IsolatedIcebergRestFixture {
             {
                 continue;
             }
-            let manifest_path = entry.path().join("manifest.json");
+            let Ok(manifest_path) = entry.path().join("manifest.json").canonicalize() else {
+                continue;
+            };
             let Ok(contents) = fs::read_to_string(&manifest_path) else {
                 continue;
             };
@@ -799,6 +762,7 @@ impl IsolatedIcebergRestFixture {
             if manifest.workspace_root == expected_workspace_root
                 && manifest.compose_project == self.compose_project
                 && !manifest.shared_docker
+                && entry.file_name().to_str() == Some(manifest.env_id.as_str())
             {
                 matches.push(manifest_path);
             }
@@ -834,7 +798,7 @@ impl IsolatedIcebergRestFixture {
         let manifest = read_manifest(&manifest_path)?;
         self.assert_isolated_manifest(&manifest)
             .context("isolated fixture manifest changed before access-key provisioning")?;
-        let mut command = Command::new("docker");
+        let mut command = controlled_command("docker");
         command
             .current_dir(&self.repo_root)
             .arg("compose")
@@ -884,20 +848,42 @@ impl IsolatedIcebergRestFixture {
     }
 
     fn assert_isolated_manifest(&self, manifest: &Manifest) -> Result<()> {
-        let runtime_base = self.repo_root.join("docker/iceberg-rest/runtime");
         ensure!(
-            manifest.compose_project == self.compose_project && !manifest.shared_docker,
+            manifest.compose_project == self.compose_project
+                && !manifest.shared_docker
+                && manifest.workspace_root == self.workspace_root.to_string_lossy(),
             "isolated fixture manifest does not belong to this fixture"
         );
+        let entry = runtime_entry_from_manifest(&self.repo_root, manifest)?;
+        for file in [&manifest.compose_file, &manifest.compose_env] {
+            let path = Path::new(file)
+                .canonicalize()
+                .with_context(|| format!("resolve generated fixture file {file}"))?;
+            ensure!(
+                path.is_file() && path.starts_with(&entry.directory),
+                "isolated fixture manifest references a compose file outside its generated entry"
+            );
+        }
         ensure!(
-            Path::new(&manifest.compose_file)
-                == self.repo_root.join("docker/iceberg-rest/compose.yml"),
-            "isolated fixture manifest references an unexpected compose file"
+            manifest.runtime.profile == self.profile.name(),
+            "isolated fixture manifest profile differs from its creation request"
         );
+        match &self.profile {
+            FixtureProfile::Stock => ensure!(
+                manifest.runtime.control_uri.is_none(),
+                "stock fixture unexpectedly publishes a hook control URI"
+            ),
+            FixtureProfile::PublicationHook { control_port, .. } => {
+                let expected = format!("http://127.0.0.1:{control_port}");
+                ensure!(
+                    manifest.runtime.control_uri.as_deref() == Some(expected.as_str()),
+                    "publication hook manifest control URI differs from its creation request"
+                );
+            }
+        }
         ensure!(
-            Path::new(&manifest.compose_env).starts_with(&runtime_base)
-                && Path::new(&manifest.runtime_dir).starts_with(&runtime_base),
-            "isolated fixture manifest references generated files outside its runtime base"
+            manifest.runtime.template_model_sha256 == fixture_template_model_hash(&self.repo_root)?,
+            "isolated fixture template model differs from its generated manifest"
         );
         Ok(())
     }
@@ -912,6 +898,9 @@ impl IsolatedIcebergRestFixture {
             &self.compose_project,
             args,
         );
+        if script == "up.sh" {
+            self.profile.apply(&mut command);
+        }
         // Once the entry is known, address it by name.  The scripts otherwise
         // derive it by hashing the workspace root, which stops resolving as soon
         // as that temporary directory is removed.
@@ -1050,7 +1039,7 @@ fn remove_project_docker_state(repo_root: &Path, compose_project: &str) -> Resul
 fn remove_runtime_entry(repo_root: &Path, runtime_dir: &Path) -> Result<()> {
     let runtime_base = repo_root.join("docker/iceberg-rest/runtime");
     ensure!(
-        runtime_dir.starts_with(&runtime_base),
+        runtime_dir.parent() == Some(runtime_base.as_path()),
         "refusing to remove runtime entry outside {}: {}",
         runtime_base.display(),
         runtime_dir.display()
@@ -1331,19 +1320,15 @@ fn container_image(
     container: &str,
     service: &str,
 ) -> Result<IsolatedIcebergRestImageIdentity> {
-    let image_id = docker_inspect_scalar(repo_root, &container, "{{.Image}}", "image id")?;
+    let image_id = docker_inspect_scalar(repo_root, container, "{{.Image}}", "image id")?;
     ensure!(
         image_id.strip_prefix("sha256:").is_some_and(
             |digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         ),
         "isolated fixture service {service} did not report an immutable image id"
     );
-    let image_reference = docker_inspect_scalar(
-        repo_root,
-        &container,
-        "{{.Config.Image}}",
-        "image reference",
-    )?;
+    let image_reference =
+        docker_inspect_scalar(repo_root, container, "{{.Config.Image}}", "image reference")?;
     ensure!(
         !image_reference.trim().is_empty(),
         "isolated fixture service {service} has an empty image reference"
@@ -1412,6 +1397,56 @@ fn image_tag(reference: &str) -> Option<String> {
     .then(|| tag.to_string())
 }
 
+fn fixture_template_paths(repo_root: &Path) -> Vec<PathBuf> {
+    ["object-store.yml", "catalog.yml"]
+        .into_iter()
+        .map(|name| repo_root.join("docker/iceberg-rest/templates").join(name))
+        .collect()
+}
+
+fn fixture_template_model_hash(repo_root: &Path) -> Result<String> {
+    let mut paths = fixture_template_paths(repo_root);
+    paths.push(repo_root.join("docker/iceberg-rest/spark/Dockerfile"));
+    hash_named_files(repo_root, &paths)
+}
+
+fn build_publication_hook_image(repo_root: &Path) -> Result<String> {
+    let hook_root = repo_root.join("tests/fixtures/iceberg-rest-publication");
+    let mut inputs = vec![hook_root.join("Dockerfile")];
+    let source_root = hook_root.join("src/main/java/org/apache/iceberg/rest/fixture");
+    for entry in fs::read_dir(&source_root).context("read publication hook sources")? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "java")
+        {
+            inputs.push(path);
+        }
+    }
+    let source_hash = hash_named_files(repo_root, &inputs)?;
+    let image = format!(
+        "novarocks/iceberg-rest-publication-fixture:uea7-{}",
+        &source_hash[..16]
+    );
+    let mut command = controlled_command("docker");
+    command
+        .current_dir(repo_root)
+        .args(["build", "--pull=false", "-t", &image])
+        .arg(&hook_root);
+    let output = run_bounded_command(
+        command,
+        FIXTURE_SCRIPT_TIMEOUT,
+        "build publication hook image before fixture creation",
+        &[],
+    )?;
+    ensure!(
+        output.status.success(),
+        "build publication hook image {image}: {}",
+        safe_diagnostics(&output, &[])
+    );
+    Ok(image)
+}
+
 fn hash_named_files(repo_root: &Path, paths: &[PathBuf]) -> Result<String> {
     ensure!(!paths.is_empty(), "fixture identity file set is empty");
     let mut paths = paths.to_vec();
@@ -1460,7 +1495,7 @@ fn docker_ids(repo_root: &Path, args: &[&str]) -> Result<Vec<String>> {
 }
 
 fn run_docker(repo_root: &Path, args: &[&str]) -> Result<Output> {
-    let mut command = Command::new("docker");
+    let mut command = controlled_command("docker");
     command.current_dir(repo_root).args(args);
     // Reclaim runs through here, so an unbounded wait would strand exactly the
     // Docker project this fixture exists to remove.
@@ -1798,6 +1833,8 @@ fn sts_xml_value(xml: &str, element: &str) -> Result<String> {
 
 #[derive(Deserialize)]
 struct Manifest {
+    env_id: String,
+    runtime: ManifestRuntime,
     workspace_root: String,
     shared_docker: bool,
     compose_project: String,
@@ -1806,6 +1843,50 @@ struct Manifest {
     runtime_dir: String,
     minio: ManifestMinio,
     iceberg_rest: ManifestIcebergRest,
+}
+
+#[derive(Deserialize)]
+struct ManifestRuntime {
+    profile: String,
+    control_uri: Option<String>,
+    template_model_sha256: String,
+    publication_dir: String,
+    entry_root: String,
+}
+
+fn runtime_entry_from_manifest(repo_root: &Path, manifest: &Manifest) -> Result<RuntimeEntry> {
+    ensure!(
+        manifest.env_id.starts_with(FIXTURE_ENTRY_PREFIX)
+            && Path::new(&manifest.env_id).components().count() == 1,
+        "isolated fixture manifest has an unexpected entry identity"
+    );
+    let expected = repo_root
+        .join("docker/iceberg-rest/runtime")
+        .join(&manifest.env_id);
+    ensure!(
+        Path::new(&manifest.runtime.entry_root) == expected
+            && Path::new(&manifest.runtime_dir) == expected,
+        "isolated fixture manifest entry root differs from its worktree identity"
+    );
+    let directory = expected
+        .canonicalize()
+        .context("resolve isolated runtime entry")?;
+    ensure!(
+        directory == expected,
+        "isolated fixture entry root must not redirect outside its owner"
+    );
+    let configuration_directory = Path::new(&manifest.runtime.publication_dir)
+        .canonicalize()
+        .context("resolve isolated fixture publication")?;
+    ensure!(
+        configuration_directory.is_dir() && configuration_directory.starts_with(&directory),
+        "isolated fixture publication is outside its stable entry"
+    );
+    Ok(RuntimeEntry {
+        id: manifest.env_id.clone(),
+        directory,
+        configuration_directory,
+    })
 }
 
 fn read_manifest(manifest_path: &Path) -> Result<Manifest> {
@@ -1923,6 +2004,44 @@ fn shell_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
 }
 
+fn apply_controlled_environment(
+    command: &mut Command,
+    source: impl IntoIterator<Item = (OsString, OsString)>,
+) {
+    // Keep this transport/tooling allowlist aligned with fixture_runtime.py.
+    // Generated endpoints, credentials and Compose overrides are never inputs.
+    const PRESERVED: &[&str] = &[
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "SSL_CERT_FILE",
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONFIG",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "NOVA_FIXTURE_STORE",
+        "NOVA_FIXTURE_RUNTIME_DIR",
+    ];
+    command.env_clear();
+    command.envs(
+        source
+            .into_iter()
+            .filter(|(key, _)| key.to_str().is_some_and(|key| PRESERVED.contains(&key))),
+    );
+}
+
+fn controlled_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    apply_controlled_environment(&mut command, std::env::vars_os());
+    command
+}
+
 fn fixture_command(
     script_path: &Path,
     repo_root: &Path,
@@ -1931,26 +2050,7 @@ fn fixture_command(
     compose_project: &str,
     args: &[&str],
 ) -> Command {
-    let mut command = Command::new(script_path);
-    // The desktop shell may have sourced the shared fixture's generated
-    // `env.sh`.  Those volatile ports must not leak into an isolated project:
-    // `up.sh` chooses an unused port only when these values are absent.
-    for inherited in [
-        "NOVA_ENV_MINIO_PORT",
-        "NOVA_ENV_MINIO_CONSOLE_PORT",
-        "NOVA_ENV_REST_PORT",
-        "NOVA_ENV_SPARK_UI_PORT",
-        "NOVA_ENV_MYSQL_PORT",
-        "NOVA_ENV_FE_GRPC_PORT",
-        "NOVA_ENV_BE_GRPC_PORT",
-        "NOVA_ENV_FE_HTTP_PORT",
-        "NOVA_ENV_BE_HTTP_PORT",
-        "NOVA_ENV_SHARED_COMPOSE_PROJECT",
-        "NOVA_ENV_SHARED_REST_WAREHOUSE_URI",
-        "NOVA_ENV_REST_WAREHOUSE_URI",
-    ] {
-        command.env_remove(inherited);
-    }
+    let mut command = controlled_command(script_path);
     command
         .current_dir(repo_root)
         .args(args)
@@ -2010,6 +2110,231 @@ fn truncate_for_diagnostics(text: &str) -> String {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn controlled_environment_preserves_transport_and_private_supply_only() {
+        let source = [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/tmp/fixture-home"),
+            ("DOCKER_CONTEXT", "test-daemon"),
+            ("DOCKER_HOST", "unix:///tmp/fixture.sock"),
+            ("XDG_CACHE_HOME", "/tmp/fixture-cache"),
+            ("NOVA_FIXTURE_STORE", "/tmp/private-bom"),
+            ("NOVA_FIXTURE_RUNTIME_DIR", "/tmp/private-owner"),
+            ("NOVA_ENV_REST_PORT", "8181"),
+            ("NOVA_ENV_UNKNOWN_FUTURE_OVERRIDE", "foreign"),
+            ("NOVAROCKS_WORKSPACE_ROOT", "/foreign/worktree"),
+            ("COMPOSE_PROJECT_NAME", "nr-iceberg-rest"),
+            ("ICEBERG_REST_IMAGE", "foreign-image"),
+            ("AWS_S3_SECRET_ACCESS_KEY", "foreign-secret"),
+        ];
+        let mut command = Command::new("/usr/bin/env");
+        apply_controlled_environment(
+            &mut command,
+            source
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
+        let output = run_bounded_command(command, FIXTURE_PROBE_TIMEOUT, "environment probe", &[])
+            .expect("read controlled environment");
+        assert!(output.status.success());
+        let actual = String::from_utf8(output.stdout).unwrap();
+        for expected in [
+            "DOCKER_CONTEXT=test-daemon",
+            "DOCKER_HOST=unix:///tmp/fixture.sock",
+            "XDG_CACHE_HOME=/tmp/fixture-cache",
+            "NOVA_FIXTURE_STORE=/tmp/private-bom",
+            "NOVA_FIXTURE_RUNTIME_DIR=/tmp/private-owner",
+        ] {
+            assert!(actual.lines().any(|line| line == expected), "{actual}");
+        }
+        for forbidden in [
+            "NOVA_ENV_",
+            "NOVAROCKS_WORKSPACE_ROOT",
+            "COMPOSE_",
+            "ICEBERG_REST_IMAGE",
+            "AWS_",
+        ] {
+            assert!(!actual.contains(forbidden), "{actual}");
+        }
+    }
+
+    #[test]
+    fn publication_profile_is_an_initial_creation_request() {
+        let mut command = fixture_command(
+            Path::new("/repo/docker/iceberg-rest/up.sh"),
+            Path::new("/repo"),
+            Path::new("/tmp/isolated-rest-test"),
+            Path::new("/tmp/isolated-rest-test/config.env"),
+            "nr-isolated-rest-test",
+            &[],
+        );
+        FixtureProfile::PublicationHook {
+            image: "novarocks/hook:exact-test-inputs".into(),
+            control_port: 38182,
+        }
+        .apply(&mut command);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("--profile"),
+                OsStr::new("publication-hook"),
+                OsStr::new("--hook-image"),
+                OsStr::new("novarocks/hook:exact-test-inputs"),
+            ]
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "NOVA_ENV_PUBLICATION_HOOK_CONTROL_PORT")
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("38182"))
+        );
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, _)| key == "NOVA_ENV_REST_PORT")
+        );
+    }
+
+    fn manifest_fixture() -> (
+        tempfile::TempDir,
+        IsolatedIcebergRestFixture,
+        serde_json::Value,
+    ) {
+        let temp = tempfile::tempdir().expect("create manifest test root");
+        let repo_root = temp.path().canonicalize().unwrap();
+        let env_id = "isolated-rest-1-test";
+        let entry = repo_root.join("docker/iceberg-rest/runtime").join(env_id);
+        fs::create_dir_all(&entry).unwrap();
+        for file in ["compose.yml", "compose.env", "env.sh"] {
+            fs::write(entry.join(file), "fixture test\n").unwrap();
+        }
+        let mut model = fixture_template_paths(&repo_root);
+        model.push(repo_root.join("docker/iceberg-rest/spark/Dockerfile"));
+        for file in model {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "fixture model\n").unwrap();
+        }
+        let scenario_root = repo_root.join("scenario");
+        let workspace_root = scenario_root.join(env_id);
+        fs::create_dir_all(&workspace_root).unwrap();
+        let project = format!("nr-{env_id}");
+        let manifest = serde_json::json!({
+            "env_id": env_id,
+            "workspace_root": workspace_root,
+            "shared_docker": false,
+            "compose_project": project,
+            "compose_file": entry.join("compose.yml"),
+            "compose_env": entry.join("compose.env"),
+            "runtime_dir": entry,
+            "runtime": {
+                "profile": "stock", "control_uri": null,
+                "template_model_sha256": fixture_template_model_hash(&repo_root).unwrap(),
+                "publication_dir": entry, "entry_root": entry,
+            },
+            "minio": {"endpoint":"http://127.0.0.1:38000", "access_key_id":"test-key", "secret_access_key":"test-secret"},
+            "iceberg_rest": {"uri":"http://127.0.0.1:38001", "warehouse":"s3://warehouse/test/rest"},
+        });
+        let fixture = IsolatedIcebergRestFixture {
+            repo_root,
+            scenario_root,
+            config_file: workspace_root.join("isolated-compose.env"),
+            workspace_root,
+            compose_project: project,
+            runtime_entry: None,
+            endpoints: IsolatedIcebergRestEndpoints {
+                rest_uri: String::new(),
+                rest_warehouse: String::new(),
+                minio_endpoint: String::new(),
+                compose_project: String::new(),
+            },
+            minio_root_identity: IsolatedS3Identity {
+                access_key_id: "test-key".into(),
+                secret_access_key: "test-secret".into(),
+            },
+            vended_s3_identities: None,
+            publication_control_uri: None,
+            profile: FixtureProfile::Stock,
+            // These tests own files only. Drop must never contact Docker.
+            active: false,
+        };
+        (temp, fixture, manifest)
+    }
+
+    #[test]
+    fn manifest_requires_owned_generated_compose_and_the_exact_model() {
+        let (_temp, fixture, mut value) = manifest_fixture();
+        let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+        fixture
+            .assert_isolated_manifest(&manifest)
+            .expect("generated compose is owned");
+        let old_compose = fixture.repo_root.join("docker/iceberg-rest/compose.yml");
+        fs::write(&old_compose, "old model\n").unwrap();
+        value["compose_file"] = serde_json::to_value(old_compose).unwrap();
+        let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+        assert!(fixture.assert_isolated_manifest(&manifest).is_err());
+        value["compose_file"] = serde_json::to_value(
+            Path::new(value["runtime_dir"].as_str().unwrap()).join("compose.yml"),
+        )
+        .unwrap();
+        value["runtime"]["template_model_sha256"] = serde_json::json!("wrong-model");
+        let manifest: Manifest = serde_json::from_value(value).unwrap();
+        assert!(fixture.assert_isolated_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn publication_directory_does_not_replace_the_stable_entry_identity() {
+        let (_temp, mut fixture, mut value) = manifest_fixture();
+        let entry = PathBuf::from(value["runtime_dir"].as_str().unwrap());
+        let publication = entry.join("publications/pub-random-id");
+        fs::create_dir_all(&publication).unwrap();
+        value["runtime"]["publication_dir"] = serde_json::to_value(&publication).unwrap();
+        fs::write(
+            publication.join("manifest.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "publications/pub-random-id/manifest.json",
+            entry.join("manifest.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.find_manifest().unwrap(),
+            publication.join("manifest.json")
+        );
+        fixture.record_runtime_entry();
+        let recorded = fixture.runtime_entry.as_ref().expect("record stable entry");
+        assert_eq!(recorded.id, "isolated-rest-1-test");
+        assert_eq!(recorded.directory, entry);
+        assert_eq!(recorded.configuration_directory, publication);
+        assert!(
+            fixture
+                .assert_isolated_manifest(
+                    &read_manifest(&fixture.find_manifest().unwrap()).unwrap()
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn manifest_profile_and_control_uri_must_match_creation() {
+        let (_temp, mut fixture, mut value) = manifest_fixture();
+        fixture.profile = FixtureProfile::PublicationHook {
+            image: "hook:test".into(),
+            control_port: 38182,
+        };
+        let stock: Manifest = serde_json::from_value(value.clone()).unwrap();
+        assert!(fixture.assert_isolated_manifest(&stock).is_err());
+        value["runtime"]["profile"] = serde_json::json!("publication-hook");
+        value["runtime"]["control_uri"] = serde_json::json!("http://127.0.0.1:38182");
+        let hook: Manifest = serde_json::from_value(value.clone()).unwrap();
+        fixture.assert_isolated_manifest(&hook).unwrap();
+        value["runtime"]["control_uri"] = serde_json::json!("http://127.0.0.1:38183");
+        let wrong: Manifest = serde_json::from_value(value).unwrap();
+        assert!(fixture.assert_isolated_manifest(&wrong).is_err());
+    }
 
     #[test]
     fn isolated_command_forces_unique_non_shared_environment() {
@@ -2223,7 +2548,13 @@ mod tests {
         // otherwise it has no owner left to remove it.
         assert!(is_fixture_project("nr-cca1-vended-rest-11940-1-1"));
         assert!(is_fixture_entry("cca1-vended-rest-11940-1-1"));
-        assert!(!is_fixture_project("nr-iceberg-rest"));
+        for project in [
+            "nr-iceberg-rest",
+            "nr-iceberg-hive",
+            "nr-fx-a1b2c3-cat-0123456789ab",
+        ] {
+            assert!(!is_fixture_project(project));
+        }
         assert!(!is_fixture_entry("novarocks-5e0a3e29"));
     }
 
@@ -2259,14 +2590,17 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_refuses_a_project_outside_this_fixture() {
+    fn reclaim_refuses_shared_versioned_and_hive_projects_before_docker_access() {
         let repo_root = repository_root().expect("repository root");
-        let error = reclaim_fixture(&repo_root, "nr-iceberg-rest", None)
-            .expect_err("the shared project must never be reclaimable");
-        assert!(
-            format!("{error:#}").contains("refusing to reclaim"),
-            "unexpected error: {error:#}"
-        );
+        for project in [
+            "nr-iceberg-rest",
+            "nr-iceberg-hive",
+            "nr-fx-a1b2c3-cat-0123456789ab",
+        ] {
+            let error = reclaim_fixture(&repo_root, project, None)
+                .expect_err("a foreign project must never be reclaimable");
+            assert!(format!("{error:#}").contains("refusing to reclaim"));
+        }
     }
 
     #[test]
@@ -2341,18 +2675,23 @@ mod tests {
     }
 
     #[test]
-    fn provider_model_hash_is_order_independent_but_content_sensitive() {
-        let repo_root = repository_root().expect("repository root");
-        let compose = repo_root.join("docker/iceberg-rest/compose.yml");
-        let dockerfile = repo_root.join("docker/iceberg-rest/spark/Dockerfile");
-        let forward = hash_named_files(&repo_root, &[compose.clone(), dockerfile.clone()])
-            .expect("hash model");
-        let reverse = hash_named_files(&repo_root, &[dockerfile, compose.clone()])
-            .expect("hash reversed model");
-        let compose_only =
-            hash_named_files(&repo_root, &[compose]).expect("hash compose-only model");
-        assert_eq!(forward, reverse);
-        assert_ne!(forward, compose_only);
+    fn provider_model_hash_covers_both_templates_and_spark_definition() {
+        let root = tempfile::tempdir().expect("create model test root");
+        let mut paths = fixture_template_paths(root.path());
+        paths.push(root.path().join("docker/iceberg-rest/spark/Dockerfile"));
+        for path in &paths {
+            fs::create_dir_all(path.parent().unwrap()).expect("create model directory");
+            fs::write(path, "original").expect("write model input");
+        }
+        let forward = fixture_template_model_hash(root.path()).expect("hash model");
+        let mut reversed = paths.clone();
+        reversed.reverse();
+        assert_eq!(forward, hash_named_files(root.path(), &reversed).unwrap());
+        for path in &paths {
+            fs::write(path, "changed").expect("change model input");
+            assert_ne!(forward, fixture_template_model_hash(root.path()).unwrap());
+            fs::write(path, "original").expect("restore model input");
+        }
         assert_eq!(forward.len(), 64);
     }
 
@@ -2372,16 +2711,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Docker and locally provisioned REST and Spark base images"]
-    fn publication_hook_replaces_only_the_private_rest_service() -> Result<()> {
+    fn publication_hook_is_selected_before_the_private_rest_service_starts() -> Result<()> {
         let scenario_root = std::env::temp_dir().join(format!(
             "uea7-publication-hook-{}-{}",
             std::process::id(),
             unique_fixture_id()
         ));
-        let mut fixture = IsolatedIcebergRestFixture::start(&scenario_root)?;
+        let (mut fixture, control_uri) =
+            IsolatedIcebergRestFixture::start_with_publication_hook(&scenario_root)?;
         let project = fixture.compose_project.clone();
+        let initial_rest = live_service_container(&fixture.repo_root, &project, "rest")?;
         let outcome = (|| -> Result<()> {
-            let control_uri = fixture.enable_publication_hook()?.to_string();
             ensure!(
                 fixture_http_client()?
                     .get(format!("{control_uri}/health"))
@@ -2392,6 +2732,10 @@ mod tests {
             );
             fixture.runtime_identity()?;
             fixture.provision_empty_table("probe_db", "probe_data")?;
+            ensure!(
+                live_service_container(&fixture.repo_root, &project, "rest")? == initial_rest,
+                "publication hook replaced the initial REST container"
+            );
             Ok(())
         })();
         let shutdown = fixture.shutdown();

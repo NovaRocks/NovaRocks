@@ -20,6 +20,7 @@
 
 from copy import deepcopy
 import importlib.util
+import json
 from pathlib import Path
 import shutil
 import tempfile
@@ -126,11 +127,50 @@ class FixtureContractTest(unittest.TestCase):
                 destination = workspace / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
+            lock = workspace / "docker/fixture-inputs/lock.json"
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / "docker/fixture-inputs/lock.json", lock)
             baseline = RESOLVER.resolve_fixture(self.model, workspace, "ssb", "1")
             loader = workspace / self.model["fixture"]["producer_inputs"]["loader"]
             loader.write_bytes(loader.read_bytes() + b"\n# contract-test mutation\n")
             changed = RESOLVER.resolve_fixture(self.model, workspace, "ssb", "1")
             self.assertNotEqual(baseline["fixture_contract_id"], changed["fixture_contract_id"])
+
+    def test_lock_projection_only_tracks_spark_semantics(self):
+        lock = json.loads((ROOT / "docker/fixture-inputs/lock.json").read_text())
+        declarations = self.model["fixture"]["producer_lock_projections"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "docker/fixture-inputs/lock.json"
+            path.parent.mkdir(parents=True)
+            def projection(value):
+                path.write_text(json.dumps(value))
+                return RESOLVER.producer_lock_projections(root, declarations)
+            baseline = projection(lock)
+            positives = [
+                ("images", "iceberg-spark-base", "manifest_digest", "sha256:new"),
+                ("images", "iceberg-spark-base", "source", "different/spark"),
+                ("images", "iceberg-spark-base", "platform", "linux/other"),
+                ("derived_images", "iceberg-spark", "platform", "linux/other"),
+                ("derived_images", "iceberg-spark", "dockerfile", "other/Dockerfile"),
+                ("artifacts", "hadoop-aws-3.3.4.jar", "sha1", "different"),
+                ("artifacts", "hadoop-aws-3.3.4.jar", "bytes", 42),
+                ("artifacts", "hadoop-aws-3.3.4.jar", "url", "https://other/jar"),
+            ]
+            for section, name, field, value in positives:
+                changed = deepcopy(lock)
+                changed[section][name][field] = value
+                self.assertNotEqual(baseline, projection(changed), (section, field))
+            changed = deepcopy(lock)
+            changed["images"]["iceberg-rest"]["manifest_digest"] = "other"
+            changed["images"]["paimon-spark-base"]["source"] = "other"
+            changed["artifacts"]["paimon-s3.jar"]["sha1"] = "other"
+            changed["images"]["iceberg-spark-base"]["alias"] = "transport-only"
+            changed["derived_images"]["iceberg-spark"]["alias"] = "transport-only"
+            changed["derived_images"]["iceberg-spark"]["build_args"] = {"RENAMED": "unused"}
+            changed["unrelated_ports"] = [1001, 2002]
+            self.assertEqual(baseline, projection(changed))
+            self.assertNotIn("docker/iceberg-rest/shared.env", self.model["fixture"]["producer_inputs"].values())
 
     def test_ready_and_error_schemas_fail_closed(self):
         resolved = self.resolve()

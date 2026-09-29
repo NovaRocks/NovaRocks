@@ -3116,7 +3116,7 @@ pub(crate) fn analyze_candidates(
         if consumer_requires_semantic_snapshot {
             entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(SqlMvRewriteDiagnostic {
                 mv_id: Some(definition.mv_id),
-                message: "mv rewrite: persisted definition is ineligible under GROUP_CONCAT_LEGACY because its semantic settings are not captured".to_string(),
+                message: "mv rewrite: persisted definition is ineligible under GROUP_CONCAT_LEGACY or decimal_overflow_to_double because its semantic settings are not captured".to_string(),
             }));
             continue;
         }
@@ -3470,6 +3470,33 @@ mod tests {
         let mut index = candidate_index();
         index.definitions[0].select_query =
             test_query("SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM base");
+        let analysis = analyze_candidates(
+            &index,
+            &catalog,
+            "db",
+            &logical,
+            &factory,
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::optimizer::options::SessionOptimizerSettings::default(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+            false,
+        )
+        .unwrap();
+        assert!(analysis.entries.iter().any(|entry| matches!(entry, SqlMvRewriteAnalysisEntry::Diagnostic(d) if d.message.contains("ineligible persisted definition"))));
+        assert_eq!(
+            catalog.resolutions.load(Ordering::Acquire),
+            resolutions_before
+        );
+    }
+
+    #[test]
+    fn stored_decimal_definition_is_ineligible_before_reanalysis() {
+        let catalog = CandidateCatalog::new();
+        let (logical, factory) = main_candidate_query(&catalog);
+        let resolutions_before = catalog.resolutions.load(Ordering::Acquire);
+        let mut index = candidate_index();
+        index.definitions[0].select_query =
+            test_query("SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ k FROM base");
         let analysis = analyze_candidates(
             &index,
             &catalog,

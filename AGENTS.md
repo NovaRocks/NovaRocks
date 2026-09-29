@@ -505,15 +505,17 @@ the CI fixture for the `iceberg`, `iceberg-compatibility`, and `iceberg-rest`
 SQL suites. The Codex workspace manifest at
 `.codex/environments/environment.toml` points setup at this directory.
 
-The Docker side is shared across worktrees by default. Codex environment setup
-only runs `docker/iceberg-rest/up.sh --prepare-only`, which generates this
-worktree's runtime entry and does not start Docker. When Docker-backed tests
-are actually needed, `docker/iceberg-rest/up.sh` starts or reuses one shared
-Docker Compose project configured by
-`docker/iceberg-rest/shared.env`; the default shared service ports are MinIO
-`9000`, MinIO console `9001`, Iceberg REST `8181`, and Spark UI `4040`. Each
-worktree still gets its own generated runtime entry and a separate NovaRocks
-standalone port.
+共享 Docker fixture 由版本化 runtime owner 管理：一个对象存储实例可以供多个 catalog 实例使用，相同输入附着同一实例，输入变化创建并存版本。控制目录默认是 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-runtime`，可由 `NOVA_FIXTURE_RUNTIME_DIR` 指定；资源身份同时包含控制目录与本机 Docker daemon。服务端口由 owner 预留，默认范围 `28000..28999`，不能假设 `9000/8181/4040` 或固定 Compose 项目。
+
+Codex setup 的 `docker/iceberg-rest/up.sh --prepare-only` 不调用 Docker。它按入口已保存的 owner locator 和记录发布配置；`ready=true` 只表示保存的记录为 ready，不证明当前健康。首次、记录缺失或 deleting 时发布 unbound，清除端点和镜像变量；正常 `up.sh` 先验证本机 BOM，再恢复或附着实例。
+
+`runtime/current` 定位本 worktree 的稳定入口，入口的 `published` 是唯一绑定提交点。消费者在启动时解析一次 publication，再 source 其中的 `env.sh`；所有配置路径指向同一不可变 publication。`NOVA_ENV_RUNTIME_DIR` 保存 SQLite 等稳定运行数据，不能拼接成 `NOVA_ENV_RUNTIME_DIR/env.sh`。推荐：
+
+```bash
+docker/iceberg-rest/up.sh
+fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
+source "$fixture_publication/env.sh"
+```
 
 Do not guess the NovaRocks server port. Always discover the active worktree
 environment from the fixed generated entry:
@@ -534,6 +536,8 @@ Important generated locations:
 Important environment variables after sourcing `env.sh`:
 
 - `NOVA_ENV_SHARED_DOCKER`, `NOVA_ENV_COMPOSE_PROJECT`, `NOVA_ENV_CONFIG_FILE`
+- `NOVA_ENV_OBJECT_STORE_RUNTIME`, `NOVA_ENV_CATALOG_RUNTIME`, `NOVA_ENV_OBJECT_STORE_CONTAINER`
+- `NOVA_ENV_REST_ENV_FILE`（本次 publication 的不可变 `env.sh` 路径）
 - `NOVA_ENV_MINIO_PORT`, `NOVA_ENV_REST_PORT`, `NOVA_ENV_MYSQL_PORT`
 - `NOVA_ENV_SPARK_UI_PORT`
 - `AWS_S3_ENDPOINT`, `AWS_S3_ACCESS_KEY_ID`, `AWS_S3_SECRET_ACCESS_KEY`
@@ -593,8 +597,8 @@ backgrounds the server **must** gate its first connection on this line.
 Run SQL tests with the generated runner config:
 
 ```bash
-source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg --mode verify
@@ -604,8 +608,8 @@ Run cross-engine Iceberg compatibility tests where Spark writes through REST
 Catalog + MinIO and NovaRocks reads the table:
 
 ```bash
-source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
@@ -615,8 +619,8 @@ Run NovaRocks-only Iceberg REST end-to-end smoke (no Spark, NovaRocks both
 writes and reads):
 
 ```bash
-source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-rest --mode verify
@@ -626,8 +630,8 @@ Generate an Iceberg format-v3 table through Spark against the same REST Catalog
 and MinIO services:
 
 ```bash
-source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
+source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 ```
 
@@ -636,16 +640,11 @@ and `http://minio:9000` for object storage. NovaRocks should use the host
 endpoints from `env.sh`. Do not mix container endpoints into NovaRocks catalog
 SQL.
 
-Workspace cleanup uses `docker/iceberg-rest/down.sh --runtime-only --purge`,
-which removes only this worktree's generated runtime entry and private object
-prefixes. It deliberately preserves `s3://novarocks/shared/benchmarks/` and
-leaves the shared Docker services running because other worktrees may be using
-them. Standard SSB/TPC-H/TPC-DS data is an immutable READY-published fixture:
-the runner resolves it before suite hooks, and only the bootstrap's exact-key
-Docker lease may build it. Use `docker/iceberg-rest/down.sh --docker` only when
-you explicitly want to stop the shared Docker project. `--docker --volumes`
-always rejects the canonical project; it requires an exact task-created project
-and volume confirmation for an isolated reset.
+`docker/iceberg-rest/down.sh --runtime-only` 显式解绑，发布 unbound 并回收旧输出，保留全部历史 `data_locations`。加 `--purge` 才清理全部已记录对象存储位置的私有前缀；只有全部成功才释放数据引用，失败保留原发布供重试。标准 benchmark READY 数据不属于 worktree 清理范围；首次新对象存储需要重新构建 benchmark 数据。
+
+共享服务的停止与删除使用 `docker/iceberg-rest/fixture-runtime.sh stop/delete <exact-runtime-id>`，全局 `--root/--daemon` 放在子命令前并取自 manifest 的 owner locator。catalog 普通删除在有绑定时拒绝；force 只条件解绑仍指向目标的 worktree，保留数据引用。对象存储默认停止和任何删除都受 catalog/数据引用保护；force-stop 可以中断消费者但保留记录、卷和端口。HMS 或其他外部 endpoint 未退出时普通/force catalog 删除均在破坏操作前拒绝；先按 HMS 自身入口退出。共享模式拒绝 `down.sh --docker/--volumes`。旧 `nr-iceberg-rest`、`nr-iceberg-hive` 项目和卷不自动接管或删除，退出由用户另行安排。
+
+真实验收基准仍为 1FE+3BE；all-in-one 只作 smoke。fixture verify 和测试不自行下载或构建缺失输入，BOM 前置条件失败为 BLOCKED（75），端口/身份/生命周期失败为 VERIFY FAILED。
 
 ---
 
@@ -728,8 +727,13 @@ config so its configured MySQL port cannot collide with another worktree.
 
 **Run test suites:**
 
+Non-isolated runs require an explicit runner config with fixture endpoints and
+the exact publication env file. The default config does not supply them.
+
 ```bash
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite <suite> --mode <verify|record|diff> [--query-timeout 60] [-j 4]
 ```
 
@@ -754,7 +758,9 @@ owns an alternate server runtime.
 **Run specific cases:**
 
 ```bash
+source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite join --only join_cross_join_small,join_array_type --mode verify
 ```
 

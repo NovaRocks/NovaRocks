@@ -32,9 +32,32 @@ SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_not_contains=memory=inf
 SELECT COUNT(*) AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
 
+-- Assert the selected distribution and the edge contract, without node numbers.
+-- @skip_result_check=true
+-- @result_contains=HASH JOIN (PARTITIONED, INNER
+-- @result_contains=HASH EXCHANGE
+-- @result_contains=PARTITION: HASH_PARTITIONED
+-- @result_contains=HASH AGGREGATE (LOCAL)
+-- @result_contains=HASH AGGREGATE (GLOBAL)
+-- @result_not_contains=HASH JOIN (BROADCAST
+-- @result_not_contains=BROADCAST EXCHANGE
+-- @result_not_contains=memory=inf
+-- @result_contains=RUNTIME FILTER GRAPH
+-- @result_contains=activation = BlockingSnapshot
+-- @result_contains=columns: k
 EXPLAIN VERBOSE
 SELECT COUNT(*) AS cnt FROM probe_1m_exact p JOIN build_wide_unanalyzed b ON p.k = b.k;
 
+-- The build has ten i64 keys: 80 payload bytes; every backend receives it.
+-- @skip_result_check=true
+-- @result_contains=HASH JOIN (BROADCAST, INNER
+-- @result_contains=BROADCAST EXCHANGE
+-- @result_contains=PARTITION: BROADCAST
+-- @result_contains=bcast_verdict=feasible
+-- @result_contains=RUNTIME FILTER GRAPH
+-- @result_contains=activation = BlockingSnapshot
+-- @result_not_contains=HASH JOIN (PARTITIONED
+-- @query_stats_contract={"tables":[],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}
 EXPLAIN COSTS
 WITH p AS (
     SELECT generate_series AS k

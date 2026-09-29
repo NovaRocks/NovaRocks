@@ -120,6 +120,7 @@ esac
 
 [[ -n "$runtime_env" ]] || \
   fail "NOVA_ENV_REST_ENV_FILE must name the generated Iceberg REST environment"
+runtime_env="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$runtime_env")"
 [[ -f "$runtime_env" ]] || fail "missing generated Iceberg REST environment: $runtime_env"
 # Runtime facts must come entirely from the named generated entry. Ambient
 # values can belong to another worktree and must not fill omissions in it.
@@ -128,7 +129,7 @@ unset AWS_S3_ACCESS_KEY_ID AWS_S3_SECRET_ACCESS_KEY
 # shellcheck source=/dev/null
 source "$runtime_env"
 
-[[ "${NOVA_ENV_SHARED_DOCKER:-}" == true ]] || fail "the canonical shared Iceberg REST fixture is not active"
+[[ "${NOVA_ENV_SHARED_DOCKER:-}" == true ]] || fail "a shared Iceberg REST fixture is not active"
 [[ -n "${NOVA_ENV_COMPOSE_PROJECT:-}" ]] || fail "generated Iceberg REST environment has no compose project"
 [[ -n "${NOVA_ENV_REST_WAREHOUSE_URI:-}" ]] || fail "generated Iceberg REST environment has no warehouse URI"
 [[ -n "${AWS_S3_ACCESS_KEY_ID:-}" ]] || fail "generated Iceberg REST environment has no S3 access key"

@@ -28,6 +28,7 @@ mod mv_rest_document_graph;
 mod parser;
 mod publication_catalog;
 mod publication_service;
+mod query_stats_contract;
 mod results;
 mod runner;
 mod s3_trace;
@@ -42,9 +43,10 @@ mod engine_error_codes;
 
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
 use crate::config::{
-    TestLane, build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
-    load_runner_config, placeholder_variables_with_run_id, resolve_config_path, resolve_path,
-    resolve_reference_port, resolve_repo_root, resolve_target_port, suite_default_query_timeout,
+    FixtureEndpoints, TestLane, build_suite_configs, case_auto_db_name, env_optional,
+    env_or_default, list_sql_files, load_runner_config, placeholder_variables_with_run_id,
+    project_fixture_value, resolve_config_path, resolve_path, resolve_reference_port,
+    resolve_repo_root, resolve_target_port, suite_default_query_timeout,
 };
 use crate::failure_artifacts::{FailureArtifactContext, FailureArtifactRecorder};
 use crate::parser::load_suite_hook;
@@ -72,7 +74,6 @@ use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -594,59 +595,6 @@ fn execute_target_session_sql_with<S>(
             .map_err(|error| format!("target session SQL failed for {statement:?}: {error}"))?;
     }
     Ok(())
-}
-
-/// Best-effort TCP probe for a MinIO-style endpoint like `http://127.0.0.1:9000`.
-fn endpoint_reachable(endpoint: &str) -> bool {
-    let stripped = endpoint
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(endpoint);
-    let authority = stripped.split('/').next().unwrap_or(stripped);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => match port.parse::<u16>() {
-            Ok(port) => (host, port),
-            Err(_) => return false,
-        },
-        None => {
-            let default_port = if endpoint.starts_with("https://") {
-                443
-            } else {
-                80
-            };
-            (authority, default_port)
-        }
-    };
-    let Ok(addr) = format!("{host}:{port}").parse() else {
-        return false;
-    };
-    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
-}
-
-/// When the runner config declares an Iceberg warehouse, fail fast if the
-/// object-store endpoint is not reachable. Without this probe, the first
-/// `CREATE TABLE` in a suite would timeout deep inside the standalone server.
-fn ensure_iceberg_object_store_prereqs(runner_config: &RunnerConfig) -> Result<()> {
-    if !runner_config
-        .values
-        .contains_key("iceberg_catalog_warehouse")
-    {
-        return Ok(());
-    }
-    let endpoint = runner_config
-        .values
-        .get("oss_endpoint")
-        .cloned()
-        .unwrap_or_else(|| env_or_default("AWS_S3_ENDPOINT", "http://127.0.0.1:9000"));
-    if endpoint_reachable(&endpoint) {
-        return Ok(());
-    }
-    bail!(
-        "MinIO at {} is unreachable.\n\
-         hint: start it with:\n  \
-         mkdir -p ~/minio-data && minio server ~/minio-data --console-address :9001 &",
-        endpoint
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4875,9 +4823,6 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         lane: lane_label.to_string(),
         suites: suite_names.clone(),
     }));
-    if !cli.dry_run {
-        ensure_iceberg_object_store_prereqs(&runner_config)?;
-    }
     let selected_cluster_mode = cli.cluster_mode;
     let selected_cluster_size = cli.cluster_size.unwrap_or(1);
     if let Some(path) = cli.process_resource_output.as_deref() {
@@ -4932,7 +4877,25 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     }
     // Before the proxy: it forwards to whatever REST Catalog this run uses, and
     // an isolated one has to exist first.
-    let mut isolated_rest_catalog = start_isolated_rest_catalog(&mut runner_config, &suite_names)?;
+    let (mut isolated_rest_catalog, publication_control_uri) =
+        start_isolated_rest_catalog(&suite_names)?;
+    let fixture_endpoints = if let Some(fixture) = isolated_rest_catalog.as_ref() {
+        FixtureEndpoints::from_isolated(
+            fixture.endpoints(),
+            &fixture.static_s3_identity(),
+            fixture.runtime_env_file()?,
+        )?
+    } else {
+        FixtureEndpoints::from_runner_config(&runner_config)?
+    };
+    let subprocess_environment = fixture_endpoints.project(&mut runner_config);
+    // SAFETY: no runner-owned server, trace, proxy or case worker exists yet.
+    // Publish the physical fixture projection once before starting those threads.
+    unsafe {
+        for (key, value) in &subprocess_environment {
+            std::env::set_var(key, value);
+        }
+    }
     let mut s3_trace = if let Some(path) = std::env::var_os("UEA7_SCALE_S3_TRACE_FILE") {
         anyhow::ensure!(
             suite_names.len() == 1 && suite_names[0] == "mv-storage-contract",
@@ -4948,14 +4911,10 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     } else {
         None
     };
-    let publication_service_control = if suite_names
-        .iter()
-        .any(|suite| suite == "mv-publication-v11")
-    {
+    let publication_service_control = if let Some(control_uri) = publication_control_uri {
         let fixture = isolated_rest_catalog
-            .as_mut()
+            .as_ref()
             .context("MV V11 requires a private REST Catalog")?;
-        let control_uri = fixture.enable_publication_hook()?.to_string();
         let identity = fixture.runtime_identity()?;
         let image = identity
             .images
@@ -5768,8 +5727,8 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 /// The suites that must not share the ordinary `docker/iceberg-rest`
 /// environment.
 ///
-/// That environment deliberately shares one REST Catalog container, and
-/// therefore one catalog database, across every worktree on the machine.
+/// Worktrees bound to the same runtime contract share one REST Catalog
+/// container and therefore one catalog database.
 /// Isolation there reaches the object-store prefix and the generated names,
 /// but not the namespace listing: every attachment enumerates every worktree's
 /// tables. A suite that restarts the frontend and lets it rediscover its own
@@ -5794,20 +5753,22 @@ fn isolated_rest_catalog_suite(suite: &str) -> bool {
     ISOLATED_REST_CATALOG_SUITES.contains(&suite)
 }
 
-/// Starts a private REST Catalog and MinIO for the selected suites, and points
-/// both the SQL placeholders and the servers this run will launch at it.
+/// Starts a private REST Catalog and MinIO for the selected suites. Its caller
+/// projects the resulting endpoints before launching any consumer.
 ///
-/// Returning `None` is the ordinary case: the shared environment is what every
-/// other suite wants, and starting a container per run is not free.
+/// Returning no fixture or control URI is the ordinary shared-runtime case.
 fn start_isolated_rest_catalog(
-    runner_config: &mut RunnerConfig,
     selected_suites: &[String],
-) -> Result<Option<novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture>> {
+) -> Result<(
+    Option<novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture>,
+    Option<String>,
+)> {
+    use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
     if !selected_suites
         .iter()
         .any(|suite| isolated_rest_catalog_suite(suite.as_str()))
     {
-        return Ok(None);
+        return Ok((None, None));
     }
     if let Some(disallowed) = selected_suites
         .iter()
@@ -5825,51 +5786,22 @@ fn start_isolated_rest_catalog(
         )
     })?;
     println!("→ starting an isolated Iceberg REST catalog for this run");
-    let fixture =
-        novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture::start(
-            &scenario_root,
-        )?;
-    let endpoints = fixture.endpoints();
-    let identity = fixture.static_s3_identity();
-    let runtime_env_file = fixture.runtime_env_file()?;
+    let (fixture, control_uri) = if selected_suites
+        .iter()
+        .any(|suite| suite == "mv-publication-v11")
+    {
+        let (fixture, control_uri) =
+            IsolatedIcebergRestFixture::start_with_publication_hook(&scenario_root)?;
+        (fixture, Some(control_uri))
+    } else {
+        (IsolatedIcebergRestFixture::start(&scenario_root)?, None)
+    };
     println!(
         "  isolated REST catalog {} (compose project {})",
-        endpoints.rest_uri, endpoints.compose_project
+        fixture.endpoints().rest_uri,
+        fixture.endpoints().compose_project
     );
-    for (key, value) in [
-        ("iceberg_rest_uri", endpoints.rest_uri.clone()),
-        ("iceberg_rest_warehouse", endpoints.rest_warehouse.clone()),
-        ("oss_endpoint", endpoints.minio_endpoint.clone()),
-        ("oss_ak", identity.access_key_id.clone()),
-        ("oss_sk", identity.secret_access_key.clone()),
-    ] {
-        // Both spellings: a runner configuration file may set either, and the
-        // shared environment's value must not survive anywhere.
-        runner_config
-            .values
-            .insert(format!("env.oss.{key}"), value.clone());
-        runner_config.values.insert(key.to_string(), value);
-    }
-    // The generated server configuration reads its object-store credentials
-    // through `${ENV:...}`, and the servers are children of this process.
-    //
-    // SAFETY: this runs on the runner's only thread, before any server, rayon
-    // pool, or case worker exists, so nothing can be reading the environment
-    // concurrently.
-    unsafe {
-        std::env::set_var("AWS_S3_ENDPOINT", &endpoints.minio_endpoint);
-        std::env::set_var("AWS_S3_ACCESS_KEY_ID", &identity.access_key_id);
-        std::env::set_var("AWS_S3_SECRET_ACCESS_KEY", &identity.secret_access_key);
-        std::env::set_var("MINIO_ROOT_USER", &identity.access_key_id);
-        std::env::set_var("MINIO_ROOT_PASSWORD", &identity.secret_access_key);
-        std::env::set_var("NOVAROCKS_ICEBERG_REST_URI", &endpoints.rest_uri);
-        std::env::set_var(
-            "NOVAROCKS_ICEBERG_REST_WAREHOUSE",
-            &endpoints.rest_warehouse,
-        );
-        std::env::set_var("NOVA_ENV_REST_ENV_FILE", runtime_env_file);
-    }
-    Ok(Some(fixture))
+    Ok((Some(fixture), control_uri))
 }
 
 /// The suites the transparent publication-catalog fixture serves.
@@ -5912,13 +5844,12 @@ fn start_publication_catalog_fixture(
         .values
         .get("iceberg_rest_uri")
         .cloned()
-        .or_else(|| std::env::var("NOVAROCKS_ICEBERG_REST_URI").ok())
         .filter(|uri| !uri.trim().is_empty())
         .context("lake publication acceptance requires iceberg_rest_uri")?;
     let fixture = publication_catalog::FixtureHandle::start(downstream)?;
-    runner_config
-        .values
-        .insert("iceberg_rest_uri".to_string(), fixture.uri().to_string());
+    // This fault proxy overlays SQL/engine transport only. Provider subprocesses
+    // keep the physical publication's environment and container-side Spark URI.
+    project_fixture_value(runner_config, "iceberg_rest_uri", fixture.uri());
     Ok(Some(fixture))
 }
 
@@ -7644,15 +7575,70 @@ access_key_secret = "admin123"
     }
 
     #[test]
-    fn an_ordinary_suite_never_silently_gets_the_isolated_catalog() {
-        let mut config = crate::types::RunnerConfig::default();
-        let result = super::start_isolated_rest_catalog(
+    fn publication_proxy_overlays_all_sql_aliases_without_rebinding_provider_processes() {
+        let directory = tempfile::tempdir().unwrap();
+        let env_file = directory.path().join("env.sh");
+        std::fs::write(&env_file, "export NOVA_ENV_READY=true\n").unwrap();
+        let config_file = directory.path().join("sql-test.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                r#"
+[env]
+fixture_env_file = {env_file:?}
+iceberg_rest_uri = "http://127.0.0.1:38181"
+iceberg_rest_warehouse = "s3://warehouse/private/rest"
+oss_endpoint = "http://127.0.0.1:38000"
+oss_ak = "private-key"
+oss_sk = "private-secret"
+"#
+            ),
+        )
+        .unwrap();
+        let mut config = crate::config::load_runner_config(Some(&config_file)).unwrap();
+        let physical = crate::config::FixtureEndpoints::from_runner_config(&config).unwrap();
+        let child_environment = physical.project(&mut config);
+        let process_environment_before: std::collections::BTreeMap<_, _> = child_environment
+            .keys()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        let proxy = super::start_publication_catalog_fixture(
             &mut config,
-            &[
-                "mv-storage-contract".to_string(),
-                "iceberg-compatibility".to_string(),
-            ],
+            &["lake-publication".to_string()],
+        )
+        .unwrap()
+        .unwrap();
+        for alias in [
+            "iceberg_rest_uri",
+            "env.iceberg_rest_uri",
+            "env.oss.iceberg_rest_uri",
+        ] {
+            assert_eq!(config.values[alias], proxy.uri());
+        }
+        for alias in ["oss_endpoint", "env.oss_endpoint", "env.oss.oss_endpoint"] {
+            assert_eq!(config.values[alias], "http://127.0.0.1:38000");
+        }
+        let process_environment_after: std::collections::BTreeMap<_, _> = child_environment
+            .keys()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        assert_eq!(process_environment_before, process_environment_after);
+        assert_eq!(
+            child_environment["NOVAROCKS_ICEBERG_REST_URI"],
+            "http://127.0.0.1:38181"
         );
+        assert_eq!(
+            PathBuf::from(&child_environment["NOVA_ENV_REST_ENV_FILE"]),
+            env_file.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn an_ordinary_suite_never_silently_gets_the_isolated_catalog() {
+        let result = super::start_isolated_rest_catalog(&[
+            "mv-storage-contract".to_string(),
+            "iceberg-compatibility".to_string(),
+        ]);
         let error = match result {
             Ok(_) => panic!("a shared-environment suite must not be redirected silently"),
             Err(error) => error,
@@ -7670,13 +7656,14 @@ access_key_secret = "admin123"
             "iceberg_rest_uri".to_string(),
             "http://127.0.0.1:8181".to_string(),
         );
-        let fixture = super::start_isolated_rest_catalog(
-            &mut config,
-            &["iceberg-compatibility".to_string(), "join".to_string()],
-        )
+        let (fixture, control_uri) = super::start_isolated_rest_catalog(&[
+            "iceberg-compatibility".to_string(),
+            "join".to_string(),
+        ])
         .expect("an ordinary selection is not an error");
 
         assert!(fixture.is_none());
+        assert!(control_uri.is_none());
         assert_eq!(
             config.values.get("iceberg_rest_uri").map(String::as_str),
             Some("http://127.0.0.1:8181"),

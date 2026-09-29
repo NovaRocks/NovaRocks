@@ -54,6 +54,11 @@ printf '{"winner":2}\n' > "$TMP/ready-two"
 [[ "$(fixture_publication_put_conditional "$uri" "$TMP/ready-two" rebuild bad-etag)" == 412 ]] || fail 'stale rebuild ETag'
 [[ "$(fixture_publication_put_conditional "$uri" "$TMP/ready-two" rebuild "$etag")" == 200 ]] || fail 'exact rebuild ETag'
 
+# The injected binder returns one immutable publication. Docker is a local
+# command fake that checks every project/path and returns the exact image ID.
+python3 "$ROOT/tests/sql/fixtures/benchmarks/tests/producer-binding-test.py" --prepare "$ROOT" "$TMP/binding"
+export PATH="$TMP/binding/bin:$PATH"
+
 # Runner-facing --check is typed JSON and uses only direct storage objects.
 env_file="$TMP/env.sh"
 cat > "$env_file" <<EOF
@@ -87,7 +92,7 @@ part.write_text(json.dumps({'dataset_key':r['dataset_key'], 'fixture_contract':r
 ready={"schema_version":1,"dataset_key":r['dataset_key'],"state":"ReadyValid","exact_warehouse":warehouse,"manifest_uri":manifest,"contract":r['contract'],"producer_fingerprint":r['producer_fingerprint'],"publication":{"ready_uri":r['ready_uri'],"identity":"writer-a"}}
 p=path(r['ready_uri']); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(json.dumps(ready), encoding='utf-8')
 PY
-output="$(NOVA_ENV_REST_ENV_FILE="$env_file" BENCHMARK_FIXTURE_STORAGE_DIR="$BENCHMARK_FIXTURE_STORAGE_DIR" BENCHMARK_FIXTURE_UP_COMMAND=true "$BOOTSTRAP" --suite ssb --scale 1 --resolved-dataset "$resolved" --check)"
+output="$(NOVA_ENV_REST_ENV_FILE="$env_file" BENCHMARK_FIXTURE_STORAGE_DIR="$BENCHMARK_FIXTURE_STORAGE_DIR" BENCHMARK_FIXTURE_UP_COMMAND="$TMP/binding/bind" "$BOOTSTRAP" --suite ssb --scale 1 --resolved-dataset "$resolved" --check)"
 python3 "$ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --suite ssb --scale 1 --shared-root s3://fixture/shared/benchmarks --validate-ensure-result <(printf '%s\n' "$output")
 [[ "$output" != *test-secret* ]] || fail 'credential leaked to stdout'
 
@@ -163,3 +168,5 @@ printf '{"repaired":true}\n' > "$TMP/repaired"
 fixture_publication_get "$sibling"
 [[ "$FIXTURE_PUBLICATION_ETAG" == "$sibling_etag" && "$FIXTURE_PUBLICATION_BODY" == "$sibling_body" ]] || fail 'rebuild touched sibling key'
 echo 'bootstrap lifecycle tests passed'
+
+python3 "$ROOT/tests/sql/fixtures/benchmarks/tests/producer-binding-test.py"

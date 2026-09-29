@@ -35,6 +35,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -95,6 +96,7 @@ SNAPSHOT_ADVANCES = {
     "schema": ("schema_evolution",),
 }
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 SAFE_PREFIX_RE = re.compile(
     r"^fixtures/paimon-read/[a-z0-9][a-z0-9-]{0,63}/"
     r"[a-z0-9][a-z0-9-]{0,47}-[0-9a-f]{12}$"
@@ -175,16 +177,32 @@ def parse_env_file(path: Path) -> dict[str, str]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if line.startswith("export "):
-            line = line[len("export ") :]
+        fields = line.split()
+        if fields[0] == "unset":
+            names = fields[1:]
+            if not names or any(not ENV_NAME_RE.fullmatch(name) for name in names):
+                raise FixtureError(f"invalid environment unset {path}:{number}")
+            for name in names:
+                values.pop(name, None)
+            continue
+        if fields[0] == "export":
+            line = line[len("export") :].lstrip()
         if "=" not in line:
             raise FixtureError(f"invalid environment line {path}:{number}")
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
-        if value.startswith('"') and value.endswith('"'):
-            value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
-        values[key] = value
+        if not ENV_NAME_RE.fullmatch(key):
+            raise FixtureError(f"invalid environment variable name {path}:{number}")
+        try:
+            # Decode the renderer's shell quoting without executing expansions
+            # or consulting the process environment.
+            words = shlex.split(value, comments=False, posix=True)
+        except ValueError as error:
+            raise FixtureError(f"invalid environment value {path}:{number}") from error
+        if len(words) > 1:
+            raise FixtureError(f"invalid environment value {path}:{number}")
+        values[key] = words[0] if words else ""
     return values
 
 

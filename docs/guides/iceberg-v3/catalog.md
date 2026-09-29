@@ -19,100 +19,44 @@ under the License.
 
 # Catalog 接入
 
-> Iceberg 的 catalog 决定 metadata 怎么存、commit 怎么协调。NovaRocks 当前主力是 Hadoop catalog，REST 客户端基础已就位但未走通 engine flow，其他 catalog 后端尚未实现。
+Catalog 决定 Iceberg 元数据如何发现和提交。当前 provider 的 `NovaRocksCatalogFactory::adopt` 按已经验证的配置选择 Hadoop、REST 或 Hive 实现，并保留当前 generation 已构造的唯一客户端。代码入口是 `novarocks/connector/iceberg/src/catalog/{factory,rest,hive}.rs` 与 `catalog_runtime.rs`；这份操作指南不再使用早期 PR 的完成度作为当前能力判断。
 
-| Catalog | 状态 | 备注 |
-| --- | --- | --- |
-| Hadoop | ✅ | `vN.metadata.json` + `version-hint.text` + commit lock 文件 |
-| In-memory | ✅ | 仅测试 |
-| REST | 🚧 | 客户端基础落地（PR #82），engine 路由 / 鉴权 / 端到端测试待补 |
-| AWS Glue | ❌ | |
-| Hive Metastore（HMS） | ❌ | |
-| Nessie | ❌ | |
-| JDBC | ❌ | |
+## REST 本地测试
 
----
+`docker/iceberg-rest/` 提供 REST Catalog、MinIO、Spark fixture，供 `iceberg`、`iceberg-rest` 和 `iceberg-compatibility` 等 SQL 套件使用。共享 runtime 按输入版本化，host 端口由 owner 分配；不要在 worktree 中固定写 `localhost:8181` 或 `9000`。
 
-## ✅ Hadoop catalog
+先显式供给缺失输入，普通运行只验证本机 BOM；再绑定并解析一次 publication：
 
-**实现入口**：`src/connector/iceberg/catalog/hadoop_catalog.rs`
-
-```sql
-CREATE EXTERNAL CATALOG ice
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "warehouse" = "file:///tmp/wh"          -- 也支持 s3:// / oss:// / hdfs://
-);
+```bash
+docker/fixture-inputs/provision.sh   # Explicit supply, when needed.
+docker/iceberg-rest/up.sh
+fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
+source "$fixture_publication/env.sh"
+mysql -h 127.0.0.1 -P "$NOVA_ENV_MYSQL_PORT" -uroot < "$NOVAROCKS_ICE_REST_CATALOG_SQL"
 ```
 
-约定：
+最后一行要求已有按生成 FE/BE 配置启动的 NovaRocks 服务。生成 SQL 使用本次 `NOVAROCKS_ICEBERG_REST_URI`、客户端 warehouse 与对象存储端点。REST 客户端构造由 `catalog_runtime::build_rest_catalog` 路径完成；catalog 操作由 `NovaRocksRestCatalog` 承接，不是解析后仍走 Hadoop 的占位语法。
 
-- metadata 文件名：`v{N}.metadata.json`（Hadoop convention）
-- version hint：`version-hint.text` 单文件指向当前版本号
-- commit lock：通过 rename 操作的原子性保证
+`runtime/current` 只是定位器，入口的 `published` 原子发布绑定和配置。`NOVA_ENV_REST_ENV_FILE` 和 `[env].fixture_env_file` 固定到本次 publication；`NOVA_ENV_RUNTIME_DIR` 存 SQLite 等稳定数据，不能用来拼接 env.sh。Spark 使用生成的容器网络端点，NovaRocks 使用 host 端点。
 
-> ⚠️ 与 StarRocks FE 期望的 `{version}-{uuid}.metadata.json` 命名约定不一致。如果同一份 warehouse 还要被 StarRocks FE 直接读，需要做命名转换；当前没有提供自动 shim，路线图上有跟踪。
+`up.sh --prepare-only` 不调用 Docker，也不证明 BOM/健康；保存记录为 ready 才恢复端点，首次或缺失/deleting 记录发布 unbound。测试 fixture 的凭证不能被当作生产鉴权模型。REST 存储访问支持的静态/vended 模式由 provider 配置和消费方 `StorageAuthority` 契约决定，参见 [ADR-0151](../../adr/ADR-0151-credential-renewal-is-driven-by-the-consumer.md)；本指南不据本地匿名 fixture 推断全部远程服务的鉴权能力。
 
-## ✅ In-memory catalog
-
-仅用于单元测试与 fixture，不要在生产配置。
-
-## 🚧 REST catalog
-
-**实现现状（PR #82）**：
-
-- ✅ 属性解析：`iceberg.catalog.type=rest` + `uri`（必填）+ `warehouse`（可选，REST 服务也可在 `GET /v1/config` 中下发）
-- ✅ Spec 要求的 config handshake：在 catalog 构造时调用 `GET /v1/config` 拉取 server defaults / overrides
-- ✅ `build_iceberg_catalog` 统一 dispatcher（Hadoop / Memory / Rest）
-
-**当前不能直接走通的部分**：
-
-- ❌ engine flow 切换：`build_hadoop_catalog(&entry)?` 调用点尚未替换为 `build_iceberg_catalog(&entry)?`，所以 INSERT / SELECT / DDL 实际并不会路由到 RestCatalog
-- ❌ 鉴权：当前只有匿名 + 默认 HTTP client，不支持 OAuth2 / SigV4 / Bearer token / `iceberg-rest-conformance-tests`
-- ❌ 端到端 SQL 套件：缺一个起 `tabulario/iceberg-rest` + MinIO 的 docker-compose fixture
-
-**临时占位语法**（解析通过，运行时仍走 Hadoop 路径，**不会真的写到 REST 服务**）：
-
-```sql
--- TODO: 暂未端到端可用
-CREATE EXTERNAL CATALOG ice_rest
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "http://localhost:8181",
-  "warehouse" = "s3://my-warehouse/"
-);
+```bash
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg,iceberg-rest,iceberg-compatibility \
+  --mode verify --cluster-mode cross-process --cluster-size 3
 ```
 
-跟踪：参见 `NovaRocks Iceberg v3 完成度清单` §1（REST Catalog 子任务）。
+这是验收命令入口，文档更新本身不是套件通过证据。
 
-## ❌ AWS Glue catalog
+## Hadoop 与 Hive
 
-Spec：实现 `iceberg.catalog.type=glue`，使用 AWS Glue Data Catalog 作为 metadata 后端。AWS 用户的首选路径。
+Hadoop 实现入口为 `novarocks/connector/iceberg/src/hadoop_catalog.rs`；使用 `iceberg.catalog.type=hadoop` 和明确 warehouse。它的 metadata/commit 约定由该实现管理，不应把 warehouse 当作可以绕过原 catalog 协调直接写入的路径。
 
-**TODO**：未实现，无替代方案。如果你必须走 Glue，目前只能让 Spark / Trino 把 Iceberg 表元数据写到 Glue，再让 NovaRocks 用 Hadoop catalog 直接读底层文件（不推荐，commit 协调会丢）。
+Hive 的 provider 实现与 runtime 构造入口为 `catalog/hive.rs` 和 `catalog_runtime::build_hms_catalog`。本地 HMS fixture 由 `docker/iceberg-hive/` 管理，连接选定的版本化 REST fixture 网络供 Spark/对象存储访问。运行 `iceberg-hms` 前先按该目录操作说明启动 HMS。HMS 等外部 endpoint 尚在时，普通与 force catalog 删除均拒绝；先退出 HMS 自己的精确项目与连接。
 
-## ❌ Hive Metastore（HMS）
+## 生命周期与边界
 
-Spec：实现 `iceberg.catalog.type=hive`，与传统 Hadoop 数仓共用 metastore。
+`down.sh --runtime-only` 解绑并保留历史数据引用；加 `--purge` 才在全部私有位置清理成功后释放引用。共享实例停止/删除必须使用 `fixture-runtime.sh` 的精确 runtime ID，不能按旧项目名猜测。force catalog 删除仅条件解绑目标、保留 worktree 数据引用；对象存储任何删除都受 catalog/数据引用保护。
 
-**TODO**：未实现。
-
-## ❌ Nessie catalog
-
-Spec：git-like 分支语义，对 branch / tag 是一等公民。
-
-**TODO**：未实现。NovaRocks 的 branch / tag 当前仅在 Iceberg 表内部生效（见 [Branch / Tag](branches-and-tags.md)），不是 Nessie 那种"跨多张表的事务分支"。
-
-## ❌ JDBC catalog
-
-Spec：spec 列出的轻量后端，把 metadata 存到 JDBC 后端（Postgres / MySQL）。
-
-**TODO**：未实现。
-
-## ❌ Catalog credential vending
-
-Spec：REST catalog 在响应 `loadTable` 时下发临时 FileIO 凭据（SigV4 / token），客户端透传给底层对象存储。这是 Lakekeeper / Polaris 的核心安全模型。
-
-**TODO**：未实现。即使后面 REST catalog engine flow 接通，也不会自动下发凭据；FileIO 凭据需要在 catalog properties 里静态指定。
+新对象存储会重建 benchmark READY 数据。旧 `nr-iceberg-rest`、`nr-iceberg-hive` 和卷保留，退役由用户另行安排。完整命令、owner locator 与操作保护见 [fixture README](../../../docker/iceberg-rest/README.md) 和 [ADR-0165](../../adr/ADR-0165-versioned-fixture-runtime-ownership.md)。其它 catalog 的支持面应查当前 provider 配置与测试，不能从旧 TODO 清单推断。

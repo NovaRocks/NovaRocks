@@ -70,7 +70,8 @@ fi
 
 blocked_run="$tmpdir/blocked-run"
 blocked_capture="$tmpdir/blocked-cargo"
-if (
+blocked_code=0
+(
   init_run_dir() {
     CI_RUN_DIR="$blocked_run"
     CI_SUMMARY="$CI_RUN_DIR/summary.md"
@@ -88,8 +89,9 @@ if (
   }
 
   main --tier smoke >/dev/null
-); then
-  echo "missing fixture BOM must stop CI as BLOCKED" >&2
+) || blocked_code=$?
+if [ "$blocked_code" -ne 75 ]; then
+  echo "missing fixture BOM must preserve exit 75 and stop CI as BLOCKED" >&2
   exit 1
 fi
 
@@ -102,43 +104,77 @@ if [[ -e "$blocked_capture" ]]; then
   exit 1
 fi
 
-runtime_failed_run="$tmpdir/runtime-failed-run"
-runtime_failed_capture="$tmpdir/runtime-failed-cargo"
-if (
-  init_run_dir() {
-    CI_RUN_DIR="$runtime_failed_run"
-    CI_SUMMARY="$CI_RUN_DIR/summary.md"
-    mkdir -p "$CI_RUN_DIR"
-    ci_init_summary_state
-    ci_set_repo_context "$REPO_ROOT" test test
-    ci_render_summary "RUNNING"
-  }
-  verify_fixture_inputs() {
-    return 0
-  }
-  function docker/iceberg-rest/up.sh {
-    return 1
-  }
-  run_cargo_gates() {
-    printf '%s\n' "cargo" >"$runtime_failed_capture"
-  }
+for owner_error in PortUnavailable RuntimeIdentityMismatch ExternalAttachmentsPresent; do
+  runtime_failed_run="$tmpdir/runtime-failed-$owner_error"
+  runtime_failed_capture="$tmpdir/runtime-failed-cargo-$owner_error"
+  runtime_failed_code=0
+  (
+    init_run_dir() {
+      CI_RUN_DIR="$runtime_failed_run"
+      CI_SUMMARY="$CI_RUN_DIR/summary.md"
+      mkdir -p "$CI_RUN_DIR"
+      ci_init_summary_state
+      ci_set_repo_context "$REPO_ROOT" test test
+      ci_render_summary "RUNNING"
+    }
+    verify_fixture_inputs() { return 0; }
+    function docker/iceberg-rest/up.sh {
+      echo "error: $owner_error: synthetic owner failure" >&2
+      return 1
+    }
+    run_cargo_gates() {
+      printf '%s\n' "cargo" >"$runtime_failed_capture"
+    }
 
-  main --tier smoke >/dev/null
-); then
-  echo "ordinary runtime setup errors must stop CI as VERIFY FAILED" >&2
-  exit 1
-fi
+    main --tier smoke >/dev/null
+  ) || runtime_failed_code=$?
+  if [ "$runtime_failed_code" -ne 1 ]; then
+    echo "owner errors must preserve their failure exit code" >&2
+    exit 1
+  fi
+  grep -Fx -- '- Status: VERIFY FAILED' "$runtime_failed_run/summary.md" >/dev/null
+  grep -F '| prepare runtime | VERIFY FAILED |' "$runtime_failed_run/summary.md" >/dev/null
+  grep -F "$owner_error" "$runtime_failed_run/env.log" >/dev/null
+  if grep -F '| fixture prerequisites | BLOCKED |' "$runtime_failed_run/summary.md" >/dev/null; then
+    echo "owner errors must not be classified as fixture BLOCKED" >&2
+    exit 1
+  fi
+  if [[ -e "$runtime_failed_capture" ]]; then
+    echo "VERIFY FAILED runtime setup must run before Cargo gates" >&2
+    exit 1
+  fi
+done
 
-grep -Fx -- '- Status: VERIFY FAILED' "$runtime_failed_run/summary.md" >/dev/null
-grep -F '| prepare runtime | VERIFY FAILED |' "$runtime_failed_run/summary.md" >/dev/null
-if grep -F '| fixture prerequisites | BLOCKED |' "$runtime_failed_run/summary.md" >/dev/null; then
-  echo "ordinary runtime setup errors must not be classified as fixture BLOCKED" >&2
-  exit 1
-fi
-if [[ -e "$runtime_failed_capture" ]]; then
-  echo "VERIFY FAILED runtime setup must run before Cargo gates" >&2
-  exit 1
-fi
+publication_a="$tmpdir/publications/a"
+publication_b="$tmpdir/publications/b"
+mkdir -p "$publication_a" "$publication_b" "$tmpdir/entry"
+cat >"$publication_a/env.sh" <<EOF
+export NOVA_ENV_REST_ENV_FILE='$publication_a/env.sh'
+export NOVA_ENV_RUNTIME_DIR='$tmpdir/stable-runtime'
+export NOVA_ENV_OBJECT_STORE_RUNTIME='os-test'
+export NOVA_ENV_CATALOG_RUNTIME='cat-test'
+export AWS_S3_ENDPOINT='http://127.0.0.1:28000'
+export NOVAROCKS_ICEBERG_REST_URI='http://127.0.0.1:28002'
+EOF
+printf '%s\n' 'return 96' >"$publication_b/env.sh"
+ln -s "$publication_a" "$tmpdir/entry/published"
+ln -s published/env.sh "$tmpdir/entry/env.sh"
+(
+  load_fixture_publication "$tmpdir/entry/env.sh"
+  rm "$tmpdir/entry/published"
+  ln -s "$publication_b" "$tmpdir/entry/published"
+  record_fixture_runtime >"$tmpdir/runtime-receipt.log"
+  [ "$NOVA_ENV_REST_ENV_FILE" = "$publication_a/env.sh" ]
+  [ "$NOVA_ENV_RUNTIME_DIR" = "$tmpdir/stable-runtime" ]
+)
+for receipt in \
+  'NOVA_ENV_OBJECT_STORE_RUNTIME=os-test' \
+  'NOVA_ENV_CATALOG_RUNTIME=cat-test' \
+  "NOVA_ENV_PUBLICATION_DIR=$publication_a" \
+  'AWS_S3_ENDPOINT=http://127.0.0.1:28000' \
+  'NOVAROCKS_ICEBERG_REST_URI=http://127.0.0.1:28002'; do
+  grep -Fx "$receipt" "$tmpdir/runtime-receipt.log" >/dev/null
+done
 
 stage_capture="$tmpdir/cargo-gates"
 (
@@ -376,7 +412,8 @@ launcher_capture="$tmpdir/sql-runner-launcher.args"
   REPO_ROOT="$tmpdir/current-worktree"
   CI_RUN_DIR="$tmpdir/sql-runner-launcher"
   NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
-  NOVA_ENV_RUNTIME_DIR="$tmpdir/runtime"
+  NOVA_ENV_RUNTIME_DIR="$tmpdir/stable-runtime"
+  NOVA_ENV_REST_ENV_FILE="$publication_a/env.sh"
   RUN_MODE="explicit"
   mkdir -p "$CI_RUN_DIR/sql"
 
@@ -398,7 +435,7 @@ if ! grep -Fx "NOVAROCKS_WORKSPACE_ROOT=$tmpdir/current-worktree" "$launcher_cap
   exit 1
 fi
 
-if ! grep -Fx "NOVA_ENV_REST_ENV_FILE=$tmpdir/runtime/env.sh" "$launcher_capture" >/dev/null; then
+if ! grep -Fx "NOVA_ENV_REST_ENV_FILE=$publication_a/env.sh" "$launcher_capture" >/dev/null; then
   echo "SQL runner must receive the exact prepared Iceberg REST environment" >&2
   exit 1
 fi
@@ -413,7 +450,8 @@ native_launcher_capture="$tmpdir/native-sql-runner-launcher.args"
   REPO_ROOT="$tmpdir/current-worktree"
   CI_RUN_DIR="$tmpdir/native-sql-runner-launcher"
   NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
-  NOVA_ENV_RUNTIME_DIR="$tmpdir/runtime"
+  NOVA_ENV_RUNTIME_DIR="$tmpdir/stable-runtime"
+  NOVA_ENV_REST_ENV_FILE="$publication_a/env.sh"
   SQL_CLUSTER_MODE="cross-process"
   NOVA_CI_NATIVE_CROSS_PROCESS_FULL="1"
 
@@ -431,6 +469,11 @@ native_launcher_capture="$tmpdir/native-sql-runner-launcher.args"
   run_native_cross_process_sql_suites
 )
 
+if ! grep -Fx "NOVA_ENV_REST_ENV_FILE=$publication_a/env.sh" "$native_launcher_capture" >/dev/null; then
+  echo "native SQL runner must receive the exact prepared publication" >&2
+  exit 1
+fi
+
 if grep -Fx -- "--query-timeout" "$native_launcher_capture" >/dev/null; then
   echo "native iceberg-dml must use the SQL runner's suite timeout when CI has no explicit override" >&2
   exit 1
@@ -441,7 +484,8 @@ override_capture="$tmpdir/sql-runner-timeout-override.args"
   REPO_ROOT="$tmpdir/current-worktree"
   CI_RUN_DIR="$tmpdir/sql-runner-timeout-override"
   NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
-  NOVA_ENV_RUNTIME_DIR="$tmpdir/runtime"
+  NOVA_ENV_RUNTIME_DIR="$tmpdir/stable-runtime"
+  NOVA_ENV_REST_ENV_FILE="$publication_a/env.sh"
   RUN_MODE="explicit"
   SQL_QUERY_TIMEOUT_SECONDS="75"
   mkdir -p "$CI_RUN_DIR/sql"

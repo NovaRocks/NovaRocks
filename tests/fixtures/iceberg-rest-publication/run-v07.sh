@@ -91,13 +91,16 @@ docker_arguments=(
 )
 
 if [[ "${UEA7_USE_SHARED_MINIO:-0}" == "1" ]]; then
-  for required_variable in NOVA_ENV_COMPOSE_PROJECT MINIO_ROOT_USER MINIO_ROOT_PASSWORD; do
+  runtime_env="${NOVA_ENV_REST_ENV_FILE:-$repo_root/docker/iceberg-rest/runtime/current/env.sh}"
+  runtime_env="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$runtime_env")"
+  source "$runtime_env"
+  for required_variable in NOVA_ENV_COMPOSE_PROJECT NOVA_ENV_OBJECT_STORE_CONTAINER MINIO_ROOT_USER MINIO_ROOT_PASSWORD; do
     [[ -n "${!required_variable:-}" ]] \
       || fail "UEA7_USE_SHARED_MINIO=1 requires $required_variable"
   done
   storage_mode="shared-minio"
   shared_network="${NOVA_ENV_COMPOSE_PROJECT}_iceberg_net"
-  minio_container="${UEA7_MINIO_CONTAINER:-${NOVA_ENV_COMPOSE_PROJECT}-minio-1}"
+  minio_container="${NOVA_ENV_OBJECT_STORE_CONTAINER}"
   docker network inspect "$shared_network" >/dev/null 2>&1 \
     || fail "shared MinIO network does not exist: $shared_network"
   [[ "$(docker inspect "$minio_container" --format '{{.State.Running}}' 2>/dev/null)" == "true" ]] \

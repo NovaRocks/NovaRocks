@@ -1,0 +1,59 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file for additional
+# information. The ASF licenses this file under the Apache License, Version 2.0.
+# You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed in writing, software distributed
+# under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+# CONDITIONS OF ANY KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations under the License.
+x-owner-labels: &owner-labels
+  novarocks.fixture.owner: ${NOVA_FIXTURE_OWNER}
+  novarocks.fixture.key: ${NOVA_FIXTURE_KEY}
+  novarocks.fixture.kind: ${NOVA_FIXTURE_KIND}
+services:
+  rest:
+    image: ${REST_IMAGE:?provisioned image required}
+    pull_policy: never
+    labels: *owner-labels
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: ${NOVA_ENV_REST_SERVER_WAREHOUSE_URI}
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: 'true'
+      CATALOG_URI: jdbc:sqlite:/tmp/iceberg-rest-catalog.db
+    ports: ['${NOVA_ENV_REST_PORT}:8181']
+    volumes: [rest-catalog:/tmp]
+    networks: [iceberg_net]
+  spark:
+    image: ${SPARK_IMAGE:?provisioned image required}
+    pull_policy: never
+    labels: *owner-labels
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      SPARK_LOCAL_HOSTNAME: localhost
+    ports: ['${NOVA_ENV_SPARK_PORT}:4040']
+    entrypoint: [/bin/bash, -lc]
+    command: ["trap 'exit 0' TERM INT; sleep infinity & wait"]
+    networks: [iceberg_net]
+  mc:
+    image: ${MC_IMAGE:?provisioned image required}
+    pull_policy: never
+    labels: *owner-labels
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: [/bin/sh]
+    command: [-c, 'exit 0']
+    networks: [iceberg_net]
+volumes:
+  rest-catalog:
+    labels: *owner-labels
+networks:
+  iceberg_net:
+    name: ${NOVA_FIXTURE_PROJECT}_iceberg_net
+    labels: *owner-labels

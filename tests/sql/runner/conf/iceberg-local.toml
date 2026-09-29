@@ -1,3 +1,5 @@
+# Fixture endpoints are required from a generated runtime sql-test.toml.
+# Run docker/iceberg-rest/up.sh and pass --config "$NOVAROCKS_SQL_TEST_CONFIG".
 [cluster]
 host = "127.0.0.1"
 port = "19031"
@@ -7,6 +9,3 @@ password = ""
 [env]
 iceberg_catalog_type = "hadoop"
 iceberg_catalog_warehouse = "/tmp/novarocks-sql-test/iceberg-local-catalog/${suite_uuid0}/"
-oss_ak = "admin"
-oss_sk = "admin123"
-oss_endpoint = "http://127.0.0.1:9000"

@@ -154,7 +154,8 @@ impl SqlFinalPlanCompileRequest {
         let query = crate::sql_mode::normalize_concat_query(
             super::parse_query(&statement)?,
             &session.sql_semantics,
-        );
+        )
+        .map_err(SqlCompileError::Analyze)?;
         let common = FinalPlanCommon {
             version,
             intent,
@@ -172,6 +173,11 @@ impl SqlFinalPlanCompileRequest {
         // catalog needs so an unrelated candidate cannot fail the base query.
         let consumer_requires_semantic_snapshot =
             crate::sql_mode::query_uses_group_concat_legacy(&common.session.sql_semantics, &query)
+                .map_err(SqlCompileError::Analyze)?
+                || crate::sql_mode::query_uses_decimal_overflow_to_double(
+                    &common.session.sql_semantics,
+                    &query,
+                )
                 .map_err(SqlCompileError::Analyze)?;
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;
@@ -301,6 +307,7 @@ pub(crate) struct SqlStatisticsCompletionState {
 pub(crate) struct SqlProviderReadCompletionState {
     common: FinalPlanCommon,
     physical: PhysicalPlanNode,
+    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     needs: Box<[ProviderReadNeed]>,
 }
 
@@ -700,15 +707,22 @@ fn optimize_and_prepare_provider(
     next_need_ordinal: u32,
     control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
-    let physical = optimize_to_physical(analyzed, &statistics_snapshot, control)?;
-    provider_or_ready_step(common, physical, next_need_ordinal)
+    let optimized = optimize_to_physical(analyzed, &statistics_snapshot, control)?;
+    provider_or_ready_step(common, optimized, next_need_ordinal)
+}
+
+/// The optimizer result and the immutable base-table facts it consumed travel
+/// together until final-plan completion. Provider negotiation cannot replace them.
+struct OptimizedPhysicalPlan {
+    physical: PhysicalPlanNode,
+    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
 }
 
 fn optimize_to_physical(
     analyzed: SqlAnalyzedQuery,
     statistics_snapshot: &DmlStatisticsSnapshot,
     control: &SqlCompileControl,
-) -> Result<PhysicalPlanNode, SqlCompileError> {
+) -> Result<OptimizedPhysicalPlan, SqlCompileError> {
     let SqlAnalyzedQuery {
         logical_plan,
         factory,
@@ -769,15 +783,23 @@ fn optimize_to_physical(
     }
     .map_err(SqlCompileError::Compilation)?;
     control.check()?;
-    crate::planner::optimizer_bridge::to_physical_plan(&optimized)
-        .map_err(SqlCompileError::Compilation)
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized)
+        .map_err(SqlCompileError::Compilation)?;
+    Ok(OptimizedPhysicalPlan {
+        physical,
+        query_statistics: statistics.snapshot,
+    })
 }
 
 fn provider_or_ready_step(
     common: FinalPlanCommon,
-    mut physical: PhysicalPlanNode,
+    optimized: OptimizedPhysicalPlan,
     next_need_ordinal: u32,
 ) -> Result<CompilerStep, SqlCompileError> {
+    let OptimizedPhysicalPlan {
+        mut physical,
+        query_statistics,
+    } = optimized;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         &common.session.optimizer_settings,
@@ -793,16 +815,18 @@ fn provider_or_ready_step(
             CompilerContinuation::provider_read(SqlProviderReadCompletionState {
                 common,
                 physical,
+                query_statistics,
                 needs,
             }),
         ));
     }
-    let builder = crate::planner::distributed::build::lower_final_physical_plan(
+    let mut builder = crate::planner::distributed::build::lower_final_physical_plan(
         &physical,
         common.version,
         common.dop_domain,
     )
     .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
+    query_statistics.annotate_final_plan(&mut builder);
     Ok(CompilerStep::ready(
         common.version,
         builder,
@@ -1072,7 +1096,7 @@ pub(super) fn resume_provider_read(
             .into_iter()
             .map(|fact| (fact, state.common.scan_read_budget)),
     )?;
-    let builder =
+    let mut builder =
         crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
             &state.physical,
             state.common.version,
@@ -1080,6 +1104,7 @@ pub(super) fn resume_provider_read(
             reads,
         )
         .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
+    state.query_statistics.annotate_final_plan(&mut builder);
     Ok(CompilerStep::ready(
         state.common.version,
         builder,
@@ -1682,6 +1707,145 @@ mod tests {
     }
 
     #[test]
+    fn decimal_consumer_never_discovers_optional_mv_definitions() {
+        for (sql, connection_flag) in [
+            ("SELECT order_key FROM orders", true),
+            (
+                "SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders",
+                false,
+            ),
+            (
+                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders",
+                false,
+            ),
+            (
+                "SELECT order_key FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders) d",
+                false,
+            ),
+        ] {
+            let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
+            request.session.sql_semantics = request
+                .session
+                .sql_semantics
+                .clone()
+                .with_decimal_overflow_to_double(connection_flag);
+            let seed = request.try_into_completion().expect("eligible base query");
+            let discovery_calls = AtomicUsize::new(0);
+            let target_catalog_reads = AtomicUsize::new(0);
+            complete_base_query_with_counters(
+                SqlCompiler::start(seed).expect("start base query"),
+                &discovery_calls,
+                &target_catalog_reads,
+            );
+            assert_eq!(
+                discovery_calls.load(Ordering::Acquire),
+                0,
+                "an unrelated bad MV cannot be observed for this query"
+            );
+            assert_eq!(target_catalog_reads.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn decimal_false_overrides_keep_existing_mv_discovery_policy() {
+        for sql in [
+            "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders",
+            "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders",
+        ] {
+            let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
+            request.session.sql_semantics = request
+                .session
+                .sql_semantics
+                .clone()
+                .with_decimal_overflow_to_double(true);
+            let compilation =
+                incomplete(SqlCompiler::start(request.try_into_completion().unwrap()).unwrap());
+            assert!(matches!(
+                compilation.needs(),
+                SqlNeedBatch::MaterializedViews(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn stored_decimal_definition_never_requests_optional_target_catalog() {
+        use super::super::mv_rewrite::{
+            SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId,
+            SqlMvRewriteBaseTableFacts, SqlMvRewriteSourceOccurrenceFacts,
+        };
+        let seed = request_with_mv(
+            "SELECT order_key FROM orders",
+            SqlCompileIntent::Query,
+            true,
+        )
+        .try_into_completion()
+        .unwrap();
+        let mv = incomplete(SqlCompiler::start(seed).unwrap());
+        let need = match mv.needs() {
+            SqlNeedBatch::MaterializedViews(needs) => needs[0].clone(),
+            other => panic!("modern query retains MV discovery, got {other:?}"),
+        };
+        let discovery_calls = AtomicUsize::new(0);
+        discovery_calls.fetch_add(1, Ordering::AcqRel);
+        let table = novarocks_types::naming::TableIdentity {
+            catalog: "iceberg".to_string(),
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+        };
+        let mut statements = novarocks_parser::parse(
+            "SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders",
+        )
+        .unwrap();
+        let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
+            panic!("query")
+        };
+        let definition = SqlMvRewriteDefinitionFacts::try_new(
+            91,
+            [11; 32],
+            query,
+            SqlMvDefinitionResolutionContext::try_new("iceberg".to_string(), "db".to_string())
+                .unwrap(),
+            "iceberg".to_string(),
+            Some(novarocks_types::naming::TableIdentity {
+                table: "missing_mv_target".to_string(),
+                ..table.clone()
+            }),
+            vec![
+                SqlMvRewriteSourceOccurrenceFacts::try_new(
+                    SqlMvRelationOccurrenceId::new(0),
+                    table,
+                    "orders".to_string(),
+                    None,
+                    SqlMvRewriteBaseTableFacts::unavailable("no publication".to_string()),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let progress = SqlCompiler::finish(
+            mv,
+            SqlFactBatch::MaterializedViews(Box::from([MaterializedViewFact::observed(
+                &need,
+                Box::from([definition]),
+            )])),
+            &SqlCompileControl::unbounded(),
+        )
+        .expect("stored unsupported candidate must not fail base query");
+        let target_catalog_reads = AtomicUsize::new(0);
+        complete_base_query_with_counters(progress, &discovery_calls, &target_catalog_reads);
+        assert_eq!(
+            discovery_calls.load(Ordering::Acquire),
+            1,
+            "modern discovery policy is unchanged"
+        );
+        assert_eq!(
+            target_catalog_reads.load(Ordering::Acquire),
+            0,
+            "no optional target read before late eligibility diagnostic"
+        );
+    }
+
+    #[test]
     fn materialized_view_enabled_external_read_completes_in_four_exact_rounds() {
         let seed = request_with_mv(
             "select order_key from orders",
@@ -1831,5 +1995,626 @@ mod tests {
             Err(SqlCompileError::Compilation(message))
                 if message.contains("repeat scan occurrence")
         ));
+    }
+
+    fn available_statistics_evidence(rows: u64) -> DmlStatisticsEvidence {
+        available_statistics_evidence_with_average_size(rows, None)
+    }
+
+    fn available_statistics_evidence_with_average_size(
+        rows: u64,
+        average_size: Option<f64>,
+    ) -> DmlStatisticsEvidence {
+        use novarocks_spi::connector::{
+            StatisticsBasisRelation, StatisticsDataVersion, StatisticsEvidence,
+            StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
+            StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
+            StatisticsNumericNature, StatisticsRowCoverage,
+        };
+        let basis = StatisticsDataVersion::try_new(bytes::Bytes::from_static(b"frozen-data"))
+            .expect("data version");
+        let mut metrics = std::collections::BTreeMap::from([(
+            StatisticsMetric::RowCount,
+            StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                StatisticsMetricValue::U64(rows),
+                basis.clone(),
+                StatisticsMetricSource::CurrentManifest,
+                StatisticsNumericNature::Exact,
+                StatisticsBasisRelation::Identical,
+            )),
+        )]);
+        if let Some(width) = average_size {
+            metrics.insert(
+                StatisticsMetric::AverageSize {
+                    column: "order_key".into(),
+                },
+                StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                    StatisticsMetricValue::F64(width),
+                    basis.clone(),
+                    StatisticsMetricSource::CurrentManifest,
+                    StatisticsNumericNature::TwoSidedApproximate,
+                    StatisticsBasisRelation::Identical,
+                )),
+            );
+        }
+        DmlStatisticsEvidence::Available {
+            binding: SqlTableBindingId::new_for_test(41),
+            label: "iceberg.db.orders".to_string(),
+            columns: vec![novarocks_types::schema::ColumnDef {
+                name: "order_key".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            evidence: StatisticsEvidence::try_new(
+                basis.clone(),
+                StatisticsEvidenceRevision::try_new(bytes::Bytes::from_static(b"frozen-revision"))
+                    .expect("evidence revision"),
+                StatisticsRowCoverage::AllVisibleRows,
+                metrics,
+            )
+            .expect("frozen row count"),
+        }
+    }
+
+    fn answer_exact_statistics(compilation: SqlCompilation, rows: u64) -> SqlCompileProgress {
+        answer_frozen_statistics(compilation, available_statistics_evidence(rows))
+    }
+
+    fn answer_frozen_statistics(
+        compilation: SqlCompilation,
+        frozen: DmlStatisticsEvidence,
+    ) -> SqlCompileProgress {
+        use novarocks_spi::connector::{
+            StatisticsMetricState, StatisticsMissing, StatisticsMissingKind,
+        };
+        let needs = match compilation.needs() {
+            SqlNeedBatch::Statistics(needs) => needs.to_vec(),
+            other => panic!("expected statistics needs, got {other:?}"),
+        };
+        let DmlStatisticsEvidence::Available {
+            binding,
+            label,
+            columns,
+            evidence,
+        } = frozen
+        else {
+            unreachable!()
+        };
+        let facts = needs
+            .iter()
+            .map(|need| {
+                assert_eq!(need.binding(), binding);
+                // Answer exactly the requested metrics; unavailable column metrics
+                // remain missing instead of borrowing defaults from another query.
+                let metrics = need
+                    .metrics()
+                    .iter()
+                    .map(|metric| {
+                        (
+                            metric.clone(),
+                            evidence.metrics().get(metric).cloned().unwrap_or_else(|| {
+                                StatisticsMetricState::Missing(StatisticsMissing {
+                                    kind: StatisticsMissingKind::NotCollected,
+                                    message: "not part of the frozen fixture".into(),
+                                })
+                            }),
+                        )
+                    })
+                    .collect();
+                let answer = novarocks_spi::connector::StatisticsEvidence::try_new(
+                    evidence.data_version().clone(),
+                    evidence.evidence_revision().clone(),
+                    evidence.row_coverage(),
+                    metrics,
+                )
+                .expect("complete requested metrics");
+                StatisticsFact::try_new(
+                    need,
+                    need.metrics().to_vec(),
+                    DmlStatisticsEvidence::Available {
+                        binding,
+                        label: label.clone(),
+                        columns: columns.clone(),
+                        evidence: answer,
+                    },
+                )
+                .expect("statistics fact")
+            })
+            .collect::<Vec<_>>();
+        SqlCompiler::finish(
+            compilation,
+            SqlFactBatch::Statistics(facts.into_boxed_slice()),
+            &SqlCompileControl::unbounded(),
+        )
+        .expect("statistics round")
+    }
+
+    fn complete_with_exact_statistics(
+        sql: &str,
+        intent: SqlCompileIntent,
+        rows: u64,
+    ) -> crate::compiler::SqlCompletedPlan {
+        let catalog = incomplete(
+            SqlCompiler::start(
+                request(sql, intent)
+                    .try_into_completion()
+                    .expect("completion seed"),
+            )
+            .expect("catalog need"),
+        );
+        let statistics = incomplete(answer_catalog(catalog));
+        let provider = incomplete(answer_exact_statistics(statistics, rows));
+        answer_provider(provider)
+            .into_complete()
+            .expect("completed plan")
+    }
+
+    fn frozen_table_statistics(plan: &novarocks_physical_plan::PhysicalPlan) -> Vec<&str> {
+        plan.annotations()
+            .iter()
+            .filter_map(|annotation| {
+                (annotation.subject == novarocks_physical_plan::AnnotationSubject::Plan
+                    && annotation.key.as_ref()
+                        == crate::optimizer::stats_input::TABLE_STATISTICS_ANNOTATION_KEY)
+                    .then_some(annotation.value.as_ref())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_and_explain_retain_only_the_optimizer_consumed_statistics() {
+        for rows in [7, 13] {
+            let query = complete_with_exact_statistics(
+                "select order_key from orders",
+                SqlCompileIntent::Query,
+                rows,
+            );
+            let explain = complete_with_exact_statistics(
+                "select order_key from orders",
+                SqlCompileIntent::Explain {
+                    level: crate::explain::ExplainLevel::Costs,
+                    analyze: false,
+                },
+                rows,
+            );
+            let expected = format!(
+                "TABLE STATS ref=0 table=iceberg.db.orders rows={rows} confidence=Exact source=IcebergManifest"
+            );
+            assert_eq!(
+                frozen_table_statistics(query.plan()),
+                vec![expected.as_str()]
+            );
+            assert_eq!(
+                frozen_table_statistics(explain.plan()),
+                vec![expected.as_str()]
+            );
+            for plan in [query.plan(), explain.plan()] {
+                // Exact source cardinality must have reached optimization as
+                // well as the final-plan provenance; a second display-only
+                // catalog lookup could not satisfy this relationship.
+                assert!(plan.annotations().iter().any(|annotation| {
+                    annotation.key.as_ref() == "optimizer.statistics"
+                        && (annotation.value.as_ref() == format!("rows={rows}")
+                            || annotation.value.starts_with(&format!("rows={rows},")))
+                }));
+                let costs = crate::explain::completed_tree::render_completed_plan_tree(
+                    plan,
+                    crate::explain::ExplainLevel::Costs,
+                )
+                .expect("costs text");
+                assert!(costs.iter().any(|line| line == &expected));
+                let contract = crate::explain::completed::render_completed_plan(
+                    plan,
+                    &[],
+                    crate::explain::ExplainLevel::Contract,
+                    None,
+                    crate::explain::completed::ExplainRenderBudget::default(),
+                )
+                .expect("contract text");
+                assert!(contract.iter().any(|line| line.contains(&expected)));
+                let normal = crate::explain::completed_tree::render_completed_plan_tree(
+                    plan,
+                    crate::explain::ExplainLevel::Normal,
+                )
+                .expect("normal text");
+                assert!(!normal.iter().any(|line| line.starts_with("TABLE STATS")));
+            }
+        }
+    }
+
+    #[test]
+    fn self_join_keeps_distinct_statistics_refs_and_relation_aliases() {
+        let completed = complete_with_exact_statistics(
+            "select lhs.order_key from orders lhs join orders rhs on lhs.order_key = rhs.order_key",
+            SqlCompileIntent::Explain {
+                level: crate::explain::ExplainLevel::Costs,
+                analyze: false,
+            },
+            17,
+        );
+        assert_eq!(
+            frozen_table_statistics(completed.plan()),
+            vec![
+                "TABLE STATS ref=0 table=iceberg.db.orders rows=17 confidence=Exact source=IcebergManifest",
+                "TABLE STATS ref=1 table=iceberg.db.orders rows=17 confidence=Exact source=IcebergManifest",
+            ]
+        );
+        let names = completed
+            .plan()
+            .annotations()
+            .iter()
+            .filter(|annotation| annotation.key.as_ref() == "sql.display_name")
+            .map(|annotation| annotation.value.as_ref())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"lhs.order_key"));
+        assert!(names.contains(&"rhs.order_key"));
+    }
+
+    #[test]
+    fn missing_and_source_free_statistics_are_never_fabricated() {
+        let catalog = incomplete(
+            SqlCompiler::start(
+                request("select order_key from orders", SqlCompileIntent::Query)
+                    .try_into_completion()
+                    .expect("seed"),
+            )
+            .expect("catalog"),
+        );
+        let statistics = incomplete(answer_catalog(catalog));
+        let provider = incomplete(answer_statistics(statistics));
+        let completed = answer_provider(provider)
+            .into_complete()
+            .expect("completed");
+        let provenance = frozen_table_statistics(completed.plan());
+        assert_eq!(provenance.len(), 1);
+        assert!(provenance[0].contains("rows=missing"));
+        assert!(provenance[0].contains("test fixture has no statistics"));
+        assert!(!provenance[0].contains("source=IcebergManifest"));
+        let values = SqlCompiler::start(
+            request("select 1", SqlCompileIntent::Query)
+                .try_into_completion()
+                .expect("seed"),
+        )
+        .expect("values")
+        .into_complete()
+        .expect("complete");
+        assert!(frozen_table_statistics(values.plan()).is_empty());
+    }
+
+    struct FrozenOrdersCatalog;
+
+    impl crate::catalog::PlannerTableProvider for FrozenOrdersCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<ResolvedAnalyzerTable, String> {
+            Ok(ResolvedAnalyzerTable::from_planner(
+                catalog,
+                database,
+                TableDef {
+                    name: table.to_string(),
+                    columns: vec![novarocks_types::schema::ColumnDef {
+                        name: "order_key".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: ScanSource::Sql(SqlScanSource::new(
+                        SqlTableBindingId::new_for_test(41),
+                        SqlTableIdentity::try_new(
+                            "iceberg".to_string(),
+                            database.to_string(),
+                            table.to_string(),
+                        )
+                        .expect("identity"),
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    )),
+                },
+            ))
+        }
+    }
+    impl crate::compiler::SqlCatalogSnapshot for FrozenOrdersCatalog {
+        fn planner_table_provider(&self) -> &dyn crate::catalog::PlannerTableProvider {
+            self
+        }
+    }
+
+    #[test]
+    fn dml_read_completion_retains_the_admitted_snapshot_after_optimization() {
+        let catalog = FrozenOrdersCatalog;
+        let functions = builtin_sql_function_catalog();
+        let analyzed = SqlCompiler::analyze(crate::compiler::SqlAnalyzeRequest::new(
+            SqlStatementInput::sql("select order_key from orders"),
+            SqlCompileIntent::Query,
+            request("select 1", SqlCompileIntent::Query).session,
+            SqlPlanningEnvironment::Distributed,
+            &catalog,
+            functions,
+            noop_constant_evaluator(),
+            None,
+            SqlCompileControl::unbounded(),
+        ))
+        .expect("analysis")
+        .into_pending()
+        .expect("analyzed source");
+        let statistics = DmlStatisticsSnapshot::from_evidence([available_statistics_evidence(23)]);
+        let (completion, needs) = crate::planning::dml::begin_final_dml_read_plan(
+            crate::compiler::SqlOptimizeRequest::new(
+                analyzed,
+                &statistics,
+                SqlCompileControl::unbounded(),
+            ),
+            &SessionOptimizerSettings::default(),
+        )
+        .expect("optimized DML source");
+        drop(statistics);
+        let reads =
+            crate::planning::dml::DmlFinalizedProviderReadSet::try_new(needs.iter().map(|need| {
+                crate::planning::dml::DmlFinalizedProviderRead {
+                    fact: ProviderReadFact::negotiated(need, provider_contract(need))
+                        .expect("provider fact"),
+                    read_budget: ScanReadBudget {
+                        max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                        max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+                    },
+                }
+            }))
+            .expect("frozen reads");
+        let plan = completion
+            .finish(
+                PlanVersionId::try_new([24; 16]).expect("version"),
+                PipelineDopDomain {
+                    min: 1,
+                    max: 8,
+                    requires_power_of_two: true,
+                },
+                reads,
+            )
+            .expect("DML final plan");
+        let expected = "TABLE STATS ref=0 table=iceberg.db.orders rows=23 confidence=Exact source=IcebergManifest";
+        assert_eq!(frozen_table_statistics(&plan), vec![expected]);
+        assert!(
+            crate::explain::completed_tree::render_completed_plan_tree(
+                &plan,
+                crate::explain::ExplainLevel::Costs
+            )
+            .expect("DML costs")
+            .iter()
+            .any(|line| line == expected)
+        );
+    }
+
+    #[test]
+    fn final_broadcast_annotation_uses_the_same_frozen_cardinality_and_byte_formula() {
+        let mut compile_request = request(
+            "select lhs.order_key from orders lhs join orders rhs on lhs.order_key = rhs.order_key",
+            SqlCompileIntent::Query,
+        );
+        compile_request
+            .session
+            .optimizer_settings
+            .effective_backend_count = Some(3.0);
+        compile_request
+            .session
+            .optimizer_settings
+            .cbo_broadcast_node_mem_budget_bytes = Some(268435456.0);
+        let catalog = incomplete(
+            SqlCompiler::start(compile_request.try_into_completion().expect("seed"))
+                .expect("catalog"),
+        );
+        let statistics = incomplete(answer_catalog(catalog));
+        let provider = incomplete(answer_exact_statistics(statistics, 10));
+        let completed = answer_provider(provider).into_complete().expect("complete");
+        let provenance = frozen_table_statistics(completed.plan());
+        assert_eq!(provenance.len(), 2);
+        assert!(
+            provenance
+                .iter()
+                .all(|row| row.contains("rows=10 confidence=Exact source=IcebergManifest"))
+        );
+        let decision = completed
+            .plan()
+            .annotations()
+            .iter()
+            .find(|annotation| annotation.key.as_ref() == "optimizer.broadcast")
+            .expect("small exact build has a frozen broadcast decision");
+        let fields = decision
+            .value
+            .split(", ")
+            .map(|part| part.split_once('=').expect("field"))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let number = |name: &str| fields[name].parse::<f64>().expect("numeric decision fact");
+        assert_eq!(fields["verdict"], "feasible");
+        assert_eq!(number("backends"), 3.0);
+        assert_eq!(number("per_node_budget_bytes"), 268435456.0);
+        // This fixture leaves AverageSize missing: the existing unknown-column
+        // statistics policy supplies eight bytes per row, not a measurement
+        // inferred from Int64. The supplied-width test below replaces it.
+        assert_eq!(number("build_bytes"), 10.0 * 8.0);
+        assert_eq!(number("hash_table_bytes"), 80.0 / 0.75 + 10.0 * 16.0);
+        assert_eq!(
+            number("fanout_bytes"),
+            80.0 * 3.0 * number("risk_multiplier")
+        );
+        assert!(
+            number("hash_table_bytes") * number("risk_multiplier")
+                <= number("per_node_budget_bytes")
+        );
+    }
+
+    #[test]
+    fn final_broadcast_consumes_supplied_approximate_width_and_keeps_exact_row_provenance() {
+        for supplied_width in [None, Some(20.25), Some(42.5)] {
+            let mut compile_request = request(
+                "select lhs.order_key from orders lhs join orders rhs on lhs.order_key = rhs.order_key",
+                SqlCompileIntent::Explain {
+                    level: crate::explain::ExplainLevel::Costs,
+                    analyze: false,
+                },
+            );
+            compile_request
+                .session
+                .optimizer_settings
+                .effective_backend_count = Some(3.0);
+            compile_request
+                .session
+                .optimizer_settings
+                .cbo_broadcast_node_mem_budget_bytes = Some(268435456.0);
+            let catalog = incomplete(
+                SqlCompiler::start(compile_request.try_into_completion().expect("seed"))
+                    .expect("catalog"),
+            );
+            let statistics = incomplete(answer_catalog(catalog));
+            let provider = incomplete(answer_frozen_statistics(
+                statistics,
+                available_statistics_evidence_with_average_size(10, supplied_width),
+            ));
+            // The owned continuation is the only remaining statistics holder.
+            // No catalog object or mutable external evidence exists at finish.
+            let completed = answer_provider(provider).into_complete().expect("complete");
+            let provenance = frozen_table_statistics(completed.plan());
+            assert_eq!(provenance.len(), 2);
+            assert!(
+                provenance
+                    .iter()
+                    .all(|line| line.contains("rows=10 confidence=Exact source=IcebergManifest"))
+            );
+            let decision = completed
+                .plan()
+                .annotations()
+                .iter()
+                .find(|annotation| annotation.key.as_ref() == "optimizer.broadcast")
+                .expect("frozen broadcast decision");
+            let fields = decision
+                .value
+                .split(", ")
+                .map(|part| part.split_once('=').expect("decision field"))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let number = |name: &str| fields[name].parse::<f64>().expect("finite decision number");
+            // Missing width keeps the existing ColumnStatistic::unknown(8)
+            // policy. Actual approximate width replaces that policy per metric;
+            // its inexact nature does not turn an exact RowCount into missing.
+            let width = supplied_width.unwrap_or(8.0);
+            let payload = 10.0 * width;
+            assert_eq!(fields["verdict"], "feasible");
+            assert_eq!(fields["forced"], "false");
+            assert_eq!(number("build_bytes"), payload);
+            assert_eq!(number("hash_table_bytes"), payload / 0.75 + 10.0 * 16.0);
+            assert_eq!(
+                number("fanout_bytes"),
+                payload * 3.0 * number("risk_multiplier")
+            );
+            assert_eq!(number("backends"), 3.0);
+            assert_eq!(number("per_node_budget_bytes"), 268435456.0);
+            assert!(number("hash_table_bytes") * number("risk_multiplier") <= 268435456.0);
+            assert!(number("fanout_bytes") <= 268435456.0);
+            let text = crate::explain::completed_tree::render_completed_plan_tree(
+                completed.plan(),
+                crate::explain::ExplainLevel::Costs,
+            )
+            .expect("completed costs");
+            assert!(
+                text.iter()
+                    .any(|line| line.contains(decision.value.as_ref()))
+            );
+        }
+    }
+
+    #[test]
+    fn source_free_ctes_do_not_fabricate_base_statistics_or_known_zero_rows() {
+        let scenarios = [
+            (
+                "WITH big_probe AS (SELECT generate_series AS k FROM TABLE(generate_series(1, 1000000))), no_stats AS (SELECT k FROM (SELECT generate_series + 0 AS k FROM TABLE(generate_series(1, 100000000))) projected WHERE k > 0) SELECT COUNT(*) AS cnt FROM big_probe p JOIN no_stats b ON p.k = b.k",
+                false,
+            ),
+            (
+                "WITH p AS (SELECT generate_series AS k FROM TABLE(generate_series(1, 1000))), b AS (SELECT generate_series AS k FROM TABLE(generate_series(1, 10))) SELECT COUNT(*) AS cnt FROM p JOIN b ON p.k = b.k",
+                true,
+            ),
+        ];
+        for (sql, small_build) in scenarios {
+            let mut compile_request = request(
+                sql,
+                SqlCompileIntent::Explain {
+                    level: crate::explain::ExplainLevel::Costs,
+                    analyze: false,
+                },
+            );
+            // Match the SQL fixtures' fixed probe/build roles. Otherwise join
+            // commutativity may legally broadcast the smaller probe relation.
+            compile_request.session.optimizer_settings.disabled_rules =
+                vec!["JoinReorder".to_string(), "JoinCommutativity".to_string()];
+            compile_request
+                .session
+                .optimizer_settings
+                .effective_backend_count = Some(3.0);
+            compile_request
+                .session
+                .optimizer_settings
+                .cbo_broadcast_node_mem_budget_bytes = Some(268435456.0);
+            let completed =
+                SqlCompiler::start(compile_request.try_into_completion().expect("seed"))
+                    .expect("source-free compilation")
+                    .into_complete()
+                    .expect("no catalog/statistics/provider needs");
+            assert!(frozen_table_statistics(completed.plan()).is_empty());
+            let text = crate::explain::completed_tree::render_completed_plan_tree(
+                completed.plan(),
+                crate::explain::ExplainLevel::Costs,
+            )
+            .expect("completed costs");
+            if small_build {
+                let decision = completed
+                    .plan()
+                    .annotations()
+                    .iter()
+                    .find(|annotation| annotation.key.as_ref() == "optimizer.broadcast")
+                    .expect("ten i64 keys permit broadcast");
+                let fields = decision
+                    .value
+                    .split(", ")
+                    .map(|part| part.split_once('=').expect("decision field"))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                let number = |name: &str| fields[name].parse::<f64>().expect("number");
+                assert_eq!(fields["verdict"], "feasible");
+                assert_eq!(number("risk_multiplier"), 2.0);
+                assert_eq!(number("build_bytes"), 80.0);
+                assert_eq!(number("hash_table_bytes"), 80.0 / 0.75 + 10.0 * 16.0);
+                assert_eq!(number("fanout_bytes"), 480.0);
+                assert!(
+                    text.iter()
+                        .any(|line| line.contains("HASH JOIN (BROADCAST, INNER"))
+                );
+            } else {
+                // These expressions have no external base-row observation.
+                // Generated cardinalities remain positive derived facts: the
+                // absence of a QueryStatsSnapshot is not a known-zero table.
+                assert!(
+                    text.iter()
+                        .any(|line| line.contains("HASH JOIN (PARTITIONED, INNER"))
+                );
+                assert!(
+                    !text
+                        .iter()
+                        .any(|line| line.contains("HASH JOIN (BROADCAST"))
+                );
+                assert!(
+                    text.iter()
+                        .any(|line| line.contains("GENERATE_SERIES(1, 100000000, 1)"))
+                );
+                assert!(completed.plan().annotations().iter().any(|annotation| {
+                    annotation.key.as_ref() == "optimizer.statistics"
+                        && annotation.value.starts_with("rows=100000000")
+                }));
+            }
+        }
     }
 }

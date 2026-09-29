@@ -57,6 +57,7 @@ while (($#)); do
   esac
 done
 
+ENV_FILE="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$ENV_FILE")"
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "NovaRocks generated environment is not initialized: $ENV_FILE" >&2
   echo "run docker/iceberg-rest/up.sh first" >&2

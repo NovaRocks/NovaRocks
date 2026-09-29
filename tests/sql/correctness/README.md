@@ -89,9 +89,7 @@ owning crate's Rust tests) or the corpus has a gap worth filling.
 
 ### Suites that get their own REST Catalog
 
-`docker/iceberg-rest` deliberately shares its Docker services across worktrees,
-which also means one REST Catalog database and one namespace listing for the
-whole machine.  Object-storage prefixes are per worktree and generated names
+相同输入的 worktree 附着同一版本化 catalog，因而共享其数据库和 namespace 列表；不同输入的 catalog 版本可以并存。  Object-storage prefixes are per worktree and generated names
 carry a uuid, so nothing collides -- but every attachment still enumerates
 every worktree's tables.
 
@@ -106,14 +104,10 @@ MinIO for them
 and environment for the whole run.  Such a suite cannot share a run with an
 ordinary one, and the runner says so rather than silently redirecting it.
 
-Nothing extra is needed to run one -- the fixture is started and torn down by
-the runner -- but Docker must be available, and the run costs one container
-start.
-`mv-publication-v11` additionally builds its checked-in REST hook image from
-locally provisioned base images without pulling from a registry. The hook
-replaces only that run's private REST container and publishes a loopback control
-port; the runner records the actual image ID and removes the whole private
-project after the case.
+隔离 fixture 由 runner 启停，需要已 provision 的 BOM 与本机 Docker；不回退固定端点。端点统一投影到 runner 配置及受控子进程环境。它有自己的唯一项目，并设置 `NOVA_ENV_UPDATE_CURRENT=false`，不会占用共享 current。
+`mv-publication-v11` 在创建前从本机 provisioned base 构建 checked-in hook image，以 publication-hook profile 启动私有 REST，并发布 loopback control URI；不会在 stock 就绪后替换容器。runner 记录 profile、实际镜像身份与 control URI，结束后删除其私有项目。hook 镜像的供给快照统一仍属于后续工作。
+
+共享套件使用 publication 中的实际端点和 `[env].fixture_env_file`；stable runtime 目录只用于运行数据。共享 catalog 删除前先退出 HMS 等外部 endpoint；force 不豁免该检查。新对象存储需要重建 benchmark READY 数据，旧 REST/Hive 不自动迁移或删除。
 
 ## Taxonomy
 

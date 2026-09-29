@@ -17,6 +17,7 @@
 
 import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,63 @@ SPEC.loader.exec_module(fixture)
 
 
 class FixtureContractTest(unittest.TestCase):
+    def test_publication_unset_then_exports_load_without_shell_or_ambient_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env_file = root / "env.sh"
+            exported = {
+                "NOVA_ENV_ID": "publication-env",
+                "NOVA_ENV_COMPOSE_PROJECT": "nr-fx-test-cat-123",
+                "NOVA_ENV_COMPOSE_FILE": str(root / "project directory" / "compose.yml"),
+                "NOVA_ENV_COMPOSE_ENV": str(root / "project directory" / "compose.env"),
+                "AWS_S3_ENDPOINT": "http://127.0.0.1:38000",
+                "AWS_S3_ACCESS_KEY_ID": "publication-key",
+                "AWS_S3_SECRET_ACCESS_KEY": "secret with 'quotes' and $literal",
+                "NOVAROCKS_FE_CONFIG": str(root / "publication" / "fe.toml"),
+                "NOVAROCKS_SQL_TEST_CONFIG": str(root / "publication" / "sql-test.toml"),
+            }
+            env_file.write_text(
+                "# Generated fixture publication.\n"
+                + "unset " + " ".join(exported) + " AMBIENT_ONLY\n"
+                + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in exported.items())
+            )
+            with (
+                mock.patch.dict(fixture.os.environ, {"AWS_S3_ENDPOINT": "http://foreign:9000", "AMBIENT_ONLY": "foreign"}),
+                mock.patch.object(fixture.subprocess, "run", side_effect=AssertionError("env parsing must not execute shell")),
+            ):
+                self.assertEqual(fixture.parse_env_file(env_file), exported)
+                runtime = fixture.load_runtime(env_file)
+            self.assertEqual(runtime.minio_endpoint_host, exported["AWS_S3_ENDPOINT"])
+            self.assertEqual(runtime.secret_key, exported["AWS_S3_SECRET_ACCESS_KEY"])
+            self.assertEqual(runtime.compose_file, Path(exported["NOVA_ENV_COMPOSE_FILE"]).resolve())
+
+    def test_unset_removes_only_prior_file_values_and_allows_reexport(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / "env.sh"
+            env_file.write_text(
+                "export FIRST=old\nSECOND=old\nKEEP=file\n"
+                "unset FIRST SECOND ABSENT\nexport FIRST=new\nEMPTY=\n"
+                "export LITERAL='$(never-run) ${KEEP}'\n"
+            )
+            with mock.patch.dict(fixture.os.environ, {"SECOND": "ambient", "KEEP": "ambient"}):
+                self.assertEqual(fixture.parse_env_file(env_file), {
+                    "FIRST": "new", "KEEP": "file", "EMPTY": "",
+                    "LITERAL": "$(never-run) ${KEEP}",
+                })
+
+    def test_env_parser_rejects_uncontrolled_unset_and_malformed_assignments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / "env.sh"
+            for invalid in (
+                "unset", "unset -v NAME", "unset NAME=other", "unset 1NAME",
+                "unset NAME; touch marker", "unset $(command)", "unset 'NAME'",
+                "unset NAME OTHER-NAME", "export BAD-NAME=value",
+                "export NAME='unterminated", "export NAME=value other",
+            ):
+                with self.subTest(invalid=invalid), self.assertRaises(fixture.FixtureError):
+                    env_file.write_text(invalid + "\n")
+                    fixture.parse_env_file(env_file)
+
     @staticmethod
     def runtime(root: Path) -> fixture.Runtime:
         return fixture.Runtime(

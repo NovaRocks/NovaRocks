@@ -19,10 +19,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
-# A full CI run resolves this once before system scenarios create and remove
-# their isolated fixtures. Prefer that stable entry over the mutable `current`
-# symlink, while keeping the normal interactive default unchanged.
+SOURCE_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SOURCE_ROOT}" && pwd)"
+# Normal runs replace this discovery hint with the publication returned by
+# the current bind. Dry-run never requires a ready entry.
 ENV_FILE="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
 # shellcheck source=benchmark_fixture_publication.sh
 source "$SCRIPT_DIR/benchmark_fixture_publication.sh"
@@ -235,7 +235,7 @@ resolve_paths() {
   raw_dir="$generated_dir/raw"
   archive_file="$cache_dir/$archive_basename"
   source_dir="$cache_dir/$archive_root"
-  spark_loader="$WORKSPACE_ROOT/tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
+  spark_loader="$SOURCE_ROOT/tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
 
   schema_ddl_file=""
   case "$suite" in
@@ -264,7 +264,7 @@ schema_ddl_file=$schema_ddl_file
 spark_loader=$spark_loader
 iceberg_format_version=3
 puffin_ndv=spark_compute_table_stats
-compose_project=$NOVA_ENV_COMPOSE_PROJECT
+producer_identity=not_checked_dry_run
 EOF
 }
 
@@ -290,8 +290,16 @@ PY
 }
 
 load_resolved_dataset() {
-  local expected actual
-  expected="$(python3 "$WORKSPACE_ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --workspace-root "$WORKSPACE_ROOT" --suite "$suite" --scale "$scale" --shared-root "$NOVA_ENV_SHARED_BENCHMARK_ROOT")" || die "unable to resolve fixture contract"
+  local expected actual shared_root
+  shared_root="$(python3 - "$resolved_dataset_file" <<'PYROOT'
+import json, sys
+r=json.load(open(sys.argv[1]))
+suffix='/' + r['dataset_key']['suite'] + '/' + r['dataset_key']['scale'].lower() + '/' + r['fixture_contract_id']
+assert r['dataset_root'].endswith(suffix)
+print(r['dataset_root'][:-len(suffix)])
+PYROOT
+)" || die "invalid resolved dataset root"
+  expected="$(python3 "$SOURCE_ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --workspace-root "$SOURCE_ROOT" --suite "$suite" --scale "$scale" --shared-root "$shared_root")" || die "unable to resolve fixture contract"
   actual="$(python3 - "$resolved_dataset_file" <<'PY'
 import json, sys
 print(json.dumps(json.load(open(sys.argv[1], encoding='utf-8')), sort_keys=True, separators=(',', ':')))
@@ -667,11 +675,29 @@ run_spark_loader() {
 }
 
 ensure_docker_services() {
+  local binding publication spark_container actual_image
   if [[ -n "${BENCHMARK_FIXTURE_UP_COMMAND:-}" ]]; then
-    "$BENCHMARK_FIXTURE_UP_COMMAND"
-    return
+    binding="$("$BENCHMARK_FIXTURE_UP_COMMAND")" || return 1
+  else
+    binding="$("$SOURCE_ROOT/docker/iceberg-rest/up.sh")" || return 1
   fi
-  "$WORKSPACE_ROOT/docker/iceberg-rest/up.sh"
+  publication="$(python3 - "$binding" <<'PYBIND'
+import json, pathlib, sys
+path=pathlib.Path(json.loads(sys.argv[1])["published_dir"])
+assert path.is_absolute() and path.is_dir()
+print(path.resolve())
+PYBIND
+)" || return 1
+  ENV_FILE="$publication/env.sh"
+  source_env
+  compose_args=(python3 "$SOURCE_ROOT/docker/iceberg-rest/runtime_entry.py" compose
+    --env-file "$NOVA_ENV_COMPOSE_ENV" -p "$NOVA_ENV_COMPOSE_PROJECT" -f "$NOVA_ENV_COMPOSE_FILE")
+  spark_container="$("${compose_args[@]}" ps -q spark)" || return 1
+  [[ -n "$spark_container" && "$spark_container" != *$'\n'* ]] || return 1
+  actual_image="$(docker inspect "$spark_container" --format '{{.Image}}')" || return 1
+  python3 "$SOURCE_ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" \
+    --workspace-root "$SOURCE_ROOT" --validate-producer "$publication" \
+    --resolved-dataset "$resolved_dataset_file" --actual-container "$spark_container" --actual-image "$actual_image"
 }
 
 new_identity() {
@@ -780,23 +806,18 @@ main() {
   parse_args "$@"
   validate_suite_and_scale
   configure_suite
-  source_env
   load_resolved_dataset
   resolve_paths
-
-  compose_args=(
-    docker compose
-    --env-file "$NOVA_ENV_COMPOSE_ENV"
-    -p "$NOVA_ENV_COMPOSE_PROJECT"
-    -f "$NOVA_ENV_COMPOSE_FILE"
-  )
 
   if [[ "$dry_run" == "1" ]]; then
     print_dry_run
     exit 0
   fi
 
-  ensure_docker_services
+  if ! ensure_docker_services; then
+    emit_error writer_failed "ProducerIdentityMismatch: unable to bind and verify the current Spark producer"
+    exit 1
+  fi
   ready_etag=""
   if check_readiness; then
     if [[ "$rebuild" != 1 ]]; then emit_result true false "$ready_etag"; exit 0; fi

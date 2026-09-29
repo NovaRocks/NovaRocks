@@ -610,6 +610,7 @@ pub fn build_final_frozen_connector_write_plan(
     )?;
     complete_connector_write_plan(
         physical,
+        &crate::optimizer::stats_input::QueryStatsSnapshot::empty(),
         sink.0,
         write_target_ordinal,
         &auxiliary,
@@ -626,6 +627,7 @@ pub fn build_final_frozen_connector_write_plan(
 /// accounted for under, so the two halves are separated here -- the needs
 /// leave, the facts come back, and the plan is lowered against them.
 pub struct DmlWriteCompletion {
+    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
     sink: DmlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
@@ -672,6 +674,7 @@ pub fn begin_final_connector_write_plan(
     .map_err(|error| error.to_string())?;
     Ok((
         DmlWriteCompletion {
+            query_statistics: compiled.statistics.snapshot,
             physical,
             sink,
             write_target_ordinal,
@@ -690,7 +693,7 @@ impl DmlWriteCompletion {
         reads: DmlFinalizedProviderReadSet,
         targets: DmlFinalizedWriteTargetSet,
     ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
-        crate::planner::distributed::build::lower_final_physical_write_plan(
+        let mut builder = crate::planner::distributed::build::lower_final_physical_write_plan(
             &self.physical,
             version,
             dop_domain,
@@ -702,9 +705,9 @@ impl DmlWriteCompletion {
                 targets: targets.0,
             },
         )
-        .map_err(|error| error.to_string())?
-        .finish()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        self.query_statistics.annotate_final_plan(&mut builder);
+        builder.finish().map_err(|error| error.to_string())
     }
 }
 
@@ -736,6 +739,7 @@ pub fn compile_final_connector_write_plan(
     )?;
     complete_connector_write_plan(
         physical,
+        &compiled.statistics.snapshot,
         sink.0,
         write_target_ordinal,
         &auxiliary,
@@ -744,8 +748,10 @@ pub fn compile_final_connector_write_plan(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_connector_write_plan(
     mut physical: crate::planner::physical::PhysicalPlanNode,
+    query_statistics: &crate::optimizer::stats_input::QueryStatsSnapshot,
     sink: crate::planner::distributed::write::contract::SqlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     auxiliary: &crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
@@ -758,7 +764,7 @@ fn complete_connector_write_plan(
     );
     let (final_context, finalized_targets) = final_write.into_parts();
     let (version, dop_domain, reads) = final_context.into_parts();
-    crate::planner::distributed::build::lower_final_physical_write_plan(
+    let mut builder = crate::planner::distributed::build::lower_final_physical_write_plan(
         &physical,
         version,
         dop_domain,
@@ -770,13 +776,14 @@ fn complete_connector_write_plan(
             targets: finalized_targets.0,
         },
     )
-    .map_err(|error| error.to_string())?
-    .finish()
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    query_statistics.annotate_final_plan(&mut builder);
+    builder.finish().map_err(|error| error.to_string())
 }
 
 /// One internal DML read, optimized and waiting for its provider facts.
 pub struct DmlReadCompletion {
+    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
 }
 
@@ -800,7 +807,13 @@ pub fn begin_final_dml_read_plan(
         settings.connector_static_predicate_pushdown_enabled(),
     )
     .map_err(|error| error.to_string())?;
-    Ok((DmlReadCompletion { physical }, needs))
+    Ok((
+        DmlReadCompletion {
+            physical,
+            query_statistics: compiled.statistics.snapshot,
+        },
+        needs,
+    ))
 }
 
 impl DmlReadCompletion {
@@ -810,7 +823,7 @@ impl DmlReadCompletion {
         dop_domain: novarocks_physical_plan::PipelineDopDomain,
         reads: DmlFinalizedProviderReadSet,
     ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
-        let builder = match reads.into_optional() {
+        let mut builder = match reads.into_optional() {
             Some(reads) => {
                 crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
                     &self.physical,
@@ -826,6 +839,7 @@ impl DmlReadCompletion {
             ),
         }
         .map_err(|error| error.to_string())?;
+        self.query_statistics.annotate_final_plan(&mut builder);
         builder.finish().map_err(|error| error.to_string())
     }
 }
@@ -835,6 +849,7 @@ impl DmlReadCompletion {
 /// stable capture fingerprint, and sealed write plan derived from it.
 #[derive(Clone, Debug)]
 pub struct DmlCtasSourcePlan {
+    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     optimized: crate::optimizer::OptimizedOperatorNode,
     function_catalog: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
 }
@@ -889,6 +904,7 @@ pub fn compile_ctas_source(
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
     Ok(DmlCtasSourcePlan {
+        query_statistics: compiled.statistics.snapshot,
         optimized: compiled.optimized_tree,
         function_catalog: compiled.function_catalog,
     })
@@ -928,6 +944,7 @@ pub fn begin_final_ctas_connector_write_plan(
     .map_err(|error| error.to_string())?;
     Ok((
         DmlWriteCompletion {
+            query_statistics: source.query_statistics.clone(),
             physical,
             sink,
             write_target_ordinal,
@@ -1065,6 +1082,7 @@ pub struct DmlFinalChangeStreamPlan {
 /// An optimized change stream whose provider reads have been stated but not
 /// frozen. The application supplies their exact facts before lowering.
 pub struct DmlChangeStreamCompletion {
+    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
     dag: crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     auxiliary: crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
@@ -1077,21 +1095,20 @@ impl DmlChangeStreamCompletion {
     ) -> Result<DmlFinalChangeStreamPlan, String> {
         let (final_context, finalized_targets) = final_write.into_parts();
         let (version, dop_domain, reads) = final_context.into_parts();
-        let physical_plan =
-            crate::planner::distributed::build::lower_final_change_stream_write_plan(
-                &self.physical,
-                version,
-                dop_domain,
-                crate::planner::distributed::build::FinalChangeStreamWriteLowering {
-                    reads,
-                    dag: self.dag,
-                    auxiliary: &self.auxiliary,
-                    targets: finalized_targets.0,
-                },
-            )
-            .map_err(|error| error.to_string())?
-            .finish()
-            .map_err(|error| error.to_string())?;
+        let mut builder = crate::planner::distributed::build::lower_final_change_stream_write_plan(
+            &self.physical,
+            version,
+            dop_domain,
+            crate::planner::distributed::build::FinalChangeStreamWriteLowering {
+                reads,
+                dag: self.dag,
+                auxiliary: &self.auxiliary,
+                targets: finalized_targets.0,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        self.query_statistics.annotate_final_plan(&mut builder);
+        let physical_plan = builder.finish().map_err(|error| error.to_string())?;
         let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
         Ok(DmlFinalChangeStreamPlan {
             physical_plan,
@@ -1100,8 +1117,10 @@ impl DmlChangeStreamCompletion {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
+    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     effect_output_ordinal: usize,
@@ -1155,6 +1174,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     .map_err(|error| error.to_string())?;
     Ok((
         DmlChangeStreamCompletion {
+            query_statistics,
             physical,
             dag,
             auxiliary,
@@ -1232,6 +1252,7 @@ pub fn begin_final_dml_change_stream(
         .ok_or_else(|| "change-stream producer has no effect output occurrence".to_string())?;
     begin_final_change_stream_producer_with_effect_ordinal(
         producer,
+        compiled.statistics.snapshot,
         request.routes,
         request.statistics_targets,
         effect_output_ordinal,
@@ -1275,6 +1296,7 @@ pub fn compile_final_dml_change_stream(
     };
     seal_final_change_stream_producer(
         producer,
+        compiled.statistics.snapshot,
         request.routes,
         request.statistics_targets,
         compiled.function_catalog.as_ref(),
@@ -1288,6 +1310,7 @@ pub fn compile_final_dml_change_stream(
 
 pub(crate) fn seal_final_change_stream_producer(
     producer: crate::optimizer::OptimizedOperatorNode,
+    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
@@ -1309,6 +1332,7 @@ pub(crate) fn seal_final_change_stream_producer(
     }
     seal_final_change_stream_producer_with_effect_ordinal(
         producer,
+        query_statistics,
         routes,
         statistics_targets,
         effect_output_ordinal,
@@ -1319,6 +1343,7 @@ pub(crate) fn seal_final_change_stream_producer(
 
 pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
+    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     effect_output_ordinal: usize,
@@ -1362,7 +1387,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     );
     let (final_context, finalized_targets) = context.final_write.into_parts();
     let (version, dop_domain, reads) = final_context.into_parts();
-    let physical_plan = crate::planner::distributed::build::lower_final_change_stream_write_plan(
+    let mut builder = crate::planner::distributed::build::lower_final_change_stream_write_plan(
         &physical,
         version,
         dop_domain,
@@ -1373,9 +1398,9 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
             targets: finalized_targets.0,
         },
     )
-    .map_err(|error| error.to_string())?
-    .finish()
     .map_err(|error| error.to_string())?;
+    query_statistics.annotate_final_plan(&mut builder);
+    let physical_plan = builder.finish().map_err(|error| error.to_string())?;
     let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
     Ok(DmlFinalChangeStreamPlan {
         physical_plan,

@@ -22,12 +22,9 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 fixture_dir=$(cd "$script_dir/.." && pwd)
 repo_root=$(cd "$fixture_dir/../.." && pwd)
 
-if [[ ! -f "$fixture_dir/runtime/current/env.sh" ]]; then
-    "$fixture_dir/up.sh" --prepare-only
-fi
-
-source "$fixture_dir/runtime/current/env.sh"
-"$fixture_dir/up.sh"
+# Bind before reading paths; an old current pointer is not this request's result.
+publication="$("$fixture_dir/up.sh" | python3 -c 'import json, sys; print(json.load(sys.stdin)["published_dir"])')"
+source "$publication/env.sh"
 
 run_id="$(date +%s)-$$"
 export NR_HADOOP_FENCE_MINIO_WAREHOUSE="${NOVAROCKS_ICEBERG_TEST_WAREHOUSE%/}/hadoop-fencing-$run_id"

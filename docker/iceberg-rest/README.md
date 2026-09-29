@@ -19,281 +19,123 @@ under the License.
 
 # Iceberg REST + MinIO + Spark Test Environment
 
-Shared local Iceberg REST Catalog + MinIO object store + Spark runtime for
-NovaRocks development and CI.
+此目录提供开发与 CI 的 Iceberg REST Catalog、MinIO 和 Spark fixture。共享模式按已验证输入生成运行实例：同输入附着同一实例，输入变化允许版本并存；一个对象存储实例可供多个 catalog 使用。旧 `nr-iceberg-rest` / `nr-iceberg-hive` 项目、数据和卷不会被自动接管、迁移或删除。
 
-This environment is the canonical test fixture for the
-`iceberg-compatibility` SQL suite (cross-engine: Spark writes, NovaRocks
-reads) and is also used by the standard `iceberg` suite. The Codex workspace
-manifest at `.codex/environments/environment.toml` points its setup hook at
-`up.sh --prepare-only` and its cleanup hook at
-`down.sh --runtime-only --purge`.
+## 输入、实例与端点
 
-By default, all worktrees share one Docker Compose project
-(`nr-iceberg-rest`) on the services' conventional local ports: MinIO `9000`,
-MinIO console `9001`, Iceberg REST `8181`, and Spark UI `4040`. Each worktree
-still gets its own generated runtime entry, object-store prefixes, SQL test
-config, and allocated NovaRocks standalone MySQL / gRPC ports.
+输入供给按 [ADR-0155](../../docs/adr/ADR-0155-fixture-provisioning-and-offline-verification.md) 分离：
 
-Standard SSB, TPC-H, and TPC-DS fixtures are different: they are immutable,
-versioned objects under `s3://novarocks/shared/benchmarks`, owned by this
-shared MinIO volume. The generated environment exports the exact shared root.
-Concurrent first writers use separate staging prefixes and an atomic `READY`
-publication; no helper image or Docker lease container is needed. A worktree
-may read a READY fixture but must never delete or mutate it through normal
-cleanup.
+```bash
+docker/fixture-inputs/provision.sh   # Explicit acquisition and build; run when inputs change or are absent.
+docker/fixture-inputs/verify.sh
+docker/iceberg-rest/up.sh
+```
 
-Defaults live in `docker/iceberg-rest/shared.env`. Edit that file, or set
-`NOVA_ENV_CONFIG_FILE=/path/to/file.env`, to override the shared compose
-project, service ports, credentials, or NovaRocks port allocation range.
-Set `NOVA_ENV_SHARED_DOCKER=false` in the config file when a fully isolated
-per-worktree Docker project is required.
+`NOVA_FIXTURE_STORE` 指定 BOM store。provision 可以下载、pull 和 build；verify、共享 runtime owner 和普通测试消费者只读取本机 BOM 与镜像。BOM 前置条件缺失/不一致返回 75；CI 归为 BLOCKED。端口不可用、身份不符、外部连接和其他 owner 失败归为 VERIFY FAILED，不进入 Cargo gates。
 
-`up.sh` normally claims `docker/iceberg-rest/runtime/current`, because that link
-is how a worktree publishes its environment: `CLAUDE.md` tells every agent and
-developer to `source docker/iceberg-rest/runtime/current/env.sh`. A throwaway
-environment whose ports die with it must not claim that link, so set
-`NOVA_ENV_UPDATE_CURRENT=false`. `up.sh` then leaves the link untouched, `down.sh`
-refuses to remove it, and the caller addresses its generated entry by path
-instead. The isolated system-test fixture in
-`tests/cluster-harness/src/isolated_iceberg_rest.rs` always sets this.
+供给阶段仍可能移动 daemon 全局 derived-image alias，私有 BOM store 本身不隔离 alias。owner 为实例保存独立标签和真实 image ID；benchmark bootstrap 先 bind，再读取本次 publication，并核对实际 Spark 容器 image ID 与 BOM producer。精确供给快照的竞态消除属于后续工作，不能把当前核验描述为已经消除竞态。
 
-## Prepare Runtime Only
+控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-runtime`，`NOVA_FIXTURE_RUNTIME_DIR` 可覆盖。owner locator 是控制目录加本机 daemon ID；实例的资源命名也包含该所有权命名空间。对象存储与 catalog 分别拥有项目、记录和卷；catalog 使用持久数据库，并连接到其对象存储。MinIO 恢复会重新接入全部仍有记录的 catalog 网络。
 
-Generate this worktree's runtime entry and configs without starting Docker:
+`shared.env` 是声明输入：凭证、版本、benchmark root 和端口分配范围。`NOVA_ENV_CONFIG_FILE` 可指定其它声明文件；共享模式的服务端口由 owner 在 `NOVA_ENV_RUNTIME_PORT_START..NOVA_ENV_RUNTIME_PORT_END` 分配（默认 `28000..28999`），记录存在时恢复沿用预留。NovaRocks FE/BE listener 仍按 worktree 分配。不要以 `9000/8181/4040` 或旧 Compose 项目代替运行记录。
+
+## 单一 publication
+
+共享模式的布局：
+
+```text
+docker/iceberg-rest/runtime/current -> <env-id>
+runtime/<env-id>/
+  .owner.lock                 # Stable worktree lock.
+  published -> publications/<publication-id>
+  env.sh -> published/env.sh   # Discovery link; resolve once per consumer start.
+  publications/<publication-id>/
+    env.sh manifest.json README.md fe.toml be.toml sql-test.toml
+    ice-rest-catalog.sql spark-defaults.conf spark-iceberg-v3-smoke.sql
+  frontend-state.sqlite       # Stable runtime data, outside publications.
+```
+
+`published` 是绑定事实和配置的唯一原子提交点。owner 在固定 worktree 锁内完整写入、落盘 publication，再替换指针；shell 返回后不补写或删除共享入口。current 只是定位器，不是第二份绑定权威。每个消费者启动时固定一次 publication：
+
+```bash
+docker/iceberg-rest/up.sh
+fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
+source "$fixture_publication/env.sh"
+```
+
+`NOVA_ENV_REST_ENV_FILE` 是该 publication 的不可变 env 路径；`NOVA_ENV_RUNTIME_DIR` 是稳定运行数据目录，不可拼接成 `NOVA_ENV_RUNTIME_DIR/env.sh`。runner 配置的 `[env].fixture_env_file` 同样固定到 publication。显式解绑或 force 可以使在线消费者失效；这里没有在线租约或自动退出协调。
+
+输出包括：
+
+- `NOVA_ENV_OBJECT_STORE_RUNTIME`、`NOVA_ENV_CATALOG_RUNTIME`、`NOVA_ENV_OBJECT_STORE_CONTAINER`：精确实例及 MinIO 容器身份。
+- `NOVA_ENV_COMPOSE_PROJECT/FILE/ENV`：catalog 保存的项目与定义。
+- `AWS_S3_ENDPOINT`、`NOVAROCKS_ICEBERG_REST_URI`：实际 host 端点。
+- `NOVA_ENV_REST_SERVER_WAREHOUSE_URI`：catalog 服务端 warehouse；`NOVA_ENV_REST_WAREHOUSE_URI` / `NOVAROCKS_ICEBERG_REST_WAREHOUSE` 是客户端 warehouse，不能混用。
+- `NOVAROCKS_FE_CONFIG/BE_CONFIG/SQL_TEST_CONFIG`、`NOVAROCKS_SPARK_DEFAULTS`：同 publication 的配置。
+- `manifest.json.runtime`：两个运行记录、owner locator、producer receipt、profile、control URI、template model hash、publication/entry 路径。
+
+FE 配置使用稳定 SQLite StateStore、worktree cluster ID 及正常 BE announce/heartbeat，不包含持久 backend membership。重新发布配置不迁移或删除 SQLite。不要以删 publication 当作清除本地 StateStore。
+
+## Offline prepare
 
 ```bash
 docker/iceberg-rest/up.sh --prepare-only
 source docker/iceberg-rest/runtime/current/env.sh
 ```
 
-This is what Codex environment setup does. It records the shared Docker ports
-and the per-worktree NovaRocks server ports, but it does not create or start
-containers.
+这是 Codex setup 路径，不调用 Docker，也不验证 BOM。它沿用保存的 owner locator；保存的两个记录为 ready 时可以发布配置，但 `ready=true` 不证明当前服务健康。首次或记录缺失/deleting 时发布 unbound，`env.sh` 可 source 且 `NOVA_ENV_READY=false`，没有占位端点/镜像。正常 up 才验证、恢复与附着。只做 prepare 的 fresh worktree 仍可由 benchmark bootstrap 完成 bind，不能要求它预先具有端点。
 
-## Start Docker
+## 启动消费者
 
-```bash
-docker/fixture-inputs/provision.sh   # explicit acquisition/build step; run when inputs change or are absent
-docker/iceberg-rest/up.sh
-```
-
-The script starts or reuses the shared Docker services, writes generated state
-under a workspace-specific directory, and publishes a fixed discovery entry:
-
-```text
-docker/iceberg-rest/runtime/<env-id>/
-docker/iceberg-rest/runtime/current/
-```
-
-Important generated files (under the runtime entry):
-
-- `env.sh` — shell exports for this workspace.
-- `manifest.json` — machine-readable ports, endpoints, compose project, and config paths.
-- `README.md` — human-readable summary of the active environment.
-- `fe.toml` — deployable FE config with StateStore, an additive BE seed, and
-  the FE Native/management listeners.
-- `be.toml` — deployable BE config with the BE Native/management listeners.
-- `sql-test.toml` — SQL test runner config.
-- `ice-rest-catalog.sql` — REST catalog DDL for this workspace.
-- `spark-defaults.conf` — Spark catalog config for REST Catalog + MinIO.
-- `spark-iceberg-v3-smoke.sql` — Spark SQL that creates and writes a format-v3 Iceberg row-lineage table.
-
-The generated FE config uses the per-worktree SQLite StateStore at
-`runtime/<env-id>/frontend-state.sqlite`, with `<env-id>` as the cluster ID and
-`fe-1` as the deployment owner. The frontend maintenance service stores
-asynchronous `ALTER TABLE ... OPTIMIZE` jobs there, so terminal job history
-survives a server restart that reuses the runtime entry. Purging the runtime
-entry also removes this local durability fixture.
-
-For `lake-publication` native-cluster acceptance, the SQL runner starts its
-test-only transparent publication proxy automatically. It redirects only that
-suite's `iceberg_rest_uri` and forwards all ordinary Iceberg REST requests to
-the configured Catalog. The proxy has no SQLite state, no private Catalog
-extension, and no publication authority: it can only consume one bounded fault
-token at a standard REST stage-create or table-commit boundary. The suite is
-explicit-only, requires `--cluster-mode cross-process --cluster-size 3 -j 1`,
-and cannot be selected together with an ordinary SQL suite.
-
-Use the generated configs:
+已 source 上述同一次 publication 后：
 
 ```bash
-source docker/iceberg-rest/runtime/current/env.sh
-
 NO_PROXY=127.0.0.1,localhost \
 cargo run -p novarocks-server -- standalone --role all-in-one \
   --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
 
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite iceberg --mode verify
+NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_REST_ENV_FILE" \
+  docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite iceberg-compatibility --mode verify
-
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite iceberg-rest --mode verify
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg,iceberg-rest,iceberg-compatibility \
+  --mode verify --cluster-mode cross-process --cluster-size 3
 ```
 
-Run the Spark Iceberg v3 smoke SQL:
+后台启动 server 时，首个连接必须等待该进程日志中的 `NOVAROCKS_READY`，不能只 probe MySQL port。all-in-one 是 smoke 便利形态，产品验收为 1FE+3BE。
+
+Spark 使用生成的 Docker 网络端点（`rest:8181` 与 `minio:9000`）；host 消费者使用生成的 host 端点。`spark-shell.sh`、Paimon prepare、Trino interop 和 benchmark bootstrap 接收明确的 `NOVA_ENV_REST_ENV_FILE`。benchmark 是 `s3://novarocks/shared/benchmarks` 下的不可变 READY fixture；worktree purge 不删除它。新的对象存储为空，第一次 ensure 需要重建数据，--check 不负责补建。
+
+HMS 由 `docker/iceberg-hive/` 的 owner 管理，按精确 catalog 接网；它的数据库与容器不归 REST owner。HMS 活着时，普通和 force catalog 删除均以 `ExternalAttachmentsPresent` 拒绝。先用 HMS down 撤销精确连接、退出自己的项目，再删除 catalog。不要以 REST owner 停止别人的 HMS 项目。
+
+## 显式解绑与实例管理
 
 ```bash
-docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
+docker/iceberg-rest/down.sh --runtime-only          # Unbind; retain data references.
+docker/iceberg-rest/down.sh --runtime-only --purge  # Purge every recorded private data location, then unbind.
 ```
 
-The Spark service talks to REST Catalog at `http://rest:8181` and MinIO at
-`http://minio:9000` from inside the Docker network. NovaRocks talks to the
-same services through the host-mapped endpoints recorded in `env.sh`.
+解绑发布 unbound，回收旧输出并保留固定入口、锁及稳定运行数据。没有 `--purge` 时保留全部 `data_locations`，包括旧 owner/对象存储位置。purge 全部成功才清空引用；任意位置失败保留原 publication 和引用供重试。坏指针/索引不能被当作无引用。标准 READY 数据不属于这些私有前缀。
 
-## Status
+实例管理使用精确 ID 与 manifest 中的 owner locator；全局选项放在子命令之前。以下示例从当前 ready publication 取所有权：
 
 ```bash
-docker/iceberg-rest/status.sh
+fixture_root="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["owner_locator"]["control_root"])' "$NOVA_ENV_MANIFEST")"
+fixture_daemon="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["owner_locator"]["daemon_id"])' "$NOVA_ENV_MANIFEST")"
+docker/iceberg-rest/fixture-runtime.sh --root "$fixture_root" --daemon "$fixture_daemon" list
+docker/iceberg-rest/fixture-runtime.sh --root "$fixture_root" --daemon "$fixture_daemon" status "$NOVA_ENV_CATALOG_RUNTIME"
 ```
 
-## Stop
+在记录中确认目标 ID 后，使用相同全局选项执行 `stop <id>` 或 `delete <id>`；`--force` 在 ID 之后。
 
-```bash
-docker/iceberg-rest/down.sh
-```
+- catalog 有绑定时普通 stop/delete 拒绝；force-stop 可中断消费者。force-delete 仅条件解绑仍指向目标的 worktree，保留全部数据引用；不能误解绑已经切到另一版本的入口。
+- 对象存储有 catalog 或数据引用时普通 stop 与任何 delete 均拒绝；force-stop 可以中断消费者，但保留记录、卷和端口以供恢复。`--force` 不能豁免对象存储 delete 的引用保护。
+- 外部 endpoint 尚在时普通/force catalog delete 都在进入 deleting、停止或清理前拒绝。先退出各消费者，再按精确记录操作。
+- 删除持久化 `deleting + deletion_id`；重试复核同一操作身份，逐步核验资源与标签消失后退休记录。旧删除者不能删除同 key 重建后的新资源。
 
-In shared Docker mode this leaves the shared Docker services running. It is
-safe for a worktree cleanup because other worktrees may be using the same
-containers.
+共享模式的 `down.sh --docker/--volumes` 被拒绝，使用上面的显式 manager。隔离 harness 设置 `NOVA_ENV_SHARED_DOCKER=false`、唯一 `nr-isolated-rest-*` 项目和 `NOVA_ENV_UPDATE_CURRENT=false`，不改共享 current；它保留精确项目/卷确认的私有 teardown。publication-hook profile 在创建前选定，不先启动 stock 再替换 REST。
 
-Remove the current worktree runtime entry:
-
-```bash
-docker/iceberg-rest/down.sh --runtime-only --purge
-```
-
-Stop the shared Docker services explicitly:
-
-```bash
-docker/iceberg-rest/down.sh --docker
-```
-
-Remove the shared Docker volume as well:
-
-```bash
-docker/iceberg-rest/down.sh --docker --volumes
-```
-
-The canonical `nr-iceberg-rest` volume is deliberately protected and this
-command rejects it. It is only available for a task-created, noncanonical
-project when all of the following exact confirmations are set:
-
-```bash
-NOVA_ENV_ALLOW_VOLUME_DELETE=true \
-NOVA_ENV_EXPECTED_COMPOSE_PROJECT=nr-tst10-example \
-NOVA_ENV_EXPECTED_MINIO_VOLUME=nr-tst10-example_minio-data \
-docker/iceberg-rest/down.sh --docker --volumes
-```
-
-`down.sh --runtime-only --purge` deletes
-`docker/iceberg-rest/runtime/<env-id>/` and removes
-`docker/iceberg-rest/runtime/current` when that entry points at the purged
-worktree environment. It does not stop or remove shared Docker services.
-A caller that ran `up.sh` with `NOVA_ENV_UPDATE_CURRENT=false` never claimed the
-link, so `down.sh` leaves it alone.
-
-Teardown is designed to be repeatable. `down.sh` derives its environment id by
-hashing the workspace root, which stops resolving once a temporary workspace is
-removed; pass `NOVA_ENV_ID=<env-id>` to address a known entry exactly. A
-workspace root that no longer exists is a warning rather than a fatal error, so
-a crashed run's Docker project and runtime entry can still be reclaimed.
-
-## Required fixture inputs
-
-The fixture never acquires or builds inputs during a test run. Before first use, or after
-`docker/fixture-inputs/lock.json` changes, run the explicit supply step:
-
-```bash
-docker/fixture-inputs/provision.sh
-docker/fixture-inputs/verify.sh
-```
-
-镜像站只能作为 provision 的传输端点，不能改变 lock 的平台或 digest。例如 Docker Hub 不可达而同一
-Spark manifest 可由镜像站传输时：
-
-```bash
-docker/fixture-inputs/provision.sh \
-  --image-source paimon-spark-base=dockerproxy.net/apache/spark \
-  --image-source iceberg-spark-base=dockerproxy.net/apache/spark
-```
-
-`--image-source` 只能按 logical input 指定 repository，拒绝 tag/digest 覆盖；发布后的 BOM 和所有
-verify consumer 都只做本机校验。
-
-Provision locks and validates the service manifests, the four Spark/Iceberg JARs, and the
-derived Spark image before atomically publishing the local BOM. `up.sh` only verifies that
-BOM and starts Compose with its aliases (`pull_policy: never`); it cannot pull or build a
-fallback image. A missing or mismatched BOM is an actionable prerequisite failure.
-`up.sh --prepare-only` intentionally avoids Docker and records `fixture_inputs.verified=false`; it
-does not prove that the fixture is runnable.
-
-## CI Integration
-
-`up.sh --prepare-only`, `up.sh`, and `down.sh --runtime-only --purge` are
-designed to be safe to call from CI:
-
-- `up.sh --prepare-only` is the Codex setup path. It only writes runtime
-  config and does not touch Docker.
-- `up.sh` is idempotent — re-runs reuse the existing runtime entry and
-  allocated NovaRocks port if `env.sh` already exists.
-- Docker service ports come from `shared.env` and default to `9000`, `9001`,
-  `8181`, and `4040`.
-- The NovaRocks FE MySQL port is allocated per worktree from
-  `NOVA_ENV_MYSQL_PORT_START` / `NOVA_ENV_MYSQL_PORT_RANGE`.
-- The four NovaRocks listener ports are allocated per worktree from
-  `NOVA_ENV_FE_GRPC_PORT_START`, `NOVA_ENV_FE_HTTP_PORT_START`,
-  `NOVA_ENV_BE_GRPC_PORT_START`, and `NOVA_ENV_BE_HTTP_PORT_START` (with their
-  corresponding `_RANGE` settings).
-- `down.sh --runtime-only --purge` removes only the per-worktree runtime
-  directory and its two private object prefixes. It never removes the shared
-  benchmark fixture root.
-- The runtime directory (`docker/iceberg-rest/runtime/`) is gitignored.
-
-A typical CI step:
-
-```bash
-docker/iceberg-rest/up.sh
-source docker/iceberg-rest/runtime/current/env.sh
-trap "docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
-
-SERVER_LOG=/tmp/novarocks-server.log
-NO_PROXY=127.0.0.1,localhost \
-cargo run --release -p novarocks-server -- standalone \
-  --role all-in-one \
-  --fe-config "$NOVAROCKS_FE_CONFIG" \
-  --be-config "$NOVAROCKS_BE_CONFIG" >"$SERVER_LOG" 2>&1 &
-SERVER_PID=$!
-trap "kill $SERVER_PID; docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
-
-# Wait for this process's post-bind marker. A port probe can hit a stale process.
-for i in $(seq 1 60); do
-  if grep -q '^NOVAROCKS_READY ' "$SERVER_LOG"; then break; fi
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    tail -40 "$SERVER_LOG" >&2
-    exit 1
-  fi
-  sleep 1
-done
-grep -q '^NOVAROCKS_READY ' "$SERVER_LOG" || {
-  tail -40 "$SERVER_LOG" >&2
-  exit 1
-}
-
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite iceberg-compatibility --mode verify
-
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite iceberg-rest --mode verify
-```
+旧 REST/Hive 退出是独立的用户操作：确认旧消费者已退出、数据已保存且无其它 worktree 使用后再安排。新 owner 不扫描或删除它们。运行实例所有权规则见 [ADR-0165](../../docs/adr/ADR-0165-versioned-fixture-runtime-ownership.md)。
 
 ## External-Engine MV Read Interop
 

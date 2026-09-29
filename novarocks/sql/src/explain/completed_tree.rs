@@ -48,6 +48,14 @@ pub fn render_completed_plan_tree(
 ) -> Result<Vec<String>, SqlCompileError> {
     let context = TreeContext::new(plan, level);
     let mut out = Vec::new();
+    if context.costs() {
+        out.extend(plan.annotations().iter().filter_map(|annotation| {
+            (annotation.subject == AnnotationSubject::Plan
+                && annotation.key.as_ref()
+                    == crate::optimizer::stats_input::TABLE_STATISTICS_ANNOTATION_KEY)
+                .then(|| annotation.value.to_string())
+        }));
+    }
     context.render_runtime_filters(&mut out);
     for (display_id, fragment_id) in context.fragment_order().into_iter().enumerate() {
         let Some(fragment) = plan.fragments().get(&fragment_id) else {

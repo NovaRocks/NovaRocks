@@ -27,7 +27,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
 # See spark-sql.sh: CI supplies its already-resolved generated environment so
 # this helper does not depend on the mutable interactive `current` link.
-CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$SCRIPT_DIR/runtime/current/env.sh}"
+CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
+CURRENT_ENV="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CURRENT_ENV")"
 
 if [[ ! -f "$CURRENT_ENV" ]]; then
   echo "environment is not initialized: $CURRENT_ENV" >&2
@@ -37,6 +38,7 @@ fi
 
 # shellcheck disable=SC1090
 source "$CURRENT_ENV"
+[[ "${NOVA_ENV_READY:-false}" == "true" ]] || { echo "fixture is not ready; run docker/iceberg-rest/up.sh" >&2; exit 1; }
 
 scala_file="${1:-}"
 if [[ -z "$scala_file" ]]; then
@@ -53,7 +55,7 @@ if [[ ! -f "$NOVAROCKS_SPARK_DEFAULTS" ]]; then
 fi
 
 compose_args=(
-  docker compose
+  python3 "$SCRIPT_DIR/runtime_entry.py" compose
   --env-file "$NOVA_ENV_COMPOSE_ENV"
   -p "$NOVA_ENV_COMPOSE_PROJECT"
   -f "$NOVA_ENV_COMPOSE_FILE"

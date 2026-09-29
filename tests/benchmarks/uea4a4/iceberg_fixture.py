@@ -356,7 +356,8 @@ def prepare(args: argparse.Namespace) -> int:
 
 
 def verify(args: argparse.Namespace) -> int:
-    runtime = support.load_runtime(Path(args.env_file).expanduser().resolve())
+    env_file = Path(args.env_file).expanduser().resolve()
+    runtime = support.load_runtime(env_file)
     install_verified_images(Path(args.fixture_store).expanduser().resolve(), runtime)
     output_dir = Path(args.output_dir).expanduser().resolve()
     verify_ready(output_dir, runtime)
@@ -366,7 +367,8 @@ def verify(args: argparse.Namespace) -> int:
 
 def cleanup(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
-    runtime = support.load_runtime(Path(args.env_file).expanduser().resolve())
+    env_file = Path(args.env_file).expanduser().resolve()
+    runtime = support.load_runtime(env_file)
     install_verified_images(Path(args.fixture_store).expanduser().resolve(), runtime)
     with (output_dir / ".fixture.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -380,7 +382,7 @@ def cleanup(args: argparse.Namespace) -> int:
         sql = f"DROP TABLE IF EXISTS ice_rest.{manifest['database']}.{TABLE};\nDROP NAMESPACE IF EXISTS ice_rest.{manifest['database']};\n"
         sql_path = output_dir / "cleanup.sql"
         support.atomic_write(sql_path, sql.encode())
-        spark_build(runtime, Path(args.env_file).expanduser().resolve(), sql_path)
+        spark_build(runtime, env_file, sql_path)
         remove_prefix(runtime, location)
         (output_dir / "READY").unlink()
         support.write_json(output_dir / "CLEANED", {"run_id": args.run_id, "table_location": location})

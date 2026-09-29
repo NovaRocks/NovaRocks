@@ -23,7 +23,8 @@ WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
 # `current` is a convenience link for interactive use. CI passes the exact
 # generated entry it prepared so isolated system fixtures cannot redirect or
 # remove the environment required by subsequent SQL helpers.
-CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$SCRIPT_DIR/runtime/current/env.sh}"
+CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
+CURRENT_ENV="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CURRENT_ENV")"
 
 if [[ ! -f "$CURRENT_ENV" ]]; then
   echo "environment is not initialized: $CURRENT_ENV" >&2
@@ -33,6 +34,7 @@ fi
 
 # shellcheck disable=SC1090
 source "$CURRENT_ENV"
+[[ "${NOVA_ENV_READY:-false}" == "true" ]] || { echo "fixture is not ready; run docker/iceberg-rest/up.sh" >&2; exit 1; }
 
 sql_file="${1:-${NOVAROCKS_SPARK_V3_SMOKE_SQL:-}}"
 if [[ -z "$sql_file" ]]; then
@@ -62,7 +64,7 @@ if [[ -n "${NOVAROCKS_SPARK_EXTRA_DEFAULTS:-}" ]]; then
 fi
 
 compose_args=(
-  docker compose
+  python3 "$SCRIPT_DIR/runtime_entry.py" compose
   --env-file "$NOVA_ENV_COMPOSE_ENV"
   -p "$NOVA_ENV_COMPOSE_PROJECT"
   -f "$NOVA_ENV_COMPOSE_FILE"

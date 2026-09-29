@@ -18,6 +18,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../../../.." && pwd)
 env_file="${NOVA_ENV_REST_ENV_FILE:-$repo_root/docker/iceberg-rest/runtime/current/env.sh}"
+env_file="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$env_file")"
 if [[ ! -f "$env_file" ]]; then
   echo "Iceberg REST environment is not initialized: $env_file" >&2
   echo "run docker/iceberg-rest/up.sh first" >&2

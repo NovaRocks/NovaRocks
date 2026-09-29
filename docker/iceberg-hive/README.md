@@ -19,110 +19,74 @@ under the License.
 
 # Iceberg Hive Metastore Test Environment
 
-Standalone Hive Metastore fixture for NovaRocks Iceberg HMS catalog testing.
+HMS owns one Compose project, recorded host port and Derby volume for each
+fixture owner namespace + catalog ID. It does not adopt the old
+`nr-iceberg-hive` project. Its container starts on its own network and joins
+the catalog network through the fixture owner's exact consumer API, using
+`hms` and `minio` aliases.
 
-This directory is intentionally separate from `docker/iceberg-rest/`. The REST
-fixture owns MinIO, REST Catalog, and Spark. The Hive fixture owns only HMS and
-joins the REST fixture's Docker network so the metastore can reach MinIO at
-`http://minio:9000`.
-
-## Prepare Runtime Only
-
-Generate this worktree's HMS runtime entry without starting Docker:
+Provision the local image explicitly before starting tests:
 
 ```bash
-docker/iceberg-hive/up.sh --prepare-only
-source docker/iceberg-hive/runtime/current/env.sh
+docker image inspect apache/hive:4.0.0
+docker build --pull=false -t novarocks/hive-metastore:4.0.0 docker/iceberg-hive
 ```
 
-## Start Docker
-
-Start REST/MinIO first, then HMS:
+Bind REST first, resolve its returned publication once, then start HMS:
 
 ```bash
-docker/iceberg-rest/up.sh
-docker/iceberg-hive/up.sh
-source docker/iceberg-rest/runtime/current/env.sh
-source docker/iceberg-hive/runtime/current/env.sh
+publication=$(docker/iceberg-rest/up.sh | python3 -c 'import json,sys; print(json.load(sys.stdin)["published_dir"])')
+export NOVA_ENV_REST_ENV_FILE="$publication/env.sh"
+source "$NOVA_ENV_REST_ENV_FILE"
+hms_manifest=$(docker/iceberg-hive/up.sh)
+hms_dir=$(printf '%s' "$hms_manifest" | python3 -c 'import json,sys,pathlib; print(pathlib.Path(json.load(sys.stdin)["compose_env"]).parent)')
+source "$hms_dir/env.sh"
 ```
 
-The script writes generated state under:
+`up.sh --prepare-only` generates the catalog-scoped HMS files from a saved
+ready REST publication without calling Docker. It requires that REST binding;
+an unbound entry cannot invent an HMS dependency. Normal `up.sh` only uses local
+images and does not build or pull. Derby state survives container recreation.
+The instance directory is `<control-root>/<daemon>/hms/<catalog-id>/`, containing
+`manifest.json`, `env.sh`, saved Compose inputs, credential-specific
+`core-site.xml`, `ice-hms-catalog.sql`, and `spark-hms-defaults.conf`.
 
-```text
-docker/iceberg-hive/runtime/<env-id>/
-docker/iceberg-hive/runtime/current/
-```
-
-Important generated files:
-
-- `env.sh` — shell exports for the HMS endpoint and warehouse.
-- `manifest.json` — machine-readable HMS endpoint, compose project, and network.
-- `README.md` — human-readable summary of the active HMS environment.
-- `ice-hms-catalog.sql` — sample NovaRocks `CREATE EXTERNAL CATALOG` SQL.
-- `spark-hms-defaults.conf` — extra Spark defaults for the `hms_catalog` catalog.
-
-The SQL test runner picks up HMS placeholders from environment variables, so
-source both runtime files before running HMS suites:
+After sourcing both entries, the SQL runner reads the explicit HMS endpoint
+and warehouse. Spark helpers use `NOVAROCKS_SPARK_EXTRA_DEFAULTS`:
 
 ```bash
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite iceberg-hms --mode verify
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms --mode verify
+printf 'SHOW NAMESPACES IN hms_catalog;\n' > /tmp/hms-check.sql
+docker/iceberg-rest/spark-sql.sh /tmp/hms-check.sql
 ```
 
-After sourcing the HMS env, `docker/iceberg-rest/spark-sql.sh` automatically
-loads the generated HMS Spark defaults through `NOVAROCKS_SPARK_EXTRA_DEFAULTS`.
-Spark should use `hms_catalog` and the in-network endpoint `thrift://hms:9083`.
+`status.sh` prints the saved project, catalog dependency, endpoint and state.
+`down.sh --catalog-id <id>` disconnects the exact HMS container through the
+owner, then stops only its own project. Ordinary down retains the Derby volume,
+saved definition and fixed port for a later start. `--volumes` (or `--purge`)
+removes its Derby volume and verifies that its containers, network and volumes
+are absent before retiring the saved definition and releasing the port
+reservation. Stable owner lock files remain. A failed destructive cleanup keeps
+the deleting record and its reservation; `up` rejects it until `down` completes
+the cleanup. Repeating a completed destructive down is a no-op.
+HMS must exit before the dependent catalog can be deleted, including force.
 
-## Status
+After switching a worktree to another catalog, explicitly select the old ID:
 
 ```bash
-docker/iceberg-hive/status.sh
+docker/iceberg-hive/down.sh --catalog-id "$old_catalog_id" --volumes
 ```
 
-## Stop
+If the original REST publication is no longer available, use its saved owner
+locator as well. These values are recorded in the HMS manifest:
 
 ```bash
-docker/iceberg-hive/down.sh
+docker/iceberg-hive/down.sh --root "$control_root" --daemon "$daemon_id" \
+  --catalog-id "$old_catalog_id" --volumes
 ```
 
-In shared Docker mode this leaves the shared HMS Docker service running. Remove
-only the current worktree runtime entry with:
+HMS reserves ports in the owner's configured range; use `--port-start` and
+`--port-end` (or explicit `NOVA_ENV_RUNTIME_PORT_START/END`) for a task range.
 
-```bash
-docker/iceberg-hive/down.sh --runtime-only --purge
-```
-
-Stop the shared HMS service explicitly:
-
-```bash
-docker/iceberg-hive/down.sh --docker
-```
-
-## Required Base Image
-
-The default image is built locally from this directory and tagged as
-`novarocks/hive-metastore:4.0.0`. It uses `apache/hive:4.0.0` plus Hadoop S3A
-support jars.
-
-The fixture never pulls during a run: `up.sh` requires `apache/hive:4.0.0` to
-be in the local image store before it builds, and `compose.yml` declares
-`pull_policy: never`. Import the base once:
-
-```bash
-docker pull apache/hive:4.0.0
-```
-
-If the bundled Hadoop or AWS SDK version in `apache/hive:4.0.0` changes, check
-the jars before building and update the version arguments in `Dockerfile`:
-
-```bash
-docker run --rm --entrypoint bash apache/hive:4.0.0 -lc \
-  'ls /opt/hadoop/share/hadoop/common/hadoop-common-*.jar /opt/hadoop/share/hadoop/tools/lib/{hadoop-aws,aws-java-sdk-bundle}-*.jar'
-```
-
-Build manually if needed:
-
-```bash
-docker build -t novarocks/hive-metastore:4.0.0 docker/iceberg-hive
-```
+No command discovers resources from old fixed project names or ports.

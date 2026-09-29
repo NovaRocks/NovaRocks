@@ -91,6 +91,66 @@ def source_input_digests(workspace_root, producer_inputs):
     return digests
 
 
+def producer_lock_projections(workspace_root, declarations):
+    """Hash producer semantics, never transport aliases or unrelated fixtures."""
+    if not isinstance(declarations, dict) or not declarations:
+        raise ValueError("fixture.producer_lock_projections must be a non-empty table")
+    result = []
+    for label, declaration in sorted(declarations.items()):
+        relative = Path(declaration["lock"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("producer lock must be a workspace relative path")
+        lock = json.loads((workspace_root / relative).read_text())
+        name = declaration["derived_image"]
+        derived = lock["derived_images"][name]
+        base_names = [derived["base"]] if "base" in derived else list(derived["bases"].values())
+        bases = [{field: lock["images"][base][field] for field in
+                  ("source", "platform", "manifest_digest")} for base in base_names]
+        projection = {
+            "derived_image": name, "dockerfile": derived["dockerfile"],
+            "platform": derived["platform"],
+            "bases": sorted(bases, key=canonical_json),
+            "artifacts": [{"name": name, **{field: lock["artifacts"][name][field]
+                          for field in ("url", "bytes", "sha1")}}
+                          for name in sorted(derived["artifacts"])],
+        }
+        result.append({"label": label, "projection": projection})
+    return result
+
+
+def validate_producer(workspace_root, resolved, publication, actual_image, actual_container):
+    """Check the bound producer before consulting or publishing a READY object."""
+    manifest = json.loads((publication / "manifest.json").read_text())
+    runtime = manifest["runtime"]
+    if not manifest.get("ready") or Path(runtime["publication_dir"]).resolve() != publication.resolve():
+        raise ValueError("ProducerIdentityMismatch: publication is not ready or has moved")
+    catalog = runtime["catalog"]
+    saved = catalog["images"]["spark"]
+    receipt = runtime["producer_receipt"]
+    bom = json.loads(Path(manifest["fixture_inputs"]["bom"]).read_text())
+    model = load_model(workspace_root / "tests/sql/fixtures/benchmarks/benchmark_tools.toml")
+    declarations = model["fixture"]["producer_lock_projections"]
+    if resolved["producer_fingerprint"]["lock_projections"] != producer_lock_projections(workspace_root, declarations):
+        raise ValueError("ProducerIdentityMismatch: resolver producer inputs changed")
+    # The supply receipt binds a canonical lock and exact definition bytes.
+    # Compare those receipts before accepting the semantic projection above.
+    sys.path.insert(0, str(workspace_root / "docker/fixture-inputs"))
+    from fixture_inputs import load_lock, definition_sha256
+    declaration = declarations["spark"]
+    lock, lock_hash = load_lock(workspace_root / declaration["lock"])
+    derived = lock["derived_images"][declaration["derived_image"]]
+    bom_receipt = bom["derived_images"][declaration["derived_image"]]
+    expected = {"lock_sha256": lock_hash, **bom_receipt}
+    if (receipt != expected or saved["receipt"] != bom_receipt
+            or bom["lock_sha256"] != lock_hash
+            or bom_receipt["definition_sha256"] != definition_sha256(workspace_root, derived["definition_files"])
+            or bom_receipt["platform"] != derived["platform"]
+            or actual_container != catalog["containers"]["spark"]
+            or not actual_image
+            or actual_image != saved["image_id"] or actual_image != bom_receipt["image_id"]):
+        raise ValueError("ProducerIdentityMismatch: actual Spark, saved record and BOM disagree")
+
+
 def normalized_layouts(layouts):
     if not isinstance(layouts, list):
         raise ValueError("fixture.table_layouts must be an array")
@@ -152,6 +212,7 @@ def resolve_fixture(model, workspace_root, suite, scale, shared_root=None):
     producer_fingerprint = {
         "schema_version": fixture.get("schema_version"),
         "source_inputs": producer_inputs,
+        "lock_projections": producer_lock_projections(workspace_root, fixture.get("producer_lock_projections")),
         "spark_runtime": runtime,
     }
     contract["producer_fingerprint"] = producer_fingerprint
@@ -217,9 +278,17 @@ def main():
     parser.add_argument("--shared-root")
     parser.add_argument("--validate-ensure-result", type=Path)
     parser.add_argument("--validate-error", type=Path)
+    parser.add_argument("--validate-producer", type=Path)
+    parser.add_argument("--resolved-dataset", type=Path)
+    parser.add_argument("--actual-image")
+    parser.add_argument("--actual-container")
     args = parser.parse_args()
     workspace_root = args.workspace_root.resolve()
     config_path = args.config or workspace_root / "tests/sql/fixtures/benchmarks/benchmark_tools.toml"
+    if args.validate_producer:
+        validate_producer(workspace_root, json.loads(args.resolved_dataset.read_text()),
+                          args.validate_producer.resolve(), args.actual_image, args.actual_container)
+        return
     if args.validate_ensure_result or args.validate_error:
         source = args.validate_ensure_result or args.validate_error
         value = json.loads(source.read_text(encoding="utf-8"))
@@ -241,6 +310,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         print(f"fixture contract error: {exc}", file=sys.stderr)
         raise SystemExit(2)

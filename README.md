@@ -258,72 +258,38 @@ The standalone server supports session context such as `USE <db>`,
 
 ## Local Iceberg REST + MinIO + Spark Environment
 
-The `docker/iceberg-rest/` directory contains the shared local Iceberg REST
-Catalog, MinIO, and Spark environment used by both local development and CI.
-Bring it up, then discover the active worktree ports and generated configs
-from the fixed entry:
+`docker/iceberg-rest/` 为开发与 CI 提供版本化 fixture。相同输入复用一个对象存储/catalog 实例，输入变化允许新旧版本并存；对象存储可供多个 catalog 使用。owner 预留实际服务端口，不使用固定 host 端口或固定共享 Compose 项目。
+
+先启动/附着，再一次性解析 publication 并读取生成配置：
 
 ```bash
 docker/iceberg-rest/up.sh
-source docker/iceberg-rest/runtime/current/env.sh
+fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
+source "$fixture_publication/env.sh"
 ```
 
-Codex environment setup uses `docker/iceberg-rest/up.sh --prepare-only`
-instead. That only writes `runtime/current/env.sh` and related config files;
-it does not start Docker.
+`runtime/current` 只是定位器，入口中的 `published` 是绑定与全部配置的唯一原子提交点。`NOVA_ENV_REST_ENV_FILE`、FE/BE 配置、runner 配置及 Spark defaults 都指向这次 publication；`NOVA_ENV_RUNTIME_DIR` 是 SQLite 等稳定运行数据目录。消费者不能据此拼接 `env.sh`，也不能混用两次 publication 的变量。
 
-Useful generated values:
+Codex setup 的 `up.sh --prepare-only` 不调用 Docker；有保存的 ready 记录时恢复该入口，否则发布没有端点/镜像的 unbound。该 ready 状态不是健康证明，运行前仍需正常 up。输入须由 `docker/fixture-inputs/provision.sh` 显式供给；verify/测试不下载、pull 或构建。BOM 缺失/无效返回 75，CI 报 BLOCKED；owner 端口与身份失败报 VERIFY FAILED。
 
-- `NOVA_ENV_COMPOSE_PROJECT`
-- `NOVA_ENV_MYSQL_PORT`
-- `NOVAROCKS_ICEBERG_REST_URI`
-- `NOVAROCKS_ICEBERG_REST_WAREHOUSE`
-- `AWS_S3_ENDPOINT`
-- `NOVAROCKS_FE_CONFIG`
-- `NOVAROCKS_BE_CONFIG`
-- `NOVAROCKS_SQL_TEST_CONFIG`
-- `NOVAROCKS_ICE_REST_CATALOG_SQL`
-- `NOVAROCKS_SPARK_DEFAULTS`
-- `NOVAROCKS_SPARK_V3_SMOKE_SQL`
-- `NOVAROCKS_SPARK_SQL`
-
-Start standalone with the generated object-store config:
+常用输出是 `NOVA_ENV_OBJECT_STORE_RUNTIME`、`NOVA_ENV_CATALOG_RUNTIME`、`NOVA_ENV_COMPOSE_PROJECT`、`AWS_S3_ENDPOINT`、`NOVAROCKS_ICEBERG_REST_URI`、`NOVAROCKS_FE_CONFIG`、`NOVAROCKS_BE_CONFIG`、`NOVAROCKS_SQL_TEST_CONFIG` 和 `NOVAROCKS_SPARK_DEFAULTS`。Spark 容器使用生成的网络端点，NovaRocks 使用生成的 host 端点。
 
 ```bash
-source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
 cargo run -p novarocks-server -- standalone --role all-in-one \
   --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
-```
 
-Generate an Iceberg format-v3 table through Spark using the same REST Catalog
-and MinIO object store:
+NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_REST_ENV_FILE" \
+  docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 
-```bash
-source docker/iceberg-rest/runtime/current/env.sh
-docker/iceberg-rest/up.sh
-docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
-```
-
-Spark uses the Docker-network endpoints `http://rest:8181` and
-`http://minio:9000`; NovaRocks uses the host endpoints exported in `env.sh`.
-The Docker services are shared across worktrees by default and use the
-service-default host ports configured in `docker/iceberg-rest/shared.env`;
-the NovaRocks FE MySQL and four FE/BE Native/management listener ports are
-allocated per worktree.
-
-Run the cross-engine Iceberg compatibility SQL suite:
-
-```bash
-source docker/iceberg-rest/runtime/current/env.sh
-docker/iceberg-rest/up.sh
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite iceberg-compatibility --mode verify
+  --suite iceberg-compatibility --mode verify --cluster-mode cross-process --cluster-size 3
 ```
 
-See [`docker/iceberg-rest/README.md`](docker/iceberg-rest/README.md) for the
-full guide, including required Docker images and a CI integration example.
+显式 worktree 解绑用 `down.sh --runtime-only`；加 `--purge` 才清理全部历史数据位置，全部成功后才释放引用。共享服务 stop/delete 按精确 runtime ID 管理；force catalog 删除仅条件解绑目标，保留数据引用。对象存储任何删除都受引用保护，HMS 等外部连接须先退出。首次新对象存储会重建 benchmark READY 数据。
+
+旧 `nr-iceberg-rest` / `nr-iceberg-hive` 及其卷保留，不自动迁移或删除；用户确认旧消费者退出和数据保存后另行安排退役。详见 [fixture 操作说明](docker/iceberg-rest/README.md) 与 [ADR-0165](docs/adr/ADR-0165-versioned-fixture-runtime-ownership.md)。
 
 ## SQL Regression Tests
 

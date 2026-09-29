@@ -241,6 +241,9 @@ pub(crate) struct QueryStatsSnapshot {
     entries: HashMap<StatsRef, QueryStatsEntry>,
 }
 
+/// Frozen base-table statistics used by the optimizer, displayed by the plan.
+pub(crate) const TABLE_STATISTICS_ANNOTATION_KEY: &str = "optimizer.table_statistics";
+
 impl QueryStatsSnapshot {
     pub(crate) fn empty() -> Self {
         Self::default()
@@ -267,6 +270,18 @@ impl QueryStatsSnapshot {
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Keep precisely the facts optimization consumed, without consulting a
+    /// catalog or converting derived operator estimates into base-table facts.
+    pub(crate) fn annotate_final_plan(&self, builder: &mut novarocks_physical_plan::PlanBuilder) {
+        for row in self.display_rows() {
+            builder.add_annotation(novarocks_physical_plan::PlanAnnotation {
+                subject: novarocks_physical_plan::AnnotationSubject::Plan,
+                key: TABLE_STATISTICS_ANNOTATION_KEY.into(),
+                value: row.into_boxed_str(),
+            });
+        }
     }
 
     pub(crate) fn display_rows(&self) -> Vec<String> {

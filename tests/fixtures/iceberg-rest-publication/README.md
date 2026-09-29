@@ -38,11 +38,12 @@ tests/fixtures/iceberg-rest-publication/run-v07.sh
 Set `UEA7_SKIP_BUILD=1` to reuse the already built image. The script creates one
 uniquely named container, publishes random loopback ports, uses an isolated
 SQLite catalog and local warehouse, and removes the container on every exit.
-It never addresses the shared `nr-iceberg-rest` project.
+It never alters the versioned shared catalog project.
 
-For plan-level V07 evidence, source the generated environment and set
+For plan-level V07 evidence, bind the shared fixture and set
 `UEA7_USE_SHARED_MINIO=1`. The fixture then joins only the shared Docker
-network, creates a unique bucket through the running MinIO container, delegates
+catalog network, reads one resolved publication, creates a unique bucket through
+its exact object-store container ID, delegates
 the tracing wrapper to the real `S3FileIO`, and removes that exact bucket on
 exit. It still owns a private SQLite catalog, endpoint, namespace, and
 container; it never sends catalog requests to the shared REST service.
@@ -79,7 +80,7 @@ UEA7_USE_SHARED_MINIO=1 \
 
 The explicit `mv-publication-v11` SQL suite uses the same checked-in hook in a
 runner-owned private REST and MinIO project. The runner builds an image tagged
-with the hook source digest, replaces only that project's REST service, and
+with the hook source digest, starts the project with the publication-hook profile, and
 records the live image ID. One case holds an actual NovaRocks MV target commit
 after service-side requirement validation while Spark advances `main`. Three
 cases hold a frozen external request at that same service boundary while the

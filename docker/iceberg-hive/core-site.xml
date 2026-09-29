@@ -1,5 +1,8 @@
 <?xml version="1.0"?>
 <configuration>
+  <!-- Iceberg persists canonical s3:// locations; HMS resolves that scheme
+       through Hadoop's explicitly configured S3A implementation. -->
+  <property><name>fs.s3.impl</name><value>org.apache.hadoop.fs.s3a.S3AFileSystem</value></property>
   <property><name>fs.s3a.impl</name><value>org.apache.hadoop.fs.s3a.S3AFileSystem</value></property>
   <property><name>fs.s3a.endpoint</name><value>http://minio:9000</value></property>
   <property><name>fs.s3a.path.style.access</name><value>true</value></property>

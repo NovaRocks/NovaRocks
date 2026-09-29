@@ -484,6 +484,7 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 而不是下载或普通测试失败。
 
 - ADR-0155 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
+- ADR-0165 — fixture 运行实例为何按输入版本化、由唯一 owner 发布工作区绑定，并以显式引用保护删除（active；补充 ADR-0155 的运行所有权，不替代输入供给）
 
 #### 历史
 

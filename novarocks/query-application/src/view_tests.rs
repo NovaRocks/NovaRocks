@@ -1083,3 +1083,86 @@ fn external_view_read_rejects_stored_legacy_hints_under_modern_caller() {
     assert_eq!(print_query(&query), before);
     assert!(engine.analyzed_queries.lock().unwrap().is_empty());
 }
+
+#[test]
+fn view_read_checks_decimal_snapshot_before_expansion() {
+    use novarocks_sql::sql_mode::SqlSemanticSettings;
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default();
+    let ctx = context(None, "db");
+    service
+        .try_handle_statement(&engine, "CREATE VIEW v AS SELECT 1 AS a", ctx)
+        .unwrap();
+    let modern = SqlSemanticSettings::default();
+    let legacy = modern.clone().with_decimal_overflow_to_double(true);
+    for sql in [
+        "SELECT * FROM v",
+        "WITH c AS (SELECT * FROM v) SELECT * FROM c",
+        "SELECT * FROM (SELECT * FROM v) d",
+        "SELECT 1 UNION ALL SELECT * FROM v",
+    ] {
+        let mut query = parse_query(sql);
+        assert!(
+            service
+                .rewrite_query(&engine, &mut query, ctx, &legacy)
+                .unwrap_err()
+                .starts_with("Unsupported:")
+        );
+        assert_eq!(
+            print_query(&query),
+            print_query(&parse_query(sql)),
+            "rejected body is never installed"
+        );
+    }
+    for sql in [
+        "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ * FROM v",
+        "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ * FROM v UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ * FROM v",
+    ] {
+        let mut query = parse_query(sql);
+        service
+            .rewrite_query(&engine, &mut query, ctx, &legacy)
+            .unwrap();
+        assert!(!print_query(&query).contains("FROM v"));
+    }
+    let mut query = parse_query("SELECT * FROM physical_table");
+    let before = print_query(&query);
+    service
+        .rewrite_query(&engine, &mut query, ctx, &legacy)
+        .unwrap();
+    assert_eq!(print_query(&query), before);
+    let mut query = parse_query("SELECT * FROM v");
+    service
+        .rewrite_query(&engine, &mut query, ctx, &modern)
+        .unwrap();
+    assert!(!print_query(&query).contains("FROM v"));
+    assert!(legacy.decimal_overflow_to_double());
+}
+
+#[test]
+fn external_view_read_rejects_stored_decimal_hints() {
+    use novarocks_sql::sql_mode::SqlSemanticSettings;
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default().with_rest_catalog("ice");
+    engine.insert_view(
+        ViewTarget {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            view: "decimal_v".to_string(),
+        },
+        "SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS a",
+        "db",
+    );
+    let mut query = parse_query("SELECT * FROM decimal_v");
+    let before = print_query(&query);
+    let error = service
+        .rewrite_query(
+            &engine,
+            &mut query,
+            context(Some("ice"), "db"),
+            &SqlSemanticSettings::default(),
+        )
+        .unwrap_err();
+    assert!(error.starts_with("Unsupported:"));
+    assert_eq!(print_query(&query), before);
+    assert!(engine.analyzed_queries.lock().unwrap().is_empty());
+}

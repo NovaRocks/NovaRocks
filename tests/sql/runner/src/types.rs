@@ -276,6 +276,7 @@ pub struct QueryMeta {
     /// Declarative NovaRocks-only syntax label. It is consumed only by the
     /// extension-manifest listing path and never changes execution behavior.
     pub nova_extension: Option<String>,
+    pub query_stats_contract: Option<crate::query_stats_contract::QueryStatsContract>,
     pub result_contains: Vec<String>,
     pub result_contains_any: Vec<String>,
     pub result_not_contains: Vec<String>,

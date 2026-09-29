@@ -158,7 +158,9 @@ loader = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
 bootstrap = "tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh"
 publication_helper = "tests/sql/fixtures/benchmarks/benchmark_fixture_publication.sh"
 spark_dockerfile = "docker/iceberg-rest/spark/Dockerfile"
-spark_build_environment = "docker/iceberg-rest/shared.env"
 ssb_schema = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
 tpch_schema = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
 tpcds_schema = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
+
+[fixture.producer_lock_projections]
+spark = { lock = "docker/fixture-inputs/lock.json", derived_image = "iceberg-spark" }

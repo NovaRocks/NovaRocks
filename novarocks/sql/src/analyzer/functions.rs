@@ -1036,7 +1036,9 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         "array_difference" | "array_cum_sum" => infer_array_numeric_list_return_type(arg_types),
         "array_sum" => infer_array_sum_return_type(arg_types),
         "array_avg" => infer_array_avg_return_type(arg_types),
-        "array_generate" => infer_array_generate_return_type(arg_types),
+        "array_generate" => {
+            crate::functions::dynamic_scalar_data_type("array_generate", arg_types)?
+        }
         "map_keys" => match arg_types.first() {
             Some(DataType::Map(entries, _)) => match entries.data_type() {
                 DataType::Struct(fields) if fields.len() == 2 => DataType::List(Arc::new(
@@ -1111,30 +1113,6 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
 
         _ => return None,
     })
-}
-
-fn infer_array_generate_return_type(arg_types: &[DataType]) -> DataType {
-    let is_datetime = arg_types.iter().any(|ty| {
-        matches!(
-            ty,
-            DataType::Date32 | DataType::Timestamp(_, _) | DataType::Utf8
-        )
-    });
-    let item_type = if is_datetime {
-        arg_types
-            .iter()
-            .find_map(|ty| match ty {
-                DataType::Date32 => Some(DataType::Date32),
-                DataType::Timestamp(unit, tz) => Some(DataType::Timestamp(*unit, tz.clone())),
-                _ => None,
-            })
-            .unwrap_or(DataType::Date32)
-    } else {
-        DataType::Int64
-    };
-    DataType::List(Arc::new(arrow::datatypes::Field::new(
-        "item", item_type, true,
-    )))
 }
 
 fn list_type(item_type: DataType) -> DataType {

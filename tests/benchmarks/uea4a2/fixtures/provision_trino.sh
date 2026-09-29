@@ -29,7 +29,9 @@ output_dir=$1
 [[ ! -e "$output_dir" ]] || { echo "output directory already exists" >&2; exit 2; }
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
 command -v mc >/dev/null || { echo "MinIO mc is required" >&2; exit 2; }
-source "$repo_root/docker/iceberg-rest/runtime/current/env.sh"
+env_file="${NOVA_ENV_REST_ENV_FILE:-$repo_root/docker/iceberg-rest/runtime/current/env.sh}"
+env_file="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$env_file")"
+source "$env_file"
 
 readonly image_digest=sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534
 readonly image_ref=$image_digest

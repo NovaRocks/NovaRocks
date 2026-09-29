@@ -659,6 +659,7 @@ pub fn compile_final_join_incremental_refresh_change_stream(
         })?;
     crate::planning::dml::seal_final_change_stream_producer_with_effect_ordinal(
         producer,
+        compiled.statistics.snapshot,
         analyzed.routes,
         statistics_targets,
         effect_output_ordinal,
@@ -709,6 +710,7 @@ pub fn begin_final_join_incremental_refresh_change_stream(
         })?;
     crate::planning::dml::begin_final_change_stream_producer_with_effect_ordinal(
         producer,
+        compiled.statistics.snapshot,
         analyzed.routes,
         statistics_targets,
         effect_output_ordinal,
@@ -814,6 +816,7 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
         .ok_or_else(|| "incremental MV change-stream producer has no effect output".to_string())?;
     crate::planning::dml::seal_final_change_stream_producer_with_effect_ordinal(
         producer,
+        compiled.statistics.snapshot,
         analyzed.routes,
         statistics_targets,
         effect_output_ordinal,
@@ -859,6 +862,7 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
         .ok_or_else(|| "incremental MV change-stream producer has no effect output".to_string())?;
     crate::planning::dml::begin_final_change_stream_producer_with_effect_ordinal(
         producer,
+        compiled.statistics.snapshot,
         analyzed.routes,
         statistics_targets,
         effect_output_ordinal,

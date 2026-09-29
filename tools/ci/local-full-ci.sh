@@ -354,8 +354,8 @@ prepare_runtime() {
     verify_fixture_inputs &&
     echo "+ docker/iceberg-rest/up.sh" &&
     docker/iceberg-rest/up.sh &&
-      echo "+ source docker/iceberg-rest/runtime/current/env.sh" &&
-      . docker/iceberg-rest/runtime/current/env.sh &&
+      echo "+ resolve and source fixture publication" &&
+      load_fixture_publication docker/iceberg-rest/runtime/current/env.sh &&
       require_runtime_var NOVAROCKS_FE_CONFIG &&
       require_runtime_var NOVAROCKS_BE_CONFIG &&
       require_runtime_var NOVAROCKS_SQL_TEST_CONFIG &&
@@ -363,6 +363,10 @@ prepare_runtime() {
       require_runtime_var NOVA_ENV_MYSQL_PORT &&
       require_runtime_var NOVAROCKS_ICEBERG_REST_URI &&
       require_runtime_var NOVA_ENV_REST_ENV_FILE &&
+      require_runtime_var NOVA_ENV_OBJECT_STORE_RUNTIME &&
+      require_runtime_var NOVA_ENV_CATALOG_RUNTIME &&
+      require_runtime_var AWS_S3_ENDPOINT &&
+      record_fixture_runtime &&
       PAIMON_FIXTURE_DIR="$CI_RUN_DIR/paimon-fixture" &&
       PAIMON_FIXTURE_RUN_ID="ci-${CI_COMMIT_SHA:0:12}-$(basename "$CI_RUN_DIR")" &&
       echo "+ docker/paimon-read/prepare.sh --env-file <runtime-env> --run-id $PAIMON_FIXTURE_RUN_ID --output-dir <ci-run>/paimon-fixture" &&
@@ -417,6 +421,21 @@ prepare_runtime() {
 
 verify_fixture_inputs() {
   docker/fixture-inputs/verify.sh
+}
+
+load_fixture_publication() {
+  local publication_env
+  publication_env="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$1")" || return
+  . "$publication_env"
+}
+
+record_fixture_runtime() {
+  echo "NOVA_ENV_OBJECT_STORE_RUNTIME=$NOVA_ENV_OBJECT_STORE_RUNTIME"
+  echo "NOVA_ENV_CATALOG_RUNTIME=$NOVA_ENV_CATALOG_RUNTIME"
+  echo "NOVA_ENV_REST_ENV_FILE=$NOVA_ENV_REST_ENV_FILE"
+  echo "NOVA_ENV_PUBLICATION_DIR=$(dirname "$NOVA_ENV_REST_ENV_FILE")"
+  echo "AWS_S3_ENDPOINT=$AWS_S3_ENDPOINT"
+  echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
 }
 
 reset_frontend_state_store_stage() {
@@ -1076,7 +1095,7 @@ run_sql_suites() {
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
       NOVAROCKS_WORKSPACE_ROOT="$REPO_ROOT" \
-      NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_RUNTIME_DIR/env.sh" \
+      NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_REST_ENV_FILE" \
       cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" --bin novarocks-sql-test -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
@@ -1214,7 +1233,7 @@ run_native_cross_process_sql_suites() {
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
-      NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_RUNTIME_DIR/env.sh" \
+      NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_REST_ENV_FILE" \
       cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \

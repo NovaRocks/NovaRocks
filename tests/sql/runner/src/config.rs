@@ -18,6 +18,9 @@
 use crate::suite_manifest::SuiteManifest;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
+use novarocks_cluster_harness::isolated_iceberg_rest::{
+    IsolatedIcebergRestEndpoints, IsolatedS3Identity,
+};
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -104,6 +107,154 @@ pub fn load_runner_config(path: Option<&Path>) -> Result<RunnerConfig> {
     Ok(config)
 }
 
+const FIXTURE_ENDPOINT_KEYS: [&str; 5] = [
+    "iceberg_rest_uri",
+    "iceberg_rest_warehouse",
+    "oss_endpoint",
+    "oss_ak",
+    "oss_sk",
+];
+
+pub(crate) fn project_fixture_value(config: &mut RunnerConfig, key: &str, value: &str) {
+    for alias in [
+        key.to_string(),
+        format!("env.{key}"),
+        format!("env.oss.{key}"),
+    ] {
+        config.values.insert(alias, value.to_string());
+    }
+}
+
+/// One endpoint projection for generated configurations and private fixtures.
+/// Secrets deliberately have no Debug implementation.
+pub(crate) struct FixtureEndpoints {
+    values: [String; 5],
+    env_file: PathBuf,
+}
+
+impl FixtureEndpoints {
+    pub(crate) fn from_runner_config(config: &RunnerConfig) -> Result<Self> {
+        Self::from_runner_config_with_environment(config, |key| env::var(key).ok())
+    }
+
+    fn from_runner_config_with_environment(
+        config: &RunnerConfig,
+        environment: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let required = |key: &str| -> Result<String> {
+            let aliases = [
+                key.to_string(),
+                format!("env.{key}"),
+                format!("env.oss.{key}"),
+            ];
+            let candidates = aliases.iter().filter_map(|alias| config.values.get(alias));
+            let mut value = None;
+            for candidate in candidates {
+                if candidate.trim().is_empty() {
+                    bail!(
+                        "fixture runtime configuration required: {key} is empty; use the generated sql-test.toml after docker/iceberg-rest/up.sh"
+                    );
+                }
+                if value.is_some_and(|existing| existing != candidate) {
+                    bail!("fixture runtime configuration has conflicting aliases for {key}");
+                }
+                value = Some(candidate);
+            }
+            let value = value.with_context(|| format!(
+                "fixture runtime configuration required: missing {key}; use --config with the generated sql-test.toml after docker/iceberg-rest/up.sh"
+            ))?;
+            // Paimon artifacts retain explicit credential references instead of
+            // secrets. Resolve only declared references, never an ambient fallback.
+            if let Some(reference) = value
+                .strip_prefix("${ENV:")
+                .and_then(|v| v.strip_suffix('}'))
+            {
+                anyhow::ensure!(
+                    !reference.is_empty()
+                        && reference
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                    "invalid fixture environment reference for {key}"
+                );
+                return environment(reference).filter(|v| !v.trim().is_empty()).with_context(|| {
+                    format!("fixture runtime configuration requires environment variable {reference} declared by {key}")
+                });
+            }
+            anyhow::ensure!(
+                !value.contains("${ENV"),
+                "fixture {key} must use a complete environment reference"
+            );
+            Ok(value.clone())
+        };
+        let values = FIXTURE_ENDPOINT_KEYS
+            .map(required)
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let env_file = PathBuf::from(required("fixture_env_file")?);
+        Self::new(values.try_into().expect("five endpoint keys"), env_file)
+    }
+
+    pub(crate) fn from_isolated(
+        endpoints: &IsolatedIcebergRestEndpoints,
+        identity: &IsolatedS3Identity,
+        env_file: PathBuf,
+    ) -> Result<Self> {
+        Self::new(
+            [
+                endpoints.rest_uri.clone(),
+                endpoints.rest_warehouse.clone(),
+                endpoints.minio_endpoint.clone(),
+                identity.access_key_id.clone(),
+                identity.secret_access_key.clone(),
+            ],
+            env_file,
+        )
+    }
+
+    fn new(values: [String; 5], env_file: PathBuf) -> Result<Self> {
+        for (key, value) in FIXTURE_ENDPOINT_KEYS.iter().zip(&values) {
+            anyhow::ensure!(
+                !value.trim().is_empty(),
+                "fixture runtime configuration required: missing {key}"
+            );
+        }
+        anyhow::ensure!(
+            env_file.is_absolute() && env_file.is_file(),
+            "fixture runtime configuration requires an existing absolute fixture_env_file"
+        );
+        let env_file = env_file
+            .canonicalize()
+            .context("resolve fixture publication environment")?;
+        Ok(Self { values, env_file })
+    }
+
+    /// Replaces every supported spelling, including aliases left by TOML flattening.
+    pub(crate) fn project(&self, config: &mut RunnerConfig) -> BTreeMap<String, String> {
+        for (key, value) in FIXTURE_ENDPOINT_KEYS.iter().zip(&self.values) {
+            project_fixture_value(config, key, value);
+        }
+        project_fixture_value(config, "fixture_env_file", &self.env_file.to_string_lossy());
+        let [rest, warehouse, endpoint, access_key, secret_key] = &self.values;
+        [
+            ("AWS_S3_ENDPOINT", endpoint.clone()),
+            ("AWS_S3_ACCESS_KEY_ID", access_key.clone()),
+            ("AWS_S3_SECRET_ACCESS_KEY", secret_key.clone()),
+            ("MINIO_ROOT_USER", access_key.clone()),
+            ("MINIO_ROOT_PASSWORD", secret_key.clone()),
+            ("NOVAROCKS_ICEBERG_REST_URI", rest.clone()),
+            ("NOVAROCKS_ICEBERG_REST_WAREHOUSE", warehouse.clone()),
+            ("NOVA_ENV_REST_WAREHOUSE_URI", warehouse.clone()),
+            (
+                "NOVA_ENV_REST_ENV_FILE",
+                self.env_file.to_string_lossy().into_owned(),
+            ),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
+    }
+}
+
 fn toml_value_to_string(value: &toml::Value) -> String {
     value
         .as_str()
@@ -153,78 +304,26 @@ pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>,
         | "iceberg-mv-scheduler"
         | "materialized-view"
         | "mv-rewrite" => {
-            // Keep local suites that exercise Iceberg catalogs aligned with bootstrap
-            // defaults so they run out of the box against the MinIO-backed dev setup.
+            // Catalog semantics may have defaults; runtime endpoints never do.
             insert_placeholder_default(variables, "iceberg_catalog_type", "hadoop");
             insert_placeholder_default(
                 variables,
                 "iceberg_catalog_warehouse",
                 env_or_default("CATALOG_WAREHOUSE_URI", "s3://novarocks/iceberg-catalog"),
             );
-            let rest_warehouse_default = env_or_default(
-                "NOVA_ENV_REST_WAREHOUSE_URI",
-                "s3://warehouse/novarocks-sql-test-rest",
-            );
-            insert_placeholder_default(
-                variables,
-                "iceberg_rest_uri",
-                env_or_default("NOVAROCKS_ICEBERG_REST_URI", "http://127.0.0.1:8181"),
-            );
-            insert_placeholder_default(
-                variables,
-                "iceberg_rest_warehouse",
-                env_or_default("NOVAROCKS_ICEBERG_REST_WAREHOUSE", &rest_warehouse_default),
-            );
-        }
-        "iceberg-compatibility" | "statistics" => {
-            let rest_warehouse_default = env_or_default(
-                "NOVA_ENV_REST_WAREHOUSE_URI",
-                "s3://warehouse/novarocks-sql-test-rest",
-            );
-            insert_placeholder_default(
-                variables,
-                "iceberg_rest_uri",
-                env_or_default("NOVAROCKS_ICEBERG_REST_URI", "http://127.0.0.1:8181"),
-            );
-            insert_placeholder_default(
-                variables,
-                "iceberg_rest_warehouse",
-                env_or_default("NOVAROCKS_ICEBERG_REST_WAREHOUSE", &rest_warehouse_default),
-            );
         }
         "iceberg-hms" | "iceberg-hms-compatibility" => {
-            insert_placeholder_default(
-                variables,
-                "iceberg_hms_uris",
-                env_or_default("NOVAROCKS_ICEBERG_HMS_URI", "thrift://127.0.0.1:9083"),
-            );
-            insert_placeholder_default(
-                variables,
-                "iceberg_hms_warehouse",
-                env_or_default(
-                    "NOVA_ENV_SHARED_HMS_WAREHOUSE_URI",
-                    "s3://warehouse/shared/hms",
-                ),
-            );
+            for (key, environment) in [
+                ("iceberg_hms_uris", "NOVAROCKS_ICEBERG_HMS_URI"),
+                ("iceberg_hms_warehouse", "NOVA_ENV_SHARED_HMS_WAREHOUSE_URI"),
+            ] {
+                if let Some(value) = env_optional(environment) {
+                    insert_placeholder_default(variables, key, value);
+                }
+            }
         }
-        _ => return,
+        _ => {}
     }
-
-    insert_placeholder_default(
-        variables,
-        "oss_ak",
-        env_or_default("MINIO_ROOT_USER", "admin"),
-    );
-    insert_placeholder_default(
-        variables,
-        "oss_sk",
-        env_or_default("MINIO_ROOT_PASSWORD", "admin123"),
-    );
-    insert_placeholder_default(
-        variables,
-        "oss_endpoint",
-        env_or_default("AWS_S3_ENDPOINT", "http://127.0.0.1:9000"),
-    );
 }
 
 pub fn placeholder_variables_with_run_id(
@@ -687,25 +786,260 @@ oss_endpoint = "http://127.0.0.1:9000"
     }
 
     #[test]
-    fn hms_suite_defaults_populate_uris_warehouse_and_oss() {
-        // Env-independent: the crate's tests avoid touching process env (Rust
-        // 2024 `std::env::{set,remove}_var` is `unsafe`), so assert only that
-        // the HMS arm populates the expected keys plus the shared oss_* block.
-        // The concrete values come from `env_or_default` and so vary with the
-        // ambient environment; presence is what this arm guarantees.
-        let mut vars = std::collections::HashMap::new();
-        apply_suite_placeholder_defaults(&mut vars, "iceberg-hms");
-        assert!(vars.contains_key("iceberg_hms_uris"));
-        assert!(vars.contains_key("iceberg_hms_warehouse"));
-        assert!(vars.contains_key("oss_ak"));
-        assert!(vars.contains_key("oss_sk"));
-        assert!(vars.contains_key("oss_endpoint"));
+    fn suite_defaults_never_invent_fixture_endpoints_or_credentials() {
+        for suite in [
+            "iceberg",
+            "iceberg-compatibility",
+            "statistics",
+            "iceberg-hms",
+            "iceberg-mv-apply",
+        ] {
+            let mut variables = HashMap::new();
+            apply_suite_placeholder_defaults(&mut variables, suite);
+            for key in FIXTURE_ENDPOINT_KEYS {
+                assert!(!variables.contains_key(key), "{suite} invented {key}");
+            }
+        }
+    }
 
-        // The compatibility suite shares the same arm.
-        let mut compat_vars = std::collections::HashMap::new();
-        apply_suite_placeholder_defaults(&mut compat_vars, "iceberg-hms-compatibility");
-        assert!(compat_vars.contains_key("iceberg_hms_uris"));
-        assert!(compat_vars.contains_key("iceberg_hms_warehouse"));
-        assert!(compat_vars.contains_key("oss_endpoint"));
+    fn configured_fixture() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempdir().unwrap();
+        let env_file = directory.path().join("env.sh");
+        fs::write(&env_file, "export NOVA_ENV_READY=true\n").unwrap();
+        let path = directory.path().join("sql-test.toml");
+        fs::write(
+            &path,
+            format!(
+                r#"
+[cluster]
+host = "127.0.0.1"
+port = "23223"
+
+[env]
+fixture_env_file = {env_file:?}
+iceberg_rest_uri = "http://127.0.0.1:38181"
+iceberg_rest_warehouse = "s3://warehouse/worktree/rest"
+oss_endpoint = "http://127.0.0.1:38000"
+oss_ak = "fixture-key"
+oss_sk = "fixture-secret"
+"#
+            ),
+        )
+        .unwrap();
+        (directory, path)
+    }
+
+    #[test]
+    fn loaded_toml_projection_replaces_all_aliases_and_subprocess_values() {
+        let (_directory, path) = configured_fixture();
+        // The real TOML loader retains scoped spellings alongside plain keys.
+        // Include a conflicting nested legacy scope: a private fixture replaces all.
+        let mut source = fs::read_to_string(&path).unwrap();
+        source.push_str("\n[env.oss]\n");
+        for key in FIXTURE_ENDPOINT_KEYS {
+            source.push_str(&format!("{key} = \"foreign\"\n"));
+        }
+        fs::write(&path, source).unwrap();
+        let mut config = load_runner_config(Some(&path)).unwrap();
+        assert_eq!(
+            config.values["env.iceberg_rest_uri"],
+            "http://127.0.0.1:38181"
+        );
+        assert_eq!(config.values["env.oss.iceberg_rest_uri"], "foreign");
+        let endpoints = IsolatedIcebergRestEndpoints {
+            rest_uri: "http://127.0.0.1:39181".into(),
+            rest_warehouse: "s3://warehouse/isolated/rest".into(),
+            minio_endpoint: "http://127.0.0.1:39000".into(),
+            compose_project: "nr-isolated-rest-test".into(),
+        };
+        let identity = IsolatedS3Identity {
+            access_key_id: "private-key".into(),
+            secret_access_key: "private-secret".into(),
+        };
+        let env_file = path.parent().unwrap().join("private-env.sh");
+        fs::write(&env_file, "export NOVA_ENV_READY=true\n").unwrap();
+        let projection =
+            FixtureEndpoints::from_isolated(&endpoints, &identity, env_file.clone()).unwrap();
+        let child = projection.project(&mut config);
+        for (key, expected) in FIXTURE_ENDPOINT_KEYS.iter().zip(&projection.values) {
+            for alias in [
+                key.to_string(),
+                format!("env.{key}"),
+                format!("env.oss.{key}"),
+            ] {
+                assert_eq!(config.values.get(&alias), Some(expected), "{alias}");
+            }
+        }
+        let output = std::process::Command::new("/usr/bin/env")
+            .env_clear()
+            .envs(&child)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let actual = String::from_utf8(output.stdout).unwrap();
+        let captured: BTreeMap<_, _> = actual
+            .lines()
+            .map(|line| {
+                let (key, value) = line.split_once('=').unwrap();
+                (key.to_string(), value.to_string())
+            })
+            .collect();
+        assert_eq!(captured, child);
+        assert_eq!(captured["AWS_S3_ENDPOINT"], endpoints.minio_endpoint);
+        assert_eq!(captured["AWS_S3_ACCESS_KEY_ID"], identity.access_key_id);
+        assert_eq!(captured["MINIO_ROOT_USER"], identity.access_key_id);
+        assert_eq!(
+            captured["AWS_S3_SECRET_ACCESS_KEY"],
+            identity.secret_access_key
+        );
+        assert_eq!(captured["MINIO_ROOT_PASSWORD"], identity.secret_access_key);
+        assert_eq!(captured["NOVAROCKS_ICEBERG_REST_URI"], endpoints.rest_uri);
+        assert_eq!(
+            captured["NOVAROCKS_ICEBERG_REST_WAREHOUSE"],
+            endpoints.rest_warehouse
+        );
+        assert_eq!(
+            captured["NOVA_ENV_REST_WAREHOUSE_URI"],
+            endpoints.rest_warehouse
+        );
+        assert_eq!(
+            Path::new(&captured["NOVA_ENV_REST_ENV_FILE"]),
+            env_file.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn loaded_fixture_requires_complete_unambiguous_runtime_configuration() {
+        let (_directory, path) = configured_fixture();
+        let configured = load_runner_config(Some(&path)).unwrap();
+        for key in FIXTURE_ENDPOINT_KEYS
+            .into_iter()
+            .chain(["fixture_env_file"])
+        {
+            let mut missing = configured.clone();
+            for alias in [
+                key.to_string(),
+                format!("env.{key}"),
+                format!("env.oss.{key}"),
+            ] {
+                missing.values.remove(&alias);
+            }
+            let error = FixtureEndpoints::from_runner_config(&missing)
+                .err()
+                .expect("missing input must fail");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+        let mut conflict = configured.clone();
+        conflict
+            .values
+            .insert("env.oss.oss_endpoint".into(), "foreign".into());
+        assert!(
+            FixtureEndpoints::from_runner_config(&conflict)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("conflicting aliases")
+        );
+        let mut blank = configured.clone();
+        blank.values.insert("oss_ak".into(), String::new());
+        assert!(FixtureEndpoints::from_runner_config(&blank).is_err());
+        let mut projected = configured.clone();
+        FixtureEndpoints::from_runner_config(&configured)
+            .unwrap()
+            .project(&mut projected);
+        assert!(FixtureEndpoints::from_runner_config(&projected).is_ok());
+    }
+
+    #[test]
+    fn shipped_configs_cannot_resolve_a_fixture_without_runtime_configuration() {
+        let repo_root = resolve_repo_root().unwrap();
+        for name in ["default.toml", "iceberg.toml", "iceberg-local.toml"] {
+            let config =
+                load_runner_config(Some(&repo_root.join("tests/sql/runner/conf").join(name)))
+                    .unwrap();
+            let error = FixtureEndpoints::from_runner_config(&config)
+                .err()
+                .expect("no endpoint fallback");
+            assert!(
+                error
+                    .to_string()
+                    .contains("fixture runtime configuration required")
+            );
+        }
+    }
+
+    #[test]
+    fn paimon_keys_append_to_the_generated_final_env_table() {
+        let (_directory, path) = configured_fixture();
+        let mut source = fs::read_to_string(&path)
+            .unwrap()
+            .replace("fixture-key", "${ENV:AWS_S3_ACCESS_KEY_ID}")
+            .replace("fixture-secret", "${ENV:AWS_S3_SECRET_ACCESS_KEY}");
+        // These are the fields appended by docker/paimon-read/fixture.py.
+        source.push_str(
+            r#"
+paimon_fixture_manifest = "/tmp/paimon/manifest.json"
+paimon_warehouse = "s3://warehouse/private/paimon"
+paimon_catalog_sql = "/tmp/paimon/catalog.sql"
+paimon_object_store_credential_name = "iceberg-test-data"
+paimon_object_store_credential_generation = "v1"
+"#,
+        );
+        fs::write(&path, source).unwrap();
+        let mut config = load_runner_config(Some(&path)).unwrap();
+        let physical =
+            FixtureEndpoints::from_runner_config_with_environment(&config, |key| match key {
+                "AWS_S3_ACCESS_KEY_ID" => Some("paimon-key".into()),
+                "AWS_S3_SECRET_ACCESS_KEY" => Some("paimon-secret".into()),
+                _ => panic!("literal configuration unexpectedly read {key}"),
+            })
+            .unwrap();
+        let child = physical.project(&mut config);
+        assert_eq!(
+            config.values["paimon_warehouse"],
+            "s3://warehouse/private/paimon"
+        );
+        assert_eq!(
+            config.values["env.paimon_object_store_credential_name"],
+            "iceberg-test-data"
+        );
+        assert_eq!(config.values["env.oss.oss_ak"], "paimon-key");
+        assert_eq!(config.values["env.oss_sk"], "paimon-secret");
+        assert_eq!(child["AWS_S3_ACCESS_KEY_ID"], "paimon-key");
+        assert_eq!(child["AWS_S3_SECRET_ACCESS_KEY"], "paimon-secret");
+    }
+
+    #[test]
+    fn explicit_environment_references_reject_missing_empty_or_malformed_inputs() {
+        let (_directory, path) = configured_fixture();
+        let mut config = load_runner_config(Some(&path)).unwrap();
+        FixtureEndpoints::from_runner_config_with_environment(&config, |_| {
+            panic!("literal value must not read process environment")
+        })
+        .unwrap();
+        project_fixture_value(&mut config, "oss_sk", "${ENV:FIXTURE_SECRET}");
+        for value in [None, Some(String::new()), Some("  ".into())] {
+            let error =
+                FixtureEndpoints::from_runner_config_with_environment(&config, |_| value.clone())
+                    .err()
+                    .expect("missing referenced credential must fail");
+            assert!(error.to_string().contains("FIXTURE_SECRET"));
+        }
+        for malformed in [
+            "${ENV}",
+            "${ENV:}",
+            "${ENV:BAD-NAME}",
+            "${ENV:SECRET",
+            "prefix${ENV:SECRET}",
+            "${ENV:SECRET}suffix",
+        ] {
+            project_fixture_value(&mut config, "oss_sk", malformed);
+            assert!(
+                FixtureEndpoints::from_runner_config_with_environment(&config, |_| panic!(
+                    "malformed reference must not be read"
+                ))
+                .is_err()
+            );
+        }
     }
 }
