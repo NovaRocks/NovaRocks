@@ -4418,7 +4418,7 @@ mod tests {
         let response = runtime
             .block_on(ingress.fetch_task_result(proto::FetchTaskResultRequest {
                 root_task: Some(novarocks_task_codec::identity::encode_task_identity(root)),
-                max_wait_millis: 0,
+                max_wait_millis: 1_000,
                 acknowledged_packet_sequence: None,
                 max_result_bytes: 1024,
             }))
