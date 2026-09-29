@@ -221,10 +221,10 @@ pub fn eval_array_contains(
 
         if target_is_const {
             let target_idx = 0usize;
-            let result = if target_arr.is_null(target_idx) {
+            let result = if super::common::is_logically_null(target_arr.as_ref(), target_idx) {
                 let mut found_null = false;
                 for i in start..end {
-                    if values.is_null(i) {
+                    if super::common::is_logically_null(values.as_ref(), i) {
                         found_null = true;
                         break;
                     }
@@ -252,10 +252,10 @@ pub fn eval_array_contains(
         let mut out = Vec::with_capacity(chunk.len());
         for row in 0..chunk.len() {
             let target_idx = super::common::row_index(row, target_arr.len());
-            if target_arr.is_null(target_idx) {
+            if super::common::is_logically_null(target_arr.as_ref(), target_idx) {
                 let mut found_null = false;
                 for i in start..end {
-                    if values.is_null(i) {
+                    if super::common::is_logically_null(values.as_ref(), i) {
                         found_null = true;
                         break;
                     }
@@ -320,10 +320,10 @@ pub fn eval_array_contains(
             let mut out = Vec::with_capacity(chunk.len());
             for row in 0..chunk.len() {
                 let target_idx = super::common::row_index(row, target_arr.len());
-                if target_arr.is_null(target_idx) {
+                if super::common::is_logically_null(target_arr.as_ref(), target_idx) {
                     let mut found_null = false;
                     for i in start..end {
-                        if values.is_null(i) {
+                        if super::common::is_logically_null(values.as_ref(), i) {
                             found_null = true;
                             break;
                         }
@@ -349,10 +349,10 @@ pub fn eval_array_contains(
             return Ok(Arc::new(BooleanArray::from(out)) as ArrayRef);
         }
 
-        let result = if target_arr.is_null(0) {
+        let result = if super::common::is_logically_null(target_arr.as_ref(), 0) {
             let mut found_null = false;
             for i in start..end {
-                if values.is_null(i) {
+                if super::common::is_logically_null(values.as_ref(), i) {
                     found_null = true;
                     break;
                 }
@@ -382,10 +382,10 @@ pub fn eval_array_contains(
         let start = offsets[row] as usize;
         let end = offsets[row + 1] as usize;
 
-        if target_arr.is_null(target_idx) {
+        if super::common::is_logically_null(target_arr.as_ref(), target_idx) {
             let mut found_null = false;
             for i in start..end {
-                if values.is_null(i) {
+                if super::common::is_logically_null(values.as_ref(), i) {
                     found_null = true;
                     break;
                 }

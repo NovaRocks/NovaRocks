@@ -26,6 +26,372 @@ use novarocks_execution::exec::expr::function::array::*;
 use novarocks_execution::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use std::sync::Arc;
 
+fn null_element_list_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Null, true)))
+}
+
+fn null_element_literal_array(
+    arena: &mut ExprArena,
+    count: usize,
+) -> novarocks_execution::exec::expr::ExprId {
+    let element = common::typed_null(arena, DataType::Null);
+    arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: vec![element; count],
+        },
+        null_element_list_type(),
+    )
+}
+
+fn null_element_chunk(
+    columns: Vec<arrow::array::ArrayRef>,
+) -> novarocks_execution::exec::chunk::Chunk {
+    use arrow::record_batch::RecordBatch;
+    use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
+    use novarocks_types::SlotId;
+    let fields = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            Field::new(format!("column_{index}"), column.data_type().clone(), true)
+        })
+        .collect::<Vec<_>>();
+    let slots = (0..columns.len())
+        .map(|index| SlotId::new(index as u32 + 10))
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
+    Chunk::new_with_chunk_schema(batch, schema)
+}
+
+#[test]
+fn null_elements_constant_membership_distinguishes_empty_values_and_null_parent() {
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let boolean = common::typed_null(&mut arena, DataType::Boolean);
+    let position = common::typed_null(&mut arena, DataType::Int32);
+    let target = common::typed_null(&mut arena, DataType::Null);
+    for count in [0, 1, 2] {
+        let array = null_element_literal_array(&mut arena, count);
+        let contains = eval_array_contains(&arena, boolean, &[array, target], &chunk).unwrap();
+        let contains = contains.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(!contains.is_null(0));
+        assert_eq!(contains.value(0), count != 0);
+        let found = eval_array_position(&arena, position, &[array, target], &chunk).unwrap();
+        let found = found.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert!(!found.is_null(0));
+        assert_eq!(found.value(0), if count == 0 { 0 } else { 1 });
+    }
+    let null_parent = common::typed_null(&mut arena, null_element_list_type());
+    let contains = eval_array_contains(&arena, boolean, &[null_parent, target], &chunk).unwrap();
+    let found = eval_array_position(&arena, position, &[null_parent, target], &chunk).unwrap();
+    assert!(contains.is_null(0));
+    assert!(found.is_null(0));
+}
+
+#[test]
+fn null_elements_slot_membership_preserves_multiline_offsets_and_slices() {
+    use arrow::array::{ArrayRef, NullArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use novarocks_types::SlotId;
+    let values = Arc::new(NullArray::new(3)) as ArrayRef;
+    let array = ListArray::new(
+        Arc::new(Field::new("item", DataType::Null, true)),
+        OffsetBuffer::new(vec![0_i32, 0, 1, 3, 3].into()),
+        values,
+        Some(NullBuffer::from(vec![true, true, true, false])),
+    );
+    let chunk = null_element_chunk(vec![Arc::new(array), Arc::new(NullArray::new(4))]);
+    let mut arena = ExprArena::default();
+    let source = arena.push_typed(ExprNode::SlotId(SlotId::new(10)), null_element_list_type());
+    let probe = arena.push_typed(ExprNode::SlotId(SlotId::new(11)), DataType::Null);
+    let boolean = common::typed_null(&mut arena, DataType::Boolean);
+    let position = common::typed_null(&mut arena, DataType::Int32);
+    let constant = null_element_literal_array(&mut arena, 1);
+    let output = common::typed_null(&mut arena, null_element_list_type());
+    for (batch, expected_contains, expected_position) in [
+        (
+            chunk.clone(),
+            vec![Some(false), Some(true), Some(true), None],
+            vec![Some(0), Some(1), Some(1), None],
+        ),
+        (
+            chunk.slice(1, 3),
+            vec![Some(true), Some(true), None],
+            vec![Some(1), Some(1), None],
+        ),
+    ] {
+        let contains = eval_array_contains(&arena, boolean, &[source, probe], &batch).unwrap();
+        assert_eq!(
+            contains
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected_contains
+        );
+        let found = eval_array_position(&arena, position, &[source, probe], &batch).unwrap();
+        assert_eq!(
+            found
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            expected_position
+        );
+        let constant_contains =
+            eval_array_contains(&arena, boolean, &[constant, probe], &batch).unwrap();
+        assert_eq!(
+            constant_contains
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(true); batch.len()]
+        );
+        let constant_position =
+            eval_array_position(&arena, position, &[constant, probe], &batch).unwrap();
+        assert_eq!(
+            constant_position
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(1); batch.len()]
+        );
+        for (name, args) in [
+            ("array_remove", vec![source, probe]),
+            ("array_distinct", vec![source]),
+            ("array_intersect", vec![source, constant]),
+        ] {
+            let out = eval_array_function(name, &arena, output, &args, &batch).unwrap();
+            let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+            for (row, contains) in expected_contains.iter().enumerate() {
+                assert_eq!(
+                    list.is_null(row),
+                    contains.is_none(),
+                    "{name}: parent validity"
+                );
+                if let Some(contains) = contains {
+                    let count = if name == "array_remove" {
+                        0
+                    } else {
+                        usize::from(*contains)
+                    };
+                    let values = list.value(row);
+                    assert_eq!(values.data_type(), &DataType::Null);
+                    assert_eq!(values.len(), count, "{name}: row {row}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn null_elements_equality_matches_typed_nulls_without_matching_valid_numbers() {
+    use arrow::array::{ArrayRef, NullArray};
+    let nulls = Arc::new(NullArray::new(2)) as ArrayRef;
+    let typed = Arc::new(Int64Array::from(vec![None, Some(7)])) as ArrayRef;
+    for (left, right) in [(&nulls, &typed), (&typed, &nulls)] {
+        assert!(compare_values_with_null(left, 0, right, 0, true).unwrap());
+        assert!(!compare_values_with_null(left, 0, right, 0, false).unwrap());
+    }
+    assert!(!compare_values_with_null(&nulls, 0, &typed, 1, true).unwrap());
+    assert!(!compare_values_with_null(&typed, 1, &nulls, 0, true).unwrap());
+    assert!(compare_values_with_null(&nulls, 0, &nulls, 1, true).unwrap());
+    assert!(!compare_values_with_null(&nulls, 0, &nulls, 1, false).unwrap());
+}
+
+#[test]
+fn null_elements_transform_membership_and_hash_use_one_null_equivalence() {
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let array = null_element_literal_array(&mut arena, 2);
+    let singleton = null_element_literal_array(&mut arena, 1);
+    let empty = null_element_literal_array(&mut arena, 0);
+    let probe = common::typed_null(&mut arena, DataType::Null);
+    let boolean = common::typed_null(&mut arena, DataType::Boolean);
+    let list_output = common::typed_null(&mut arena, null_element_list_type());
+    for (name, args, expected_len) in [
+        ("array_remove", vec![array, probe], 0),
+        ("array_distinct", vec![array], 1),
+        ("array_intersect", vec![array, singleton], 1),
+        ("array_intersect", vec![array, empty], 0),
+    ] {
+        let out = eval_array_function(name, &arena, list_output, &args, &chunk).unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(!list.is_null(0), "{name} must preserve a non-NULL parent");
+        let values = list.value(0);
+        assert_eq!(values.data_type(), &DataType::Null);
+        assert_eq!(values.len(), expected_len);
+        if expected_len != 0 {
+            assert_eq!(values.logical_nulls().unwrap().null_count(), expected_len);
+        }
+    }
+    for (name, args, expected) in [
+        ("arrays_overlap", vec![array, singleton], true),
+        ("arrays_overlap", vec![empty, singleton], false),
+        ("array_contains_all", vec![array, singleton], true),
+        ("array_contains_seq", vec![array, singleton], true),
+    ] {
+        let out = eval_array_function(name, &arena, boolean, &args, &chunk).unwrap();
+        assert_eq!(
+            out.as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(expected)]
+        );
+    }
+}
+
+#[test]
+fn null_elements_typed_null_control_retains_numeric_value_and_position() {
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+    let one = common::literal_i64(&mut arena, 1);
+    let two = common::literal_i64(&mut arena, 2);
+    let null = common::typed_null(&mut arena, DataType::Int64);
+    let array = arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: vec![one, null, two],
+        },
+        list_type.clone(),
+    );
+    let null_probe = common::typed_null(&mut arena, DataType::Null);
+    let boolean = common::typed_null(&mut arena, DataType::Boolean);
+    let position = common::typed_null(&mut arena, DataType::Int32);
+    let contains = eval_array_contains(&arena, boolean, &[array, null_probe], &chunk).unwrap();
+    assert_eq!(
+        contains
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(true)]
+    );
+    let found = eval_array_position(&arena, position, &[array, null_probe], &chunk).unwrap();
+    assert_eq!(
+        found
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(2)]
+    );
+    let list_output = common::typed_null(&mut arena, list_type);
+    let removed = eval_array_remove(&arena, list_output, &[array, null_probe], &chunk).unwrap();
+    let values = removed
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        values
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(1), Some(2)]
+    );
+}
+
+#[test]
+fn null_elements_nested_list_struct_and_map_hash_preserve_equal_values() {
+    use arrow::array::{ArrayRef, MapArray, NullArray, StructArray};
+    use arrow::datatypes::Fields;
+    use arrow_buffer::OffsetBuffer;
+    use novarocks_types::SlotId;
+    let nulls = Arc::new(NullArray::new(2)) as ArrayRef;
+    let lists = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", DataType::Null, true)),
+        OffsetBuffer::new(vec![0_i32, 1, 2].into()),
+        nulls.clone(),
+        None,
+    )) as ArrayRef;
+    let structs = Arc::new(StructArray::new(
+        Fields::from(vec![Arc::new(Field::new("n", DataType::Null, true))]),
+        vec![nulls.clone()],
+        None,
+    )) as ArrayRef;
+    let entries = StructArray::new(
+        Fields::from(vec![
+            Arc::new(Field::new("key", DataType::Int32, false)),
+            Arc::new(Field::new("value", DataType::Null, true)),
+        ]),
+        vec![Arc::new(Int32Array::from(vec![1, 1])), nulls],
+        None,
+    );
+    let maps = Arc::new(MapArray::new(
+        Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+        OffsetBuffer::new(vec![0_i32, 1, 2].into()),
+        entries,
+        None,
+        false,
+    )) as ArrayRef;
+    for values in [lists, structs, maps] {
+        let list_type = DataType::List(Arc::new(Field::new(
+            "item",
+            values.data_type().clone(),
+            true,
+        )));
+        let array = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", values.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0_i32, 2].into()),
+            values.clone(),
+            None,
+        )) as ArrayRef;
+        let chunk = null_element_chunk(vec![array, values.slice(0, 1)]);
+        let mut arena = ExprArena::default();
+        let source = arena.push_typed(ExprNode::SlotId(SlotId::new(10)), list_type.clone());
+        let probe = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(11)),
+            values.data_type().clone(),
+        );
+        let boolean = common::typed_null(&mut arena, DataType::Boolean);
+        let contains = eval_array_contains(&arena, boolean, &[source, probe], &chunk).unwrap();
+        assert_eq!(
+            contains
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(true)]
+        );
+        let output = common::typed_null(&mut arena, list_type);
+        for (name, args) in [
+            ("array_distinct", vec![source]),
+            ("array_intersect", vec![source, source]),
+        ] {
+            let out = eval_array_function(name, &arena, output, &args, &chunk).unwrap();
+            let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+            assert!(!list.is_null(0));
+            let deduplicated = list.value(0);
+            assert_eq!(deduplicated.data_type(), values.data_type());
+            assert_eq!(
+                deduplicated.len(),
+                1,
+                "{name} must keep one equivalent nested value"
+            );
+            assert!(
+                !deduplicated.is_null(0),
+                "a complex value with a NULL child remains non-NULL"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // all_match tests
 // ---------------------------------------------------------------------------

@@ -120,10 +120,10 @@ pub fn eval_array_position(
         let start = offsets[0] as usize;
         let end = offsets[1] as usize;
         if target_is_const {
-            let pos = if target_arr.is_null(0) {
+            let pos = if super::common::is_logically_null(target_arr.as_ref(), 0) {
                 let mut p = 0_i64;
                 for (idx, i) in (start..end).enumerate() {
-                    if values.is_null(i) {
+                    if super::common::is_logically_null(values.as_ref(), i) {
                         p = idx as i64 + 1;
                         break;
                     }
@@ -146,10 +146,10 @@ pub fn eval_array_position(
         let mut out = Vec::with_capacity(chunk.len());
         for row in 0..chunk.len() {
             let target_idx = super::common::row_index(row, target_arr.len());
-            if target_arr.is_null(target_idx) {
+            if super::common::is_logically_null(target_arr.as_ref(), target_idx) {
                 let mut pos = 0_i64;
                 for (idx, i) in (start..end).enumerate() {
-                    if values.is_null(i) {
+                    if super::common::is_logically_null(values.as_ref(), i) {
                         pos = idx as i64 + 1;
                         break;
                     }
@@ -188,10 +188,10 @@ pub fn eval_array_position(
         let start = offsets[row] as usize;
         let end = offsets[row + 1] as usize;
 
-        if target_arr.is_null(target_idx) {
+        if super::common::is_logically_null(target_arr.as_ref(), target_idx) {
             let mut pos = 0_i64;
             for (idx, i) in (start..end).enumerate() {
-                if values.is_null(i) {
+                if super::common::is_logically_null(values.as_ref(), i) {
                     pos = idx as i64 + 1;
                     break;
                 }

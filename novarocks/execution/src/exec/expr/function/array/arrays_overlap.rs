@@ -168,7 +168,7 @@ pub fn eval_arrays_overlap(
 
         let mut right_has_null = false;
         for j in s2..e2 {
-            if values2.is_null(j) {
+            if super::common::is_logically_null(values2.as_ref(), j) {
                 right_has_null = true;
                 break;
             }
@@ -176,7 +176,7 @@ pub fn eval_arrays_overlap(
 
         let mut found = false;
         for i in s1..e1 {
-            if values1.is_null(i) {
+            if super::common::is_logically_null(values1.as_ref(), i) {
                 if right_has_null {
                     found = true;
                     break;
@@ -184,7 +184,7 @@ pub fn eval_arrays_overlap(
                 continue;
             }
             for j in s2..e2 {
-                if values2.is_null(j) {
+                if super::common::is_logically_null(values2.as_ref(), j) {
                     continue;
                 }
                 if super::common::compare_values_at(&values1, i, &values2, j)? {

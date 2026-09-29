@@ -1,0 +1,21 @@
+-- query 1
+empty_contains	empty_position	singleton_contains	singleton_position	repeated_contains	repeated_position
+0	0	1	1	1	1
+
+-- query 2
+removed	deduplicated	intersected	empty_intersection	shared_null	empty_overlap	contains_all_null	contains_null_seq
+[]	[null]	[null]	[]	1	0	1	1
+
+-- query 3
+null_contains	null_position	null_removed	null_distinct	null_intersection	null_overlap
+NULL	NULL	NULL	NULL	NULL	NULL
+
+-- query 4
+id	contains_null	null_position	removed	deduplicated
+1	0	0	[]	[]
+2	1	1	[]	[null]
+3	1	1	[]	[null]
+
+-- query 5
+typed_contains	typed_position	typed_removed	nested_distinct	nested_intersection
+1	2	[1,2]	[[null]]	[[null]]

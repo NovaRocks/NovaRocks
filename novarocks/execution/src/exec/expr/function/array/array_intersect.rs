@@ -291,7 +291,7 @@ fn hash_complex_value_impl(
     idx: usize,
     hasher: &mut std::collections::hash_map::DefaultHasher,
 ) -> Result<(), String> {
-    if values.is_null(idx) {
+    if super::common::is_logically_null(values.as_ref(), idx) {
         0u8.hash(hasher);
         return Ok(());
     }
@@ -558,15 +558,15 @@ pub fn eval_array_intersect(
         let first_start = first_offsets[first_row] as usize;
         let first_end = first_offsets[first_row + 1] as usize;
 
-        let mut has_null_in_all = false;
+        let mut shared_null_index = None;
         let mut row_map = HashMap::<
             IntersectValue,
             (usize, usize, u64),
             BuildHasherDefault<PhmapCompatHasher>,
         >::default();
         for idx in first_start..first_end {
-            if value_arrays[0].is_null(idx) {
-                has_null_in_all = true;
+            if super::common::is_logically_null(value_arrays[0].as_ref(), idx) {
+                shared_null_index = Some(idx);
                 continue;
             }
             let key = value_key(&value_arrays[0], idx)?;
@@ -585,7 +585,7 @@ pub fn eval_array_intersect(
             let end = offsets[list_row + 1] as usize;
             let mut local_has_null = false;
             for idx in start..end {
-                if value_arrays[array_idx].is_null(idx) {
+                if super::common::is_logically_null(value_arrays[array_idx].as_ref(), idx) {
                     local_has_null = true;
                     continue;
                 }
@@ -596,7 +596,9 @@ pub fn eval_array_intersect(
                     *overlap_times += 1;
                 }
             }
-            has_null_in_all = has_null_in_all && local_has_null;
+            if !local_has_null {
+                shared_null_index = None;
+            }
         }
 
         let max_overlap_times = list_arrays.len() - 1;
@@ -610,8 +612,10 @@ pub fn eval_array_intersect(
             mutable.extend(0, first_idx, first_idx + 1);
             current += 1;
         }
-        if has_null_in_all {
-            mutable.extend_nulls(1);
+        if let Some(first_null_index) = shared_null_index {
+            // Copy the existing NULL rather than requiring a physical validity
+            // buffer, which NullArray deliberately does not carry.
+            mutable.extend(0, first_null_index, first_null_index + 1);
             current += 1;
         }
         if current > i32::MAX as i64 {

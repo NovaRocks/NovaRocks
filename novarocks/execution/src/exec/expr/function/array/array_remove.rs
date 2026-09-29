@@ -91,13 +91,13 @@ pub fn eval_array_remove(
         }
 
         let target_row = super::common::row_index(row, targets.len());
-        let target_is_null = targets.is_null(target_row);
+        let target_is_null = super::common::is_logically_null(targets.as_ref(), target_row);
         let start = offsets[list_row] as usize;
         let end = offsets[list_row + 1] as usize;
 
         for idx in start..end {
             let should_remove = if target_is_null {
-                values.is_null(idx)
+                super::common::is_logically_null(values.as_ref(), idx)
             } else {
                 super::common::compare_values_with_null(&values, idx, &targets, target_row, false)?
             };

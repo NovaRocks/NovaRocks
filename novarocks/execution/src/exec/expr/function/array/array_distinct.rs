@@ -41,7 +41,7 @@ fn hash_value_impl(
     idx: usize,
     hasher: &mut std::collections::hash_map::DefaultHasher,
 ) -> Result<(), String> {
-    if values.is_null(idx) {
+    if super::common::is_logically_null(values.as_ref(), idx) {
         0u8.hash(hasher);
         return Ok(());
     }

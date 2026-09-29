@@ -31,6 +31,14 @@ use crate::exec::expr::function::date::common::{
 use novarocks_types::decimal::LEGACY_DECIMALV2_SCALE;
 use novarocks_types::largeint;
 
+/// SQL element nullness for the supported execution array types.
+/// NullArray has no physical validity bitmap although all its values are NULL.
+/// Keep this hot-loop check allocation-free; logical_nulls() computes a bitmap
+/// for NullArray. Encoded dictionary/run/union values are not array-kernel inputs.
+pub(super) fn is_logically_null(array: &dyn Array, index: usize) -> bool {
+    matches!(array.data_type(), DataType::Null) || array.is_null(index)
+}
+
 pub(super) fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }
 }
@@ -231,8 +239,10 @@ pub fn compare_values_with_null(
     right_idx: usize,
     null_equals_null: bool,
 ) -> Result<bool, String> {
-    if left.is_null(left_idx) || right.is_null(right_idx) {
-        return Ok(null_equals_null && left.is_null(left_idx) && right.is_null(right_idx));
+    let left_null = is_logically_null(left.as_ref(), left_idx);
+    let right_null = is_logically_null(right.as_ref(), right_idx);
+    if left_null || right_null {
+        return Ok(null_equals_null && left_null && right_null);
     }
     if left.data_type() != right.data_type() {
         return Err(format!(
@@ -478,7 +488,8 @@ pub(super) fn compare_values_ordered(
     left_idx: usize,
     right_idx: usize,
 ) -> Result<Ordering, String> {
-    if values.is_null(left_idx) || values.is_null(right_idx) {
+    if is_logically_null(values.as_ref(), left_idx) || is_logically_null(values.as_ref(), right_idx)
+    {
         return Err("array ordered compare does not accept null indices".to_string());
     }
     match values.data_type() {
