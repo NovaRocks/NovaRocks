@@ -6502,7 +6502,9 @@ mod tests {
         ] {
             let error = analyze_projection_expr(sql).unwrap_err();
             assert!(
-                error.contains("builtin function `json_array` has no admitted selected scalar implementation"),
+                error.contains(
+                    "builtin function `json_array` has no admitted selected scalar implementation"
+                ),
                 "{sql}: {error}"
             );
         }
