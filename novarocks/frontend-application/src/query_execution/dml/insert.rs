@@ -35,15 +35,7 @@ use novarocks_parser::ast::{Insert, Query};
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::{QueryExecutionContext, RequestContext};
 use novarocks_spi::connector::{ConnectorWriteOperationId, LakePublicationId};
-use novarocks_sql::semantic::{Literal, ObjectName};
-
-/// Encode one constant JSON literal for frontend-owned INSERT conversion.
-///
-/// The binary format remains an execution-layer concern; frontend receives
-/// only opaque bytes and owns the decision to fold `parse_json(...)`.
-pub fn encode_insert_variant_json(json_text: &str) -> Result<Vec<u8>, String> {
-    novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(json_text)
-}
+use novarocks_sql::semantic::ObjectName;
 
 /// One admitted INSERT statement at the frontend route boundary.
 pub struct InsertRequest<'a> {
@@ -59,20 +51,6 @@ pub struct InsertRequest<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InsertTargetName {
     pub parts: Vec<String>,
-}
-
-/// INSERT literal independent of core's legacy custom statement AST.
-#[derive(Clone, Debug, PartialEq)]
-pub enum InsertValue {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    String(String),
-    Date(String),
-    Array(Vec<InsertValue>),
-    Map(Vec<(InsertValue, InsertValue)>),
-    Struct(Vec<InsertValue>),
 }
 
 /// Overwrite semantics owned by the frontend INSERT command.
@@ -119,19 +97,12 @@ impl std::fmt::Debug for ResolvedInsertTarget {
     }
 }
 
-/// One non-UNION source for an Iceberg INSERT transaction.
-#[derive(Clone, Debug, PartialEq)]
-pub enum IcebergInsertSource {
-    Rows(Vec<Vec<InsertValue>>),
-    Query(Box<Query>),
-}
-
 /// Prepare an Iceberg INSERT without starting writers or external commit.
 pub struct PrepareIcebergInsert {
     pub publication_id: LakePublicationId,
     pub target: ResolvedInsertTarget,
     pub insert_columns: Vec<String>,
-    pub source: IcebergInsertSource,
+    pub source: Box<Query>,
     /// Original client SQL retained for typed analysis error rendering after
     /// native assembly.
     pub sql_source: String,
@@ -388,14 +359,7 @@ impl InsertEngine for DmlExecutionKernel {
             columns,
             statistics_pin: None,
         };
-        let source = match request.source {
-            IcebergInsertSource::Rows(rows) => iceberg_writer::IcebergWriteInput::Rows(
-                rows.iter()
-                    .map(|row| row.iter().map(insert_value_to_literal).collect())
-                    .collect(),
-            ),
-            IcebergInsertSource::Query(query) => iceberg_writer::IcebergWriteInput::Query(query),
-        };
+        let source = request.source;
         let overwrite_mode = match request.overwrite_mode {
             InsertOverwriteMode::Append => iceberg_writer::IcebergWriteMode::Append,
             InsertOverwriteMode::FullTable => iceberg_writer::IcebergWriteMode::FullTableOverwrite,
@@ -564,29 +528,6 @@ fn iceberg_write_report_from_result(
     };
     let commit: Arc<dyn IcebergInsertCommit> = Arc::new(CoreIcebergInsertCommit::new(completion));
     IcebergWriteReport::CommitRequired(commit)
-}
-
-fn insert_value_to_literal(value: &InsertValue) -> Literal {
-    match value {
-        InsertValue::Null => Literal::Null,
-        InsertValue::Bool(value) => Literal::Bool(*value),
-        InsertValue::Int(value) => Literal::Int(*value),
-        InsertValue::Float(value) => Literal::Float(*value),
-        InsertValue::String(value) => Literal::String(value.clone()),
-        InsertValue::Date(value) => Literal::Date(value.clone()),
-        InsertValue::Array(values) => {
-            Literal::Array(values.iter().map(insert_value_to_literal).collect())
-        }
-        InsertValue::Map(values) => Literal::Map(
-            values
-                .iter()
-                .map(|(key, value)| (insert_value_to_literal(key), insert_value_to_literal(value)))
-                .collect(),
-        ),
-        InsertValue::Struct(values) => {
-            Literal::Struct(values.iter().map(insert_value_to_literal).collect())
-        }
-    }
 }
 
 #[cfg(test)]

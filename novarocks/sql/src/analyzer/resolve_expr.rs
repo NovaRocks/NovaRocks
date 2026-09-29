@@ -213,6 +213,20 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // Unary minus
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
+                if let ast::Expr::Literal(ast::Literal {
+                    kind: ast::LiteralKind::Number(number),
+                    span,
+                }) = unary.expression.as_ref()
+                {
+                    if !number.contains('.') && !number.contains('e') && !number.contains('E') {
+                        // Check the signed value before the positive magnitude:
+                        // the absolute value of an integer minimum is out of range.
+                        return self.analyze_literal(&ast::Literal {
+                            kind: ast::LiteralKind::Number(format!("-{number}")),
+                            span: *span,
+                        });
+                    }
+                }
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
                 let dt = inner_typed.data_type.clone();
                 Ok(TypedExpr {
@@ -5693,6 +5707,88 @@ mod tests {
             .next()
             .map(|item| item.expr)
             .ok_or_else(|| "expected projection".to_string())
+    }
+
+    #[test]
+    fn signed_integer_literal_boundaries_preserve_exact_values_and_types() {
+        use crate::analysis::{ExprKind, LiteralValue};
+
+        for value in [i64::MIN, i64::MAX] {
+            let expr = analyze_projection_expr(&format!("select {value}"))
+                .expect("signed BIGINT boundary should analyze");
+            assert_eq!(expr.data_type, DataType::Int64);
+            assert!(!expr.nullable);
+            assert!(
+                matches!(expr.kind, ExprKind::Literal(LiteralValue::Int(actual)) if actual == value)
+            );
+        }
+
+        for value in [
+            i128::MIN,
+            i128::MAX,
+            i64::MIN as i128 - 1,
+            i64::MAX as i128 + 1,
+        ] {
+            let expr = analyze_projection_expr(&format!("select {value}"))
+                .expect("signed LARGEINT boundary should analyze");
+            assert_eq!(
+                expr.data_type,
+                DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+            );
+            assert!(!expr.nullable);
+            assert!(
+                matches!(expr.kind, ExprKind::Literal(LiteralValue::LargeInt(actual)) if actual == value)
+            );
+        }
+    }
+
+    #[test]
+    fn signed_integer_literal_overflow_reports_the_original_numeric_span() {
+        for literal in [
+            "170141183460469231731687303715884105728",
+            "-170141183460469231731687303715884105729",
+        ] {
+            let sql = format!("select {literal}");
+            let statements = novarocks_parser::parse(&sql).expect("test query should parse");
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("expected query");
+            };
+            let error = analyze(query, &EmptyCatalog, "default")
+                .expect_err("numeric literal outside LARGEINT range must be rejected");
+            assert_eq!(error.code().as_str(), "sql.analyze.invalid_literal");
+            let numeric_start = "select ".len() + usize::from(literal.starts_with('-'));
+            assert_eq!(
+                error.span(),
+                Some(novarocks_parser::Span::new(numeric_start, sql.len()))
+            );
+            assert!(error.message().contains(literal), "{error}");
+        }
+    }
+
+    #[test]
+    fn negative_decimal_and_exponent_literals_keep_existing_numeric_types() {
+        use crate::analysis::{ExprKind, LiteralValue, UnOp};
+
+        let decimal = analyze_projection_expr("select -123456789.123456789")
+            .expect("negative decimal should analyze");
+        assert_eq!(decimal.data_type, DataType::Decimal128(18, 9));
+        assert!(matches!(
+            decimal.kind,
+            ExprKind::UnaryOp { op: UnOp::Negate, expr }
+                if matches!(expr.kind, ExprKind::Literal(LiteralValue::Decimal(ref value))
+                    if value == "123456789.123456789")
+        ));
+
+        for sql in ["select -1.25e2", "select -1.25E2"] {
+            let exponent = analyze_projection_expr(sql).expect("negative exponent should analyze");
+            assert_eq!(exponent.data_type, DataType::Float64);
+            assert!(matches!(
+                exponent.kind,
+                ExprKind::UnaryOp { op: UnOp::Negate, expr }
+                    if matches!(expr.kind, ExprKind::Literal(LiteralValue::Float(value))
+                        if value == 125.0)
+            ));
+        }
     }
 
     #[test]

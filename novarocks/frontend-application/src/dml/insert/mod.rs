@@ -22,7 +22,7 @@ mod iceberg;
 mod shaping;
 
 use crate::query_execution::dml::insert::{
-    IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, PrepareIcebergInsert,
+    InsertEngine, InsertOverwriteMode, InsertTargetName, PrepareIcebergInsert,
     PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
@@ -34,8 +34,8 @@ use crate::dml::runner::StatementWriteTransactionRunner;
 use crate::dml::service::DmlService;
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 
-pub use command::{InsertCommandSource, convert_insert_command};
-pub use shaping::reorder_insert_rows;
+pub use command::convert_insert_command;
+pub(crate) use shaping::{omitted_insert_expr, shape_insert_source};
 
 use self::iceberg::{IcebergInsertWriteExecutor, write_transaction_spec};
 
@@ -114,7 +114,7 @@ impl DmlService {
         engine: &dyn InsertEngine,
         target: ResolvedInsertTarget,
         insert_columns: &[String],
-        source: &InsertCommandSource,
+        source: &novarocks_parser::ast::Query,
         sql_source: &str,
         overwrite_mode: InsertOverwriteMode,
         target_ref: &InsertTargetRef,
@@ -122,33 +122,13 @@ impl DmlService {
         query_options: Option<&QueryOptions>,
     ) -> Result<PreparedInsertAttempt, DmlError> {
         let publication_id = LakePublicationId::new_v7();
-        let (source, prepared_insert_columns) = match source {
-            InsertCommandSource::Values(rows) => (
-                IcebergInsertSource::Rows(
-                    reorder_insert_rows(rows, insert_columns, &target.columns)
-                        .map_err(DmlError::executor)?,
-                ),
-                Vec::new(),
-            ),
-            InsertCommandSource::SelectLiteralRow(row) => (
-                IcebergInsertSource::Rows(
-                    reorder_insert_rows(std::slice::from_ref(row), insert_columns, &target.columns)
-                        .map_err(DmlError::executor)?,
-                ),
-                Vec::new(),
-            ),
-            InsertCommandSource::FromQuery(query) => (
-                IcebergInsertSource::Query(query.clone()),
-                insert_columns.to_vec(),
-            ),
-        };
         let prepared = engine
             .prepare_iceberg_write(PrepareIcebergInsert {
                 publication_id,
                 target,
-                insert_columns: prepared_insert_columns,
+                insert_columns: insert_columns.to_vec(),
                 sql_source: sql_source.to_string(),
-                source,
+                source: Box::new(source.clone()),
                 overwrite_mode,
                 target_ref: match target_ref {
                     InsertTargetRef::Main => "main".to_string(),

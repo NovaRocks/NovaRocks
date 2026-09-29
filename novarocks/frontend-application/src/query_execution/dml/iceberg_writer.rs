@@ -46,17 +46,11 @@ use novarocks_spi::connector::{
 };
 #[cfg(test)]
 use novarocks_sql::literal::bytes_to_latin1_string;
-use novarocks_sql::literal::{column_default_to_ast_literal, latin1_string_to_bytes};
+use novarocks_sql::literal::latin1_string_to_bytes;
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_sql::semantic::Literal;
 use novarocks_types::schema::{ColumnDef, ColumnDefault, SqlType};
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum IcebergWriteInput {
-    Rows(Vec<Vec<Literal>>),
-    Query(Box<Query>),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IcebergWriteMode {
@@ -112,7 +106,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
-    source: &IcebergWriteInput,
+    source: &Query,
     overwrite_mode: IcebergWriteMode,
     target_ref: &str,
     execution: Option<QueryExecutionContext>,
@@ -180,7 +174,7 @@ fn prepare_iceberg_distributed_write(
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
-    source: &IcebergWriteInput,
+    source: &Query,
     overwrite_mode: IcebergWriteMode,
     target_ref: &str,
     write_target: &crate::connector::write_target::ConnectorWriteTargetBinding,
@@ -560,7 +554,7 @@ pub(crate) fn build_iceberg_write_plan(
     target: &TargetBackend,
     resolved: &ResolvedTable,
     insert_columns: &[String],
-    source: &IcebergWriteInput,
+    source: &Query,
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Result<(Query, Vec<ColumnDef>), String> {
     let write_columns = insert_columns_from_connector_metadata(
@@ -598,7 +592,7 @@ fn sql_write_source_columns(
     reason = "Retained for staged query-execution DML recovery and connector wiring."
 )]
 fn append_source_to_query(
-    source: &IcebergWriteInput,
+    source: &Query,
     insert_columns: &[String],
     target_columns: &[ColumnDef],
 ) -> Result<Query, String> {
@@ -606,29 +600,28 @@ fn append_source_to_query(
 }
 
 fn append_source_to_query_for_write(
-    source: &IcebergWriteInput,
+    source: &Query,
     insert_columns: &[String],
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
 ) -> Result<Query, String> {
-    match source {
-        IcebergWriteInput::Query(query)
-            if insert_columns.is_empty() && same_column_sequence(source_columns, write_columns) =>
-        {
-            Ok((**query).clone())
-        }
-        IcebergWriteInput::Query(query) => wrap_insert_query_with_write_projection(
-            query,
+    if let Some(query) = crate::dml::insert::shape_insert_source(
+        source,
+        insert_columns,
+        source_columns,
+        write_columns,
+    )? {
+        return Ok(query);
+    }
+    if insert_columns.is_empty() && same_column_sequence(source_columns, write_columns) {
+        Ok(source.clone())
+    } else {
+        wrap_insert_query_with_write_projection(
+            source,
             insert_columns,
             source_columns,
             write_columns,
-        ),
-        IcebergWriteInput::Rows(rows) => values_append_source_to_query_for_write(
-            rows,
-            insert_columns,
-            source_columns,
-            write_columns,
-        ),
+        )
     }
 }
 
@@ -696,74 +689,6 @@ fn wrap_insert_query_with_write_projection(
         alias_columns
     );
     parse_generated_query(&sql, "append INSERT SELECT projection")
-}
-
-fn values_append_source_to_query_for_write(
-    rows: &[Vec<Literal>],
-    insert_columns: &[String],
-    source_columns: &[ColumnDef],
-    write_columns: &[ColumnDef],
-) -> Result<Query, String> {
-    let insert_idx_by_target = if insert_columns.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        insert_column_index_by_target_name(insert_columns, write_columns)?
-    };
-    let rendered_rows = rows
-        .iter()
-        .map(|row| {
-            if insert_columns.is_empty() {
-                if row.len() != source_columns.len() {
-                    return Err(format!(
-                        "insert column count mismatch: expected {} values, got {}",
-                        source_columns.len(),
-                        row.len()
-                    ));
-                }
-            } else if row.len() != insert_columns.len() {
-                return Err(format!(
-                    "insert column count mismatch: expected {} values for column list, got {}",
-                    insert_columns.len(),
-                    row.len()
-                ));
-            }
-            let values = write_columns
-                .iter()
-                .enumerate()
-                .map(|(write_idx, column)| {
-                    if insert_columns.is_empty() {
-                        if let Some(literal) = source_index_for_write_column(
-                            column,
-                            write_idx,
-                            source_columns,
-                            write_columns,
-                        )
-                        .and_then(|source_idx| row.get(source_idx))
-                        {
-                            target_literal_expr_sql(literal, column)
-                        } else {
-                            target_cast_expr_sql(&omitted_column_expr_sql(column)?, column)
-                        }
-                    } else {
-                        let target_name =
-                            novarocks_types::naming::normalize_identifier(&column.name)?;
-                        if let Some(literal) = insert_idx_by_target
-                            .get(&target_name)
-                            .and_then(|source_idx| row.get(*source_idx))
-                        {
-                            target_literal_expr_sql(literal, column)
-                        } else {
-                            target_cast_expr_sql(&omitted_column_expr_sql(column)?, column)
-                        }
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .join(", ");
-            Ok(format!("({values})"))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let sql = format!("VALUES {}", rendered_rows.join(", "));
-    parse_generated_query(&sql, "append INSERT VALUES")
 }
 
 fn same_column_sequence(left: &[ColumnDef], right: &[ColumnDef]) -> bool {
@@ -875,19 +800,9 @@ fn insert_column_index_by_target_name(
 }
 
 fn omitted_column_expr_sql(column: &ColumnDef) -> Result<String, String> {
-    let Some(write_default) = &column.write_default else {
-        return Ok("NULL".to_string());
-    };
-    let sql_type = arrow_data_type_to_sql_type(&column.data_type)?;
-    let literal = column_default_to_ast_literal(write_default, &sql_type)?;
-    literal_to_sql_for_arrow_type(&literal, &column.data_type)
-}
-
-fn target_literal_expr_sql(literal: &Literal, column: &ColumnDef) -> Result<String, String> {
-    target_cast_expr_sql(
-        &literal_to_sql_for_arrow_type(literal, &column.data_type)?,
-        column,
-    )
+    Ok(novarocks_parser::printer::print_expr(
+        &crate::dml::insert::omitted_insert_expr(column)?,
+    ))
 }
 
 pub(crate) fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
@@ -1083,7 +998,9 @@ fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlTyp
     })
 }
 
-fn arrow_data_type_to_sql_type_name(dt: &arrow::datatypes::DataType) -> Result<String, String> {
+pub(crate) fn arrow_data_type_to_sql_type_name(
+    dt: &arrow::datatypes::DataType,
+) -> Result<String, String> {
     sql_type_name(&arrow_data_type_to_sql_type(dt)?)
 }
 
@@ -1174,6 +1091,25 @@ mod tests {
         )
     }
 
+    fn rows_query(rows: Vec<Vec<Literal>>) -> Query {
+        let sql = format!(
+            "VALUES {}",
+            rows.iter()
+                .map(|row| {
+                    format!(
+                        "({})",
+                        row.iter()
+                            .map(|value| literal_to_sql(value).unwrap())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        parse_query(&sql)
+    }
+
     fn test_struct_type(fields: Vec<(&str, DataType)>) -> DataType {
         DataType::Struct(Fields::from(
             fields
@@ -1205,7 +1141,7 @@ mod tests {
             test_column("b", DataType::Int32, Some(ColumnDefault::Int32(5))),
             test_column("c", DataType::Int32, None),
         ];
-        let source = IcebergWriteInput::Rows(vec![vec![Literal::Int(30), Literal::Int(10)]]);
+        let source = rows_query(vec![vec![Literal::Int(30), Literal::Int(10)]]);
 
         let query = append_source_to_query(
             &source,
@@ -1258,7 +1194,7 @@ mod tests {
                     precision: 10,
                     scale: 2,
                 }),
-                "'123.45'".to_string(),
+                "123.45".to_string(),
             ),
             (
                 "date",
@@ -1300,7 +1236,7 @@ mod tests {
                 "empty-map",
                 test_map_type(DataType::Int32, DataType::Utf8),
                 Some(ColumnDefault::Map(Vec::new())),
-                "map()".to_string(),
+                "MAP{}".to_string(),
             ),
             ("missing", DataType::Int32, None, "NULL".to_string()),
         ];
@@ -1326,16 +1262,13 @@ mod tests {
     }
 
     #[test]
-    fn omitted_column_expr_characterizes_non_empty_collection_default_errors() {
+    fn omitted_column_expr_preserves_non_empty_collection_defaults() {
         let list_column = test_column(
             "items",
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
             Some(ColumnDefault::Array(vec![ColumnDefault::Int32(1)])),
         );
-        assert_eq!(
-            omitted_column_expr_sql(&list_column).unwrap_err(),
-            "non-empty ARRAY write-default is not yet supported (1 elements)"
-        );
+        assert_eq!(omitted_column_expr_sql(&list_column).unwrap(), "[1]");
 
         let map_column = test_column(
             "attributes",
@@ -1346,8 +1279,8 @@ mod tests {
             )])),
         );
         assert_eq!(
-            omitted_column_expr_sql(&map_column).unwrap_err(),
-            "non-empty MAP write-default is not yet supported (1 entries)"
+            omitted_column_expr_sql(&map_column).unwrap(),
+            "MAP{1: 'value'}"
         );
     }
 
@@ -1358,7 +1291,7 @@ mod tests {
             test_column("region", DataType::Utf8, None),
             test_column("amount", DataType::Float64, None),
         ];
-        let source = IcebergWriteInput::Rows(vec![
+        let source = rows_query(vec![
             vec![
                 Literal::Int(1),
                 Literal::String("us".to_string()),
@@ -1411,7 +1344,7 @@ mod tests {
             test_column("category", DataType::Utf8, None),
             test_column("amount", DataType::Int32, None),
         ];
-        let source = IcebergWriteInput::Rows(vec![vec![Literal::Int(1), Literal::Int(10)]]);
+        let source = rows_query(vec![vec![Literal::Int(1), Literal::Int(10)]]);
 
         let query = append_source_to_query_for_write(&source, &[], &source_columns, &write_columns)
             .expect("append source query");
@@ -1455,7 +1388,7 @@ mod tests {
     #[test]
     fn append_source_to_query_values_preserves_backslash_string_literals() {
         let target_columns = vec![test_column("region", DataType::Utf8, None)];
-        let source = IcebergWriteInput::Rows(vec![vec![Literal::String(r"e\f".to_string())]]);
+        let source = rows_query(vec![vec![Literal::String(r"e\f".to_string())]]);
 
         let query =
             append_source_to_query(&source, &[], &target_columns).expect("append source query");
@@ -1482,7 +1415,7 @@ mod tests {
     fn append_source_to_query_values_renders_binary_literals_as_hex() {
         let target_columns = vec![test_column("payload", DataType::Binary, None)];
         let packed = bytes_to_latin1_string(&[0xab, 0x01]);
-        let source = IcebergWriteInput::Rows(vec![vec![Literal::String(packed)]]);
+        let source = rows_query(vec![vec![Literal::String(packed)]]);
 
         let query =
             append_source_to_query(&source, &[], &target_columns).expect("append source query");
@@ -1520,7 +1453,7 @@ mod tests {
             test_column("a", DataType::Int32, None),
             test_column("b", DataType::Int32, None),
         ];
-        let source = IcebergWriteInput::Rows(vec![vec![Literal::Int(1), Literal::Int(2)]]);
+        let source = rows_query(vec![vec![Literal::Int(1), Literal::Int(2)]]);
 
         let err = append_source_to_query(&source, &["a".to_string()], &target_columns)
             .expect_err("extra value must be rejected");
@@ -1537,7 +1470,7 @@ mod tests {
             test_column("b", DataType::Int32, Some(ColumnDefault::Int32(7))),
             test_column("c", DataType::Int32, None),
         ];
-        let source = IcebergWriteInput::Query(Box::new(parse_query("SELECT x, y FROM src")));
+        let source = parse_query("SELECT x, y FROM src");
 
         let query = append_source_to_query(
             &source,
@@ -1574,9 +1507,7 @@ mod tests {
                 None,
             ),
         ];
-        let source = IcebergWriteInput::Query(Box::new(parse_query(
-            "SELECT idx FROM row_util ORDER BY idx LIMIT 1000",
-        )));
+        let source = parse_query("SELECT idx FROM row_util ORDER BY idx LIMIT 1000");
 
         let query = append_source_to_query(&source, &["k1".to_string()], &target_columns)
             .expect("append source query");

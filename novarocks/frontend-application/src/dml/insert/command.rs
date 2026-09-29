@@ -15,27 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::query_execution::dml::insert::{InsertOverwriteMode, InsertTargetName, InsertValue};
+use crate::query_execution::dml::insert::{InsertOverwriteMode, InsertTargetName};
 use novarocks_parser::{
     ast::{self, Insert},
     printer,
 };
 
-/// Frontend application command produced from one SQLP-5 typed INSERT.
+/// Frontend command retaining the parser's complete source and numeric text.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InsertCommand {
     pub target: InsertTargetName,
     pub columns: Vec<String>,
-    pub source: InsertCommandSource,
+    pub source: Box<ast::Query>,
     pub overwrite_mode: InsertOverwriteMode,
-}
-
-/// Source form retained until backend dispatch and shaping.
-#[derive(Clone, Debug, PartialEq)]
-pub enum InsertCommandSource {
-    Values(Vec<Vec<InsertValue>>),
-    SelectLiteralRow(Vec<InsertValue>),
-    FromQuery(Box<ast::Query>),
 }
 
 /// Convert the typed INSERT statement into the frontend-owned execution command.
@@ -65,11 +57,10 @@ pub fn convert_insert_command(insert: &Insert) -> Result<InsertCommand, String> 
         return Err("INSERT target is empty after overwrite normalization".to_string());
     }
 
-    let source = if should_route_insert_via_from_query(&insert.source) {
-        InsertCommandSource::FromQuery(Box::new(insert.source.clone()))
-    } else {
-        convert_set_expr_to_source(insert.source.body.as_ref())?
-    };
+    if legacy_literal_query(&insert.source) {
+        validate_literal_set_operations(&insert.source.body)?;
+    }
+    let source = Box::new(insert.source.clone());
 
     Ok(InsertCommand {
         target: InsertTargetName {
@@ -85,28 +76,222 @@ pub fn convert_insert_command(insert: &Insert) -> Result<InsertCommand, String> 
     })
 }
 
-fn convert_set_expr_to_source(body: &ast::SetExpr) -> Result<InsertCommandSource, String> {
+/// Classify literal projections by syntax, without evaluating values or CASTs.
+pub(crate) fn is_literal_expr(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(_) | ast::Expr::TypedString(_) => true,
+        ast::Expr::Nested(nested) => is_literal_expr(&nested.expression),
+        ast::Expr::Unary(unary) => {
+            matches!(unary.operator, ast::UnaryOperator::Minus)
+                && is_literal_expr(&unary.expression)
+        }
+        ast::Expr::Cast(cast) => is_literal_expr(&cast.expr),
+        ast::Expr::Binary(binary) => {
+            matches!(
+                binary.operator,
+                ast::BinaryOperator::Add
+                    | ast::BinaryOperator::Subtract
+                    | ast::BinaryOperator::Multiply
+            ) && is_literal_expr(&binary.left)
+                && is_literal_expr(&binary.right)
+        }
+        ast::Expr::Array(array) => array.elements.iter().all(is_literal_expr),
+        ast::Expr::Map(map) => map
+            .entries
+            .iter()
+            .all(|entry| is_literal_expr(&entry.key) && is_literal_expr(&entry.value)),
+        ast::Expr::Tuple(tuple) => tuple.expressions.iter().all(is_literal_expr),
+        ast::Expr::Struct(structure) => structure
+            .fields
+            .iter()
+            .all(|field| is_literal_expr(&field.value)),
+        ast::Expr::FunctionCall(function) => {
+            plain_function(function)
+                && matches!(
+                    printer::print_object_name(&function.name)
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "array" | "map" | "row" | "named_struct" | "parse_json"
+                )
+                && function.arguments.iter().all(is_literal_expr)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn plain_function(function: &ast::FunctionCall) -> bool {
+    matches!(function.quantifier, ast::FunctionQuantifier::None)
+        && function.order_by.is_empty()
+        && function.separator.is_none()
+        && function.filter.is_none()
+        && function.null_treatment.is_none()
+        && function.over.is_none()
+}
+
+pub(crate) fn literal_query(query: &ast::Query) -> bool {
+    query.with.is_none()
+        && query.order_by.is_empty()
+        && query.limit.is_none()
+        && query.offset.is_none()
+        && query.fetch.is_none()
+        && literal_body(&query.body)
+}
+
+fn literal_body(body: &ast::SetExpr) -> bool {
     match body {
-        ast::SetExpr::Values(values) => Ok(InsertCommandSource::Values(
-            values
+        ast::SetExpr::Values(values) => values.rows.iter().flatten().all(is_literal_expr),
+        ast::SetExpr::Select(select) => {
+            select.from.is_empty()
+                && select.projection.iter().all(|item| match item {
+                    ast::SelectItem::UnnamedExpr(expr)
+                    | ast::SelectItem::ExprWithAlias { expr, .. } => is_literal_expr(expr),
+                    _ => false,
+                })
+        }
+        ast::SetExpr::Query(query) => literal_query(query),
+        ast::SetExpr::SetOperation(operation) => {
+            literal_body(&operation.left) && literal_body(&operation.right)
+        }
+    }
+}
+
+// Admission preserves the former literal-source grammar without evaluating
+// constants. Shaping is broader: SQL still owns all numeric values and CASTs.
+#[derive(Clone, Copy, PartialEq)]
+enum LiteralShape {
+    Integer,
+    Float,
+    String,
+    Other,
+}
+
+fn legacy_literal_shape(expr: &ast::Expr) -> Option<LiteralShape> {
+    use LiteralShape::{Float, Integer, Other, String};
+    match expr {
+        ast::Expr::Literal(literal) => Some(match &literal.kind {
+            ast::LiteralKind::Number(text) if text.contains(['.', 'e', 'E']) => Float,
+            ast::LiteralKind::Number(text) if text.parse::<i64>().is_ok() => Integer,
+            ast::LiteralKind::Number(_)
+            | ast::LiteralKind::String(_)
+            | ast::LiteralKind::HexString(_) => String,
+            _ => Other,
+        }),
+        ast::Expr::TypedString(_) | ast::Expr::Identifier(_) => Some(String),
+        ast::Expr::Nested(nested) => legacy_literal_shape(&nested.expression),
+        ast::Expr::Cast(cast) => {
+            if matches!(
+                printer::print_object_name(&cast.data_type.name)
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "decimal" | "decimal32" | "decimal64" | "decimal128" | "dec" | "numeric"
+            ) {
+                None
+            } else {
+                legacy_literal_shape(&cast.expr)
+            }
+        }
+        ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
+            legacy_literal_shape(&unary.expression)
+                .filter(|kind| matches!(kind, Integer | Float | String))
+        }
+        ast::Expr::Binary(binary) => match (
+            legacy_literal_shape(&binary.left)?,
+            binary.operator,
+            legacy_literal_shape(&binary.right)?,
+        ) {
+            (
+                Integer,
+                ast::BinaryOperator::Add
+                | ast::BinaryOperator::Subtract
+                | ast::BinaryOperator::Multiply,
+                Integer,
+            ) => Some(Integer),
+            (Float, ast::BinaryOperator::Add | ast::BinaryOperator::Subtract, Float) => Some(Float),
+            _ => None,
+        },
+        ast::Expr::Array(array) => array
+            .elements
+            .iter()
+            .all(|value| legacy_literal_shape(value).is_some())
+            .then_some(Other),
+        ast::Expr::Map(map) => map
+            .entries
+            .iter()
+            .all(|entry| {
+                legacy_literal_shape(&entry.key).is_some()
+                    && legacy_literal_shape(&entry.value).is_some()
+            })
+            .then_some(Other),
+        ast::Expr::Tuple(tuple) => tuple
+            .expressions
+            .iter()
+            .all(|value| legacy_literal_shape(value).is_some())
+            .then_some(Other),
+        ast::Expr::Struct(structure) => structure
+            .fields
+            .iter()
+            .all(|field| legacy_literal_shape(&field.value).is_some())
+            .then_some(Other),
+        ast::Expr::FunctionCall(function) if plain_function(function) => {
+            let name = printer::print_object_name(&function.name).to_ascii_lowercase();
+            if name == "parse_json" {
+                return (function.arguments.len() == 1
+                    && legacy_literal_shape(&function.arguments[0]) == Some(String))
+                .then_some(String);
+            }
+            if !matches!(name.as_str(), "array" | "row" | "map" | "named_struct")
+                || (matches!(name.as_str(), "map" | "named_struct")
+                    && function.arguments.len() % 2 != 0)
+            {
+                return None;
+            }
+            function
+                .arguments
+                .iter()
+                .all(|value| legacy_literal_shape(value).is_some())
+                .then_some(Other)
+        }
+        _ => None,
+    }
+}
+
+fn legacy_literal_query(query: &ast::Query) -> bool {
+    if query.with.is_some()
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
+        || query.fetch.is_some()
+    {
+        return false;
+    }
+    fn body_is_literal(body: &ast::SetExpr) -> bool {
+        match body {
+            ast::SetExpr::Select(select) => {
+                select.from.is_empty()
+                    && select.projection.iter().all(|item| match item {
+                        ast::SelectItem::UnnamedExpr(expr)
+                        | ast::SelectItem::ExprWithAlias { expr, .. } => {
+                            legacy_literal_shape(expr).is_some()
+                        }
+                        _ => false,
+                    })
+            }
+            ast::SetExpr::Values(values) => values
                 .rows
                 .iter()
-                .map(|row| row.iter().map(expr_to_insert_value).collect())
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        ast::SetExpr::Select(select) => {
-            if !select.from.is_empty() {
-                return Err("INSERT SELECT with FROM must use the query pipeline".to_string());
+                .flatten()
+                .all(|value| legacy_literal_shape(value).is_some()),
+            ast::SetExpr::Query(query) => legacy_literal_query(query),
+            ast::SetExpr::SetOperation(operation) => {
+                body_is_literal(&operation.left) && body_is_literal(&operation.right)
             }
-            Ok(InsertCommandSource::SelectLiteralRow(
-                select
-                    .projection
-                    .iter()
-                    .map(select_item_expr)
-                    .map(|expr| expr.and_then(expr_to_insert_value))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
         }
+    }
+    body_is_literal(&query.body)
+}
+
+fn validate_literal_set_operations(body: &ast::SetExpr) -> Result<(), String> {
+    match body {
         ast::SetExpr::SetOperation(operation) => {
             if !matches!(operation.operator, ast::SetOperator::Union) {
                 return Err("INSERT SELECT set operation is only UNION ALL here".to_string());
@@ -117,453 +302,117 @@ fn convert_set_expr_to_source(body: &ast::SetExpr) -> Result<InsertCommandSource
                         .to_string(),
                 );
             }
-            let mut rows = Vec::new();
-            flatten_literal_union_all(&operation.left, &mut rows)?;
-            flatten_literal_union_all(&operation.right, &mut rows)?;
-            Ok(InsertCommandSource::Values(rows))
+            validate_literal_set_operations(&operation.left)?;
+            validate_literal_set_operations(&operation.right)
         }
-        ast::SetExpr::Query(query) => convert_set_expr_to_source(query.body.as_ref()),
+        ast::SetExpr::Query(query) => validate_literal_set_operations(&query.body),
+        _ => Ok(()),
     }
-}
-
-fn flatten_literal_union_all(
-    body: &ast::SetExpr,
-    out: &mut Vec<Vec<InsertValue>>,
-) -> Result<(), String> {
-    if let ast::SetExpr::SetOperation(operation) = body
-        && matches!(operation.operator, ast::SetOperator::Union)
-        && matches!(operation.quantifier, ast::SetQuantifier::All)
-    {
-        flatten_literal_union_all(&operation.left, out)?;
-        flatten_literal_union_all(&operation.right, out)
-    } else {
-        match convert_set_expr_to_source(body)? {
-            InsertCommandSource::Values(rows) => out.extend(rows),
-            InsertCommandSource::SelectLiteralRow(row) => out.push(row),
-            InsertCommandSource::FromQuery(_) => {
-                return Err(
-                    "internal: query-backed UNION ALL must use the query pipeline".to_string(),
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-fn should_route_insert_via_from_query(query: &ast::Query) -> bool {
-    query.with.is_some()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-        || query.fetch.is_some()
-        || body_requires_pipeline(query.body.as_ref())
-}
-
-fn body_requires_pipeline(body: &ast::SetExpr) -> bool {
-    match body {
-        ast::SetExpr::Select(select) => {
-            !select.from.is_empty()
-                || select.projection.iter().any(|item| {
-                    select_item_expr(item)
-                        .and_then(expr_to_insert_value)
-                        .is_err()
-                })
-        }
-        ast::SetExpr::Values(values) => values
-            .rows
-            .iter()
-            .flatten()
-            .any(|expr| expr_to_insert_value(expr).is_err()),
-        ast::SetExpr::Query(query) => should_route_insert_via_from_query(query),
-        ast::SetExpr::SetOperation(operation) => {
-            body_requires_pipeline(&operation.left) || body_requires_pipeline(&operation.right)
-        }
-    }
-}
-
-fn select_item_expr(item: &ast::SelectItem) -> Result<&ast::Expr, String> {
-    match item {
-        ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
-            Ok(expr)
-        }
-        _ => Err("INSERT SELECT source only supports expressions".to_string()),
-    }
-}
-
-fn expr_to_insert_value(expr: &ast::Expr) -> Result<InsertValue, String> {
-    match expr {
-        ast::Expr::Literal(literal) => match &literal.kind {
-            ast::LiteralKind::Null => Ok(InsertValue::Null),
-            ast::LiteralKind::Boolean(value) => Ok(InsertValue::Bool(*value)),
-            ast::LiteralKind::Number(value) => Ok(number_to_insert_value(value)),
-            ast::LiteralKind::String(value) => Ok(InsertValue::String(value.clone())),
-            ast::LiteralKind::HexString(value) => {
-                let bytes = hex::decode(value)
-                    .map_err(|error| format!("invalid hex literal X'{value}': {error}"))?;
-                Ok(InsertValue::String(
-                    bytes.into_iter().map(char::from).collect(),
-                ))
-            }
-        },
-        ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
-            negate_insert_value(expr_to_insert_value(&unary.expression)?)
-        }
-        ast::Expr::Nested(nested) => expr_to_insert_value(&nested.expression),
-        ast::Expr::Cast(cast) => {
-            if cast_data_type_is_decimal(&cast.data_type) {
-                return Err(format!(
-                    "CAST to DECIMAL in INSERT SELECT requires pipeline evaluation: {}",
-                    printer::print_expr(expr)
-                ));
-            }
-            expr_to_insert_value(&cast.expr)
-        }
-        ast::Expr::TypedString(typed) => {
-            expr_to_insert_value(&ast::Expr::Literal(typed.value.clone()))
-        }
-        ast::Expr::Identifier(ident) => Ok(InsertValue::String(ident.value.clone())),
-        ast::Expr::Binary(binary) => {
-            let left = expr_to_insert_value(&binary.left)?;
-            let right = expr_to_insert_value(&binary.right)?;
-            match (left, binary.operator, right) {
-                (InsertValue::Int(left), ast::BinaryOperator::Add, InsertValue::Int(right)) => left
-                    .checked_add(right)
-                    .map(InsertValue::Int)
-                    .ok_or_else(|| {
-                        format!(
-                            "integer literal overflow in `{}`",
-                            printer::print_expr(expr)
-                        )
-                    }),
-                (
-                    InsertValue::Int(left),
-                    ast::BinaryOperator::Subtract,
-                    InsertValue::Int(right),
-                ) => left
-                    .checked_sub(right)
-                    .map(InsertValue::Int)
-                    .ok_or_else(|| {
-                        format!(
-                            "integer literal overflow in `{}`",
-                            printer::print_expr(expr)
-                        )
-                    }),
-                (
-                    InsertValue::Int(left),
-                    ast::BinaryOperator::Multiply,
-                    InsertValue::Int(right),
-                ) => left
-                    .checked_mul(right)
-                    .map(InsertValue::Int)
-                    .ok_or_else(|| {
-                        format!(
-                            "integer literal overflow in `{}`",
-                            printer::print_expr(expr)
-                        )
-                    }),
-                (InsertValue::Float(left), ast::BinaryOperator::Add, InsertValue::Float(right)) => {
-                    Ok(InsertValue::Float(left + right))
-                }
-                (
-                    InsertValue::Float(left),
-                    ast::BinaryOperator::Subtract,
-                    InsertValue::Float(right),
-                ) => Ok(InsertValue::Float(left - right)),
-                _ => Err(format!(
-                    "unsupported expression in INSERT VALUES: {}",
-                    printer::print_expr(expr)
-                )),
-            }
-        }
-        ast::Expr::Array(array) => Ok(InsertValue::Array(
-            array
-                .elements
-                .iter()
-                .map(expr_to_insert_value)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        ast::Expr::Tuple(tuple) => Ok(InsertValue::Struct(
-            tuple
-                .expressions
-                .iter()
-                .map(expr_to_insert_value)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        ast::Expr::Struct(structure) => Ok(InsertValue::Struct(
-            structure
-                .fields
-                .iter()
-                .map(|field| expr_to_insert_value(&field.value))
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        ast::Expr::Map(map) => Ok(InsertValue::Map(
-            map.entries
-                .iter()
-                .map(|entry| {
-                    Ok((
-                        expr_to_insert_value(&entry.key)?,
-                        expr_to_insert_value(&entry.value)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        )),
-        ast::Expr::FunctionCall(function) => function_to_insert_value(function),
-        _ => Err(format!(
-            "unsupported expression in INSERT VALUES: {}",
-            printer::print_expr(expr)
-        )),
-    }
-}
-
-fn function_to_insert_value(function: &ast::FunctionCall) -> Result<InsertValue, String> {
-    let args = function_expr_args(function)?;
-    let name = printer::print_object_name(&function.name).to_ascii_lowercase();
-    match name.as_str() {
-        "parse_json" => {
-            if args.len() != 1 {
-                return Err("parse_json expects 1 argument".to_string());
-            }
-            let InsertValue::String(json_text) = expr_to_insert_value(args[0])? else {
-                return Err("parse_json expects VARCHAR argument".to_string());
-            };
-            let bytes = crate::query_execution::dml::insert::encode_insert_variant_json(&json_text)
-                .map_err(|error| format!("parse_json failed: {error}"))?;
-            Ok(InsertValue::String(
-                bytes.into_iter().map(char::from).collect(),
-            ))
-        }
-        "array" => Ok(InsertValue::Array(
-            args.into_iter()
-                .map(expr_to_insert_value)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        "row" => Ok(InsertValue::Struct(
-            args.into_iter()
-                .map(expr_to_insert_value)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        "named_struct" => {
-            if args.len() % 2 != 0 {
-                return Err(format!(
-                    "named_struct literal requires an even number of arguments, got {}",
-                    args.len()
-                ));
-            }
-            Ok(InsertValue::Struct(
-                args.into_iter()
-                    .skip(1)
-                    .step_by(2)
-                    .map(expr_to_insert_value)
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
-        }
-        "map" => {
-            if args.len() % 2 != 0 {
-                return Err(format!(
-                    "MAP literal requires an even number of arguments, got {}",
-                    args.len()
-                ));
-            }
-            args.chunks_exact(2)
-                .map(|pair| {
-                    Ok((
-                        expr_to_insert_value(pair[0])?,
-                        expr_to_insert_value(pair[1])?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()
-                .map(InsertValue::Map)
-        }
-        _ => Err(format!(
-            "unsupported expression in INSERT VALUES: {}",
-            printer::print_expr(&ast::Expr::FunctionCall(function.clone()))
-        )),
-    }
-}
-
-fn function_expr_args(function: &ast::FunctionCall) -> Result<Vec<&ast::Expr>, String> {
-    if !matches!(function.quantifier, ast::FunctionQuantifier::None)
-        || !function.order_by.is_empty()
-        || function.separator.is_some()
-        || function.filter.is_some()
-        || function.null_treatment.is_some()
-        || function.over.is_some()
-    {
-        return Err(format!(
-            "unsupported function modifiers in INSERT VALUES: {}",
-            printer::print_expr(&ast::Expr::FunctionCall(function.clone()))
-        ));
-    }
-    Ok(function.arguments.iter().collect())
-}
-
-fn number_to_insert_value(value: &str) -> InsertValue {
-    if !value.contains(['.', 'e', 'E']) {
-        value
-            .parse::<i64>()
-            .map(InsertValue::Int)
-            .unwrap_or_else(|_| InsertValue::String(value.to_string()))
-    } else {
-        value
-            .parse::<f64>()
-            .map(InsertValue::Float)
-            .unwrap_or_else(|_| InsertValue::String(value.to_string()))
-    }
-}
-
-fn negate_insert_value(value: InsertValue) -> Result<InsertValue, String> {
-    match value {
-        InsertValue::Int(value) => value
-            .checked_neg()
-            .map(InsertValue::Int)
-            .ok_or_else(|| "integer literal overflow while negating".to_string()),
-        InsertValue::Float(value) => Ok(InsertValue::Float(-value)),
-        InsertValue::String(value) if !value.trim().contains(['.', 'e', 'E']) => {
-            Ok(InsertValue::String(format!("-{}", value.trim())))
-        }
-        other => Err(format!("cannot negate {other:?}")),
-    }
-}
-
-fn cast_data_type_is_decimal(data_type: &ast::TypeName) -> bool {
-    matches!(
-        printer::print_object_name(&data_type.name)
-            .to_ascii_lowercase()
-            .as_str(),
-        "decimal" | "decimal32" | "decimal64" | "decimal128" | "dec" | "numeric"
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_execution::dml::insert::{InsertOverwriteMode, InsertValue};
 
-    fn parse_insert(sql: &str) -> Insert {
-        let statements = novarocks_parser::parse(sql).expect("statement should parse");
-        let [ast::Statement::Dml(ast::DmlStatement::Insert(statement))] = statements.as_slice()
-        else {
-            panic!("statement should be SQLP-5 INSERT");
+    fn convert(sql: &str) -> Result<InsertCommand, String> {
+        let statements = novarocks_parser::parse(sql).expect("parse INSERT");
+        let [ast::Statement::Dml(ast::DmlStatement::Insert(insert))] = statements.as_slice() else {
+            panic!("expected INSERT");
         };
-        statement.clone()
-    }
-
-    fn convert_insert(sql: &str) -> Result<InsertCommand, String> {
-        convert_insert_command(&parse_insert(sql))
+        convert_insert_command(insert)
     }
 
     #[test]
-    fn values_become_literal_rows() {
-        let command =
-            convert_insert("INSERT INTO db.t VALUES (1, 'a'), (2, NULL)").expect("convert command");
-        assert_eq!(command.target.parts, vec!["db", "t"]);
+    fn preserves_exact_numbers_and_explicit_casts() {
+        let command = convert("INSERT INTO db.t(d) VALUES (123456789.123456789), (CAST(-123456789.123456789 AS DOUBLE))").unwrap();
+        assert_eq!(command.target.parts, ["db", "t"]);
+        assert_eq!(command.columns, ["d"]);
+        let ast::SetExpr::Values(values) = command.source.body.as_ref() else {
+            panic!("VALUES");
+        };
+        let ast::Expr::Literal(value) = &values.rows[0][0] else {
+            panic!("numeric literal");
+        };
         assert_eq!(
-            command.source,
-            InsertCommandSource::Values(vec![
-                vec![InsertValue::Int(1), InsertValue::String("a".to_string())],
-                vec![InsertValue::Int(2), InsertValue::Null],
-            ])
+            value.kind,
+            ast::LiteralKind::Number("123456789.123456789".into())
         );
+        assert!(matches!(&values.rows[1][0], ast::Expr::Cast(_)));
     }
 
     #[test]
-    fn select_without_from_becomes_literal_row() {
-        let command = convert_insert("INSERT INTO t SELECT 40 + 2, 'x'").expect("convert command");
-        assert_eq!(
-            command.source,
-            InsertCommandSource::SelectLiteralRow(vec![
-                InsertValue::Int(42),
-                InsertValue::String("x".to_string()),
-            ])
-        );
+    fn retains_source_filters_limits_and_union_branches() {
+        for sql in [
+            "INSERT INTO t SELECT 40 + 2 WHERE false",
+            "INSERT INTO t SELECT DISTINCT 1 LIMIT 0",
+            "INSERT INTO t SELECT 1 UNION ALL SELECT 2",
+            "INSERT INTO t SELECT id FROM src ORDER BY id LIMIT 3",
+            "INSERT INTO t VALUES (to_bitmap(11), hll_hash(5))",
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [ast::Statement::Dml(ast::DmlStatement::Insert(insert))] = statements.as_slice()
+            else {
+                panic!("INSERT");
+            };
+            assert_eq!(
+                *convert_insert_command(insert).unwrap().source,
+                insert.source
+            );
+        }
     }
 
     #[test]
-    fn select_with_from_uses_query_pipeline() {
-        let command = convert_insert("INSERT INTO t SELECT id FROM src").expect("convert command");
-        assert!(matches!(command.source, InsertCommandSource::FromQuery(_)));
-    }
-
-    #[test]
-    fn non_constant_projection_uses_query_pipeline() {
-        let command = convert_insert("INSERT INTO t SELECT value + 1").expect("convert command");
-        assert!(matches!(command.source, InsertCommandSource::FromQuery(_)));
-    }
-
-    #[test]
-    fn non_literal_values_function_uses_query_pipeline() {
-        let command = convert_insert("INSERT INTO t VALUES (to_bitmap(11), hll_hash(5))")
-            .expect("convert command");
-        assert!(matches!(command.source, InsertCommandSource::FromQuery(_)));
-    }
-
-    #[test]
-    fn parse_json_values_fold_to_packed_variant_literal() {
-        let command = convert_insert(r#"INSERT INTO t VALUES (1, parse_json('{"a":1}'))"#)
-            .expect("convert command");
-        let InsertCommandSource::Values(rows) = command.source else {
-            panic!("constant parse_json must stay on the literal VALUES path");
-        };
-        let InsertValue::String(packed) = &rows[0][1] else {
-            panic!("parse_json must produce packed variant bytes");
-        };
+    fn rejects_literal_union_distinct_but_preserves_general_query_boundary() {
         assert!(
-            packed.chars().all(|ch| u32::from(ch) <= 0xff),
-            "packed variant must preserve every byte through the Latin-1 bridge"
+            convert("INSERT INTO t SELECT 1 UNION SELECT 2")
+                .unwrap_err()
+                .contains("requires UNION ALL")
         );
-        let unpacked = packed.chars().map(|ch| ch as u8).collect::<Vec<_>>();
-        let expected =
-            crate::query_execution::dml::insert::encode_insert_variant_json(r#"{"a":1}"#)
-                .expect("encode expected variant");
-        assert_eq!(unpacked, expected);
+        assert!(convert("INSERT INTO t SELECT id FROM src UNION SELECT id FROM other").is_ok());
+        assert!(
+            convert(
+                "INSERT INTO t SELECT CAST(1 AS DECIMAL(5,2)) UNION SELECT CAST(1 AS DECIMAL(5,2))"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn union_all_flattens_in_source_order() {
-        let command =
-            convert_insert("INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
-                .expect("convert command");
-        let InsertCommandSource::Values(rows) = command.source else {
-            panic!("expected UNION ALL literals to normalize into one VALUES source");
+    fn keeps_general_numeric_union_admission() {
+        for sql in [
+            "INSERT INTO t SELECT CAST(1 AS DECIMAL(5,2)) UNION SELECT CAST(1 AS DECIMAL(5,2))",
+            "INSERT INTO t SELECT 1 + 1.5 UNION SELECT 2.5",
+            "INSERT INTO t SELECT 1.5 * 2.0 UNION SELECT 3.0",
+        ] {
+            assert!(convert(sql).is_ok(), "{sql}");
+        }
+        for sql in [
+            "INSERT INTO t SELECT 1 + 2 UNION SELECT 3",
+            "INSERT INTO t SELECT 1.5 + 2.5 UNION SELECT 4.0",
+        ] {
+            assert!(
+                convert(sql).unwrap_err().contains("requires UNION ALL"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn retains_variant_function_for_target_representation() {
+        let command = convert(r#"INSERT INTO t VALUES (parse_json('{"a":1}'))"#).unwrap();
+        let ast::SetExpr::Values(values) = command.source.body.as_ref() else {
+            panic!("VALUES");
         };
-        assert_eq!(
-            rows,
-            vec![
-                vec![InsertValue::Int(1)],
-                vec![InsertValue::Int(2)],
-                vec![InsertValue::Int(3)],
-            ]
-        );
+        assert!(matches!(&values.rows[0][0], ast::Expr::FunctionCall(_)));
     }
 
     #[test]
-    fn union_distinct_is_rejected() {
-        let error = convert_insert("INSERT INTO t SELECT 1 UNION SELECT 2").unwrap_err();
-        assert!(error.contains("requires UNION ALL"), "{error}");
-    }
-
-    #[test]
-    fn typed_dynamic_overwrite_uses_partition_field() {
-        let command = convert_insert("INSERT OVERWRITE PARTITIONS TABLE db.t VALUES (1)")
-            .expect("convert dynamic overwrite");
-        assert_eq!(command.target.parts, vec!["db", "t"]);
+    fn preserves_dynamic_overwrite_target() {
+        let command = convert("INSERT OVERWRITE PARTITIONS TABLE db.t VALUES (1)").unwrap();
+        assert_eq!(command.target.parts, ["db", "t"]);
         assert_eq!(
             command.overwrite_mode,
             InsertOverwriteMode::DynamicPartitions
-        );
-    }
-
-    #[test]
-    fn typed_insert_target_preserves_object_name_components() {
-        let statement = parse_insert("INSERT INTO db.t SELECT remote('localhost')");
-        assert_eq!(
-            statement
-                .target
-                .parts
-                .iter()
-                .map(|part| part.value.as_str())
-                .collect::<Vec<_>>(),
-            vec!["db", "t"]
         );
     }
 }
