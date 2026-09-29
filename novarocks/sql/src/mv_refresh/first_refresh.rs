@@ -305,6 +305,7 @@ pub fn analyze_mv_first_refresh_connector_write(
         crate::compiler::SqlStatementInput::sql(artifact.sql()),
         crate::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
         crate::compiler::SqlSessionContext {
+            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
             current_catalog: context.current_catalog,
             current_database: context.current_database,
             optimizer_settings: context.optimizer_settings,
@@ -449,6 +450,7 @@ pub fn analyze_join_first_refresh_connector_write(
             ),
         },
         crate::compiler::SqlSessionContext {
+            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
             current_catalog: context.current_catalog,
             current_database: context.current_database,
             optimizer_settings: context.optimizer_settings,
@@ -601,6 +603,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         factory,
         crate::compiler::SqlCompileIntent::ChangeStreamWrite,
         crate::compiler::SqlSessionContext {
+            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
             current_catalog: None,
             current_database: String::new(),
             optimizer_settings: crate::planning::dml::dml_change_stream_optimizer_settings(),
@@ -881,6 +884,7 @@ fn canonical_incremental_change_stream_request<'a>(
         crate::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         crate::compiler::SqlCompileIntent::ChangeStreamWrite,
         crate::compiler::SqlSessionContext {
+            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
             current_catalog,
             current_database,
             optimizer_settings: crate::planning::dml::dml_change_stream_optimizer_settings(),
@@ -1505,6 +1509,7 @@ fn plain_join_first_refresh_logical_request<'a>(
         crate::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         crate::compiler::SqlCompileIntent::LogicalOnly,
         crate::compiler::SqlSessionContext {
+            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
             current_catalog,
             current_database,
             optimizer_settings,

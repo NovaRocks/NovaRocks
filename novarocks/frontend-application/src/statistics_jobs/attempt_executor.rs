@@ -425,6 +425,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                         Some(deadline),
                         cancellation,
                         novarocks_sql::compiler::SessionOptimizerSettings::default(),
+                        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
                     );
                 let relation =
                     crate::query_execution::statistics::StatisticsRelationIdentity::try_new(

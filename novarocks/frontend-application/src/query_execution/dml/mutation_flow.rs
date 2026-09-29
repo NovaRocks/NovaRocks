@@ -435,6 +435,7 @@ fn compile_dml_change_stream_write(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
         novarocks_sql::compiler::SqlSessionContext {
+            sql_semantics: execution.sql_semantics().clone(),
             current_catalog: None,
             current_database: target.namespace.clone(),
             optimizer_settings: dml_change_stream_optimizer_settings(),
@@ -3011,6 +3012,7 @@ fn execute_exact_cow_match_query(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         novarocks_sql::compiler::SqlCompileIntent::DmlInternalRead,
         novarocks_sql::compiler::SqlSessionContext {
+            sql_semantics: execution.sql_semantics().clone(),
             current_catalog: Some(target.catalog.clone()),
             current_database: target.namespace.clone(),
             optimizer_settings: execution.optimizer_settings().clone(),
@@ -5977,6 +5979,7 @@ mod tests {
                     novarocks_query_application::cancellation::QueryCancellationSource::new()
                         .view(),
                     novarocks_sql::compiler::SessionOptimizerSettings::default(),
+                    novarocks_sql::sql_mode::SqlSemanticSettings::default(),
                 ),
             connector_context: connector_context_for_test(),
             write_session: session,

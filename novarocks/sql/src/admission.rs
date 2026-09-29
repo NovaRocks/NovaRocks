@@ -18,26 +18,9 @@
 //! SQL admission helpers over native typed parser nodes.
 
 pub fn query_allows_throw_exception_hint(query: &novarocks_parser::ast::Query) -> bool {
-    use novarocks_parser::ast::{BinaryOperator, Expr, LiteralKind, SelectHintValue, SetExpr};
-
-    let mut body = query.body.as_ref();
-    while let SetExpr::Query(nested) = body {
-        body = nested.body.as_ref();
-    }
-    let SetExpr::Select(select) = body else {
-        return false;
-    };
-    select.hints.iter().any(|hint| {
-        hint.name.value.eq_ignore_ascii_case("set_var")
-            && matches!(&hint.value, SelectHintValue::Call { arguments } if arguments.iter().any(|argument| {
-                matches!(argument,
-                    Expr::Binary(binary)
-                        if binary.operator == BinaryOperator::Equal
-                            && matches!(binary.left.as_ref(), Expr::Identifier(name) if name.value.eq_ignore_ascii_case("sql_mode"))
-                            && matches!(binary.right.as_ref(), Expr::Literal(literal) if matches!(&literal.kind, LiteralKind::String(value) if value.to_ascii_lowercase().contains("allow_throw_exception")))
-                )
-            }))
-    })
+    crate::sql_mode::query_sql_semantics(&crate::sql_mode::SqlSemanticSettings::default(), query)
+        .sql_mode()
+        .allow_throw_exception()
 }
 
 /// Returns the positive per-statement execution-memory limit carried by a

@@ -61,6 +61,11 @@ use novarocks_types::wider_type;
 use helpers::{expr_display_name, extract_limit, extract_offset};
 use scope::AnalyzerScope;
 
+#[cfg(test)]
+pub(crate) fn display_expr_for_test(expr: &ast::Expr) -> String {
+    helpers::expr_display_name(expr)
+}
+
 #[derive(Clone, Debug)]
 struct RepeatGroupBySpec {
     grouping_sets: Vec<Vec<ast::Expr>>,
@@ -118,6 +123,31 @@ pub(crate) fn analyze_with_function_catalog(
     )
 }
 
+/// Analyze using the semantic setting frozen by the SQL compiler.
+pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::analysis::cte::CTERegistry,
+        crate::column_id::ColumnRefFactory,
+    ),
+    AnalyzeError,
+> {
+    analyze_with_factory_and_function_catalog_inner(
+        query,
+        catalog,
+        current_database,
+        crate::column_id::ColumnRefFactory::new(),
+        function_catalog,
+        sql_semantics,
+    )
+}
+
 /// Test-only analysis helper that threads an existing [`ColumnRefFactory`] so that
 /// ColumnIds allocated by this analysis never collide with ids the caller
 /// already minted (used by MV rewrite candidate preparation, which analyzes
@@ -171,6 +201,7 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
         current_database,
         factory,
         function_catalog,
+        &crate::sql_mode::SqlSemanticSettings::default(),
     )
 }
 
@@ -180,6 +211,7 @@ fn analyze_with_factory_and_function_catalog_inner(
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
 ) -> Result<
     (
         ResolvedQuery,
@@ -188,12 +220,14 @@ fn analyze_with_factory_and_function_catalog_inner(
     ),
     AnalyzeError,
 > {
-    let query = query_prepass::preanalyze(query.clone())?;
+    let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics);
+    let query = query_prepass::preanalyze(query)?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         catalog,
         current_database,
         function_catalog,
+        sql_semantics: crate::sql_mode::query_sql_semantics(sql_semantics, &query),
         factory: factory.clone(),
         ctes: std::collections::HashMap::new(),
         pending_ctes: std::collections::HashSet::new(),
@@ -218,6 +252,7 @@ pub(super) struct AnalyzerContext<'a> {
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
     pub(super) function_catalog: &'a dyn crate::compiler::SqlFunctionCatalog,
+    pub(super) sql_semantics: crate::sql_mode::SqlSemanticSettings,
     /// Shared factory for allocating globally unique ColumnIds.
     pub(super) factory: std::rc::Rc<std::cell::RefCell<crate::column_id::ColumnRefFactory>>,
     /// Currently visible CTE definitions from outer scopes or earlier entries
@@ -290,6 +325,7 @@ impl<'a> AnalyzerContext<'a> {
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
+            sql_semantics: self.sql_semantics.clone(),
             factory: self.factory.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: pending_ctes.clone(),

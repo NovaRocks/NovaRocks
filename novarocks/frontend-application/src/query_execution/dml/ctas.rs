@@ -612,6 +612,7 @@ fn plan_query_for_ctas_source(
             root_distribution: novarocks_sql::compiler::RootDistributionRequirement::Any,
         },
         novarocks_sql::compiler::SqlSessionContext {
+            sql_semantics: execution.sql_semantics().clone(),
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),

@@ -3750,6 +3750,7 @@ mod tests {
             SqlStatementInput::sql(sql),
             intent,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: Some("iceberg".to_string()),
                 current_database: "db".to_string(),
                 optimizer_settings: SessionOptimizerSettings {

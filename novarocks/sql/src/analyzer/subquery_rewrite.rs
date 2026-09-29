@@ -2418,6 +2418,7 @@ impl<'a> AnalyzerContext<'a> {
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
+            sql_semantics: crate::sql_mode::query_sql_semantics(&self.sql_semantics, query),
             factory: self.factory.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),

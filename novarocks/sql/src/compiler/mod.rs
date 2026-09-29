@@ -466,6 +466,7 @@ pub struct SqlSessionContext {
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub optimizer_settings: SessionOptimizerSettings,
+    pub sql_semantics: crate::sql_mode::SqlSemanticSettings,
 }
 
 /// The execution environment selected for SQL planning.
@@ -841,6 +842,7 @@ fn imv_refresh_explain_request<'a>(
         SqlStatementInput::parsed_query(Box::new(query)),
         SqlCompileIntent::LogicalOnly,
         SqlSessionContext {
+            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
             current_catalog,
             current_database,
             optimizer_settings,
@@ -981,13 +983,15 @@ impl SqlCompiler {
                         "SQL analysis requires a function catalog".to_string(),
                     )
                 })?;
-                let (resolved, ctes, mut factory) = crate::analyzer::analyze_with_function_catalog(
-                    &query,
-                    catalog,
-                    &request.session.current_database,
-                    functions,
-                )
-                .map_err(SqlCompileError::Analyze)?;
+                let (resolved, ctes, mut factory) =
+                    crate::analyzer::analyze_with_function_catalog_and_sql_semantics(
+                        &query,
+                        catalog,
+                        &request.session.current_database,
+                        functions,
+                        &request.session.sql_semantics,
+                    )
+                    .map_err(SqlCompileError::Analyze)?;
                 request.check_control()?;
                 let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
                     .map_err(SqlCompileError::Compilation)?;
@@ -1531,6 +1535,7 @@ mod tests {
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: Some("iceberg".to_string()),
                 current_database: "db".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -1560,6 +1565,7 @@ mod tests {
             SqlStatementInput::sql("select order_id from orders"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: Some("iceberg".to_string()),
                 current_database: "db".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -1972,6 +1978,7 @@ mod tests {
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -2000,6 +2007,7 @@ mod tests {
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -2047,6 +2055,7 @@ mod tests {
                 ),
             },
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -2075,6 +2084,7 @@ mod tests {
                 root_distribution: RootDistributionRequirement::Any,
             },
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),

@@ -1,0 +1,59 @@
+-- query 2
+group_concat(v ORDER BY id ASC SEPARATOR ', ')
+a, b
+
+-- query 3
+value
+a-b
+
+-- query 4
+value
+a-,b-
+
+-- query 5
+value
+a-b
+
+-- query 6
+value
+a-,b-
+
+-- query 7
+value
+a-b
+
+-- query 8
+value
+a-|b-
+
+-- query 9
+value
+a|b
+
+-- query 11
+value
+a-,b-
+
+-- query 12
+value
+a|b
+
+-- query 14
+value
+a-,b-
+
+-- query 16
+value
+a-b
+
+-- query 18
+value
+a-b
+
+-- query 20
+value
+a, b
+
+-- query 21
+value
+a-,b-

@@ -38,6 +38,7 @@ pub struct RequestAdmission {
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     optimizer_settings: SessionOptimizerSettings,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 }
 
 impl RequestAdmission {
@@ -50,6 +51,7 @@ impl RequestAdmission {
         deadline: Option<Instant>,
         cancellation: QueryCancellationView,
         optimizer_settings: SessionOptimizerSettings,
+        sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Self {
         Self {
             current_catalog,
@@ -59,6 +61,7 @@ impl RequestAdmission {
             deadline,
             cancellation,
             optimizer_settings,
+            sql_semantics,
         }
     }
 }
@@ -87,12 +90,14 @@ impl StatementAdmissionContext {
         deadline: Option<Instant>,
         cancellation: QueryCancellationView,
         optimizer_settings: SessionOptimizerSettings,
+        sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Self {
         Self {
             session: RequestSessionContext::new(
                 current_catalog,
                 current_database,
                 optimizer_settings,
+                sql_semantics,
             ),
             role,
             deadline,
@@ -112,6 +117,7 @@ impl StatementAdmissionContext {
                 self.deadline,
                 self.cancellation.clone(),
                 self.session.optimizer_settings().clone(),
+                self.session.sql_semantics().clone(),
             ),
         )
     }
@@ -147,6 +153,7 @@ pub struct QueryExecutionContext {
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     optimizer_settings: SessionOptimizerSettings,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 }
 
 impl QueryExecutionContext {
@@ -156,6 +163,7 @@ impl QueryExecutionContext {
         deadline: Option<Instant>,
         cancellation: QueryCancellationView,
         mut optimizer_settings: SessionOptimizerSettings,
+        sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Self {
         if optimizer_settings.cbo_broadcast_backend_count.is_none()
             && optimizer_settings.effective_backend_count.is_none()
@@ -169,6 +177,7 @@ impl QueryExecutionContext {
             deadline,
             cancellation,
             optimizer_settings,
+            sql_semantics,
         }
     }
 
@@ -190,6 +199,10 @@ impl QueryExecutionContext {
 
     /// Settings frozen with the request so DML and coordinator-adjacent plan
     /// construction never consult process- or thread-local session state.
+    pub fn sql_semantics(&self) -> &novarocks_sql::sql_mode::SqlSemanticSettings {
+        &self.sql_semantics
+    }
+
     pub fn optimizer_settings(&self) -> &SessionOptimizerSettings {
         &self.optimizer_settings
     }
@@ -227,6 +240,7 @@ impl RequestContext {
             admission.deadline,
             admission.cancellation,
             admission.optimizer_settings,
+            admission.sql_semantics,
         );
         statement.for_topology(admission.topology)
     }
@@ -327,6 +341,7 @@ mod tests {
                 Some("iceberg".to_string()),
                 "db1".to_string(),
                 SessionOptimizerSettings::default(),
+                novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             ),
             QueryExecutionContext::new(
                 ClusterRole::Fe,
@@ -334,6 +349,7 @@ mod tests {
                 None,
                 cancellation.view(),
                 SessionOptimizerSettings::default(),
+                novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             ),
         );
 
@@ -353,13 +369,19 @@ mod tests {
             ..SessionOptimizerSettings::default()
         };
         let context = RequestContext::new(
-            RequestSessionContext::new(None, "db1".to_string(), admitted_settings.clone()),
+            RequestSessionContext::new(
+                None,
+                "db1".to_string(),
+                admitted_settings.clone(),
+                novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            ),
             QueryExecutionContext::new(
                 ClusterRole::Fe,
                 BackendTopologySnapshot::empty(4),
                 Some(deadline),
                 QueryCancellationSource::new().view(),
                 admitted_settings.clone(),
+                novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             ),
         );
 
@@ -394,6 +416,7 @@ mod tests {
             None,
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ));
         let statement = StatementAdmissionContext::new(
             None,
@@ -402,6 +425,7 @@ mod tests {
             first.execution().deadline(),
             first.execution().cancellation().clone(),
             first.execution().optimizer_settings().clone(),
+            first.execution().sql_semantics().clone(),
         );
         let replacement = statement.for_topology(topology(8, 1));
 
@@ -438,6 +462,7 @@ mod tests {
                 cbo_broadcast_backend_count: Some(11.0),
                 ..SessionOptimizerSettings::default()
             },
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ));
         let statement = StatementAdmissionContext::new(
             None,
@@ -446,6 +471,7 @@ mod tests {
             first.execution().deadline(),
             first.execution().cancellation().clone(),
             first.execution().optimizer_settings().clone(),
+            first.execution().sql_semantics().clone(),
         );
         let replacement = statement.for_topology(topology(8, 1));
 
@@ -480,6 +506,7 @@ mod tests {
                 effective_backend_count: Some(5.0),
                 ..SessionOptimizerSettings::default()
             },
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ));
 
         assert_eq!(
@@ -504,6 +531,7 @@ mod tests {
                 optimizer_query_mem_limit_bytes: Some(512.0 * 1024.0 * 1024.0),
                 ..SessionOptimizerSettings::default()
             },
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ));
 
         assert_eq!(
@@ -525,6 +553,7 @@ mod tests {
             None,
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ));
 
         assert_eq!(
@@ -534,5 +563,38 @@ mod tests {
                 .optimizer_query_mem_limit_bytes,
             None
         );
+    }
+
+    #[test]
+    fn sql_mode_is_frozen_in_both_request_projections_and_topology_retries() {
+        let mode = novarocks_sql::sql_mode::SqlSemanticSettings::default().with_sql_mode(
+            novarocks_sql::sql_mode::SqlMode::from_assignment(
+                "GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
+            ),
+        );
+        let first = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db1".to_owned(),
+            ClusterRole::Fe,
+            topology(7, 3),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings::default(),
+            mode.clone(),
+        ));
+        assert_eq!(first.session().sql_semantics(), &mode);
+        assert_eq!(first.execution().sql_semantics(), &mode);
+        let statement = StatementAdmissionContext::new(
+            None,
+            "db1".to_owned(),
+            first.execution().role(),
+            first.execution().deadline(),
+            first.execution().cancellation().clone(),
+            first.execution().optimizer_settings().clone(),
+            first.session().sql_semantics().clone(),
+        );
+        let replacement = statement.for_topology(topology(8, 1));
+        assert_eq!(replacement.session().sql_semantics(), &mode);
+        assert_eq!(replacement.execution().sql_semantics(), &mode);
     }
 }

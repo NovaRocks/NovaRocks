@@ -1240,8 +1240,15 @@ impl FrontendQuerySession {
             wait_for_initial_query_topology(&self.service.topology, &cancellation, deadline)
                 .await
                 .map_err(|error| governed_preparation_error(error, &cancellation))?;
-        let (current_catalog, current_database, execution_settings, mut optimizer_settings) =
-            state.into_query_attempt_inputs();
+        let (
+            current_catalog,
+            current_database,
+            execution_settings,
+            mut optimizer_settings,
+            sql_semantics,
+        ) = state.into_query_attempt_inputs();
+        let sql_semantics =
+            novarocks_sql::sql_mode::statement_sql_semantics(&sql_semantics, &parsed_statement);
         if optimizer_settings.optimizer_query_mem_limit_bytes.is_none() {
             optimizer_settings.optimizer_query_mem_limit_bytes =
                 Some(self.service.optimizer_query_mem_limit_bytes as f64);
@@ -1254,9 +1261,11 @@ impl FrontendQuerySession {
             deadline,
             cancellation.clone(),
             optimizer_settings,
+            sql_semantics.clone(),
         ));
         let query_options = with_query_hints(
             query_options_from_session_settings(&execution_settings),
+            &sql_semantics,
             match &parsed_statement {
                 ParsedStatement::Query(query) => Some(query),
                 _ => None,
@@ -1687,8 +1696,15 @@ impl FrontendQuerySession {
         } else {
             topology
         };
-        let (current_catalog, current_database, execution_settings, mut optimizer_settings) =
-            state.into_query_attempt_inputs();
+        let (
+            current_catalog,
+            current_database,
+            execution_settings,
+            mut optimizer_settings,
+            sql_semantics,
+        ) = state.into_query_attempt_inputs();
+        let sql_semantics =
+            novarocks_sql::sql_mode::statement_sql_semantics(&sql_semantics, &parsed_statement);
         // A session `SET` wins; otherwise admission freezes the process budget so
         // SQL costing never consults a process-global configuration.
         if optimizer_settings.optimizer_query_mem_limit_bytes.is_none() {
@@ -1703,6 +1719,7 @@ impl FrontendQuerySession {
             deadline,
             cancellation.clone(),
             optimizer_settings,
+            sql_semantics.clone(),
         ));
         let compiler = self.service.query_compiler.clone();
         let command_executor = Arc::clone(&self.service.command_executor);
@@ -1717,8 +1734,15 @@ impl FrontendQuerySession {
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let query_options = with_query_hints(
             query_options_from_session_settings(&execution_settings),
+            &sql_semantics,
             match &parsed_statement {
                 ParsedStatement::ExplainQuery(explain) => Some(&explain.query),
+                ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Insert(insert)) => {
+                    Some(&insert.source)
+                }
+                ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::CreateTableAsSelect(
+                    ctas,
+                )) => Some(&ctas.query),
                 _ => None,
             },
         );
@@ -2306,12 +2330,16 @@ fn reject_plain_query_from_legacy_typed_route(
 
 fn with_query_hints(
     query_options: QueryOptions,
+    sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
     query: Option<&novarocks_parser::ast::Query>,
 ) -> QueryOptions {
     let mut raw = *query_options.as_proto();
+    raw.allow_throw_exception = sql_semantics.sql_mode().allow_throw_exception();
     if let Some(query) = query {
         raw.allow_throw_exception =
-            novarocks_sql::admission::query_allows_throw_exception_hint(query);
+            novarocks_sql::sql_mode::query_sql_semantics(sql_semantics, query)
+                .sql_mode()
+                .allow_throw_exception();
         if let Some(limit) = novarocks_sql::admission::query_mem_limit_hint(query) {
             raw.query_mem_limit = limit;
         }
@@ -3624,6 +3652,7 @@ mod tests {
             Some(deadline),
             cancellation.view(),
             SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ))
     }
 
@@ -4177,5 +4206,33 @@ mod tests {
             error.to_string().contains("unterminated quoted string"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn execution_throw_policy_uses_the_same_effective_mode_as_sql_analysis() {
+        let session = novarocks_sql::sql_mode::SqlSemanticSettings::default().with_sql_mode(
+            novarocks_sql::sql_mode::SqlMode::from_assignment(
+                "GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION",
+            ),
+        );
+        let statements = novarocks_parser::parse(
+            "SELECT /*+ SET_VAR(sql_mode=68719477248) */ /*+ SET_VAR(sql_mode=32) */ \
+             /*+ SET_VAR(query_mem_limit=9) */ 1",
+        )
+        .unwrap();
+        let [ParsedStatement::Query(query)] = statements.as_slice() else {
+            panic!("query");
+        };
+        let options = with_query_hints(
+            QueryOptions::from_proto(Default::default()),
+            &session,
+            Some(query),
+        );
+        assert!(!options.as_proto().allow_throw_exception);
+        assert_eq!(options.as_proto().query_mem_limit, 9);
+        let restored =
+            with_query_hints(QueryOptions::from_proto(Default::default()), &session, None);
+        assert!(restored.as_proto().allow_throw_exception);
+        assert!(session.sql_mode().group_concat_legacy());
     }
 }

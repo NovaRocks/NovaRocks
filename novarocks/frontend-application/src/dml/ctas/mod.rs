@@ -627,6 +627,7 @@ mod tests {
             None,
             cancellation.view(),
             SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ));
         let sql = "CREATE TABLE iceberg.db.dst AS SELECT 1 AS x";
         let parsed = novarocks_parser::parse(sql).expect("CTAS parses");

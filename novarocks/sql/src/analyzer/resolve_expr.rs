@@ -1632,40 +1632,14 @@ impl<'a> super::AnalyzerContext<'a> {
         let is_count_star = name == "count"
             && matches!(func.arguments.as_slice(), [ast::Expr::Identifier(ident)] if ident.value == "*");
 
-        // The native AST retains GROUP_CONCAT's `SEPARATOR` outside the
-        // regular argument list. The aggregate contract, order-by resolver,
-        // and type diagnostics expect it as the final typed argument. The
-        // legacy comma spelling is retained for compatibility: a trailing
-        // string literal remains a separator, while all other positional
-        // arguments are values and receive a default comma separator.
+        // SQL preparation makes separator ownership explicit. Analysis and
+        // output naming consume the same idempotently normalized syntax.
         let group_concat_args = if matches!(name.as_str(), "group_concat" | "string_agg") {
-            match (func.separator.as_deref(), func.arguments.as_slice()) {
-                (Some(separator), values) => values
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(separator.clone()))
-                    .collect(),
-                (None, []) => Vec::new(),
-                (None, values)
-                    if values.len() > 1
-                        && values.last().is_some_and(|argument| {
-                            matches!(
-                                argument,
-                                ast::Expr::Literal(ast::Literal {
-                                    kind: ast::LiteralKind::String(_),
-                                    ..
-                                })
-                            )
-                        }) =>
-                {
-                    values.to_vec()
-                }
-                (None, values) => {
-                    let mut arguments = values.to_vec();
-                    arguments.push(string_literal_expr(",".to_string(), func.span));
-                    arguments
-                }
-            }
+            func.arguments
+                .iter()
+                .cloned()
+                .chain(func.separator.as_deref().cloned())
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
@@ -6627,5 +6601,65 @@ mod tests {
             err,
             "try_variant_get type argument must be a string literal"
         );
+    }
+
+    #[test]
+    fn concat_modes_control_argument_channels_ordinals_and_output_names() {
+        fn resolved(
+            sql: &str,
+            mode: &str,
+        ) -> Result<crate::analysis::ResolvedQuery, crate::analyze_error::AnalyzeError> {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            super::super::analyze_with_function_catalog_and_sql_semantics(
+                query,
+                &EmptyCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                &crate::sql_mode::SqlSemanticSettings::default()
+                    .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode)),
+            )
+            .map(|(query, _, _)| query)
+        }
+        for (mode, args_len, heading) in [
+            ("32", 3, "group_concat('a','-' SEPARATOR ',')"),
+            ("GROUP_CONCAT_LEGACY", 2, "group_concat('a' SEPARATOR '-')"),
+        ] {
+            let query = resolved("SELECT group_concat('a','-')", mode).unwrap();
+            let QueryBody::Select(select) = query.body else {
+                panic!("select");
+            };
+            assert_eq!(select.projection[0].output_name, heading);
+            let crate::analysis::ExprKind::AggregateCall { args, .. } =
+                &select.projection[0].expr.kind
+            else {
+                panic!("aggregate");
+            };
+            assert_eq!(args.len(), args_len);
+        }
+        resolved("SELECT group_concat('a','-' ORDER BY 2)", "32").unwrap();
+        let error = resolved(
+            "SELECT group_concat('a','-' ORDER BY 2)",
+            "GROUP_CONCAT_LEGACY",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ORDER BY position 2 is not in group_concat output list")
+        );
+        for mode in ["32", "GROUP_CONCAT_LEGACY"] {
+            let query = resolved("SELECT group_concat('a','-' SEPARATOR '|')", mode).unwrap();
+            let QueryBody::Select(select) = query.body else {
+                panic!("select");
+            };
+            assert_eq!(
+                select.projection[0].output_name,
+                "group_concat('a','-' SEPARATOR '|')"
+            );
+            assert!(resolved("SELECT string_agg('a','-' ORDER BY 2)", mode).is_err());
+        }
     }
 }

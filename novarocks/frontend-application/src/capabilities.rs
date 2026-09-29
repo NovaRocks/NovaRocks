@@ -775,6 +775,7 @@ pub fn background_maintenance_attempt(
         Some(deadline),
         cancellation.view(),
         novarocks_sql::compiler::SessionOptimizerSettings::default(),
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     );
     let connector_context = crate::connector::connector_request_context_for_execution_on_runtime(
         None, &execution, runtime,

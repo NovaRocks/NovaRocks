@@ -41,6 +41,7 @@ pub struct SessionSqlState {
     current_database: String,
     execution_settings: SessionExecutionSettings,
     optimizer_settings: SessionOptimizerSettings,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     user_variables: BTreeMap<String, String>,
 }
 
@@ -51,6 +52,7 @@ impl Default for SessionSqlState {
             current_database: DEFAULT_DATABASE.to_string(),
             execution_settings: SessionExecutionSettings::default(),
             optimizer_settings: SessionOptimizerSettings::default(),
+            sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             user_variables: BTreeMap::new(),
         }
     }
@@ -63,6 +65,10 @@ impl SessionSqlState {
 
     pub fn current_database(&self) -> &str {
         &self.current_database
+    }
+
+    pub fn sql_semantics(&self) -> &novarocks_sql::sql_mode::SqlSemanticSettings {
+        &self.sql_semantics
     }
 
     pub fn execution_settings(&self) -> &SessionExecutionSettings {
@@ -100,12 +106,14 @@ impl SessionSqlState {
         String,
         SessionExecutionSettings,
         SessionOptimizerSettings,
+        novarocks_sql::sql_mode::SqlSemanticSettings,
     ) {
         (
             self.current_catalog,
             self.current_database,
             self.execution_settings,
             self.optimizer_settings,
+            self.sql_semantics,
         )
     }
 
@@ -214,6 +222,37 @@ pub fn apply_session_set_assignment(
                         format!("SET GLOBAL {name} is not supported"),
                     ),
                 ));
+            }
+            if name == "sql_mode" {
+                // Preserve the previously admitted GLOBAL no-op. This feature
+                // owns connection and statement settings, not global state.
+                if matches!(assignment.scope, ast::SetScope::Global) {
+                    return Ok(SessionSetAssignmentOutcome::Applied);
+                }
+                let mode = match &assignment.value {
+                    ast::SetValue::Expression(value) => {
+                        novarocks_sql::sql_mode::SqlMode::from_expression(value)
+                    }
+                    ast::SetValue::Words(words) => {
+                        novarocks_sql::sql_mode::SqlMode::from_assignment(
+                            &words
+                                .iter()
+                                .map(|word| match word {
+                                    ast::SetWord::Ident(value) => value.value.clone(),
+                                    ast::SetWord::Literal(value) => {
+                                        novarocks_parser::printer::print_expr(&ast::Expr::Literal(
+                                            value.clone(),
+                                        ))
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                    }
+                    ast::SetValue::Query(_) => return Err(session_value_expression_error()),
+                };
+                state.sql_semantics = state.sql_semantics.clone().with_sql_mode(mode);
+                return Ok(SessionSetAssignmentOutcome::Applied);
             }
             let value = session_setting_value(&assignment.value)?;
             apply_session_system_variable(state, &name, &value)
@@ -796,7 +835,7 @@ mod tests {
             );
         }
 
-        let (_, _, _, optimizer_settings) = state.into_query_attempt_inputs();
+        let (_, _, _, optimizer_settings, _) = state.into_query_attempt_inputs();
         assert!(optimizer_settings.enable_eliminate_agg);
         assert_eq!(
             optimizer_settings.cbo_broadcast_node_mem_budget_bytes,
@@ -836,5 +875,50 @@ mod tests {
         .expect_err("global known setting is unsupported");
         assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
         assert!(error.message().contains("SET GLOBAL query_timeout"));
+    }
+
+    #[test]
+    fn sql_mode_set_replaces_whole_connection_setting_and_preserves_other_modes() {
+        let mut a = SessionSqlState::default();
+        let mut b = SessionSqlState::default();
+        for sql in [
+            "SET sql_mode='32,GROUP_CONCAT_LEGACY,ALLOW_THROW_EXCEPTION'",
+            "SET LOCAL sql_mode='GROUP_CONCAT_LEGACY'",
+            "SET SESSION sql_mode='GROUP_CONCAT_LEGACY,ERROR_IF_OVERFLOW,STRUCT_CAST_BY_NAME'",
+        ] {
+            assert_eq!(
+                apply_session_set_assignment(sql, &set_assignment(sql), &mut a).unwrap(),
+                SessionSetAssignmentOutcome::Applied
+            );
+            assert!(a.sql_semantics().sql_mode().group_concat_legacy());
+            assert!(!b.sql_semantics().sql_mode().group_concat_legacy());
+        }
+        assert_eq!(
+            a.sql_semantics().sql_mode().assignment(),
+            "GROUP_CONCAT_LEGACY,ERROR_IF_OVERFLOW,STRUCT_CAST_BY_NAME"
+        );
+        let frozen = a.clone().into_query_attempt_inputs().4;
+        for sql in [
+            "SET @@session.sql_mode=32",
+            "SET sql_mode='STRUCT_CAST_BY_NAME'",
+            "SET sql_mode=''",
+        ] {
+            apply_session_set_assignment(sql, &set_assignment(sql), &mut a).unwrap();
+            assert!(!a.sql_semantics().sql_mode().group_concat_legacy());
+        }
+        assert!(frozen.sql_mode().group_concat_legacy());
+        let sql = "SET sql_mode=68719477248";
+        apply_session_set_assignment(sql, &set_assignment(sql), &mut b).unwrap();
+        assert!(b.sql_semantics().sql_mode().group_concat_legacy());
+        assert!(b.sql_semantics().sql_mode().allow_throw_exception());
+        assert!(!a.sql_semantics().sql_mode().group_concat_legacy());
+        let before = b.sql_semantics().clone();
+        let sql = "SET GLOBAL sql_mode=32";
+        apply_session_set_assignment(sql, &set_assignment(sql), &mut b).unwrap();
+        assert_eq!(
+            b.sql_semantics(),
+            &before,
+            "GLOBAL retains its previously admitted no-op"
+        );
     }
 }

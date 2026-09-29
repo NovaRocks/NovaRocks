@@ -106,6 +106,7 @@ fn external_sql_contract_analyzes_and_optimizes_query() {
             SqlStatementInput::sql("SELECT 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),

@@ -481,6 +481,7 @@ impl FrontendQueryCompiler {
                 analyze: false,
             },
             SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),
@@ -567,6 +568,7 @@ impl FrontendQueryCompiler {
             SqlStatementInput::parsed_query(Box::new(query.clone())),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),
@@ -711,6 +713,7 @@ impl FrontendQueryCompiler {
                 analyze: true,
             },
             SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),
@@ -804,6 +807,7 @@ impl FrontendQueryCompiler {
                         execution.deadline(),
                         execution.cancellation().clone(),
                         execution.optimizer_settings().clone(),
+                        execution.sql_semantics().clone(),
                     ),
                     profile_plan: plan,
                     profile_annotations: annotations,
@@ -828,6 +832,7 @@ impl FrontendQueryCompiler {
             SqlStatementInput::parsed_query(Box::new(query.clone())),
             intent,
             SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),

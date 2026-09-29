@@ -238,6 +238,7 @@ fn values_request(version: [u8; 16]) -> SqlFinalPlanCompileRequest {
         SqlStatementInput::sql("SELECT 1 AS a, CAST(NULL AS VARCHAR) AS b"),
         SqlCompileIntent::Query,
         SqlSessionContext {
+            sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             current_catalog: Some("iceberg".to_string()),
             current_database: "db".to_string(),
             optimizer_settings: SessionOptimizerSettings::default(),

@@ -151,7 +151,10 @@ impl SqlFinalPlanCompileRequest {
         validate_dop_domain(dop_domain)?;
         validate_scan_read_budget(scan_read_budget)?;
         let display_intent = display_intent(&intent);
-        let query = super::parse_query(&statement)?;
+        let query = crate::sql_mode::normalize_concat_query(
+            super::parse_query(&statement)?,
+            &session.sql_semantics,
+        );
         let common = FinalPlanCommon {
             version,
             intent,
@@ -1133,6 +1136,7 @@ mod tests {
             SqlStatementInput::sql(sql),
             intent,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: Some("iceberg".to_string()),
                 current_database: "db".to_string(),
                 optimizer_settings,
