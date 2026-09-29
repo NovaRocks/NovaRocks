@@ -1,0 +1,34 @@
+-- query 3
+region	c	s
+east	4	20
+west	2	10
+
+-- query 4
+region	c	s
+east	4	20
+west	2	10
+
+-- query 8
+region	c	s
+east	2	7
+west	4	14
+
+-- query 9
+region	c	s
+east	2	7
+west	4	14
+
+-- query 13
+g
+0
+
+-- query 17
+region	c	s
+east	1	5
+west	2	10
+
+-- query 18
+region	c	s
+east	1	5
+west	2	10
+

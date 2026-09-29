@@ -123,12 +123,13 @@ struct TypedConnectorScanShared {
     /// the columns the connector itself produces, which is not necessarily the
     /// node's whole output.
     slot_ids: Vec<SlotId>,
+    output_schema: ChunkSchemaRef,
     dynamic_filter: Arc<ConnectorReadDynamicFilter>,
     /// Builds the columns the connector does not read, and the output schema
     /// the result must have.
     ///
-    /// Absent when the node's output is exactly what the connector reads,
-    /// which is every scan that projects no derived column.
+    /// Absent when no derived column exists. The frozen output schema is
+    /// still bound by the page converter for ordinary columns.
     output_materialization: Option<OutputMaterialization>,
     stream_host: ScanStreamHost,
 }
@@ -136,16 +137,18 @@ struct TypedConnectorScanShared {
 /// How one scan turns the connector's read columns into the node's output.
 struct OutputMaterialization {
     transform: Arc<dyn ConnectorBatchTransform>,
-    chunk_schema: ChunkSchemaRef,
 }
 
 impl TypedConnectorScanShared {
     /// Turn one read chunk into the node's output chunk.
     ///
-    /// Without a materialization the connector already read the whole output,
-    /// so the chunk passes through untouched and no schema is rebuilt.
+    /// Ordinary output was already checked and retagged by its page converter.
     fn materialize_output(&self, chunk: Chunk) -> Result<Chunk, String> {
-        materialize_output(self.output_materialization.as_ref(), chunk)
+        materialize_output(
+            self.output_materialization.as_ref(),
+            &self.output_schema,
+            chunk,
+        )
     }
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
@@ -162,17 +165,17 @@ impl TypedConnectorScanShared {
 
 /// Turn one read chunk into the node's output chunk.
 ///
-/// Without a materialization the connector already read the whole output, so
-/// the chunk passes through untouched and no schema is rebuilt.
+/// Ordinary output was already checked and retagged by its page converter.
 fn materialize_output(
     materialization: Option<&OutputMaterialization>,
+    output_schema: &ChunkSchemaRef,
     chunk: Chunk,
 ) -> Result<Chunk, String> {
     let Some(materialization) = materialization else {
         return Ok(chunk);
     };
     let batch = materialization.transform.transform(chunk.batch)?;
-    Chunk::try_new_with_chunk_schema(batch, Arc::clone(&materialization.chunk_schema))
+    Chunk::try_new_with_chunk_schema(batch, Arc::clone(output_schema))
         .map_err(|error| error.to_string())
 }
 
@@ -216,6 +219,7 @@ impl TypedConnectorScanSource {
         queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
+        output_schema: ChunkSchemaRef,
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
@@ -229,6 +233,7 @@ impl TypedConnectorScanSource {
             queues,
             plan_node_id,
             slot_ids,
+            output_schema,
             runtime_filter,
             live_dynamic_filter_factory,
             emit_reader_markers,
@@ -245,6 +250,7 @@ impl TypedConnectorScanSource {
         queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
+        output_schema: ChunkSchemaRef,
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
@@ -263,6 +269,7 @@ impl TypedConnectorScanSource {
                 request,
                 plan_node_id,
                 slot_ids,
+                output_schema,
                 output_materialization: None,
                 stream_host,
             }),
@@ -279,6 +286,7 @@ impl TypedConnectorScanSource {
         queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
+        output_schema: ChunkSchemaRef,
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
@@ -292,6 +300,7 @@ impl TypedConnectorScanSource {
             queues,
             plan_node_id,
             slot_ids,
+            output_schema,
             runtime_filter,
             live_dynamic_filter_factory,
             emit_reader_markers,
@@ -307,14 +316,10 @@ impl TypedConnectorScanSource {
     pub fn with_output_materialization(
         mut self,
         transform: Arc<dyn ConnectorBatchTransform>,
-        chunk_schema: ChunkSchemaRef,
     ) -> Self {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("typed connector scan source is not shared before it is bound");
-        shared.output_materialization = Some(OutputMaterialization {
-            transform,
-            chunk_schema,
-        });
+        shared.output_materialization = Some(OutputMaterialization { transform });
         self
     }
 
@@ -383,12 +388,12 @@ impl TypedConnectorScanSource {
                 request: self.shared.request.clone(),
                 plan_node_id: self.shared.plan_node_id,
                 slot_ids: self.shared.slot_ids.clone(),
+                output_schema: Arc::clone(&self.shared.output_schema),
                 dynamic_filter,
                 stream_host: self.shared.stream_host.clone(),
                 output_materialization: self.shared.output_materialization.as_ref().map(
                     |materialization| OutputMaterialization {
                         transform: Arc::clone(&materialization.transform),
-                        chunk_schema: Arc::clone(&materialization.chunk_schema),
                     },
                 ),
             }),
@@ -407,6 +412,11 @@ impl ScanSource for TypedConnectorScanSource {
                     "typed connector scan source requires an empty range binding".to_string(),
                 );
             }
+        }
+        if self.shared.output_materialization.is_none()
+            && self.shared.slot_ids.as_slice() != self.shared.output_schema.slot_ids()
+        {
+            return Err("typed scan read slots do not match the frozen output slots".to_string());
         }
         self.shared.check_liveness("provider open")?;
         // Created empty on first use, and born closed when the attempt is
@@ -543,6 +553,7 @@ struct TypedSystemTableScanShared {
     emit_reader_markers: bool,
     /// Ordered read slot ids. `slot_ids[i]` names page channel `i`.
     slot_ids: Vec<SlotId>,
+    output_schema: ChunkSchemaRef,
     /// Builds the columns the connector does not read, exactly as an ordinary
     /// typed scan does. A system relation is not exempt: its output can carry
     /// derived columns too, and refusing them here rather than materializing
@@ -554,7 +565,11 @@ struct TypedSystemTableScanShared {
 
 impl TypedSystemTableScanShared {
     fn materialize_output(&self, chunk: Chunk) -> Result<Chunk, String> {
-        materialize_output(self.output_materialization.as_ref(), chunk)
+        materialize_output(
+            self.output_materialization.as_ref(),
+            &self.output_schema,
+            chunk,
+        )
     }
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
@@ -580,6 +595,7 @@ impl TypedConnectorSystemTableScanSource {
         request: ConnectorRequestContext,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
+        output_schema: ChunkSchemaRef,
         emit_reader_markers: bool,
         stream_runtime: tokio::runtime::Handle,
     ) -> Self {
@@ -590,6 +606,7 @@ impl TypedConnectorSystemTableScanSource {
             request,
             plan_node_id,
             slot_ids,
+            output_schema,
             emit_reader_markers,
             stream_runtime,
         )
@@ -603,6 +620,7 @@ impl TypedConnectorSystemTableScanSource {
         request: ConnectorRequestContext,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
+        output_schema: ChunkSchemaRef,
         emit_reader_markers: bool,
         stream_runtime: tokio::runtime::Handle,
     ) -> Self {
@@ -615,6 +633,7 @@ impl TypedConnectorSystemTableScanSource {
                 plan_node_id,
                 emit_reader_markers,
                 slot_ids,
+                output_schema,
                 output_materialization: None,
                 stream_runtime,
             }),
@@ -629,6 +648,7 @@ impl TypedConnectorSystemTableScanSource {
         request: ConnectorRequestContext,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
+        output_schema: ChunkSchemaRef,
         emit_reader_markers: bool,
         stream_runtime: tokio::runtime::Handle,
     ) -> Self {
@@ -639,6 +659,7 @@ impl TypedConnectorSystemTableScanSource {
             request,
             plan_node_id,
             slot_ids,
+            output_schema,
             emit_reader_markers,
             stream_runtime,
         )
@@ -651,14 +672,10 @@ impl TypedConnectorSystemTableScanSource {
     pub fn with_output_materialization(
         mut self,
         transform: Arc<dyn ConnectorBatchTransform>,
-        chunk_schema: ChunkSchemaRef,
     ) -> Self {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("typed system relation scan source is not shared before it is bound");
-        shared.output_materialization = Some(OutputMaterialization {
-            transform,
-            chunk_schema,
-        });
+        shared.output_materialization = Some(OutputMaterialization { transform });
         self
     }
 }
@@ -673,6 +690,11 @@ impl ScanSource for TypedConnectorSystemTableScanSource {
                 );
             }
         }
+        if self.shared.output_materialization.is_none()
+            && self.shared.slot_ids.as_slice() != self.shared.output_schema.slot_ids()
+        {
+            return Err("typed scan read slots do not match the frozen output slots".to_string());
+        }
         self.shared.check_liveness("provider open")?;
         let mut shared = Arc::new(TypedSystemTableScanShared {
             descriptor: self.shared.descriptor.clone(),
@@ -682,10 +704,10 @@ impl ScanSource for TypedConnectorSystemTableScanSource {
             plan_node_id: self.shared.plan_node_id,
             emit_reader_markers: self.shared.emit_reader_markers,
             slot_ids: self.shared.slot_ids.clone(),
+            output_schema: Arc::clone(&self.shared.output_schema),
             output_materialization: self.shared.output_materialization.as_ref().map(|value| {
                 OutputMaterialization {
                     transform: Arc::clone(&value.transform),
-                    chunk_schema: Arc::clone(&value.chunk_schema),
                 }
             }),
             stream_runtime: self.shared.stream_runtime.clone(),

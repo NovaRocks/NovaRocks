@@ -20,14 +20,12 @@
 -- Preserve array test coverage migrated from dev/test.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_sum_avg FORCE;
-CREATE DATABASE sql_tests_complex_test_array_sum_avg;
-USE sql_tests_complex_test_array_sum_avg;
+USE ${case_db};
 
 -- name: test_array_sum_avg @mac @no_arrow_flight_sql
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sum_avg;
+USE ${case_db};
 CREATE TABLE test_array_functions (
     id INT,
     array_boolean ARRAY<BOOLEAN>,
@@ -47,7 +45,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sum_avg;
+USE ${case_db};
 INSERT INTO test_array_functions VALUES
 (1, [true, false, true], [1, 2, 3], [100, 200, 300], [10, 20, 30], [1000, 2000, 3000], 
  [9223372036854775806, 9223372036854775807], [1.5, 2.5, 3.5], [2.34, 1.23, 3.45], 
@@ -95,7 +93,7 @@ INSERT INTO test_array_functions VALUES
  [1234.56, 4567.89, 6789.01]);
 
 -- query 4
-USE sql_tests_complex_test_array_sum_avg;
+USE ${case_db};
 SELECT 
     id, 
     array_sum(array_boolean) AS sum_boolean, 
@@ -113,7 +111,7 @@ SELECT
 FROM test_array_functions;
 
 -- query 5
-USE sql_tests_complex_test_array_sum_avg;
+USE ${case_db};
 SELECT 
     id, 
     array_avg(array_boolean) AS avg_boolean, 
@@ -135,6 +133,5 @@ FROM test_array_functions;
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming
 -- the namespace holds none. Drop the tables explicitly instead.
-USE sql_tests_complex_test_array_sum_avg;
+USE ${case_db};
 DROP TABLE IF EXISTS test_array_functions;
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_sum_avg;

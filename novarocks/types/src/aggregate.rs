@@ -54,7 +54,24 @@ pub fn infer_agg_function_types(
             };
             Ok((out.clone(), Some(out)))
         }
-        "avg" => {
+        "avg" | "multi_distinct_avg" => {
+            if name == "multi_distinct_avg"
+                && !matches!(
+                    first_arg,
+                    DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Decimal128(..)
+                        | DataType::Decimal256(..)
+                )
+            {
+                return Err(format!(
+                    "multi_distinct_avg unsupported input type: {first_arg:?}"
+                ));
+            }
             let out = match &first_arg {
                 DataType::Decimal128(..) => canonical_agg_decimal_type("avg", &first_arg)
                     .expect("avg decimal canonical type"),
@@ -62,7 +79,14 @@ pub fn infer_agg_function_types(
                 DataType::Decimal256(..) => first_arg.clone(),
                 _ => DataType::Float64,
             };
-            Ok((out, Some(DataType::Utf8)))
+            Ok((
+                out,
+                Some(if name == "multi_distinct_avg" {
+                    DataType::Binary
+                } else {
+                    DataType::Utf8
+                }),
+            ))
         }
         "min" | "max" => Ok((first_arg.clone(), Some(first_arg))),
         "any_value" => Ok((first_arg.clone(), Some(first_arg))),
@@ -285,7 +309,8 @@ fn list_output_type(item_type: DataType) -> DataType {
 
 /// Apply the canonical DISTINCT aggregate name mangling to `name`: a distinct
 /// `count` / `sum` / `array_agg` maps to its multi-distinct/`_distinct` variant
-/// (`count` -> `multi_distinct_count`, `sum` -> `multi_distinct_sum`, `array_agg`
+/// (`count` -> `multi_distinct_count`, `sum` -> `multi_distinct_sum`,
+/// `avg` -> `multi_distinct_avg`, `array_agg`
 /// -> `array_agg_distinct`); every other name is returned lowercased unchanged.
 ///
 /// This is the single source of truth for the DISTINCT-mangling table, feeding
@@ -301,6 +326,7 @@ pub fn mangle_distinct_aggregate_name(name: &str, distinct: bool) -> String {
     match name.as_str() {
         "count" => "multi_distinct_count".to_string(),
         "sum" => "multi_distinct_sum".to_string(),
+        "avg" => "multi_distinct_avg".to_string(),
         "array_agg" => "array_agg_distinct".to_string(),
         _ => name,
     }
@@ -314,6 +340,33 @@ mod tests {
     use novarocks_type_contract::canonical_agg_decimal_type;
 
     use super::{infer_agg_function_types, mangle_distinct_aggregate_name};
+
+    #[test]
+    fn distinct_avg_has_its_own_binary_state_and_canonical_decimal_result() {
+        assert_eq!(
+            mangle_distinct_aggregate_name("AVG", true),
+            "multi_distinct_avg"
+        );
+        assert_eq!(mangle_distinct_aggregate_name("avg", false), "avg");
+        assert_eq!(
+            infer_agg_function_types("multi_distinct_avg", &[DataType::Decimal256(50, 2)], true)
+                .unwrap(),
+            (DataType::Decimal256(50, 2), Some(DataType::Binary))
+        );
+        assert_eq!(
+            infer_agg_function_types("multi_distinct_avg", &[DataType::Int64], true).unwrap(),
+            (DataType::Float64, Some(DataType::Binary))
+        );
+        assert_eq!(
+            infer_agg_function_types("multi_distinct_avg", &[DataType::Decimal128(10, 2)], true)
+                .unwrap(),
+            (DataType::Decimal128(38, 8), Some(DataType::Binary))
+        );
+        assert_eq!(
+            infer_agg_function_types("avg", &[DataType::Int64], false).unwrap(),
+            (DataType::Float64, Some(DataType::Utf8))
+        );
+    }
 
     #[test]
     fn distinct_name_mangling_is_the_single_source_of_truth() {

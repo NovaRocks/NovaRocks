@@ -20,14 +20,12 @@
 -- Preserve array test coverage migrated from dev/test.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_map FORCE;
-CREATE DATABASE sql_tests_complex_test_array_map;
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 
 -- name: test_array_map_1
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 CREATE TABLE t1 (
     k1 bigint,
     c1 array < varchar(65536) > 
@@ -36,7 +34,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 CREATE TABLE t2 (
     k1 bigint,
     c1 bigint
@@ -45,7 +43,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 4
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 insert into t1
 values
     (1, ["1","2"]        ), 
@@ -61,7 +59,7 @@ values
 
 -- query 5
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 insert into t2
 values
     (1, 1),
@@ -70,7 +68,7 @@ values
     (4, 5);
 
 -- query 6
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 with w1 as (
     select
         k1, c1, array_map (x -> true, c1) as c2
@@ -89,7 +87,7 @@ order by
 
 -- query 7
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 INSERT INTO t1 (k1, c1)
 VALUES 
 (1, ARRAY_MAP(
@@ -115,7 +113,7 @@ VALUES
 
 -- query 8
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 CREATE TABLE table1 (
     id INT,
     arr_largeint ARRAY<INT> NOT NULL
@@ -124,7 +122,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 9
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 INSERT INTO table1 (id, arr_largeint) VALUES
 (1, [1, 2]),
 (2, [3, 4, 5]),
@@ -132,7 +130,7 @@ INSERT INTO table1 (id, arr_largeint) VALUES
 
 -- query 10
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 CREATE TABLE table2 (
     id INT,
     arr_str ARRAY<INT> NOT NULL
@@ -141,14 +139,14 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 11
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 INSERT INTO table2 (id, arr_str) VALUES
 (1, [1, 2, 3]),
 (2, [4, 5]),
 (3, [6, 7, 8, 9]);
 
 -- query 12
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 SELECT t1.id AS t1_id, t2.id AS t2_id, t1.arr_largeint
 FROM table1 t1
 LEFT JOIN[broadcast] table2 t2
@@ -156,7 +154,7 @@ ON t1.id = t2.id
 AND array_length(array_map(x -> x + array_length(t2.arr_str), t1.arr_largeint)) >= 2;
 
 -- query 13
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 WITH `CTE` AS (
     SELECT TRUE AS bool_1, TRUE AS bool_2, TRUE AS bool_3, ["a"] AS arr
     UNION ALL
@@ -164,7 +162,7 @@ WITH `CTE` AS (
 ) SELECT ARRAY_MAP((arg)->`bool_1` AND `bool_2` AND `bool_3`, arr), ARRAY_MAP((arg)->`bool_1` AND `bool_3` AND `bool_2`, arr) FROM `CTE`;
 
 -- query 14
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 with t1 as (
  select parse_json('[{"open_id": "aaa", "num": 1},{"open_id": "bbb", "num": 2},{"open_id": "ccc", "num": 3}]') as price_list
 ),t2 as (
@@ -179,9 +177,8 @@ where  array_contains(fields,'bbb');
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming
 -- the namespace holds none. Drop the tables explicitly instead.
-USE sql_tests_complex_test_array_map;
+USE ${case_db};
 DROP TABLE IF EXISTS t1;
 DROP TABLE IF EXISTS t2;
 DROP TABLE IF EXISTS table1;
 DROP TABLE IF EXISTS table2;
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_map;

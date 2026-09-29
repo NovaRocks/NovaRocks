@@ -1012,13 +1012,21 @@ fn validate_join_incremental_routes(
 fn validate_join_incremental_snapshot(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<(), String> {
-    let join = snapshot
-        .schema_contract
-        .join
-        .as_ref()
-        .ok_or_else(|| "join incremental refresh snapshot has no join contract".to_string())?;
-    if join.predicates.is_empty() {
-        return Err("join incremental refresh snapshot has no join predicate facts".to_string());
+    if snapshot.schema_contract.aggregate.is_some() {
+        // Aggregate refresh consumes the independently bound logical join and
+        // signed aggregate states. Equality reachability belongs to row-join
+        // refresh and is not a zero-key aggregate join's execution contract.
+        snapshot.aggregate_shape_and_layout_for_execution()?;
+    } else {
+        let join =
+            snapshot.schema_contract.join.as_ref().ok_or_else(|| {
+                "join incremental refresh snapshot has no join contract".to_string()
+            })?;
+        if join.predicates.is_empty() {
+            return Err(
+                "join incremental refresh snapshot has no join predicate facts".to_string(),
+            );
+        }
     }
     if snapshot.base_snapshots.len() < 2 {
         return Err(
@@ -3135,6 +3143,51 @@ mod tests {
         let error = validate_join_incremental_routes(&[])
             .expect_err("no admitted route must fail closed before planning");
         assert!(error.contains("at least one admitted writer route"));
+    }
+
+    #[test]
+    fn aggregate_join_terminal_requires_execution_layout_and_both_pinned_bases() {
+        let mut snapshot = (*crate::compiler::mv_rewrite::test_join_snapshot(true)).clone();
+        Arc::make_mut(&mut snapshot.schema_contract).join = None;
+        validate_join_incremental_snapshot(&snapshot)
+            .expect("zero-key aggregate refresh has aggregate execution facts");
+
+        let mut missing_layout = snapshot.clone();
+        missing_layout.aggregate_execution = None;
+        assert!(
+            validate_join_incremental_snapshot(&missing_layout)
+                .unwrap_err()
+                .contains("no aggregate execution layout")
+        );
+        snapshot.base_snapshots = Arc::from([snapshot.base_snapshots[0].clone()]);
+        assert!(
+            validate_join_incremental_snapshot(&snapshot)
+                .unwrap_err()
+                .contains("fewer than two pinned bases")
+        );
+    }
+
+    #[test]
+    fn row_join_terminal_keeps_equality_reachability_mandatory() {
+        let mut snapshot = (*crate::compiler::mv_rewrite::test_join_snapshot(false)).clone();
+        validate_join_incremental_snapshot(&snapshot).unwrap();
+        Arc::make_mut(&mut snapshot.schema_contract)
+            .join
+            .as_mut()
+            .unwrap()
+            .predicates
+            .clear();
+        assert!(
+            validate_join_incremental_snapshot(&snapshot)
+                .unwrap_err()
+                .contains("no join predicate facts")
+        );
+        Arc::make_mut(&mut snapshot.schema_contract).join = None;
+        assert!(
+            validate_join_incremental_snapshot(&snapshot)
+                .unwrap_err()
+                .contains("no join contract")
+        );
     }
 
     #[test]

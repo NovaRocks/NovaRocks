@@ -20,14 +20,12 @@
 -- Preserve array test coverage migrated from dev/test.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_min_max FORCE;
-CREATE DATABASE sql_tests_complex_test_array_min_max;
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 
 -- name: test_array_min_max_all_type @mac @no_arrow_flight_sql
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 CREATE TABLE test_array_min_max (
     id INT,
     array_boolean ARRAY<BOOLEAN>,
@@ -50,7 +48,7 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 INSERT INTO test_array_min_max VALUES
 (1, [true, false, NULL], [1, 2, NULL], [100, 200, NULL], [10, 20, NULL], [1000, 2000, NULL], [1234567890123456789, NULL, NULL],
  [12345.67, 89012.34, NULL], [123.45, 678.90, NULL], [12345678.90, 9876543.21, NULL], [1234567890.1234567890, NULL, NULL], 
@@ -98,500 +96,500 @@ INSERT INTO test_array_min_max VALUES
  [NULL], [NULL]);
 
 -- query 4
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_boolean) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 5
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_boolean) AS result 
 FROM test_array_min_max 
 WHERE array_boolean IS NOT NULL ORDER BY id;
 
 -- query 6
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_boolean) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_boolean) > 3 ORDER BY id;
 
 -- query 7
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_tinyint) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 8
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_tinyint) AS result 
 FROM test_array_min_max 
 WHERE array_tinyint IS NOT NULL ORDER BY id;
 
 -- query 9
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_tinyint) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_tinyint) > 3 ORDER BY id;
 
 -- query 10
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_smallint) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 11
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_smallint) AS result 
 FROM test_array_min_max 
 WHERE array_smallint IS NOT NULL ORDER BY id;
 
 -- query 12
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_smallint) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_smallint) > 3 ORDER BY id;
 
 -- query 13
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_int) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 14
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_int) AS result 
 FROM test_array_min_max 
 WHERE array_int IS NOT NULL ORDER BY id;
 
 -- query 15
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_int) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_int) > 3 ORDER BY id;
 
 -- query 16
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_bigint) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 17
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_bigint) AS result 
 FROM test_array_min_max 
 WHERE array_bigint IS NOT NULL ORDER BY id;
 
 -- query 18
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_bigint) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_bigint) > 3 ORDER BY id;
 
 -- query 19
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_largeint) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 20
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_largeint) AS result 
 FROM test_array_min_max 
 WHERE array_largeint IS NOT NULL ORDER BY id;
 
 -- query 21
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_largeint) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_largeint) > 3 ORDER BY id;
 
 -- query 22
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_float) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 23
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_float) AS result 
 FROM test_array_min_max 
 WHERE array_float IS NOT NULL ORDER BY id;
 
 -- query 24
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_float) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_float) > 3 ORDER BY id;
 
 -- query 25
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimal32) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 26
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimal32) AS result 
 FROM test_array_min_max 
 WHERE array_decimal32 IS NOT NULL ORDER BY id;
 
 -- query 27
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimal32) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_decimal32) > 3 ORDER BY id;
 
 -- query 28
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimal64) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 29
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimal64) AS result 
 FROM test_array_min_max 
 WHERE array_decimal64 IS NOT NULL ORDER BY id;
 
 -- query 30
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimal64) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_decimal64) > 3 ORDER BY id;
 
 -- query 31
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimal128) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 32
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimal128) AS result 
 FROM test_array_min_max 
 WHERE array_decimal128 IS NOT NULL ORDER BY id;
 
 -- query 33
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimal128) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_decimal128) > 3 ORDER BY id;
 
 -- query 34
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_double) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 35
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_double) AS result 
 FROM test_array_min_max 
 WHERE array_double IS NOT NULL ORDER BY id;
 
 -- query 36
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_double) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_double) > 3 ORDER BY id;
 
 -- query 37
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimalv2) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 38
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimalv2) AS result 
 FROM test_array_min_max 
 WHERE array_decimalv2 IS NOT NULL ORDER BY id;
 
 -- query 39
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_decimalv2) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_decimalv2) > 3 ORDER BY id;
 
 -- query 40
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_date) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 41
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_date) AS result 
 FROM test_array_min_max 
 WHERE array_date IS NOT NULL ORDER BY id;
 
 -- query 42
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_date) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_date) > 3 ORDER BY id;
 
 -- query 43
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_datetime) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 44
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_datetime) AS result 
 FROM test_array_min_max 
 WHERE array_datetime IS NOT NULL ORDER BY id;
 
 -- query 45
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_datetime) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_datetime) > 3 ORDER BY id;
 
 -- query 46
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_varchar) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 47
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_varchar) AS result 
 FROM test_array_min_max 
 WHERE array_varchar IS NOT NULL ORDER BY id;
 
 -- query 48
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_min(array_varchar) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_varchar) > 3 ORDER BY id;
 
 -- query 49
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_boolean) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 50
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_boolean) AS result 
 FROM test_array_min_max 
 WHERE array_boolean IS NOT NULL ORDER BY id;
 
 -- query 51
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_boolean) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_boolean) > 3 ORDER BY id;
 
 -- query 52
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_tinyint) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 53
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_tinyint) AS result 
 FROM test_array_min_max 
 WHERE array_tinyint IS NOT NULL ORDER BY id;
 
 -- query 54
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_tinyint) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_tinyint) > 3 ORDER BY id;
 
 -- query 55
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_smallint) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 56
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_smallint) AS result 
 FROM test_array_min_max 
 WHERE array_smallint IS NOT NULL ORDER BY id;
 
 -- query 57
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_smallint) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_smallint) > 3 ORDER BY id;
 
 -- query 58
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_int) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 59
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_int) AS result 
 FROM test_array_min_max 
 WHERE array_int IS NOT NULL ORDER BY id;
 
 -- query 60
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_int) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_int) > 3 ORDER BY id;
 
 -- query 61
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_bigint) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 62
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_bigint) AS result 
 FROM test_array_min_max 
 WHERE array_bigint IS NOT NULL ORDER BY id;
 
 -- query 63
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_bigint) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_bigint) > 3 ORDER BY id;
 
 -- query 64
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_largeint) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 65
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_largeint) AS result 
 FROM test_array_min_max 
 WHERE array_largeint IS NOT NULL ORDER BY id;
 
 -- query 66
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_largeint) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_largeint) > 3 ORDER BY id;
 
 -- query 67
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_float) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 68
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_float) AS result 
 FROM test_array_min_max 
 WHERE array_float IS NOT NULL ORDER BY id;
 
 -- query 69
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_float) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_float) > 3 ORDER BY id;
 
 -- query 70
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimal32) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 71
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimal32) AS result 
 FROM test_array_min_max 
 WHERE array_decimal32 IS NOT NULL ORDER BY id;
 
 -- query 72
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimal32) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_decimal32) > 3 ORDER BY id;
 
 -- query 73
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimal64) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 74
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimal64) AS result 
 FROM test_array_min_max 
 WHERE array_decimal64 IS NOT NULL ORDER BY id;
 
 -- query 75
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimal64) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_decimal64) > 3 ORDER BY id;
 
 -- query 76
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimal128) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 77
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimal128) AS result 
 FROM test_array_min_max 
 WHERE array_decimal128 IS NOT NULL ORDER BY id;
 
 -- query 78
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimal128) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_decimal128) > 3 ORDER BY id;
 
 -- query 79
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_double) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 80
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_double) AS result 
 FROM test_array_min_max 
 WHERE array_double IS NOT NULL ORDER BY id;
 
 -- query 81
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_double) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_double) > 3 ORDER BY id;
 
 -- query 82
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimalv2) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 83
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimalv2) AS result 
 FROM test_array_min_max 
 WHERE array_decimalv2 IS NOT NULL ORDER BY id;
 
 -- query 84
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_decimalv2) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_decimalv2) > 3 ORDER BY id;
 
 -- query 85
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_date) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 86
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_date) AS result 
 FROM test_array_min_max 
 WHERE array_date IS NOT NULL ORDER BY id;
 
 -- query 87
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_date) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_date) > 3 ORDER BY id;
 
 -- query 88
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_datetime) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 89
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_datetime) AS result 
 FROM test_array_min_max 
 WHERE array_datetime IS NOT NULL ORDER BY id;
 
 -- query 90
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_datetime) AS result 
 FROM test_array_min_max 
 WHERE array_length(array_datetime) > 3 ORDER BY id;
 
 -- query 91
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 SELECT id, array_max(array_varchar) AS result FROM test_array_min_max ORDER BY id;
 
 -- query 92
@@ -599,6 +597,5 @@ SELECT id, array_max(array_varchar) AS result FROM test_array_min_max ORDER BY i
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming
 -- the namespace holds none. Drop the tables explicitly instead.
-USE sql_tests_complex_test_array_min_max;
+USE ${case_db};
 DROP TABLE IF EXISTS test_array_min_max;
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_min_max;

@@ -20,14 +20,12 @@
 -- Preserve array test coverage migrated from dev/test.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_filter FORCE;
-CREATE DATABASE sql_tests_complex_test_array_filter;
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 
 -- name: test_array_filter @mac
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 CREATE TABLE `t` (
   `k` bigint(20) NOT NULL COMMENT "",
   `arr_0` array<bigint(20)> NOT NULL COMMENT "",
@@ -38,55 +36,55 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 insert into t values (1,[1,2],[1,2],[0,1]),(2,[1,2],null,[1,1]),(3,[1,2],[1,2],null),(4,[1,2],[null,null],[null,null]),(5,[1],[1,2],[0,0,1]);
 
 -- query 4
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter(arr_0, arr_2) from t order by k;
 
 -- query 5
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter(arr_1, arr_2) from t order by k;
 
 -- query 6
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter(arr_0,[0,0,0,1]) from t order by k;
 
 -- query 7
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter(arr_0,[1,0,1]) from t order by k;
 
 -- query 8
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter(arr_0,null) from t order by k;
 
 -- query 9
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter(arr_1,null) from t order by k;
 
 -- query 10
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter([1,2,3,4],arr_2) from t order by k;
 
 -- query 11
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter(null, arr_2) from t order by k;
 
 -- query 12
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter([1,2,3,4],[0,0,1,1]) from t;
 
 -- query 13
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter(null, null) from t;
 
 -- query 14
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter([1,2,3,4],null) from t;
 
 -- query 15
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 select array_filter(null, [1,0,1,null]) from t;
 
 -- query 16
@@ -94,6 +92,5 @@ select array_filter(null, [1,0,1,null]) from t;
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming
 -- the namespace holds none. Drop the tables explicitly instead.
-USE sql_tests_complex_test_array_filter;
+USE ${case_db};
 DROP TABLE IF EXISTS t;
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_filter;

@@ -20,9 +20,7 @@
 -- nested values; distinct VARCHAR spellings remain distinct.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_array_varchar_common_coercion FORCE;
-CREATE DATABASE sql_tests_array_varchar_common_coercion;
-USE sql_tests_array_varchar_common_coercion;
+USE ${case_db};
 
 -- query 2
 -- @skip_result_check=true
@@ -76,4 +74,3 @@ SELECT arrays_overlap(CAST([[10], [1.25, NULL]] AS ARRAY<ARRAY<DOUBLE>>), [['10'
 -- query 10
 -- @skip_result_check=true
 DROP TABLE input_values;
-DROP DATABASE sql_tests_array_varchar_common_coercion;

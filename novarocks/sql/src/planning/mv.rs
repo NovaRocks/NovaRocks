@@ -1868,6 +1868,31 @@ pub struct SqlMvJoinPredicateColumns {
     pub right: SqlMvJoinColumnRef,
 }
 
+/// Equality-contract analysis for refresh, distinct from the logical join tree.
+/// Composed relations keep their existing independently bound change stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SqlMvRefreshJoinAnalysis {
+    NotDirectTwoTableJoin,
+    ZeroKeyCrossJoin,
+    InnerEquiJoin(Vec<SqlMvJoinPredicateColumns>),
+}
+
+pub fn extract_refresh_join_analysis(query: &Query) -> Result<SqlMvRefreshJoinAnalysis, String> {
+    if extract_join_aliases(query).is_err() {
+        return Ok(SqlMvRefreshJoinAnalysis::NotDirectTwoTableJoin);
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        unreachable!("direct join aliases require SELECT");
+    };
+    let join = &select.from[0].joins[0];
+    match (&join.operator, &join.constraint) {
+        (ast::JoinOperator::Cross, ast::JoinConstraint::None) => {
+            Ok(SqlMvRefreshJoinAnalysis::ZeroKeyCrossJoin)
+        }
+        _ => extract_join_equality_predicates(query).map(SqlMvRefreshJoinAnalysis::InnerEquiJoin),
+    }
+}
+
 /// Read a definition's join as a conjunction of qualified equality predicates.
 ///
 /// Everything else fails closed. An incremental join refresh works by deciding
@@ -3433,6 +3458,48 @@ mod tests {
             panic!("not a query");
         };
         query.clone()
+    }
+
+    #[test]
+    fn refresh_join_analysis_preserves_explicit_cross_identity_and_strict_equi_boundary() {
+        assert_eq!(
+            extract_refresh_join_analysis(&parse_query(
+                "SELECT r.k, SUM(a.v) FROM ice.db.r r CROSS JOIN ice.db.a a GROUP BY r.k"
+            ))
+            .unwrap(),
+            SqlMvRefreshJoinAnalysis::ZeroKeyCrossJoin
+        );
+        let SqlMvRefreshJoinAnalysis::InnerEquiJoin(keys) = extract_refresh_join_analysis(
+            &parse_query("SELECT r.k FROM ice.db.r r JOIN ice.db.a a ON r.k = a.k"),
+        )
+        .unwrap() else {
+            panic!("expected equality lineage");
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].left.qualifier, "r");
+        assert_eq!(keys[0].right.qualifier, "a");
+        for sql in [
+            "SELECT r.k FROM ice.db.r r LEFT JOIN ice.db.a a ON r.k = a.k",
+            "SELECT r.k FROM ice.db.r r JOIN ice.db.a a ON r.k < a.k",
+            "SELECT r.k FROM ice.db.r r JOIN ice.db.a a ON TRUE",
+            "SELECT r.k FROM ice.db.r r JOIN ice.db.a a ON r.k + 1 = a.k",
+        ] {
+            assert!(
+                extract_refresh_join_analysis(&parse_query(sql)).is_err(),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            extract_refresh_join_analysis(&parse_query("SELECT r.k FROM ice.db.r r")).unwrap(),
+            SqlMvRefreshJoinAnalysis::NotDirectTwoTableJoin
+        );
+        // The strict equality extractor itself is never widened to empty keys.
+        assert!(
+            extract_join_equality_predicates(&parse_query(
+                "SELECT * FROM ice.db.r r CROSS JOIN ice.db.a a"
+            ))
+            .is_err()
+        );
     }
 
     fn classify_sql(sql: &str) -> Result<IncrementalMvShape, String> {

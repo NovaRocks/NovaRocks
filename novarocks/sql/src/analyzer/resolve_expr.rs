@@ -1863,14 +1863,19 @@ impl<'a> super::AnalyzerContext<'a> {
                     rewritten.push(string_literal_expr(unit, interval.span));
                     continue;
                 }
-                let token = match e {
-                    ast::Expr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
-                    ast::Expr::CompoundIdentifier(parts) if parts.parts.len() == 1 => {
-                        Some(parts.parts[0].value.to_ascii_lowercase())
+                if idx == 1 && !matches!(e, ast::Expr::Interval(_)) {
+                    rewritten.push((*e).clone());
+                    let default_day = arg_exprs.len() == 2
+                        || (arg_exprs.len() == 3 && slice_boundary_keyword(arg_exprs[2]).is_some());
+                    if default_day {
+                        rewritten.push(string_literal_expr("day".into(), e.span()));
                     }
-                    _ => None,
-                };
-                if let Some(token) = token
+                    continue;
+                }
+                let token = slice_boundary_keyword(e);
+                if idx == arg_exprs.len() - 1
+                    && idx >= 2
+                    && let Some(token) = token
                     && matches!(token.as_str(), "ceil" | "floor")
                 {
                     rewritten.push(string_literal_expr(token, e.span()));
@@ -1941,6 +1946,33 @@ impl<'a> super::AnalyzerContext<'a> {
             (args_typed, arg_types)
         };
 
+        if name == "concat"
+            && args_typed
+                .iter()
+                .any(|arg| is_array_carrier(&arg.data_type))
+        {
+            // CONCAT chooses the array family before implicit string casts.
+            // A scalar contributes one element, including a NULL element;
+            // an existing array contributes its elements and its parent NULL.
+            args_typed = args_typed
+                .into_iter()
+                .map(|arg| {
+                    if is_array_carrier(&arg.data_type) {
+                        Ok(arg)
+                    } else {
+                        resolved_scalar_call_at(
+                            self.function_catalog,
+                            "__array_literal",
+                            vec![arg],
+                            func.span,
+                        )
+                    }
+                })
+                .collect::<Result<Vec<_>, AnalyzeError>>()?;
+            name = "array_concat".to_string();
+            arg_types = args_typed.iter().map(|arg| arg.data_type.clone()).collect();
+        }
+
         let needs_statistical_float_args = matches!(
             name.as_str(),
             "corr"
@@ -1980,6 +2012,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             }
             arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
+        }
+
+        if matches!(name.as_str(), "time_slice" | "date_slice") {
+            normalize_slice_arguments(&name, &effective_arg_exprs, &mut args_typed, func.span)?;
+            arg_types = args_typed.iter().map(|arg| arg.data_type.clone()).collect();
         }
 
         self.validate_ds_hll_arguments(&name, &args_typed, func.span)?;
@@ -3687,6 +3724,205 @@ impl<'a> super::AnalyzerContext<'a> {
     }
 }
 
+fn slice_boundary_keyword(expr: &ast::Expr) -> Option<String> {
+    let token = match expr {
+        ast::Expr::Identifier(ident) => ident.value.to_ascii_lowercase(),
+        ast::Expr::CompoundIdentifier(parts) if parts.parts.len() == 1 => {
+            parts.parts[0].value.to_ascii_lowercase()
+        }
+        ast::Expr::Nested(nested) => return slice_boundary_keyword(&nested.expression),
+        _ => return None,
+    };
+    matches!(token.as_str(), "floor" | "ceil").then_some(token)
+}
+
+/// Freeze the slice domain before overload binding. Runtime kernels receive
+/// a canonical temporal value, checked INT count, and literal control strings.
+fn normalize_slice_arguments(
+    name: &str,
+    source: &[&ast::Expr],
+    args: &mut [TypedExpr],
+    span: Span,
+) -> Result<(), AnalyzeError> {
+    if !matches!(args.len(), 3 | 4) {
+        return Err(AnalyzeError::invalid_argument(
+            format!("{name} expects value, interval, unit and optional boundary"),
+            span,
+        ));
+    }
+    fn integer_source(expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Number(value),
+                ..
+            }) => value.parse::<i128>().is_ok(),
+            ast::Expr::Unary(unary)
+                if matches!(
+                    unary.operator,
+                    ast::UnaryOperator::Plus | ast::UnaryOperator::Minus
+                ) =>
+            {
+                integer_source(&unary.expression)
+            }
+            ast::Expr::Nested(nested) => integer_source(&nested.expression),
+            _ => false,
+        }
+    }
+    if !source.get(1).is_some_and(|source| integer_source(source)) {
+        return Err(AnalyzeError::invalid_argument(
+            format!("{name} requires second parameter must be a constant interval"),
+            span,
+        ));
+    }
+    fn interval_value(expr: &TypedExpr) -> Option<i64> {
+        match &expr.kind {
+            ExprKind::Nested(nested) => interval_value(nested),
+            ExprKind::UnaryOp {
+                op: UnOp::Negate,
+                expr: nested,
+            } => interval_value(nested).and_then(i64::checked_neg),
+            _ => signed_int_literal_value(expr),
+        }
+    }
+    let count = interval_value(&args[1]).ok_or_else(|| {
+        AnalyzeError::invalid_argument(format!("{name} interval must fit INT32"), span)
+    })?;
+    if count <= 0 {
+        return Err(AnalyzeError::invalid_argument(
+            format!("{name} requires second parameter must be greater than 0"),
+            span,
+        ));
+    }
+    i32::try_from(count).map_err(|_| {
+        AnalyzeError::invalid_argument(format!("{name} interval must fit INT32"), span)
+    })?;
+    args[1] = TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Int(count)),
+        data_type: DataType::Int32,
+        nullable: false,
+    };
+    fn control_string(expr: &TypedExpr) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Literal(LiteralValue::String(value)) => Some(value),
+            ExprKind::Nested(nested) => control_string(nested),
+            _ => None,
+        }
+    }
+    let unit = match control_string(&args[2]) {
+        Some(value) => value.to_ascii_lowercase(),
+        _ => {
+            return Err(AnalyzeError::invalid_argument(
+                format!("{name} requires constant unit string"),
+                span,
+            ));
+        }
+    };
+    let unit = match unit.as_str() {
+        "year" | "years" => "year",
+        "quarter" | "quarters" => "quarter",
+        "month" | "months" => "month",
+        "week" | "weeks" => "week",
+        "day" | "days" => "day",
+        "hour" | "hours" => "hour",
+        "minute" | "minutes" => "minute",
+        "second" | "seconds" => "second",
+        "millisecond" | "milliseconds" => "millisecond",
+        "microsecond" | "microseconds" => "microsecond",
+        _ => {
+            return Err(AnalyzeError::invalid_argument(
+                format!("{name} unsupported unit: {unit}"),
+                span,
+            ));
+        }
+    };
+    if name == "date_slice" && !matches!(unit, "year" | "quarter" | "month" | "week" | "day") {
+        return Err(AnalyzeError::invalid_argument(
+            "can't use time_slice for date with time(hour/minute/second)",
+            span,
+        ));
+    }
+    args[2] = TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::String(unit.into())),
+        data_type: DataType::Utf8,
+        nullable: false,
+    };
+    if let Some(boundary) = args.get_mut(3) {
+        let value = match control_string(boundary) {
+            Some(value) => value.to_ascii_lowercase(),
+            _ => {
+                return Err(AnalyzeError::invalid_argument(
+                    format!("{name} requires constant boundary string"),
+                    span,
+                ));
+            }
+        };
+        if !matches!(value.as_str(), "floor" | "ceil") {
+            return Err(AnalyzeError::invalid_argument(
+                format!("{name} expects boundary floor/ceil, got {value}"),
+                span,
+            ));
+        }
+        *boundary = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String(value)),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+    }
+    let domain = if name == "date_slice" {
+        DataType::Date32
+    } else {
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+    };
+    if args[0].data_type != domain {
+        // Coercion belongs to the existing explicit SQL CAST owner; no kernel
+        // infers its output type or parses a string under a temporal binding.
+        if !matches!(
+            args[0].data_type,
+            DataType::Null
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, _)
+                | DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(_, _)
+                | DataType::FixedSizeBinary(16)
+        ) {
+            return Err(AnalyzeError::type_mismatch(
+                format!("{name} first argument cannot be cast to its temporal domain"),
+                span,
+            ));
+        }
+        let inner = std::mem::replace(
+            &mut args[0],
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Null),
+                data_type: DataType::Null,
+                nullable: true,
+            },
+        );
+        args[0] = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(inner),
+                target: domain.clone(),
+            },
+            data_type: domain,
+            nullable: true,
+        };
+    }
+    Ok(())
+}
+
 fn function_order_by_position(expr: &ast::Expr) -> Option<i64> {
     match expr {
         ast::Expr::Literal(ast::Literal {
@@ -4058,8 +4294,18 @@ fn cast_utf8_args(args: &mut [TypedExpr], indexes: &[usize]) -> bool {
     changed
 }
 
+fn is_array_carrier(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+    )
+}
+
 fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> bool {
     match name {
+        // Array CONCAT must already have been normalized by the SQL owner.
+        // A direct typed caller cannot stringify an array to bypass that fact.
+        "concat" if args.iter().any(|arg| is_array_carrier(&arg.data_type)) => false,
         "concat" | "concat_ws" | "group_concat" | "string_agg" => args
             .iter_mut()
             .fold(false, |changed, arg| cast_to_utf8_if_needed(arg) || changed),
@@ -6111,6 +6357,135 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slice_calls_freeze_temporal_result_and_materialize_input_cast_before_binding() {
+        for (sql, date) in [
+            (
+                "select time_slice('2023-12-31 03:12:04',interval 2147483647 year)",
+                false,
+            ),
+            (
+                "select time_slice(cast('2020-01-01' as date),interval 1 day,ceil)",
+                false,
+            ),
+            ("select time_slice('2020-01-01',1)", false),
+            ("select time_slice('2020-01-01',(1))", false),
+            ("select time_slice('2020-01-01',1,ceil)", false),
+            (
+                "select time_slice('2020-01-01',interval 1 day,(CEIL))",
+                false,
+            ),
+            ("select time_slice(null,1,'day','floor')", false),
+            (
+                "select date_slice('2020-01-01 12:00:00',interval 1 day)",
+                true,
+            ),
+            (
+                "select date_slice(cast('2020-01-01' as datetime),1,'day','ceil')",
+                true,
+            ),
+            (
+                "select date_slice(cast('2020-01-01' as date),interval 1 month)",
+                true,
+            ),
+        ] {
+            let expr =
+                analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let domain = if date {
+                DataType::Date32
+            } else {
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+            };
+            assert_eq!(expr.data_type, domain);
+            assert!(expr.nullable);
+            let ExprKind::FunctionCall { binding, args, .. } = &expr.kind else {
+                panic!("expected bound slice call")
+            };
+            assert_eq!(
+                binding.function_id.as_str(),
+                if date {
+                    "builtin.scalar/date_slice/v1"
+                } else {
+                    "builtin.scalar/time_slice/v1"
+                }
+            );
+            assert_eq!(args[0].data_type, domain);
+            assert_eq!(args[1].data_type, DataType::Int32);
+            assert!(!args[1].nullable);
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                panic!("expected scalar")
+            };
+            assert_eq!(result.data_type, domain);
+            assert!(result.nullable);
+            for (argument, selected) in args.iter().zip(&binding.selected.argument_types) {
+                let novarocks_functions::FunctionArgumentType::Value(selected) = selected else {
+                    panic!("expected value")
+                };
+                assert_eq!(argument.data_type, selected.data_type);
+                assert_eq!(argument.nullable, selected.nullable);
+            }
+        }
+    }
+
+    #[test]
+    fn slice_calls_fail_fast_for_invalid_interval_unit_boundary_and_input() {
+        for (sql, fragment) in [
+            (
+                "select time_slice('2020-01-01',interval 0 day)",
+                "greater than 0",
+            ),
+            (
+                "select time_slice('2020-01-01',interval -1 day)",
+                "greater than 0",
+            ),
+            (
+                "select date_slice('2020-01-01',interval 3.2 day)",
+                "constant interval",
+            ),
+            (
+                "select time_slice('2020-01-01',interval 2147483648 day)",
+                "fit INT32",
+            ),
+            (
+                "select time_slice('2020-01-01',null,'day','floor')",
+                "constant interval",
+            ),
+            (
+                "select time_slice('2020-01-01','1','day','floor')",
+                "constant interval",
+            ),
+            (
+                "select time_slice('2020-01-01',1+1,'day','floor')",
+                "constant interval",
+            ),
+            (
+                "select date_slice(null,interval 1 hour)",
+                "can't use time_slice",
+            ),
+            (
+                "select date_slice('2020-01-01',1,'microsecond','floor')",
+                "can't use time_slice",
+            ),
+            (
+                "select time_slice(null,1,'century','floor')",
+                "unsupported unit",
+            ),
+            (
+                "select time_slice(null,1,'day','round')",
+                "boundary floor/ceil",
+            ),
+            (
+                "select time_slice([1],1,'day','floor')",
+                "first argument cannot be cast",
+            ),
+        ] {
+            let error = analyze_projection_expr(sql).unwrap_err();
+            assert!(error.contains(fragment), "{sql}: {error}");
+        }
+    }
+
     struct UnaryInputCatalog {
         key_type: DataType,
         nullable: bool,
@@ -7304,5 +7679,102 @@ mod tests {
                 .unwrap_err()
                 .contains("does not support argument type")
         );
+    }
+
+    fn assert_array_concat_binding(expression: &crate::analysis::TypedExpr) {
+        let ExprKind::FunctionCall {
+            name,
+            args,
+            binding,
+            ..
+        } = &expression.kind
+        else {
+            panic!("expected bound array_concat");
+        };
+        assert_eq!(name, "array_concat");
+        assert!(matches!(expression.data_type, DataType::List(_)));
+        for (arg, target) in args.iter().zip(&binding.selected.argument_types) {
+            let novarocks_functions::FunctionArgumentType::Value(value) = target else {
+                panic!("array_concat consumes values");
+            };
+            assert_eq!(arg.data_type, value.data_type);
+            assert!(matches!(arg.data_type, DataType::List(_)));
+        }
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("scalar result");
+        };
+        assert_eq!(expression.data_type, result.data_type);
+    }
+
+    #[test]
+    fn concat_array_family_wraps_scalars_before_string_coercion() {
+        for sql in [
+            "select concat('a', cast('[]' as array<string>))",
+            "select concat('a', ['b'], 'c')",
+            "select concat(cast(null as string), ['b'])",
+            "select concat('a', cast(null as array<string>))",
+            "select concat(cast(9223372036854775807 as bigint), cast([1] as array<bigint>))",
+            "select concat(cast('9007199254740993.00' as decimal(20,2)), cast([1] as array<decimal(20,2)>))",
+        ] {
+            let expression = analyze_projection_expr(sql).expect(sql);
+            assert_array_concat_binding(&expression);
+            let ExprKind::FunctionCall { args, .. } = &expression.kind else {
+                unreachable!()
+            };
+            assert!(
+                matches!(&args[0].kind, ExprKind::FunctionCall { name, args, .. }
+                if name == "__array_literal" && args.len() == 1),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn array_map_concat_body_has_nested_array_binding_and_keeps_lambda_identity() {
+        let expression = analyze_projection_expr("select array_map(x -> concat(x, []), ['a','b'])")
+            .expect("higher order array concat");
+        let DataType::List(outer) = &expression.data_type else {
+            panic!("array_map result");
+        };
+        assert!(
+            matches!(outer.data_type(), DataType::List(item) if item.data_type() == &DataType::Utf8)
+        );
+        let ExprKind::FunctionCall { args, .. } = &expression.kind else {
+            panic!("array_map call");
+        };
+        let ExprKind::LambdaFunction { params, body } = &args[0].kind else {
+            panic!("lambda");
+        };
+        assert_array_concat_binding(body);
+        let ExprKind::FunctionCall { args, .. } = &body.kind else {
+            unreachable!()
+        };
+        let ExprKind::FunctionCall { name, args, .. } = &args[0].kind else {
+            panic!("singleton wrapper");
+        };
+        assert_eq!(name, "__array_literal");
+        assert!(
+            matches!(&args[0].kind, ExprKind::LambdaParamRef { slot_id, .. } if *slot_id == params[0].slot_id)
+        );
+    }
+
+    #[test]
+    fn concat_array_incompatible_domain_fails_without_stringification() {
+        let error = analyze_projection_expr("select concat(['a'], map{1:2})")
+            .expect_err("incompatible array item shapes must fail during binding");
+        assert!(error.contains("array_concat"), "{error}");
+        let array = analyze_projection_expr("select ['a']").expect("array argument");
+        assert!(
+            super::bind_scalar_function_call("concat", vec![array]).is_err(),
+            "a direct typed string binding must not stringify an array"
+        );
+    }
+
+    #[test]
+    fn concat_without_an_array_retains_string_binding() {
+        let expression = analyze_projection_expr("select concat('a','b')").expect("string concat");
+        assert_eq!(expression.data_type, DataType::Utf8);
+        assert!(matches!(expression.kind, ExprKind::FunctionCall { name, .. } if name == "concat"));
     }
 }
