@@ -158,6 +158,26 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::UserVariable(variable) => {
                 if variable.value.starts_with("@@") {
                     let name = variable.value[2..].to_ascii_lowercase();
+                    if name == "global.decimal_overflow_to_double" {
+                        return Err(AnalyzeError::unsupported_expression(
+                            "global decimal_overflow_to_double state is not supported",
+                            variable.span,
+                        ));
+                    }
+                    if matches!(
+                        name.as_str(),
+                        "decimal_overflow_to_double"
+                            | "session.decimal_overflow_to_double"
+                            | "local.decimal_overflow_to_double"
+                    ) {
+                        return Ok(TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(i64::from(
+                                self.sql_semantics.decimal_overflow_to_double(),
+                            ))),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                        });
+                    }
                     return Ok(TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::String(session_variable_default(
                             &name,
@@ -1357,6 +1377,22 @@ impl<'a> super::AnalyzerContext<'a> {
         )? {
             return Ok(date_shift);
         }
+
+        // The SQL owner freezes promotion from declared metadata before any
+        // values are evaluated. Both operands must carry the float cast.
+        let (left_typed, right_typed) = if *op == ast::BinaryOperator::Multiply
+            && self.sql_semantics.decimal_overflow_to_double()
+            && novarocks_type_contract::decimal_multiplication_requires_float64(
+                &left_typed.data_type,
+                &right_typed.data_type,
+            ) {
+            (
+                cast_null_preserving_target_type(left_typed, &DataType::Float64),
+                cast_null_preserving_target_type(right_typed, &DataType::Float64),
+            )
+        } else {
+            (left_typed, right_typed)
+        };
 
         let arithmetic_type = |operator| {
             arithmetic_result_type_with_op(
@@ -5586,7 +5622,8 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::super::analyze;
-    use crate::analysis::{ExprKind, QueryBody, UnOp};
+    use super::{AnalyzeError, BinOp, TypedExpr};
+    use crate::analysis::{ExprKind, LiteralValue, QueryBody, UnOp};
     use crate::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::catalog::PlannerTableProvider;
     use crate::planner::table::{
@@ -6660,6 +6697,242 @@ mod tests {
                 "group_concat('a','-' SEPARATOR '|')"
             );
             assert!(resolved("SELECT string_agg('a','-' ORDER BY 2)", mode).is_err());
+        }
+    }
+
+    #[test]
+    fn decimal_promotion_freezes_float_result_and_both_operand_casts() {
+        fn projection(sql: &str, enabled: bool) -> Result<TypedExpr, AnalyzeError> {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            let (query, _, _) = super::super::analyze_with_function_catalog_and_sql_semantics(
+                query,
+                &EmptyCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                &crate::sql_mode::SqlSemanticSettings::default()
+                    .with_decimal_overflow_to_double(enabled),
+            )?;
+            let QueryBody::Select(select) = query.body else {
+                panic!("select");
+            };
+            Ok(select.projection.into_iter().next().unwrap().expr)
+        }
+        for prefix in ["", "session.", "local."] {
+            for enabled in [false, true] {
+                let value = projection(
+                    &format!("SELECT @@{prefix}decimal_overflow_to_double"),
+                    enabled,
+                )
+                .unwrap();
+                assert_eq!(value.data_type, DataType::Int64);
+                assert!(!value.nullable);
+                assert!(
+                    matches!(value.kind, ExprKind::Literal(LiteralValue::Int(v)) if v == i64::from(enabled))
+                );
+            }
+        }
+        assert!(projection("SELECT @@global.decimal_overflow_to_double", true).is_err());
+        let expression = "CAST(0 AS DECIMAL(30,10))*CAST(0 AS DECIMAL(18,9))";
+        let checked = projection(&format!("SELECT {expression}"), false).unwrap();
+        assert_eq!(checked.data_type, DataType::Decimal128(38, 19));
+        for sql in [
+            format!("SELECT {expression}"),
+            "SELECT CAST(NULL AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9))".into(),
+            "SELECT CAST(1 AS DECIMAL(20,0))*CAST(1 AS INT)".into(),
+        ] {
+            let promoted = projection(&sql, true).unwrap();
+            assert_eq!(promoted.data_type, DataType::Float64);
+            let ExprKind::BinaryOp { left, op, right } = promoted.kind else {
+                panic!("binary");
+            };
+            assert_eq!(op, BinOp::Mul);
+            for operand in [left, right] {
+                assert_eq!(operand.data_type, DataType::Float64);
+                assert!(matches!(
+                    operand.kind,
+                    ExprKind::Cast {
+                        target: DataType::Float64,
+                        ..
+                    }
+                ));
+            }
+        }
+        assert_eq!(
+            projection(
+                "SELECT CAST(1 AS DECIMAL(18,9))*CAST(1 AS DECIMAL(18,9))",
+                true
+            )
+            .unwrap()
+            .data_type,
+            DataType::Decimal128(36, 18)
+        );
+        assert_eq!(
+            projection(
+                "SELECT CAST(1 AS DECIMAL(30,10))+CAST(1 AS DECIMAL(18,9))",
+                true
+            )
+            .unwrap()
+            .data_type,
+            projection(
+                "SELECT CAST(1 AS DECIMAL(30,10))+CAST(1 AS DECIMAL(18,9))",
+                false
+            )
+            .unwrap()
+            .data_type
+        );
+        assert!(
+            projection(
+                "SELECT CAST(1 AS DECIMAL(38,20))*CAST(1 AS DECIMAL(20,19))",
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            projection(
+                "SELECT CAST(1 AS DECIMAL(76,0))*CAST(1 AS DECIMAL(76,0))",
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decimal_and_mode_scopes_cover_cte_derived_correlated_and_union_siblings() {
+        fn resolved(
+            sql: &str,
+        ) -> (
+            crate::analysis::ResolvedQuery,
+            crate::analysis::cte::CTERegistry,
+        ) {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            let (query, registry, _) =
+                super::super::analyze_with_function_catalog_and_sql_semantics(
+                    query,
+                    &EmptyCatalog,
+                    "default",
+                    crate::functions::builtin_sql_function_catalog(),
+                    &crate::sql_mode::SqlSemanticSettings::default(),
+                )
+                .unwrap();
+            (query, registry)
+        }
+        let product = "CAST(0 AS DECIMAL(30,10))*CAST(0 AS DECIMAL(18,9))";
+        let on = "/*+ SET_VAR(decimal_overflow_to_double=true) */";
+        let off = "/*+ SET_VAR(decimal_overflow_to_double=false) */";
+        // The first CTE's local override reaches its producer and is retained
+        // in the registry, while the second CTE and outer SELECT stay Decimal.
+        let (query, registry) = resolved(&format!(
+            "WITH a AS (SELECT {on} {product} x), b AS (SELECT {product} y)              SELECT a.x,b.y,{product} z FROM a CROSS JOIN b"
+        ));
+        assert_eq!(
+            query
+                .output_columns
+                .iter()
+                .map(|c| c.data_type.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                DataType::Float64,
+                DataType::Decimal128(38, 19),
+                DataType::Decimal128(38, 19)
+            ]
+        );
+        assert_eq!(query.local_cte_ids.len(), 2);
+        for id in &query.local_cte_ids {
+            assert!(registry.get(*id).is_some());
+        }
+        let (query, _) = resolved(&format!(
+            "SELECT {on} t.x,{product} y FROM (SELECT {off} {product} x) t"
+        ));
+        assert_eq!(
+            query.output_columns[0].data_type,
+            DataType::Decimal128(38, 19)
+        );
+        assert_eq!(query.output_columns[1].data_type, DataType::Float64);
+        let (query, _) = resolved(&format!(
+            "SELECT (SELECT {on} {product}) x,(SELECT {product}) y,{product} z"
+        ));
+        assert_eq!(
+            query
+                .output_columns
+                .iter()
+                .map(|c| c.data_type.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                DataType::Float64,
+                DataType::Decimal128(38, 19),
+                DataType::Decimal128(38, 19)
+            ]
+        );
+        let QueryBody::Select(select) = &query.body else {
+            panic!("select");
+        };
+        assert_eq!(select.apply_specs.len(), 2);
+        assert_ne!(
+            select.apply_specs[0].subquery_id,
+            select.apply_specs[1].subquery_id
+        );
+        assert_ne!(
+            select.apply_specs[0].output_column.column_id,
+            select.apply_specs[1].output_column.column_id
+        );
+        let (query, _) = resolved(&format!(
+            "SELECT (SELECT {on} CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) x, \
+             (SELECT CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) y FROM (SELECT 1 n) o"
+        ));
+        assert_eq!(query.output_columns[0].data_type, DataType::Float64);
+        assert_eq!(
+            query.output_columns[1].data_type,
+            DataType::Decimal128(38, 19)
+        );
+        let QueryBody::Select(select) = &query.body else {
+            panic!("select");
+        };
+        assert_eq!(select.apply_specs.len(), 2);
+        let Some(crate::analysis::Relation::Subquery { output_columns, .. }) = &select.from else {
+            panic!("outer derived relation");
+        };
+        assert_eq!(output_columns.len(), 1);
+        for spec in &select.apply_specs {
+            assert_eq!(
+                spec.correlation_column_ids,
+                vec![output_columns[0].column_id]
+            );
+        }
+        assert_ne!(
+            select.apply_specs[0].subquery_id,
+            select.apply_specs[1].subquery_id
+        );
+        let (query, _) = resolved(&format!(
+            "SELECT {on} {product} x UNION ALL SELECT {product} x"
+        ));
+        let QueryBody::SetOperation(set) = query.body else {
+            panic!("set operation");
+        };
+        let QueryBody::Select(left) = set.left.body else {
+            panic!("left select");
+        };
+        let QueryBody::Select(right) = set.right.body else {
+            panic!("right select");
+        };
+        assert_eq!(left.projection[0].expr.data_type, DataType::Float64);
+        assert_eq!(
+            right.projection[0].expr.data_type,
+            DataType::Decimal128(38, 19)
+        );
+        // GROUP_CONCAT must bind using the same lexical mode that normalized
+        // positional separator syntax, including CTE and derived-table scopes.
+        for sql in [
+            "WITH t AS (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat('a','-') x) SELECT x FROM t",
+            "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat('a','-') x) t",
+            "SELECT group_concat('a','-') UNION ALL SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ group_concat('b','-')",
+        ] {
+            resolved(sql);
         }
     }
 }

@@ -17,10 +17,15 @@
 
 //! SQL admission helpers over native typed parser nodes.
 
-pub fn query_allows_throw_exception_hint(query: &novarocks_parser::ast::Query) -> bool {
-    crate::sql_mode::query_sql_semantics(&crate::sql_mode::SqlSemanticSettings::default(), query)
-        .sql_mode()
-        .allow_throw_exception()
+pub fn query_allows_throw_exception_hint(
+    query: &novarocks_parser::ast::Query,
+) -> Result<bool, crate::analyze_error::AnalyzeError> {
+    Ok(crate::sql_mode::query_sql_semantics(
+        &crate::sql_mode::SqlSemanticSettings::default(),
+        query,
+    )?
+    .sql_mode()
+    .allow_throw_exception())
 }
 
 /// Returns the positive per-statement execution-memory limit carried by a
@@ -77,7 +82,7 @@ mod tests {
         let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
             panic!("expected query");
         };
-        assert!(query_allows_throw_exception_hint(query));
+        assert!(query_allows_throw_exception_hint(query).unwrap());
     }
 
     #[test]

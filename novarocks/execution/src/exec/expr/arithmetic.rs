@@ -1277,6 +1277,67 @@ mod tests {
     }
 
     #[test]
+    fn frozen_float64_decimal_product_casts_operands_before_multiplication() {
+        let lhs_type = DataType::Decimal128(30, 10);
+        let rhs_type = DataType::Decimal128(18, 9);
+        let lhs_coefficient = 123456789012345678901234567890_i128;
+        let rhs_coefficient = 123456789123456789_i128;
+        let lhs_array: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![
+                Some(lhs_coefficient),
+                Some(-lhs_coefficient),
+                None,
+                Some(0),
+            ])
+            .with_precision_and_scale(30, 10)
+            .unwrap(),
+        );
+        let rhs_array: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![
+                Some(rhs_coefficient),
+                Some(-rhs_coefficient),
+                Some(rhs_coefficient),
+                Some(rhs_coefficient),
+            ])
+            .with_precision_and_scale(18, 9)
+            .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("left", lhs_type.clone(), true),
+            Field::new("right", rhs_type.clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![lhs_array, rhs_array]).unwrap();
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+        let mut arena = ExprArena::default();
+        let lhs = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), lhs_type);
+        let rhs = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), rhs_type);
+        let lhs_f64 = arena.push_typed(ExprNode::Cast(lhs), DataType::Float64);
+        let rhs_f64 = arena.push_typed(ExprNode::Cast(rhs), DataType::Float64);
+        let promoted = arena.push_typed(ExprNode::Mul(lhs_f64, rhs_f64), DataType::Float64);
+        let checked = arena.push_typed(ExprNode::Mul(lhs, rhs), DataType::Decimal128(38, 19));
+        let output = arena.eval(promoted, &chunk).unwrap();
+        assert_eq!(output.data_type(), &DataType::Float64);
+        let output = output.as_any().downcast_ref::<Float64Array>().unwrap();
+        // Independent original-SQL coefficient -> binary64 cast -> binary64 product oracle.
+        assert_eq!(output.value(0).to_bits(), 0x4593_b303_f039_904e);
+        assert_eq!(output.value(1).to_bits(), 0x4593_b303_f039_904e);
+        assert!(output.is_null(2));
+        assert!(!output.is_null(3));
+        assert_eq!(output.value(3), 0.0);
+        let checked = arena.eval(checked, &chunk).unwrap();
+        let checked = checked.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert!(checked.is_null(0));
+        assert!(checked.is_null(1));
+        assert!(checked.is_null(2));
+        assert_eq!(checked.value(3), 0);
+    }
+
+    #[test]
     fn test_decimal_div_precision_overflow_returns_null() {
         let mut arena = ExprArena::default();
         let lhs = arena.push_typed(

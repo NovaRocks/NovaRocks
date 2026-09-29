@@ -29,6 +29,7 @@ mod partition;
 pub use arithmetic::{
     ArithmeticOperator, arithmetic_result_type, arithmetic_result_type_with_op,
     canonical_agg_decimal_type, decimal_arithmetic_result_type,
+    decimal_multiplication_requires_float64,
 };
 pub use comparison::OrderedComparisonAlgorithm;
 pub use function::{
