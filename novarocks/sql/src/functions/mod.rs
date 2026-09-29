@@ -895,6 +895,8 @@ fn scalar_result_nullable(name: &str, request: FunctionBindingRequest<'_>) -> bo
         None => false,
     };
     match name {
+        // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
+        "field" => false,
         // A NULL predicate fails the assertion; successful evaluations are true.
         "assert_true"
         | "mv_group_row_id"

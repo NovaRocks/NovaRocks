@@ -2238,6 +2238,58 @@ mod tests {
             "aggregate refresh should accept aggregate-state change-stream descriptor evidence",
         );
     }
+    #[test]
+    fn field_common_type_survives_physical_planning() {
+        use crate::analysis::{ExprKind, TypedExpr};
+        use crate::planner::physical::{PhysicalPlanKind, PhysicalPlanNode};
+        use arrow::datatypes::DataType;
+        fn find_field(plan: &PhysicalPlanNode) -> Option<&TypedExpr> {
+            let expressions = match &plan.kind {
+                PhysicalPlanKind::Project(project) => project
+                    .items
+                    .iter()
+                    .map(|item| &item.expr)
+                    .collect::<Vec<_>>(),
+                PhysicalPlanKind::Values(values) => values.rows.iter().flatten().collect(),
+                _ => Vec::new(),
+            };
+            expressions.into_iter().find(|expr| matches!(&expr.kind, ExprKind::FunctionCall { name, .. } if name == "field"))
+                .or_else(|| plan.children.iter().find_map(find_field))
+        }
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let request = SqlAnalyzeRequest::new(
+            SqlStatementInput::sql("select field('01', '1', 1) as ordinal"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "default".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &snapshot,
+            crate::functions::builtin_sql_function_catalog(),
+            noop_constant_evaluator(),
+            None,
+            SqlCompileControl::unbounded(),
+        );
+        let optimized = analyze_then_optimize(request)
+            .unwrap()
+            .into_optimized_output()
+            .unwrap();
+        let physical =
+            crate::planner::optimizer_bridge::to_physical_plan(&optimized.optimized_tree).unwrap();
+        let field = find_field(&physical)
+            .expect("FIELD must remain typed when constant evaluation is disabled");
+        let ExprKind::FunctionCall { args, binding, .. } = &field.kind else {
+            unreachable!()
+        };
+        assert!(args.iter().all(|arg| arg.data_type == DataType::Float64));
+        assert!(binding.selected.argument_types.iter().all(|arg| matches!(arg,
+            novarocks_functions::FunctionArgumentType::Value(value) if value.data_type == DataType::Float64)));
+        assert_eq!(field.data_type, DataType::Int32);
+        assert!(!field.nullable);
+    }
 }
 mod completion;
 mod completion_catalog;
