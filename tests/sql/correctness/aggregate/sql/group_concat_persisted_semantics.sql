@@ -25,6 +25,8 @@ CREATE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT 7 AS value;
 SET sql_mode='GROUP_CONCAT_LEGACY';
 
 -- query 2
+-- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
+-- @expect_sql_phase=Admit
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
 CREATE VIEW default_catalog.${case_db}.v_forbidden_mode AS SELECT 1;
 
@@ -40,10 +42,14 @@ SELECT /*+ SET_VAR(sql_mode=32) */ value FROM default_catalog.${case_db}.v_persi
 EXPLAIN SELECT * FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 6
+-- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
+-- @expect_sql_phase=Admit
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
 CREATE MATERIALIZED VIEW ${case_db}.mv_forbidden_mode DISTRIBUTED BY HASH(k) BUCKETS 1 AS SELECT k FROM definitely_missing_table;
 
 -- query 7
+-- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
+-- @expect_sql_phase=Admit
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
 REFRESH MATERIALIZED VIEW ${case_db}.definitely_missing_mv;
 
@@ -62,6 +68,8 @@ SELECT value FROM default_catalog.${case_db}.v_persisted_mode;
 SELECT * FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ * FROM default_catalog.${case_db}.v_persisted_mode) d;
 
 -- query 12
+-- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
+-- @expect_sql_phase=Admit
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
 CREATE OR REPLACE VIEW default_catalog.${case_db}.v_persisted_mode AS SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 9 AS value;
 
