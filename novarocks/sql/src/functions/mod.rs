@@ -3047,9 +3047,9 @@ mod tests {
             (
                 "bar",
                 vec![
-                    value_argument(DataType::Float64, false, None),
-                    value_argument(DataType::Float64, false, None),
-                    value_argument(DataType::Float64, false, None),
+                    value_argument(DataType::Int64, false, None),
+                    value_argument(DataType::Int64, false, None),
+                    value_argument(DataType::Int64, false, None),
                     value_argument(DataType::Int64, false, None),
                 ],
                 Own::MayRaise,

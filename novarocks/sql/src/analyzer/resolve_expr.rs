@@ -6474,7 +6474,7 @@ mod tests {
     fn array_agg_freezes_json_output_separately_from_physical_binding() {
         for sql in [
             "select array_agg(json_object('2:3'))",
-            "select array_agg(json_array(1))",
+            "select array_agg(parse_json('[1]'))",
             "select array_agg(j2) from (select cast(json_object('k',1) as json) as j, j as j2) s",
             "select array_agg(j) from (values (cast(json_object('k',1) as json)), (null)) q(j)",
             "select array_agg(j) from (select cast(json_object('k',1) as json) as j union all select null) q",
@@ -6493,6 +6493,18 @@ mod tests {
             let expression =
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
             assert_array_agg_json_adapter(&expression);
+        }
+        // JSON_ARRAY has a legacy declaration but no installed scalar kernel.
+        // Keep its admission control alongside the JSON aggregate boundary.
+        for sql in [
+            "select array_agg(json_array(1))",
+            "select array_agg(json_array(1)) where false",
+        ] {
+            let error = analyze_projection_expr(sql).unwrap_err();
+            assert!(
+                error.contains("builtin function `json_array` has no admitted selected scalar implementation"),
+                "{sql}: {error}"
+            );
         }
     }
 
