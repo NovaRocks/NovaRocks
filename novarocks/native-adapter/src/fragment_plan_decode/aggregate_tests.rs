@@ -16,8 +16,169 @@ mod tests {
     use super::super::{NativePlanDecodeContext, decode_node};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_proto_models::plan;
     use novarocks_types::SlotId;
+
+    fn ordered_concat_merge_plan(name: &str) -> plan::DistributedNode {
+        let signature = resolved_aggregate_update_signature(
+            name,
+            &[DataType::Utf8, DataType::Utf8],
+            &[DataType::Utf8, DataType::Utf8, DataType::Int64],
+        );
+        let intermediate_type = novarocks_plan_codec::native_type::decode_type(
+            signature
+                .as_ref()
+                .and_then(|signature| signature.intermediate_type.as_ref())
+                .expect("concat intermediate type"),
+        )
+        .expect("decoded concat intermediate type");
+        let local_columns = vec![output_column(3, "concat_state", intermediate_type.clone())];
+        let local = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Local as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: name.to_string(),
+                    args: vec![column_ref(2, DataType::Utf8), string_literal("|")],
+                    distinct: true,
+                    result_type: Some(type_desc(&DataType::Utf8)),
+                    order_by: vec![sort_item(1)],
+                    output_column_id: 3,
+                    resolved_signature: signature.clone(),
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: local_columns.clone(),
+                }),
+                output_columns: local_columns.clone(),
+            }),
+            local_columns,
+            vec![values_node(10)],
+        );
+        let final_columns = vec![output_column(4, "concat_result", DataType::Utf8)];
+        physical_node(
+            30,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Global as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: name.to_string(),
+                    args: vec![column_ref(3, intermediate_type)],
+                    distinct: true,
+                    result_type: Some(type_desc(&DataType::Utf8)),
+                    order_by: Vec::new(),
+                    output_column_id: 4,
+                    resolved_signature: signature,
+                }],
+                is_merge: vec![true],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: final_columns.clone(),
+                }),
+                output_columns: final_columns.clone(),
+            }),
+            final_columns,
+            vec![local],
+        )
+    }
+
+    fn assert_concat_phase_limits(
+        plan: &plan::DistributedNode,
+        context: &NativePlanDecodeContext,
+        expected: Option<i64>,
+    ) {
+        let lowered = decode_node(plan, &mut ExprArena::default(), context)
+            .expect("concat Local/Global plan must decode");
+        let ExecNodeKind::Aggregate(global) = lowered.node.kind else {
+            panic!("expected global concat aggregate");
+        };
+        assert!(global.functions[0].input_is_intermediate);
+        assert_eq!(global.functions[0].order.group_concat_max_len, expected);
+        assert!(global.functions[0].order.is_distinct);
+        let ExecNodeKind::Aggregate(local) = &global.input.kind else {
+            panic!("expected local concat aggregate");
+        };
+        assert!(!local.functions[0].input_is_intermediate);
+        assert_eq!(local.functions[0].order.group_concat_max_len, expected);
+        assert_eq!(local.functions[0].order.is_asc_order, [true]);
+        assert_eq!(local.functions[0].order.nulls_first, [false]);
+        assert!(local.functions[0].order.is_distinct);
+    }
+
+    #[test]
+    fn concat_phases_preserve_exact_frozen_query_limits() {
+        for name in ["group_concat", "string_agg"] {
+            let plan = ordered_concat_merge_plan(name);
+            assert_concat_phase_limits(&plan, &aggregate_decode_context(), None);
+            for limit in [None, Some(0), Some(-121), Some(5), Some(121)] {
+                let context = aggregate_decode_context().with_query_options(Some(QueryOptions {
+                    group_concat_max_len: limit,
+                    ..Default::default()
+                }));
+                assert_concat_phase_limits(&plan, &context, limit);
+            }
+        }
+    }
+
+    #[test]
+    fn concat_query_contexts_do_not_share_limits() {
+        let plan = ordered_concat_merge_plan("group_concat");
+        let context_a = aggregate_decode_context().with_query_options(Some(QueryOptions {
+            group_concat_max_len: Some(4),
+            ..Default::default()
+        }));
+        let context_b = aggregate_decode_context().with_query_options(Some(QueryOptions {
+            group_concat_max_len: Some(8),
+            ..Default::default()
+        }));
+        assert_concat_phase_limits(&plan, &context_a, Some(4));
+        assert_concat_phase_limits(&plan, &context_b, Some(8));
+        assert_concat_phase_limits(&plan, &aggregate_decode_context(), None);
+        assert_concat_phase_limits(&plan, &context_a, Some(4));
+        assert_concat_phase_limits(&plan, &context_b, Some(8));
+    }
+
+    #[test]
+    fn unrelated_aggregate_does_not_receive_concat_limit() {
+        let columns = vec![output_column(2, "sum_id", DataType::Int64)];
+        let plan = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![column_ref(1, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                    resolved_signature: resolved_aggregate_signature("sum", &[DataType::Int64]),
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: columns.clone(),
+                }),
+                output_columns: columns.clone(),
+            }),
+            columns,
+            vec![one_col_values_node(10)],
+        );
+        let context = aggregate_decode_context().with_query_options(Some(QueryOptions {
+            group_concat_max_len: Some(5),
+            ..Default::default()
+        }));
+        let lowered = decode_node(&plan, &mut ExprArena::default(), &context)
+            .expect("sum must decode with query options");
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected sum aggregate");
+        };
+        assert_eq!(aggregate.functions[0].order.group_concat_max_len, None);
+    }
 
     #[test]
     fn hash_aggregate_derives_output_columns_from_layout_sidecar() {

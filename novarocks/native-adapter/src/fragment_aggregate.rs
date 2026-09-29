@@ -317,7 +317,7 @@ pub fn lower_hash_aggregate_node(
                 output_type: Some(signature_output_type),
                 input_arg_type: signature_input_arg_type,
             }),
-            order: aggregate_order_spec(call),
+            order: aggregate_order_spec(call, ctx),
         });
         resolved_aggregates.push(selected);
     }
@@ -559,7 +559,10 @@ fn lower_aggregate_update_inputs(
     Ok(inputs)
 }
 
-fn aggregate_order_spec(call: &plan::PlanAggregateCall) -> AggOrderSpec {
+fn aggregate_order_spec(
+    call: &plan::PlanAggregateCall,
+    ctx: &NativePlanDecodeContext,
+) -> AggOrderSpec {
     AggOrderSpec {
         is_asc_order: call.order_by.iter().map(|item| item.asc).collect(),
         nulls_first: call.order_by.iter().map(|item| item.nulls_first).collect(),
@@ -567,7 +570,8 @@ fn aggregate_order_spec(call: &plan::PlanAggregateCall) -> AggOrderSpec {
         group_concat_max_len: if call.name.eq_ignore_ascii_case("group_concat")
             || call.name.eq_ignore_ascii_case("string_agg")
         {
-            Some(1024)
+            ctx.query_options()
+                .and_then(|options| options.group_concat_max_len())
         } else {
             None
         },

@@ -1,0 +1,35 @@
+-- query 2
+value	rows_seen
+abcdef|ghijkl	3
+
+-- query 4
+value	rows_seen
+abcdef|g	3
+
+-- query 6
+value	rows_seen
+abcdef|ghijkl	3
+
+-- query 8
+value	rows_seen
+abcd	3
+
+-- query 10
+value	rows_seen
+abcdef|ghijkl	3
+
+-- query 12
+value
+李
+
+-- query 14
+value
+李
+
+-- query 16
+value
+李四|
+
+-- query 18
+value
+李四|王五
