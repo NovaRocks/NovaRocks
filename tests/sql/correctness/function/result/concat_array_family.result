@@ -8,7 +8,7 @@ mixed
 
 -- query 3
 null_element
-[NULL,"b"]
+[null,"b"]
 
 -- query 4
 null_array
