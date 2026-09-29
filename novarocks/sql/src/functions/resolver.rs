@@ -408,43 +408,40 @@ mod tests {
     }
 
     #[test]
-    fn time_slice_declares_exact_rewritten_arities_and_preserves_value_type() {
-        assert_eq!(
-            resolve_scalar_function(
-                "time_slice",
-                &[DataType::Utf8, DataType::Int64, DataType::Utf8]
-            ),
-            Ok(DataType::Utf8)
-        );
-        assert_eq!(
-            resolve_scalar_function(
-                "time_slice",
-                &[
-                    DataType::Date32,
-                    DataType::Int64,
-                    DataType::Utf8,
-                    DataType::Utf8,
-                ]
-            ),
-            Ok(DataType::Date32)
-        );
-        assert!(matches!(
-            resolve_scalar_function("time_slice", &[DataType::Utf8, DataType::Int64]),
-            Err(ResolveError::NoMatchingSignature { .. })
-        ));
-        assert!(matches!(
-            resolve_scalar_function(
-                "time_slice",
-                &[
-                    DataType::Utf8,
-                    DataType::Int64,
-                    DataType::Utf8,
-                    DataType::Utf8,
-                    DataType::Utf8,
-                ]
-            ),
-            Err(ResolveError::NoMatchingSignature { .. })
-        ));
+    fn slice_functions_bind_only_their_declared_temporal_domains() {
+        let timestamp = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+        for (name, domain) in [("time_slice", timestamp), ("date_slice", DataType::Date32)] {
+            for arity in [3, 4] {
+                let mut args = vec![domain.clone(), DataType::Int32, DataType::Utf8];
+                if arity == 4 {
+                    args.push(DataType::Utf8);
+                }
+                let result = resolve_scalar_function_signature(name, &args).unwrap();
+                assert_eq!(result.return_type, domain);
+                assert_eq!(result.argument_types, args);
+                assert!(result.enforce_argument_binding);
+            }
+            for bad in [DataType::Utf8, DataType::Boolean, DataType::Float64] {
+                assert!(matches!(
+                    resolve_scalar_function(name, &[bad, DataType::Int32, DataType::Utf8]),
+                    Err(ResolveError::NoMatchingSignature { .. })
+                ));
+            }
+            assert!(resolve_scalar_function(name, &[domain.clone(), DataType::Int32]).is_err());
+            assert!(
+                resolve_scalar_function(
+                    name,
+                    &[
+                        domain,
+                        DataType::Int32,
+                        DataType::Utf8,
+                        DataType::Utf8,
+                        DataType::Utf8
+                    ]
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

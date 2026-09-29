@@ -461,13 +461,30 @@ fn assert_date_function_logic(name: &str) {
             );
         }
         "time_slice" | "date_slice" => {
-            let dt = common::literal_string(&mut arena, "2020-01-02 03:04:05");
-            let interval = common::literal_i64(&mut arena, 1);
-            let unit = common::literal_string(&mut arena, "hour");
-            assert_eq!(
-                date_eval_ts(name, &arena, expr_ts, &[dt, interval, unit], &chunk),
-                dt_micros("2020-01-02 03:00:00")
+            let raw = common::literal_string(&mut arena, "2020-01-02 03:04:05");
+            let domain = if name == "date_slice" {
+                DataType::Date32
+            } else {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            };
+            let dt = arena.push_typed(ExprNode::Cast(raw), domain);
+            let interval =
+                arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int32);
+            let unit = common::literal_string(
+                &mut arena,
+                if name == "date_slice" { "day" } else { "hour" },
             );
+            if name == "date_slice" {
+                assert_eq!(
+                    date_eval_date32(name, &arena, expr_date, &[dt, interval, unit], &chunk),
+                    date32_from_ymd(2020, 1, 2)
+                );
+            } else {
+                assert_eq!(
+                    date_eval_ts(name, &arena, expr_ts, &[dt, interval, unit], &chunk),
+                    dt_micros("2020-01-02 03:00:00")
+                );
+            }
         }
         "timestampadd" => {
             let unit = common::literal_string(&mut arena, "day");
@@ -2420,9 +2437,13 @@ fn test_trunc_and_slice_and_alignment() {
         dt_micros("2020-01-15 00:00:00")
     );
 
-    let interval = common::literal_i64(&mut arena, 1);
+    let interval = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int32);
     let unit_hour = common::literal_string(&mut arena, "hour");
-    let dt2 = common::literal_string(&mut arena, "2020-01-02 03:04:05");
+    let dt2_raw = common::literal_string(&mut arena, "2020-01-02 03:04:05");
+    let dt2 = arena.push_typed(
+        ExprNode::Cast(dt2_raw),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+    );
     assert_eq!(
         date_eval_ts(
             "time_slice",
@@ -2433,16 +2454,19 @@ fn test_trunc_and_slice_and_alignment() {
         ),
         dt_micros("2020-01-02 03:00:00")
     );
-    let dt3 = common::literal_string(&mut arena, "2020-01-02 03:04:05");
+    let dt3_raw = common::literal_string(&mut arena, "2020-01-02 03:04:05");
+    let dt3 = arena.push_typed(ExprNode::Cast(dt3_raw), DataType::Date32);
+    let unit_day = common::literal_string(&mut arena, "day");
+    let expr_date = common::typed_null(&mut arena, DataType::Date32);
     assert_eq!(
-        date_eval_ts(
+        date_eval_date32(
             "date_slice",
             &arena,
-            expr_ts,
-            &[dt3, interval, unit_hour],
+            expr_date,
+            &[dt3, interval, unit_day],
             &chunk
         ),
-        dt_micros("2020-01-02 03:00:00")
+        date32_from_ymd(2020, 1, 2)
     );
 }
 
@@ -2917,4 +2941,364 @@ fn test_date_format_microseconds() {
         date_eval_str("date_format", &arena, expr_str, &[dt, fmt], &chunk),
         "2023-10-11 00:00:01.030000"
     );
+}
+
+// These exercise the actual typed FunctionCall arena path. SQL/final-plan
+// tests cover sealed binding separately.
+fn slice_call(
+    arena: &mut ExprArena,
+    name: &'static str,
+    args: Vec<ExprId>,
+    result: DataType,
+) -> ExprId {
+    arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Date(name),
+            args,
+        },
+        result,
+    )
+}
+
+#[test]
+fn slice_typed_arena_canonicalizes_units_and_returns_exact_temporal_domains() {
+    use arrow::array::{TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
+    let seed = dt_micros("2020-01-02 03:04:05");
+    for source in [
+        Arc::new(Date32Array::from(vec![
+            Some(0),
+            Some(date32_from_ymd(2020, 1, 2)),
+            None,
+            Some(date32_from_ymd(2020, 1, 3)),
+        ])) as ArrayRef,
+        Arc::new(TimestampSecondArray::from(vec![
+            Some(0),
+            Some(seed / 1_000_000),
+            None,
+            Some(seed / 1_000_000 + 1),
+        ])) as ArrayRef,
+        Arc::new(TimestampMillisecondArray::from(vec![
+            Some(0),
+            Some(seed / 1_000),
+            None,
+            Some(seed / 1_000 + 1),
+        ])) as ArrayRef,
+        Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(0),
+            Some(seed),
+            None,
+            Some(seed + 1),
+        ])) as ArrayRef,
+        Arc::new(TimestampNanosecondArray::from(vec![
+            Some(0),
+            Some(seed * 1_000),
+            None,
+            Some(seed * 1_000 + 1),
+        ])) as ArrayRef,
+    ] {
+        let source = source.slice(1, 3);
+        for name in ["time_slice", "date_slice"] {
+            let mut arena = ExprArena::default();
+            let chunk = common::chunk_from_columns(vec![source.clone()]);
+            let slot = common::slot_ref(&mut arena, 1, source.data_type().clone());
+            let domain = if name == "date_slice" {
+                DataType::Date32
+            } else {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            };
+            let value = arena.push_typed(ExprNode::Cast(slot), domain.clone());
+            let count = arena.push_typed(
+                ExprNode::Literal(LiteralValue::Int64(i64::from(i32::MAX))),
+                DataType::Int32,
+            );
+            let unit = common::literal_string(&mut arena, "year");
+            let call = slice_call(&mut arena, name, vec![value, count, unit], domain.clone());
+            let out = arena.eval(call, &chunk).unwrap();
+            assert_eq!(out.data_type(), &domain);
+            assert_eq!(out.len(), 3);
+            assert!(out.is_null(1));
+            if name == "date_slice" {
+                let out = out.as_any().downcast_ref::<Date32Array>().unwrap();
+                assert_eq!(out.value(0), -719_162);
+                assert_eq!(out.value(2), -719_162);
+            } else {
+                let out = out
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                assert_eq!(out.value(0), -62_135_596_800_000_000);
+                assert_eq!(out.value(2), -62_135_596_800_000_000);
+            }
+        }
+    }
+}
+
+#[test]
+fn slice_typed_arena_ceil_is_right_edge_even_on_boundary_and_overflow_is_null() {
+    for name in ["time_slice", "date_slice"] {
+        for (input, count, unit, expected) in [
+            ("0001-01-01 00:00:00", 1, "day", Some("0001-01-02 00:00:00")),
+            (
+                "2020-01-01 00:00:00",
+                1,
+                "year",
+                Some("2021-01-01 00:00:00"),
+            ),
+            ("9999-12-31 00:00:00", 5, "year", None),
+            ("9999-12-31 00:00:00", 5, "month", None),
+            ("2023-12-31 03:12:04", i64::from(i32::MAX), "quarter", None),
+            ("2023-12-31 03:12:04", i64::from(i32::MAX), "week", None),
+        ] {
+            let mut arena = ExprArena::default();
+            let chunk = common::chunk_len_1();
+            let raw = common::literal_string(&mut arena, input);
+            let domain = if name == "date_slice" {
+                DataType::Date32
+            } else {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            };
+            let value = arena.push_typed(ExprNode::Cast(raw), domain.clone());
+            let count = arena.push_typed(
+                ExprNode::Literal(LiteralValue::Int64(count)),
+                DataType::Int32,
+            );
+            let unit = common::literal_string(&mut arena, unit);
+            let ceil = common::literal_string(&mut arena, "ceil");
+            let call = slice_call(
+                &mut arena,
+                name,
+                vec![value, count, unit, ceil],
+                domain.clone(),
+            );
+            let out = arena.eval(call, &chunk).unwrap();
+            assert_eq!(out.data_type(), &domain);
+            match expected {
+                None => assert!(out.is_null(0)),
+                Some(expected) if name == "time_slice" => assert_eq!(
+                    out.as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .value(0),
+                    dt_micros(expected)
+                ),
+                Some(expected) => {
+                    let date = NaiveDateTime::parse_from_str(expected, "%Y-%m-%d %H:%M:%S")
+                        .unwrap()
+                        .date();
+                    assert_eq!(
+                        out.as_any().downcast_ref::<Date32Array>().unwrap().value(0),
+                        date32_from_ymd(
+                            chrono::Datelike::year(&date),
+                            chrono::Datelike::month(&date),
+                            chrono::Datelike::day(&date)
+                        )
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn slice_typed_arena_rejects_contract_and_control_errors_without_null_masking() {
+    let ts = DataType::Timestamp(TimeUnit::Microsecond, None);
+    for (name, input_type, result_type, count_type, count, unit, boundary, fragment) in [
+        (
+            "time_slice",
+            DataType::Utf8,
+            ts.clone(),
+            DataType::Int32,
+            1,
+            "day",
+            "floor",
+            "arguments differ",
+        ),
+        (
+            "time_slice",
+            ts.clone(),
+            DataType::Utf8,
+            DataType::Int32,
+            1,
+            "day",
+            "floor",
+            "result type differs",
+        ),
+        (
+            "time_slice",
+            DataType::Timestamp(TimeUnit::Second, None),
+            ts.clone(),
+            DataType::Int32,
+            1,
+            "day",
+            "floor",
+            "arguments differ",
+        ),
+        (
+            "time_slice",
+            ts.clone(),
+            ts.clone(),
+            DataType::Int64,
+            1,
+            "day",
+            "floor",
+            "arguments differ",
+        ),
+        (
+            "time_slice",
+            ts.clone(),
+            ts.clone(),
+            DataType::Int32,
+            0,
+            "day",
+            "floor",
+            "greater than 0",
+        ),
+        (
+            "time_slice",
+            ts.clone(),
+            ts.clone(),
+            DataType::Int32,
+            1,
+            "century",
+            "floor",
+            "unsupported unit",
+        ),
+        (
+            "time_slice",
+            ts.clone(),
+            ts.clone(),
+            DataType::Int32,
+            1,
+            "day",
+            "round",
+            "boundary floor/ceil",
+        ),
+        (
+            "date_slice",
+            DataType::Date32,
+            DataType::Date32,
+            DataType::Int32,
+            1,
+            "hour",
+            "floor",
+            "can't use time_slice",
+        ),
+    ] {
+        let mut arena = ExprArena::default();
+        let chunk = common::chunk_len_1();
+        // A NULL value cannot conceal invalid frozen metadata or controls.
+        let value = common::typed_null(&mut arena, input_type);
+        let count = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(count)), count_type);
+        let unit = common::literal_string(&mut arena, unit);
+        let boundary = common::literal_string(&mut arena, boundary);
+        let call = slice_call(
+            &mut arena,
+            name,
+            vec![value, count, unit, boundary],
+            result_type,
+        );
+        let error = arena.eval(call, &chunk).unwrap_err();
+        assert!(error.contains(fragment), "{name}: {error}");
+    }
+}
+
+#[test]
+fn slice_typed_arena_subsecond_coefficients_follow_year_one_epoch() {
+    // Independent integer-calendar derivation is recorded in the class report.
+    for (count, unit, boundary, expected) in [
+        (17, "microsecond", "floor", 1_698_796_799_123_451_i64),
+        (17, "microsecond", "ceil", 1_698_796_799_123_468_i64),
+        (1001, "millisecond", "floor", 1_698_796_798_976_000_i64),
+        (1001, "millisecond", "ceil", 1_698_796_799_977_000_i64),
+    ] {
+        let mut arena = ExprArena::default();
+        let chunk = common::chunk_len_1();
+        let raw = common::literal_string(&mut arena, "2023-10-31 23:59:59.123456");
+        let domain = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let value = arena.push_typed(ExprNode::Cast(raw), domain.clone());
+        let count = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Int64(count)),
+            DataType::Int32,
+        );
+        let unit = common::literal_string(&mut arena, unit);
+        let boundary = common::literal_string(&mut arena, boundary);
+        let call = slice_call(
+            &mut arena,
+            "time_slice",
+            vec![value, count, unit, boundary],
+            domain.clone(),
+        );
+        let out = arena.eval(call, &chunk).unwrap();
+        assert_eq!(out.data_type(), &domain);
+        assert_eq!(
+            out.as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            expected
+        );
+    }
+}
+
+#[test]
+fn slice_typed_arena_distinguishes_input_null_cast_failure_and_pre_epoch_error() {
+    for (input, error) in [("not a date", false), ("0000-01-01", true)] {
+        let mut arena = ExprArena::default();
+        let chunk = common::chunk_len_1();
+        let raw = common::literal_string(&mut arena, input);
+        let domain = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let value = arena.push_typed(ExprNode::Cast(raw), domain.clone());
+        let count = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(1)), DataType::Int32);
+        let unit = common::literal_string(&mut arena, "day");
+        let call = slice_call(
+            &mut arena,
+            "time_slice",
+            vec![value, count, unit],
+            domain.clone(),
+        );
+        if error {
+            assert!(
+                arena
+                    .eval(call, &chunk)
+                    .unwrap_err()
+                    .contains("can't before 0001-01-01")
+            );
+        } else {
+            let out = arena.eval(call, &chunk).unwrap();
+            assert_eq!(out.data_type(), &domain);
+            assert!(out.is_null(0));
+        }
+    }
+}
+
+#[test]
+fn slice_typed_arena_rejects_null_controls_even_with_null_input() {
+    for name in ["time_slice", "date_slice"] {
+        for (null_index, control_type, fragment) in [
+            (1, DataType::Int32, "non-null interval"),
+            (2, DataType::Utf8, "non-null unit"),
+            (3, DataType::Utf8, "non-null boundary"),
+        ] {
+            let mut arena = ExprArena::default();
+            let chunk = common::chunk_len_1();
+            let domain = if name == "date_slice" {
+                DataType::Date32
+            } else {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            };
+            let value = common::typed_null(&mut arena, domain.clone());
+            let count =
+                arena.push_typed(ExprNode::Literal(LiteralValue::Int32(1)), DataType::Int32);
+            let unit = common::literal_string(&mut arena, "day");
+            let boundary = common::literal_string(&mut arena, "floor");
+            let mut args = vec![value, count, unit, boundary];
+            args[null_index] = common::typed_null(&mut arena, control_type);
+            let call = slice_call(&mut arena, name, args, domain);
+            let error = arena.eval(call, &chunk).unwrap_err();
+            assert!(
+                error.contains(fragment),
+                "{name} control {null_index}: {error}"
+            );
+        }
+    }
 }

@@ -942,31 +942,34 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(vec![TypeSpec::Utf8], TypeSpec::Date),
     );
 
-    // time_slice / date_slice preserve the first argument type. The interval
-    // rewrite produces exactly `(value, count, unit[, boundary])`; the unit
-    // and optional boundary are independent strings rather than repetitions
-    // of the value type.
-    for name in ["time_slice", "date_slice"] {
+    // SQL normalizes each call to its frozen temporal domain before binding.
+    // StarRocks TIME_SLICE is DATETIME -> DATETIME; DATE_SLICE is DATE -> DATE.
+    for (name, temporal) in [
+        ("time_slice", TypeSpec::Datetime),
+        ("date_slice", TypeSpec::Date),
+    ] {
         add(
             m,
             name,
             Signature::new(
-                vec![TypeSpec::Any("T"), TypeSpec::Int64, TypeSpec::Utf8],
-                TypeSpec::Any("T"),
-            ),
+                vec![temporal.clone(), TypeSpec::Int32, TypeSpec::Utf8],
+                temporal.clone(),
+            )
+            .with_argument_coercion(),
         );
         add(
             m,
             name,
             Signature::new(
                 vec![
-                    TypeSpec::Any("T"),
-                    TypeSpec::Int64,
+                    temporal.clone(),
+                    TypeSpec::Int32,
                     TypeSpec::Utf8,
                     TypeSpec::Utf8,
                 ],
-                TypeSpec::Any("T"),
-            ),
+                temporal,
+            )
+            .with_argument_coercion(),
         );
     }
 }

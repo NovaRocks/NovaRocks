@@ -901,11 +901,10 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         }
         "date" => DataType::Date32,
-        // time_slice / date_slice mirror their first input type.
-        "time_slice" | "date_slice" => arg_types.first().cloned().unwrap_or(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
-        )),
+        // These function domains are fixed even in legacy return-type-only
+        // inference. Executable calls still require the exact sealed binding.
+        "time_slice" => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        "date_slice" => DataType::Date32,
         "date_format" | "from_unixtime" | "time_format" | "sec_to_time" => DataType::Utf8,
         // `add_months` always returns DATETIME.
         "add_months" => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
