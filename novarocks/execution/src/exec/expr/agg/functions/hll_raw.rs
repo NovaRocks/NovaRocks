@@ -689,13 +689,14 @@ impl AggregateFunction for HllRawAgg {
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let state = unsafe { get_state(ptr) };
-                    // hll_union_agg / ds_hll_count_distinct_merge over an
-                    // all-null group return NULL, mirroring StarRocks. Only
-                    // emit the estimated cardinality when at least one
-                    // non-null input was observed.
+                    // Value-counting NDV aggregates return zero for empty or all-null
+                    // groups. HLL union cardinality retains its nullable result.
                     match state {
                         Some(s) if s.has_value => {
                             builder.append_value(estimate_cardinality(s));
+                        }
+                        _ if matches!(spec.kind, AggKind::HllRawHash) => {
+                            builder.append_value(0);
                         }
                         _ => builder.append_null(),
                     }
@@ -718,9 +719,16 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::HllRawAgg;
+    use crate::exec::expr::ExprId;
     use crate::exec::expr::agg::functions::{
         AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction,
     };
+    use crate::exec::expr::agg::{
+        AggKernelSet, AggStateArena, build_kernel_set, test_builtin_execution_function_set,
+    };
+    use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    use crate::runtime::mem_tracker::MemTracker;
+    use novarocks_functions::AggregateInputBatch;
     use novarocks_types::value::hll::HLL_DATA_EMPTY;
 
     fn spec_hll_union() -> AggSpec {
@@ -843,20 +851,20 @@ mod tests {
     }
 
     #[test]
-    fn ndv_finalize_returns_null_for_empty_group() {
-        // ndv / approx_count_distinct use HllRawHash with Int64 output.
-        // All-null group must yield NULL, not 0.
+    fn ndv_finalize_returns_zero_for_empty_group() {
+        // ndv / approx_count_distinct count non-null distinct values.
         let spec = spec_hll_raw_hash();
         let out = with_state(&spec, |agg, ptr, spec| {
             agg.build_array(spec, 0, &[ptr as AggStatePtr], false)
                 .expect("build_array")
         });
         let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert!(arr.is_null(0));
+        assert!(!arr.is_null(0));
+        assert_eq!(arr.value(0), 0);
     }
 
     #[test]
-    fn ndv_finalize_returns_null_for_all_null_input() {
+    fn ndv_finalize_returns_zero_for_all_null_input() {
         let spec = spec_hll_raw_hash();
         let input: ArrayRef = Arc::new(Int32Array::from(vec![Option::<i32>::None, None]));
         let out = with_state(&spec, |agg, ptr, spec| {
@@ -867,7 +875,8 @@ mod tests {
                 .expect("build_array")
         });
         let arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert!(arr.is_null(0));
+        assert!(!arr.is_null(0));
+        assert_eq!(arr.value(0), 0);
     }
 
     #[test]
@@ -906,5 +915,189 @@ mod tests {
         });
         let arr = out.as_any().downcast_ref::<BinaryArray>().unwrap();
         assert!(arr.is_null(0));
+    }
+
+    fn bound_hll_kernel(name: &str, input_type: DataType, merge: bool) -> AggKernelSet {
+        let function_set = test_builtin_execution_function_set();
+        let selected = function_set
+            .catalog()
+            .resolve_aggregate_trusted(name, &[input_type.clone()])
+            .expect("resolve aggregate");
+        let func = AggFunction {
+            name: name.to_string(),
+            inputs: vec![ExprId(0)],
+            input_is_intermediate: merge,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(selected.intermediate_type.clone()),
+                output_type: Some(selected.output_type.clone()),
+                input_arg_type: Some(input_type.clone()),
+            }),
+            ..Default::default()
+        };
+        let evaluated_type = if merge { DataType::Binary } else { input_type };
+        build_kernel_set(&function_set, &[func], &[Some(evaluated_type)], &[selected])
+            .expect("build aggregate kernel")
+    }
+
+    fn bound_states(kernels: &AggKernelSet, count: usize) -> (AggStateArena, Vec<AggStatePtr>) {
+        let tracker = MemTracker::new_root("ndv-null-contract-test");
+        let mut arena = AggStateArena::new(1024);
+        arena.set_mem_tracker(Arc::clone(&tracker));
+        let kernel = &kernels.entries[0];
+        let states = (0..count)
+            .map(|_| {
+                let base = arena.alloc(kernels.layout.total_size, kernel.state_align());
+                kernel
+                    .init_state_with_tracker(base, Arc::clone(&tracker))
+                    .expect("init state");
+                base
+            })
+            .collect();
+        (arena, states)
+    }
+
+    fn assert_bound_counts(array: &ArrayRef, expected: &[i64]) {
+        let values = array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 result");
+        assert_eq!(values.null_count(), 0);
+        assert_eq!(values.values().as_ref(), expected);
+    }
+
+    #[test]
+    fn bound_ndv_empty_all_null_and_mixed_groups_count_non_null_values() {
+        for name in ["ndv", "approx_count_distinct"] {
+            let kernels = bound_hll_kernel(name, DataType::Int32, false);
+            let kernel = &kernels.entries[0];
+            let (_arena, states) = bound_states(&kernels, 4);
+            // State zero is untouched; states one through three represent independent groups.
+            let input: ArrayRef = Arc::new(Int32Array::from(vec![
+                None,
+                None,
+                Some(7),
+                None,
+                Some(7),
+                Some(7),
+                Some(8),
+            ]));
+            let destinations = [
+                states[1], states[1], states[2], states[2], states[2], states[3], states[3],
+            ];
+            kernel
+                .update_batch(
+                    &destinations,
+                    AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
+                )
+                .expect("update grouped values");
+            assert_bound_counts(&kernel.build_array(&states, false).unwrap(), &[0, 0, 1, 2]);
+            let partial = kernel.build_array(&states, true).expect("build partial");
+            assert!(partial.is_null(0));
+            assert!(partial.is_null(1));
+            assert!(!partial.is_null(2));
+            assert!(!partial.is_null(3));
+            for base in states {
+                kernel.drop_state(base);
+            }
+        }
+    }
+
+    #[test]
+    fn bound_ndv_merge_accepts_null_partials_and_preserves_cardinality() {
+        for name in ["ndv", "approx_count_distinct"] {
+            let local = bound_hll_kernel(name, DataType::Int32, false);
+            let local_kernel = &local.entries[0];
+            let (_local_arena, local_states) = bound_states(&local, 3);
+            let input: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(7), Some(7), Some(8)]));
+            let destinations = [
+                local_states[0],
+                local_states[1],
+                local_states[2],
+                local_states[2],
+            ];
+            local_kernel
+                .update_batch(
+                    &destinations,
+                    AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
+                )
+                .expect("update partial groups");
+            let partial = local_kernel
+                .build_array(&local_states, true)
+                .expect("build partial");
+            let partial = partial.as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert!(partial.is_null(0));
+            let merges: ArrayRef = Arc::new(BinaryArray::from(vec![
+                None,
+                Some(partial.value(1)),
+                None,
+                Some(partial.value(1)),
+                Some(partial.value(2)),
+                Some(partial.value(2)),
+            ]));
+            let final_kernels = bound_hll_kernel(name, DataType::Int32, true);
+            let final_kernel = &final_kernels.entries[0];
+            let (_final_arena, final_states) = bound_states(&final_kernels, 4);
+            // Untouched, all-null, duplicate singleton, and duplicate two-value partial groups.
+            let destinations = [
+                final_states[1],
+                final_states[2],
+                final_states[2],
+                final_states[2],
+                final_states[3],
+                final_states[3],
+            ];
+            final_kernel
+                .merge_batch(
+                    &destinations,
+                    AggregateInputBatch::try_new(Some(&merges), merges.len()).unwrap(),
+                )
+                .expect("merge groups");
+            assert_bound_counts(
+                &final_kernel.build_array(&final_states, false).unwrap(),
+                &[0, 0, 1, 2],
+            );
+            for base in local_states {
+                local_kernel.drop_state(base);
+            }
+            for base in final_states {
+                final_kernel.drop_state(base);
+            }
+        }
+    }
+
+    #[test]
+    fn bound_hll_union_kinds_keep_nullable_empty_contract() {
+        for name in ["hll_union", "hll_raw_agg", "hll_union_agg"] {
+            let kernels = bound_hll_kernel(name, DataType::Binary, false);
+            let kernel = &kernels.entries[0];
+            let (_arena, states) = bound_states(&kernels, 3);
+            let input: ArrayRef =
+                Arc::new(BinaryArray::from(vec![None, Some(&[HLL_DATA_EMPTY][..])]));
+            kernel
+                .update_batch(
+                    &[states[1], states[2]],
+                    AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
+                )
+                .expect("update nullable HLL payloads");
+            let result = kernel
+                .build_array(&states, false)
+                .expect("finalize HLL union");
+            assert!(result.is_null(0));
+            assert!(result.is_null(1));
+            assert!(!result.is_null(2));
+            if name == "hll_union_agg" {
+                assert_eq!(
+                    result
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(2),
+                    0
+                );
+            }
+            for base in states {
+                kernel.drop_state(base);
+            }
+        }
     }
 }

@@ -1,0 +1,21 @@
+-- query 3
+ndv_empty	approx_empty	exact_empty
+0	0	0
+
+-- query 4
+ndv_null	approx_null	exact_null
+0	0	0
+
+-- query 5
+k	ndv_count	approx_count	exact_count
+1	0	0	0
+2	1	1	1
+3	2	2	2
+
+-- query 6
+ndv_cast_null	approx_cast_null
+0	0
+
+-- query 7
+k
+1
