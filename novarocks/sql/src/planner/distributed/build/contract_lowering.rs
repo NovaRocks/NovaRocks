@@ -6165,6 +6165,98 @@ impl ContractLoweringVisitor {
         })
     }
 
+    /// Give independently nullifiable grouping columns their own value identity
+    /// when an identity projection shares their input with another column.
+    /// Repeat replaces values, so sharing one value across distinct grouping
+    /// domains would also null an original aggregate input or another key.
+    fn materialize_repeat_input_identities(
+        &mut self,
+        child: LoweredNode,
+        input_columns: &[OutputColumn],
+        nullable_columns: &BTreeSet<ColumnId>,
+    ) -> Result<LoweredNode, ContractLoweringError> {
+        if input_columns.len() != child.output.len() {
+            return Err(ContractLoweringError::ArityMismatch {
+                context: "Repeat input",
+                expected: input_columns.len(),
+                actual: child.output.len(),
+            });
+        }
+        let mut value_columns = BTreeMap::<ValueId, BTreeSet<ColumnId>>::new();
+        for (value, column) in child.output.iter().zip(input_columns) {
+            value_columns
+                .entry(*value)
+                .or_default()
+                .insert(column.column_id);
+        }
+        let independent_columns = child
+            .output
+            .iter()
+            .zip(input_columns)
+            .filter(|(value, column)| {
+                nullable_columns.contains(&column.column_id) && value_columns[*value].len() > 1
+            })
+            .map(|(_, column)| column.column_id)
+            .collect::<BTreeSet<_>>();
+        if independent_columns.is_empty() {
+            return Ok(child);
+        }
+
+        let node = self.fragment_mut().reserve_node_id()?;
+        let mut expressions = Vec::with_capacity(child.output.len());
+        let mut output = Vec::with_capacity(child.output.len());
+        let mut columns = child.columns.clone();
+        let mut materialized = BTreeMap::new();
+        for (source, column) in child.output.iter().zip(input_columns) {
+            let (expression, value) = if let Some(pair) = materialized.get(&column.column_id) {
+                *pair
+            } else {
+                let ty = self.value_declared_type(*source)?;
+                let expression = self.fragment_mut().add_expression(
+                    node,
+                    ty.clone(),
+                    ContractExprKind::Value(*source),
+                )?;
+                let value = if independent_columns.contains(&column.column_id) {
+                    self.fragment_mut().add_value(
+                        ty,
+                        ValueOrigin::Expr {
+                            node,
+                            expr: expression,
+                        },
+                    )?
+                } else {
+                    *source
+                };
+                let pair = (expression, value);
+                materialized.insert(column.column_id, pair);
+                pair
+            };
+            columns.insert(column.column_id, value);
+            expressions.push((expression, value));
+            output.push(value);
+        }
+        self.fragment_mut().add_project(
+            node,
+            child.node,
+            expressions.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the projection was just inserted")
+            .clone();
+        Ok(LoweredNode {
+            fragment: child.fragment,
+            node,
+            output: output.into_boxed_slice(),
+            columns,
+            properties,
+            display_names: child.display_names,
+        })
+    }
+
     fn lower_repeat(
         &mut self,
         plan: &PhysicalPlanNode,
@@ -6193,7 +6285,23 @@ impl ContractLoweringVisitor {
             });
         }
 
+        let nullable_columns = repeat
+            .all_rollup_column_ids
+            .iter()
+            .copied()
+            .filter(|column| {
+                repeat
+                    .repeat_column_ref_ids
+                    .iter()
+                    .any(|set| !set.contains(column))
+            })
+            .collect::<BTreeSet<_>>();
         let child = self.lower_node(&plan.children[0])?;
+        let child = self.materialize_repeat_input_identities(
+            child,
+            &plan.children[0].output_columns,
+            &nullable_columns,
+        )?;
         let mut grouping_sets = Vec::with_capacity(repeat.repeat_column_ref_ids.len());
         for (set_ordinal, (set, grouping_id)) in repeat
             .repeat_column_ref_ids
@@ -6250,17 +6358,6 @@ impl ContractLoweringVisitor {
             });
         }
         let node = self.fragment_mut().reserve_node_id()?;
-        let nullable_columns = repeat
-            .all_rollup_column_ids
-            .iter()
-            .copied()
-            .filter(|column| {
-                repeat
-                    .repeat_column_ref_ids
-                    .iter()
-                    .any(|set| !set.contains(column))
-            })
-            .collect::<std::collections::BTreeSet<_>>();
         let mut grouping_values = Vec::with_capacity(nullable_columns.len());
         let mut grouping_replacements = BTreeMap::new();
         let mut output = Vec::with_capacity(expected_output_len);
@@ -11706,6 +11803,171 @@ mod tests {
             spec.mappings[0].constants[0],
             ContractUnpivotConstant::Scalar(_)
         ));
+    }
+
+    fn repeat_over_identity_aliases(
+        projected_columns: Vec<OutputColumn>,
+        keys: Vec<OutputColumn>,
+        sets: Vec<Vec<ColumnId>>,
+        grouping_ids: Vec<u64>,
+    ) -> PhysicalPlanNode {
+        let source = column(1, "source", DataType::Int64, false);
+        let project = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items: projected_columns
+                    .iter()
+                    .map(|column| ProjectItem {
+                        expr: column_ref(&source),
+                        output_name: column.name.clone(),
+                        output_column_id: column.column_id,
+                    })
+                    .collect(),
+                output_qualifier: None,
+            }),
+            children: vec![values(vec![source], vec![vec![literal_int(7)]])],
+            output_columns: projected_columns.clone(),
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let grouping = column(4, "grouping", DataType::Int64, false);
+        let mut output_columns = projected_columns;
+        for column in &mut output_columns {
+            if keys.iter().any(|key| key.column_id == column.column_id) {
+                column.nullable = true;
+            }
+        }
+        output_columns.push(grouping.clone());
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::Repeat(PlanRepeatNode {
+                repeat_column_ref_list: sets
+                    .iter()
+                    .map(|set| {
+                        set.iter()
+                            .map(|id| {
+                                keys.iter()
+                                    .find(|key| key.column_id == *id)
+                                    .unwrap()
+                                    .name
+                                    .clone()
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                repeat_column_ref_ids: sets,
+                grouping_ids,
+                all_rollup_columns: keys.iter().map(|key| key.name.clone()).collect(),
+                all_rollup_column_ids: keys.iter().map(|key| key.column_id).collect(),
+                grouping_key_aliases: Vec::new(),
+                grouping_fn_args: vec![(
+                    "grouping".to_string(),
+                    keys.iter().map(|key| key.name.clone()).collect(),
+                )],
+                grouping_fn_arg_ids: vec![keys.iter().map(|key| key.column_id).collect()],
+                grouping_fn_ids: vec![("grouping".to_string(), grouping.column_id)],
+                virtual_tuple_id: None,
+            }),
+            children: vec![project],
+            output_columns,
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn repeat_keeps_original_input_and_repeated_alias_in_independent_null_domains() {
+        let source = column(1, "source", DataType::Int64, false);
+        let key = column(2, "key", DataType::Int64, false);
+        let plan = repeat_over_identity_aliases(
+            vec![source, key.clone(), key.clone()],
+            vec![key.clone()],
+            vec![vec![key.column_id], Vec::new()],
+            vec![0, 1],
+        );
+        let final_plan = finish_for_test(&plan).unwrap();
+        let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let repeat = fragment.nodes().get(&fragment.root()).unwrap();
+        let copied = fragment.nodes().get(&repeat.inputs[0]).unwrap();
+        let original = fragment.nodes().get(&copied.inputs[0]).unwrap();
+        assert!(matches!(copied.kind, NodeKind::Project { .. }));
+        assert_eq!(original.output.columns[0], original.output.columns[1]);
+        assert_eq!(original.output.columns[1], original.output.columns[2]);
+        assert_eq!(copied.output.columns[0], original.output.columns[0]);
+        assert_ne!(copied.output.columns[0], copied.output.columns[1]);
+        assert_eq!(copied.output.columns[1], copied.output.columns[2]);
+        assert_eq!(repeat.output.columns[0], copied.output.columns[0]);
+        assert_ne!(repeat.output.columns[1], copied.output.columns[1]);
+        assert_eq!(repeat.output.columns[1], repeat.output.columns[2]);
+        assert!(!fragment.values()[&repeat.output.columns[0]].ty.nullable);
+        assert!(fragment.values()[&repeat.output.columns[1]].ty.nullable);
+        assert!(matches!(
+            fragment.values()[&copied.output.columns[1]].origin,
+            ValueOrigin::Expr { node, .. } if node == copied.id
+        ));
+        let NodeKind::Repeat {
+            rollup_keys,
+            grouping_sets,
+            grouping_values,
+            grouping_outputs,
+        } = &repeat.kind
+        else {
+            panic!("expected Repeat");
+        };
+        assert_eq!(rollup_keys.as_ref(), &[copied.output.columns[1]]);
+        assert_eq!(grouping_sets[0].as_ref(), &[copied.output.columns[1]]);
+        assert!(grouping_sets[1].is_empty());
+        assert_eq!(
+            grouping_values.as_ref(),
+            &[(copied.output.columns[1], repeat.output.columns[1])]
+        );
+        assert_eq!(
+            grouping_outputs[0].arguments.as_ref(),
+            &[copied.output.columns[1]]
+        );
+    }
+
+    #[test]
+    fn repeat_same_source_keys_with_different_presence_have_independent_values() {
+        let source = column(1, "source", DataType::Int64, false);
+        let left = column(2, "left_key", DataType::Int64, false);
+        let right = column(3, "right_key", DataType::Int64, false);
+        let plan = repeat_over_identity_aliases(
+            vec![source, left.clone(), right.clone()],
+            vec![left.clone(), right.clone()],
+            vec![vec![left.column_id], vec![right.column_id], Vec::new()],
+            vec![1, 2, 3],
+        );
+        let final_plan = finish_for_test(&plan).unwrap();
+        let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let repeat = fragment.nodes().get(&fragment.root()).unwrap();
+        let copied = fragment.nodes().get(&repeat.inputs[0]).unwrap();
+        assert_ne!(copied.output.columns[0], copied.output.columns[1]);
+        assert_ne!(copied.output.columns[0], copied.output.columns[2]);
+        assert_ne!(copied.output.columns[1], copied.output.columns[2]);
+        assert_eq!(repeat.output.columns[0], copied.output.columns[0]);
+        assert_ne!(repeat.output.columns[1], repeat.output.columns[2]);
+        let NodeKind::Repeat {
+            grouping_sets,
+            grouping_values,
+            grouping_outputs,
+            ..
+        } = &repeat.kind
+        else {
+            panic!("expected Repeat");
+        };
+        assert_eq!(grouping_sets[0].as_ref(), &[copied.output.columns[1]]);
+        assert_eq!(grouping_sets[1].as_ref(), &[copied.output.columns[2]]);
+        assert!(grouping_sets[2].is_empty());
+        assert_eq!(
+            grouping_values.as_ref(),
+            &[
+                (copied.output.columns[1], repeat.output.columns[1]),
+                (copied.output.columns[2], repeat.output.columns[2])
+            ]
+        );
+        assert_eq!(
+            grouping_outputs[0].arguments.as_ref(),
+            &copied.output.columns[1..3]
+        );
     }
 
     #[test]
