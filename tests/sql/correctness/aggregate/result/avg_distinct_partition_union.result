@@ -1,0 +1,24 @@
+-- query 2
+g	n	total	distinct_avg	ordinary_avg	decimal_avg
+a	3	12	4	3.2	1.51500000
+b	0	NULL	NULL	NULL	NULL
+
+-- query 3
+distinct_avg
+4
+
+-- query 4
+expression_avg
+5
+
+-- query 5
+empty_avg	empty_decimal_avg
+NULL	NULL
+
+-- query 6
+rounded_positive	rounded_negative
+0.0000000000002	-0.0000000000002
+
+-- query 7
+signed_zero_avg
+2
