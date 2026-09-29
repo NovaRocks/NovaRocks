@@ -62,7 +62,7 @@ pub fn eval_array_min(
         let end = offsets[row_idx + 1] as usize;
         let mut best = None::<usize>;
         for idx in start..end {
-            if values.is_null(idx) {
+            if super::common::is_logically_null(values.as_ref(), idx) {
                 continue;
             }
             best = match best {
