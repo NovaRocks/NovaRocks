@@ -3180,6 +3180,89 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn aggregate_cross_join_delta_preserves_both_occurrences_and_snapshot_windows() {
+        let ctx = join_aggregate_mv_ctx_customized(|snapshot| {
+            Arc::make_mut(&mut snapshot.schema_contract).join = None;
+        });
+        let mut plan = join_aggregate_plan();
+        let LogicalPlanKind::Join(join) = &mut plan.children[0].kind else {
+            panic!("fixture requires direct aggregate join");
+        };
+        join.join_type = JoinKind::Cross;
+        join.condition = None;
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan,
+            snapshot: ctx,
+            disabled_rules: Vec::new(),
+            deadline: None,
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .expect("zero-key aggregate join uses aggregate state merge");
+        assert!(outcome.annotation.change_stream.has_aggregate());
+        assert!(outcome.annotation.change_stream.join_refresh.is_none());
+        let mut delta_windows = Vec::new();
+        let mut versions = Vec::new();
+        fn collect(
+            plan: &LogicalPlanNode,
+            delta: &mut Vec<(String, i64, i64)>,
+            versions: &mut Vec<(String, i64)>,
+            crosses: &mut usize,
+        ) {
+            if let LogicalPlanKind::Join(join) = &plan.kind {
+                // Aggregate change publication also crosses its state merge
+                // with the two literal DELETE/INSERT branch markers. Count
+                // the source delta joins separately from that expansion.
+                if join.join_type == JoinKind::Cross
+                    && !plan
+                        .children
+                        .iter()
+                        .any(|child| matches!(&child.kind, LogicalPlanKind::Values(_)))
+                {
+                    assert!(join.condition.is_none());
+                    *crosses += 1;
+                }
+            }
+            if let LogicalPlanKind::Scan(scan) = &plan.kind {
+                if let ScanSource::Sql(source) = &scan.table.source {
+                    match source.kind {
+                        SqlScanKind::Delta {
+                            from_snapshot_id,
+                            to_snapshot_id,
+                        } => delta.push((
+                            source.table.table.clone(),
+                            from_snapshot_id,
+                            to_snapshot_id,
+                        )),
+                        SqlScanKind::FrozenInputSet {
+                            version: SqlTableVersionSelector::Snapshot(id),
+                            ..
+                        } => versions.push((source.table.table.clone(), id)),
+                        _ => {}
+                    }
+                }
+            }
+            for child in &plan.children {
+                collect(child, delta, versions, crosses);
+            }
+        }
+        let mut crosses = 0;
+        collect(
+            &outcome.plan,
+            &mut delta_windows,
+            &mut versions,
+            &mut crosses,
+        );
+        delta_windows.sort();
+        versions.sort();
+        assert_eq!(crosses, 2, "two signed cross delta branches");
+        assert_eq!(
+            delta_windows,
+            vec![("l".into(), 11, 22), ("r".into(), 33, 44)]
+        );
+        assert_eq!(versions, vec![("l".into(), 22), ("r".into(), 33)]);
+    }
+
+    #[test]
     fn query_rewrite_preserves_join_aggregate_action_column() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),

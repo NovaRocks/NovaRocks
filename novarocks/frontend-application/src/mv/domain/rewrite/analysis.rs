@@ -30,7 +30,9 @@ use novarocks_mv_application::persistence::codec::{
 use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_mv_application::persistence::schema::MvPartitionContract;
-use novarocks_sql::planning::mv::{SqlMvAggregateCalls, SqlMvJoinPredicateColumns};
+use novarocks_sql::planning::mv::{
+    SqlMvAggregateCalls, SqlMvJoinPredicateColumns, SqlMvRefreshJoinAnalysis,
+};
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
 
 use bytes::Bytes;
@@ -52,9 +54,8 @@ pub(crate) struct MvRewriteAnalysisInput<'a> {
     /// The provider's partition names and numeric scan-key spec from the same
     /// target generation. L owns the verified opaque IDs and typed transforms.
     pub observed_target_partition: &'a MvPartitionContract,
-    /// D's join, as equality predicates in D's own vocabulary, decided by
-    /// reparsing D's own effective SQL. Empty when D has no join.
-    pub join_predicates: Vec<SqlMvJoinPredicateColumns>,
+    /// D's explicit direct-join analysis, frozen from its effective query.
+    pub join_analysis: SqlMvRefreshJoinAnalysis,
     /// SQL aggregate calls and the physical layout derived from D's query.
     pub aggregate: Option<(SqlMvAggregateCalls, SqlMvAggregatePhysicalLayout)>,
 }
@@ -74,10 +75,21 @@ pub(crate) fn freeze_rewrite_analysis_facts(
     // provider identity beside the name it was bound under. Resolving the
     // predicate through the occurrence keeps a self-join's two references
     // apart, which an FQN map cannot.
-    let join = if input.join_predicates.is_empty() {
-        None
-    } else {
-        Some(join_contract_facts(definition, &input.join_predicates)?)
+    let join = match &input.join_analysis {
+        SqlMvRefreshJoinAnalysis::NotDirectTwoTableJoin => None,
+        SqlMvRefreshJoinAnalysis::ZeroKeyCrossJoin => {
+            if input.aggregate.is_none() {
+                return Err(
+                    "zero-key CROSS JOIN refresh requires aggregate change-stream facts".into(),
+                );
+            }
+            // Aggregate state merging consumes the independently bound logical
+            // CROSS tree. It has no equality reachability/apply-key descriptor.
+            None
+        }
+        SqlMvRefreshJoinAnalysis::InnerEquiJoin(predicates) => {
+            Some(join_contract_facts(definition, predicates)?)
+        }
     };
 
     // Affected-partition derivation needs the typed transform and the opaque
