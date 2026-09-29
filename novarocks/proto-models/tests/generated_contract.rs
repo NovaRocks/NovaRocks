@@ -2009,3 +2009,20 @@ fn admission_ticket_contract_is_exact_and_append_only() {
         10
     );
 }
+
+#[test]
+fn root_result_revocation_has_a_distinct_control_wait_status() {
+    let pool = DescriptorPool::decode(FILE_DESCRIPTOR_SET).unwrap();
+    let status = pool
+        .get_enum_by_name("novarocks.FetchResultResponse.Status")
+        .unwrap();
+    assert_eq!(
+        status
+            .get_value_by_name("AWAIT_TERMINAL_CONTROL")
+            .unwrap()
+            .number(),
+        5
+    );
+    assert_eq!(status.get_value_by_name("NOT_READY").unwrap().number(), 2);
+    assert_eq!(status.get_value_by_name("ERROR").unwrap().number(), 4);
+}

@@ -3758,3 +3758,178 @@ fn two_concurrent_advances_never_roll_a_shared_token_backwards() {
         "version five must already be the accepted token"
     );
 }
+
+#[test]
+fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
+    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+    let fixture = Fixture::new();
+    let context = fixture.establish(90_501);
+    let root = fixture.identity(90_501, 1, 1);
+    let child = fixture.identity(90_501, 2, 2);
+    let root_reporter = fixture.create(root, 5);
+    let child_reporter = fixture.create(child, STREAM_SINK);
+    root_reporter.running();
+    child_reporter.running();
+    let active_missing = poll_root_result(&fixture.registry, root);
+    assert_eq!(fetch_status(&active_missing), FetchStatus::Error);
+    assert_eq!(active_missing.message, "no result for this query");
+    novarocks_worker::result_buffer::create_task_typed_sender(root);
+    let RootResultRoute::Serve(_held_route) = fixture.registry.root_result_route(root) else {
+        panic!("the active root must own its registered result");
+    };
+    fixture
+        .task_host
+        .ignore_stand_down
+        .store(true, Ordering::SeqCst);
+    let failure = TaskFailure::new(
+        TaskFailureCategory::Execution,
+        SafeDetail::new("upstream array lengths differ").unwrap(),
+    );
+    child_reporter.failing(failure.clone());
+    child_reporter.failed(failure.clone());
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Aborting
+    );
+    assert_eq!(
+        fixture.registry.termination_cause(context),
+        Some(AbortCause::PeerTaskFailed)
+    );
+    assert_eq!(
+        child_reporter.current().termination(),
+        Some(
+            &novarocks_execution_contract::task_execution::status::TerminationDetail::Failed(
+                failure
+            )
+        )
+    );
+    assert!(matches!(
+        fixture.registry.root_result_route(root),
+        RootResultRoute::AwaitTerminalControl
+    ));
+    let response = poll_root_result(&fixture.registry, root);
+    assert_eq!(fetch_status(&response), FetchStatus::AwaitTerminalControl);
+    assert!(response.message.is_empty() && response.result_arrow_ipc.is_empty());
+    assert!(!response.eos);
+    assert_eq!(
+        fetch_status(&poll_root_result(&fixture.registry, child)),
+        FetchStatus::Error
+    );
+
+    // The first Serve preceded revocation. Its real typed buffer read now
+    // returns NotFound; one exact owner reread changes only the typed verdict.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let error = match runtime.block_on(novarocks_worker::result_buffer::wait_fetch_task_typed(
+        root,
+        None,
+        Duration::ZERO,
+        novarocks_execution_contract::task_execution::operation::ResultByteLimit::new(
+            16 * 1024 * 1024,
+        )
+        .unwrap(),
+    )) {
+        novarocks_worker::result_buffer::TryFetchTypedResult::Error(error) => error,
+        _ => panic!("termination discarded the registered result"),
+    };
+    assert!(matches!(
+        error.kind,
+        novarocks_worker::result_buffer::FetchErrorKind::NotFound
+    ));
+    let ingress = RegistryTaskExecutionIngress::new(
+        Arc::clone(&fixture.registry),
+        NativeCompatibilityId::new([0x71; 32]),
+    );
+    assert!(matches!(
+        runtime
+            .block_on(ingress.resolve_task_result_error(root, error, None))
+            .unwrap(),
+        novarocks_native_adapter::task_protocol::TaskResultRead::AwaitTerminalControl
+    ));
+    let wrong = TaskIdentity::new(
+        root.query_execution_id(),
+        root.stage_id(),
+        root.task_id(),
+        BackendProcessId::new_v7(),
+    );
+    assert_eq!(
+        fetch_status(&poll_root_result(&fixture.registry, wrong)),
+        FetchStatus::Error
+    );
+    assert_eq!(
+        fetch_status(&poll_root_result_after(&fixture.registry, root, Some(0))),
+        FetchStatus::AwaitTerminalControl,
+        "an unproven ACK must never be manufactured into EOF"
+    );
+}
+
+#[test]
+fn canceled_queued_terminal_relookup_retains_its_ingress_slot() {
+    use std::future::Future;
+    let fixture = Fixture::new();
+    fixture.establish(90_505);
+    let root = fixture.identity(90_505, 1, 1);
+    fixture.create(root, 5);
+    fixture
+        .registry
+        .abort_query_context(&AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            fixture.context(90_505),
+            AbortCause::PeerTaskFailed,
+        ));
+    let ingress = RegistryTaskExecutionIngress::new(
+        Arc::clone(&fixture.registry),
+        NativeCompatibilityId::new([0x71; 32]),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (ownership, running) = crate::native_ingress::one_slot_test_ownership().await;
+        let weak = Arc::downgrade(&ownership);
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let held = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+        let error = novarocks_worker::result_buffer::FetchError {
+            kind: novarocks_worker::result_buffer::FetchErrorKind::NotFound,
+            message: "typed missing result".to_owned(),
+        };
+        let mut relookup =
+            Box::pin(ingress.resolve_task_result_error(root, error, Some(ownership)));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                relookup.as_mut().poll(cx).is_pending()
+            ))
+            .await,
+            "the second exact lookup is queued behind the held blocking owner"
+        );
+        drop(relookup); // RPC cancellation cannot cancel already-queued work.
+        assert_eq!(running.available_permits(), 0);
+        assert!(
+            weak.upgrade().is_some(),
+            "queued work still owns ingress backing"
+        );
+        assert!(
+            Arc::clone(&running).try_acquire_owned().is_err(),
+            "another request cannot exceed the one running slot"
+        );
+        release.send(()).unwrap();
+        held.await.unwrap();
+        let returned = Arc::clone(&running).acquire_owned().await.unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "real closure exit releases its backing"
+        );
+        drop(returned);
+        assert_eq!(running.available_permits(), 1);
+    });
+}

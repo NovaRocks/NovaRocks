@@ -2677,11 +2677,11 @@ mod tests {
     #[derive(Debug, Default)]
     struct ClosedSuccessSealPort;
 
-    impl super::super::AcceptedRootSuccessSealPort for ClosedSuccessSealPort {
-        fn enqueue_success_seal(
+    impl super::super::AcceptedRootControlPort for ClosedSuccessSealPort {
+        fn enqueue_root_control(
             &self,
-            request: super::super::AcceptedRootSuccessSealRequest,
-        ) -> Result<(), super::super::AcceptedRootSuccessSealRequest> {
+            request: super::super::AcceptedRootControlRequest,
+        ) -> Result<(), super::super::AcceptedRootControlRequest> {
             Err(request)
         }
     }
@@ -2729,7 +2729,7 @@ mod tests {
             let converged = Arc::clone(&self.converged);
             Box::pin(async move {
                 let (status_sender, statuses) =
-                    super::super::accepted_root_status_projection_with_seal_port(
+                    super::super::accepted_root_status_projection_with_control_port(
                         root,
                         Arc::new(ClosedSuccessSealPort),
                     );
@@ -3083,7 +3083,7 @@ mod tests {
                     }));
                 }
                 let (status_sender, statuses) =
-                    super::super::accepted_root_status_projection_with_seal_port(
+                    super::super::accepted_root_status_projection_with_control_port(
                         root,
                         Arc::new(ClosedSuccessSealPort),
                     );
@@ -3844,7 +3844,7 @@ mod tests {
             let fail = Arc::clone(&self.fail);
             Box::pin(async move {
                 let (status_sender, statuses) =
-                    super::super::accepted_root_status_projection_with_seal_port(
+                    super::super::accepted_root_status_projection_with_control_port(
                         root,
                         Arc::new(ClosedSuccessSealPort),
                     );

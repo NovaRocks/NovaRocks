@@ -223,6 +223,7 @@ impl PreflightedRootResultPacket {
 pub enum RootResultFetchOutcome {
     Ready(PreflightedRootResultPacket),
     NotReady,
+    AwaitTerminalControl,
     EndPending(ResultPacketSequence),
     EndAcknowledged(ResultPacketSequence),
 }
@@ -490,30 +491,60 @@ pub struct AcceptedRootStatusSource {
     root: TaskIdentity,
     receiver: watch::Receiver<Option<AcceptedRootProjection>>,
     observed: Option<AcceptedRootProjection>,
-    success_seal_port: Option<Arc<dyn AcceptedRootSuccessSealPort>>,
+    root_control_port: Option<Arc<dyn AcceptedRootControlPort>>,
 }
 
-/// Frontend's single serialized path for ordering success against accepted
-/// Task status. Implementations enqueue the request beside status events and
+/// Frontend's single serialized path for ordering result-control requirements
+/// against accepted Task status. Implementations enqueue the request beside status events and
 /// must not decide it on the caller's async task.
 #[doc(hidden)]
-pub trait AcceptedRootSuccessSealPort: std::fmt::Debug + Send + Sync {
-    fn enqueue_success_seal(
+pub trait AcceptedRootControlPort: std::fmt::Debug + Send + Sync {
+    fn enqueue_root_control(
         &self,
-        request: AcceptedRootSuccessSealRequest,
-    ) -> Result<(), AcceptedRootSuccessSealRequest>;
+        request: AcceptedRootControlRequest,
+    ) -> Result<(), AcceptedRootControlRequest>;
 }
 
-/// Move-only request whose reply proves that the serialized status owner
-/// consumed its only publisher at one precise point in the status order.
+/// Move-only result-control request. Success sealing consumes its status
+/// publisher; terminal-control registration records a nonrenewable evidence
+/// requirement in that same serialized owner.
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct AcceptedRootSuccessSealRequest {
+pub struct AcceptedRootControlRequest {
+    kind: AcceptedRootControlRequestKind,
     reply: oneshot::Sender<Result<(), QueryExecutionError>>,
 }
 
-impl AcceptedRootSuccessSealRequest {
+#[derive(Clone, Copy, Debug)]
+enum AcceptedRootControlRequestKind {
+    SuccessSeal,
+    AwaitTerminalControl(TaskIdentity),
+}
+
+impl AcceptedRootControlRequest {
+    pub fn terminal_control_root(&self) -> Option<TaskIdentity> {
+        match self.kind {
+            AcceptedRootControlRequestKind::AwaitTerminalControl(root) => Some(root),
+            AcceptedRootControlRequestKind::SuccessSeal => None,
+        }
+    }
+
+    pub fn accept_terminal_control(self) -> Result<(), QueryExecutionError> {
+        if self.terminal_control_root().is_none() {
+            return Err(contract_error(
+                "success request cannot register terminal control",
+            ));
+        }
+        let _ = self.reply.send(Ok(()));
+        Ok(())
+    }
+
     pub fn accept(self, sender: AcceptedRootStatusSender) -> Result<(), QueryExecutionError> {
+        if self.terminal_control_root().is_some() {
+            let error = contract_error("terminal control request cannot seal success");
+            let _ = self.reply.send(Err(error.clone()));
+            return Err(error);
+        }
         let result = sender.seal_success();
         let _ = self.reply.send(result.clone());
         result
@@ -552,16 +583,16 @@ fn accepted_root_status_projection(
 }
 
 #[doc(hidden)]
-pub fn accepted_root_status_projection_with_seal_port(
+pub fn accepted_root_status_projection_with_control_port(
     root: TaskIdentity,
-    success_seal_port: Arc<dyn AcceptedRootSuccessSealPort>,
+    root_control_port: Arc<dyn AcceptedRootControlPort>,
 ) -> (AcceptedRootStatusSender, AcceptedRootStatusSource) {
-    accepted_root_status_projection_inner(root, Some(success_seal_port))
+    accepted_root_status_projection_inner(root, Some(root_control_port))
 }
 
 fn accepted_root_status_projection_inner(
     root: TaskIdentity,
-    success_seal_port: Option<Arc<dyn AcceptedRootSuccessSealPort>>,
+    root_control_port: Option<Arc<dyn AcceptedRootControlPort>>,
 ) -> (AcceptedRootStatusSender, AcceptedRootStatusSource) {
     let (sender, receiver) = watch::channel(None);
     (
@@ -570,7 +601,7 @@ fn accepted_root_status_projection_inner(
             root,
             receiver,
             observed: None,
-            success_seal_port,
+            root_control_port,
         },
     )
 }
@@ -694,6 +725,18 @@ impl AcceptedRootStatusSender {
 }
 
 impl AcceptedRootStatusSource {
+    fn try_next(&mut self) -> Option<AcceptedRootProjection> {
+        let current = self.receiver.borrow_and_update().clone();
+        if let Some(status) = current
+            && self.observed.as_ref() != Some(&status)
+        {
+            self.observed = Some(status.clone());
+            Some(status)
+        } else {
+            None
+        }
+    }
+
     async fn next(&mut self) -> Result<AcceptedRootProjection, QueryExecutionError> {
         loop {
             let current = self.receiver.borrow_and_update().clone();
@@ -711,20 +754,40 @@ impl AcceptedRootStatusSource {
         }
     }
 
+    pub fn begin_terminal_control_request(
+        &self,
+    ) -> Result<oneshot::Receiver<Result<(), QueryExecutionError>>, QueryExecutionError> {
+        let Some(port) = self.root_control_port.as_ref() else {
+            return Err(contract_error(
+                "accepted root source has no serialized terminal control port",
+            ));
+        };
+        let (reply, receiver) = oneshot::channel();
+        port.enqueue_root_control(AcceptedRootControlRequest {
+            kind: AcceptedRootControlRequestKind::AwaitTerminalControl(self.root),
+            reply,
+        })
+        .map_err(|_| contract_error("terminal control request intake is closed"))?;
+        Ok(receiver)
+    }
+
     /// Requests the serialized attempt owner's decision after the result owner
     /// consumed exact EOS. This request carries no authority to seal success.
     #[doc(hidden)]
     pub fn begin_success_seal_request(
         &self,
     ) -> Result<oneshot::Receiver<Result<(), QueryExecutionError>>, QueryExecutionError> {
-        let Some(port) = self.success_seal_port.as_ref() else {
+        let Some(port) = self.root_control_port.as_ref() else {
             return Err(contract_error(
                 "accepted root status source has no serialized success-seal port",
             ));
         };
         let (reply, outcome) = oneshot::channel();
-        port.enqueue_success_seal(AcceptedRootSuccessSealRequest { reply })
-            .map_err(|_| contract_error("success-seal request intake is closed"))?;
+        port.enqueue_root_control(AcceptedRootControlRequest {
+            kind: AcceptedRootControlRequestKind::SuccessSeal,
+            reply,
+        })
+        .map_err(|_| contract_error("success-seal request intake is closed"))?;
         Ok(outcome)
     }
 }
@@ -927,14 +990,37 @@ impl PumpRuntime {
             status,
             attempt_failure,
         } = observation;
-        if let Some(pending) = self.pending_root_failure.as_ref() {
-            if pending != &status {
-                return Err(PumpInterruption::Decision(contract_failure(
-                    contract_error("authoritative attempt failure refined a different root status"),
-                )));
+        if self.pending_root_failure.is_some() {
+            if matches!(attempt_failure, AcceptedAttemptFailure::DerivedPending) {
+                // Pending causal authority does not freeze the root's Task version.
+                // The actor's existing cursor/transition owner validates each
+                // exact-root progression and still forbids terminal overwrite.
+                return match self
+                    .observer
+                    .observe_status_with_failure(status.clone(), RootTerminalFailure::Pending)
+                    .await
+                {
+                    Err(LogicalExecutionActorError::RootAttemptTerminal) => {
+                        self.pending_root_failure = Some(status);
+                        Ok(())
+                    }
+                    Err(error) => Err(PumpInterruption::Decision(actor_failure(
+                        "advance pending root Task status",
+                        error,
+                    ))),
+                    Ok(()) => Err(PumpInterruption::Decision(contract_failure(
+                        contract_error(
+                            "pending root failure progression did not retain a terminal disposition",
+                        ),
+                    ))),
+                };
             }
             let AcceptedAttemptFailure::Authoritative(authoritative) = attempt_failure else {
-                return Ok(());
+                return Err(PumpInterruption::Decision(contract_failure(
+                    contract_error(
+                        "pending attempt failure cannot lose its causal authority requirement",
+                    ),
+                )));
             };
             let failure =
                 classify_root_termination(&status, Some(&authoritative)).ok_or_else(|| {
@@ -1102,6 +1188,78 @@ impl PumpRuntime {
         }
     }
 
+    async fn await_terminal_control(&mut self) -> PumpInterruption {
+        if let Some(projection) = self.statuses.try_next()
+            && let Err(interruption) = self.observe_projection(projection).await
+        {
+            return interruption;
+        }
+        if self.native_completed || self.success_sealed {
+            return PumpInterruption::Decision(contract_failure(contract_error(
+                "revoked root output has no pending native terminal authority",
+            )));
+        }
+        let reply = match self.statuses.begin_terminal_control_request() {
+            Ok(reply) => reply,
+            Err(error) => return PumpInterruption::Decision(contract_failure(error)),
+        };
+        match self
+            .await_step(async move {
+                reply
+                    .await
+                    .map_err(|_| contract_error("terminal control registration owner dropped"))?
+            })
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return PumpInterruption::Decision(contract_failure(error)),
+            Err(interruption) => return interruption,
+        }
+        if let Some(projection) = self.statuses.try_next()
+            && let Err(interruption) = self.observe_projection(projection).await
+        {
+            return interruption;
+        }
+        if self.native_completed || self.success_sealed {
+            return PumpInterruption::Decision(contract_failure(contract_error(
+                "revoked root output has no pending native terminal authority",
+            )));
+        }
+        // No further result fetch or ACK is issued. The existing Task owner
+        // applies its bounded observation/transport recovery and publishes
+        // either an originating failure or an explicit recovery failure.
+        loop {
+            tokio::select! {
+                biased;
+                reason = self.cancellation.cancelled() => {
+                    return PumpInterruption::Cancellation(cancellation_failure(reason));
+                }
+                status = self.statuses.next() => {
+                    let projection = match status {
+                        Ok(projection) => projection,
+                        Err(error) => return PumpInterruption::Decision(contract_failure(error)),
+                    };
+                    if let Err(interruption) = self.observe_projection(projection).await {
+                        return interruption;
+                    }
+                    if self.success_sealed {
+                        return PumpInterruption::Decision(contract_failure(contract_error(
+                            "revoked root output received a success seal",
+                        )));
+                    }
+                }
+                terminal = self.native_terminal.next(), if !self.native_completed => {
+                    if let Err(interruption) = self.observe_native_terminal(terminal) {
+                        return interruption;
+                    }
+                    return PumpInterruption::Decision(contract_failure(contract_error(
+                        "revoked root output completed without an originating Task failure",
+                    )));
+                }
+            }
+        }
+    }
+
     async fn await_success_seal(&mut self) -> Result<(), PumpInterruption> {
         // The serialized Task owner publishes SuccessSealed only after the
         // exact root is Finished, no authoritative attempt failure exists,
@@ -1242,6 +1400,11 @@ pub(crate) async fn run_root_result_pump(
         };
 
         match outcome {
+            RootResultFetchOutcome::AwaitTerminalControl => {
+                drop(credit);
+                let interruption = runtime.await_terminal_control().await;
+                return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
+            }
             RootResultFetchOutcome::NotReady if pending_eos.is_none() => {
                 drop(credit);
             }
@@ -1858,15 +2021,19 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct TestSuccessSealPort {
-        requests: Mutex<VecDeque<AcceptedRootSuccessSealRequest>>,
+        requests: Mutex<VecDeque<AcceptedRootControlRequest>>,
         ready: Notify,
     }
 
-    impl AcceptedRootSuccessSealPort for TestSuccessSealPort {
-        fn enqueue_success_seal(
+    impl AcceptedRootControlPort for TestSuccessSealPort {
+        fn enqueue_root_control(
             &self,
-            request: AcceptedRootSuccessSealRequest,
-        ) -> Result<(), AcceptedRootSuccessSealRequest> {
+            request: AcceptedRootControlRequest,
+        ) -> Result<(), AcceptedRootControlRequest> {
+            if request.terminal_control_root().is_some() {
+                request.accept_terminal_control().unwrap();
+                return Ok(());
+            }
             self.requests.lock().unwrap().push_back(request);
             self.ready.notify_one();
             Ok(())
@@ -1874,7 +2041,7 @@ mod tests {
     }
 
     impl TestSuccessSealPort {
-        async fn next(&self) -> AcceptedRootSuccessSealRequest {
+        async fn next(&self) -> AcceptedRootControlRequest {
             loop {
                 if let Some(request) = self.requests.lock().unwrap().pop_front() {
                     return request;
@@ -1882,6 +2049,27 @@ mod tests {
                 self.ready.notified().await;
             }
         }
+    }
+
+    async fn poll_once<F: Future + ?Sized>(mut future: Pin<&mut F>) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    async fn poll_pending_after_actor_turn<F: Future + ?Sized>(
+        mut future: Pin<&mut F>,
+        actor: &LogicalExecutionActor,
+    ) {
+        assert!(matches!(
+            poll_once(future.as_mut()).await,
+            std::task::Poll::Pending
+        ));
+        // This exact actor mailbox barrier acknowledges the previously sent
+        // root observation; advancing the test does not depend on scheduling.
+        actor.snapshot().await.unwrap();
+        assert!(matches!(
+            poll_once(future.as_mut()).await,
+            std::task::Poll::Pending
+        ));
     }
 
     fn execution(tag: i64) -> QueryExecutionId {
@@ -3611,9 +3799,9 @@ mod tests {
             root,
         } = harness(2).await;
         let seal_port = Arc::new(TestSuccessSealPort::default());
-        let (status_sender, statuses) = accepted_root_status_projection_with_seal_port(
+        let (status_sender, statuses) = accepted_root_status_projection_with_control_port(
             root,
-            Arc::clone(&seal_port) as Arc<dyn AcceptedRootSuccessSealPort>,
+            Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
         );
         status_sender.publish(finished(root)).unwrap();
         let decode_calls = Arc::new(AtomicUsize::new(0));
@@ -3945,9 +4133,9 @@ mod tests {
             root,
         } = harness(22).await;
         let seal_port = Arc::new(TestSuccessSealPort::default());
-        let (status_sender, statuses) = accepted_root_status_projection_with_seal_port(
+        let (status_sender, statuses) = accepted_root_status_projection_with_control_port(
             root,
-            Arc::clone(&seal_port) as Arc<dyn AcceptedRootSuccessSealPort>,
+            Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
         );
         let root_finished = finished(root);
         status_sender.publish(root_finished.clone()).unwrap();
@@ -4156,9 +4344,9 @@ mod tests {
             root,
         } = harness(26).await;
         let seal_port = Arc::new(TestSuccessSealPort::default());
-        let (status_sender, statuses) = accepted_root_status_projection_with_seal_port(
+        let (status_sender, statuses) = accepted_root_status_projection_with_control_port(
             root,
-            Arc::clone(&seal_port) as Arc<dyn AcceptedRootSuccessSealPort>,
+            Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
         );
         status_sender.publish(finished(root)).unwrap();
         let (terminal_sender, terminal_source) = native_attempt_terminal_channel();
@@ -4218,5 +4406,398 @@ mod tests {
         drop(stream);
         drop(actor);
         drop(owner);
+    }
+    #[tokio::test]
+    async fn revoked_root_waits_for_originating_control_before_or_after_pending_eos() {
+        for (index, (pending_eos, own_failure)) in
+            [(false, false), (true, false), (false, true), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let Harness {
+                control,
+                scope,
+                actor,
+                owner,
+                permit,
+                mut stream,
+                root,
+            } = harness(70 + index as i64).await;
+            let (sender, statuses) = accepted_root_status_projection_with_control_port(
+                root,
+                Arc::new(TestSuccessSealPort::default()),
+            );
+            sender.publish(running(root)).unwrap();
+            let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let binding = RootResultPumpBinding::new(decode_runtime(), {
+                let requests = Arc::clone(&requests);
+                move |request| {
+                    let mut requests = requests.lock().unwrap();
+                    let index = requests.len();
+                    requests.push(request);
+                    let outcome = if pending_eos && index == 0 {
+                        RootResultFetchOutcome::EndPending(ResultPacketSequence::new(0))
+                    } else {
+                        assert_eq!(index, usize::from(pending_eos), "no fetch after revocation");
+                        RootResultFetchOutcome::AwaitTerminalControl
+                    };
+                    async move { Ok(outcome) }
+                }
+            });
+            let mut pump = Box::pin(run_root_result_pump(
+                permit,
+                root,
+                scope,
+                control.resources(),
+                result_schema(),
+                binding,
+                statuses,
+                terminal_source,
+                MaxWait::new(Duration::from_secs(1)).unwrap(),
+                ResultByteLimit::new(1 << 12).unwrap(),
+            ));
+            assert!(matches!(
+                poll_once(pump.as_mut()).await,
+                std::task::Poll::Pending
+            ));
+            let derived = TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Aborted,
+                Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+                TaskOutputFacts::new(false),
+            )
+            .unwrap();
+            if !own_failure {
+                sender.publish(derived.clone()).unwrap();
+                assert!(matches!(
+                    poll_once(pump.as_mut()).await,
+                    std::task::Poll::Pending
+                ));
+            }
+            assert_eq!(requests.lock().unwrap().len(), 1 + usize::from(pending_eos));
+            if pending_eos {
+                assert_eq!(
+                    requests.lock().unwrap()[1].acknowledged,
+                    Some(ResultPacketSequence::new(0))
+                );
+            }
+            let originating = TerminationDetail::Failed(TaskFailure::new(
+                TaskFailureCategory::Execution,
+                SafeDetail::new("upstream array lengths differ").unwrap(),
+            ));
+            if own_failure {
+                sender
+                    .publish(
+                        TaskStatus::try_new(
+                            root,
+                            TaskStatusVersion::new(4).unwrap(),
+                            TaskState::Failed,
+                            Some(originating),
+                            TaskOutputFacts::new(false),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            } else {
+                sender
+                    .publish_with_attempt_failure(derived, originating)
+                    .unwrap();
+            }
+            let ResultPumpFailure::DecisionPending(failure) = pump.await.unwrap_err() else {
+                panic!("unexposed result retains the decision owner");
+            };
+            assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+            assert!(
+                failure
+                    .error()
+                    .message()
+                    .contains("upstream array lengths differ")
+            );
+            assert!(!failure.error().message().contains("PEER_TASK_FAILED"));
+            assert_eq!(requests.lock().unwrap().len(), 1 + usize::from(pending_eos));
+            assert_eq!(
+                failure.fail_logical(&actor).await.unwrap(),
+                LogicalConclusion::Failed
+            );
+            assert!(stream.next().await.is_err());
+            drop(sender);
+            drop(stream);
+            drop(actor);
+            drop(owner);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_not_ready_after_pending_eos_remains_a_contract_violation() {
+        let Harness {
+            control,
+            scope,
+            actor,
+            owner,
+            permit,
+            mut stream,
+            root,
+        } = harness(73).await;
+        let (sender, statuses) = accepted_root_status_projection(root);
+        sender.publish(running(root)).unwrap();
+        let ResultPumpFailure::DecisionPending(failure) = run_root_result_pump(
+            permit,
+            root,
+            scope,
+            control.resources(),
+            result_schema(),
+            scripted_binding(vec![
+                RootResultFetchOutcome::EndPending(ResultPacketSequence::new(0)),
+                RootResultFetchOutcome::NotReady,
+            ]),
+            statuses,
+            completed_native_terminal(),
+            MaxWait::new(Duration::from_secs(1)).unwrap(),
+            ResultByteLimit::new(1 << 12).unwrap(),
+        )
+        .await
+        .unwrap_err() else {
+            panic!("ordinary NotReady cannot waive the ACK contract");
+        };
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+        assert!(
+            failure
+                .error()
+                .message()
+                .contains("invalid for the current stream phase")
+        );
+        assert_eq!(
+            failure.fail_logical(&actor).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        assert!(stream.next().await.is_err());
+        drop(sender);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn revoked_root_control_recovery_failure_still_settles_the_attempt() {
+        let Harness {
+            control,
+            scope,
+            actor,
+            owner,
+            permit,
+            mut stream,
+            root,
+        } = harness(74).await;
+        let (sender, statuses) = accepted_root_status_projection_with_control_port(
+            root,
+            Arc::new(TestSuccessSealPort::default()),
+        );
+        sender.publish(running(root)).unwrap();
+        let (terminal_sender, terminal_source) = native_attempt_terminal_channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let binding = RootResultPumpBinding::new(decode_runtime(), {
+            let calls = Arc::clone(&calls);
+            move |_| {
+                assert_eq!(calls.fetch_add(1, Ordering::SeqCst), 0);
+                async { Ok(RootResultFetchOutcome::AwaitTerminalControl) }
+            }
+        });
+        let mut pump = Box::pin(run_root_result_pump(
+            permit,
+            root,
+            scope,
+            control.resources(),
+            result_schema(),
+            binding,
+            statuses,
+            terminal_source,
+            MaxWait::new(Duration::from_secs(1)).unwrap(),
+            ResultByteLimit::new(1 << 12).unwrap(),
+        ));
+        assert!(matches!(
+            poll_once(pump.as_mut()).await,
+            std::task::Poll::Pending
+        ));
+        terminal_sender.publish(failed_native_terminal(
+            "required terminal observation recovery expired",
+        ));
+        let ResultPumpFailure::DecisionPending(failure) = pump.await.unwrap_err() else {
+            panic!("transport recovery terminal must settle a revoked result");
+        };
+        assert_eq!(
+            failure.class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        assert!(
+            failure
+                .error()
+                .message()
+                .contains("required terminal observation recovery expired")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            failure.fail_logical(&actor).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        assert!(stream.next().await.is_err());
+        drop(sender);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn revoked_root_pending_cause_accepts_only_owned_task_progression() {
+        for (index, (pending_eos, authority_while_aborting)) in
+            [(false, false), (true, false), (false, true), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let Harness {
+                control,
+                scope,
+                actor,
+                owner,
+                permit,
+                mut stream,
+                root,
+            } = harness(80 + index as i64).await;
+            let (sender, statuses) = accepted_root_status_projection_with_control_port(
+                root,
+                Arc::new(TestSuccessSealPort::default()),
+            );
+            let running = TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Running,
+                None,
+                TaskOutputFacts::new(false),
+            )
+            .unwrap();
+            sender.publish(running.clone()).unwrap();
+            let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let binding = RootResultPumpBinding::new(decode_runtime(), {
+                let calls = Arc::clone(&calls);
+                move |_| {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        call <= usize::from(pending_eos),
+                        "no result polls while awaiting control"
+                    );
+                    async move {
+                        Ok(if pending_eos && call == 0 {
+                            RootResultFetchOutcome::EndPending(ResultPacketSequence::new(0))
+                        } else {
+                            RootResultFetchOutcome::AwaitTerminalControl
+                        })
+                    }
+                }
+            });
+            let mut pump = Box::pin(run_root_result_pump(
+                permit,
+                root,
+                scope,
+                control.resources(),
+                result_schema(),
+                binding,
+                statuses,
+                terminal_source,
+                MaxWait::new(Duration::from_secs(1)).unwrap(),
+                ResultByteLimit::new(1 << 12).unwrap(),
+            ));
+            loop {
+                poll_pending_after_actor_turn(pump.as_mut(), &actor).await;
+                if calls.load(Ordering::SeqCst) == 1 + usize::from(pending_eos) {
+                    break; // Exact Await fetch occurred; the serialized status scope is active.
+                }
+            }
+            sender
+                .publish_attempt_observation(running, AcceptedAttemptFailure::DerivedPending)
+                .unwrap();
+            poll_pending_after_actor_turn(pump.as_mut(), &actor).await;
+            let aborting = TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Aborting,
+                Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+                TaskOutputFacts::new(false),
+            )
+            .unwrap();
+            sender
+                .publish_attempt_observation(
+                    aborting.clone(),
+                    AcceptedAttemptFailure::DerivedPending,
+                )
+                .unwrap();
+            poll_pending_after_actor_turn(pump.as_mut(), &actor).await;
+            let terminal = if authority_while_aborting {
+                aborting
+            } else {
+                let aborted = TaskStatus::try_new(
+                    root,
+                    TaskStatusVersion::new(4).unwrap(),
+                    TaskState::Aborted,
+                    Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+                    TaskOutputFacts::new(false),
+                )
+                .unwrap();
+                sender
+                    .publish_attempt_observation(
+                        aborted.clone(),
+                        AcceptedAttemptFailure::DerivedPending,
+                    )
+                    .unwrap();
+                poll_pending_after_actor_turn(pump.as_mut(), &actor).await;
+                // A terminal record stays immutable even while its attempt cause is pending.
+                assert!(
+                    sender
+                        .publish_attempt_observation(
+                            TaskStatus::try_new(
+                                root,
+                                TaskStatusVersion::new(5).unwrap(),
+                                TaskState::Aborted,
+                                Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+                                TaskOutputFacts::new(false),
+                            )
+                            .unwrap(),
+                            AcceptedAttemptFailure::DerivedPending
+                        )
+                        .is_err()
+                );
+                aborted
+            };
+            sender
+                .publish_with_attempt_failure(
+                    terminal,
+                    TerminationDetail::Failed(TaskFailure::new(
+                        TaskFailureCategory::Execution,
+                        SafeDetail::new("original multiversion upstream length error").unwrap(),
+                    )),
+                )
+                .unwrap();
+            let ResultPumpFailure::DecisionPending(failure) = pump.await.unwrap_err() else {
+                panic!("the accepted original cause must retain decision authority");
+            };
+            assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+            assert!(
+                failure
+                    .error()
+                    .message()
+                    .contains("original multiversion upstream length error")
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1 + usize::from(pending_eos));
+            assert_eq!(
+                failure.fail_logical(&actor).await.unwrap(),
+                LogicalConclusion::Failed
+            );
+            assert!(stream.next().await.is_err());
+            drop(sender);
+            drop(stream);
+            drop(actor);
+            drop(owner);
+        }
     }
 }

@@ -194,6 +194,8 @@ pub enum RootResultOutcome {
     Ready(RawRootResultPacket),
     /// Nothing available within this poll's wait.
     NotReady,
+    /// The exact root has revoked output and awaits its control-plane cause.
+    AwaitTerminalControl,
     /// EOS arrived at this sequence but still needs the frontend's final ACK.
     EndOfStreamPending { packet_sequence: u64 },
     /// The stream ended and the backend accepted the final packet ACK.
@@ -212,6 +214,7 @@ impl fmt::Debug for RootResultOutcome {
                 .field("decode_bounds", &packet.decode_bounds())
                 .finish_non_exhaustive(),
             Self::NotReady => formatter.write_str("NotReady"),
+            Self::AwaitTerminalControl => formatter.write_str("AwaitTerminalControl"),
             Self::EndOfStreamPending { packet_sequence } => formatter
                 .debug_struct("EndOfStreamPending")
                 .field("packet_sequence", packet_sequence)
@@ -852,6 +855,9 @@ fn adapt_native_root_result_outcome(
             })
         }
         RootResultOutcome::NotReady => Ok(PumpRootResultFetchOutcome::NotReady),
+        RootResultOutcome::AwaitTerminalControl => {
+            Ok(PumpRootResultFetchOutcome::AwaitTerminalControl)
+        }
         RootResultOutcome::EndOfStreamPending { packet_sequence } => Ok(
             PumpRootResultFetchOutcome::EndPending(ResultPacketSequence::new(packet_sequence)),
         ),
@@ -933,6 +939,15 @@ fn classify_root_result_response(
                 ));
             }
             Ok(RootResultOutcome::NotReady)
+        }
+        FetchStatus::AwaitTerminalControl => {
+            require_empty_root_result_payload(address, "AWAIT_TERMINAL_CONTROL", &response)?;
+            if response.packet_seq != 0 || response.eos || !response.message.is_empty() {
+                return Err(format!(
+                    "{address}: root result AWAIT_TERMINAL_CONTROL carries payload or terminal facts"
+                ));
+            }
+            Ok(RootResultOutcome::AwaitTerminalControl)
         }
         FetchStatus::Error => {
             require_empty_root_result_payload(address, "ERROR", &response)?;
@@ -1369,5 +1384,57 @@ mod tests {
         let error = validate_result_payload_size("backend", 4, limit)
             .expect_err("the payload exceeds its request credit");
         assert!(error.contains("exceeding the requested limit 3"));
+    }
+    #[test]
+    fn terminal_control_wait_is_distinct_and_cannot_carry_payload_or_ack_facts() {
+        let response = FetchResultResponse {
+            status: Status::AwaitTerminalControl as i32,
+            ..Default::default()
+        };
+        assert!(matches!(
+            classify_root_result_response(
+                "be",
+                response.clone(),
+                Some(7),
+                ResultByteLimit::new(1024).unwrap()
+            )
+            .unwrap(),
+            RootResultOutcome::AwaitTerminalControl
+        ));
+        assert!(matches!(
+            adapt_native_root_result_outcome(
+                RootResultOutcome::AwaitTerminalControl,
+                Arc::new(ChunkSchema::empty())
+            )
+            .unwrap(),
+            PumpRootResultFetchOutcome::AwaitTerminalControl
+        ));
+        for bad in [
+            FetchResultResponse {
+                packet_seq: 1,
+                ..response.clone()
+            },
+            FetchResultResponse {
+                eos: true,
+                ..response.clone()
+            },
+            FetchResultResponse {
+                message: "not an originating cause".to_string(),
+                ..response.clone()
+            },
+            FetchResultResponse {
+                result_arrow_ipc: Bytes::from_static(b"payload"),
+                ..response.clone()
+            },
+            FetchResultResponse {
+                status: 99,
+                ..response
+            },
+        ] {
+            assert!(
+                classify_root_result_response("be", bad, None, ResultByteLimit::new(1024).unwrap())
+                    .is_err()
+            );
+        }
     }
 }
