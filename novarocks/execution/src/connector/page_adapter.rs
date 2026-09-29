@@ -29,10 +29,9 @@
 //! - Functions: `source_page_to_chunk`.
 //!
 //! Current limitations:
-//! - The Arrow field of each output column is derived from the array the
-//!   connector materialized. This adapter carries no independent type
-//!   declaration to check it against, so a provider that changes a column's
-//!   Arrow type between pages produces chunks whose schema changes with it.
+//! - Owner-local read intermediates may derive their schema from the arrays.
+//!   Native scan outputs instead bind the immutable output declaration and
+//!   metadata-retag equivalent carriers before handing the chunk downstream.
 //!
 //! Provider neutrality: nothing here names a provider or inspects a provider
 //! variant, so this file compiles with no provider crate in the dependency
@@ -133,7 +132,7 @@ pub fn source_page_to_chunk(
     slot_ids: &[SlotId],
 ) -> Result<Chunk, PageAdapterError> {
     let mut schema: Option<ChunkSchemaRef> = None;
-    convert_page(page, slot_ids, &mut schema)
+    convert_page(page, slot_ids, &mut schema, None)
 }
 
 /// Converts the pages of one scan stream into chunks, reusing the chunk
@@ -145,6 +144,7 @@ pub fn source_page_to_chunk(
 pub struct SourcePageConverter {
     slot_ids: Vec<SlotId>,
     schema: Option<ChunkSchemaRef>,
+    output_schema: Option<ChunkSchemaRef>,
 }
 
 impl SourcePageConverter {
@@ -152,11 +152,27 @@ impl SourcePageConverter {
         Self {
             slot_ids,
             schema: None,
+            output_schema: None,
+        }
+    }
+
+    /// Bind a scan's frozen output slots and types. Equivalent nested Arrow
+    /// metadata is re-tagged; a different logical carrier is rejected.
+    pub fn with_output_schema(output_schema: ChunkSchemaRef) -> Self {
+        Self {
+            slot_ids: output_schema.slot_ids().to_vec(),
+            schema: None,
+            output_schema: Some(output_schema),
         }
     }
 
     pub fn convert(&mut self, page: SourcePage) -> Result<Chunk, PageAdapterError> {
-        convert_page(page, &self.slot_ids, &mut self.schema)
+        convert_page(
+            page,
+            &self.slot_ids,
+            &mut self.schema,
+            self.output_schema.as_ref(),
+        )
     }
 }
 
@@ -164,6 +180,7 @@ fn convert_page(
     mut page: SourcePage,
     slot_ids: &[SlotId],
     schema_cache: &mut Option<ChunkSchemaRef>,
+    output_schema: Option<&ChunkSchemaRef>,
 ) -> Result<Chunk, PageAdapterError> {
     let positions = page.position_count();
     let channel_count = page.channel_count();
@@ -234,8 +251,9 @@ fn convert_page(
     } else {
         None
     };
-    let mut chunk = Chunk::try_new_with_chunk_schema(batch, schema)
-        .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
+    let mut chunk =
+        Chunk::try_new_with_chunk_schema(batch, output_schema.map(Arc::clone).unwrap_or(schema))
+            .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
     if let Some(output_memory) = output_memory {
         chunk
             .attach_connector_output_memory(output_memory)
@@ -467,5 +485,144 @@ mod tests {
             .expect("second chunk")
             .chunk_schema_ref();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    fn frozen_map_schema(value_type: arrow::datatypes::DataType) -> ChunkSchemaRef {
+        use arrow::datatypes::DataType;
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, true)),
+                        Arc::new(Field::new("value", value_type, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(
+                    SlotId::new(17),
+                    &Field::new("mi", map_type, true),
+                    None,
+                )
+                .expect("frozen map slot"),
+            ])
+            .expect("frozen map schema"),
+        )
+    }
+
+    fn physical_map() -> ArrayRef {
+        use arrow::array::{Int32Array, MapArray, StructArray};
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+        let entries = StructArray::new(
+            vec![
+                Arc::new(Field::new("key", arrow::datatypes::DataType::Int32, false)),
+                Arc::new(Field::new("value", arrow::datatypes::DataType::Int32, true)),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int32Array::from(vec![None, Some(7)])),
+            ],
+            None,
+        );
+        Arc::new(MapArray::new(
+            Arc::new(Field::new("key_value", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0_i32, 0, 0, 1, 2].into()),
+            entries,
+            Some(NullBuffer::from(vec![false, true, true, true])),
+            false,
+        ))
+    }
+
+    #[test]
+    fn frozen_scan_map_retags_buffers_and_keeps_parent_value_nulls_and_one_lease() {
+        use arrow::array::MapArray;
+        let retained = Arc::new(AtomicU64::new(0));
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(OutputLedger {
+            retained: Arc::clone(&retained),
+        }));
+        let source = physical_map();
+        let physical = source
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("source map");
+        let key_pointer = physical.keys().to_data().buffers()[0].as_ptr();
+        let value_pointer = physical.values().to_data().buffers()[0].as_ptr();
+        let offset_pointer = physical.offsets().inner().inner().as_ptr();
+        let bytes = source.get_array_memory_size() as u64;
+        let lease = resources
+            .try_reserve(ConnectorResourceClass::ReaderOutput, bytes)
+            .expect("reserve")
+            .into_output(bytes)
+            .expect("output lease");
+        let page = SourcePage::try_new_accounted(4, vec![source], lease).expect("page");
+        let schema = frozen_map_schema(arrow::datatypes::DataType::Int32);
+        let mut converter = SourcePageConverter::with_output_schema(Arc::clone(&schema));
+        let mut chunk = converter.convert(page).expect("frozen map output");
+        assert_eq!(
+            chunk.columns()[0].data_type(),
+            schema.slots()[0].data_type()
+        );
+        assert_eq!(chunk.chunk_schema().slot_ids(), &[SlotId::new(17)]);
+        let map = chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map");
+        assert_eq!(map.keys().to_data().buffers()[0].as_ptr(), key_pointer);
+        assert_eq!(map.values().to_data().buffers()[0].as_ptr(), value_pointer);
+        assert_eq!(map.offsets().inner().inner().as_ptr(), offset_pointer);
+        assert!(map.is_null(0));
+        assert!(!map.is_null(1));
+        assert_eq!(map.value_length(1), 0);
+        assert_eq!(map.values().null_count(), 1);
+        assert_eq!(map.value_length(2), 1);
+        let tracker = MemTracker::new_root("frozen map output");
+        chunk.transfer_to(&tracker);
+        assert_eq!(
+            tracker.current(),
+            0,
+            "retag must keep the existing provider lease"
+        );
+        assert_eq!(retained.load(Ordering::Acquire), bytes);
+        let cloned = chunk.clone();
+        drop(chunk);
+        assert_eq!(retained.load(Ordering::Acquire), bytes);
+        drop(cloned);
+        assert_eq!(retained.load(Ordering::Acquire), 0);
+        let second = converter
+            .convert(SourcePage::try_new(4, vec![physical_map()]).expect("page"))
+            .expect("second page uses the same frozen contract");
+        assert_eq!(
+            second.columns()[0].data_type(),
+            schema.slots()[0].data_type()
+        );
+    }
+
+    #[test]
+    fn frozen_scan_rejects_nested_value_drift_instead_of_rebinding_from_the_page() {
+        let mut converter = SourcePageConverter::with_output_schema(frozen_map_schema(
+            arrow::datatypes::DataType::Int64,
+        ));
+        let error = converter
+            .convert(SourcePage::try_new(4, vec![physical_map()]).expect("page"))
+            .expect_err("Int32 must not become Int64 by metadata retag");
+        assert_eq!(error.kind(), PageAdapterErrorKind::Chunk);
+    }
+
+    #[test]
+    fn frozen_zero_channel_scan_preserves_count_and_output_contract() {
+        let schema = Arc::new(ChunkSchema::empty());
+        let chunk = SourcePageConverter::with_output_schema(Arc::clone(&schema))
+            .convert(SourcePage::zero_channel(19))
+            .expect("count-only page");
+        assert_eq!(chunk.len(), 19);
+        assert!(chunk.columns().is_empty());
+        assert_eq!(chunk.chunk_schema().slot_ids(), schema.slot_ids());
     }
 }
