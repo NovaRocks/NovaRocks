@@ -1,0 +1,7 @@
+-- query 1
+exact_bytes	legacy_ndv	legacy_approx	ds_lgk10
+5	5	5	5
+
+-- query 2
+exact_bytes	legacy_ndv	legacy_approx	ds_lgk10
+0	0	0	0

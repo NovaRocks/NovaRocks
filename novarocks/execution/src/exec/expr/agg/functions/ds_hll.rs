@@ -610,4 +610,226 @@ mod tests {
             before_estimate
         );
     }
+    // Use the sealed catalog selection and the production aggregate adapters.
+    // Exact estimates below come from the pinned Java 6.2.0 byte-domain oracle.
+    fn prepared_binary_hll_parts(
+        partitions: Vec<ArrayRef>,
+        replay_dense: bool,
+    ) -> (i64, Vec<Vec<u8>>, Vec<u8>) {
+        use crate::exec::expr::agg::{
+            AggStateArena, build_kernel_set, test_builtin_execution_function_set,
+        };
+        use crate::exec::node::aggregate::AggTypeSignature;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::Field;
+        use novarocks_functions::AggregateInputBatch;
+        let functions = test_builtin_execution_function_set();
+        let selected = functions
+            .catalog()
+            .resolve_aggregate_trusted(
+                "ds_hll_count_distinct",
+                &[DataType::Binary, DataType::Int64],
+            )
+            .unwrap();
+        assert_eq!(
+            selected.argument_types,
+            vec![DataType::Binary, DataType::Int64]
+        );
+        assert_eq!(selected.intermediate_type, DataType::Binary);
+        assert_eq!(selected.output_type, DataType::Int64);
+        let packed_fields = vec![
+            Arc::new(Field::new("value", DataType::Binary, true)),
+            Arc::new(Field::new("lgk", DataType::Int64, false)),
+        ];
+        let packed_type = DataType::Struct(packed_fields.clone().into());
+        let function = |merge| AggFunction {
+            name: "ds_hll_count_distinct".to_string(),
+            input_is_intermediate: merge,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(DataType::Binary),
+                output_type: Some(DataType::Int64),
+                input_arg_type: Some(DataType::Binary),
+            }),
+            ..Default::default()
+        };
+        let update = build_kernel_set(
+            &functions,
+            &[function(false)],
+            &[Some(packed_type)],
+            &[selected.clone()],
+        )
+        .unwrap();
+        let merge = build_kernel_set(
+            &functions,
+            &[function(true)],
+            &[Some(DataType::Binary)],
+            &[selected],
+        )
+        .unwrap();
+        let update = &update.entries[0];
+        let merge = &merge.entries[0];
+        let tracker = MemTracker::new_root("prepared-binary-hll-reference");
+        let mut arena = AggStateArena::new(4096);
+        arena.try_set_mem_tracker(tracker.clone()).unwrap();
+        let mut partials = Vec::new();
+        let mut frames = Vec::new();
+        for values in partitions {
+            let rows = values.len();
+            let packed: ArrayRef = Arc::new(StructArray::new(
+                packed_fields.clone().into(),
+                vec![values, Arc::new(Int64Array::from(vec![10; rows]))],
+                None,
+            ));
+            let pointer = arena.alloc(update.state.size, update.state_align());
+            update
+                .init_state_with_tracker(pointer, tracker.clone())
+                .unwrap();
+            update
+                .update_batch(
+                    &vec![pointer; rows],
+                    AggregateInputBatch::try_new(Some(&packed), rows).unwrap(),
+                )
+                .unwrap();
+            let partial = update.build_array(&[pointer], true).unwrap();
+            frames.push(
+                partial
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap()
+                    .value(0)
+                    .to_vec(),
+            );
+            partials.push(partial);
+            update.drop_state(pointer);
+        }
+        let pointer = arena.alloc(merge.state.size, merge.state_align());
+        merge
+            .init_state_with_tracker(pointer, tracker.clone())
+            .unwrap();
+        for partial in partials
+            .iter()
+            .chain(if replay_dense { partials.first() } else { None })
+        {
+            merge
+                .merge_batch(
+                    &[pointer],
+                    AggregateInputBatch::try_new(Some(partial), 1).unwrap(),
+                )
+                .unwrap();
+        }
+        let result = merge.build_array(&[pointer], false).unwrap();
+        let payload = merge.build_array(&[pointer], true).unwrap();
+        let result = result
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let payload = payload
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(0)
+            .to_vec();
+        merge.drop_state(pointer);
+        drop(arena);
+        assert_eq!(
+            tracker.current(),
+            0,
+            "retained heap and state blocks release after the tree exits"
+        );
+        (result, frames, payload)
+    }
+
+    fn binary_values(indices: impl IntoIterator<Item = i32>) -> ArrayRef {
+        let mut builder = BinaryBuilder::new();
+        for index in indices {
+            builder.append_value(format!("value_{index}").as_bytes());
+        }
+        Arc::new(builder.finish())
+    }
+
+    #[test]
+    fn ds_hll_prepared_binary_dense_threshold_matches_independent_raw_reference() {
+        use datasketches::hll::HllSketch;
+        for (count, expected_mode, estimate, integer) in [
+            (96, 1, 96.00002264977122, 96),
+            (97, 2, 97.00002312660857, 97),
+            (100, 2, 100.20239597952975, 100),
+        ] {
+            let (result, frames, _) =
+                prepared_binary_hll_parts(vec![binary_values(1..=count)], false);
+            assert_eq!(result, integer);
+            assert_eq!(
+                frames[0][7] & 3,
+                expected_mode,
+                "97 unique coupons enter dense mode at lgK10"
+            );
+            let decoded = HllSketch::deserialize(&frames[0]).unwrap();
+            assert!(
+                (decoded.estimate() - estimate).abs() < 1e-8,
+                "count={count}: {}",
+                decoded.estimate()
+            );
+        }
+    }
+
+    #[test]
+    fn ds_hll_prepared_binary_partial_merge_and_dense_replay_preserve_the_reference_domain() {
+        use datasketches::hll::HllSketch;
+        let (result, _, _) = prepared_binary_hll_parts(
+            (0..3)
+                .map(|part| binary_values((1..=100).filter(move |index| index % 3 == part)))
+                .collect(),
+            false,
+        );
+        assert_eq!(
+            result, 100,
+            "three sparse partials preserve all 100 fixed byte inputs"
+        );
+        // Each overlapping leaf is dense, so merging loses HIP chronology.
+        // The composite estimate is register-derived and replay-idempotent.
+        let (result, frames, payload) =
+            prepared_binary_hll_parts(vec![binary_values(1..=100), binary_values(1..=100)], true);
+        assert_eq!(result, 103);
+        assert!(frames.iter().all(|frame| frame[7] & 3 == 2));
+        let decoded = HllSketch::deserialize(&payload).unwrap();
+        assert!(
+            (decoded.estimate() - 102.9590150260783).abs() < 1e-8,
+            "{}",
+            decoded.estimate()
+        );
+    }
+
+    #[test]
+    fn ds_hll_binary_hash_domain_preserves_zero_invalid_utf8_empty_and_null_bytes() {
+        let mut builder = BinaryBuilder::new();
+        for bytes in [
+            b"".as_slice(),
+            &[0],
+            &[0xff],
+            &[0, 1, 0xff, 0x80],
+            b"value_1".as_slice(),
+        ] {
+            builder.append_value(bytes);
+        }
+        builder.append_null();
+        let values: ArrayRef = Arc::new(builder.finish());
+        for (row, expected) in [
+            0xd8dfea6585bc9732,
+            0xa55b92ce23afa288,
+            0xe325594e010c6967,
+            0xb37e42d422e8a61a,
+            0x6c264bfa909526d5,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                prehash_array_value(&values, row, "reference").unwrap(),
+                Some(expected)
+            );
+        }
+        assert_eq!(prehash_array_value(&values, 5, "reference").unwrap(), None);
+        assert_eq!(prepared_binary_hll_parts(vec![values], false).0, 5);
+    }
 }
