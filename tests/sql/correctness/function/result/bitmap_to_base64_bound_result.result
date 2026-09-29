@@ -1,0 +1,13 @@
+-- query 2
+empty_text	singleton32_text	singleton64_text
+AA==	AQcAAAA=	AwAAAAABAAAA
+
+-- query 3
+text_consumer	bare_null	malformed_null
+bitmap:AQcAAAA=	1	1
+
+-- query 4
+n	encoded
+0	AQAAAAA=
+7	AQcAAAA=
+4294967296	AwAAAAABAAAA

@@ -1563,7 +1563,6 @@ fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "bitmap_and",
         "bitmap_to_binary",
         "bitmap_from_binary",
-        "bitmap_to_base64",
         "bitmap_agg",
         "bitmap_union",
     ] {
@@ -1573,6 +1572,12 @@ fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
         );
     }
+    // The installed encoder consumes bitmap bytes and emits base64 text.
+    add(
+        m,
+        "bitmap_to_base64",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Utf8),
+    );
     // Boolean queries.
     for name in ["bitmap_contains", "bitmap_has_any"] {
         add(
@@ -2079,5 +2084,93 @@ fn register_aggregate_in_expr_fns(m: &mut HashMap<String, Vec<Signature>>) {
             name,
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
         );
+    }
+}
+
+#[cfg(test)]
+mod bitmap_base64_type_tests {
+    use arrow::datatypes::DataType;
+    use novarocks_functions::{
+        FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
+        FunctionValueType,
+    };
+
+    #[test]
+    fn bitmap_base64_freezes_text_result_and_binary_input() {
+        let catalog = crate::functions::build_builtin_engine_function_catalog().unwrap();
+        for (ty, nullable) in [
+            (DataType::Binary, false),
+            (DataType::Binary, true),
+            (DataType::Null, true),
+        ] {
+            let arguments = [FunctionArgument::Value {
+                value_type: FunctionValueType::new(ty, nullable),
+                constant: None,
+            }];
+            let request = FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: 1,
+            };
+            let binding = catalog
+                .resolve_bound_user("bitmap_to_base64", FunctionKind::Scalar, request)
+                .unwrap();
+            assert_eq!(
+                binding.selected.result_type,
+                FunctionResultType::Scalar(FunctionValueType::new(DataType::Utf8, true))
+            );
+            assert_eq!(
+                binding.selected.argument_types,
+                vec![novarocks_functions::FunctionArgumentType::Value(
+                    FunctionValueType::new(DataType::Binary, nullable)
+                )]
+            );
+            // Exact validation consumes already-coerced expressions, as SQL does.
+            let coerced = [FunctionArgument::Value {
+                value_type: FunctionValueType::new(DataType::Binary, nullable),
+                constant: None,
+            }];
+            catalog
+                .validate_bound(
+                    &binding,
+                    FunctionBindingRequest {
+                        arguments: &coerced,
+                        logical_argument_count: 1,
+                    },
+                )
+                .unwrap();
+        }
+        for types in [
+            vec![],
+            vec![DataType::Int64],
+            vec![DataType::Utf8],
+            vec![DataType::Binary, DataType::Binary],
+        ] {
+            let arguments = types
+                .into_iter()
+                .map(|ty| FunctionArgument::Value {
+                    value_type: FunctionValueType::new(ty, true),
+                    constant: None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                catalog
+                    .resolve_bound_user(
+                        "bitmap_to_base64",
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+        // Other bitmap-producing declarations still freeze binary results.
+        let resolved = crate::functions::resolver::resolve_scalar_function_signature(
+            "bitmap_to_binary",
+            &[DataType::Binary],
+        )
+        .unwrap();
+        assert_eq!(resolved.return_type, DataType::Binary);
     }
 }
