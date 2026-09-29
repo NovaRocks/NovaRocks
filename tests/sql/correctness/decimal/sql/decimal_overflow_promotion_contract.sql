@@ -58,10 +58,7 @@ SELECT CAST(123456789.123456789 AS DECIMAL(18,9)) *
 
 -- query 9
 -- @skip_result_check=true
--- @expect_error=decimal_overflow_to_double=true is not captured
--- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
--- @expect_error_at=1:1
--- @expect_error_tier=target
+-- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
 CREATE VIEW default_catalog.${case_db}.decimal_promotion_view AS SELECT 1 AS v;
 
 -- query 10
@@ -76,10 +73,7 @@ SET decimal_overflow_to_double=false;
 
 -- query 12
 -- @skip_result_check=true
--- @expect_error=decimal_overflow_to_double=true is not captured
--- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
--- @expect_error_at=1:1
--- @expect_error_tier=target
+-- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
 CREATE VIEW default_catalog.${case_db}.decimal_promotion_hint_view AS
 SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v;
 
@@ -117,19 +111,13 @@ SELECT @@session.decimal_overflow_to_double AS enabled;
 
 -- query 20
 -- @skip_result_check=true
--- @expect_error=decimal_overflow_to_double=true is not captured
--- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
--- @expect_error_at=1:1
--- @expect_error_tier=target
+-- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
 CREATE VIEW default_catalog.${case_db}.decimal_promotion_nested_view AS
 SELECT v FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v) t;
 
 -- query 21
 -- @skip_result_check=true
--- @expect_error=decimal_overflow_to_double=true is not captured
--- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
--- @expect_error_at=1:1
--- @expect_error_tier=target
+-- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
 CREATE MATERIALIZED VIEW ${case_db}.decimal_promotion_hint_mv DISTRIBUTED BY HASH(v) BUCKETS 1 AS
 SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS v;
 
@@ -174,18 +162,12 @@ SET decimal_overflow_to_double=true;
 
 -- query 30
 -- @skip_result_check=true
--- @expect_error=decimal_overflow_to_double=true is not captured
--- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
--- @expect_error_at=1:1
--- @expect_error_tier=target
+-- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
 REFRESH MATERIALIZED VIEW ${case_db}.decimal_uncaptured_missing_mv;
 
 -- query 31
 -- @skip_result_check=true
--- @expect_error=decimal_overflow_to_double=true is not captured
--- @expect_sql_code=sql.admit.persisted_definition_semantics_unsupported
--- @expect_error_at=1:1
--- @expect_error_tier=target
+-- @expect_error=[sql.admit.persisted_definition_semantics_unsupported] unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay at line 1 column 1
 EXPLAIN REFRESH MATERIALIZED VIEW ${case_db}.decimal_uncaptured_missing_mv;
 
 -- query 32

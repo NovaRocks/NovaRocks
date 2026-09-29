@@ -6867,8 +6867,8 @@ mod tests {
             select.apply_specs[1].output_column.column_id
         );
         let (query, _) = resolved(&format!(
-            "SELECT (SELECT {on} CAST(o.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9))) x, \
-             (SELECT CAST(o.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9))) y FROM (SELECT 1 n) o"
+            "SELECT (SELECT {on} CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) x, \
+             (SELECT CAST(i.n AS DECIMAL(30,10))*CAST(1 AS DECIMAL(18,9)) FROM (SELECT 1 n) i WHERE i.n=o.n) y FROM (SELECT 1 n) o"
         ));
         assert_eq!(query.output_columns[0].data_type, DataType::Float64);
         assert_eq!(
@@ -6879,12 +6879,16 @@ mod tests {
             panic!("select");
         };
         assert_eq!(select.apply_specs.len(), 2);
-        assert!(
-            select
-                .apply_specs
-                .iter()
-                .all(|spec| !spec.correlation_column_ids.is_empty())
-        );
+        let Some(crate::analysis::Relation::Subquery { output_columns, .. }) = &select.from else {
+            panic!("outer derived relation");
+        };
+        assert_eq!(output_columns.len(), 1);
+        for spec in &select.apply_specs {
+            assert_eq!(
+                spec.correlation_column_ids,
+                vec![output_columns[0].column_id]
+            );
+        }
         assert_ne!(
             select.apply_specs[0].subquery_id,
             select.apply_specs[1].subquery_id
