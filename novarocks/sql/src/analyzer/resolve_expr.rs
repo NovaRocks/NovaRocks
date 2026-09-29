@@ -1886,14 +1886,19 @@ impl<'a> super::AnalyzerContext<'a> {
                     rewritten.push(string_literal_expr(unit, interval.span));
                     continue;
                 }
-                let token = match e {
-                    ast::Expr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
-                    ast::Expr::CompoundIdentifier(parts) if parts.parts.len() == 1 => {
-                        Some(parts.parts[0].value.to_ascii_lowercase())
+                if idx == 1 && !matches!(e, ast::Expr::Interval(_)) {
+                    rewritten.push((*e).clone());
+                    let default_day = arg_exprs.len() == 2
+                        || (arg_exprs.len() == 3 && slice_boundary_keyword(arg_exprs[2]).is_some());
+                    if default_day {
+                        rewritten.push(string_literal_expr("day".into(), e.span()));
                     }
-                    _ => None,
-                };
-                if let Some(token) = token
+                    continue;
+                }
+                let token = slice_boundary_keyword(e);
+                if idx == arg_exprs.len() - 1
+                    && idx >= 2
+                    && let Some(token) = token
                     && matches!(token.as_str(), "ceil" | "floor")
                 {
                     rewritten.push(string_literal_expr(token, e.span()));
@@ -2003,6 +2008,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             }
             arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
+        }
+
+        if matches!(name.as_str(), "time_slice" | "date_slice") {
+            normalize_slice_arguments(&name, &effective_arg_exprs, &mut args_typed, func.span)?;
+            arg_types = args_typed.iter().map(|arg| arg.data_type.clone()).collect();
         }
 
         self.validate_ds_hll_arguments(&name, &args_typed, func.span)?;
@@ -3675,6 +3685,205 @@ impl<'a> super::AnalyzerContext<'a> {
             _ => false,
         }
     }
+}
+
+fn slice_boundary_keyword(expr: &ast::Expr) -> Option<String> {
+    let token = match expr {
+        ast::Expr::Identifier(ident) => ident.value.to_ascii_lowercase(),
+        ast::Expr::CompoundIdentifier(parts) if parts.parts.len() == 1 => {
+            parts.parts[0].value.to_ascii_lowercase()
+        }
+        ast::Expr::Nested(nested) => return slice_boundary_keyword(&nested.expression),
+        _ => return None,
+    };
+    matches!(token.as_str(), "floor" | "ceil").then_some(token)
+}
+
+/// Freeze the slice domain before overload binding. Runtime kernels receive
+/// a canonical temporal value, checked INT count, and literal control strings.
+fn normalize_slice_arguments(
+    name: &str,
+    source: &[&ast::Expr],
+    args: &mut [TypedExpr],
+    span: Span,
+) -> Result<(), AnalyzeError> {
+    if !matches!(args.len(), 3 | 4) {
+        return Err(AnalyzeError::invalid_argument(
+            format!("{name} expects value, interval, unit and optional boundary"),
+            span,
+        ));
+    }
+    fn integer_source(expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Number(value),
+                ..
+            }) => value.parse::<i128>().is_ok(),
+            ast::Expr::Unary(unary)
+                if matches!(
+                    unary.operator,
+                    ast::UnaryOperator::Plus | ast::UnaryOperator::Minus
+                ) =>
+            {
+                integer_source(&unary.expression)
+            }
+            ast::Expr::Nested(nested) => integer_source(&nested.expression),
+            _ => false,
+        }
+    }
+    if !source.get(1).is_some_and(|source| integer_source(source)) {
+        return Err(AnalyzeError::invalid_argument(
+            format!("{name} requires second parameter must be a constant interval"),
+            span,
+        ));
+    }
+    fn interval_value(expr: &TypedExpr) -> Option<i64> {
+        match &expr.kind {
+            ExprKind::Nested(nested) => interval_value(nested),
+            ExprKind::UnaryOp {
+                op: UnOp::Negate,
+                expr: nested,
+            } => interval_value(nested).and_then(i64::checked_neg),
+            _ => signed_int_literal_value(expr),
+        }
+    }
+    let count = interval_value(&args[1]).ok_or_else(|| {
+        AnalyzeError::invalid_argument(format!("{name} interval must fit INT32"), span)
+    })?;
+    if count <= 0 {
+        return Err(AnalyzeError::invalid_argument(
+            format!("{name} requires second parameter must be greater than 0"),
+            span,
+        ));
+    }
+    i32::try_from(count).map_err(|_| {
+        AnalyzeError::invalid_argument(format!("{name} interval must fit INT32"), span)
+    })?;
+    args[1] = TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Int(count)),
+        data_type: DataType::Int32,
+        nullable: false,
+    };
+    fn control_string(expr: &TypedExpr) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Literal(LiteralValue::String(value)) => Some(value),
+            ExprKind::Nested(nested) => control_string(nested),
+            _ => None,
+        }
+    }
+    let unit = match control_string(&args[2]) {
+        Some(value) => value.to_ascii_lowercase(),
+        _ => {
+            return Err(AnalyzeError::invalid_argument(
+                format!("{name} requires constant unit string"),
+                span,
+            ));
+        }
+    };
+    let unit = match unit.as_str() {
+        "year" | "years" => "year",
+        "quarter" | "quarters" => "quarter",
+        "month" | "months" => "month",
+        "week" | "weeks" => "week",
+        "day" | "days" => "day",
+        "hour" | "hours" => "hour",
+        "minute" | "minutes" => "minute",
+        "second" | "seconds" => "second",
+        "millisecond" | "milliseconds" => "millisecond",
+        "microsecond" | "microseconds" => "microsecond",
+        _ => {
+            return Err(AnalyzeError::invalid_argument(
+                format!("{name} unsupported unit: {unit}"),
+                span,
+            ));
+        }
+    };
+    if name == "date_slice" && !matches!(unit, "year" | "quarter" | "month" | "week" | "day") {
+        return Err(AnalyzeError::invalid_argument(
+            "can't use time_slice for date with time(hour/minute/second)",
+            span,
+        ));
+    }
+    args[2] = TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::String(unit.into())),
+        data_type: DataType::Utf8,
+        nullable: false,
+    };
+    if let Some(boundary) = args.get_mut(3) {
+        let value = match control_string(boundary) {
+            Some(value) => value.to_ascii_lowercase(),
+            _ => {
+                return Err(AnalyzeError::invalid_argument(
+                    format!("{name} requires constant boundary string"),
+                    span,
+                ));
+            }
+        };
+        if !matches!(value.as_str(), "floor" | "ceil") {
+            return Err(AnalyzeError::invalid_argument(
+                format!("{name} expects boundary floor/ceil, got {value}"),
+                span,
+            ));
+        }
+        *boundary = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String(value)),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+    }
+    let domain = if name == "date_slice" {
+        DataType::Date32
+    } else {
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+    };
+    if args[0].data_type != domain {
+        // Coercion belongs to the existing explicit SQL CAST owner; no kernel
+        // infers its output type or parses a string under a temporal binding.
+        if !matches!(
+            args[0].data_type,
+            DataType::Null
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, _)
+                | DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(_, _)
+                | DataType::FixedSizeBinary(16)
+        ) {
+            return Err(AnalyzeError::type_mismatch(
+                format!("{name} first argument cannot be cast to its temporal domain"),
+                span,
+            ));
+        }
+        let inner = std::mem::replace(
+            &mut args[0],
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Null),
+                data_type: DataType::Null,
+                nullable: true,
+            },
+        );
+        args[0] = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(inner),
+                target: domain.clone(),
+            },
+            data_type: domain,
+            nullable: true,
+        };
+    }
+    Ok(())
 }
 
 fn function_order_by_position(expr: &ast::Expr) -> Option<i64> {
@@ -5718,6 +5927,135 @@ mod tests {
             .next()
             .map(|item| item.expr)
             .ok_or_else(|| "expected projection".to_string())
+    }
+
+    #[test]
+    fn slice_calls_freeze_temporal_result_and_materialize_input_cast_before_binding() {
+        for (sql, date) in [
+            (
+                "select time_slice('2023-12-31 03:12:04',interval 2147483647 year)",
+                false,
+            ),
+            (
+                "select time_slice(cast('2020-01-01' as date),interval 1 day,ceil)",
+                false,
+            ),
+            ("select time_slice('2020-01-01',1)", false),
+            ("select time_slice('2020-01-01',(1))", false),
+            ("select time_slice('2020-01-01',1,ceil)", false),
+            (
+                "select time_slice('2020-01-01',interval 1 day,(CEIL))",
+                false,
+            ),
+            ("select time_slice(null,1,'day','floor')", false),
+            (
+                "select date_slice('2020-01-01 12:00:00',interval 1 day)",
+                true,
+            ),
+            (
+                "select date_slice(cast('2020-01-01' as datetime),1,'day','ceil')",
+                true,
+            ),
+            (
+                "select date_slice(cast('2020-01-01' as date),interval 1 month)",
+                true,
+            ),
+        ] {
+            let expr =
+                analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let domain = if date {
+                DataType::Date32
+            } else {
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+            };
+            assert_eq!(expr.data_type, domain);
+            assert!(expr.nullable);
+            let ExprKind::FunctionCall { binding, args, .. } = &expr.kind else {
+                panic!("expected bound slice call")
+            };
+            assert_eq!(
+                binding.function_id.as_str(),
+                if date {
+                    "builtin.scalar/date_slice/v1"
+                } else {
+                    "builtin.scalar/time_slice/v1"
+                }
+            );
+            assert_eq!(args[0].data_type, domain);
+            assert_eq!(args[1].data_type, DataType::Int32);
+            assert!(!args[1].nullable);
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                panic!("expected scalar")
+            };
+            assert_eq!(result.data_type, domain);
+            assert!(result.nullable);
+            for (argument, selected) in args.iter().zip(&binding.selected.argument_types) {
+                let novarocks_functions::FunctionArgumentType::Value(selected) = selected else {
+                    panic!("expected value")
+                };
+                assert_eq!(argument.data_type, selected.data_type);
+                assert_eq!(argument.nullable, selected.nullable);
+            }
+        }
+    }
+
+    #[test]
+    fn slice_calls_fail_fast_for_invalid_interval_unit_boundary_and_input() {
+        for (sql, fragment) in [
+            (
+                "select time_slice('2020-01-01',interval 0 day)",
+                "greater than 0",
+            ),
+            (
+                "select time_slice('2020-01-01',interval -1 day)",
+                "greater than 0",
+            ),
+            (
+                "select date_slice('2020-01-01',interval 3.2 day)",
+                "constant interval",
+            ),
+            (
+                "select time_slice('2020-01-01',interval 2147483648 day)",
+                "fit INT32",
+            ),
+            (
+                "select time_slice('2020-01-01',null,'day','floor')",
+                "constant interval",
+            ),
+            (
+                "select time_slice('2020-01-01','1','day','floor')",
+                "constant interval",
+            ),
+            (
+                "select time_slice('2020-01-01',1+1,'day','floor')",
+                "constant interval",
+            ),
+            (
+                "select date_slice(null,interval 1 hour)",
+                "can't use time_slice",
+            ),
+            (
+                "select date_slice('2020-01-01',1,'microsecond','floor')",
+                "can't use time_slice",
+            ),
+            (
+                "select time_slice(null,1,'century','floor')",
+                "unsupported unit",
+            ),
+            (
+                "select time_slice(null,1,'day','round')",
+                "boundary floor/ceil",
+            ),
+            (
+                "select time_slice([1],1,'day','floor')",
+                "first argument cannot be cast",
+            ),
+        ] {
+            let error = analyze_projection_expr(sql).unwrap_err();
+            assert!(error.contains(fragment), "{sql}: {error}");
+        }
     }
 
     struct UnaryInputCatalog {
