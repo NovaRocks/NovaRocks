@@ -2290,6 +2290,71 @@ mod tests {
         assert_eq!(field.data_type, DataType::Int32);
         assert!(!field.nullable);
     }
+
+    #[test]
+    fn slice_calls_retain_fixed_temporal_types_in_strict_final_plan() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        for (sql, expected) in [
+            (
+                "select time_slice('2023-12-31 03:12:04',interval 2147483647 year) as sliced",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "select time_slice(cast('2020-01-01' as date),interval 1 day,ceil) as sliced",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "select date_slice('2020-01-01 12:00:00',interval 1 day) as sliced",
+                DataType::Date32,
+            ),
+            (
+                "select date_slice(cast('2020-01-01' as datetime),1,'month','ceil') as sliced",
+                DataType::Date32,
+            ),
+        ] {
+            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let cancellation = Arc::new(Cancellation::default());
+            let request = SqlAnalyzeRequest::new(
+                SqlStatementInput::sql(sql),
+                SqlCompileIntent::Query,
+                SqlSessionContext {
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: SessionOptimizerSettings::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &catalog_snapshot,
+                crate::functions::builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                control(None, &cancellation),
+            );
+            let optimized = analyze_then_optimize(request)
+                .unwrap()
+                .into_optimized_output()
+                .unwrap();
+            let physical =
+                crate::planner::optimizer_bridge::to_physical_plan(&optimized.optimized_tree)
+                    .unwrap();
+            let plan = crate::planner::distributed::build::lower_final_physical_plan(
+                &physical,
+                novarocks_physical_plan::PlanVersionId::try_new([42; 16]).unwrap(),
+                novarocks_physical_plan::PipelineDopDomain {
+                    min: 1,
+                    max: 8,
+                    requires_power_of_two: true,
+                },
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            let result = plan.result_port().unwrap();
+            assert_eq!(result.fields.len(), 1);
+            assert_eq!(result.fields[0].ty.data_type, expected);
+            assert!(result.fields[0].ty.nullable);
+        }
+    }
 }
 mod completion;
 mod completion_catalog;

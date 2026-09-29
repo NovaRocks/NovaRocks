@@ -267,15 +267,14 @@ fn lower_typed_connector_scan(
                 inputs.queues,
                 node.node_id,
                 read_slot_ids,
+                Arc::clone(&output_schema),
                 inputs.runtime_filter,
                 live_dynamic_filter_factory,
                 crate::debug_environment::debug_emit_connector_reader_marker(),
                 inputs.runtime.stream_host().clone(),
             );
             match output_materialization {
-                Some(transform) => Arc::new(
-                    source.with_output_materialization(transform, Arc::clone(&output_schema)),
-                ),
+                Some(transform) => Arc::new(source.with_output_materialization(transform)),
                 None => Arc::new(source),
             }
         }
@@ -300,13 +299,12 @@ fn lower_typed_connector_scan(
                 inputs.request,
                 node.node_id,
                 read_slot_ids,
+                Arc::clone(&output_schema),
                 crate::debug_environment::debug_emit_connector_reader_marker(),
                 inputs.runtime.stream_host().runtime().clone(),
             );
             match output_materialization {
-                Some(transform) => Arc::new(
-                    source.with_output_materialization(transform, Arc::clone(&output_schema)),
-                ),
+                Some(transform) => Arc::new(source.with_output_materialization(transform)),
                 None => Arc::new(source),
             }
         }

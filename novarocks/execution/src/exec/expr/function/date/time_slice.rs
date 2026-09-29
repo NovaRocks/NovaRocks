@@ -14,10 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{extract_datetime_array, extract_i64_array, to_timestamp_value};
+use super::common::{
+    extract_datetime_array, extract_i64_array, naive_to_date32, to_timestamp_value,
+};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Array, ArrayRef, Date32Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
 use std::sync::Arc;
@@ -53,10 +55,10 @@ impl TimeSliceUnit {
         }
     }
 
-    fn index(self, dt: NaiveDateTime, start: NaiveDateTime) -> i64 {
+    fn index(self, dt: NaiveDateTime, start: NaiveDateTime) -> Option<i64> {
         let delta = dt.signed_duration_since(start);
-        match self {
-            Self::Year => (dt.year() - start.year()) as i64,
+        Some(match self {
+            Self::Year => i64::from(dt.year() - start.year()),
             Self::Quarter => ((dt.year() - start.year()) as i64) * 4 + (dt.month0() / 3) as i64,
             Self::Month => ((dt.year() - start.year()) as i64) * 12 + dt.month0() as i64,
             Self::Week => delta.num_days() / 7,
@@ -65,8 +67,8 @@ impl TimeSliceUnit {
             Self::Minute => delta.num_minutes(),
             Self::Second => delta.num_seconds(),
             Self::Millisecond => delta.num_milliseconds(),
-            Self::Microsecond => delta.num_microseconds().unwrap_or(i64::MAX),
-        }
+            Self::Microsecond => delta.num_microseconds()?,
+        })
     }
 
     fn sliced_datetime(
@@ -75,42 +77,63 @@ impl TimeSliceUnit {
         epoch: i64,
         interval: i64,
     ) -> Option<NaiveDateTime> {
+        let units = epoch.checked_mul(interval)?;
         match self {
             Self::Year => {
-                let delta_years = epoch.checked_mul(interval)?;
-                let year = (start.year() as i64).checked_add(delta_years)?;
-                if year < i32::MIN as i64 || year > i32::MAX as i64 {
-                    return None;
-                }
-                start.date().with_year(year as i32)?.and_hms_opt(0, 0, 0)
+                let year = i32::try_from(i64::from(start.year()).checked_add(units)?).ok()?;
+                NaiveDate::from_ymd_opt(year, 1, 1)?.and_hms_opt(0, 0, 0)
             }
-            Self::Quarter => {
-                let months = epoch.checked_mul(interval)?.checked_mul(3)?;
-                if months < i32::MIN as i64 || months > i32::MAX as i64 {
-                    return None;
-                }
-                Some(super::add_months::add_months_to_datetime(
-                    start,
-                    months as i32,
-                ))
+            Self::Quarter | Self::Month => {
+                let months = if matches!(self, Self::Quarter) {
+                    units.checked_mul(3)?
+                } else {
+                    units
+                };
+                let year =
+                    i32::try_from(i64::from(start.year()).checked_add(months.div_euclid(12))?)
+                        .ok()?;
+                let month = u32::try_from(months.rem_euclid(12).checked_add(1)?).ok()?;
+                NaiveDate::from_ymd_opt(year, month, 1)?.and_hms_opt(0, 0, 0)
             }
-            Self::Month => {
-                let months = epoch.checked_mul(interval)?;
-                if months < i32::MIN as i64 || months > i32::MAX as i64 {
-                    return None;
-                }
-                Some(super::add_months::add_months_to_datetime(
-                    start,
-                    months as i32,
-                ))
-            }
-            Self::Week => Some(start + Duration::weeks(epoch.checked_mul(interval)?)),
-            Self::Day => Some(start + Duration::days(epoch.checked_mul(interval)?)),
-            Self::Hour => Some(start + Duration::hours(epoch.checked_mul(interval)?)),
-            Self::Minute => Some(start + Duration::minutes(epoch.checked_mul(interval)?)),
-            Self::Second => Some(start + Duration::seconds(epoch.checked_mul(interval)?)),
-            Self::Millisecond => Some(start + Duration::milliseconds(epoch.checked_mul(interval)?)),
-            Self::Microsecond => Some(start + Duration::microseconds(epoch.checked_mul(interval)?)),
+            // Checked durations/addition preserve legitimate overflow -> NULL
+            // without a chrono panic for large positive INT32 intervals.
+            Self::Week => start.checked_add_signed(Duration::try_days(units.checked_mul(7)?)?),
+            Self::Day => start.checked_add_signed(Duration::try_days(units)?),
+            Self::Hour => start.checked_add_signed(Duration::try_hours(units)?),
+            Self::Minute => start.checked_add_signed(Duration::try_minutes(units)?),
+            Self::Second => start.checked_add_signed(Duration::try_seconds(units)?),
+            Self::Millisecond => start.checked_add_signed(Duration::try_milliseconds(units)?),
+            Self::Microsecond => start.checked_add_signed(Duration::microseconds(units)),
+        }
+    }
+}
+
+// A single result vector uses the frozen result's physical width. No temporary
+// datetime output vector or per-row type guessing is needed.
+enum SliceValues {
+    Date(Vec<Option<i32>>),
+    Datetime(Vec<Option<i64>>),
+}
+
+impl SliceValues {
+    fn push(&mut self, value: Option<NaiveDateTime>) -> Result<(), String> {
+        match self {
+            Self::Date(values) => values.push(value.map(|dt| naive_to_date32(dt.date()))),
+            Self::Datetime(values) => values.push(
+                value
+                    .map(|dt| {
+                        to_timestamp_value(dt, &DataType::Timestamp(TimeUnit::Microsecond, None))
+                    })
+                    .transpose()?,
+            ),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> ArrayRef {
+        match self {
+            Self::Date(values) => Arc::new(Date32Array::from(values)),
+            Self::Datetime(values) => Arc::new(TimestampMicrosecondArray::from(values)),
         }
     }
 }
@@ -135,8 +158,29 @@ fn eval_time_slice_inner(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
+    date_output: bool,
 ) -> Result<ArrayRef, String> {
-    // time_slice(datetime, interval, unit, boundary?)
+    let name = if date_output {
+        "date_slice"
+    } else {
+        "time_slice"
+    };
+    if !matches!(args.len(), 3 | 4) {
+        return Err(format!(
+            "{name} expects value, count, unit and optional boundary"
+        ));
+    }
+    let output_type = if date_output {
+        DataType::Date32
+    } else {
+        DataType::Timestamp(TimeUnit::Microsecond, None)
+    };
+    if arena.data_type(expr) != Some(&output_type) {
+        return Err(format!(
+            "{name} result type differs from its frozen temporal domain"
+        ));
+    }
+    // SQL materializes temporal coercions before binding.
     let dt_arr = arena.eval(args[0], chunk)?;
     let interval_arr = arena.eval(args[1], chunk)?;
     let unit_arr = arena.eval(args[2], chunk)?;
@@ -145,6 +189,11 @@ fn eval_time_slice_inner(
     } else {
         None
     };
+    if dt_arr.data_type() != &output_type || interval_arr.data_type() != &DataType::Int32 {
+        return Err(format!(
+            "{name} arguments differ from their frozen temporal/INT32 domains"
+        ));
+    }
     let dts = extract_datetime_array(&dt_arr)?;
     let interval_values = extract_i64_array(&interval_arr, "time_slice")
         .map_err(|_| "time_slice expects int interval".to_string())?;
@@ -154,44 +203,58 @@ fn eval_time_slice_inner(
         .ok_or_else(|| "time_slice expects unit string".to_string())?;
     let boundary_arr = boundary_arr
         .as_ref()
-        .and_then(|a| a.as_any().downcast_ref::<StringArray>());
-
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    let mut out = Vec::with_capacity(dts.len());
+        .map(|array| {
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| format!("{name} expects boundary string"))
+        })
+        .transpose()?;
+    for length in [interval_values.len(), unit_arr.len()]
+        .into_iter()
+        .chain(boundary_arr.map(|array| array.len()))
+    {
+        if length != 1 && length != dts.len() {
+            return Err(format!("{name} argument lengths differ"));
+        }
+    }
+    let mut out = if date_output {
+        SliceValues::Date(Vec::with_capacity(dts.len()))
+    } else {
+        SliceValues::Datetime(Vec::with_capacity(dts.len()))
+    };
     let start = NaiveDate::from_ymd_opt(1, 1, 1)
         .unwrap()
         .and_hms_opt(0, 0, 0)
         .unwrap();
     for i in 0..dts.len() {
-        let Some(interval) = i64_at(&interval_values, i, dts.len()) else {
-            out.push(None);
-            continue;
-        };
-        let Some(unit_str) = str_at(unit_arr, i, dts.len()) else {
-            out.push(None);
-            continue;
-        };
-        let dt = match dts[i] {
-            Some(v) => v,
-            None => {
-                out.push(None);
-                continue;
-            }
-        };
-        if dt < start {
-            return Err("time used with time_slice can't before 0001-01-01 00:00:00".to_string());
-        }
+        let interval = i64_at(&interval_values, i, dts.len())
+            .ok_or_else(|| format!("{name} requires non-null interval"))?;
+        let unit_str = str_at(unit_arr, i, dts.len())
+            .ok_or_else(|| format!("{name} requires non-null unit"))?;
         if interval <= 0 {
-            out.push(None);
-            continue;
+            return Err(format!(
+                "{name} requires second parameter must be greater than 0"
+            ));
         }
         let unit = TimeSliceUnit::parse(unit_str)?;
-        let boundary = boundary_arr
-            .and_then(|b| str_at(b, i, dts.len()))
-            .unwrap_or("floor");
+        if date_output
+            && !matches!(
+                unit,
+                TimeSliceUnit::Year
+                    | TimeSliceUnit::Quarter
+                    | TimeSliceUnit::Month
+                    | TimeSliceUnit::Week
+                    | TimeSliceUnit::Day
+            )
+        {
+            return Err("can't use time_slice for date with time(hour/minute/second)".into());
+        }
+        let boundary = match boundary_arr {
+            Some(array) => str_at(array, i, dts.len())
+                .ok_or_else(|| format!("{name} requires non-null boundary"))?,
+            None => "floor",
+        };
         let use_ceil = match boundary.to_ascii_lowercase().as_str() {
             "floor" => false,
             "ceil" => true,
@@ -202,22 +265,36 @@ fn eval_time_slice_inner(
                 ));
             }
         };
-        let duration = unit.index(dt, start);
+        let dt = match dts[i] {
+            Some(v) => v,
+            None => {
+                out.push(None)?;
+                continue;
+            }
+        };
+        if dt < start {
+            return Err("time used with time_slice can't before 0001-01-01 00:00:00".to_string());
+        }
+        let duration = unit
+            .index(dt, start)
+            .ok_or_else(|| format!("{name} input exceeds supported slice arithmetic"))?;
         let mut epoch = duration / interval;
         if use_ceil {
-            epoch += 1;
+            epoch = epoch
+                .checked_add(1)
+                .ok_or_else(|| format!("{name} bucket index overflow"))?;
         }
         let Some(sliced) = unit.sliced_datetime(start, epoch, interval) else {
-            out.push(None);
+            out.push(None)?;
             continue;
         };
         if !(1..=9999).contains(&sliced.year()) {
-            out.push(None);
+            out.push(None)?;
             continue;
         }
-        out.push(to_timestamp_value(sliced, &output_type).ok());
+        out.push(Some(sliced))?;
     }
-    Ok(Arc::new(TimestampMicrosecondArray::from(out)) as ArrayRef)
+    Ok(out.finish())
 }
 
 pub fn eval_time_slice(
@@ -226,7 +303,7 @@ pub fn eval_time_slice(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_time_slice_inner(arena, expr, args, chunk)
+    eval_time_slice_inner(arena, expr, args, chunk, false)
 }
 
 pub fn eval_date_slice(
@@ -235,5 +312,5 @@ pub fn eval_date_slice(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_time_slice_inner(arena, expr, args, chunk)
+    eval_time_slice_inner(arena, expr, args, chunk, true)
 }

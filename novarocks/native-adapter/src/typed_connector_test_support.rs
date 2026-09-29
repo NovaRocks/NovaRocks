@@ -1004,6 +1004,21 @@ mod tests {
             queues,
             NODE,
             vec![SlotId::new(1)],
+            Arc::new(
+                novarocks_execution::exec::chunk::ChunkSchema::try_new(vec![
+                    novarocks_execution::exec::chunk::ChunkSlotSchema::from_field(
+                        SlotId::new(1),
+                        &arrow::datatypes::Field::new(
+                            "value",
+                            arrow::datatypes::DataType::Int64,
+                            true,
+                        ),
+                        None,
+                    )
+                    .expect("frozen test output slot"),
+                ])
+                .expect("frozen test output schema"),
+            ),
             no_runtime_filter(),
             live_dynamic_filter_factory(),
             false,
@@ -1437,6 +1452,21 @@ mod tests {
             request_with_source(&operations),
             NODE,
             vec![SlotId::new(1)],
+            Arc::new(
+                novarocks_execution::exec::chunk::ChunkSchema::try_new(vec![
+                    novarocks_execution::exec::chunk::ChunkSlotSchema::from_field(
+                        SlotId::new(1),
+                        &arrow::datatypes::Field::new(
+                            "value",
+                            arrow::datatypes::DataType::Int64,
+                            true,
+                        ),
+                        None,
+                    )
+                    .expect("frozen test output slot"),
+                ])
+                .expect("frozen test output schema"),
+            ),
             false,
             crate::backend_test_support::test_scan_stream_runtime(),
         );

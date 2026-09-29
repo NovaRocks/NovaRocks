@@ -1,0 +1,47 @@
+-- query 1
+sliced
+0001-01-01 00:00:00
+
+-- query 2
+sliced
+0001-01-01
+
+-- query 3
+sliced
+2020-01-02 00:00:00
+
+-- query 4
+sliced
+2020-01-02
+
+-- query 5
+sliced
+2023-10-31 23:59:59.123468
+
+-- query 6
+sliced
+NULL
+
+-- query 12
+sliced
+0001-01-01 00:00:00
+
+-- query 13
+sliced
+0001-01-01
+
+-- query 14
+sliced
+2023-10-31 23:59:59.123468
+
+-- query 15
+sliced
+NULL
+
+-- query 16
+sliced
+NULL
+
+-- query 20
+sliced
+NULL
