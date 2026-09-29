@@ -9585,3 +9585,34 @@ fn revoked_result_originator_fact_wins_and_success_seal_is_never_allowed() {
     );
     assert!(!round.root_success_sealed());
 }
+
+/// A real admitted TaskRound for the synchronous result-consumer controls.
+/// No status or clock owner is replaced by the coordinator test transport.
+pub(crate) fn synchronous_root_control_round() -> (
+    crate::task_execution::round::TaskRound,
+    crate::task_execution::status_intake::StatusIntakeHandle,
+    Arc<ManualClock>,
+) {
+    let harness = Harness::new(&[0], &[1], 64);
+    let clock = Arc::clone(&harness.clock);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    round.turn().unwrap();
+    let root = round.root_task();
+    status.publish(StatusEvent::Published(
+        TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::new(false),
+        )
+        .unwrap(),
+    ));
+    round.turn().unwrap();
+    assert!(round.result_pump_ready());
+    assert!(!round.execution().root_end_of_stream_observed());
+    (round, status, clock)
+}
