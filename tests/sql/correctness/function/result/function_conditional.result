@@ -14,16 +14,16 @@ NULL
 
 -- query 8
 CASE i WHEN 1 THEN mi WHEN 3 THEN ms ELSE mi END
-{null:"2",1:"1"}
-{null:"2",1:"1"}
-{null:null,1:null}
+{1:"1"}
+{1:"1"}
+{1:null}
 NULL
 
 -- query 9
 CASE i WHEN 1 THEN mi WHEN 3 THEN ms END
-{null:"2",1:"1"}
+{1:"1"}
 NULL
-{null:null,1:null}
+{1:null}
 NULL
 
 -- query 10
@@ -42,16 +42,16 @@ NULL
 
 -- query 12
 CASE WHEN (i = 1) THEN mi WHEN (i = 3) THEN ms END
-{null:"2",1:"1"}
+{1:"1"}
 NULL
-{null:null,1:null}
+{1:null}
 NULL
 
 -- query 13
 CASE WHEN (i = 1) THEN mi WHEN (i = 3) THEN ms ELSE ms END
-{null:"2",1:"1"}
-{null:null,1:"b"}
-{null:null,1:null}
+{1:"1"}
+{1:"b"}
+{1:null}
 NULL
 
 -- query 14
@@ -63,23 +63,23 @@ NULL
 
 -- query 15
 coalesce(mi, ms)
-{null:"2",1:"1"}
-{null:"2",1:"1"}
-{null:null,1:null}
+{1:"1"}
+{1:"1"}
+{1:null}
 NULL
 
 -- query 16
 coalesce(NULL, ms, mi)
-{null:"2",1:"1"}
-{null:null,1:"b"}
-{null:null,1:null}
+{1:"1"}
+{1:"b"}
+{1:null}
 NULL
 
 -- query 17
 ifnull(ms, mi)	ms	mi
-{null:"2",1:"1"}	NULL	{null:2,1:1}
-{null:null,1:"b"}	{null:null,1:"b"}	{null:2,1:1}
-{null:null,1:null}	{null:null,1:null}	NULL
+{1:"1"}	NULL	{1:1}
+{1:"b"}	{1:"b"}	{1:1}
+{1:null}	{1:null}	NULL
 NULL	NULL	NULL
 
 -- query 18
@@ -98,9 +98,9 @@ NULL
 
 -- query 20
 if(i > 2, ms, mi)
-{null:"2",1:"1"}
-{null:"2",1:"1"}
-{null:null,1:null}
+{1:"1"}
+{1:"1"}
+{1:null}
 NULL
 
 -- query 21
@@ -126,9 +126,9 @@ NULL	NULL	NULL
 
 -- query 24
 nullif(ms, mi)	ms	mi
-NULL	NULL	{null:2,1:1}
-{null:null,1:"b"}	{null:null,1:"b"}	{null:2,1:1}
-{null:null,1:null}	{null:null,1:null}	NULL
+NULL	NULL	{1:1}
+{1:"b"}	{1:"b"}	{1:1}
+{1:null}	{1:null}	NULL
 NULL	NULL	NULL
 
 -- query 25
@@ -137,3 +137,14 @@ NULL
 NULL
 NULL
 NULL
+
+-- query 26
+i	mi	ms	mi_parent_null	ms_parent_null
+1	{1:1}	NULL	0	1
+2	{1:1}	{1:"b"}	0	0
+3	NULL	{1:null}	1	0
+4	NULL	NULL	1	1
+
+-- query 27
+rows_total	mi_present	ms_present	ms_nonnull_values
+4	2	2	1
