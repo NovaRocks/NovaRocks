@@ -390,7 +390,14 @@ impl<A: Allocator + Clone> TDigest<A> {
             self.unprocessed = merged;
         }
 
-        self.processed_weight += self.unprocessed_weight;
+        // Rebuild the represented mass after collecting both centroid lists.
+        // Adding rounded per-partial totals makes the quantile index depend on
+        // the input partitioning and disagree with the cumulative centers.
+        self.processed_weight = self
+            .unprocessed
+            .iter()
+            .map(|centroid| f64::from(centroid.weight))
+            .sum::<f64>() as f32;
         self.unprocessed_weight = 0.0;
 
         let Some(first) = self.unprocessed.first().copied() else {
@@ -491,7 +498,9 @@ impl<A: Allocator + Clone> TDigest<A> {
             self.cumulative.push((previous + weight / 2.0) as f32);
             previous += weight;
         }
-        self.cumulative.push(previous as f32);
+        let represented_mass = previous as f32;
+        self.cumulative.push(represented_mass);
+        self.processed_weight = represented_mass;
         Ok(())
     }
 
@@ -1131,6 +1140,9 @@ mod tests {
             digest.cumulative.as_slice(),
             &[8388608.0, 16777216.0, 16777218.0, 16777218.0, 16777220.0]
         );
+        // The interpolation denominator and the stored CDF end are one mass.
+        assert_eq!(digest.processed_weight, 16777220.0);
+        assert_eq!(digest.count(), 16777220.0);
     }
 
     #[test]
@@ -1158,12 +1170,13 @@ mod tests {
         }
         assert_eq!(exact_rows, 16671);
         assert_eq!(exact_mass, 416675010);
-        // The floating mass and CDF center constants below are independently
-        // calculated from the fixed integer input, not an engine receipt:
-        // stored mass416681600 -> index208340800; centers208305776/208341136
-        // at means35353/35356; float weighted interpolation35355.9765625.
-        assert_eq!(state.digest.total_weight(), 416681600.0);
-        assert_eq!(quantile_value(&state, 0.5).unwrap(), Some(35355.9765625));
+        // Round the exact mass once: 416675010 -> 416675008, index208337504.
+        // Centers208305776/208341136 at means35353/35356 independently give
+        // the f32 weighted interpolation35355.6875.
+        assert_eq!(state.digest.quantile(0.5).unwrap(), Some(35355.6875));
+        assert_eq!(state.digest.total_weight(), 416675008.0);
+        assert_eq!(state.digest.cumulative.last(), Some(&416675008.0));
+        assert_eq!(quantile_value(&state, 0.5).unwrap(), Some(35355.6875));
     }
 
     #[test]

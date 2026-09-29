@@ -280,10 +280,10 @@ fn prepared_weighted_q56_int32_input_matches_independent_single_state_cdf() {
             AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
         )
         .unwrap();
-    // Independent IEEE/CDF calculation for this exact input order, not all distributed trees:
-    // stored mass416681600 -> index208340800; centers208305776/208341136.
+    // Independent IEEE/CDF calculation: round exact mass once to416675008,
+    // index208337504; centers208305776/208341136 at means35353/35356.
     let value = scalar_result(&local, ptr).unwrap();
-    assert_eq!(value, 35355.9765625);
+    assert_eq!(value, 35355.6875);
     assert_eq!(value.trunc(), 35355.0);
     local.entries[0].drop_state(ptr);
     drop(arena);
@@ -310,6 +310,185 @@ fn prepared_weighted_negative_weight_is_rejected_without_digest_contribution() {
     );
     assert_eq!(scalar_result(&local, ptr), None);
     local.entries[0].drop_state(ptr);
+    drop(arena);
+    assert_eq!(tracker.current(), 0);
+}
+
+fn q5_input(values: Vec<i32>, weights: Vec<f64>) -> ArrayRef {
+    assert_eq!(values.len(), weights.len());
+    let quantiles = vec![0.5; values.len()];
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int32Array::from(values)),
+        Arc::new(Float64Array::from(weights)),
+        Arc::new(Float64Array::from(quantiles)),
+    ];
+    // These are the production Native pack_struct_inputs field names.
+    let fields = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            Arc::new(Field::new(
+                format!("f{index}"),
+                column.data_type().clone(),
+                true,
+            ))
+        })
+        .collect::<Vec<_>>();
+    Arc::new(StructArray::try_new(fields.into(), columns, None).unwrap())
+}
+
+fn prepared_partials(
+    inputs: &[ArrayRef],
+    tracker: &Arc<MemTracker>,
+    arena: &mut AggStateArena,
+) -> (AggKernelSet, Vec<ArrayRef>) {
+    let local = kernels(inputs[0].data_type(), false);
+    let merged = kernels(inputs[0].data_type(), true);
+    let partials = inputs
+        .iter()
+        .map(|input| {
+            let ptr = state(&local, arena, tracker);
+            local.entries[0]
+                .update_batch(
+                    &vec![ptr; input.len()],
+                    AggregateInputBatch::try_new(Some(input), input.len()).unwrap(),
+                )
+                .unwrap();
+            let partial = local.entries[0].build_array(&[ptr], true).unwrap();
+            local.entries[0].drop_state(ptr);
+            partial
+        })
+        .collect();
+    (merged, partials)
+}
+
+fn centroid_counts(partial: &ArrayRef) -> (u32, u32) {
+    let binary = partial.as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert!(!binary.is_null(0));
+    let payload = binary.value(0);
+    // The existing bounded v4 envelope precedes the raw TDigest layout.
+    assert_eq!(&payload[..3], &[0xa2, 4, 1]);
+    let quantile_count = u32::from_le_bytes(payload[7..11].try_into().unwrap()) as usize;
+    assert_eq!(quantile_count, 1);
+    let digest = 11 + quantile_count * 8;
+    let processed = u32::from_le_bytes(payload[digest + 36..digest + 40].try_into().unwrap());
+    let next = digest + 40 + processed as usize * 8;
+    let unprocessed = u32::from_le_bytes(payload[next..next + 4].try_into().unwrap());
+    (processed, unprocessed)
+}
+
+#[test]
+fn prepared_weighted_native_q5_split_mass_is_consistent_in_both_merge_orders() {
+    let tracker = MemTracker::new_root("weighted-percentile-prepared-native-q5-mass");
+    let mut arena = AggStateArena::new(4096);
+    arena.set_mem_tracker(Arc::clone(&tracker));
+    // The observed split/order is a reproduction layout, not the value oracle.
+    // Every input is independently derived from the original SQL arithmetic series.
+    let first = [1, 2, 3, 4]
+        .into_iter()
+        .chain((36865..=49150).step_by(3))
+        .collect::<Vec<i32>>();
+    let second = (24577..=36862)
+        .step_by(3)
+        .chain((1..=24574).step_by(3))
+        .chain((49153..=49999).step_by(3))
+        .collect::<Vec<i32>>();
+    assert_eq!(first.len(), 4100);
+    assert_eq!(second.len(), 12571);
+    assert_eq!(first.iter().map(|&x| i64::from(x)).sum::<i64>(), 176158730);
+    assert_eq!(second.iter().map(|&x| i64::from(x)).sum::<i64>(), 240516280);
+    let mut population = first.iter().chain(&second).copied().collect::<Vec<_>>();
+    let mut expected = (1..=50000)
+        .step_by(3)
+        .chain([1, 2, 3, 4])
+        .collect::<Vec<_>>();
+    population.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        population, expected,
+        "the split contains the original multiset exactly once"
+    );
+    let inputs = [
+        q5_input(first.clone(), first.into_iter().map(f64::from).collect()),
+        q5_input(second.clone(), second.into_iter().map(f64::from).collect()),
+    ];
+    let (merged, partials) = prepared_partials(&inputs, &tracker, &mut arena);
+    assert_eq!(centroid_counts(&partials[0]), (0, 4100));
+    assert_eq!(centroid_counts(&partials[1]), (0, 12571));
+    for order in [[0, 1], [1, 0]] {
+        let root = state(&merged, &mut arena, &tracker);
+        for index in order {
+            merged.entries[0]
+                .merge_batch(
+                    &[root],
+                    AggregateInputBatch::try_new(Some(&partials[index]), 1).unwrap(),
+                )
+                .unwrap();
+        }
+        // The authoritative retained-centroid mass is 416675010, rounded once
+        // to f32 416675008, median index208337504; f32 weighted interpolation.
+        assert_eq!(scalar_result(&merged, root), Some(35355.6875));
+        let serialized = merged.entries[0].build_array(&[root], true).unwrap();
+        merged.entries[0].drop_state(root);
+        let replay = state(&merged, &mut arena, &tracker);
+        merged.entries[0]
+            .merge_batch(
+                &[replay],
+                AggregateInputBatch::try_new(Some(&serialized), 1).unwrap(),
+            )
+            .unwrap();
+        let value = scalar_result(&merged, replay).unwrap();
+        assert_eq!(value, 35355.6875);
+        assert_eq!(value.trunc(), 35355.0);
+        merged.entries[0].drop_state(replay);
+    }
+    drop(arena);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn prepared_weighted_processed_and_pending_partials_keep_mass_through_roundtrip() {
+    let tracker = MemTracker::new_root("weighted-percentile-prepared-mixed-mass");
+    let mut arena = AggStateArena::new(4096);
+    arena.set_mem_tracker(Arc::clone(&tracker));
+    // 80001 > default max_unprocessed80000, so this must process in the
+    // actual update path, not merely in a finalization clone.
+    let inputs = [
+        q5_input(vec![2; 80001], vec![1.0; 80001]),
+        q5_input(vec![3, 4], vec![160002.0, 240003.0]),
+    ];
+    let (merged, partials) = prepared_partials(&inputs, &tracker, &mut arena);
+    let (processed, pending) = centroid_counts(&partials[0]);
+    assert!(processed > 0);
+    assert_eq!(pending, 0);
+    assert_eq!(centroid_counts(&partials[1]), (0, 2));
+    for order in [[0, 1], [1, 0]] {
+        let root = state(&merged, &mut arena, &tracker);
+        for index in order {
+            merged.entries[0]
+                .merge_batch(
+                    &[root],
+                    AggregateInputBatch::try_new(Some(&partials[index]), 1).unwrap(),
+                )
+                .unwrap();
+        }
+        let serialized = merged.entries[0].build_array(&[root], true).unwrap();
+        let (processed, pending) = centroid_counts(&serialized);
+        assert!(processed > 0);
+        assert_eq!(pending, 2);
+        merged.entries[0].drop_state(root);
+        let replay = state(&merged, &mut arena, &tracker);
+        merged.entries[0]
+            .merge_batch(
+                &[replay],
+                AggregateInputBatch::try_new(Some(&serialized), 1).unwrap(),
+            )
+            .unwrap();
+        // Exact mass480006, centers for3/4 are160002/360004.5;
+        // median index240003 => (3*120001.5+4*80001)/200002.5 =3.4.
+        assert_eq!(scalar_result(&merged, replay), Some(f64::from(3.4_f32)));
+        merged.entries[0].drop_state(replay);
+    }
     drop(arena);
     assert_eq!(tracker.current(), 0);
 }
