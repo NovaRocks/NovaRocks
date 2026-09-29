@@ -37,16 +37,15 @@ fn compare_key_positions(
         let left_idx = key_start + left_pos;
         let right_idx = key_start + right_pos;
 
-        let ord = if key_values.is_null(left_idx) || key_values.is_null(right_idx) {
-            if key_values.is_null(left_idx) && key_values.is_null(right_idx) {
-                Ordering::Equal
-            } else if key_values.is_null(left_idx) {
-                Ordering::Less
-            } else {
-                Ordering::Greater
+        let left_null = super::common::is_logically_null(key_values.as_ref(), left_idx);
+        let right_null = super::common::is_logically_null(key_values.as_ref(), right_idx);
+        let ord = match (left_null, right_null) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => {
+                super::common::compare_values_ordered(key_values, left_idx, right_idx)?
             }
-        } else {
-            super::common::compare_values_ordered(key_values, left_idx, right_idx)?
         };
         if ord != Ordering::Equal {
             return Ok(ord);

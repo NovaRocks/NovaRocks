@@ -2643,3 +2643,59 @@ fn mixed_timestamp_string_intersection_keeps_sql_varchar_text() {
         }
     }
 }
+
+#[test]
+fn test_array_ordered_functions_accept_untyped_null_elements() {
+    let chunk = common::chunk_len_1();
+    let mut arena = ExprArena::default();
+    let nulls = null_element_literal_array(&mut arena, 3);
+    let list_expr = common::typed_null(&mut arena, null_element_list_type());
+    let sorted = eval_array_function("array_sort", &arena, list_expr, &[nulls], &chunk).unwrap();
+    let sorted = sorted.as_any().downcast_ref::<ListArray>().unwrap();
+    assert!(!sorted.is_null(0));
+    assert_eq!(sorted.value_length(0), 3);
+    assert_eq!(sorted.values().data_type(), &DataType::Null);
+    assert_eq!(sorted.values().logical_null_count(), 3);
+    let scalar_expr = common::typed_null(&mut arena, DataType::Null);
+    for name in ["array_min", "array_max"] {
+        let out = eval_array_function(name, &arena, scalar_expr, &[nulls], &chunk).unwrap();
+        assert_eq!(out.data_type(), &DataType::Null);
+        assert_eq!(out.logical_null_count(), 1);
+    }
+}
+
+#[test]
+fn test_array_sortby_null_array_keys_refine_with_secondary_keys() {
+    let chunk = common::chunk_len_1();
+    let mut arena = ExprArena::default();
+    fn ints(arena: &mut ExprArena, values: &[i64]) -> novarocks_execution::exec::expr::ExprId {
+        let elements = values
+            .iter()
+            .map(|value| common::literal_i64(arena, *value))
+            .collect();
+        arena.push_typed(
+            ExprNode::ArrayExpr { elements },
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        )
+    }
+    let source = ints(&mut arena, &[30, 10, 20]);
+    let nulls = null_element_literal_array(&mut arena, 3);
+    let secondary = ints(&mut arena, &[3, 1, 2]);
+    let expr = common::typed_null(
+        &mut arena,
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+    );
+    for (keys, expected) in [
+        (vec![nulls], vec![30, 10, 20]),
+        (vec![nulls, secondary], vec![10, 20, 30]),
+        (vec![secondary, nulls], vec![10, 20, 30]),
+    ] {
+        let mut args = vec![source];
+        args.extend(keys);
+        let out = eval_array_function("array_sortby", &arena, expr, &args, &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let values = out.value(0);
+        let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(values.values().as_ref(), expected.as_slice());
+    }
+}

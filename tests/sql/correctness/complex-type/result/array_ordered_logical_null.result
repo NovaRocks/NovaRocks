@@ -1,0 +1,19 @@
+-- query 1
+ties
+[30,10,20]
+
+-- query 2
+refined
+[10,20,30]
+
+-- query 3
+trailing_null_key
+[10,20,30]
+
+-- query 4
+sorted	smallest	largest
+[null,null,null]	NULL	NULL
+
+-- query 5
+null_value_moves
+[8,7,null]
