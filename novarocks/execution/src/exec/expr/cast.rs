@@ -4413,7 +4413,10 @@ mod tests {
             );
             assert!(output_list.is_null(2));
             assert!(output_list.value(0).is_empty());
-            assert_eq!(output_list.value(1), source_list.value(1));
+            assert_eq!(
+                output_list.value(1).to_data(),
+                source_list.value(1).to_data()
+            );
             let DataType::List(item) = output_list.data_type() else {
                 unreachable!();
             };
