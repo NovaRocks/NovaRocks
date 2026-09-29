@@ -50,6 +50,14 @@ pub struct AggOrderSpec {
     pub group_concat_max_len: Option<i64>,
 }
 
+impl AggOrderSpec {
+    /// Apply GROUP_CONCAT's minimum byte limit while preserving an absent option.
+    /// The raw session value remains available for transport and query identity.
+    pub fn effective_group_concat_max_len(&self) -> Option<i64> {
+        self.group_concat_max_len.map(|value| value.max(4))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AggFunction {
     /// Lowercased function name from FE (e.g. "sum", "count").

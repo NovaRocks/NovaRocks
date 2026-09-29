@@ -453,7 +453,7 @@ impl AggregateFunction for GroupConcatAgg {
         let is_distinct = func.order.is_distinct;
         let is_asc_order = func.order.is_asc_order.clone();
         let nulls_first = func.order.nulls_first.clone();
-        let max_len = func.order.group_concat_max_len.unwrap_or(1024).max(4);
+        let max_len = func.order.effective_group_concat_max_len().unwrap_or(1024);
         let order_by_num = is_asc_order.len();
         let kind = AggKind::GroupConcat {
             is_distinct,
@@ -806,6 +806,9 @@ impl AggregateFunction for GroupConcatAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::expr::agg::{
+        AggStateArena, build_kernel_set, test_builtin_execution_function_set,
+    };
     use arrow::array::{ArrayRef, Int64Array, NullArray, StringArray};
     use std::mem::MaybeUninit;
 
@@ -867,6 +870,88 @@ mod tests {
         GroupConcatAgg.drop_state(spec, state.as_mut_ptr() as *mut u8);
         let out = out.as_any().downcast_ref::<StringArray>().unwrap();
         out.value(0).to_string()
+    }
+
+    fn run_bound_group_concat(max_len: Option<i64>, values: &[&str]) -> String {
+        let function_set = test_builtin_execution_function_set();
+        let selected = function_set
+            .catalog()
+            .resolve_aggregate_trusted("group_concat", &[DataType::Utf8, DataType::Utf8])
+            .expect("resolve group_concat");
+        let input_fields = Fields::from(vec![
+            Arc::new(Field::new("v", DataType::Utf8, true)),
+            Arc::new(Field::new("sep", DataType::Utf8, true)),
+        ]);
+        let input_type = DataType::Struct(input_fields.clone());
+        let mut order = order_spec(false, &[], &[]);
+        order.group_concat_max_len = max_len;
+        let func = make_func(
+            "group_concat",
+            false,
+            selected.intermediate_type.clone(),
+            input_type.clone(),
+            order,
+        );
+        // Exercise the generic option binder before the legacy implementation
+        // adapter. Calling build_spec_from_type directly misses negative limits.
+        let kernels = build_kernel_set(&function_set, &[func], &[Some(input_type)], &[selected])
+            .expect("bind group_concat kernel");
+        let kernel = &kernels.entries[0];
+        let mut arena = AggStateArena::new(1024);
+        let base = arena.alloc(kernels.layout.total_size, kernel.state_align());
+        kernel
+            .init_state_with_tracker(base, MemTracker::new_root("bound-group-concat-test"))
+            .expect("init group_concat state");
+        let input = Arc::new(StructArray::new(
+            input_fields,
+            vec![
+                Arc::new(StringArray::from(values.to_vec())) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some(","); values.len()])) as ArrayRef,
+            ],
+            None,
+        )) as ArrayRef;
+        kernel
+            .update_batch(
+                &vec![base; input.len()],
+                novarocks_functions::AggregateInputBatch::try_new(Some(&input), input.len())
+                    .expect("group_concat input batch"),
+            )
+            .expect("update group_concat");
+        let output = kernel
+            .build_array(&[base], false)
+            .expect("finalize group_concat");
+        kernel.drop_state(base);
+        let output = output
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("group_concat UTF-8 output");
+        assert!(!output.is_null(0));
+        output.value(0).to_string()
+    }
+
+    #[test]
+    fn bound_group_concat_applies_minimum_before_generic_option_validation() {
+        for (limit, expected) in [
+            (None, "é你,abcd"),
+            (Some(-121), "é"),
+            (Some(0), "é"),
+            (Some(1), "é"),
+            (Some(4), "é"),
+            (Some(5), "é你"),
+            (Some(8), "é你,ab"),
+        ] {
+            assert_eq!(
+                run_bound_group_concat(limit, &["é你", "abcd"]),
+                expected,
+                "raw group_concat_max_len={limit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_group_concat_retains_default_limit_when_option_is_absent() {
+        let value = "a".repeat(1100);
+        assert_eq!(run_bound_group_concat(None, &[&value]), "a".repeat(1024));
     }
 
     #[test]

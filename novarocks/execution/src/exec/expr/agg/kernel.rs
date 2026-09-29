@@ -257,7 +257,7 @@ pub fn build_kernel_set(
             func.order.is_distinct,
             &func.order.is_asc_order,
             &func.order.nulls_first,
-            func.order.group_concat_max_len,
+            func.order.effective_group_concat_max_len(),
         )
         .map_err(|error| format!("bind aggregate `{}` options: {error}", func.name))?;
         let context = AggregatePrepareContext {
