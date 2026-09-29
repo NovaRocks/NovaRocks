@@ -150,10 +150,11 @@ SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(1000 AS DECIMA
 -- query 32
 -- @skip_result_check=true
 -- @expect_error=The 'mul' operation involving decimal values overflows
-SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))*CAST(2 AS DECIMAL(38,0)) AS legacy_mul;
+SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION',decimal_overflow_to_double=false) */ CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))*CAST(2 AS DECIMAL(38,0)) AS legacy_mul;
 
 -- query 33
 -- @skip_result_check=true
+SET decimal_overflow_to_double=false;
 CREATE VIEW default_catalog.${case_db}.decimal_error_allowed_v AS SELECT 1 AS n;
 
 -- query 34
