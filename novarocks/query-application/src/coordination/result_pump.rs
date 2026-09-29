@@ -2023,6 +2023,8 @@ mod tests {
     struct TestSuccessSealPort {
         requests: Mutex<VecDeque<AcceptedRootControlRequest>>,
         ready: Notify,
+        terminal_roots: Mutex<VecDeque<TaskIdentity>>,
+        terminal_ready: Notify,
     }
 
     impl AcceptedRootControlPort for TestSuccessSealPort {
@@ -2030,8 +2032,10 @@ mod tests {
             &self,
             request: AcceptedRootControlRequest,
         ) -> Result<(), AcceptedRootControlRequest> {
-            if request.terminal_control_root().is_some() {
+            if let Some(root) = request.terminal_control_root() {
                 request.accept_terminal_control().unwrap();
+                self.terminal_roots.lock().unwrap().push_back(root);
+                self.terminal_ready.notify_one();
                 return Ok(());
             }
             self.requests.lock().unwrap().push_back(request);
@@ -2041,6 +2045,15 @@ mod tests {
     }
 
     impl TestSuccessSealPort {
+        async fn next_terminal_control(&self) -> TaskIdentity {
+            loop {
+                if let Some(root) = self.terminal_roots.lock().unwrap().pop_front() {
+                    return root;
+                }
+                self.terminal_ready.notified().await;
+            }
+        }
+
         async fn next(&self) -> AcceptedRootControlRequest {
             loop {
                 if let Some(request) = self.requests.lock().unwrap().pop_front() {
@@ -2053,6 +2066,21 @@ mod tests {
 
     async fn poll_once<F: Future + ?Sized>(mut future: Pin<&mut F>) -> std::task::Poll<F::Output> {
         std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    async fn wait_for_terminal_control_registration<F: Future + ?Sized>(
+        pump: Pin<&mut F>,
+        port: &TestSuccessSealPort,
+        root: TaskIdentity,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = pump => panic!("the revoked result finished before control registration"),
+                registered = port.next_terminal_control() => assert_eq!(registered, root),
+            }
+        })
+        .await
+        .expect("the exact revoked root must register terminal control");
     }
 
     async fn poll_pending_after_actor_turn<F: Future + ?Sized>(
@@ -4423,9 +4451,10 @@ mod tests {
                 mut stream,
                 root,
             } = harness(70 + index as i64).await;
+            let seal_port = Arc::new(TestSuccessSealPort::default());
             let (sender, statuses) = accepted_root_status_projection_with_control_port(
                 root,
-                Arc::new(TestSuccessSealPort::default()),
+                Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
             );
             sender.publish(running(root)).unwrap();
             let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
@@ -4457,10 +4486,7 @@ mod tests {
                 MaxWait::new(Duration::from_secs(1)).unwrap(),
                 ResultByteLimit::new(1 << 12).unwrap(),
             ));
-            assert!(matches!(
-                poll_once(pump.as_mut()).await,
-                std::task::Poll::Pending
-            ));
+            wait_for_terminal_control_registration(pump.as_mut(), &seal_port, root).await;
             let derived = TaskStatus::try_new(
                 root,
                 TaskStatusVersion::new(3).unwrap(),
@@ -4489,15 +4515,16 @@ mod tests {
             ));
             if own_failure {
                 sender
-                    .publish(
+                    .publish_with_attempt_failure(
                         TaskStatus::try_new(
                             root,
                             TaskStatusVersion::new(4).unwrap(),
                             TaskState::Failed,
-                            Some(originating),
+                            Some(originating.clone()),
                             TaskOutputFacts::new(false),
                         )
                         .unwrap(),
+                        originating,
                     )
                     .unwrap();
             } else {
@@ -4505,7 +4532,12 @@ mod tests {
                     .publish_with_attempt_failure(derived, originating)
                     .unwrap();
             }
-            let ResultPumpFailure::DecisionPending(failure) = pump.await.unwrap_err() else {
+            let ResultPumpFailure::DecisionPending(failure) =
+                tokio::time::timeout(Duration::from_secs(10), pump)
+                    .await
+                    .expect("the authoritative failure must settle the revoked result")
+                    .unwrap_err()
+            else {
                 panic!("unexposed result retains the decision owner");
             };
             assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
@@ -4590,9 +4622,10 @@ mod tests {
             mut stream,
             root,
         } = harness(74).await;
+        let seal_port = Arc::new(TestSuccessSealPort::default());
         let (sender, statuses) = accepted_root_status_projection_with_control_port(
             root,
-            Arc::new(TestSuccessSealPort::default()),
+            Arc::clone(&seal_port) as Arc<dyn AcceptedRootControlPort>,
         );
         sender.publish(running(root)).unwrap();
         let (terminal_sender, terminal_source) = native_attempt_terminal_channel();
@@ -4616,10 +4649,7 @@ mod tests {
             MaxWait::new(Duration::from_secs(1)).unwrap(),
             ResultByteLimit::new(1 << 12).unwrap(),
         ));
-        assert!(matches!(
-            poll_once(pump.as_mut()).await,
-            std::task::Poll::Pending
-        ));
+        wait_for_terminal_control_registration(pump.as_mut(), &seal_port, root).await;
         terminal_sender.publish(failed_native_terminal(
             "required terminal observation recovery expired",
         ));
