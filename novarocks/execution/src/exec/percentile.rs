@@ -446,7 +446,11 @@ impl<A: Allocator + Clone> TDigest<A> {
         let index = q * self.processed_weight;
 
         if index <= self.weight(0) / 2.0 {
-            return Some(self.min + 2.0 * index / self.weight(0) * (self.mean(0) - self.min));
+            return Some(
+                (f64::from(self.min)
+                    + 2.0 * f64::from(index) / f64::from(self.weight(0))
+                        * f64::from(self.mean(0) - self.min)) as f32,
+            );
         }
 
         if let Some(i) = self.cumulative.iter().position(|value| *value >= index)
@@ -463,9 +467,14 @@ impl<A: Allocator + Clone> TDigest<A> {
             ));
         }
 
-        let z1 = index - self.processed_weight - self.weight(n - 1) / 2.0;
-        let z2 = self.weight(n - 1) / 2.0 - z1;
-        Some(Self::weighted_average(self.mean(n - 1), z1, self.max, z2))
+        let z1 = f64::from(index - self.processed_weight) - f64::from(self.weight(n - 1)) / 2.0;
+        let z2 = f64::from(self.weight(n - 1)) / 2.0 - z1;
+        Some(Self::weighted_average(
+            self.mean(n - 1),
+            z1 as f32,
+            self.max,
+            z2 as f32,
+        ))
     }
 
     fn update_cumulative(&mut self) -> Result<(), String> {
@@ -473,13 +482,16 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.cumulative
             .try_reserve(self.processed.len() + 1)
             .map_err(|_| "ResourceExhausted: reserve TDigest cumulative weights".to_string())?;
-        let mut previous = 0.0;
+        // The reference digest accumulates in double precision, then stores
+        // each CDF center as a float. Repeated float accumulation loses small
+        // weights after a large prefix and changes quantile interpolation.
+        let mut previous = 0.0_f64;
         for centroid in &self.processed {
-            let half_current = centroid.weight / 2.0;
-            self.cumulative.push(previous + half_current);
-            previous += centroid.weight;
+            let weight = f64::from(centroid.weight);
+            self.cumulative.push((previous + weight / 2.0) as f32);
+            previous += weight;
         }
-        self.cumulative.push(previous);
+        self.cumulative.push(previous as f32);
         Ok(())
     }
 
@@ -492,16 +504,18 @@ impl<A: Allocator + Clone> TDigest<A> {
     }
 
     fn integrated_location(&self, q: f32) -> f32 {
-        self.compression
-            * (((2.0 * q - 1.0).asin() + std::f32::consts::FRAC_PI_2) / std::f32::consts::PI)
+        (f64::from(self.compression)
+            * ((2.0 * f64::from(q) - 1.0).asin() + std::f64::consts::FRAC_PI_2)
+            / std::f64::consts::PI) as f32
     }
 
     fn integrated_q(&self, k: f32) -> f32 {
-        (((k.min(self.compression) * std::f32::consts::PI / self.compression)
-            - std::f32::consts::FRAC_PI_2)
+        ((((f64::from(k.min(self.compression)) * std::f64::consts::PI
+            / f64::from(self.compression))
+            - std::f64::consts::FRAC_PI_2)
             .sin()
             + 1.0)
-            / 2.0
+            / 2.0) as f32
     }
 
     fn weighted_average(x1: f32, w1: f32, x2: f32, w2: f32) -> f32 {
@@ -1103,6 +1117,94 @@ fn read_f64(payload: &[u8], offset: &mut usize, label: &str) -> Result<f64, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cumulative_centers_retain_unit_weights_after_large_prefix() {
+        let mut digest = TDigest::new_in(10000.0, Global);
+        for (mean, weight) in [(0.0, 16777216.0), (1.0, 1.0), (2.0, 1.0), (3.0, 1.0)] {
+            digest.processed.push(Centroid::new(mean, weight));
+        }
+        digest.update_cumulative().unwrap();
+        // Integer sums and halves are exact in f64; each center rounds only
+        // once at the frozen f32 CDF boundary (nearest, ties to even).
+        assert_eq!(
+            digest.cumulative.as_slice(),
+            &[8388608.0, 16777216.0, 16777218.0, 16777218.0, 16777220.0]
+        );
+    }
+
+    #[test]
+    fn scale_functions_match_fixed_double_intermediate_reference() {
+        let digest = TDigest::new_in(10000.0, Global);
+        assert_eq!(digest.integrated_location(0.01_f32).to_bits(), 0x441f6be1);
+        assert_eq!(digest.integrated_location(0.25_f32).to_bits(), 0x45505555);
+        assert_eq!(digest.integrated_location(0.5_f32).to_bits(), 0x459c4000);
+        assert_eq!(digest.integrated_location(0.9_f32).to_bits(), 0x45f87d60);
+        assert_eq!(digest.integrated_q(1.0_f32).to_bits(), 0x32d3f2b9);
+        assert_eq!(digest.integrated_q(2048.0_f32).to_bits(), 0x3dccbc9c);
+        assert_eq!(digest.integrated_q(5000.0_f32).to_bits(), 0x3f000000);
+        assert_eq!(digest.integrated_q(9999.0_f32).to_bits(), 0x3f800000);
+    }
+
+    #[test]
+    fn fixed_large_weighted_series_matches_independent_cdf_reference() {
+        let mut state = PercentileState::default();
+        let mut exact_mass = 0_u64;
+        let mut exact_rows = 0_u64;
+        for value in (1_i64..=50000).step_by(3).chain([1, 2, 3, 4]) {
+            add_weighted_value(&mut state, value as f64, value).unwrap();
+            exact_mass += value as u64;
+            exact_rows += 1;
+        }
+        assert_eq!(exact_rows, 16671);
+        assert_eq!(exact_mass, 416675010);
+        // The floating mass and CDF center constants below are independently
+        // calculated from the fixed integer input, not an engine receipt:
+        // stored mass416681600 -> index208340800; centers208305776/208341136
+        // at means35353/35356; float weighted interpolation35355.9765625.
+        assert_eq!(state.digest.total_weight(), 416681600.0);
+        assert_eq!(quantile_value(&state, 0.5).unwrap(), Some(35355.9765625));
+    }
+
+    #[test]
+    fn weighted_fixed_reference_survives_merge_orders_zero_and_state_roundtrip() {
+        // CDF centers for (2,w1),(3,w2),(4,w3) are .5,2,4.5.
+        // q=.5 has index3: interpolation 3+(3-2)/(4.5-2)=3.4.
+        // q=.25 has index1.5: 2+(1.5-.5)/(2-.5)=8/3.
+        for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2]] {
+            let inputs = [(2.0, 1), (3.0, 2), (4.0, 3)];
+            let mut merged = PercentileState::default();
+            for index in order {
+                let mut part = PercentileState::default();
+                let (value, weight) = inputs[index];
+                add_weighted_value(&mut part, value, weight).unwrap();
+                // Force a real processed digest before the serialized merge.
+                assert_eq!(quantile_value(&part, 0.5).unwrap(), Some(value));
+                assert_eq!(part.digest.quantile(0.5).unwrap(), Some(value as f32));
+                merge_bounded_serialized_state_into(&mut merged, &encode_state(&part)).unwrap();
+            }
+            add_weighted_value(&mut merged, 1000000.0, 0).unwrap();
+            let decoded = decode_state(&encode_state(&merged)).unwrap();
+            for state in [&merged, &decoded] {
+                assert_eq!(quantile_value(state, 0.0).unwrap(), Some(2.0));
+                assert_eq!(
+                    quantile_value(state, 0.25).unwrap(),
+                    Some(f64::from(8.0_f32 / 3.0))
+                );
+                assert_eq!(
+                    quantile_value(state, 0.5).unwrap(),
+                    Some(f64::from(3.4_f32))
+                );
+                assert_eq!(quantile_value(state, 1.0).unwrap(), Some(4.0));
+                assert_eq!(state.digest.total_weight(), 6.0);
+            }
+        }
+        let mut empty = PercentileState::default();
+        add_weighted_value(&mut empty, 10.0, 0).unwrap();
+        assert_eq!(quantile_value(&empty, 0.5).unwrap(), None);
+        assert!(add_weighted_value(&mut empty, 1.0, -1).is_err());
+        assert_eq!(quantile_value(&empty, 0.5).unwrap(), None);
+    }
 
     #[test]
     fn tdigest_round_trip_preserves_weight() {

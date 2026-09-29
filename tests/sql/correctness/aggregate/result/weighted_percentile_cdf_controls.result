@@ -1,0 +1,27 @@
+-- query 2
+rows_seen	values_seen	weights_seen
+7	6	6
+
+-- query 3
+p
+3.4000000953674316
+
+-- query 4
+p
+[2,2.6666667461395264,3.4000000953674316,4]
+
+-- query 5
+empty
+1
+
+-- query 6
+empty
+1
+
+-- query 7
+empty
+1
+
+-- query 9
+p
+1
