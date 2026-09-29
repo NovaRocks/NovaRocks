@@ -402,6 +402,14 @@ fn parse_meta_with_sql_error_descriptors(
                 }
                 meta.nova_extension = Some(raw_value);
             }
+            "query_stats_contract" => {
+                if meta.query_stats_contract.is_some() {
+                    bail!("duplicate @query_stats_contract directive in the same metadata scope");
+                }
+                meta.query_stats_contract = Some(
+                    crate::query_stats_contract::QueryStatsContract::parse(&raw_value)?,
+                );
+            }
             "result_contains" => {
                 meta.result_contains.push(raw_value);
             }
@@ -776,6 +784,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .nova_extension
             .clone()
             .or_else(|| base.nova_extension.clone()),
+        query_stats_contract: override_meta
+            .query_stats_contract
+            .clone()
+            .or_else(|| base.query_stats_contract.clone()),
         result_contains: if override_meta.result_contains.is_empty() {
             base.result_contains.clone()
         } else {
@@ -1130,6 +1142,28 @@ fn load_sql_case_from_file_with_variables(
         }
 
         let merged_meta = merge_meta(&file_meta, &section_meta);
+        if let Some(contract) = &merged_meta.query_stats_contract {
+            if merged_meta.expect_error.is_some()
+                || merged_meta.expect_error_code.is_some()
+                || merged_meta.expect_sql_code.is_some()
+                || merged_meta.expect_sql_phase.is_some()
+                || merged_meta.expect_error_at.is_some()
+                || merged_meta.expect_error_tier.is_some()
+            {
+                bail!(
+                    "{} ({}): @query_stats_contract cannot be combined with error expectations",
+                    sql_path.display(),
+                    section_id
+                );
+            }
+            contract.validate_sql(&sql).with_context(|| {
+                format!(
+                    "{} ({}): invalid @query_stats_contract SQL",
+                    sql_path.display(),
+                    section_id
+                )
+            })?;
+        }
         validate_sql_error_expectations(&merged_meta, production_sql_error_descriptors())
             .with_context(|| {
                 format!(
@@ -2216,5 +2250,185 @@ mod opt5_directive_tests {
             format!("{error:#}").contains("invalid query_lifecycle_fault kind"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn query_stats_contract_metadata_is_strict_and_duplicates_fail_closed() {
+        let regex = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let json = r#"{"tables":[],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}"#;
+        let line = format!("-- @query_stats_contract={json}");
+        let parsed = parse_meta(std::slice::from_ref(&line), &regex).unwrap();
+        assert!(parsed.query_stats_contract.is_some());
+        assert!(parse_meta(&[line.clone(), line], &regex).is_err());
+        assert!(parse_meta(&["-- @query_stats_contract={}".to_string()], &regex).is_err());
+        let merged = merge_meta(&parsed, &QueryMeta::default());
+        assert!(merged.query_stats_contract.is_some());
+    }
+    #[test]
+    fn query_stats_contract_suffix_expands_in_real_file_loader_and_is_case_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"tables":[{"table_suffix":".${case_db}.build","rows":10,"confidence":"Exact","source":"IcebergManifest"}],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}"#;
+        let raw = format!(
+            "-- @query_stats_contract={json}\nEXPLAIN COSTS SELECT * FROM ice.${{case_db}}.build;\n"
+        );
+        let marker = Regex::new(r"^--\s*query\s+(\d+)\s*$").unwrap();
+        let variables = HashMap::new();
+        let left_path = dir.path().join("left.sql");
+        let right_path = dir.path().join("right.sql");
+        fs::write(&left_path, &raw).unwrap();
+        fs::write(&right_path, &raw).unwrap();
+        let left = load_sql_case_from_file(&left_path, &meta_re(), &marker, &variables)
+            .unwrap()
+            .unwrap();
+        let right = load_sql_case_from_file(&right_path, &meta_re(), &marker, &variables)
+            .unwrap()
+            .unwrap();
+        let left_db = case_placeholder_variables(&variables, "left")["case_db"].clone();
+        let right_db = case_placeholder_variables(&variables, "right")["case_db"].clone();
+        assert_ne!(left_db, right_db);
+        assert!(left.steps[0].sql.contains(&format!("ice.{left_db}.build")));
+        assert!(!left.steps[0].sql.contains("${"));
+        let response = format!(
+            "TABLE STATS ref=42 table=ice.{left_db}.build rows=10 confidence=Exact source=IcebergManifest\n19:HASH JOIN (BROADCAST, INNER, eq: []) bcast_verdict=feasible bcast[verdict=feasible, forced=false, build_bytes=80, hash_table_bytes={}, backends=3, fanout_bytes=480, per_node_budget_bytes=268435456, risk_multiplier=2]",
+            80.0 / 0.75 + 10.0 * 16.0
+        );
+        left.steps[0]
+            .meta
+            .query_stats_contract
+            .as_ref()
+            .unwrap()
+            .verify(&left.steps[0].sql, &response)
+            .unwrap();
+        assert!(
+            right.steps[0]
+                .meta
+                .query_stats_contract
+                .as_ref()
+                .unwrap()
+                .verify(&right.steps[0].sql, &response)
+                .is_err()
+        );
+        fs::write(&left_path, raw.replace("${case_db}", "${absent}")).unwrap();
+        assert!(load_sql_case_from_file(&left_path, &meta_re(), &marker, &variables).is_err());
+    }
+
+    fn query_stats_loader_json() -> &'static str {
+        r#"{"tables":[],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}"#
+    }
+
+    fn load_query_stats_test_case(raw: &str) -> Result<SqlCase> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("contract.sql");
+        fs::write(&path, raw)?;
+        let marker = Regex::new(r"^--\s*query\s+(\d+)\s*$").unwrap();
+        load_sql_case_from_file(&path, &meta_re(), &marker, &HashMap::new())?
+            .context("test must contain a SQL case")
+    }
+
+    #[test]
+    fn query_stats_loader_rejects_expected_error_bypass_before_execution() {
+        let json = query_stats_loader_json();
+        for error in [
+            "expect_error=missing_function",
+            "expect_error_code=IcebergWriteDescriptorMismatch",
+            "expect_sql_code=sql.parse.unsupported_statement",
+        ] {
+            let raw = format!(
+                "-- @query_stats_contract={json}\n-- @{error}\nEXPLAIN COSTS SELECT missing_function();\n"
+            );
+            let failure = load_query_stats_test_case(&raw).unwrap_err();
+            assert!(
+                format!("{failure:#}").contains("cannot be combined with error expectations"),
+                "{failure:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_stats_loader_rejects_side_effects_and_non_costs_ast() {
+        let json = query_stats_loader_json();
+        for sql in [
+            "CREATE TABLE forbidden (a INT)",
+            "INSERT INTO forbidden VALUES (1)",
+            "DROP TABLE forbidden",
+            "SELECT 1",
+            "EXPLAIN VERBOSE SELECT 1",
+            "EXPLAIN LOGICAL SELECT 1",
+        ] {
+            let raw = format!("-- @query_stats_contract={json}\n{sql};\n");
+            let failure = load_query_stats_test_case(&raw).unwrap_err();
+            assert!(
+                format!("{failure:#}").contains("invalid @query_stats_contract SQL"),
+                "{sql}: {failure:#}"
+            );
+        }
+        // Markers keep both statements in one step: a valid first statement
+        // cannot authorize the following side effect.
+        let raw = format!(
+            "-- @query_stats_contract={json}\n-- query 1\nEXPLAIN COSTS SELECT 1;\nINSERT INTO forbidden VALUES (1);\n-- query 2\nEXPLAIN COSTS SELECT 2;\n"
+        );
+        assert!(load_query_stats_test_case(&raw).is_err());
+    }
+
+    #[test]
+    fn query_stats_loader_validates_final_inherited_and_overridden_step() {
+        let json = query_stats_loader_json();
+        for override_meta in [String::new(), format!("-- @query_stats_contract={json}\n")] {
+            let raw = format!(
+                "-- @query_stats_contract={json}\n-- query 1\nEXPLAIN COSTS SELECT 1;\n-- query 2\n{override_meta}INSERT INTO forbidden VALUES (1);\n"
+            );
+            let failure = load_query_stats_test_case(&raw).unwrap_err();
+            assert!(format!("{failure:#}").contains("contract-2"), "{failure:#}");
+            assert!(format!("{failure:#}").contains("invalid @query_stats_contract SQL"));
+        }
+        let raw = format!(
+            "-- @query_stats_contract={json}\n-- query 1\nEXPLAIN COSTS SELECT 1;\n-- query 2\n-- @query_stats_contract={json}\n-- @skip_result_check=true\nEXPLAIN COSTS SELECT 2;\n"
+        );
+        let case = load_query_stats_test_case(&raw).unwrap();
+        assert_eq!(case.steps.len(), 2);
+        assert!(
+            case.steps
+                .iter()
+                .all(|step| step.meta.query_stats_contract.is_some())
+        );
+        assert!(case.steps[1].meta.skip_result_check);
+    }
+
+    #[test]
+    fn query_stats_loader_accepts_all_five_broadcast_fixture_controls() {
+        let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("../correctness/optimizer-dist/sql");
+        let marker = Regex::new(r"^--\s*query\s+(\d+)\s*$").unwrap();
+        for (name, steps, contract_query) in [
+            ("broadcast_risk_fallback_large_build_rejected_dist", 6, 6),
+            ("broadcast_risk_zero_stats_dist", 6, 6),
+            ("broadcast_risk_narrow_build_medium_rows_kept_dist", 11, 11),
+            ("broadcast_risk_small_build_kept_dist", 11, 11),
+            ("broadcast_risk_wide_build_uncertain_rejected_dist", 11, 11),
+        ] {
+            let case = load_sql_case_from_file(
+                &suite.join(format!("{name}.sql")),
+                &meta_re(),
+                &marker,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(case.steps.len(), steps, "{name}");
+            assert_eq!(
+                case.steps
+                    .iter()
+                    .filter(|step| step.meta.query_stats_contract.is_some())
+                    .count(),
+                1,
+                "{name}"
+            );
+            assert!(
+                case.steps
+                    .iter()
+                    .any(|step| step.query_number == contract_query
+                        && step.meta.query_stats_contract.is_some()),
+                "{name}"
+            );
+        }
     }
 }

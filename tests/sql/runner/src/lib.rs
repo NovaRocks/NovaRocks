@@ -28,6 +28,7 @@ mod mv_rest_document_graph;
 mod parser;
 mod publication_catalog;
 mod publication_service;
+mod query_stats_contract;
 mod results;
 mod runner;
 mod s3_trace;

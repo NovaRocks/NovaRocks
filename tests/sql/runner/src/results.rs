@@ -265,6 +265,11 @@ pub fn verify_text_assertions(step: &SqlStep, execution: &QueryExecution) -> (bo
             );
         }
     }
+    if let Some(contract) = &step.meta.query_stats_contract {
+        if let Err(error) = contract.verify(&step.sql, haystack) {
+            return (false, format!("query stats contract failed: {error:#}"));
+        }
+    }
     (true, String::new())
 }
 
@@ -535,6 +540,7 @@ pub fn step_allows_missing_expected_result(step: &SqlStep) -> bool {
     step.meta.expect_error.is_some()
         || step.meta.expect_error_code.is_some()
         || step.meta.skip_result_check
+        || step.meta.query_stats_contract.is_some()
         || !step.meta.result_contains.is_empty()
         || !step.meta.result_contains_any.is_empty()
         || !step.meta.result_not_contains.is_empty()
@@ -834,5 +840,36 @@ mod expected_error_code_result_classification_tests {
         });
 
         assert!(!step_requires_recorded_result(&step));
+    }
+
+    #[test]
+    fn typed_query_stats_assertion_is_enforced_before_skipped_record_comparison() {
+        let json = r#"{"tables":[],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"exact","bytes":80},"hash_table":{"kind":"exact","build_rows":10,"load_factor":0.75,"per_row_overhead_bytes":16}}"#;
+        let step = SqlStep {
+            query_number: 1,
+            sql: "EXPLAIN COSTS SELECT 1".to_string(),
+            meta: crate::types::QueryMeta {
+                skip_result_check: true,
+                query_stats_contract: Some(
+                    crate::query_stats_contract::QueryStatsContract::parse(json).unwrap(),
+                ),
+                ..Default::default()
+            },
+        };
+        let hash = 80.0_f64 / 0.75 + 10.0 * 16.0;
+        let mut execution = QueryExecution {
+            header: vec!["EXPLAIN".to_string()],
+            rows: vec![],
+            text_output: format!(
+                "7:HASH JOIN (BROADCAST, INNER, eq: [p.k = b.k]) bcast_verdict=feasible bcast[verdict=feasible, forced=false, build_bytes=80, hash_table_bytes={hash}, backends=3, fanout_bytes=480, per_node_budget_bytes=268435456, risk_multiplier=2]"
+            ),
+            elapsed: std::time::Duration::ZERO,
+        };
+        assert!(verify_text_assertions(&step, &execution).0);
+        execution.text_output = execution
+            .text_output
+            .replace("fanout_bytes=480", "fanout_bytes=240");
+        assert!(!verify_text_assertions(&step, &execution).0);
+        assert!(step_allows_missing_expected_result(&step));
     }
 }

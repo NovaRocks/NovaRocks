@@ -45,26 +45,12 @@ SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 SELECT COUNT(p.pad1) AS cnt
 FROM probe_5m_wide p JOIN build_500k b ON p.k = b.k;
 
--- Physical Iceberg file sizes can vary slightly between equivalent writes,
--- which changes only the final decimal places of scan-derived costs. Keep the
--- distributed planning contract strict without pinning those incidental bytes.
--- @result_contains=TABLE STATS ref=0
--- @result_contains=rows=5000000 confidence=Exact source=IcebergManifest
--- ref=1 has been analyzed, but its row count still comes from the manifest of
--- the snapshot being queried. A published artifact reports whatever snapshot
--- ANALYZE measured, which is not necessarily this one; Puffin is consulted only
--- for the distinct counts it alone holds.
--- @result_contains=TABLE STATS ref=1
--- @result_contains=rows=500000 confidence=Exact source=IcebergManifest
+-- Manifest column widths are measured compressed-file facts, not fixed SQL widths.
+-- Bind table provenance and finite resource bounds to this same COSTS response.
+-- @query_stats_contract={"tables":[{"table_suffix":".${case_db}.probe_5m_wide","rows":5000000,"confidence":"Exact","source":"IcebergManifest"},{"table_suffix":".${case_db}.build_500k","rows":500000,"confidence":"Exact","source":"IcebergManifest"}],"broadcast":{"distribution":"BROADCAST","join_kind":"INNER","verdict":"feasible","forced":false,"backends":3,"risk_multiplier":2,"per_node_budget_bytes":268435456,"cluster_network_budget_bytes":268435456},"payload":{"kind":"positive_range"},"hash_table":{"kind":"bounded","max_build_rows":500000,"load_factor":0.75,"per_row_overhead_bytes":16}}
 -- @result_contains=HASH JOIN (BROADCAST, INNER
--- Manifest-derived average row size differs from what a full scan reports, so
--- the build estimate moved with it (was 8.6MB/18.3MB when this came from the
--- published artifact). Fanout is that estimate times the backend count, whose
--- last decimal place tracks unrounded bytes; pin its magnitude, not that digit.
--- @result_contains=bcast={build=9.2MB
--- @result_contains=ht=19.2MB
--- @result_contains=be=3 fanout=55.
--- @result_contains=budget=256MB risk_mult=2.0x}
+-- @result_contains=BROADCAST EXCHANGE
+-- @result_contains=PARTITION: BROADCAST
 -- @result_not_contains=HASH JOIN (PARTITIONED
 -- @skip_result_check=true
 EXPLAIN COSTS
