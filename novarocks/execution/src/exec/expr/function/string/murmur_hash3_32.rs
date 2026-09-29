@@ -35,7 +35,29 @@ pub fn eval_murmur_hash3_32(
 ) -> Result<ArrayRef, String> {
     let mut inputs = Vec::with_capacity(args.len());
     for arg in args {
-        inputs.push(arena.eval(*arg, chunk)?);
+        let input = arena.eval(*arg, chunk)?;
+        // The public function accepts typed numeric arguments and hashes their
+        // VARCHAR representation. Use the existing CAST owner once per batch,
+        // including its zero, integral-float and exponent normalization.
+        let numeric_text = matches!(
+            input.data_type(),
+            DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+        ) || matches!(input.data_type(), DataType::FixedSizeBinary(width)
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH);
+        if numeric_text {
+            inputs.push(
+                crate::exec::expr::cast_with_special_rules(&input, &DataType::Utf8).map_err(
+                    |error| {
+                        format!("numeric VARCHAR conversion for murmur_hash3_32 failed: {error}")
+                    },
+                )?,
+            );
+        } else {
+            inputs.push(input);
+        }
     }
 
     let mut builder = Int32Builder::with_capacity(chunk.len());
@@ -181,9 +203,8 @@ fn try_stringify_scalar(input: &ArrayRef, row: usize) -> Result<Option<String>, 
             )))
         }
         _ => {
-            // Fall back to arrow's cast-to-string formatter for everything else
-            // (Decimal, Float, Date, Timestamp, ...). StarRocks hashes these via
-            // the VARCHAR viewer, which produces the same lexical form.
+            // Numeric text was converted once per batch by the public CAST owner.
+            // Retain the existing Arrow formatter for the remaining carriers.
             use arrow::compute::kernels::cast::{CastOptions, cast_with_options};
             use arrow::util::display::FormatOptions;
             let opts = CastOptions {
@@ -257,6 +278,168 @@ fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::expr::ExprNode;
+    use crate::exec::expr::function::FunctionKind;
+    use arrow::array::{Decimal128Array, Decimal256Array, Float32Array, Float64Array};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use arrow_buffer::i256;
+    use novarocks_types::{SlotId, largeint};
+
+    fn assert_prepared_numeric_text(input: ArrayRef, expected_text: &[Option<&str>]) {
+        let input_type = input.data_type().clone();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", input_type.clone(), true)]));
+        let batch = RecordBatch::try_new(schema, vec![input]).unwrap();
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+        let mut arena = ExprArena::default();
+        let source = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), input_type);
+        let text = arena.push_typed(ExprNode::Cast(source), DataType::Utf8);
+        let direct = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::String("murmur_hash3_32"),
+                args: vec![source],
+            },
+            DataType::Int32,
+        );
+        let explicit = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::String("murmur_hash3_32"),
+                args: vec![text],
+            },
+            DataType::Int32,
+        );
+        let frozen = arena.into_immutable().unwrap();
+        let prepared = ExprArena::from_immutable(&frozen);
+        let actual_text = prepared.eval(text, &chunk).unwrap();
+        let actual_text = actual_text.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(actual_text.iter().collect::<Vec<_>>(), expected_text);
+        let direct = prepared.eval(direct, &chunk).unwrap();
+        let explicit = prepared.eval(explicit, &chunk).unwrap();
+        let direct = direct.as_any().downcast_ref::<Int32Array>().unwrap();
+        let explicit = explicit.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(
+            direct.iter().collect::<Vec<_>>(),
+            explicit.iter().collect::<Vec<_>>()
+        );
+        for (row, expected) in expected_text.iter().enumerate() {
+            match expected {
+                Some(text) => assert_eq!(
+                    direct.value(row),
+                    murmur_hash3_32(text.as_bytes(), MURMUR3_32_SEED) as i32
+                ),
+                None => assert!(direct.is_null(row)),
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_float_hash_uses_the_public_varchar_contract() {
+        assert_prepared_numeric_text(
+            Arc::new(Float32Array::from(vec![
+                Some(0.0),
+                Some(-0.0),
+                Some(7.0),
+                Some(1.25),
+                None,
+            ])),
+            &[Some("0"), Some("0"), Some("7"), Some("1.25"), None],
+        );
+        assert_prepared_numeric_text(
+            Arc::new(Float64Array::from(vec![
+                Some(0.0),
+                Some(-0.0),
+                Some(7.0),
+                Some(1.25),
+                Some(1.2345678901234568e29),
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                None,
+            ])),
+            &[
+                Some("0"),
+                Some("0"),
+                Some("7"),
+                Some("1.25"),
+                Some("1.2345678901234568e+29"),
+                Some("nan"),
+                Some("inf"),
+                Some("-inf"),
+                None,
+            ],
+        );
+    }
+
+    #[test]
+    fn prepared_signed_minima_hash_as_decimal_text() {
+        assert_prepared_numeric_text(
+            Arc::new(Int8Array::from(vec![Some(i8::MIN), Some(0), None])),
+            &[Some("-128"), Some("0"), None],
+        );
+        assert_prepared_numeric_text(
+            Arc::new(Int16Array::from(vec![Some(i16::MIN), Some(0), None])),
+            &[Some("-32768"), Some("0"), None],
+        );
+        assert_prepared_numeric_text(
+            Arc::new(Int32Array::from(vec![Some(i32::MIN), Some(0), None])),
+            &[Some("-2147483648"), Some("0"), None],
+        );
+        assert_prepared_numeric_text(
+            Arc::new(Int64Array::from(vec![Some(i64::MIN), Some(0), None])),
+            &[Some("-9223372036854775808"), Some("0"), None],
+        );
+        assert_prepared_numeric_text(
+            largeint::array_from_i128(&[Some(i128::MIN), Some(0), None]).unwrap(),
+            &[
+                Some("-170141183460469231731687303715884105728"),
+                Some("0"),
+                None,
+            ],
+        );
+    }
+
+    #[test]
+    fn prepared_decimal128_hash_retains_declared_scale() {
+        let input = Arc::new(
+            Decimal128Array::from(vec![Some(123), Some(-100), Some(0), None])
+                .with_precision_and_scale(18, 2)
+                .unwrap(),
+        ) as ArrayRef;
+        assert_prepared_numeric_text(input, &[Some("1.23"), Some("-1.00"), Some("0.00"), None]);
+    }
+
+    #[test]
+    fn prepared_decimal256_hash_retains_all_literal_digits_and_scale() {
+        let exact: i256 = "123456789012345678901234567890123456789".parse().unwrap();
+        let input = Arc::new(
+            Decimal256Array::from(vec![Some(exact), Some(i256::ZERO), None])
+                .with_precision_and_scale(39, 9)
+                .unwrap(),
+        ) as ArrayRef;
+        assert_prepared_numeric_text(
+            input,
+            &[
+                Some("123456789012345678901234567890.123456789"),
+                Some("0.000000000"),
+                None,
+            ],
+        );
+        assert_eq!(
+            murmur_hash3_32(b"123456789012345678901234567890.123456789", MURMUR3_32_SEED) as i32,
+            1683874639
+        );
+        assert_eq!(
+            murmur_hash3_32(b"1.2345678901234568e+29", MURMUR3_32_SEED) as i32,
+            936035800
+        );
+    }
 
     /// NovaRocks treats embedded NUL bytes as content, not C-string
     /// terminators — so an 8-byte all-zero string and an empty string hash

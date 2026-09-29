@@ -37,7 +37,7 @@ use novarocks_execution::task_execution::status::TaskStatusCursor;
 use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
 use novarocks_query_application::coordination::{
     AcceptedAttemptFailure, AcceptedRootStatusSender, AcceptedRootStatusSource,
-    OperationDispatchResult, accepted_root_status_projection_with_seal_port,
+    OperationDispatchResult, accepted_root_status_projection_with_control_port,
 };
 
 use super::abort_effect::{
@@ -227,7 +227,7 @@ pub(crate) struct TaskRound {
     /// Result consumes root output; other intents retain their Task evidence.
     result_consumer_attached: bool,
     pending_success_seal:
-        Option<novarocks_query_application::coordination::AcceptedRootSuccessSealRequest>,
+        Option<novarocks_query_application::coordination::AcceptedRootControlRequest>,
     abort_effect_intake: Option<NativeAbortEffectIntake>,
     abort_effects:
         BTreeMap<novarocks_execution::task_execution::TaskOperationId, NativeAbortEffect>,
@@ -272,7 +272,7 @@ impl TaskRound {
         subscriber: Option<Arc<dyn StatusSubscriptions>>,
     ) -> Self {
         let (root_status_sender, root_status_source) =
-            accepted_root_status_projection_with_seal_port(
+            accepted_root_status_projection_with_control_port(
                 execution.graph().root_identity(),
                 Arc::new(execution.intake().handle()),
             );
@@ -318,7 +318,7 @@ impl TaskRound {
             self.root_status_source.is_some(),
             "root status source was already transferred before covered observation installation"
         );
-        let (sender, source) = accepted_root_status_projection_with_seal_port(
+        let (sender, source) = accepted_root_status_projection_with_control_port(
             self.execution.graph().root_identity(),
             intake,
         );
@@ -373,9 +373,18 @@ impl TaskRound {
                 if self.success_sealed || self.terminal_cleanup_started {
                     return None;
                 }
+                if self.execution.result_terminal_control_required()
+                    && self
+                        .execution
+                        .failure_cause()
+                        .is_none_or(|cause| cause.is_derived())
+                {
+                    return Some(state);
+                }
                 let root = self.execution.graph().root_identity();
                 if self.result_consumer_attached
                     && self.execution.failure_cause().is_none()
+                    && !self.execution.result_terminal_control_required()
                     && self
                         .execution
                         .task(root.task_id())
@@ -607,8 +616,13 @@ impl TaskRound {
             self.execution.apply_status(status_budget)?
         };
         report.status_events = status.accepted + status.ignored;
-        if let Some(request) = status.success_seal {
-            if self.pending_success_seal.replace(request).is_some() {
+        if let Some(request) = status.root_control {
+            if let Some(root) = request.terminal_control_root() {
+                self.execution.require_result_terminal_control(root)?;
+                request
+                    .accept_terminal_control()
+                    .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
+            } else if self.pending_success_seal.replace(request).is_some() {
                 return Err(TaskExecutionError::Schedule(
                     "more than one result success-seal request reached one TaskRound".to_owned(),
                 ));
@@ -637,6 +651,12 @@ impl TaskRound {
                 "required covered observation evidence could not be recovered within its budget"
                     .to_owned(),
             ));
+        }
+        if self.execution.required_result_terminal_control_expired() {
+            return Err(TaskExecutionError::Schedule(format!(
+                "required terminal control for revoked root {:?} did not arrive within its recovery budget",
+                self.execution.graph().root_identity(),
+            )));
         }
         self.publish_root_status()?;
         if !status.resubscribe {
@@ -1173,6 +1193,16 @@ impl TaskRound {
 
     fn try_settle_success_seal(&mut self) -> Result<(), TaskExecutionError> {
         if self.pending_success_seal.is_none() {
+            return Ok(());
+        }
+        if self.execution.result_terminal_control_required() {
+            self.pending_success_seal
+                .take()
+                .expect("the pending seal was checked")
+                .reject(QueryExecutionError::new(
+                    QueryExecutionErrorKind::Failed,
+                    "revoked root output requires terminal control and cannot seal success",
+                ));
             return Ok(());
         }
         if self.execution.covered_observation_active() && !self.covered_observation_ready() {

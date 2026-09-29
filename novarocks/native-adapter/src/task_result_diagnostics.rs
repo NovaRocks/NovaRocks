@@ -45,7 +45,7 @@ fn should_emit_typed_fetch_marker(
 
     match status {
         FetchStatus::Ready => packet_seq == 0 || eos,
-        FetchStatus::Eof | FetchStatus::Error => true,
+        FetchStatus::Eof | FetchStatus::Error | FetchStatus::AwaitTerminalControl => true,
         FetchStatus::ResultStatusUnspecified | FetchStatus::NotReady => false,
     }
 }

@@ -1170,7 +1170,22 @@ impl FrontendDistributedQueryCoordinator {
                 ),
                 cancellation: &cancellation,
             };
-            if let Some(detail) = round.failure_cause() {
+            let terminal_cause =
+                match synchronous_root_failure_cause(&mut round, root_task, &mut root_result_polls)
+                {
+                    Ok(cause) => cause,
+                    Err(error) => {
+                        break Err(self.fail_task_round(
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            QueryFailureCause::FrontendExecution,
+                            format!("root terminal-control registration was refused: {error}"),
+                        ));
+                    }
+                };
+            if let Some(detail) = terminal_cause {
                 let waiting_on = task_round_wait_facts(
                     &round,
                     root_task,
@@ -1220,7 +1235,7 @@ impl FrontendDistributedQueryCoordinator {
             // The first poll waits for Installed. Accepted proves the Worker
             // owns the create, but preparation may still be in progress and
             // the result plane cannot serve the task yet.
-            if observed_result_eof {
+            if observed_result_eof || round.execution().result_terminal_control_required() {
                 root_result_polls = None;
             } else if root_result_polls.is_none() && round.result_pump_ready() {
                 match RootResultPolls::start(
@@ -1474,6 +1489,26 @@ impl FrontendDistributedQueryCoordinator {
                         last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
                         moved = true;
                     }
+                    Ok(RootResultOutcome::AwaitTerminalControl) => {
+                        if let Err(error) = suspend_root_result_for_terminal_control(
+                            &mut round,
+                            root_task,
+                            &mut root_result_polls,
+                        ) {
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                format!("root terminal-control registration was refused: {error}"),
+                            ));
+                        }
+                        // This is neither a packet acknowledgement nor EOF.
+                        // Decoders and write completion remain unfinished.
+                        last_root_poll = RootResultPoll::AwaitTerminalControl;
+                        moved = true;
+                    }
                     Ok(RootResultOutcome::NotReady) => {
                         // Deliberately not progress. The poller is already
                         // asking again, so a turn that claimed this moved
@@ -1542,7 +1577,7 @@ impl FrontendDistributedQueryCoordinator {
                 Instant::now(),
             );
 
-            if round.client_visible_completion() && round.covered_observation_ready() {
+            if synchronous_root_completion_ready(&round) {
                 match write_completion.as_mut() {
                     // A write's completion is not the read's. Every declared
                     // writer must reach a success-compatible terminal and the
@@ -3029,6 +3064,11 @@ mod tests {
                     + 'static,
             >,
         > {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.acknowledgements
+                .lock()
+                .expect("scripted acknowledgement lock")
+                .push(acknowledged);
             let answer = self
                 .releases
                 .lock()
@@ -3036,11 +3076,6 @@ mod tests {
                 .recv()
                 .map_err(|_| "the test stopped releasing polls".to_owned())
                 .and_then(|()| {
-                    self.polls.fetch_add(1, Ordering::SeqCst);
-                    self.acknowledgements
-                        .lock()
-                        .expect("scripted acknowledgement lock")
-                        .push(acknowledged);
                     self.answers
                         .lock()
                         .expect("scripted answer lock")
@@ -3221,6 +3256,289 @@ mod tests {
             vec![None, None, Some(ResultPacketSequence::new(7))]
         );
     }
+    fn synchronous_await_fixture(
+        pending_eos: bool,
+    ) -> (
+        crate::task_execution::round::TaskRound,
+        crate::task_execution::status_intake::StatusIntakeHandle,
+        Arc<crate::task_execution::clock::ManualClock>,
+        Arc<ScriptedRootResult>,
+    ) {
+        let (mut round, statuses, clock) =
+            crate::task_execution::tests::synchronous_root_control_round();
+        let (release, releases) = std::sync::mpsc::channel();
+        let mut answers = std::collections::VecDeque::new();
+        if pending_eos {
+            answers.push_back(RootResultOutcome::EndOfStreamPending { packet_sequence: 7 });
+        }
+        answers.push_back(RootResultOutcome::AwaitTerminalControl);
+        let transport = Arc::new(ScriptedRootResult {
+            answers: Mutex::new(answers),
+            releases: Mutex::new(releases),
+            polls: AtomicUsize::new(0),
+            acknowledgements: Mutex::new(Vec::new()),
+        });
+        let wake = Arc::new(crate::task_execution::status_intake::CountingWake::default());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = round.root_task();
+        let mut polls = Some(
+            super::RootResultPolls::start(
+                transport.clone(),
+                root,
+                Instant::now() + Duration::from_secs(60),
+                ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT).unwrap(),
+                wake,
+                crate::native::data_runtime::FrontendDataRuntime::new(runtime.handle().clone()),
+            )
+            .unwrap(),
+        );
+        release.send(()).unwrap();
+        if pending_eos {
+            assert!(matches!(
+                answer_within(polls.as_mut().unwrap(), Duration::from_secs(10)),
+                Some(Ok(RootResultOutcome::EndOfStreamPending {
+                    packet_sequence: 7
+                }))
+            ));
+            polls.as_ref().unwrap().acknowledge(7).unwrap();
+            release.send(()).unwrap();
+        }
+        assert!(matches!(
+            answer_within(polls.as_mut().unwrap(), Duration::from_secs(10)),
+            Some(Ok(RootResultOutcome::AwaitTerminalControl))
+        ));
+        // The same production bridge is called by the synchronous match arm.
+        super::suspend_root_result_for_terminal_control(&mut round, root, &mut polls).unwrap();
+        assert!(polls.is_none());
+        assert!(round.execution().result_terminal_control_required());
+        assert!(!round.execution().root_end_of_stream_observed());
+        assert!(!super::synchronous_root_completion_ready(&round));
+        assert!(!round.root_success_sealed());
+        drop(release); // An incorrect extra fetch fails rather than blocking runtime shutdown.
+        drop(runtime); // Joins the stopped producer; no timing-based quiet window.
+        assert_eq!(Arc::strong_count(&transport), 1);
+        assert_eq!(
+            transport.polls.load(Ordering::SeqCst),
+            1 + usize::from(pending_eos)
+        );
+        assert_eq!(
+            *transport.acknowledgements.lock().unwrap(),
+            if pending_eos {
+                vec![None, Some(ResultPacketSequence::new(7))]
+            } else {
+                vec![None]
+            }
+        );
+        (round, statuses, clock, transport)
+    }
+
+    #[test]
+    fn synchronous_await_stops_fetch_and_ack_for_first_or_pending_eos_response() {
+        for pending_eos in [false, true] {
+            let (mut round, _, _, transport) = synchronous_await_fixture(pending_eos);
+            let root = round.root_task();
+            let mut stopped = None;
+            super::suspend_root_result_for_terminal_control(&mut round, root, &mut stopped)
+                .unwrap();
+            assert!(stopped.is_none());
+            assert!(!super::synchronous_root_completion_ready(&round));
+            assert!(!round.execution().root_end_of_stream_observed());
+            assert_eq!(
+                transport.polls.load(Ordering::SeqCst),
+                1 + usize::from(pending_eos)
+            );
+        }
+    }
+
+    #[test]
+    fn synchronous_await_preserves_root_cursor_and_waits_for_child_originator() {
+        use crate::task_execution::status_intake::StatusEvent;
+        use novarocks_execution::task_execution::{TaskOutputFacts, TaskStatus, TaskStatusVersion};
+        for pending_eos in [false, true] {
+            let (mut round, statuses, clock, transport) = synchronous_await_fixture(pending_eos);
+            let root = round.root_task();
+            let peer = TerminationDetail::Aborted(AbortCause::PeerTaskFailed);
+            clock.advance(Duration::from_secs(10));
+            statuses.publish(StatusEvent::Published(
+                TaskStatus::try_new(
+                    root,
+                    TaskStatusVersion::new(3).unwrap(),
+                    TaskState::Aborting,
+                    Some(peer.clone()),
+                    TaskOutputFacts::new(false),
+                )
+                .unwrap(),
+            ));
+            round.turn().unwrap();
+            assert_eq!(round.failure_cause(), Some(&peer));
+            assert!(round.failure_cause().unwrap().is_derived());
+            assert!(
+                super::synchronous_root_failure_cause(&mut round, root, &mut None)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!super::synchronous_root_completion_ready(&round));
+            clock.advance(Duration::from_secs(19));
+            let root_terminal = TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(4).unwrap(),
+                TaskState::Aborted,
+                Some(peer.clone()),
+                TaskOutputFacts::new(false),
+            )
+            .unwrap();
+            statuses.publish(StatusEvent::Published(root_terminal.clone()));
+            round.turn().unwrap();
+            let mut stopped = None;
+            super::suspend_root_result_for_terminal_control(&mut round, root, &mut stopped)
+                .unwrap();
+            let child = round
+                .execution()
+                .graph()
+                .tasks()
+                .find(|task| task.identity() != root)
+                .unwrap()
+                .identity();
+            let originator = TerminationDetail::Failed(TaskFailure::new(
+                TaskFailureCategory::Execution,
+                SafeDetail::new("original synchronous upstream length error").unwrap(),
+            ));
+            for (version, state) in [
+                (2, TaskState::Running),
+                (3, TaskState::Failing),
+                (4, TaskState::Failed),
+            ] {
+                statuses.publish(StatusEvent::Published(
+                    TaskStatus::try_new(
+                        child,
+                        TaskStatusVersion::new(version).unwrap(),
+                        state,
+                        (state != TaskState::Running).then_some(originator.clone()),
+                        TaskOutputFacts::new(false),
+                    )
+                    .unwrap(),
+                ));
+            }
+            round.turn().unwrap();
+            assert_eq!(round.failure_cause(), Some(&originator));
+            assert_eq!(
+                super::synchronous_root_failure_cause(&mut round, root, &mut None).unwrap(),
+                Some(originator.clone())
+            );
+            assert_eq!(
+                round.execution().task(root.task_id()).unwrap().status(),
+                Some(&root_terminal)
+            );
+            clock.advance(Duration::from_secs(1));
+            assert!(!round.execution().required_result_terminal_control_expired());
+            assert!(!round.execution().root_end_of_stream_observed());
+            assert!(!super::synchronous_root_completion_ready(&round));
+            assert!(!round.root_success_sealed());
+            assert_eq!(
+                transport.polls.load(Ordering::SeqCst),
+                1 + usize::from(pending_eos)
+            );
+        }
+    }
+
+    #[test]
+    fn synchronous_await_deadline_is_not_renewed_by_finished_root_or_registration() {
+        use crate::task_execution::status_intake::StatusEvent;
+        use novarocks_execution::task_execution::{TaskOutputFacts, TaskStatus, TaskStatusVersion};
+        for pending_eos in [false, true] {
+            for finished in [false, true] {
+                let (mut round, statuses, clock, transport) =
+                    synchronous_await_fixture(pending_eos);
+                let root = round.root_task();
+                if finished {
+                    for (version, state, output) in [
+                        (3, TaskState::Flushing, false),
+                        (4, TaskState::Finished, true),
+                    ] {
+                        statuses.publish(StatusEvent::Published(
+                            TaskStatus::try_new(
+                                root,
+                                TaskStatusVersion::new(version).unwrap(),
+                                state,
+                                None,
+                                TaskOutputFacts::new(output),
+                            )
+                            .unwrap(),
+                        ));
+                    }
+                    round.turn().unwrap();
+                }
+                clock.advance(Duration::from_secs(29));
+                let mut stopped = None;
+                super::suspend_root_result_for_terminal_control(&mut round, root, &mut stopped)
+                    .unwrap();
+                assert!(!round.execution().required_result_terminal_control_expired());
+                assert!(!super::synchronous_root_completion_ready(&round));
+                clock.advance(Duration::from_secs(1));
+                let error = round.turn().unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("required terminal control for revoked root"),
+                    "{error}"
+                );
+                assert!(!round.execution().root_end_of_stream_observed());
+                assert!(!round.root_success_sealed());
+                assert_eq!(
+                    transport.polls.load(Ordering::SeqCst),
+                    1 + usize::from(pending_eos)
+                );
+            }
+        }
+    }
+    #[test]
+    fn synchronous_derived_cause_registers_control_before_any_native_await() {
+        use crate::task_execution::status_intake::StatusEvent;
+        use novarocks_execution::task_execution::{TaskOutputFacts, TaskStatus, TaskStatusVersion};
+        let (mut round, statuses, clock) =
+            crate::task_execution::tests::synchronous_root_control_round();
+        let root = round.root_task();
+        let peer = TerminationDetail::Aborted(AbortCause::PeerTaskFailed);
+        statuses.publish(StatusEvent::Published(
+            TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Aborting,
+                Some(peer.clone()),
+                TaskOutputFacts::new(false),
+            )
+            .unwrap(),
+        ));
+        round.turn().unwrap();
+        let mut polls = None;
+        assert!(
+            super::synchronous_root_failure_cause(&mut round, root, &mut polls)
+                .unwrap()
+                .is_none()
+        );
+        assert!(round.execution().result_terminal_control_required());
+        assert_eq!(round.failure_cause(), Some(&peer));
+        assert!(!super::synchronous_root_completion_ready(&round));
+        clock.advance(Duration::from_secs(29));
+        assert!(
+            super::synchronous_root_failure_cause(&mut round, root, &mut polls)
+                .unwrap()
+                .is_none()
+        );
+        clock.advance(Duration::from_secs(1));
+        assert!(
+            round
+                .turn()
+                .unwrap_err()
+                .to_string()
+                .contains("required terminal control for revoked root")
+        );
+        assert!(!round.execution().root_end_of_stream_observed());
+        assert!(!round.root_success_sealed());
+    }
 }
 
 /// How long the coordinator parks when one turn moved nothing at all.
@@ -3258,6 +3576,7 @@ enum RootResultPoll {
     #[default]
     NotPolledYet,
     NotReady,
+    AwaitTerminalControl,
     Packet(u64),
     EndOfStream(u64),
 }
@@ -3267,6 +3586,9 @@ impl std::fmt::Display for RootResultPoll {
         match self {
             Self::NotPolledYet => formatter.write_str("not polled yet"),
             Self::NotReady => formatter.write_str("not ready"),
+            Self::AwaitTerminalControl => {
+                formatter.write_str("awaiting authoritative terminal control")
+            }
             Self::Packet(sequence) => write!(formatter, "packet {sequence}"),
             Self::EndOfStream(sequence) => write!(formatter, "end of stream at {sequence}"),
         }
@@ -3579,6 +3901,48 @@ fn max_root_result_wait(now: Instant, deadline: Instant) -> MaxWait {
     MaxWait::new(wait).unwrap_or_else(|_| MaxWait::default_for(OperationKind::GetFinalTaskInfo))
 }
 
+/// The synchronous consumer shares TaskRound's exact-root terminal-control
+/// requirement with the asynchronous result pump. It owns no second deadline.
+fn suspend_root_result_for_terminal_control(
+    round: &mut TaskRound,
+    root: TaskIdentity,
+    polls: &mut Option<RootResultPolls>,
+) -> Result<(), crate::task_execution::error::TaskExecutionError> {
+    round
+        .execution_mut()
+        .require_result_terminal_control(root)?;
+    // Dropping the poller stops queued ACKs and the in-flight fetch. Its next
+    // incarnation is prohibited by the same serialized owner fact.
+    *polls = None;
+    Ok(())
+}
+
+/// An originating attempt cause can decide this synchronous consumer. Peer
+/// abort is only a placeholder: freeze delivery and wait on the existing
+/// serialized owner's bounded causal-evidence requirement.
+fn synchronous_root_failure_cause(
+    round: &mut TaskRound,
+    root: TaskIdentity,
+    polls: &mut Option<RootResultPolls>,
+) -> Result<Option<TerminationDetail>, crate::task_execution::error::TaskExecutionError> {
+    match round.failure_cause() {
+        Some(cause) if !cause.is_derived() => Ok(Some(cause.clone())),
+        Some(_) => {
+            if !round.execution().result_terminal_control_required() {
+                suspend_root_result_for_terminal_control(round, root, polls)?;
+            }
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+fn synchronous_root_completion_ready(round: &TaskRound) -> bool {
+    !round.execution().result_terminal_control_required()
+        && round.client_visible_completion()
+        && round.covered_observation_ready()
+}
+
 /// One attempt's root result polls, run as an async task beside its owner.
 ///
 /// A poll asks the root task's backend to hold the request until it has
@@ -3637,23 +4001,19 @@ impl RootResultPolls {
                         max_result_bytes,
                     )
                     .await;
-                let expected_acknowledgement = match &answer {
-                    Ok(
-                        RootResultOutcome::Ready(packet)
-                    ) => Some(packet.packet_sequence()),
-                    Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) => {
-                        Some(ResultPacketSequence::new(*packet_sequence))
+                let (last, expected_acknowledgement) = match &answer {
+                    Ok(RootResultOutcome::Ready(packet)) => {
+                        (false, Some(packet.packet_sequence()))
                     }
-                    _ => None,
+                    Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) => {
+                        (false, Some(ResultPacketSequence::new(*packet_sequence)))
+                    }
+                    Ok(RootResultOutcome::NotReady) => (false, None),
+                    Ok(RootResultOutcome::AwaitTerminalControl)
+                    | Ok(RootResultOutcome::EndOfStream { .. })
+                    | Ok(RootResultOutcome::Failed(_))
+                    | Err(_) => (true, None),
                 };
-                let last = !matches!(
-                    &answer,
-                    Ok(
-                        RootResultOutcome::Ready(_)
-                            | RootResultOutcome::NotReady
-                            | RootResultOutcome::EndOfStreamPending { .. }
-                    )
-                );
                 if sender.send(answer).await.is_err() {
                     break;
                 }

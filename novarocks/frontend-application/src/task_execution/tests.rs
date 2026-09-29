@@ -9461,3 +9461,158 @@ pub(crate) fn covered_loopback_recovery_round() -> (
     round.turn().unwrap(); // Issue the exact Context Quiesce before its receipt.
     (round, clock, context, missing)
 }
+
+#[test]
+fn revoked_result_control_uses_one_deadline_even_without_eos_or_after_root_finished() {
+    for finished in [false, true] {
+        let harness = Harness::new(&[0], &[1], 64);
+        let clock = Arc::clone(&harness.clock);
+        let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+        let source = round.take_root_status_source().unwrap();
+        for create in &creates {
+            acks.publish(accepted_create_ack(create));
+        }
+        round.turn().unwrap();
+        let root = round.root_task();
+        if finished {
+            for (version, state, output) in [
+                (2, TaskState::Running, false),
+                (3, TaskState::Flushing, false),
+                (4, TaskState::Finished, true),
+            ] {
+                status.publish(StatusEvent::Published(
+                    TaskStatus::try_new(
+                        root,
+                        TaskStatusVersion::new(version).unwrap(),
+                        state,
+                        None,
+                        TaskOutputFacts::new(output),
+                    )
+                    .unwrap(),
+                ));
+            }
+            round.turn().unwrap();
+        }
+        let mut first = source.begin_terminal_control_request().unwrap();
+        round.turn().unwrap();
+        assert!(first.try_recv().unwrap().is_ok());
+        assert!(round.execution().result_terminal_control_required());
+        assert!(!round.root_success_sealed());
+        let root_context = round.execution().task(root.task_id()).unwrap().context();
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                root_context,
+                crate::native::task_transport::SubscriptionState::BudgetExhausted
+            ),
+            Some(crate::native::task_transport::SubscriptionState::BudgetExhausted)
+        );
+        clock.advance(Duration::from_secs(29));
+        let mut repeated = source.begin_terminal_control_request().unwrap();
+        round.turn().unwrap();
+        assert!(repeated.try_recv().unwrap().is_ok());
+        assert!(!round.execution().required_result_terminal_control_expired());
+        clock.advance(Duration::from_secs(1));
+        let error = round.turn().unwrap_err();
+        assert!(matches!(
+            error,
+            super::error::TaskExecutionError::Schedule(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("required terminal control for revoked root")
+        );
+        assert!(!round.root_success_sealed());
+    }
+}
+
+#[test]
+fn revoked_result_originator_fact_wins_and_success_seal_is_never_allowed() {
+    let harness = Harness::new(&[0], &[1], 64);
+    let clock = Arc::clone(&harness.clock);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let source = round.take_root_status_source().unwrap();
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    round.turn().unwrap();
+    let root = round.root_task();
+    let child = round
+        .execution()
+        .graph()
+        .tasks()
+        .find(|task| task.identity() != root)
+        .unwrap()
+        .identity();
+    let mut registered = source.begin_terminal_control_request().unwrap();
+    round.turn().unwrap();
+    assert!(registered.try_recv().unwrap().is_ok());
+    let failure = TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
+        novarocks_execution::task_execution::TaskFailureCategory::Execution,
+        novarocks_execution::task_execution::SafeDetail::new(
+            "original upstream array length error",
+        )
+        .unwrap(),
+    ));
+    for (version, state) in [
+        (2, TaskState::Running),
+        (3, TaskState::Failing),
+        (4, TaskState::Failed),
+    ] {
+        status.publish(StatusEvent::Published(
+            TaskStatus::try_new(
+                child,
+                TaskStatusVersion::new(version).unwrap(),
+                state,
+                (state != TaskState::Running).then_some(failure.clone()),
+                TaskOutputFacts::new(false),
+            )
+            .unwrap(),
+        ));
+    }
+    round.turn().unwrap();
+    assert_eq!(round.failure_cause(), Some(&failure));
+    clock.advance(Duration::from_secs(30));
+    assert!(!round.execution().required_result_terminal_control_expired());
+    let mut seal = source.begin_success_seal_request().unwrap();
+    round.turn().unwrap();
+    assert!(
+        seal.try_recv()
+            .unwrap()
+            .unwrap_err()
+            .message()
+            .contains("requires terminal control")
+    );
+    assert!(!round.root_success_sealed());
+}
+
+/// A real admitted TaskRound for the synchronous result-consumer controls.
+/// No status or clock owner is replaced by the coordinator test transport.
+pub(crate) fn synchronous_root_control_round() -> (
+    crate::task_execution::round::TaskRound,
+    crate::task_execution::status_intake::StatusIntakeHandle,
+    Arc<ManualClock>,
+) {
+    let harness = Harness::new(&[0], &[1], 64);
+    let clock = Arc::clone(&harness.clock);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    round.turn().unwrap();
+    let root = round.root_task();
+    status.publish(StatusEvent::Published(
+        TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::new(false),
+        )
+        .unwrap(),
+    ));
+    round.turn().unwrap();
+    assert!(round.result_pump_ready());
+    assert!(!round.execution().root_end_of_stream_observed());
+    (round, status, clock)
+}

@@ -651,11 +651,20 @@ impl TaskExecutionRegistry {
         let Some(context) = state.task_index.get(&identity).copied() else {
             return RootResultRoute::UnknownTask;
         };
+        let awaiting_terminal_control = state.contexts.get(&context).is_some_and(|entry| {
+            matches!(
+                entry.state,
+                QueryContextState::Aborting | QueryContextState::TerminalRetained
+            ) && entry.latch.cause().is_some()
+        });
         match self.locate_task_locked(&state, context, identity) {
             TaskLocation::Live => {
                 let live = live_task(&state, context, identity).expect("located live task");
                 if live.prepared.sink_kind() != FragmentSinkKind::Result {
                     return RootResultRoute::NotResultOwner;
+                }
+                if awaiting_terminal_control {
+                    return RootResultRoute::AwaitTerminalControl;
                 }
                 RootResultRoute::Serve(RootResultBinding::new(
                     live.descriptor.fragment_instance_id(),
@@ -665,7 +674,9 @@ impl TaskExecutionRegistry {
             TaskLocation::Creating => RootResultRoute::Creating,
             TaskLocation::Retired => {
                 let retired = retired_task(&state, context, identity).expect("retired task");
-                if retired.result_owner {
+                if retired.result_owner && awaiting_terminal_control {
+                    RootResultRoute::AwaitTerminalControl
+                } else if retired.result_owner {
                     RootResultRoute::TerminalResultOwner(retired.status.state())
                 } else {
                     RootResultRoute::Terminal(retired.status.state())

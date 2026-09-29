@@ -68,6 +68,26 @@ impl NativeIngressOwnership {
     }
 }
 
+/// A real one-slot ingress owner for deterministic adapter cancellation tests.
+#[cfg(test)]
+pub(crate) async fn one_slot_test_ownership() -> (Arc<NativeIngressOwnership>, Arc<Semaphore>) {
+    let gate = Gate::new(1, 0, "ordinary", false, 1024);
+    let arrival = Instant::now();
+    let deadline = arrival + LOCAL_ENTRY_CAP;
+    let permit = gate
+        .acquire(deadline)
+        .await
+        .expect("one available running slot");
+    (
+        Arc::new(NativeIngressOwnership {
+            _permit: permit,
+            arrival,
+            deadline,
+        }),
+        gate.running,
+    )
+}
+
 #[derive(Clone)]
 struct Gate {
     running: Arc<Semaphore>,
