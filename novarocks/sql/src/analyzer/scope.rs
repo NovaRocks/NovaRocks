@@ -112,10 +112,15 @@ impl AnalyzerScope {
         expr: &crate::analysis::TypedExpr,
     ) -> Option<novarocks_types::schema::SqlType> {
         if let crate::analysis::ExprKind::ColumnRef {
-            qualifier, column, ..
+            column_id,
+            qualifier,
+            column,
         } = &expr.kind
         {
-            self.logical_type_for(qualifier.as_deref(), column)
+            self.factory
+                .borrow()
+                .logical_type(*column_id)
+                .or_else(|| self.logical_type_for(qualifier.as_deref(), column))
         } else {
             None
         }
@@ -232,6 +237,18 @@ impl AnalyzerScope {
         col: &ColumnDef,
         id: ColumnId,
     ) {
+        self.factory.borrow_mut().set_logical_type(
+            id,
+            col.logical_type
+                .clone()
+                .filter(|logical| matches!(logical, novarocks_types::schema::SqlType::Json)),
+        );
+        let json_list = matches!(&col.data_type, DataType::List(item)
+            if novarocks_types::logical::logical_type_of_field(item) == Some(novarocks_types::logical::LogicalType::Json))
+            || matches!(&col.logical_type, Some(novarocks_types::schema::SqlType::Array(item)) if **item == novarocks_types::schema::SqlType::Json);
+        self.factory
+            .borrow_mut()
+            .set_json_list_provenance(id, json_list);
         let name_lower = col.name.to_lowercase();
         if let Some(q) = qualifier {
             self.qualified.insert(

@@ -3031,3 +3031,52 @@ fn plan_exists_subquery_expr_is_boolean_colref() {
         "EXISTS subquery_expr must reference the predicate output column"
     );
 }
+
+#[test]
+fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
+    use novarocks_types::logical::{LogicalType, logical_type_of_field};
+    for sql in [
+        "select array_agg(json_object('k',1)) as j, array_agg(cast(json_object('k',1) as varchar)) as s",
+        "select array_agg(json_object('k',1) order by a) as j, array_agg(cast(json_object('k',1) as varchar)) as s from t",
+    ] {
+        let plan = plan_test_query(sql);
+        let (project, aggregate) = root_project_over_aggregate(&plan);
+        let DataType::List(json_item) = &project.items[0].expr.data_type else {
+            panic!("expected JSON List");
+        };
+        let DataType::List(string_item) = &project.items[1].expr.data_type else {
+            panic!("expected STRING List");
+        };
+        assert_eq!(logical_type_of_field(json_item), Some(LogicalType::Json));
+        assert_eq!(logical_type_of_field(string_item), None);
+        let ExprKind::Cast {
+            expr: reference, ..
+        } = &project.items[0].expr.kind
+        else {
+            panic!("expected output adapter");
+        };
+        let ExprKind::ColumnRef { column_id, .. } = reference.kind else {
+            panic!("expected exact aggregate output slot");
+        };
+        let call = aggregate
+            .aggregates
+            .iter()
+            .find(|call| call.output_column_id == column_id)
+            .unwrap();
+        assert_eq!(reference.data_type, call.result_type);
+        assert_eq!(
+            call.result_type,
+            crate::functions::aggregate_result_type(&call.resolved).data_type
+        );
+        let DataType::List(physical_item) = &call.result_type else {
+            panic!("expected physical List");
+        };
+        assert_eq!(logical_type_of_field(physical_item), None);
+        let output = aggregate
+            .output_columns
+            .iter()
+            .find(|output| output.column_id == column_id)
+            .unwrap();
+        assert_eq!(output.data_type, call.result_type);
+    }
+}

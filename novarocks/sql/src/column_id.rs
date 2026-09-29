@@ -85,6 +85,9 @@ pub(crate) struct ColumnMeta {
     pub qualifier: Option<String>,
     pub data_type: DataType,
     pub nullable: bool,
+    /// SQL logical provenance for physically ambiguous scalar carriers.
+    pub logical_type: Option<novarocks_types::schema::SqlType>,
+    pub json_list_provenance: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +131,8 @@ impl ColumnRefFactory {
             qualifier,
             data_type,
             nullable,
+            logical_type: None,
+            json_list_provenance: false,
         });
         id
     }
@@ -146,6 +151,8 @@ impl ColumnRefFactory {
                 qualifier: None,
                 data_type: DataType::Null,
                 nullable: true,
+                logical_type: None,
+                json_list_provenance: false,
             });
         }
     }
@@ -162,6 +169,32 @@ impl ColumnRefFactory {
             self.columns.len()
         );
         &self.columns[(id.0 - 1) as usize]
+    }
+
+    /// Freeze semantic provenance alongside the query-local column identity.
+    pub(crate) fn set_logical_type(
+        &mut self,
+        id: ColumnId,
+        logical_type: Option<novarocks_types::schema::SqlType>,
+    ) {
+        self.get(id);
+        self.columns[(id.0 - 1) as usize].logical_type = logical_type;
+    }
+
+    pub(crate) fn set_json_list_provenance(&mut self, id: ColumnId, proven: bool) {
+        self.get(id);
+        self.columns[(id.0 - 1) as usize].json_list_provenance = proven;
+    }
+
+    pub(crate) fn has_json_list_provenance(&self, id: ColumnId) -> bool {
+        id.0.checked_sub(1)
+            .and_then(|index| self.columns.get(index as usize))
+            .is_some_and(|column| column.json_list_provenance)
+    }
+
+    pub(crate) fn logical_type(&self, id: ColumnId) -> Option<novarocks_types::schema::SqlType> {
+        let index = id.0.checked_sub(1)? as usize;
+        self.columns.get(index)?.logical_type.clone()
     }
 
     /// Return a human-readable display name for the column: `"qualifier.name"`

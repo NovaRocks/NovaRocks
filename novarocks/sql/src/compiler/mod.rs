@@ -1964,6 +1964,104 @@ mod tests {
     }
 
     #[test]
+    fn array_agg_json_semantic_schema_survives_optimizer_and_exact_final_plan() {
+        use arrow::datatypes::DataType;
+        use novarocks_types::logical::{LogicalType, logical_type_of_field};
+        for sql in [
+            "select array_agg(json_object('2:3')) as j, array_agg(cast(json_object('2:3') as varchar)) as s",
+            "with q as (select cast(json_object('k',1) as json) as j) select array_agg(j) as j, array_agg(cast(j as varchar)) as s from q",
+            "select array_sortby([json_object('k',1), json_object('k',2)],[2,1]) as j, array_sortby(cast([json_object('k',1), json_object('k',2)] as array<varchar>),[2,1]) as s",
+            "with q as (select [json_object('k',1),json_object('k',2)] as j) select array_sortby(j,[2,1]) as j, array_sortby(cast(j as array<varchar>),[2,1]) as s from q",
+        ] {
+            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let cancellation = Arc::new(Cancellation::default());
+            let request = SqlAnalyzeRequest::new(
+                SqlStatementInput::sql(sql),
+                SqlCompileIntent::Query,
+                SqlSessionContext {
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: SessionOptimizerSettings::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &catalog_snapshot,
+                crate::functions::builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                control(None, &cancellation),
+            );
+            let optimized = analyze_then_optimize(request)
+                .unwrap()
+                .into_optimized_output()
+                .unwrap();
+            let physical =
+                crate::planner::optimizer_bridge::to_physical_plan(&optimized.optimized_tree)
+                    .unwrap();
+            let plan = crate::planner::distributed::build::lower_final_physical_plan(
+                &physical,
+                novarocks_physical_plan::PlanVersionId::try_new([41; 16]).unwrap(),
+                novarocks_physical_plan::PipelineDopDomain {
+                    min: 1,
+                    max: 8,
+                    requires_power_of_two: true,
+                },
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            let result = plan.result_port().unwrap();
+            assert_eq!(result.fields.len(), 2);
+            let DataType::List(json_item) = &result.fields[0].ty.data_type else {
+                panic!("expected JSON List");
+            };
+            let DataType::List(string_item) = &result.fields[1].ty.data_type else {
+                panic!("expected STRING List");
+            };
+            assert_eq!(logical_type_of_field(json_item), Some(LogicalType::Json));
+            assert_eq!(logical_type_of_field(string_item), None);
+            let field = arrow::datatypes::Field::new(
+                "j",
+                result.fields[0].ty.data_type.clone(),
+                result.fields[0].ty.nullable,
+            );
+            assert!(
+                novarocks_types::FieldRenderSchema::from_field(&field)
+                    .list_item()
+                    .unwrap()
+                    .is_json_value()
+            );
+            let mut aggregate_count = 0;
+            for fragment in plan.fragments().values() {
+                for node in fragment.nodes().values() {
+                    if let novarocks_physical_plan::NodeKind::Aggregate { calls, .. } = &node.kind {
+                        for call in calls {
+                            aggregate_count += 1;
+                            assert_eq!(
+                                call.binding.function.function_id.as_str(),
+                                "builtin.aggregate/array_agg/v1"
+                            );
+                            let DataType::List(item) = &call.binding.function.result_type.data_type
+                            else {
+                                panic!("expected physical aggregate List");
+                            };
+                            assert_eq!(logical_type_of_field(item), None);
+                            let DataType::List(item) = &call.binding.intermediate_type.data_type
+                            else {
+                                panic!("expected physical state List");
+                            };
+                            assert_eq!(logical_type_of_field(item), None);
+                        }
+                    }
+                }
+            }
+            if sql.contains("array_agg") {
+                assert!(aggregate_count >= 1);
+            }
+        }
+    }
+
+    #[test]
     fn sqlx1_kernel_compiles_a_query_without_application_state() {
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);

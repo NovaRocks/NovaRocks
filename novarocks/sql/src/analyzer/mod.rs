@@ -25,6 +25,7 @@ mod helpers;
 mod literal_coercion;
 #[cfg(test)]
 mod load_op_column;
+mod logical_output;
 #[allow(
     dead_code,
     reason = "The T4 typed-query contract flip wires this staged pre-analysis module."
@@ -475,6 +476,29 @@ impl<'a> AnalyzerContext<'a> {
                     dt.clone(),
                     lc.nullable || rc.nullable,
                 );
+                let left_logical = self.factory.borrow().logical_type(lc.column_id);
+                let right_logical = self.factory.borrow().logical_type(rc.column_id);
+                // Only homogeneous semantic domains survive a set-operation output.
+                let logical = if left_logical == right_logical {
+                    left_logical
+                } else if lc.data_type == DataType::Null {
+                    right_logical
+                } else if rc.data_type == DataType::Null {
+                    left_logical
+                } else {
+                    None
+                };
+                self.factory
+                    .borrow_mut()
+                    .set_logical_type(column_id, logical);
+                let left_json_list = self.factory.borrow().has_json_list_provenance(lc.column_id);
+                let right_json_list = self.factory.borrow().has_json_list_provenance(rc.column_id);
+                let json_list = (left_json_list && right_json_list)
+                    || (lc.data_type == DataType::Null && right_json_list)
+                    || (rc.data_type == DataType::Null && left_json_list);
+                self.factory
+                    .borrow_mut()
+                    .set_json_list_provenance(column_id, json_list);
                 output_cols.push(OutputColumn {
                     column_id,
                     name: lc.name.clone(),
@@ -552,6 +576,41 @@ impl<'a> AnalyzerContext<'a> {
             .map(|(i, dt)| {
                 let name = format!("column_{i}");
                 let column_id = self.alloc_column_id(None, name.clone(), dt.clone(), true);
+                let mut all_json = true;
+                let mut saw_json = false;
+                let mut all_json_list = true;
+                let mut saw_json_list = false;
+                for (source_row, typed_row) in values.rows.iter().zip(&resolved_rows) {
+                    let (Some(source), Some(typed)) = (source_row.get(i), typed_row.get(i)) else {
+                        all_json = false;
+                        all_json_list = false;
+                        break;
+                    };
+                    if matches!(
+                        source,
+                        ast::Expr::Literal(ast::Literal {
+                            kind: ast::LiteralKind::Null,
+                            ..
+                        })
+                    ) {
+                        continue;
+                    }
+                    let json = self.logical_output_type(Some(source), typed, &scope)
+                        == Some(novarocks_types::schema::SqlType::Json);
+                    all_json &= json;
+                    saw_json |= json;
+                    let json_list = self.json_list_provenance(Some(source), typed, &scope);
+                    all_json_list &= json_list;
+                    saw_json_list |= json_list;
+                }
+                if all_json && saw_json {
+                    self.factory
+                        .borrow_mut()
+                        .set_logical_type(column_id, Some(novarocks_types::schema::SqlType::Json));
+                }
+                self.factory
+                    .borrow_mut()
+                    .set_json_list_provenance(column_id, all_json_list && saw_json_list);
                 OutputColumn {
                     column_id,
                     name,
@@ -1500,6 +1559,15 @@ impl<'a> AnalyzerContext<'a> {
                             (n, id)
                         }
                     };
+                    let logical_type =
+                        self.logical_output_type(Some(expr), &typed, &effective_scope);
+                    let json_list = self.json_list_provenance(Some(expr), &typed, &effective_scope);
+                    self.factory
+                        .borrow_mut()
+                        .set_logical_type(column_id, logical_type);
+                    self.factory
+                        .borrow_mut()
+                        .set_json_list_provenance(column_id, json_list);
                     output_columns.push(OutputColumn {
                         column_id,
                         name: name.clone(),
@@ -1527,6 +1595,15 @@ impl<'a> AnalyzerContext<'a> {
                             typed.nullable,
                         ),
                     };
+                    let logical_type =
+                        self.logical_output_type(Some(expr), &typed, &effective_scope);
+                    let json_list = self.json_list_provenance(Some(expr), &typed, &effective_scope);
+                    self.factory
+                        .borrow_mut()
+                        .set_logical_type(column_id, logical_type);
+                    self.factory
+                        .borrow_mut()
+                        .set_json_list_provenance(column_id, json_list);
                     output_columns.push(OutputColumn {
                         column_id,
                         name: name.clone(),
