@@ -211,7 +211,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 
 -- query 19
 USE ${case_db};
-select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_float)), 0)) as fingerprint from (
+select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, CAST(0 AS FLOAT))), arr_float)), 0)) as fingerprint from (
   select v1, v2, v6,
   array_agg(v6) over(partition by v1 order by v2) as arr_float
   from t0
@@ -243,7 +243,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 
 -- query 23
 USE ${case_db};
-select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct_float)), 0)) as fingerprint from (
+select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, CAST(0 AS FLOAT))), arr_distinct_float)), 0)) as fingerprint from (
   select v1, v2, v6,
   array_agg(distinct v6) over(partition by v1 order by v2) as arr_distinct_float
   from t0
@@ -275,7 +275,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 
 -- query 27
 USE ${case_db};
-select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by_float)), 0)) as fingerprint from (
+select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, CAST(0 AS FLOAT))), arr_order_by_float)), 0)) as fingerprint from (
   select v1, v2, v6,
   array_agg(v6 order by v2) over(partition by v1 order by v2) as arr_order_by_float
   from t0
@@ -323,7 +323,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 
 -- query 33
 USE ${case_db};
-select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
+select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, CAST(0 AS FLOAT))), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(abs(v6)) over(partition by v1 order by v2) as arr_basic
   from t0
@@ -640,7 +640,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 
 -- query 65
 USE ${case_db};
-select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_float)), 0)) as fingerprint from (
+select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, CAST(0 AS FLOAT))), arr_float)), 0)) as fingerprint from (
   select v1, v2, v6,
   array_agg(v6) over() as arr_float
   from t1
@@ -756,7 +756,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 
 -- query 78
 USE ${case_db};
-select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
+select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, CAST(0 AS FLOAT))), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v6) over(partition by v1 order by v2) as arr_basic
   from t1
