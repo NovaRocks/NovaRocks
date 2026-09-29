@@ -4822,7 +4822,7 @@ mod tests {
             volatility: FunctionVolatility::Immutable,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+            intrinsic_row_error: novarocks_functions::FunctionIntrinsicRowError::NoRowError,
         };
         let selected = FunctionBindingSelection {
             overload: overload.clone(),
@@ -4901,7 +4901,7 @@ mod tests {
         assert!(validate_test_scalar(&catalog, &forged_semantics).is_err());
         let mut forged_intrinsic = function.clone();
         forged_intrinsic.intrinsic_row_error =
-            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise;
+            novarocks_functions::FunctionIntrinsicRowError::MayRaise;
         assert!(validate_test_scalar(&catalog, &forged_intrinsic).is_err());
 
         let mut forged_argument = function.clone();
