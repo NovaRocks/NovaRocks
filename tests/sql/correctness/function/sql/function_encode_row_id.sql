@@ -255,3 +255,11 @@ SELECT FROM_BINARY(ENCODE_SORT_KEY(v1, v2, NULL, v3), 'hex') FROM t1;
 -- @expect_error=unsupported argument type
 USE ${case_db};
 SELECT FROM_BINARY(ENCODE_SORT_KEY(v1, v2, v3, NULL), 'hex') FROM t1;
+
+-- query 55
+-- Input widths are part of the encoding contract; neither is an implicit default.
+USE ${case_db};
+SELECT FROM_BINARY(ENCODE_ROW_ID('', -9223372036854775807, CAST(465254298 AS INT)), 'hex') AS sha_int,
+       FROM_BINARY(ENCODE_ROW_ID('', -9223372036854775807, CAST(465254298 AS BIGINT)), 'hex') AS sha_bigint,
+       FROM_BINARY(ENCODE_SORT_KEY('', -9223372036854775807, CAST(465254298 AS INT)), 'hex') AS sort_int,
+       FROM_BINARY(ENCODE_SORT_KEY('', -9223372036854775807, CAST(465254298 AS BIGINT)), 'hex') AS sort_bigint;
