@@ -2018,4 +2018,25 @@ mod tests {
             .expect_err("sum_map should reject date values");
         assert_eq!(err, "unsupported value type:DATE");
     }
+
+    #[test]
+    fn array_intersection_keeps_string_common_type_for_float_and_datetime() {
+        for scalar in [
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        ] {
+            let scalar_array = list_type(scalar);
+            let string_array = list_type(DataType::Utf8);
+            assert_eq!(
+                infer_array_intersect_return_type(&[scalar_array.clone(), string_array.clone()]),
+                string_array
+            );
+            assert_eq!(
+                infer_array_intersect_return_type(&[string_array.clone(), scalar_array.clone()]),
+                string_array
+            );
+            validate_scalar_function_call("arrays_overlap", &[scalar_array, string_array]).unwrap();
+        }
+    }
 }

@@ -2511,3 +2511,135 @@ fn test_array_metadata() {
     assert_eq!(meta.min_args, 2);
     assert_eq!(meta.max_args, 3);
 }
+
+#[test]
+fn mixed_float_string_overlap_uses_varchar_identity_in_both_argument_orders() {
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let f = arena.push_typed(
+        ExprNode::Literal(LiteralValue::Float64(10.0)),
+        DataType::Float64,
+    );
+    let text = arena.push_typed(
+        ExprNode::Literal(LiteralValue::Utf8("10".into())),
+        DataType::Utf8,
+    );
+    let different_text = arena.push_typed(
+        ExprNode::Literal(LiteralValue::Utf8("10.0".into())),
+        DataType::Utf8,
+    );
+    let floats = arena.push_typed(
+        ExprNode::ArrayExpr { elements: vec![f] },
+        DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+    );
+    let strings = arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: vec![text],
+        },
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+    );
+    let different_strings = arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: vec![different_text],
+        },
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+    );
+    let boolean = common::typed_null(&mut arena, DataType::Boolean);
+    for (left, right, expected) in [
+        (floats, strings, true),
+        (strings, floats, true),
+        (floats, different_strings, false),
+        (different_strings, floats, false),
+    ] {
+        let out = eval_arrays_overlap(&arena, boolean, &[left, right], &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(!out.is_null(0));
+        assert_eq!(out.value(0), expected);
+    }
+    let nested_floats = arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: vec![floats],
+        },
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        ))),
+    );
+    let nested_strings = arena.push_typed(
+        ExprNode::ArrayExpr {
+            elements: vec![strings],
+        },
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ))),
+    );
+    let out =
+        eval_arrays_overlap(&arena, boolean, &[nested_floats, nested_strings], &chunk).unwrap();
+    assert!(
+        out.as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0)
+    );
+}
+
+#[test]
+fn mixed_timestamp_string_intersection_keeps_sql_varchar_text() {
+    use arrow::array::{ArrayRef, TimestampMicrosecondArray};
+    use arrow::datatypes::TimeUnit;
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use novarocks_types::SlotId;
+    let timestamps = ListArray::new(
+        Arc::new(Field::new(
+            "item",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )),
+        OffsetBuffer::new(vec![0_i32, 1, 2, 2].into()),
+        Arc::new(TimestampMicrosecondArray::from(vec![Some(0), Some(0)])) as ArrayRef,
+        Some(NullBuffer::from(vec![true, true, false])),
+    );
+    let strings = ListArray::new(
+        Arc::new(Field::new("item", DataType::Utf8, true)),
+        OffsetBuffer::new(vec![0_i32, 1, 2, 2].into()),
+        Arc::new(StringArray::from(vec![
+            "1970-01-01 00:00:00",
+            "1970-01-01T00:00:00",
+        ])) as ArrayRef,
+        None,
+    );
+    let chunk = null_element_chunk(vec![Arc::new(timestamps), Arc::new(strings)]);
+    let mut arena = ExprArena::default();
+    let timestamps = arena.push_typed(
+        ExprNode::SlotId(SlotId::new(10)),
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ))),
+    );
+    let text_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+    let strings = arena.push_typed(ExprNode::SlotId(SlotId::new(11)), text_type.clone());
+    let output = common::typed_null(&mut arena, text_type);
+    for (left, right) in [(timestamps, strings), (strings, timestamps)] {
+        for batch in [chunk.clone(), chunk.slice(0, 2)] {
+            let out = eval_array_intersect(&arena, output, &[left, right], &batch).unwrap();
+            let out = out.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(out.value_offsets()[..3], [0, 1, 1]);
+            assert_eq!(
+                out.values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "1970-01-01 00:00:00"
+            );
+            if batch.len() == 3 {
+                assert!(out.is_null(2));
+            }
+        }
+    }
+}

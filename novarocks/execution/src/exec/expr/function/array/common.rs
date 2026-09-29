@@ -182,6 +182,19 @@ fn cast_decimal_to_utf8(array: &ArrayRef) -> Result<ArrayRef, String> {
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
 
+/// ARRAY membership already selected its common type. When that type's
+/// leaf is VARCHAR, floating-point and timestamp values must use the same
+/// representation as SQL CAST, including inside nested arrays.
+fn uses_sql_varchar_cast(source: &DataType, target: &DataType) -> bool {
+    match (source, target) {
+        (DataType::Float32 | DataType::Float64 | DataType::Timestamp(_, _), DataType::Utf8) => true,
+        (DataType::List(source), DataType::List(target)) => {
+            uses_sql_varchar_cast(source.data_type(), target.data_type())
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn cast_with_special_rules(
     array: &ArrayRef,
     target_type: &DataType,
@@ -191,6 +204,9 @@ pub(super) fn cast_with_special_rules(
         return Ok(array.clone());
     }
     let casted = match (array.data_type(), target_type) {
+        _ if uses_sql_varchar_cast(array.data_type(), target_type) => {
+            crate::exec::expr::cast::cast_with_special_rules(array, target_type)
+        }
         (DataType::Utf8, DataType::Date32) => cast_utf8_to_date32(array),
         (DataType::Utf8, DataType::Timestamp(_, None)) => {
             cast_utf8_to_timestamp(array, target_type)
@@ -582,5 +598,104 @@ pub(super) fn compare_values_ordered(
             "array ordered compare unsupported type: {:?}",
             other
         )),
+    }
+}
+
+#[cfg(test)]
+mod varchar_coercion_tests {
+    use super::*;
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+
+    #[test]
+    fn floating_array_values_use_sql_cast_text_and_preserve_nulls_and_slices() {
+        for source in [
+            Arc::new(Float32Array::from(vec![
+                Some(10.0),
+                Some(-0.0),
+                Some(1.25),
+                None,
+            ])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                Some(10.0),
+                Some(-0.0),
+                Some(1.25),
+                None,
+            ])) as ArrayRef,
+        ] {
+            for source in [source.clone(), source.slice(1, 3)] {
+                let output =
+                    cast_with_special_rules(&source, &DataType::Utf8, "arrays_overlap").unwrap();
+                let explicit =
+                    crate::exec::expr::cast::cast_with_special_rules(&source, &DataType::Utf8)
+                        .unwrap();
+                assert_eq!(output.to_data(), explicit.to_data());
+                let output = output.as_any().downcast_ref::<StringArray>().unwrap();
+                assert_eq!(
+                    output.iter().collect::<Vec<_>>(),
+                    if source.len() == 4 {
+                        vec![Some("10"), Some("0"), Some("1.25"), None]
+                    } else {
+                        vec![Some("0"), Some("1.25"), None]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn timestamp_array_values_use_sql_datetime_separator_for_every_time_unit() {
+        for source in [
+            Arc::new(TimestampSecondArray::from(vec![Some(0), None])) as ArrayRef,
+            Arc::new(TimestampMillisecondArray::from(vec![Some(0), None])) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(0), None])) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(vec![Some(0), None])) as ArrayRef,
+        ] {
+            let output =
+                cast_with_special_rules(&source, &DataType::Utf8, "array_intersect").unwrap();
+            let explicit =
+                crate::exec::expr::cast::cast_with_special_rules(&source, &DataType::Utf8).unwrap();
+            assert_eq!(output.to_data(), explicit.to_data());
+            let output = output.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(
+                output.iter().collect::<Vec<_>>(),
+                vec![Some("1970-01-01 00:00:00"), None]
+            );
+        }
+    }
+
+    #[test]
+    fn nested_varchar_coercion_preserves_parent_nulls_offsets_and_child_nulls() {
+        let values = Arc::new(Float64Array::from(vec![Some(10.0), Some(1.25), None])) as ArrayRef;
+        let source = Arc::new(ListArray::new(
+            Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Float64,
+                true,
+            )),
+            OffsetBuffer::new(vec![0_i32, 1, 3, 3].into()),
+            values,
+            Some(NullBuffer::from(vec![true, true, false])),
+        )) as ArrayRef;
+        let target = DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )));
+        let output = cast_with_special_rules(&source, &target, "arrays_overlap").unwrap();
+        let explicit = crate::exec::expr::cast::cast_with_special_rules(&source, &target).unwrap();
+        assert_eq!(output.to_data(), explicit.to_data());
+        let output = output.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(output.value_offsets(), &[0, 1, 3, 3]);
+        assert!(output.is_null(2));
+        assert_eq!(
+            output
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("10"), Some("1.25"), None]
+        );
     }
 }
