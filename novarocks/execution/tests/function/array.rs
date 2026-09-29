@@ -1303,6 +1303,14 @@ fn test_array_generate_date_with_unit_arg() {
         ExprNode::Literal(LiteralValue::Utf8("2025-10-05".to_string())),
         DataType::Utf8,
     );
+    let start = arena.push_typed(
+        ExprNode::Cast(start),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+    );
+    let stop = arena.push_typed(
+        ExprNode::Cast(stop),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+    );
     let step = common::literal_i64(&mut arena, 1);
     let unit = arena.push_typed(
         ExprNode::Literal(LiteralValue::Utf8("day".to_string())),
@@ -1339,7 +1347,15 @@ fn test_array_generate_datetime_null_step_errors() {
         ExprNode::Literal(LiteralValue::Utf8("2025-10-05".to_string())),
         DataType::Utf8,
     );
-    let step = common::typed_null(&mut arena, DataType::Null);
+    let start = arena.push_typed(
+        ExprNode::Cast(start),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+    );
+    let stop = arena.push_typed(
+        ExprNode::Cast(stop),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+    );
+    let step = common::typed_null(&mut arena, DataType::Int64);
 
     let err = eval_array_function("array_generate", &arena, expr, &[start, stop, step], &chunk)
         .expect_err("NULL datetime step must error");

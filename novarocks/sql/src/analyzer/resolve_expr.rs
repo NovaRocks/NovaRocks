@@ -1973,6 +1973,11 @@ impl<'a> super::AnalyzerContext<'a> {
             arg_types = args_typed.iter().map(|arg| arg.data_type.clone()).collect();
         }
 
+        if name == "array_generate" {
+            normalize_array_generate_arguments(&mut args_typed, &effective_arg_exprs, func.span)?;
+            arg_types = args_typed.iter().map(|arg| arg.data_type.clone()).collect();
+        }
+
         let needs_statistical_float_args = matches!(
             name.as_str(),
             "corr"
@@ -4160,6 +4165,171 @@ fn compares_element_wise_with_nulls(data_type: &DataType) -> bool {
         DataType::Struct(fields) => fields.iter().any(field_admits_null),
         _ => false,
     }
+}
+
+// Literal classification chooses a type; actual parsing remains an ordinary CAST.
+fn array_generate_literal_temporal_type(value: &str) -> Option<DataType> {
+    let bytes = value.as_bytes();
+    let date_shape = bytes.len() >= 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..10]
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+    if !date_shape || chrono::NaiveDate::parse_from_str(&value[..10], "%Y-%m-%d").is_err() {
+        return None;
+    }
+    if bytes.len() == 10 {
+        return Some(DataType::Date32);
+    }
+    let clock_shape = (bytes.len() == 19 || (21..=26).contains(&bytes.len()))
+        && bytes[10] == b' '
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[11..19]
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 2 || i == 5 || b.is_ascii_digit())
+        && (bytes.len() == 19 || (bytes[19] == b'.' && bytes[20..].iter().all(u8::is_ascii_digit)));
+    if clock_shape && chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f").is_ok() {
+        Some(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        ))
+    } else {
+        None
+    }
+}
+
+fn normalize_array_generate_arguments(
+    args: &mut [TypedExpr],
+    source: &[&ast::Expr],
+    span: Span,
+) -> Result<(), AnalyzeError> {
+    if args.is_empty() || args.len() > 4 {
+        return Err(AnalyzeError::invalid_argument(
+            "array_generate expects 1 to 4 arguments",
+            span,
+        ));
+    }
+    let mut temporal = None;
+    for arg in args.iter().take(2) {
+        let inferred = match &arg.data_type {
+            DataType::Date32 | DataType::Timestamp(_, _) => Some(arg.data_type.clone()),
+            DataType::Utf8 => match &arg.kind {
+                ExprKind::Literal(LiteralValue::String(value)) => {
+                    array_generate_literal_temporal_type(value)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(inferred) = inferred {
+            temporal = Some(match (temporal, inferred) {
+                (Some(DataType::Timestamp(unit, tz)), DataType::Date32) => {
+                    DataType::Timestamp(unit, tz)
+                }
+                (
+                    Some(DataType::Timestamp(left_unit, left_tz)),
+                    DataType::Timestamp(right_unit, right_tz),
+                ) if left_unit != right_unit || left_tz != right_tz => {
+                    return Err(AnalyzeError::unsupported_expression(
+                        "array_generate requires an explicit common DATETIME cast for differing timestamp types",
+                        span,
+                    ));
+                }
+                (_, inferred) => inferred,
+            });
+        }
+    }
+    let Some(mut temporal) = temporal else {
+        if novarocks_type_contract::array_generate_item_type(
+            &args
+                .iter()
+                .map(|arg| arg.data_type.clone())
+                .collect::<Vec<_>>(),
+        )
+        .is_none()
+        {
+            return Err(AnalyzeError::unsupported_expression(
+                "array_generate cannot freeze unanchored temporal or NULL bounds; use explicit DATE or DATETIME casts",
+                span,
+            ));
+        }
+        return Ok(());
+    };
+    if args.len() < 2 {
+        return Err(AnalyzeError::invalid_argument(
+            "array_generate temporal range requires two bounds",
+            span,
+        ));
+    }
+    if args.len() >= 3 && !is_integer_const_literal(source[2]) {
+        return Err(AnalyzeError::invalid_argument(
+            "array_generate requires step parameter must be a constant integer",
+            source[2].span(),
+        ));
+    }
+    let unit = if args.len() == 4 {
+        match &args[3].kind {
+            ExprKind::Literal(LiteralValue::String(unit)) => unit.to_ascii_lowercase(),
+            _ => {
+                return Err(AnalyzeError::unsupported_expression(
+                    "array_generate requires a constant temporal unit",
+                    source[3].span(),
+                ));
+            }
+        }
+    } else {
+        "day".to_string()
+    };
+    if !matches!(
+        unit.as_str(),
+        "year"
+            | "quarter"
+            | "month"
+            | "week"
+            | "day"
+            | "hour"
+            | "minute"
+            | "second"
+            | "millisecond"
+            | "microsecond"
+    ) {
+        return Err(AnalyzeError::invalid_argument(
+            format!("array_generate unsupported time unit: {unit}"),
+            span,
+        ));
+    }
+    if temporal == DataType::Date32
+        && matches!(
+            unit.as_str(),
+            "hour" | "minute" | "second" | "millisecond" | "microsecond"
+        )
+    {
+        temporal = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+    }
+    for arg in args.iter_mut().take(2) {
+        let mut input = arg.clone();
+        if !matches!(
+            input.data_type,
+            DataType::Date32 | DataType::Timestamp(_, _) | DataType::Utf8 | DataType::Null
+        ) {
+            if !matches!(input.kind, ExprKind::Literal(_)) {
+                return Err(AnalyzeError::unsupported_expression(
+                    "array_generate temporal bounds require temporal values or VARCHAR casts",
+                    span,
+                ));
+            }
+            // Preserve legacy invalid numeric-literal parsing, not epoch-day casts.
+            input = cast_null_preserving_target_type(input, &DataType::Utf8);
+        }
+        let parse_can_fail = input.data_type == DataType::Utf8;
+        *arg = cast_null_preserving_target_type(input, &temporal);
+        arg.nullable |= parse_can_fail;
+    }
+    Ok(())
 }
 
 fn cast_null_preserving_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
@@ -6429,6 +6599,127 @@ mod tests {
                 catalog, database, planner,
             ))
         }
+    }
+
+    #[test]
+    fn array_generate_seals_literal_and_common_temporal_domains() {
+        let timestamp = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+        for (query, expected) in [
+            (
+                "select array_generate('2025-10-01','2025-10-03',interval 1 day)",
+                DataType::Date32,
+            ),
+            (
+                "select array_generate('2025-10-01 14:28:31','2025-10-01 14:28:32.8',interval 500000 microsecond)",
+                timestamp.clone(),
+            ),
+            (
+                "select array_generate(DATE '2025-10-01',DATETIME '2025-10-02 01:00:00',interval 1 day)",
+                timestamp.clone(),
+            ),
+            (
+                "select array_generate(DATETIME '2025-10-02 01:00:00',DATE '2025-10-01',interval 1 day)",
+                timestamp.clone(),
+            ),
+            (
+                "select array_generate(DATE '2025-10-01',DATE '2025-10-02',interval 12 hour)",
+                timestamp,
+            ),
+            (
+                "select array_generate('2025-10-01','abc',1)",
+                DataType::Date32,
+            ),
+            (
+                "select array_generate('2025-10-01',10000,interval 0 day)",
+                DataType::Date32,
+            ),
+            (
+                "select array_generate(NULL,DATE '2025-10-01',1)",
+                DataType::Date32,
+            ),
+        ] {
+            let bound =
+                analyze_projection_expr(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+            let ExprKind::FunctionCall { args, binding, .. } = bound.kind else {
+                panic!("expected sealed call");
+            };
+            let novarocks_functions::FunctionResultType::Scalar(selected) =
+                &binding.resolved().selected.result_type
+            else {
+                panic!("expected scalar selection");
+            };
+            assert_eq!(selected.data_type, bound.data_type);
+            for selected in binding.resolved().selected.argument_types.iter().take(2) {
+                let novarocks_functions::FunctionArgumentType::Value(selected) = selected else {
+                    panic!("expected value bound");
+                };
+                assert_eq!(selected.data_type, expected);
+            }
+            assert_eq!(
+                bound.data_type,
+                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    expected.clone(),
+                    true
+                )))
+            );
+            assert_eq!(args[0].data_type, expected);
+            assert_eq!(args[1].data_type, expected);
+            if query.contains("'abc'") || query.contains("10000") {
+                assert!(args[1].nullable);
+            }
+        }
+    }
+
+    #[test]
+    fn array_generate_rejects_unanchored_or_unfrozen_domains() {
+        for query in [
+            "select array_generate('abc','def',1)",
+            "select array_generate(NULL,NULL,interval 1 day)",
+            "select array_generate(NULL,NULL,1)",
+            "select array_generate('2025-02-30','2025-99-99',1)",
+            "select array_generate('2025-10-01T01:00:00','2025-10-02T01:00:00',1)",
+        ] {
+            assert!(
+                analyze_projection_expr(query)
+                    .unwrap_err()
+                    .contains("cannot freeze"),
+                "{query}"
+            );
+        }
+        assert!(
+            analyze_projection_expr(
+                "select array_generate(DATE '2025-10-01', DATE '2025-10-02',NULL)"
+            )
+            .unwrap_err()
+            .contains("constant integer")
+        );
+    }
+
+    #[test]
+    fn array_generate_anchored_varchar_column_uses_ordinary_cast() {
+        // A real column expression stays explicit: the DATE peer supplies its domain.
+        let bound = analyze_projection_expr_with_catalog(
+            "select array_generate(DATE '2025-10-01',CAST(offset AS VARCHAR),1) from offsets",
+            &BigintOffsetCatalog,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .unwrap();
+        let ExprKind::FunctionCall { args, .. } = bound.kind else {
+            panic!("expected call");
+        };
+        assert!(matches!(
+            args[1].kind,
+            ExprKind::Cast {
+                target: DataType::Date32,
+                ..
+            }
+        ));
+        assert!(args[1].nullable);
+        assert!(analyze_projection_expr_with_catalog(
+            "select array_generate(CAST(offset AS VARCHAR),CAST(offset AS VARCHAR),1) from offsets",
+            &BigintOffsetCatalog, crate::functions::builtin_sql_function_catalog(),
+        ).unwrap_err().contains("cannot freeze"));
     }
 
     #[test]

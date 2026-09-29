@@ -21,6 +21,7 @@
 //! runtime kernels so contract consumers do not acquire those capabilities.
 
 mod arithmetic;
+mod array_generate;
 mod comparison;
 mod function;
 mod largeint;
@@ -30,6 +31,7 @@ pub use arithmetic::{
     ArithmeticOperator, arithmetic_result_type, arithmetic_result_type_with_op,
     canonical_agg_decimal_type, decimal_arithmetic_result_type,
 };
+pub use array_generate::array_generate_item_type;
 pub use comparison::OrderedComparisonAlgorithm;
 pub use function::{
     AggregateStateFormatId, FunctionArgumentEvaluation, FunctionArgumentType,
