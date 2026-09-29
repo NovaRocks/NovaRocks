@@ -396,7 +396,8 @@ CREATE TABLE test_array_sortby (
     array_varchar ARRAY<VARCHAR(100)>,
     array_datetime ARRAY<DATETIME>,
     array_date ARRAY<DATE>,
-    array_json ARRAY<JSON>
+    -- Iceberg persists JSON as STRING; readback has the STRING domain.
+    array_json ARRAY<VARCHAR>
 )
 TBLPROPERTIES ("format-version" = "3");
 
@@ -604,3 +605,9 @@ SELECT array_sortby(array_json, ['{"key":"value1"}', '{"key":"value2"}']) FROM t
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
 USE ${case_db};
 SELECT array_sortby(array_json, ['{"key":"value1"}', '{"key":"value2"}']) FROM test_array_sortby WHERE id = 7;
+
+-- query 80
+-- Parse catalog STRING values explicitly before testing JSON array output.
+USE ${case_db};
+SELECT array_sortby([parse_json(array_json[1]), parse_json(array_json[2])], [1,2]) AS parsed_json_values
+FROM test_array_sortby WHERE id = 1;
