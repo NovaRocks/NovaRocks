@@ -1339,7 +1339,7 @@ fn establish_releasable_context(
             && proto::QueryContextState::try_from(ack.state)
                 == Ok(proto::QueryContextState::Active)
             && ack.termination_cause.is_none()
-            && ack.accepted_domains.len() == 3
+            && ack.accepted_domains.is_empty()
             && lease.sequence == 0
             && lease.requested_valid_for_millis == 30_000
             && lease.effective_valid_for_millis > 0
