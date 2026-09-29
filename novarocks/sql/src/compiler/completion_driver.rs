@@ -1990,7 +1990,7 @@ mod tests {
         sql: &str,
         intent: SqlCompileIntent,
         rows: u64,
-    ) -> SqlCompletedPlan {
+    ) -> crate::compiler::SqlCompletedPlan {
         let catalog = incomplete(
             SqlCompiler::start(
                 request(sql, intent)
