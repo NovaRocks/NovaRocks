@@ -27,6 +27,10 @@ use novarocks_parser::{
 
 use crate::view_iceberg::resolve_external_target_parts;
 use crate::view_service::{DEFAULT_CATALOG, SessionViewKey, StoredView};
+use novarocks_sql::sql_mode::{
+    SqlSemanticSettings, query_sql_semantics, select_sql_semantics,
+    validate_persisted_query_semantics,
+};
 
 type ExternalViewKey = (String, String, String);
 
@@ -34,11 +38,19 @@ pub(crate) fn expand_session_views(
     query: &mut Query,
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
-) {
+    sql_semantics: &SqlSemanticSettings,
+) -> Result<(), String> {
     if registry.is_empty() {
-        return;
+        return Ok(());
     }
-    expand_session_query(query, registry, current_database, &HashSet::new());
+    expand_session_query(
+        query,
+        registry,
+        current_database,
+        &HashSet::new(),
+        sql_semantics,
+    )?;
+    Ok(())
 }
 
 fn expand_session_query(
@@ -46,7 +58,10 @@ fn expand_session_query(
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
     visible_ctes: &HashSet<String>,
-) {
+    sql_semantics: &SqlSemanticSettings,
+) -> Result<(), String> {
+    let settings = query_sql_semantics(sql_semantics, query);
+    let sql_semantics = &settings;
     let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
         let recursive = with_clause.recursive;
@@ -61,7 +76,8 @@ fn expand_session_query(
                 registry,
                 current_database,
                 &cte_visible_ctes,
-            );
+                sql_semantics,
+            )?;
             body_visible_ctes.insert(name);
         }
     }
@@ -70,7 +86,9 @@ fn expand_session_query(
         registry,
         current_database,
         &body_visible_ctes,
-    );
+        sql_semantics,
+    )?;
+    Ok(())
 }
 
 fn expand_session_set_expr(
@@ -78,28 +96,39 @@ fn expand_session_set_expr(
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
     cte_names: &HashSet<String>,
-) {
+    sql_semantics: &SqlSemanticSettings,
+) -> Result<(), String> {
     match expression {
         SetExpr::Select(select) => {
+            let settings = select_sql_semantics(sql_semantics, select);
+            let sql_semantics = &settings;
             for table_with_joins in &mut select.from {
                 expand_session_table_factor(
                     &mut table_with_joins.relation,
                     registry,
                     current_database,
                     cte_names,
-                );
+                    sql_semantics,
+                )?;
                 for join in &mut table_with_joins.joins {
                     expand_session_table_factor(
                         &mut join.relation,
                         registry,
                         current_database,
                         cte_names,
-                    );
+                        sql_semantics,
+                    )?;
                 }
             }
         }
         SetExpr::Query(query) => {
-            expand_session_query(query.as_mut(), registry, current_database, cte_names)
+            expand_session_query(
+                query.as_mut(),
+                registry,
+                current_database,
+                cte_names,
+                sql_semantics,
+            )?;
         }
         SetExpr::SetOperation(operation) => {
             expand_session_set_expr(
@@ -107,16 +136,19 @@ fn expand_session_set_expr(
                 registry,
                 current_database,
                 cte_names,
-            );
+                sql_semantics,
+            )?;
             expand_session_set_expr(
                 operation.right.as_mut(),
                 registry,
                 current_database,
                 cte_names,
-            );
+                sql_semantics,
+            )?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn expand_session_table_factor(
@@ -124,25 +156,27 @@ fn expand_session_table_factor(
     registry: &HashMap<SessionViewKey, StoredView>,
     current_database: &str,
     cte_names: &HashSet<String>,
-) {
+    sql_semantics: &SqlSemanticSettings,
+) -> Result<(), String> {
     match factor {
         TableFactor::Table {
             name, alias, span, ..
         } => {
             let parts = object_name_parts(name);
             if parts.len() == 1 && cte_names.contains(&parts[0].to_ascii_lowercase()) {
-                return;
+                return Ok(());
             }
             let key = match parts.as_slice() {
                 [view] => session_key(DEFAULT_CATALOG, current_database, view),
                 [database, view] => session_key(DEFAULT_CATALOG, database, view),
                 [catalog, database, view] => session_key(catalog, database, view),
-                _ => return,
+                _ => return Ok(()),
             };
             let Some(stored) = registry.get(&key) else {
-                return;
+                return Ok(());
             };
             let mut expanded = stored.query.as_ref().clone();
+            validate_persisted_query_semantics(&expanded, sql_semantics)?;
             qualify_view_body_names(
                 &mut expanded,
                 &stored.definition.resolution.default_catalog,
@@ -153,7 +187,8 @@ fn expand_session_table_factor(
                 registry,
                 &stored.definition.resolution.default_database,
                 &HashSet::new(),
-            );
+                sql_semantics,
+            )?;
             let alias = alias.take().unwrap_or_else(|| TableAlias {
                 name: synthetic_ident(
                     parts.last().cloned().unwrap_or_else(|| key.view.clone()),
@@ -172,7 +207,13 @@ fn expand_session_table_factor(
             };
         }
         TableFactor::Derived { subquery, .. } => {
-            expand_session_query(subquery.as_mut(), registry, current_database, cte_names);
+            expand_session_query(
+                subquery.as_mut(),
+                registry,
+                current_database,
+                cte_names,
+                sql_semantics,
+            )?;
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
@@ -182,18 +223,21 @@ fn expand_session_table_factor(
                 registry,
                 current_database,
                 cte_names,
-            );
+                sql_semantics,
+            )?;
             for join in &mut table_with_joins.joins {
                 expand_session_table_factor(
                     &mut join.relation,
                     registry,
                     current_database,
                     cte_names,
-                );
+                    sql_semantics,
+                )?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn session_key(catalog: &str, database: &str, view: &str) -> SessionViewKey {
@@ -208,9 +252,17 @@ pub(crate) fn expand_external_views(
     engine: &dyn ViewEngine,
     query: &mut Query,
     context: ViewRequestContext<'_>,
+    sql_semantics: &SqlSemanticSettings,
 ) -> Result<(), String> {
     let mut stack = Vec::new();
-    expand_external_query(engine, query, context, &HashSet::new(), &mut stack)
+    expand_external_query(
+        engine,
+        query,
+        context,
+        &HashSet::new(),
+        &mut stack,
+        sql_semantics,
+    )
 }
 
 fn expand_external_query(
@@ -219,7 +271,10 @@ fn expand_external_query(
     context: ViewRequestContext<'_>,
     visible_ctes: &HashSet<String>,
     stack: &mut Vec<ExternalViewKey>,
+    sql_semantics: &SqlSemanticSettings,
 ) -> Result<(), String> {
+    let settings = query_sql_semantics(sql_semantics, query);
+    let sql_semantics = &settings;
     let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
         let recursive = with_clause.recursive;
@@ -235,6 +290,7 @@ fn expand_external_query(
                 context,
                 &cte_visible_ctes,
                 stack,
+                sql_semantics,
             )?;
             body_visible_ctes.insert(name);
         }
@@ -245,6 +301,7 @@ fn expand_external_query(
         context,
         &body_visible_ctes,
         stack,
+        sql_semantics,
     )
 }
 
@@ -254,9 +311,12 @@ fn expand_external_set_expr(
     context: ViewRequestContext<'_>,
     cte_names: &HashSet<String>,
     stack: &mut Vec<ExternalViewKey>,
+    sql_semantics: &SqlSemanticSettings,
 ) -> Result<(), String> {
     match expression {
         SetExpr::Select(select) => {
+            let settings = select_sql_semantics(sql_semantics, select);
+            let sql_semantics = &settings;
             for table_with_joins in &mut select.from {
                 expand_external_table_factor(
                     engine,
@@ -264,6 +324,7 @@ fn expand_external_set_expr(
                     context,
                     cte_names,
                     stack,
+                    sql_semantics,
                 )?;
                 for join in &mut table_with_joins.joins {
                     expand_external_table_factor(
@@ -272,17 +333,37 @@ fn expand_external_set_expr(
                         context,
                         cte_names,
                         stack,
+                        sql_semantics,
                     )?;
                 }
             }
             Ok(())
         }
-        SetExpr::Query(query) => {
-            expand_external_query(engine, query.as_mut(), context, cte_names, stack)
-        }
+        SetExpr::Query(query) => expand_external_query(
+            engine,
+            query.as_mut(),
+            context,
+            cte_names,
+            stack,
+            sql_semantics,
+        ),
         SetExpr::SetOperation(operation) => {
-            expand_external_set_expr(engine, operation.left.as_mut(), context, cte_names, stack)?;
-            expand_external_set_expr(engine, operation.right.as_mut(), context, cte_names, stack)
+            expand_external_set_expr(
+                engine,
+                operation.left.as_mut(),
+                context,
+                cte_names,
+                stack,
+                sql_semantics,
+            )?;
+            expand_external_set_expr(
+                engine,
+                operation.right.as_mut(),
+                context,
+                cte_names,
+                stack,
+                sql_semantics,
+            )
         }
         _ => Ok(()),
     }
@@ -294,6 +375,7 @@ fn expand_external_table_factor(
     context: ViewRequestContext<'_>,
     cte_names: &HashSet<String>,
     stack: &mut Vec<ExternalViewKey>,
+    sql_semantics: &SqlSemanticSettings,
 ) -> Result<(), String> {
     match factor {
         TableFactor::Table {
@@ -332,6 +414,7 @@ fn expand_external_table_factor(
                 ));
             }
             let mut body = parse_external_view_sql(&view, &key)?;
+            validate_persisted_query_semantics(&body, sql_semantics)?;
             qualify_view_body_names(
                 &mut body,
                 &view.definition.resolution.default_catalog,
@@ -348,6 +431,7 @@ fn expand_external_table_factor(
                 },
                 &HashSet::new(),
                 stack,
+                sql_semantics,
             )?;
             stack.pop();
 
@@ -366,9 +450,14 @@ fn expand_external_table_factor(
             };
             Ok(())
         }
-        TableFactor::Derived { subquery, .. } => {
-            expand_external_query(engine, subquery.as_mut(), context, cte_names, stack)
-        }
+        TableFactor::Derived { subquery, .. } => expand_external_query(
+            engine,
+            subquery.as_mut(),
+            context,
+            cte_names,
+            stack,
+            sql_semantics,
+        ),
         TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
@@ -378,6 +467,7 @@ fn expand_external_table_factor(
                 context,
                 cte_names,
                 stack,
+                sql_semantics,
             )?;
             for join in &mut table_with_joins.joins {
                 expand_external_table_factor(
@@ -386,6 +476,7 @@ fn expand_external_table_factor(
                     context,
                     cte_names,
                     stack,
+                    sql_semantics,
                 )?;
             }
             Ok(())

@@ -330,8 +330,13 @@ fn local_view_service_does_not_restore_state_across_process_instances() {
     )
     .expect("local view service must register the view");
     let mut visible = parse_query("SELECT * FROM local_view");
-    host.rewrite_query(&SessionViewEngine, &mut visible, view_context())
-        .expect("the defining process instance must expand its own view");
+    host.rewrite_query(
+        &SessionViewEngine,
+        &mut visible,
+        view_context(),
+        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+    )
+    .expect("the defining process instance must expand its own view");
     assert_eq!(
         print_query(&visible),
         "SELECT * FROM (SELECT 42 AS answer) local_view"
@@ -341,7 +346,12 @@ fn local_view_service_does_not_restore_state_across_process_instances() {
     let reopened = novarocks_query_application::view::QueryViewService::new();
     let mut query = parse_query("SELECT * FROM local_view");
     reopened
-        .rewrite_query(&SessionViewEngine, &mut query, view_context())
+        .rewrite_query(
+            &SessionViewEngine,
+            &mut query,
+            view_context(),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .expect("new process instance must rewrite without the local view");
     assert_eq!(print_query(&query), "SELECT * FROM local_view");
 }

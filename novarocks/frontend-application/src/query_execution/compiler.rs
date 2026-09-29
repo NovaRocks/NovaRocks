@@ -1088,6 +1088,7 @@ fn prepare_explain_query_with_ports(
             current_database,
             connector_context: Some(connector_context),
         },
+        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )?;
 
     // Time-travel refs become synthetic local tables. Ordinary Iceberg refs

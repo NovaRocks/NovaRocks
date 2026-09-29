@@ -336,7 +336,14 @@ fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
     assert_eq!(query_rows(&show), vec!["v1", "v2"]);
 
     let mut query = parse_query("SELECT x.a FROM v1 AS x");
-    service.rewrite_query(&engine, &mut query, ctx).unwrap();
+    service
+        .rewrite_query(
+            &engine,
+            &mut query,
+            ctx,
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
+        .unwrap();
     assert_eq!(
         print_query(&query),
         "SELECT x.a FROM (SELECT * FROM (SELECT 2 AS a) v2) AS x"
@@ -346,14 +353,28 @@ fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
         .try_handle_statement(&engine, "CREATE OR REPLACE VIEW v1 AS SELECT 3 AS a", ctx)
         .unwrap();
     let mut replaced = parse_query("SELECT * FROM v1");
-    service.rewrite_query(&engine, &mut replaced, ctx).unwrap();
+    service
+        .rewrite_query(
+            &engine,
+            &mut replaced,
+            ctx,
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
+        .unwrap();
     assert_eq!(print_query(&replaced), "SELECT * FROM (SELECT 3 AS a) v1");
 
     service
         .try_handle_statement(&engine, "DROP VIEW v1", ctx)
         .unwrap();
     let mut dropped = parse_query("SELECT * FROM v1");
-    service.rewrite_query(&engine, &mut dropped, ctx).unwrap();
+    service
+        .rewrite_query(
+            &engine,
+            &mut dropped,
+            ctx,
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
+        .unwrap();
     assert_eq!(print_query(&dropped), "SELECT * FROM v1");
 }
 
@@ -371,7 +392,12 @@ fn default_catalog_one_two_and_three_part_names_share_session_registry() {
         .unwrap();
     let mut two_part = parse_query("SELECT * FROM db.v");
     service
-        .rewrite_query(&engine, &mut two_part, context(None, "other"))
+        .rewrite_query(
+            &engine,
+            &mut two_part,
+            context(None, "other"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     assert_eq!(print_query(&two_part), "SELECT * FROM (SELECT 1 AS a) v");
 
@@ -388,6 +414,7 @@ fn default_catalog_one_two_and_three_part_names_share_session_registry() {
             &engine,
             &mut one_part,
             context(Some("default_catalog"), "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         )
         .unwrap();
     assert_eq!(
@@ -411,7 +438,12 @@ fn session_view_rewrite_uses_its_frozen_creation_database() {
 
     let mut query = parse_query("SELECT * FROM creation.v");
     service
-        .rewrite_query(&engine, &mut query, context(None, "other"))
+        .rewrite_query(
+            &engine,
+            &mut query,
+            context(None, "other"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     assert_eq!(
         print_query(&query),
@@ -593,13 +625,23 @@ fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
 
     let mut local = parse_query("SELECT * FROM local");
     service
-        .rewrite_query(&engine, &mut local, context(Some("ice"), "db"))
+        .rewrite_query(
+            &engine,
+            &mut local,
+            context(Some("ice"), "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     assert_eq!(print_query(&local), "SELECT * FROM (SELECT 7 AS a) local");
 
     let mut nested = parse_query("SELECT * FROM nested");
     service
-        .rewrite_query(&engine, &mut nested, context(Some("ice"), "db"))
+        .rewrite_query(
+            &engine,
+            &mut nested,
+            context(Some("ice"), "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     assert_eq!(
         print_query(&nested),
@@ -608,7 +650,12 @@ fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
 
     let mut cte = parse_query("WITH nested AS (SELECT 3 AS a) SELECT * FROM nested");
     service
-        .rewrite_query(&engine, &mut cte, context(Some("ice"), "db"))
+        .rewrite_query(
+            &engine,
+            &mut cte,
+            context(Some("ice"), "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     assert_eq!(
         print_query(&cte),
@@ -630,7 +677,12 @@ fn session_cte_shadows_a_same_named_session_view() {
 
     let mut query = parse_query("WITH nested AS (SELECT 3 AS a) SELECT * FROM nested");
     service
-        .rewrite_query(&engine, &mut query, context(None, "db"))
+        .rewrite_query(
+            &engine,
+            &mut query,
+            context(None, "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     assert_eq!(
         print_query(&query),
@@ -665,7 +717,12 @@ fn session_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
         let mut query = parse_query(sql);
         let expected = print_query(&query);
         service
-            .rewrite_query(&engine, &mut query, context(None, "db"))
+            .rewrite_query(
+                &engine,
+                &mut query,
+                context(None, "db"),
+                &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            )
             .unwrap();
         assert_eq!(print_query(&query), expected, "input: {sql}");
     }
@@ -700,7 +757,12 @@ fn external_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
         let mut query = parse_query(sql);
         let expected = print_query(&query);
         service
-            .rewrite_query(&engine, &mut query, context(Some("ice"), "db"))
+            .rewrite_query(
+                &engine,
+                &mut query,
+                context(Some("ice"), "db"),
+                &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            )
             .unwrap();
         assert_eq!(print_query(&query), expected, "input: {sql}");
     }
@@ -723,7 +785,12 @@ fn external_view_qualification_preserves_ctes_inside_nested_queries() {
 
     let mut query = parse_query("SELECT * FROM wrapper");
     service
-        .rewrite_query(&engine, &mut query, context(Some("ice"), "db"))
+        .rewrite_query(
+            &engine,
+            &mut query,
+            context(Some("ice"), "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     let rendered = print_query(&query);
     assert!(!rendered.contains("ice.db.nested"), "got: {rendered}");
@@ -773,7 +840,12 @@ fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_control_resu
 
     let mut unchanged = parse_query("SELECT * FROM table_wins JOIN probe_failed ON true");
     service
-        .rewrite_query(&engine, &mut unchanged, context(Some("ice"), "db"))
+        .rewrite_query(
+            &engine,
+            &mut unchanged,
+            context(Some("ice"), "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     assert_eq!(
         print_query(&unchanged),
@@ -783,7 +855,12 @@ fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_control_resu
     let mut cycle = parse_query("SELECT * FROM cycle_a");
     assert_eq!(
         service
-            .rewrite_query(&engine, &mut cycle, context(Some("ice"), "db"))
+            .rewrite_query(
+                &engine,
+                &mut cycle,
+                context(Some("ice"), "db"),
+                &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            )
             .unwrap_err(),
         "circular view reference: ice.db.cycle_a"
     );
@@ -834,7 +911,12 @@ fn local_views_do_not_exist_on_a_new_service_instance() {
         .unwrap();
     let mut visible = parse_query("SELECT * FROM v");
     service
-        .rewrite_query(&engine, &mut visible, context(None, "db"))
+        .rewrite_query(
+            &engine,
+            &mut visible,
+            context(None, "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     assert_eq!(print_query(&visible), "SELECT * FROM (SELECT 1 AS a) v");
     drop(service);
@@ -842,7 +924,12 @@ fn local_views_do_not_exist_on_a_new_service_instance() {
     let restarted = QueryViewService::new();
     let mut absent = parse_query("SELECT * FROM v");
     restarted
-        .rewrite_query(&engine, &mut absent, context(None, "db"))
+        .rewrite_query(
+            &engine,
+            &mut absent,
+            context(None, "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     assert_eq!(
         print_query(&absent),
@@ -871,7 +958,12 @@ fn starrocks_view_sql_uses_the_same_parser_for_local_and_external_views() {
         .unwrap();
     let mut query = parse_query("SELECT * FROM dialect_view");
     service
-        .rewrite_query(&engine, &mut query, context(None, "db"))
+        .rewrite_query(
+            &engine,
+            &mut query,
+            context(None, "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     let rendered = print_query(&query);
     assert!(
@@ -893,11 +985,101 @@ fn starrocks_view_sql_uses_the_same_parser_for_local_and_external_views() {
     // path - now the only durable view mechanism - was never exercised.
     let mut external = parse_query("SELECT * FROM external_dialect_view");
     service
-        .rewrite_query(&engine, &mut external, context(Some("ice"), "db"))
+        .rewrite_query(
+            &engine,
+            &mut external,
+            context(Some("ice"), "db"),
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
         .unwrap();
     let rendered = print_query(&external);
     assert!(
         rendered.contains("first_value(a IGNORE NULLS) OVER ()"),
         "got: {rendered}"
     );
+}
+
+#[test]
+fn view_read_checks_frozen_lexical_semantics_before_expansion() {
+    use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default();
+    let ctx = context(None, "db");
+    service
+        .try_handle_statement(&engine, "CREATE VIEW v AS SELECT 1 AS a", ctx)
+        .unwrap();
+    let modern = SqlSemanticSettings::default();
+    let legacy = modern
+        .clone()
+        .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
+    for sql in [
+        "SELECT * FROM v",
+        "WITH c AS (SELECT * FROM v) SELECT * FROM c",
+        "SELECT * FROM (SELECT * FROM v) d",
+        "SELECT 1 UNION ALL SELECT * FROM v",
+    ] {
+        let mut query = parse_query(sql);
+        assert!(
+            service
+                .rewrite_query(&engine, &mut query, ctx, &legacy)
+                .unwrap_err()
+                .starts_with("Unsupported:")
+        );
+        assert_eq!(
+            print_query(&query),
+            print_query(&parse_query(sql)),
+            "rejected body is never installed"
+        );
+    }
+    for sql in [
+        "SELECT /*+ SET_VAR(sql_mode=32) */ * FROM v",
+        "SELECT /*+ SET_VAR(sql_mode=32) */ * FROM v UNION ALL SELECT /*+ SET_VAR(sql_mode=32) */ * FROM v",
+    ] {
+        let mut query = parse_query(sql);
+        service
+            .rewrite_query(&engine, &mut query, ctx, &legacy)
+            .unwrap();
+        assert!(!print_query(&query).contains("FROM v"));
+    }
+    let mut query = parse_query("SELECT * FROM physical_table");
+    let before = print_query(&query);
+    service
+        .rewrite_query(&engine, &mut query, ctx, &legacy)
+        .unwrap();
+    assert_eq!(print_query(&query), before);
+    let mut query = parse_query("SELECT * FROM v");
+    service
+        .rewrite_query(&engine, &mut query, ctx, &modern)
+        .unwrap();
+    assert!(!print_query(&query).contains("FROM v"));
+    assert_eq!(legacy.sql_mode().assignment(), "GROUP_CONCAT_LEGACY");
+}
+
+#[test]
+fn external_view_read_rejects_stored_legacy_hints_under_modern_caller() {
+    use novarocks_sql::sql_mode::SqlSemanticSettings;
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default().with_rest_catalog("ice");
+    engine.insert_view(
+        ViewTarget {
+            catalog: "ice".to_string(),
+            database: "db".to_string(),
+            view: "legacy_v".to_string(),
+        },
+        "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1 AS a",
+        "db",
+    );
+    let mut query = parse_query("SELECT * FROM legacy_v");
+    let before = print_query(&query);
+    let error = service
+        .rewrite_query(
+            &engine,
+            &mut query,
+            context(Some("ice"), "db"),
+            &SqlSemanticSettings::default(),
+        )
+        .unwrap_err();
+    assert!(error.starts_with("Unsupported:"));
+    assert_eq!(print_query(&query), before);
+    assert!(engine.analyzed_queries.lock().unwrap().is_empty());
 }

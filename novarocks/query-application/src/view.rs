@@ -99,6 +99,7 @@ pub trait ViewService: Send + Sync {
         engine: &dyn ViewEngine,
         query: &mut Query,
         context: ViewRequestContext<'_>,
+        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Result<(), String>;
 
     fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String>;

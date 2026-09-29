@@ -37,6 +37,7 @@ pub fn error_kind_for_domain_code(code: &str) -> Option<ErrorKind> {
         | "sql.admit.merge_unsupported_form"
         | "sql.admit.insert_unsupported_form"
         | "sql.admit.create_table_unsupported_form"
+        | "sql.admit.persisted_definition_semantics_unsupported"
         | "sql.admit.session_global_scope_unsupported"
         | "sql.admit.session_transaction_unsupported"
         | "sql.analyze.unsupported_expression"
@@ -62,6 +63,14 @@ mod manifest_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_definition_semantics_has_explicit_unsupported_wire_mapping() {
+        assert_eq!(
+            error_kind_for_domain_code("sql.admit.persisted_definition_semantics_unsupported"),
+            Some(ErrorKind::ER_NOT_SUPPORTED_YET),
+        );
+    }
 
     #[test]
     fn maps_known_codes_and_rejects_unknown_codes() {

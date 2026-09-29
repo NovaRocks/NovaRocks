@@ -266,6 +266,7 @@ impl FrontendQueryCompiler {
                     current_catalog,
                     current_database,
                     connector_context,
+                    context.execution().sql_semantics(),
                 )?;
                 self.complete_distributed_explain(
                     &query,
@@ -286,6 +287,7 @@ impl FrontendQueryCompiler {
                     current_catalog,
                     current_database,
                     connector_context,
+                    context.execution().sql_semantics(),
                 )?;
                 let catalog_service = query_catalog_service_snapshot(&self.query);
                 let materializer = build_catalog_service_provider(
@@ -376,6 +378,7 @@ impl FrontendQueryCompiler {
                     current_catalog,
                     current_database,
                     connector_context,
+                    context.execution().sql_semantics(),
                 )?;
                 self.complete_distributed_read(
                     &query,
@@ -855,18 +858,21 @@ impl FrontendQueryCompiler {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Result<Query, FrontendQueryCompilerError> {
         let mut prepared = self.prepare_explain_query(
             query,
             current_catalog,
             current_database,
             connector_context,
+            sql_semantics,
         )?;
         novarocks_query_application::system_catalog_rewrite::rewrite_query(
             self.system_tables.facts_port().as_ref(),
             self.system_tables.system_catalog().as_ref(),
             connector_context,
             &mut prepared,
+            sql_semantics,
         )?;
         Ok(prepared)
     }
@@ -877,6 +883,7 @@ impl FrontendQueryCompiler {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Result<Query, FrontendQueryCompilerError> {
         let mut prepared = query.clone();
         self.view.view_service().rewrite_query(
@@ -887,6 +894,7 @@ impl FrontendQueryCompiler {
                 current_database,
                 connector_context: Some(connector_context),
             },
+            sql_semantics,
         )?;
         if has_time_travel_refs(&prepared) {
             rewrite_time_travel_refs(
@@ -917,6 +925,7 @@ impl FrontendQueryCompiler {
             current_catalog,
             current_database,
             connector_context,
+            execution.sql_semantics(),
         )?;
         let planning_start = std::time::Instant::now();
         self.complete_distributed_profile(

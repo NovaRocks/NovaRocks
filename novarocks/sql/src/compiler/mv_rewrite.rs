@@ -2654,6 +2654,17 @@ impl SqlMvRewriteDefinitionFacts {
             .collect()
     }
 
+    pub(super) fn completion_query_semantics_supported(&self) -> bool {
+        // This is the existing default replay policy, not inferred durable
+        // metadata. Visible unsupported hints make this optional candidate
+        // ineligible before completion requests any of its catalog relations.
+        crate::sql_mode::validate_persisted_query_semantics(
+            &self.select_query,
+            &crate::sql_mode::SqlSemanticSettings::default(),
+        )
+        .is_ok()
+    }
+
     pub(super) fn completion_catalog_relations(
         &self,
     ) -> Vec<novarocks_types::naming::TableIdentity> {
@@ -3063,6 +3074,7 @@ pub(crate) fn analyze_candidates(
     functions: &dyn SqlFunctionCatalog,
     optimizer_settings: &crate::optimizer::options::SessionOptimizerSettings,
     control: &crate::compiler::SqlCompileControl,
+    consumer_requires_semantic_snapshot: bool,
 ) -> Result<SqlMvRewriteAnalysis, crate::compiler::SqlCompileError> {
     if !optimizer_settings.mv_rewrite_enabled() {
         return Ok(SqlMvRewriteAnalysis::empty());
@@ -3097,6 +3109,27 @@ pub(crate) fn analyze_candidates(
                 .any(|base| query_fqns.contains(&base.table.fqn()))
         {
             entries.push(SqlMvRewriteAnalysisEntry::Ignored);
+            continue;
+        }
+        // An optional candidate without a captured semantic contract is
+        // ineligible before any analyzer replay; the base query remains valid.
+        if consumer_requires_semantic_snapshot {
+            entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(SqlMvRewriteDiagnostic {
+                mv_id: Some(definition.mv_id),
+                message: "mv rewrite: persisted definition is ineligible under GROUP_CONCAT_LEGACY because its semantic settings are not captured".to_string(),
+            }));
+            continue;
+        }
+        if let Err(error) = crate::sql_mode::validate_persisted_query_semantics(
+            &definition.select_query,
+            &crate::sql_mode::SqlSemanticSettings::default(),
+        ) {
+            entries.push(SqlMvRewriteAnalysisEntry::Diagnostic(
+                SqlMvRewriteDiagnostic {
+                    mv_id: Some(definition.mv_id),
+                    message: format!("mv rewrite: ineligible persisted definition: {error}"),
+                },
+            ));
             continue;
         }
         let Some(_) = definition.selection.as_ref() else {
@@ -3396,6 +3429,64 @@ mod tests {
             panic!("fixture must be a query");
         };
         query.clone()
+    }
+
+    #[test]
+    fn unsupported_consumer_semantics_make_only_mv_candidate_ineligible() {
+        let catalog = CandidateCatalog::new();
+        let (logical, factory) = main_candidate_query(&catalog);
+        let resolutions_before = catalog.resolutions.load(Ordering::Acquire);
+        let analysis = analyze_candidates(
+            &candidate_index(),
+            &catalog,
+            "db",
+            &logical,
+            &factory,
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::optimizer::options::SessionOptimizerSettings::default(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+            true,
+        )
+        .expect("base query is still admissible");
+        assert!(
+            analysis
+                .entries
+                .iter()
+                .all(|entry| !matches!(entry, SqlMvRewriteAnalysisEntry::Candidate(_)))
+        );
+        assert!(analysis.entries.iter().any(|entry| matches!(entry, SqlMvRewriteAnalysisEntry::Diagnostic(d) if d.message.contains("GROUP_CONCAT_LEGACY"))));
+        assert_eq!(
+            catalog.resolutions.load(Ordering::Acquire),
+            resolutions_before,
+            "no unsafe definition analysis or target lookup"
+        );
+    }
+
+    #[test]
+    fn stored_legacy_definition_is_ineligible_before_reanalysis() {
+        let catalog = CandidateCatalog::new();
+        let (logical, factory) = main_candidate_query(&catalog);
+        let resolutions_before = catalog.resolutions.load(Ordering::Acquire);
+        let mut index = candidate_index();
+        index.definitions[0].select_query =
+            test_query("SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM base");
+        let analysis = analyze_candidates(
+            &index,
+            &catalog,
+            "db",
+            &logical,
+            &factory,
+            crate::functions::builtin_sql_function_catalog(),
+            &crate::optimizer::options::SessionOptimizerSettings::default(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+            false,
+        )
+        .unwrap();
+        assert!(analysis.entries.iter().any(|entry| matches!(entry, SqlMvRewriteAnalysisEntry::Diagnostic(d) if d.message.contains("ineligible persisted definition"))));
+        assert_eq!(
+            catalog.resolutions.load(Ordering::Acquire),
+            resolutions_before
+        );
     }
 
     #[test]
@@ -3839,6 +3930,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             &crate::optimizer::options::SessionOptimizerSettings::default(),
             &crate::compiler::SqlCompileControl::unbounded(),
+            false,
         )
         .expect("analyze candidate before statistics freeze");
         assert_eq!(
@@ -3878,6 +3970,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             &crate::optimizer::options::SessionOptimizerSettings::default(),
             &crate::compiler::SqlCompileControl::unbounded(),
+            false,
         )
         .expect("reanalyze candidate for omitted-target check");
         let base_only = crate::planning::dml::DmlStatisticsSnapshot::from_evidence([
@@ -3923,6 +4016,7 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             &crate::optimizer::options::SessionOptimizerSettings::default(),
             &crate::compiler::SqlCompileControl::unbounded(),
+            false,
         )
         .expect("optional MV proof failure must preserve the base query");
         let (prepared, _) = attach_candidate_statistics(

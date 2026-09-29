@@ -1609,6 +1609,11 @@ impl FrontendQuerySession {
         let parsed_statement = state
             .substitute_user_variables(parsed_statement)
             .map_err(|error| internal_error(error.to_string()))?;
+        novarocks_query_application::sql::admission::admit_persisted_definition_semantics(
+            &sql,
+            &parsed_statement,
+            state.sql_semantics(),
+        )?;
         let query_timeout_secs = state.execution_settings().query_timeout_secs();
         let session_deadline = match query_timeout_secs {
             Some(seconds) => Instant::now()

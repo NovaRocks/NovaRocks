@@ -43,12 +43,19 @@ const ADMIT_KILL_DENIED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     status: ErrorCodeStatus::Active,
 };
 
+const ADMIT_PERSISTED_DEFINITION_SEMANTICS_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.persisted_definition_semantics_unsupported"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
 /// Session capability descriptors exported for manifest and wire-mapping checks.
 pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
     ADMIT_SESSION_TRANSACTION_UNSUPPORTED,
     ADMIT_KILL_CONNECTION_UNSUPPORTED,
     ADMIT_KILL_DENIED,
+    ADMIT_PERSISTED_DEFINITION_SEMANTICS_UNSUPPORTED,
 ];
 
 /// Capability failures owned by Query Application SQL admission.
@@ -57,6 +64,7 @@ pub enum SessionAdmitError {
     GlobalScopeUnsupported,
     TransactionUnsupported,
     KillDenied,
+    PersistedDefinitionSemanticsUnsupported,
 }
 
 impl SessionAdmitError {
@@ -65,6 +73,9 @@ impl SessionAdmitError {
             Self::GlobalScopeUnsupported => ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
             Self::TransactionUnsupported => ADMIT_SESSION_TRANSACTION_UNSUPPORTED,
             Self::KillDenied => ADMIT_KILL_DENIED,
+            Self::PersistedDefinitionSemanticsUnsupported => {
+                ADMIT_PERSISTED_DEFINITION_SEMANTICS_UNSUPPORTED
+            }
         }
     }
 
@@ -128,6 +139,10 @@ mod tests {
                 "sql.admit.session_transaction_unsupported",
             ),
             (SessionAdmitError::KillDenied, "sql.admit.kill_denied"),
+            (
+                SessionAdmitError::PersistedDefinitionSemanticsUnsupported,
+                "sql.admit.persisted_definition_semantics_unsupported",
+            ),
         ] {
             let error = kind.to_user_error(
                 "SET GLOBAL query_timeout = 1",

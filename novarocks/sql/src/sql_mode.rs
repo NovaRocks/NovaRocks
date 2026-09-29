@@ -115,7 +115,7 @@ fn sql_mode_key(expression: &ast::Expr) -> bool {
     }
 }
 
-fn select_sql_semantics(
+pub fn select_sql_semantics(
     session: &SqlSemanticSettings,
     select: &ast::Select,
 ) -> SqlSemanticSettings {
@@ -172,6 +172,56 @@ pub fn statement_sql_semantics(
         || session.clone(),
         |query| query_sql_semantics(session, query),
     )
+}
+
+/// Detect unsupported semantics at every actual SELECT, preserving lexical overrides.
+/// A set-operation wrapper has no SELECT of its own; each branch is inspected.
+pub fn query_uses_group_concat_legacy(
+    session: &SqlSemanticSettings,
+    query: &ast::Query,
+) -> Result<bool, crate::analyze_error::AnalyzeError> {
+    struct Detector {
+        settings: SqlSemanticSettings,
+        uses_legacy: bool,
+    }
+    impl Fold for Detector {
+        fn fold_query(&mut self, query: ast::Query) -> ast::Query {
+            let enclosing = self.settings.clone();
+            self.settings = query_sql_semantics(&enclosing, &query);
+            let query = ast::fold_query(self, query);
+            self.settings = enclosing;
+            query
+        }
+        fn fold_select(&mut self, select: ast::Select) -> ast::Select {
+            let enclosing = self.settings.clone();
+            self.settings = select_sql_semantics(&enclosing, &select);
+            self.uses_legacy |= self.settings.sql_mode().group_concat_legacy();
+            let select = ast::fold_select(self, select);
+            self.settings = enclosing;
+            select
+        }
+    }
+    let mut detector = Detector {
+        settings: session.clone(),
+        uses_legacy: false,
+    };
+    detector.fold_query(query.clone());
+    Ok(detector.uses_legacy)
+}
+
+/// A v1 persisted definition owns namespaces but does not capture SQL semantics.
+/// Validate before replay; the caller snapshot is a consumer fact, not metadata
+/// for the definition. Do not infer durable settings from a default here.
+pub fn validate_persisted_query_semantics(
+    query: &ast::Query,
+    caller: &SqlSemanticSettings,
+) -> Result<(), String> {
+    if caller.sql_mode().group_concat_legacy()
+        || query_uses_group_concat_legacy(caller, query).map_err(|error| error.to_string())?
+    {
+        return Err("Unsupported: GROUP_CONCAT_LEGACY is not captured for persisted VIEW or MATERIALIZED VIEW definition replay".to_string());
+    }
+    Ok(())
 }
 
 /// Make separator ownership explicit once, before name/type resolution.
@@ -288,6 +338,51 @@ mod tests {
         let query = normalize_concat_query(query(sql), &semantics(mode));
         let calls = calls(&query);
         crate::analyzer::display_expr_for_test(&ast::Expr::FunctionCall(calls[0].clone()))
+    }
+
+    #[test]
+    fn persisted_definition_detector_respects_actual_select_scopes() {
+        let legacy = semantics("GROUP_CONCAT_LEGACY");
+        let modern = semantics("32");
+        for sql in [
+            "SELECT 1",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "SELECT * FROM (SELECT 1) d",
+            "SELECT 1 UNION ALL SELECT 2",
+        ] {
+            assert!(query_uses_group_concat_legacy(&legacy, &query(sql)).unwrap());
+            assert!(!query_uses_group_concat_legacy(&modern, &query(sql)).unwrap());
+        }
+        for sql in [
+            "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+            "SELECT /*+ SET_VAR(sql_mode=32) */ 1 UNION ALL SELECT /*+ SET_VAR(sql_mode=32) */ 2",
+        ] {
+            assert!(!query_uses_group_concat_legacy(&legacy, &query(sql)).unwrap());
+        }
+        for sql in [
+            "WITH c AS (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1) SELECT * FROM c",
+            "SELECT * FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1) d",
+            "SELECT 1 UNION ALL SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 2",
+            "SELECT (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1)",
+        ] {
+            assert!(query_uses_group_concat_legacy(&modern, &query(sql)).unwrap());
+        }
+    }
+
+    #[test]
+    fn persisted_replay_rejects_legacy_caller_and_stored_legacy_hint() {
+        let modern = semantics("32");
+        let legacy = semantics("GROUP_CONCAT_LEGACY");
+        assert!(validate_persisted_query_semantics(&query("SELECT 1"), &modern).is_ok());
+        assert!(
+            validate_persisted_query_semantics(&query("SELECT 1"), &legacy)
+                .unwrap_err()
+                .starts_with("Unsupported:")
+        );
+        let stored = query("SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1");
+        assert!(validate_persisted_query_semantics(&stored, &modern).is_err());
+        assert_eq!(modern.sql_mode().assignment(), "32");
+        assert_eq!(legacy.sql_mode().assignment(), "GROUP_CONCAT_LEGACY");
     }
 
     #[test]

@@ -777,6 +777,10 @@ pub fn analyze_mv_refresh_input(
     // The public MV-refresh facade still returns String while its frontend
     // owner is outside SQLP-7. Keep the typed parser rejection intact until
     // that boundary; no category is inferred from this message.
+    crate::sql_mode::validate_persisted_query_semantics(
+        &query,
+        &crate::sql_mode::SqlSemanticSettings::default(),
+    )?;
     crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
         .map_err(|error| error.to_string())?;
     let (resolved, _, _) = crate::analyzer::analyze_with_function_catalog(
@@ -964,40 +968,59 @@ use completion_driver::{
 impl SqlCompiler {
     pub fn analyze(request: SqlAnalyzeRequest<'_>) -> Result<SqlAnalyzeOutput, SqlCompileError> {
         request.check_control()?;
-        let (mut logical_plan, mut factory, logical_input) = match &request.statement.kind {
-            SqlStatementInputKind::LogicalPlan { plan, factory } => {
-                (plan.clone(), factory.clone(), true)
-            }
-            _ => {
-                let query = parse_query(&request.statement)?;
-                let catalog = request
-                    .catalog
-                    .ok_or_else(|| {
+        let (mut logical_plan, mut factory, logical_input, consumer_requires_semantic_snapshot) =
+            match &request.statement.kind {
+                SqlStatementInputKind::LogicalPlan { plan, factory } => (
+                    plan.clone(),
+                    factory.clone(),
+                    true,
+                    request
+                        .session
+                        .sql_semantics
+                        .sql_mode()
+                        .group_concat_legacy(),
+                ),
+                _ => {
+                    let query = parse_query(&request.statement)?;
+                    let catalog = request
+                        .catalog
+                        .ok_or_else(|| {
+                            SqlCompileError::InvalidRequest(
+                                "SQL analysis requires a catalog snapshot".to_string(),
+                            )
+                        })?
+                        .planner_table_provider();
+                    let functions = request.function_catalog().ok_or_else(|| {
                         SqlCompileError::InvalidRequest(
-                            "SQL analysis requires a catalog snapshot".to_string(),
+                            "SQL analysis requires a function catalog".to_string(),
                         )
-                    })?
-                    .planner_table_provider();
-                let functions = request.function_catalog().ok_or_else(|| {
-                    SqlCompileError::InvalidRequest(
-                        "SQL analysis requires a function catalog".to_string(),
+                    })?;
+                    let (resolved, ctes, mut factory) =
+                        crate::analyzer::analyze_with_function_catalog_and_sql_semantics(
+                            &query,
+                            catalog,
+                            &request.session.current_database,
+                            functions,
+                            &request.session.sql_semantics,
+                        )
+                        .map_err(SqlCompileError::Analyze)?;
+                    request.check_control()?;
+                    let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
+                        .map_err(SqlCompileError::Compilation)?;
+                    let consumer_requires_semantic_snapshot =
+                        crate::sql_mode::query_uses_group_concat_legacy(
+                            &request.session.sql_semantics,
+                            &query,
+                        )
+                        .map_err(SqlCompileError::Analyze)?;
+                    (
+                        logical_plan,
+                        factory,
+                        false,
+                        consumer_requires_semantic_snapshot,
                     )
-                })?;
-                let (resolved, ctes, mut factory) =
-                    crate::analyzer::analyze_with_function_catalog_and_sql_semantics(
-                        &query,
-                        catalog,
-                        &request.session.current_database,
-                        functions,
-                        &request.session.sql_semantics,
-                    )
-                    .map_err(SqlCompileError::Analyze)?;
-                request.check_control()?;
-                let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
-                    .map_err(SqlCompileError::Compilation)?;
-                (logical_plan, factory, false)
-            }
-        };
+                }
+            };
         request.check_control()?;
 
         if matches!(request.intent, SqlCompileIntent::AnalyzeOnly) {
@@ -1112,6 +1135,7 @@ impl SqlCompiler {
                 functions,
                 &settings,
                 &request.control,
+                consumer_requires_semantic_snapshot,
             )?
         } else {
             mv_rewrite::SqlMvRewriteAnalysis::empty()
@@ -1900,6 +1924,29 @@ mod tests {
             panic!("expected MV analysis query");
         };
         Box::new(query.clone())
+    }
+
+    #[test]
+    fn mv_refresh_rejects_stored_legacy_hint_before_table_analysis() {
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
+        let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            query: mv_analysis_query(
+                "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM missing_table",
+            ),
+            current_database: "db".to_string(),
+            catalog: &catalog,
+            functions: &functions,
+        })
+        .err()
+        .expect("unsupported persisted semantics");
+        assert!(error.starts_with("Unsupported:"));
+        assert!(error.contains("GROUP_CONCAT_LEGACY"));
+        assert!(
+            !error.contains("missing_table"),
+            "guard precedes analyzer table materialization"
+        );
     }
 
     #[test]
