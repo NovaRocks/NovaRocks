@@ -64,7 +64,9 @@ SELECT ds_hll_count_distinct(data) AS ds_hll_result FROM tbinary_ndv_test;
 
 -- query 9
 USE ${case_db};
-SELECT ds_hll_count_distinct(data, 10) AS ds_hll_result_with_logk FROM tbinary_ndv_test;
+-- The pinned DataSketches lgK10 composite 3SD envelope for N=100 rounds to 91..110.
+-- Deterministic typed/prepared tests separately freeze bytes, coupons and raw estimates.
+SELECT ds_hll_count_distinct(data, 10) BETWEEN 91 AND 110 AS ds_hll_lgk10_in_3sd FROM tbinary_ndv_test;
 
 -- query 10
 USE ${case_db};

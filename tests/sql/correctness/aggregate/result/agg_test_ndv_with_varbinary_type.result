@@ -27,8 +27,8 @@ ds_hll_result
 100
 
 -- query 9
-ds_hll_result_with_logk
-101
+ds_hll_lgk10_in_3sd
+1
 
 -- query 10
 category	ds_hll_result

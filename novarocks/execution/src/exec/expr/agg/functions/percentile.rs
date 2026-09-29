@@ -577,3 +577,7 @@ impl AggregateFunction for PercentileAgg {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "weighted_prepared_tests.rs"]
+mod weighted_prepared_tests;

@@ -1100,4 +1100,57 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn bound_ndv_binary_legacy_population_and_overlapping_partials_are_byte_exact() {
+        use arrow::array::BinaryBuilder;
+        // Independently derived from the fixed Murmur64A seed and 14-bit registers:
+        // these 100 value_i byte strings occupy 100 registers, giving
+        // -16384 * ln(1 - 100/16384) = 100.30642325692135, which rounds to 100.
+        for name in ["ndv", "approx_count_distinct"] {
+            let local = bound_hll_kernel(name, DataType::Binary, false);
+            let kernel = &local.entries[0];
+            let (_arena, states) = bound_states(&local, 2);
+            for (index, state) in states.iter().enumerate() {
+                let mut builder = BinaryBuilder::new();
+                // Distinct overlapping halves plus duplicate and NULL inputs.
+                for n in if index == 0 { 1..=75 } else { 26..=100 } {
+                    builder.append_value(format!("value_{n}").as_bytes());
+                }
+                builder.append_value(b"value_50");
+                builder.append_null();
+                let input: ArrayRef = Arc::new(builder.finish());
+                kernel
+                    .update_batch(
+                        &vec![*state; input.len()],
+                        AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
+                    )
+                    .unwrap();
+            }
+            let partial = kernel.build_array(&states, true).unwrap();
+            let payloads = partial.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let input: ArrayRef = Arc::new(BinaryArray::from(vec![
+                Some(payloads.value(0)),
+                Some(payloads.value(1)),
+                Some(payloads.value(0)),
+                None,
+            ]));
+            let merged = bound_hll_kernel(name, DataType::Binary, true);
+            let merged_kernel = &merged.entries[0];
+            let (_merged_arena, merged_states) = bound_states(&merged, 1);
+            merged_kernel
+                .merge_batch(
+                    &vec![merged_states[0]; input.len()],
+                    AggregateInputBatch::try_new(Some(&input), input.len()).unwrap(),
+                )
+                .unwrap();
+            assert_bound_counts(
+                &merged_kernel.build_array(&merged_states, false).unwrap(),
+                &[100],
+            );
+            for state in states {
+                kernel.drop_state(state);
+            }
+            merged_kernel.drop_state(merged_states[0]);
+        }
+    }
 }
