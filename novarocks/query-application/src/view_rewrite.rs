@@ -60,7 +60,7 @@ fn expand_session_query(
     visible_ctes: &HashSet<String>,
     sql_semantics: &SqlSemanticSettings,
 ) -> Result<(), String> {
-    let settings = query_sql_semantics(sql_semantics, query);
+    let settings = query_sql_semantics(sql_semantics, query).map_err(|error| error.to_string())?;
     let sql_semantics = &settings;
     let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
@@ -100,7 +100,8 @@ fn expand_session_set_expr(
 ) -> Result<(), String> {
     match expression {
         SetExpr::Select(select) => {
-            let settings = select_sql_semantics(sql_semantics, select);
+            let settings =
+                select_sql_semantics(sql_semantics, select).map_err(|error| error.to_string())?;
             let sql_semantics = &settings;
             for table_with_joins in &mut select.from {
                 expand_session_table_factor(
@@ -273,7 +274,7 @@ fn expand_external_query(
     stack: &mut Vec<ExternalViewKey>,
     sql_semantics: &SqlSemanticSettings,
 ) -> Result<(), String> {
-    let settings = query_sql_semantics(sql_semantics, query);
+    let settings = query_sql_semantics(sql_semantics, query).map_err(|error| error.to_string())?;
     let sql_semantics = &settings;
     let mut body_visible_ctes = visible_ctes.clone();
     if let Some(with_clause) = query.with.as_mut() {
@@ -315,7 +316,8 @@ fn expand_external_set_expr(
 ) -> Result<(), String> {
     match expression {
         SetExpr::Select(select) => {
-            let settings = select_sql_semantics(sql_semantics, select);
+            let settings =
+                select_sql_semantics(sql_semantics, select).map_err(|error| error.to_string())?;
             let sql_semantics = &settings;
             for table_with_joins in &mut select.from {
                 expand_external_table_factor(

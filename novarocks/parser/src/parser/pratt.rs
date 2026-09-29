@@ -772,10 +772,31 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 span,
             }) => {
                 self.advance();
-                Ok(Expr::UserVariable(UserVariable {
-                    value: self.token_text(span).to_owned(),
-                    span,
-                }))
+                let mut value = self.token_text(span).to_owned();
+                let mut span = span;
+                self.skip_trivia();
+                if matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "@@session" | "@@local" | "@@global"
+                ) && self.current_is_symbol(Symbol::Dot)
+                {
+                    self.advance();
+                    self.skip_trivia();
+                    let Some(token) = self.current().cloned() else {
+                        return Err(self.unexpected("system variable name after '.'"));
+                    };
+                    if !matches!(
+                        token.kind,
+                        TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword(_)
+                    ) {
+                        return Err(self.unexpected("system variable name after '.'"));
+                    }
+                    let name = self.parse_identifier(token.span);
+                    value.push('.');
+                    value.push_str(&name.value);
+                    span = Span::new(span.start(), name.span.end());
+                }
+                Ok(Expr::UserVariable(UserVariable { value, span }))
             }
             Some(Token {
                 kind: TokenKind::Keyword(Keyword::Null),
@@ -2093,6 +2114,34 @@ fn unescape_string(text: &str, quote: char) -> String {
 #[cfg(test)]
 mod tests {
     use crate::{lex, parser::parse_expression, printer::Printer};
+
+    #[test]
+    fn scoped_system_variables_are_single_expressions_with_exact_spans() {
+        for source in [
+            "@@session.decimal_overflow_to_double",
+            "@@LOCAL.decimal_overflow_to_double",
+            "@@global.sql_mode",
+            "@@session.`sql_mode`",
+        ] {
+            let expression = parse_expression(source, &lex(source).unwrap()).unwrap();
+            let crate::ast::Expr::UserVariable(variable) = expression else {
+                panic!("system variable must not become STRUCT field access");
+            };
+            assert_eq!(variable.span, crate::Span::new(0, source.len()));
+            assert_eq!(variable.value, source.replace('`', ""));
+            let printed = Printer::new().expression(&crate::ast::Expr::UserVariable(variable));
+            let reparsed = parse_expression(&printed, &lex(&printed).unwrap()).unwrap();
+            assert!(matches!(reparsed, crate::ast::Expr::UserVariable(_)));
+        }
+        for source in ["@@session.", "@@local.1"] {
+            assert!(parse_expression(source, &lex(source).unwrap()).is_err());
+        }
+        let source = "@user.field";
+        assert!(matches!(
+            parse_expression(source, &lex(source).unwrap()).unwrap(),
+            crate::ast::Expr::Access(_)
+        ));
+    }
 
     #[test]
     fn map_brace_literal_is_a_primary_expression_and_round_trips_in_a_query() {

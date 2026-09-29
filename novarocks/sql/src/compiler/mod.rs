@@ -974,11 +974,12 @@ impl SqlCompiler {
                     plan.clone(),
                     factory.clone(),
                     true,
-                    request
+                    (request
                         .session
                         .sql_semantics
                         .sql_mode()
-                        .group_concat_legacy(),
+                        .group_concat_legacy()
+                        || request.session.sql_semantics.decimal_overflow_to_double()),
                 ),
                 _ => {
                     let query = parse_query(&request.statement)?;
@@ -1012,7 +1013,12 @@ impl SqlCompiler {
                             &request.session.sql_semantics,
                             &query,
                         )
-                        .map_err(SqlCompileError::Analyze)?;
+                        .map_err(SqlCompileError::Analyze)?
+                            || crate::sql_mode::query_uses_decimal_overflow_to_double(
+                                &request.session.sql_semantics,
+                                &query,
+                            )
+                            .map_err(SqlCompileError::Analyze)?;
                     (
                         logical_plan,
                         factory,
