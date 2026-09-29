@@ -719,6 +719,7 @@ const ONE_ARG_AGGREGATES: &[&str] = &[
     "max",
     "min",
     "multi_distinct_sum",
+    "multi_distinct_avg",
     "ndv",
     "percentile_union",
     "sum",
