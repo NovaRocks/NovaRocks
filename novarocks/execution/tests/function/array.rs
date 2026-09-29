@@ -2294,6 +2294,69 @@ fn test_array_sortby_key_null_keeps_source() {
     assert_eq!(values.values(), &[2, 1]);
 }
 
+#[test]
+fn test_array_sortby_sliced_slots_keep_key_nulls_values_nulls_and_ties_separate() {
+    use arrow::datatypes::Int64Type;
+    use novarocks_types::SlotId;
+    // Guard rows force nonzero parent offsets; each output is independently
+    // derived from key tuples, never from the implementation's comparator.
+    let source = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(999)]),
+        Some(vec![Some(10), None, Some(30), Some(40)]),
+        Some(vec![Some(30), Some(10), Some(40), Some(20)]),
+        Some(vec![Some(9), Some(8), Some(7)]),
+        Some(vec![Some(30), Some(10), Some(20)]),
+        None,
+        Some(vec![]),
+        Some(vec![Some(888)]),
+    ])
+    .slice(1, 6);
+    let key1 = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(999)]),
+        Some(vec![Some(2), None, None, Some(1)]),
+        Some(vec![Some(1), Some(1), Some(1), Some(1)]),
+        None,
+        Some(vec![None, None, None]),
+        Some(vec![Some(100)]),
+        Some(vec![]),
+        Some(vec![Some(888)]),
+    ])
+    .slice(1, 6);
+    let key2 = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(999)]),
+        Some(vec![Some(0), Some(2), Some(1), Some(0)]),
+        Some(vec![Some(1), Some(1), Some(1), Some(1)]),
+        Some(vec![Some(3), Some(1), Some(2)]),
+        Some(vec![None, None, None]),
+        Some(vec![Some(100), Some(200)]),
+        Some(vec![]),
+        Some(vec![Some(888)]),
+    ])
+    .slice(1, 6);
+    let chunk = null_element_chunk(vec![Arc::new(source), Arc::new(key1), Arc::new(key2)]);
+    let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+    let mut arena = ExprArena::default();
+    let source = arena.push_typed(ExprNode::SlotId(SlotId::new(10)), list_type.clone());
+    let key1 = arena.push_typed(ExprNode::SlotId(SlotId::new(11)), list_type.clone());
+    let key2 = arena.push_typed(ExprNode::SlotId(SlotId::new(12)), list_type.clone());
+    let expr = common::typed_null(&mut arena, list_type);
+    let out =
+        eval_array_function("array_sortby", &arena, expr, &[source, key1, key2], &chunk).unwrap();
+    let out = out.as_any().downcast_ref::<ListArray>().unwrap();
+    let expected = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(30), None, Some(40), Some(10)]),
+        Some(vec![Some(30), Some(10), Some(40), Some(20)]),
+        Some(vec![Some(8), Some(7), Some(9)]),
+        Some(vec![Some(30), Some(10), Some(20)]),
+        None,
+        Some(vec![]),
+    ]);
+    assert_eq!(out, &expected);
+    // Source NULL suppresses key-size validation; non-NULL source does not.
+    assert!(out.is_null(4));
+    assert_eq!(out.value_length(5), 0);
+}
+
 // ---------------------------------------------------------------------------
 // array_sum tests
 // ---------------------------------------------------------------------------
