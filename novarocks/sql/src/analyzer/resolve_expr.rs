@@ -1964,6 +1964,33 @@ impl<'a> super::AnalyzerContext<'a> {
             (args_typed, arg_types)
         };
 
+        if name == "concat"
+            && args_typed
+                .iter()
+                .any(|arg| is_array_carrier(&arg.data_type))
+        {
+            // CONCAT chooses the array family before implicit string casts.
+            // A scalar contributes one element, including a NULL element;
+            // an existing array contributes its elements and its parent NULL.
+            args_typed = args_typed
+                .into_iter()
+                .map(|arg| {
+                    if is_array_carrier(&arg.data_type) {
+                        Ok(arg)
+                    } else {
+                        resolved_scalar_call_at(
+                            self.function_catalog,
+                            "__array_literal",
+                            vec![arg],
+                            func.span,
+                        )
+                    }
+                })
+                .collect::<Result<Vec<_>, AnalyzeError>>()?;
+            name = "array_concat".to_string();
+            arg_types = args_typed.iter().map(|arg| arg.data_type.clone()).collect();
+        }
+
         let needs_statistical_float_args = matches!(
             name.as_str(),
             "corr"
@@ -4048,8 +4075,18 @@ fn cast_utf8_args(args: &mut [TypedExpr], indexes: &[usize]) -> bool {
     changed
 }
 
+fn is_array_carrier(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+    )
+}
+
 fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> bool {
     match name {
+        // Array CONCAT must already have been normalized by the SQL owner.
+        // A direct typed caller cannot stringify an array to bypass that fact.
+        "concat" if args.iter().any(|arg| is_array_carrier(&arg.data_type)) => false,
         "concat" | "concat_ws" | "group_concat" | "string_agg" => args
             .iter_mut()
             .fold(false, |changed, arg| cast_to_utf8_if_needed(arg) || changed),
@@ -6627,5 +6664,102 @@ mod tests {
             err,
             "try_variant_get type argument must be a string literal"
         );
+    }
+
+    fn assert_array_concat_binding(expression: &crate::analysis::TypedExpr) {
+        let ExprKind::FunctionCall {
+            name,
+            args,
+            binding,
+            ..
+        } = &expression.kind
+        else {
+            panic!("expected bound array_concat");
+        };
+        assert_eq!(name, "array_concat");
+        assert!(matches!(expression.data_type, DataType::List(_)));
+        for (arg, target) in args.iter().zip(&binding.selected.argument_types) {
+            let novarocks_functions::FunctionArgumentType::Value(value) = target else {
+                panic!("array_concat consumes values");
+            };
+            assert_eq!(arg.data_type, value.data_type);
+            assert!(matches!(arg.data_type, DataType::List(_)));
+        }
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("scalar result");
+        };
+        assert_eq!(expression.data_type, result.data_type);
+    }
+
+    #[test]
+    fn concat_array_family_wraps_scalars_before_string_coercion() {
+        for sql in [
+            "select concat('a', cast('[]' as array<string>))",
+            "select concat('a', ['b'], 'c')",
+            "select concat(cast(null as string), ['b'])",
+            "select concat('a', cast(null as array<string>))",
+            "select concat(cast(9223372036854775807 as bigint), cast([1] as array<bigint>))",
+            "select concat(cast('9007199254740993.00' as decimal(20,2)), cast([1] as array<decimal(20,2)>))",
+        ] {
+            let expression = analyze_projection_expr(sql).expect(sql);
+            assert_array_concat_binding(&expression);
+            let ExprKind::FunctionCall { args, .. } = &expression.kind else {
+                unreachable!()
+            };
+            assert!(
+                matches!(&args[0].kind, ExprKind::FunctionCall { name, args, .. }
+                if name == "__array_literal" && args.len() == 1),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn array_map_concat_body_has_nested_array_binding_and_keeps_lambda_identity() {
+        let expression = analyze_projection_expr("select array_map(x -> concat(x, []), ['a','b'])")
+            .expect("higher order array concat");
+        let DataType::List(outer) = &expression.data_type else {
+            panic!("array_map result");
+        };
+        assert!(
+            matches!(outer.data_type(), DataType::List(item) if item.data_type() == &DataType::Utf8)
+        );
+        let ExprKind::FunctionCall { args, .. } = &expression.kind else {
+            panic!("array_map call");
+        };
+        let ExprKind::LambdaFunction { params, body } = &args[0].kind else {
+            panic!("lambda");
+        };
+        assert_array_concat_binding(body);
+        let ExprKind::FunctionCall { args, .. } = &body.kind else {
+            unreachable!()
+        };
+        let ExprKind::FunctionCall { name, args, .. } = &args[0].kind else {
+            panic!("singleton wrapper");
+        };
+        assert_eq!(name, "__array_literal");
+        assert!(
+            matches!(&args[0].kind, ExprKind::LambdaParamRef { slot_id, .. } if *slot_id == params[0].slot_id)
+        );
+    }
+
+    #[test]
+    fn concat_array_incompatible_domain_fails_without_stringification() {
+        let error = analyze_projection_expr("select concat(['a'], map{1:2})")
+            .expect_err("incompatible array item shapes must fail during binding");
+        assert!(error.contains("array_concat"), "{error}");
+        let array = analyze_projection_expr("select ['a']").expect("array argument");
+        assert!(
+            super::bind_scalar_function_call("concat", vec![array]).is_err(),
+            "a direct typed string binding must not stringify an array"
+        );
+    }
+
+    #[test]
+    fn concat_without_an_array_retains_string_binding() {
+        let expression = analyze_projection_expr("select concat('a','b')").expect("string concat");
+        assert_eq!(expression.data_type, DataType::Utf8);
+        assert!(matches!(expression.kind, ExprKind::FunctionCall { name, .. } if name == "concat"));
     }
 }
