@@ -90,6 +90,10 @@ pub(crate) fn create_external_view(
             current_database: &definition.resolution.default_database,
             connector_context: Some(connector_context),
         },
+        // External-view creation uses the same explicit default analysis
+        // policy as analyze_external_view below. This is a consumer policy,
+        // not an inferred semantic snapshot for the persisted definition.
+        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )?;
     let mut columns = engine.analyze_external_view(
         &definition.resolution.default_catalog,
