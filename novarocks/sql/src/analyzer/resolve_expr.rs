@@ -8341,4 +8341,54 @@ mod tests {
             resolved(sql);
         }
     }
+
+    #[test]
+    fn decimal_largeint_add_sub_seal_exact_result_without_operand_retagging() {
+        let largeint = DataType::FixedSizeBinary(16);
+        for op in ["+", "-"] {
+            for reverse in [false, true] {
+                let (left, right) = if reverse {
+                    ("cast(1 as largeint)", "cast(1.25 as decimal(38,15))")
+                } else {
+                    ("cast(1.25 as decimal(38,15))", "cast(1 as largeint)")
+                };
+                let sql = format!("select {left} {op} {right}");
+                let expr = analyze_projection_expr(&sql).unwrap();
+                assert_eq!(expr.data_type, DataType::Decimal256(55, 15));
+                let ExprKind::BinaryOp { left, right, .. } = expr.kind else {
+                    panic!("expected frozen arithmetic");
+                };
+                assert_eq!(
+                    left.data_type,
+                    if reverse {
+                        largeint.clone()
+                    } else {
+                        DataType::Decimal128(38, 15)
+                    }
+                );
+                assert_eq!(
+                    right.data_type,
+                    if reverse {
+                        DataType::Decimal128(38, 15)
+                    } else {
+                        largeint.clone()
+                    }
+                );
+            }
+        }
+        assert_eq!(analyze_projection_expr("select cast(0.000000000000000000000000000000000001 as decimal(38,36)) + cast(1 as largeint)").unwrap().data_type,DataType::Decimal256(76,36));
+        for query in [
+            "select cast(0 as decimal(38,37)) + cast(1 as largeint)",
+            "select cast(1 as decimal(38,15)) * cast(1 as largeint)",
+            "select cast(1 as decimal(38,15)) / cast(1 as largeint)",
+            "select cast(1 as decimal(38,15)) % cast(1 as largeint)",
+        ] {
+            assert!(
+                analyze_projection_expr(query)
+                    .unwrap_err()
+                    .contains("no frozen result rule"),
+                "{query}"
+            );
+        }
+    }
 }

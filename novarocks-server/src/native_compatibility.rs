@@ -332,4 +332,30 @@ mod tests {
                 .contains("disagree on private descriptor digest")
         );
     }
+
+    #[test]
+    fn peer_without_decimal_largeint_pair_rule_has_a_distinct_plan_digest() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
+                .unwrap();
+        // Revision 2 has normalized temporal casts but lacks this exact pair.
+        let legacy = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            [0x41; 32],
+            2,
+        )
+        .unwrap();
+        assert_ne!(
+            current.plan_contract_revision(),
+            legacy.plan_contract_revision()
+        );
+        assert_ne!(
+            current.plan_contract_digest(),
+            legacy.plan_contract_digest()
+        );
+        assert_ne!(current.id(), legacy.id());
+        assert_eq!(current.descriptor_digest(), legacy.descriptor_digest());
+    }
 }
