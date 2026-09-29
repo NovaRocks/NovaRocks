@@ -38,40 +38,48 @@ fn cast_to_i64(array: ArrayRef, arg_name: &str) -> Result<ArrayRef, String> {
     })
 }
 
-fn last_day_of_month(year: i32, month: u32) -> u32 {
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    let first_next = NaiveDate::from_ymd_opt(next_year, next_month, 1).unwrap();
-    (first_next - Duration::days(1)).day()
+fn last_day_of_month(year: i32, month: u32) -> Option<u32> {
+    // Do not construct the following month: December in Chrono's maximum
+    // year is valid even though January in the following year is not.
+    (28..=31)
+        .rev()
+        .find(|day| NaiveDate::from_ymd_opt(year, month, *day).is_some())
 }
 
 fn add_months_to_datetime(dt: NaiveDateTime, months: i32) -> Option<NaiveDateTime> {
     let date = dt.date();
-    let mut year = date.year();
-    let mut month = date.month() as i32 - 1 + months;
-    year += month.div_euclid(12);
-    month = month.rem_euclid(12) + 1;
-    let day = date.day().min(last_day_of_month(year, month as u32));
-    NaiveDate::from_ymd_opt(year, month as u32, day).map(|d| d.and_time(dt.time()))
+    let month_offset = (date.month() as i32 - 1).checked_add(months)?;
+    let year = date.year().checked_add(month_offset.div_euclid(12))?;
+    let month = (month_offset.rem_euclid(12) + 1) as u32;
+    let day = date.day().min(last_day_of_month(year, month)?);
+    NaiveDate::from_ymd_opt(year, month, day).map(|d| d.and_time(dt.time()))
 }
 
-fn add_datetime_unit(dt: NaiveDateTime, step: i64, unit: &str) -> Option<NaiveDateTime> {
-    match unit {
-        "year" => add_months_to_datetime(dt, i32::try_from(step).ok()?.checked_mul(12)?),
-        "quarter" => add_months_to_datetime(dt, i32::try_from(step).ok()?.checked_mul(3)?),
-        "month" => add_months_to_datetime(dt, i32::try_from(step).ok()?),
-        "week" => dt.checked_add_signed(Duration::weeks(step)),
-        "day" => dt.checked_add_signed(Duration::days(step)),
-        "hour" => dt.checked_add_signed(Duration::hours(step)),
-        "minute" => dt.checked_add_signed(Duration::minutes(step)),
-        "second" => dt.checked_add_signed(Duration::seconds(step)),
-        "millisecond" => dt.checked_add_signed(Duration::milliseconds(step)),
+fn add_datetime_unit(dt: NaiveDateTime, step: i64, unit: &str) -> Result<NaiveDateTime, String> {
+    let next = match unit {
+        "year" => i32::try_from(step)
+            .ok()
+            .and_then(|step| step.checked_mul(12))
+            .and_then(|months| add_months_to_datetime(dt, months)),
+        "quarter" => i32::try_from(step)
+            .ok()
+            .and_then(|step| step.checked_mul(3))
+            .and_then(|months| add_months_to_datetime(dt, months)),
+        "month" => i32::try_from(step)
+            .ok()
+            .and_then(|months| add_months_to_datetime(dt, months)),
+        "week" => Duration::try_weeks(step).and_then(|d| dt.checked_add_signed(d)),
+        "day" => Duration::try_days(step).and_then(|d| dt.checked_add_signed(d)),
+        "hour" => Duration::try_hours(step).and_then(|d| dt.checked_add_signed(d)),
+        "minute" => Duration::try_minutes(step).and_then(|d| dt.checked_add_signed(d)),
+        "second" => Duration::try_seconds(step).and_then(|d| dt.checked_add_signed(d)),
+        "millisecond" => Duration::try_milliseconds(step).and_then(|d| dt.checked_add_signed(d)),
+        // Chrono's microsecond constructor is infallible for every i64;
+        // the bounded datetime addition still returns None out of range.
         "microsecond" => dt.checked_add_signed(Duration::microseconds(step)),
-        _ => None,
-    }
+        _ => return Err(format!("array_generate unsupported time unit: {unit}")),
+    };
+    next.ok_or_else(|| format!("array_generate temporal step is out of range for {unit}"))
 }
 
 fn build_datetime_values_array(
@@ -377,9 +385,7 @@ fn eval_array_generate_datetime(
             if current_offset > i32::MAX as i64 {
                 return Err("array_generate offset overflow".to_string());
             }
-            let Some(next) = add_datetime_unit(current, actual_step, unit.as_str()) else {
-                return Err(format!("array_generate unsupported time unit: {}", unit));
-            };
+            let next = add_datetime_unit(current, actual_step, unit.as_str())?;
             if next == current {
                 break;
             }
@@ -682,5 +688,184 @@ mod tests {
             .unwrap_err()
             .contains("requires frozen DATETIME bounds")
         );
+    }
+
+    #[test]
+    fn array_generate_checked_helpers_cover_extreme_units_and_calendar_limits() {
+        let start = NaiveDate::from_ymd_opt(2025, 10, 1)
+            .unwrap()
+            .and_hms_opt(14, 28, 31)
+            .unwrap();
+        for unit in [
+            "year",
+            "quarter",
+            "month",
+            "week",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+        ] {
+            for step in [i64::MAX, i64::MIN] {
+                let error = add_datetime_unit(start, step, unit).unwrap_err();
+                assert!(
+                    error.contains("temporal step is out of range"),
+                    "{unit}: {error}"
+                );
+            }
+        }
+        assert!(add_months_to_datetime(start, i32::MAX).is_none());
+        assert!(add_months_to_datetime(start, i32::MIN).is_none());
+        assert_eq!(last_day_of_month(NaiveDate::MAX.year(), 12), Some(31));
+        assert_eq!(last_day_of_month(NaiveDate::MIN.year(), 1), Some(31));
+        assert_eq!(last_day_of_month(i32::MAX, 12), None);
+        assert_eq!(last_day_of_month(2025, 13), None);
+        let max_november = NaiveDate::from_ymd_opt(NaiveDate::MAX.year(), 11, 30)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let max_december = add_months_to_datetime(max_november, 1).unwrap();
+        assert_eq!(max_december.date().month(), 12);
+        assert_eq!(max_december.date().day(), 30);
+        assert!(
+            add_datetime_unit(max_december, 1, "month")
+                .unwrap_err()
+                .contains("out of range")
+        );
+        assert!(
+            add_datetime_unit(start, 1, "unknown")
+                .unwrap_err()
+                .contains("unsupported time unit")
+        );
+    }
+
+    #[test]
+    fn array_generate_prepared_extreme_steps_error_and_month_clamp_survives() {
+        use crate::exec::chunk::{Chunk, ChunkSchema};
+        use crate::exec::expr::function::FunctionKind;
+        use arrow::datatypes::TimeUnit;
+        use arrow::record_batch::RecordBatch;
+        use novarocks_types::SlotId;
+        let timestamp = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let parse = |s: &str| {
+            NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                .unwrap()
+                .and_utc()
+                .timestamp_micros()
+        };
+        let start = parse("2025-01-31 14:28:31.250000");
+        let end = parse("2025-04-30 14:28:31.250000");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("start", timestamp.clone(), true),
+            Field::new("end", timestamp.clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    None,
+                    Some(start),
+                    Some(end),
+                ])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(end),
+                    Some(end),
+                    Some(start),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let slots = [SlotId::new(1), SlotId::new(2)];
+        let schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
+        let chunk = Chunk::new_with_chunk_schema(batch, schema);
+        let mut arena = ExprArena::default();
+        let left = arena.push_typed(ExprNode::SlotId(slots[0]), timestamp.clone());
+        let right = arena.push_typed(ExprNode::SlotId(slots[1]), timestamp.clone());
+        let dtype = DataType::List(Arc::new(Field::new("item", timestamp, true)));
+        let mut errors = Vec::new();
+        for (step, unit) in [
+            (i64::MAX, "year"),
+            (i64::MAX, "quarter"),
+            (i32::MAX as i64, "month"),
+            (i64::MAX, "week"),
+            (i64::MAX, "day"),
+            (i64::MAX, "hour"),
+            (i64::MAX, "minute"),
+            (i64::MAX, "second"),
+            (i64::MAX, "millisecond"),
+            (i64::MAX, "microsecond"),
+        ] {
+            let step = common::literal_i64(&mut arena, step);
+            let unit = arena.push_typed(
+                ExprNode::Literal(LiteralValue::Utf8(unit.to_string())),
+                DataType::Utf8,
+            );
+            errors.push(arena.push_typed(
+                ExprNode::FunctionCall {
+                    kind: FunctionKind::Array("array_generate"),
+                    args: vec![left, right, step, unit],
+                },
+                dtype.clone(),
+            ));
+        }
+        let step = common::literal_i64(&mut arena, 1);
+        let unit = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("month".to_string())),
+            DataType::Utf8,
+        );
+        let normal = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::Array("array_generate"),
+                args: vec![left, right, step, unit],
+            },
+            dtype,
+        );
+        let frozen = arena.into_immutable().unwrap();
+        let prepared = ExprArena::from_immutable(&frozen);
+        for expr in errors {
+            // NULL row zero is visited first; overflow in the next real row
+            // refuses the whole batch instead of returning partial output.
+            assert!(
+                prepared
+                    .eval(expr, &chunk)
+                    .unwrap_err()
+                    .contains("temporal step is out of range")
+            );
+        }
+        let output = prepared.eval(normal, &chunk).unwrap();
+        let output = output.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(output.is_null(0));
+        for (row, texts) in [
+            (
+                1,
+                vec![
+                    "2025-01-31 14:28:31.250000",
+                    "2025-02-28 14:28:31.250000",
+                    "2025-03-28 14:28:31.250000",
+                    "2025-04-28 14:28:31.250000",
+                ],
+            ),
+            (
+                2,
+                vec![
+                    "2025-04-30 14:28:31.250000",
+                    "2025-03-30 14:28:31.250000",
+                    "2025-02-28 14:28:31.250000",
+                ],
+            ),
+        ] {
+            let values = output.value(row);
+            let values = values
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(
+                values.values().to_vec(),
+                texts.into_iter().map(parse).collect::<Vec<_>>()
+            );
+        }
     }
 }

@@ -97,3 +97,13 @@ SELECT array_generate(3,1) AS default_desc,
 -- @skip_result_check=true
 USE ${case_db};
 DROP TABLE temporal_range;
+
+-- query 15
+-- @expect_error=temporal step is out of range
+USE ${case_db};
+SELECT array_generate(DATE '2025-10-01', DATE '2025-10-02', interval 9223372036854775807 day);
+
+-- query 16
+-- @expect_error=temporal step is out of range
+USE ${case_db};
+SELECT array_generate(DATE '2025-10-01', DATE '2025-10-02', interval 2147483647 month);

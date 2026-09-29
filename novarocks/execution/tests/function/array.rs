@@ -1229,7 +1229,7 @@ fn test_array_generate_one_arg() {
     let chunk = common::chunk_len_1();
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     let expr = common::typed_null(&mut arena, list_type);
-    let stop = common::literal_i64(&mut arena, 3);
+    let stop = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(3)), DataType::Int64);
 
     let out = eval_array_function("array_generate", &arena, expr, &[stop], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
@@ -1243,8 +1243,8 @@ fn test_array_generate_two_args_desc() {
     let chunk = common::chunk_len_1();
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     let expr = common::typed_null(&mut arena, list_type);
-    let start = common::literal_i64(&mut arena, 3);
-    let stop = common::literal_i64(&mut arena, 1);
+    let start = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(3)), DataType::Int64);
+    let stop = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
 
     let out = eval_array_function("array_generate", &arena, expr, &[start, stop], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
@@ -1258,9 +1258,9 @@ fn test_array_generate_three_args_and_empty() {
     let chunk = common::chunk_len_1();
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     let expr = common::typed_null(&mut arena, list_type.clone());
-    let start = common::literal_i64(&mut arena, 1);
-    let stop = common::literal_i64(&mut arena, 5);
-    let step = common::literal_i64(&mut arena, 2);
+    let start = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
+    let stop = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(5)), DataType::Int64);
+    let step = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(2)), DataType::Int64);
 
     let out =
         eval_array_function("array_generate", &arena, expr, &[start, stop, step], &chunk).unwrap();
@@ -1269,9 +1269,9 @@ fn test_array_generate_three_args_and_empty() {
     assert_eq!(values.values(), &[1, 3, 5]);
 
     let expr2 = common::typed_null(&mut arena, list_type);
-    let start2 = common::literal_i64(&mut arena, 3);
-    let stop2 = common::literal_i64(&mut arena, 2);
-    let step2 = common::literal_i64(&mut arena, 1);
+    let start2 = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(3)), DataType::Int64);
+    let stop2 = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(2)), DataType::Int64);
+    let step2 = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
     let out2 = eval_array_function(
         "array_generate",
         &arena,
