@@ -915,6 +915,8 @@ fn scalar_result_nullable(name: &str, request: FunctionBindingRequest<'_>) -> bo
         None => false,
     };
     match name {
+        // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
+        "field" => false,
         // A NULL predicate fails the assertion; successful evaluations are true.
         "assert_true"
         | "mv_group_row_id"
@@ -1370,27 +1372,9 @@ pub(crate) fn dynamic_scalar_data_type(
             },
             _ => DataType::Null,
         },
-        "array_generate" => {
-            let temporal = argument_types.iter().find_map(|data_type| match data_type {
-                DataType::Date32 => Some(DataType::Date32),
-                DataType::Timestamp(unit, timezone) => {
-                    Some(DataType::Timestamp(*unit, timezone.clone()))
-                }
-                _ => None,
-            });
-            list_type(
-                if argument_types.iter().any(|data_type| {
-                    matches!(
-                        data_type,
-                        DataType::Date32 | DataType::Timestamp(_, _) | DataType::Utf8
-                    )
-                }) {
-                    temporal.unwrap_or(DataType::Date32)
-                } else {
-                    DataType::Int64
-                },
-            )
-        }
+        "array_generate" => list_type(novarocks_type_contract::array_generate_item_type(
+            argument_types,
+        )?),
         "array_intersect" => list_type(
             argument_types
                 .iter()
@@ -1532,6 +1516,10 @@ fn bind_dynamic_scalar_result(
 ) -> Result<FunctionValueType, FunctionBindingError> {
     let argument_types = dynamic_argument_data_types(request);
     let mut result = match name {
+        "array_generate" => list_type(
+            novarocks_type_contract::array_generate_item_type(&argument_types)
+                .ok_or(FunctionBindingError::NoMatchingOverload)?,
+        ),
         "array_map" => {
             let Some(FunctionArgument::Lambda { result_type, .. }) = request.arguments.first()
             else {

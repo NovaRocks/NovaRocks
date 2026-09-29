@@ -154,7 +154,8 @@ impl SqlFinalPlanCompileRequest {
         let query = crate::sql_mode::normalize_concat_query(
             super::parse_query(&statement)?,
             &session.sql_semantics,
-        );
+        )
+        .map_err(SqlCompileError::Analyze)?;
         let common = FinalPlanCommon {
             version,
             intent,
@@ -172,6 +173,11 @@ impl SqlFinalPlanCompileRequest {
         // catalog needs so an unrelated candidate cannot fail the base query.
         let consumer_requires_semantic_snapshot =
             crate::sql_mode::query_uses_group_concat_legacy(&common.session.sql_semantics, &query)
+                .map_err(SqlCompileError::Analyze)?
+                || crate::sql_mode::query_uses_decimal_overflow_to_double(
+                    &common.session.sql_semantics,
+                    &query,
+                )
                 .map_err(SqlCompileError::Analyze)?;
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;
@@ -1630,6 +1636,145 @@ mod tests {
         };
         let mut statements = novarocks_parser::parse(
             "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders",
+        )
+        .unwrap();
+        let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
+            panic!("query")
+        };
+        let definition = SqlMvRewriteDefinitionFacts::try_new(
+            91,
+            [11; 32],
+            query,
+            SqlMvDefinitionResolutionContext::try_new("iceberg".to_string(), "db".to_string())
+                .unwrap(),
+            "iceberg".to_string(),
+            Some(novarocks_types::naming::TableIdentity {
+                table: "missing_mv_target".to_string(),
+                ..table.clone()
+            }),
+            vec![
+                SqlMvRewriteSourceOccurrenceFacts::try_new(
+                    SqlMvRelationOccurrenceId::new(0),
+                    table,
+                    "orders".to_string(),
+                    None,
+                    SqlMvRewriteBaseTableFacts::unavailable("no publication".to_string()),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let progress = SqlCompiler::finish(
+            mv,
+            SqlFactBatch::MaterializedViews(Box::from([MaterializedViewFact::observed(
+                &need,
+                Box::from([definition]),
+            )])),
+            &SqlCompileControl::unbounded(),
+        )
+        .expect("stored unsupported candidate must not fail base query");
+        let target_catalog_reads = AtomicUsize::new(0);
+        complete_base_query_with_counters(progress, &discovery_calls, &target_catalog_reads);
+        assert_eq!(
+            discovery_calls.load(Ordering::Acquire),
+            1,
+            "modern discovery policy is unchanged"
+        );
+        assert_eq!(
+            target_catalog_reads.load(Ordering::Acquire),
+            0,
+            "no optional target read before late eligibility diagnostic"
+        );
+    }
+
+    #[test]
+    fn decimal_consumer_never_discovers_optional_mv_definitions() {
+        for (sql, connection_flag) in [
+            ("SELECT order_key FROM orders", true),
+            (
+                "SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders",
+                false,
+            ),
+            (
+                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders",
+                false,
+            ),
+            (
+                "SELECT order_key FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders) d",
+                false,
+            ),
+        ] {
+            let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
+            request.session.sql_semantics = request
+                .session
+                .sql_semantics
+                .clone()
+                .with_decimal_overflow_to_double(connection_flag);
+            let seed = request.try_into_completion().expect("eligible base query");
+            let discovery_calls = AtomicUsize::new(0);
+            let target_catalog_reads = AtomicUsize::new(0);
+            complete_base_query_with_counters(
+                SqlCompiler::start(seed).expect("start base query"),
+                &discovery_calls,
+                &target_catalog_reads,
+            );
+            assert_eq!(
+                discovery_calls.load(Ordering::Acquire),
+                0,
+                "an unrelated bad MV cannot be observed for this query"
+            );
+            assert_eq!(target_catalog_reads.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn decimal_false_overrides_keep_existing_mv_discovery_policy() {
+        for sql in [
+            "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders",
+            "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ order_key FROM orders",
+        ] {
+            let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
+            request.session.sql_semantics = request
+                .session
+                .sql_semantics
+                .clone()
+                .with_decimal_overflow_to_double(true);
+            let compilation =
+                incomplete(SqlCompiler::start(request.try_into_completion().unwrap()).unwrap());
+            assert!(matches!(
+                compilation.needs(),
+                SqlNeedBatch::MaterializedViews(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn stored_decimal_definition_never_requests_optional_target_catalog() {
+        use super::super::mv_rewrite::{
+            SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId,
+            SqlMvRewriteBaseTableFacts, SqlMvRewriteSourceOccurrenceFacts,
+        };
+        let seed = request_with_mv(
+            "SELECT order_key FROM orders",
+            SqlCompileIntent::Query,
+            true,
+        )
+        .try_into_completion()
+        .unwrap();
+        let mv = incomplete(SqlCompiler::start(seed).unwrap());
+        let need = match mv.needs() {
+            SqlNeedBatch::MaterializedViews(needs) => needs[0].clone(),
+            other => panic!("modern query retains MV discovery, got {other:?}"),
+        };
+        let discovery_calls = AtomicUsize::new(0);
+        discovery_calls.fetch_add(1, Ordering::AcqRel);
+        let table = novarocks_types::naming::TableIdentity {
+            catalog: "iceberg".to_string(),
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+        };
+        let mut statements = novarocks_parser::parse(
+            "SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ order_key FROM orders",
         )
         .unwrap();
         let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {

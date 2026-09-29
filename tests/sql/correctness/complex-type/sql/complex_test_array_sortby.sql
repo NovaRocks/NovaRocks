@@ -83,7 +83,7 @@ insert into __row_util_base select generate_series from TABLE(generate_series(0,
 USE ${case_db};
 insert into __row_util_base select * from __row_util_base; -- 2000
 insert into __row_util_base select * from __row_util_base; -- 4000
-insert into __row_util_base select * from __row_util_base; -- 8000
+insert into __row_util_base select * from __row_util_base; -- 8000; all aggregate fingerprints below assert this scaled cardinality.
 
 CREATE TABLE __row_util (
   idx bigint NULL,
@@ -151,7 +151,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 16
@@ -162,7 +162,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 17
@@ -215,7 +215,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 22
@@ -226,7 +226,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 23
@@ -279,7 +279,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 28
@@ -290,7 +290,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 29

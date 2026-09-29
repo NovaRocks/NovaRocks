@@ -1,0 +1,31 @@
+-- query 1
+value
+[30,null,40,10]
+
+-- query 2
+value
+[30,10,20]
+
+-- query 3
+value
+[8,7,9]
+
+-- query 4
+value
+[30,10,40,20]
+
+-- query 5
+value
+NULL
+
+-- query 6
+value
+[]
+
+-- query 7
+value
+[8,7,null]
+
+-- query 9
+row_count	null_key_rows	fingerprint
+26	2	-52114540094

@@ -35,37 +35,46 @@ pub fn admit_persisted_definition_semantics(
     statement: &ParsedStatement,
     session: &novarocks_sql::sql_mode::SqlSemanticSettings,
 ) -> Result<(), QueryServiceError> {
-    let (unsupported, span) = match statement {
-        ParsedStatement::View(ast::ViewStatement::Create(view)) => (
-            novarocks_sql::sql_mode::query_uses_group_concat_legacy(session, &view.query).map_err(
-                |error| QueryServiceError::from_user_error(error.to_user_error(Some(source))),
-            )?,
-            view.span,
-        ),
-        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Create(mv)) => (
-            novarocks_sql::sql_mode::query_uses_group_concat_legacy(session, &mv.query).map_err(
-                |error| QueryServiceError::from_user_error(error.to_user_error(Some(source))),
-            )?,
-            mv.span,
-        ),
-        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Refresh(mv)) => {
-            (session.sql_mode().group_concat_legacy(), mv.span)
+    let definition = match statement {
+        ParsedStatement::View(ast::ViewStatement::Create(view)) => Some(&view.query),
+        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Create(mv)) => {
+            Some(&mv.query)
         }
-        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::ExplainRefresh(mv)) => {
-            (session.sql_mode().group_concat_legacy(), mv.span)
-        }
-        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Alter(mv))
-            if matches!(&mv.action, ast::MaterializedViewAlterAction::Repartition(_)) =>
-        {
-            (session.sql_mode().group_concat_legacy(), mv.span)
-        }
-        _ => return Ok(()),
+        _ => None,
     };
-    if unsupported {
+    let (legacy, numeric) = if let Some(query) = definition {
+        (
+            novarocks_sql::sql_mode::query_uses_group_concat_legacy(session, query).map_err(
+                |error| QueryServiceError::from_user_error(error.to_user_error(Some(source))),
+            )?,
+            novarocks_sql::sql_mode::query_uses_decimal_overflow_to_double(session, query)
+                .map_err(|error| {
+                    QueryServiceError::from_user_error(error.to_user_error(Some(source)))
+                })?,
+        )
+    } else if matches!(
+        statement,
+        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Refresh(_))
+            | ParsedStatement::MaterializedView(ast::MaterializedViewStatement::ExplainRefresh(_))
+    ) || matches!(statement, ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Alter(mv))
+            if matches!(&mv.action, ast::MaterializedViewAlterAction::Repartition(_)))
+    {
+        (
+            session.sql_mode().group_concat_legacy(),
+            session.decimal_overflow_to_double(),
+        )
+    } else {
+        return Ok(());
+    };
+    if legacy || numeric {
+        let message = if numeric {
+            "unsupported semantic setting: decimal_overflow_to_double=true is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"
+        } else {
+            "unsupported semantic setting: GROUP_CONCAT_LEGACY is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"
+        };
         return Err(QueryServiceError::from_user_error(
             crate::sql::session_admit::SessionAdmitError::PersistedDefinitionSemanticsUnsupported
-                .to_user_error(source, span,
-                    "unsupported semantic setting: GROUP_CONCAT_LEGACY is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"),
+                .to_user_error(source, statement.span(), message),
         ));
     }
     Ok(())
@@ -346,5 +355,79 @@ mod tests {
 
         assert!(!requires_lake_publication_deadline(&query));
         assert!(requires_lake_publication_deadline(&dml));
+    }
+    #[test]
+    fn persisted_definition_guard_uses_effective_root_and_nested_settings() {
+        let disabled = novarocks_sql::sql_mode::SqlSemanticSettings::default();
+        let enabled = disabled.clone().with_decimal_overflow_to_double(true);
+        for prefix in [
+            "CREATE VIEW v AS ",
+            "CREATE OR REPLACE VIEW v AS ",
+            "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(v) BUCKETS 1 AS ",
+        ] {
+            for (settings, query, rejected) in [
+                (&disabled, "SELECT 1", false),
+                (&enabled, "SELECT 1", true),
+                (
+                    &disabled,
+                    "SELECT /*+ SET_VAR(decimal_overflow_to_double=1) */ 1",
+                    true,
+                ),
+                (
+                    &enabled,
+                    "SELECT /*+ SET_VAR(decimal_overflow_to_double=0) */ 1",
+                    false,
+                ),
+                (
+                    &disabled,
+                    "SELECT 1 FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double=1) */ 1 x) t",
+                    true,
+                ),
+                (
+                    &enabled,
+                    "SELECT /*+ SET_VAR(decimal_overflow_to_double=0) */ 1 FROM (SELECT 1 x) t",
+                    false,
+                ),
+                (
+                    &disabled,
+                    "WITH t AS (SELECT /*+ SET_VAR(decimal_overflow_to_double=1) */ 1) SELECT 1 FROM t",
+                    true,
+                ),
+                (
+                    &disabled,
+                    "SELECT 1 UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=1) */ 1",
+                    true,
+                ),
+            ] {
+                let sql = format!("{prefix}{query}");
+                let statement = parse_single_statement(&sql).unwrap();
+                let result = admit_persisted_definition_semantics(&sql, &statement, settings);
+                assert_eq!(result.is_err(), rejected, "{sql}");
+                if rejected {
+                    let error = result.unwrap_err();
+                    assert_eq!(
+                        error.user_error().unwrap().code().as_str(),
+                        "sql.admit.persisted_definition_semantics_unsupported"
+                    );
+                    assert!(error.user_error().unwrap().location().is_some());
+                }
+            }
+        }
+        let sql = "CREATE VIEW v AS SELECT 1 FROM (SELECT /*+ SET_VAR(decimal_overflow_to_double='bad') */ 1) t";
+        let statement = parse_single_statement(sql).unwrap();
+        let error = admit_persisted_definition_semantics(sql, &statement, &disabled).unwrap_err();
+        assert_eq!(
+            error.user_error().unwrap().code().as_str(),
+            "sql.analyze.invalid_argument"
+        );
+        let sql = "DROP VIEW v";
+        assert!(
+            admit_persisted_definition_semantics(
+                sql,
+                &parse_single_statement(sql).unwrap(),
+                &enabled
+            )
+            .is_ok()
+        );
     }
 }
