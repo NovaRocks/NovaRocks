@@ -921,7 +921,7 @@ mod tests {
         let function_set = test_builtin_execution_function_set();
         let selected = function_set
             .catalog()
-            .resolve_aggregate_trusted(name, &[input_type.clone()])
+            .resolve_aggregate_trusted(name, std::slice::from_ref(&input_type))
             .expect("resolve aggregate");
         let func = AggFunction {
             name: name.to_string(),
