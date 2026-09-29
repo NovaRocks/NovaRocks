@@ -41,7 +41,7 @@ EXPLAIN SELECT * FROM default_catalog.${case_db}.v_persisted_mode;
 
 -- query 6
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported
-CREATE MATERIALIZED VIEW ${case_db}.mv_forbidden_mode AS SELECT k FROM definitely_missing_table;
+CREATE MATERIALIZED VIEW ${case_db}.mv_forbidden_mode DISTRIBUTED BY HASH(k) BUCKETS 1 AS SELECT k FROM definitely_missing_table;
 
 -- query 7
 -- @expect_error=sql.admit.persisted_definition_semantics_unsupported

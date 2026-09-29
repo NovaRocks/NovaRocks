@@ -247,7 +247,7 @@ mod tests {
         for prefix in [
             "CREATE VIEW v AS",
             "CREATE OR REPLACE VIEW v AS",
-            "CREATE MATERIALIZED VIEW mv AS",
+            "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(k) BUCKETS 1 AS",
         ] {
             let sql = format!("{prefix} SELECT 1");
             let statement = parse_single_statement(&sql).unwrap();
