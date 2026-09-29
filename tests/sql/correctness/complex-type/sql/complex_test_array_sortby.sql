@@ -83,7 +83,7 @@ insert into __row_util_base select generate_series from TABLE(generate_series(0,
 USE ${case_db};
 insert into __row_util_base select * from __row_util_base; -- 2000
 insert into __row_util_base select * from __row_util_base; -- 4000
-insert into __row_util_base select * from __row_util_base; -- 8000
+insert into __row_util_base select * from __row_util_base; -- 8000; all aggregate fingerprints below assert this scaled cardinality.
 
 CREATE TABLE __row_util (
   idx bigint NULL,
@@ -151,7 +151,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 16
@@ -162,7 +162,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 17
@@ -215,7 +215,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 22
@@ -226,7 +226,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 23
@@ -279,7 +279,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 28
@@ -290,7 +290,7 @@ with w1 as (
     select array_join(x, '-') as x
     from w1
 )
-select ifnull(sum(murmur_hash3_32(x)), 0)
+select count(*) AS row_count, ifnull(sum(murmur_hash3_32(x)), 0) AS fingerprint
 from w2;
 
 -- query 29
@@ -396,7 +396,8 @@ CREATE TABLE test_array_sortby (
     array_varchar ARRAY<VARCHAR(100)>,
     array_datetime ARRAY<DATETIME>,
     array_date ARRAY<DATE>,
-    array_json ARRAY<JSON>
+    -- Iceberg persists JSON as STRING; readback has the STRING domain.
+    array_json ARRAY<VARCHAR>
 )
 TBLPROPERTIES ("format-version" = "3");
 
@@ -604,3 +605,9 @@ SELECT array_sortby(array_json, ['{"key":"value1"}', '{"key":"value2"}']) FROM t
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
 USE ${case_db};
 SELECT array_sortby(array_json, ['{"key":"value1"}', '{"key":"value2"}']) FROM test_array_sortby WHERE id = 7;
+
+-- query 80
+-- Parse catalog STRING values explicitly before testing JSON array output.
+USE ${case_db};
+SELECT array_sortby([parse_json(array_json[1]), parse_json(array_json[2])], [1,2]) AS parsed_json_values
+FROM test_array_sortby WHERE id = 1;

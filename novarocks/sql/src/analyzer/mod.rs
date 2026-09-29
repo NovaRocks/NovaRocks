@@ -221,14 +221,14 @@ fn analyze_with_factory_and_function_catalog_inner(
     ),
     AnalyzeError,
 > {
-    let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics);
+    let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
     let query = query_prepass::preanalyze(query)?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         catalog,
         current_database,
         function_catalog,
-        sql_semantics: crate::sql_mode::query_sql_semantics(sql_semantics, &query),
+        sql_semantics: sql_semantics.clone(),
         factory: factory.clone(),
         ctes: std::collections::HashMap::new(),
         pending_ctes: std::collections::HashSet::new(),
@@ -274,6 +274,42 @@ pub(super) struct AnalyzerContext<'a> {
 }
 
 impl<'a> AnalyzerContext<'a> {
+    fn with_sql_semantics_scope<T>(
+        &self,
+        settings: crate::sql_mode::SqlSemanticSettings,
+        analyze: impl FnOnce(&Self) -> Result<T, AnalyzeError>,
+    ) -> Result<T, AnalyzeError> {
+        if settings == self.sql_semantics {
+            return analyze(self);
+        }
+        let child = AnalyzerContext {
+            catalog: self.catalog,
+            current_database: self.current_database,
+            function_catalog: self.function_catalog,
+            sql_semantics: settings,
+            factory: self.factory.clone(),
+            ctes: self.ctes.clone(),
+            pending_ctes: self.pending_ctes.clone(),
+            next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
+            next_lambda_slot_id: std::cell::Cell::new(self.next_lambda_slot_id.get()),
+            collected_subqueries: std::cell::RefCell::new(Vec::new()),
+            cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
+        };
+        let result = analyze(&child);
+        self.absorb_semantic_scope(&child);
+        result
+    }
+
+    fn absorb_semantic_scope(&self, child: &Self) {
+        self.next_subquery_id.set(child.next_subquery_id.get());
+        self.next_lambda_slot_id
+            .set(child.next_lambda_slot_id.get());
+        self.collected_subqueries
+            .borrow_mut()
+            .extend(child.collected_subqueries.borrow_mut().drain(..));
+        *self.cte_registry.borrow_mut() = child.cte_registry.borrow().clone();
+    }
+
     /// Create a new empty AnalyzerScope sharing this context's factory.
     #[expect(
         private_interfaces,
@@ -373,6 +409,14 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Top-level query analysis.
     fn analyze_query(&self, query: &ast::Query) -> Result<ResolvedQuery, AnalyzeError> {
+        let settings = crate::sql_mode::query_sql_semantics(&self.sql_semantics, query)?;
+        self.with_sql_semantics_scope(settings, |ctx| ctx.analyze_query_in_semantic_scope(query))
+    }
+
+    fn analyze_query_in_semantic_scope(
+        &self,
+        query: &ast::Query,
+    ) -> Result<ResolvedQuery, AnalyzeError> {
         let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
             let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
             (Some(child_ctx), local_cte_ids)
@@ -392,7 +436,7 @@ impl<'a> AnalyzerContext<'a> {
         let offset = extract_offset(query)?;
 
         if let Some(child_ctx) = maybe_child_ctx {
-            *self.cte_registry.borrow_mut() = child_ctx.cte_registry.borrow().clone();
+            self.absorb_semantic_scope(&child_ctx);
         }
 
         // Build output columns from the body
@@ -668,6 +712,14 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Analyze a SELECT statement.
     fn analyze_select(
+        &self,
+        select: &ast::Select,
+    ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
+        let settings = crate::sql_mode::select_sql_semantics(&self.sql_semantics, select)?;
+        self.with_sql_semantics_scope(settings, |ctx| ctx.analyze_select_in_semantic_scope(select))
+    }
+
+    fn analyze_select_in_semantic_scope(
         &self,
         select: &ast::Select,
     ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {

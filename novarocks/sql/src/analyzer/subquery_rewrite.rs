@@ -2418,7 +2418,7 @@ impl<'a> AnalyzerContext<'a> {
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
-            sql_semantics: crate::sql_mode::query_sql_semantics(&self.sql_semantics, query),
+            sql_semantics: self.sql_semantics.clone(),
             factory: self.factory.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),
@@ -2431,6 +2431,8 @@ impl<'a> AnalyzerContext<'a> {
         let result = child_ctx.analyze_query_with_outer_scope_inner(query, outer_scope)?;
 
         self.next_subquery_id.set(child_ctx.next_subquery_id.get());
+        self.next_lambda_slot_id
+            .set(child_ctx.next_lambda_slot_id.get());
 
         let nested_sqs: Vec<SubqueryInfo> = child_ctx
             .collected_subqueries
@@ -2452,6 +2454,17 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze a query that can reference columns from an outer scope.
     /// Returns (ResolvedQuery, inner_scope_from_FROM_clause).
     pub(super) fn analyze_query_with_outer_scope_inner(
+        &self,
+        query: &ast::Query,
+        outer_scope: &AnalyzerScope,
+    ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
+        let settings = crate::sql_mode::query_sql_semantics(&self.sql_semantics, query)?;
+        self.with_sql_semantics_scope(settings, |ctx| {
+            ctx.analyze_query_with_outer_scope_in_semantic_scope(query, outer_scope)
+        })
+    }
+
+    fn analyze_query_with_outer_scope_in_semantic_scope(
         &self,
         query: &ast::Query,
         outer_scope: &AnalyzerScope,
@@ -2508,8 +2521,7 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         if let Some(child_ctx) = maybe_child_ctx {
-            self.next_subquery_id.set(child_ctx.next_subquery_id.get());
-            *self.cte_registry.borrow_mut() = child_ctx.cte_registry.borrow().clone();
+            self.absorb_semantic_scope(&child_ctx);
         }
 
         result
@@ -2518,6 +2530,17 @@ impl<'a> AnalyzerContext<'a> {
     /// Analyze a SELECT that can reference outer scope columns for correlation.
     /// Returns (ResolvedSelect, output_columns, inner_scope).
     fn analyze_select_with_outer_scope(
+        &self,
+        select: &ast::Select,
+        outer_scope: &AnalyzerScope,
+    ) -> Result<(ResolvedSelect, Vec<OutputColumn>, AnalyzerScope), AnalyzeError> {
+        let settings = crate::sql_mode::select_sql_semantics(&self.sql_semantics, select)?;
+        self.with_sql_semantics_scope(settings, |ctx| {
+            ctx.analyze_select_with_outer_scope_in_semantic_scope(select, outer_scope)
+        })
+    }
+
+    fn analyze_select_with_outer_scope_in_semantic_scope(
         &self,
         select: &ast::Select,
         outer_scope: &AnalyzerScope,

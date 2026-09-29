@@ -1,0 +1,39 @@
+-- query 1
+text_identity	mixed_numeric	decimal_text	invalid_numeric
+0	1	1	0
+
+-- query 2
+null_first	null_first_ignored_candidates	first_match	no_match
+0	0	2	0
+
+-- query 3
+exact_bigint	exact_largeint
+2	2
+
+-- query 4
+decimal_integer	decimal_scales	largeint_decimal
+1	1	1
+
+-- query 5
+signed_zero	float_double	boolean_numeric
+1	1	1
+
+-- query 8
+id	mixed_numeric	exact_first	decimal_integer
+1	1	2	1
+2	2	1	1
+3	0	1	1
+4	0	0	0
+5	2	2	1
+
+-- query 9
+id
+3
+4
+5
+2
+1
+
+-- query 10
+first_match_sum	nonnull_result_rows
+6	5
