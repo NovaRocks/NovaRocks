@@ -620,6 +620,7 @@ fn execute_scheduled_refresh(
             ),
             ..SessionOptimizerSettings::default()
         },
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     ));
     let connector_context =
         match crate::connector::connector_request_context_for_execution_on_runtime(

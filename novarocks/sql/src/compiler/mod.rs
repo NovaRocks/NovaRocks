@@ -466,6 +466,7 @@ pub struct SqlSessionContext {
     pub current_catalog: Option<String>,
     pub current_database: String,
     pub optimizer_settings: SessionOptimizerSettings,
+    pub sql_semantics: crate::sql_mode::SqlSemanticSettings,
 }
 
 /// The execution environment selected for SQL planning.
@@ -776,6 +777,10 @@ pub fn analyze_mv_refresh_input(
     // The public MV-refresh facade still returns String while its frontend
     // owner is outside SQLP-7. Keep the typed parser rejection intact until
     // that boundary; no category is inferred from this message.
+    crate::sql_mode::validate_persisted_query_semantics(
+        &query,
+        &crate::sql_mode::SqlSemanticSettings::default(),
+    )?;
     crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
         .map_err(|error| error.to_string())?;
     let (resolved, _, _) = crate::analyzer::analyze_with_function_catalog(
@@ -841,6 +846,7 @@ fn imv_refresh_explain_request<'a>(
         SqlStatementInput::parsed_query(Box::new(query)),
         SqlCompileIntent::LogicalOnly,
         SqlSessionContext {
+            sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
             current_catalog,
             current_database,
             optimizer_settings,
@@ -962,38 +968,59 @@ use completion_driver::{
 impl SqlCompiler {
     pub fn analyze(request: SqlAnalyzeRequest<'_>) -> Result<SqlAnalyzeOutput, SqlCompileError> {
         request.check_control()?;
-        let (mut logical_plan, mut factory, logical_input) = match &request.statement.kind {
-            SqlStatementInputKind::LogicalPlan { plan, factory } => {
-                (plan.clone(), factory.clone(), true)
-            }
-            _ => {
-                let query = parse_query(&request.statement)?;
-                let catalog = request
-                    .catalog
-                    .ok_or_else(|| {
+        let (mut logical_plan, mut factory, logical_input, consumer_requires_semantic_snapshot) =
+            match &request.statement.kind {
+                SqlStatementInputKind::LogicalPlan { plan, factory } => (
+                    plan.clone(),
+                    factory.clone(),
+                    true,
+                    request
+                        .session
+                        .sql_semantics
+                        .sql_mode()
+                        .group_concat_legacy(),
+                ),
+                _ => {
+                    let query = parse_query(&request.statement)?;
+                    let catalog = request
+                        .catalog
+                        .ok_or_else(|| {
+                            SqlCompileError::InvalidRequest(
+                                "SQL analysis requires a catalog snapshot".to_string(),
+                            )
+                        })?
+                        .planner_table_provider();
+                    let functions = request.function_catalog().ok_or_else(|| {
                         SqlCompileError::InvalidRequest(
-                            "SQL analysis requires a catalog snapshot".to_string(),
+                            "SQL analysis requires a function catalog".to_string(),
                         )
-                    })?
-                    .planner_table_provider();
-                let functions = request.function_catalog().ok_or_else(|| {
-                    SqlCompileError::InvalidRequest(
-                        "SQL analysis requires a function catalog".to_string(),
+                    })?;
+                    let (resolved, ctes, mut factory) =
+                        crate::analyzer::analyze_with_function_catalog_and_sql_semantics(
+                            &query,
+                            catalog,
+                            &request.session.current_database,
+                            functions,
+                            &request.session.sql_semantics,
+                        )
+                        .map_err(SqlCompileError::Analyze)?;
+                    request.check_control()?;
+                    let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
+                        .map_err(SqlCompileError::Compilation)?;
+                    let consumer_requires_semantic_snapshot =
+                        crate::sql_mode::query_uses_group_concat_legacy(
+                            &request.session.sql_semantics,
+                            &query,
+                        )
+                        .map_err(SqlCompileError::Analyze)?;
+                    (
+                        logical_plan,
+                        factory,
+                        false,
+                        consumer_requires_semantic_snapshot,
                     )
-                })?;
-                let (resolved, ctes, mut factory) = crate::analyzer::analyze_with_function_catalog(
-                    &query,
-                    catalog,
-                    &request.session.current_database,
-                    functions,
-                )
-                .map_err(SqlCompileError::Analyze)?;
-                request.check_control()?;
-                let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
-                    .map_err(SqlCompileError::Compilation)?;
-                (logical_plan, factory, false)
-            }
-        };
+                }
+            };
         request.check_control()?;
 
         if matches!(request.intent, SqlCompileIntent::AnalyzeOnly) {
@@ -1108,6 +1135,7 @@ impl SqlCompiler {
                 functions,
                 &settings,
                 &request.control,
+                consumer_requires_semantic_snapshot,
             )?
         } else {
             mv_rewrite::SqlMvRewriteAnalysis::empty()
@@ -1531,6 +1559,7 @@ mod tests {
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: Some("iceberg".to_string()),
                 current_database: "db".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -1560,6 +1589,7 @@ mod tests {
             SqlStatementInput::sql("select order_id from orders"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: Some("iceberg".to_string()),
                 current_database: "db".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -1897,6 +1927,29 @@ mod tests {
     }
 
     #[test]
+    fn mv_refresh_rejects_stored_legacy_hint_before_table_analysis() {
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
+        let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            query: mv_analysis_query(
+                "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM missing_table",
+            ),
+            current_database: "db".to_string(),
+            catalog: &catalog,
+            functions: &functions,
+        })
+        .err()
+        .expect("unsupported persisted semantics");
+        assert!(error.starts_with("Unsupported:"));
+        assert!(error.contains("GROUP_CONCAT_LEGACY"));
+        assert!(
+            !error.contains("missing_table"),
+            "guard precedes analyzer table materialization"
+        );
+    }
+
+    #[test]
     fn mv_refresh_analysis_terminal_returns_only_opaque_analysis_input() {
         let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         catalog
@@ -1964,6 +2017,104 @@ mod tests {
     }
 
     #[test]
+    fn array_agg_json_semantic_schema_survives_optimizer_and_exact_final_plan() {
+        use arrow::datatypes::DataType;
+        use novarocks_types::logical::{LogicalType, logical_type_of_field};
+        for sql in [
+            "select array_agg(json_object('2:3')) as j, array_agg(cast(json_object('2:3') as varchar)) as s",
+            "with q as (select cast(json_object('k',1) as json) as j) select array_agg(j) as j, array_agg(cast(j as varchar)) as s from q",
+            "select array_sortby([json_object('k',1), json_object('k',2)],[2,1]) as j, array_sortby(cast([json_object('k',1), json_object('k',2)] as array<varchar>),[2,1]) as s",
+            "with q as (select [json_object('k',1),json_object('k',2)] as j) select array_sortby(j,[2,1]) as j, array_sortby(cast(j as array<varchar>),[2,1]) as s from q",
+        ] {
+            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let cancellation = Arc::new(Cancellation::default());
+            let request = SqlAnalyzeRequest::new(
+                SqlStatementInput::sql(sql),
+                SqlCompileIntent::Query,
+                SqlSessionContext {
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: SessionOptimizerSettings::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &catalog_snapshot,
+                crate::functions::builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                control(None, &cancellation),
+            );
+            let optimized = analyze_then_optimize(request)
+                .unwrap()
+                .into_optimized_output()
+                .unwrap();
+            let physical =
+                crate::planner::optimizer_bridge::to_physical_plan(&optimized.optimized_tree)
+                    .unwrap();
+            let plan = crate::planner::distributed::build::lower_final_physical_plan(
+                &physical,
+                novarocks_physical_plan::PlanVersionId::try_new([41; 16]).unwrap(),
+                novarocks_physical_plan::PipelineDopDomain {
+                    min: 1,
+                    max: 8,
+                    requires_power_of_two: true,
+                },
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            let result = plan.result_port().unwrap();
+            assert_eq!(result.fields.len(), 2);
+            let DataType::List(json_item) = &result.fields[0].ty.data_type else {
+                panic!("expected JSON List");
+            };
+            let DataType::List(string_item) = &result.fields[1].ty.data_type else {
+                panic!("expected STRING List");
+            };
+            assert_eq!(logical_type_of_field(json_item), Some(LogicalType::Json));
+            assert_eq!(logical_type_of_field(string_item), None);
+            let field = arrow::datatypes::Field::new(
+                "j",
+                result.fields[0].ty.data_type.clone(),
+                result.fields[0].ty.nullable,
+            );
+            assert!(
+                novarocks_types::FieldRenderSchema::from_field(&field)
+                    .list_item()
+                    .unwrap()
+                    .is_json_value()
+            );
+            let mut aggregate_count = 0;
+            for fragment in plan.fragments().values() {
+                for node in fragment.nodes().values() {
+                    if let novarocks_physical_plan::NodeKind::Aggregate { calls, .. } = &node.kind {
+                        for call in calls {
+                            aggregate_count += 1;
+                            assert_eq!(
+                                call.binding.function.function_id.as_str(),
+                                "builtin.aggregate/array_agg/v1"
+                            );
+                            let DataType::List(item) = &call.binding.function.result_type.data_type
+                            else {
+                                panic!("expected physical aggregate List");
+                            };
+                            assert_eq!(logical_type_of_field(item), None);
+                            let DataType::List(item) = &call.binding.intermediate_type.data_type
+                            else {
+                                panic!("expected physical state List");
+                            };
+                            assert_eq!(logical_type_of_field(item), None);
+                        }
+                    }
+                }
+            }
+            if sql.contains("array_agg") {
+                assert!(aggregate_count >= 1);
+            }
+        }
+    }
+
+    #[test]
     fn sqlx1_kernel_compiles_a_query_without_application_state() {
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
@@ -1972,6 +2123,7 @@ mod tests {
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -2000,6 +2152,7 @@ mod tests {
             SqlStatementInput::sql("select 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -2047,6 +2200,7 @@ mod tests {
                 ),
             },
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),
@@ -2075,6 +2229,7 @@ mod tests {
                 root_distribution: RootDistributionRequirement::Any,
             },
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: None,
                 current_database: "default".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),

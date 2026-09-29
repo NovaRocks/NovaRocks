@@ -31,6 +31,7 @@ pub(crate) mod mv_refresh;
 pub(crate) mod parser;
 pub mod planning;
 pub mod semantic;
+pub mod sql_mode;
 
 pub(crate) mod optimizer;
 

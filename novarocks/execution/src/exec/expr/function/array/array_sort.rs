@@ -102,7 +102,7 @@ pub fn eval_array_sort(
         let mut null_indices = Vec::<usize>::new();
         let mut non_null_indices = Vec::<usize>::new();
         for idx in start..end {
-            if values.is_null(idx) {
+            if super::common::is_logically_null(values.as_ref(), idx) {
                 null_indices.push(idx);
             } else {
                 non_null_indices.push(idx);

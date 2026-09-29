@@ -2055,6 +2055,16 @@ fn cast_with_special_rules_with_field_schema(
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+            // A nested-field metadata change reuses every value, offset, and
+            // validity buffer. It neither parses JSON nor reinterprets Utf8.
+            if list.values().data_type() == target_field.data_type() {
+                return Ok(Arc::new(ListArray::new(
+                    target_field.clone(),
+                    list.offsets().clone(),
+                    list.values().clone(),
+                    list.nulls().cloned(),
+                )) as ArrayRef);
+            }
             // Empty list values can be safely retagged to any target item type.
             // This matches StarRocks behavior for casts around empty array literals.
             let cast_values = if list.values().is_empty() {
@@ -4357,6 +4367,65 @@ mod tests {
         let out = arena.eval(cast_expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
         assert_eq!(out.value(0), 9_223_372_036_854_775_808_i128);
+    }
+
+    #[test]
+    fn list_json_metadata_cast_preserves_sliced_values_offsets_and_validity_buffers() {
+        use novarocks_types::logical::{
+            LogicalType, field_with_logical_type, logical_type_of_field,
+        };
+        for values in [
+            Arc::new(StringArray::from(vec![
+                Some("{\"a\":1}"),
+                None,
+                Some("{\"b\":2}"),
+            ])) as ArrayRef,
+            Arc::new(StringArray::from(vec![None::<&str>, None, None])) as ArrayRef,
+        ] {
+            let source = ListArray::new(
+                Arc::new(Field::new("item", DataType::Utf8, true)),
+                OffsetBuffer::new(vec![0_i32, 1, 1, 3, 3].into()),
+                values,
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, true, true, false,
+                ])),
+            )
+            .slice(1, 3);
+            let target = DataType::List(Arc::new(field_with_logical_type(
+                Field::new("item", DataType::Utf8, true),
+                LogicalType::Json,
+            )));
+            let source = Arc::new(source) as ArrayRef;
+            let output = cast_with_special_rules(&source, &target).unwrap();
+            let source_list = source.as_any().downcast_ref::<ListArray>().unwrap();
+            let output_list = output.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(output_list.data_type(), &target);
+            assert_eq!(source_list.value_offsets(), output_list.value_offsets());
+            assert_eq!(
+                source_list.to_data().buffers()[0].as_ptr(),
+                output_list.to_data().buffers()[0].as_ptr()
+            );
+            assert!(Arc::ptr_eq(source_list.values(), output_list.values()));
+            assert_eq!(source_list.nulls(), output_list.nulls());
+            assert_eq!(
+                source_list.nulls().unwrap().buffer().as_ptr(),
+                output_list.nulls().unwrap().buffer().as_ptr()
+            );
+            assert!(output_list.is_null(2));
+            assert!(output_list.value(0).is_empty());
+            assert_eq!(
+                output_list.value(1).to_data(),
+                source_list.value(1).to_data()
+            );
+            let DataType::List(item) = output_list.data_type() else {
+                unreachable!();
+            };
+            assert_eq!(logical_type_of_field(item), Some(LogicalType::Json));
+            let reversed = cast_with_special_rules(&output, source.data_type()).unwrap();
+            let reversed = reversed.as_any().downcast_ref::<ListArray>().unwrap();
+            assert!(Arc::ptr_eq(source_list.values(), reversed.values()));
+            assert_eq!(reversed.data_type(), source.data_type());
+        }
     }
 
     #[test]

@@ -1065,6 +1065,7 @@ mod tests {
             SqlStatementInput::sql("SELECT 1"),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: Some("iceberg".to_string()),
                 current_database: "db".to_string(),
                 optimizer_settings: SessionOptimizerSettings::default(),

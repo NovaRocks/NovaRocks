@@ -228,10 +228,16 @@ impl ViewService for QueryViewService {
         engine: &dyn ViewEngine,
         query: &mut Query,
         context: ViewRequestContext<'_>,
+        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Result<(), String> {
         let registry = self.registry_snapshot()?;
-        crate::view_rewrite::expand_session_views(query, &registry, context.current_database);
-        crate::view_rewrite::expand_external_views(engine, query, context)
+        crate::view_rewrite::expand_session_views(
+            query,
+            &registry,
+            context.current_database,
+            sql_semantics,
+        )?;
+        crate::view_rewrite::expand_external_views(engine, query, context, sql_semantics)
     }
 
     fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String> {

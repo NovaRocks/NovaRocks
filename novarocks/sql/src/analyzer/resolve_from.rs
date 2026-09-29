@@ -459,12 +459,24 @@ impl<'a> super::AnalyzerContext<'a> {
                         let output_columns: Vec<OutputColumn> = producer_columns
                             .into_iter()
                             .map(|col| {
+                                let logical_type =
+                                    self.factory.borrow().logical_type(col.column_id);
+                                let json_list = self
+                                    .factory
+                                    .borrow()
+                                    .has_json_list_provenance(col.column_id);
                                 let new_id = self.alloc_column_id(
                                     Some(alias_name.clone()),
                                     col.name.clone(),
                                     col.data_type.clone(),
                                     col.nullable,
                                 );
+                                self.factory
+                                    .borrow_mut()
+                                    .set_logical_type(new_id, logical_type);
+                                self.factory
+                                    .borrow_mut()
+                                    .set_json_list_provenance(new_id, json_list);
                                 OutputColumn {
                                     column_id: new_id,
                                     name: col.name,

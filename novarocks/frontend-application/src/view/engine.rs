@@ -69,6 +69,7 @@ impl ViewService for EmptyViewService {
         _engine: &dyn ViewEngine,
         _query: &mut Query,
         _context: ViewRequestContext<'_>,
+        _sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -660,7 +661,14 @@ mod tests {
                 .contains("view service is not injected")
         );
         let mut query = parse_query("SELECT * FROM t");
-        service.rewrite_query(&engine, &mut query, ctx).unwrap();
+        service
+            .rewrite_query(
+                &engine,
+                &mut query,
+                ctx,
+                &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            )
+            .unwrap();
         assert_eq!(
             Printer::new().statement(&novarocks_parser::ast::Statement::Query(query)),
             "SELECT * FROM t"

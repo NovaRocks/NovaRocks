@@ -266,6 +266,7 @@ impl FrontendQueryCompiler {
                     current_catalog,
                     current_database,
                     connector_context,
+                    context.execution().sql_semantics(),
                 )?;
                 self.complete_distributed_explain(
                     &query,
@@ -286,6 +287,7 @@ impl FrontendQueryCompiler {
                     current_catalog,
                     current_database,
                     connector_context,
+                    context.execution().sql_semantics(),
                 )?;
                 let catalog_service = query_catalog_service_snapshot(&self.query);
                 let materializer = build_catalog_service_provider(
@@ -376,6 +378,7 @@ impl FrontendQueryCompiler {
                     current_catalog,
                     current_database,
                     connector_context,
+                    context.execution().sql_semantics(),
                 )?;
                 self.complete_distributed_read(
                     &query,
@@ -481,6 +484,7 @@ impl FrontendQueryCompiler {
                 analyze: false,
             },
             SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),
@@ -567,6 +571,7 @@ impl FrontendQueryCompiler {
             SqlStatementInput::parsed_query(Box::new(query.clone())),
             SqlCompileIntent::Query,
             SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),
@@ -711,6 +716,7 @@ impl FrontendQueryCompiler {
                 analyze: true,
             },
             SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),
@@ -804,6 +810,7 @@ impl FrontendQueryCompiler {
                         execution.deadline(),
                         execution.cancellation().clone(),
                         execution.optimizer_settings().clone(),
+                        execution.sql_semantics().clone(),
                     ),
                     profile_plan: plan,
                     profile_annotations: annotations,
@@ -828,6 +835,7 @@ impl FrontendQueryCompiler {
             SqlStatementInput::parsed_query(Box::new(query.clone())),
             intent,
             SqlSessionContext {
+                sql_semantics: execution.sql_semantics().clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),
@@ -850,12 +858,14 @@ impl FrontendQueryCompiler {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Result<Query, FrontendQueryCompilerError> {
         let mut prepared = self.prepare_explain_query(
             query,
             current_catalog,
             current_database,
             connector_context,
+            sql_semantics,
         )?;
         novarocks_query_application::system_catalog_rewrite::rewrite_query(
             self.system_tables.facts_port().as_ref(),
@@ -872,6 +882,7 @@ impl FrontendQueryCompiler {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Result<Query, FrontendQueryCompilerError> {
         let mut prepared = query.clone();
         self.view.view_service().rewrite_query(
@@ -882,6 +893,7 @@ impl FrontendQueryCompiler {
                 current_database,
                 connector_context: Some(connector_context),
             },
+            sql_semantics,
         )?;
         if has_time_travel_refs(&prepared) {
             rewrite_time_travel_refs(
@@ -912,6 +924,7 @@ impl FrontendQueryCompiler {
             current_catalog,
             current_database,
             connector_context,
+            execution.sql_semantics(),
         )?;
         let planning_start = std::time::Instant::now();
         self.complete_distributed_profile(

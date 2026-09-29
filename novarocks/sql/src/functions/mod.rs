@@ -71,6 +71,25 @@ pub(crate) use resolver::{ResolveError, ResolvedScalarFunction};
 /// the same decision.
 pub(crate) use novarocks_functions::FunctionVolatility;
 
+/// Semantic result domains declared by the closed built-in function identity.
+/// Utf8 itself never establishes JSON provenance; external or shadowing functions
+/// retain their own declared physical domain.
+pub(crate) fn scalar_output_logical_type(
+    binding: &ResolvedFunctionBinding,
+) -> Option<novarocks_types::schema::SqlType> {
+    if binding.kind != FunctionKind::Scalar {
+        return None;
+    }
+    match binding.function_id.as_str() {
+        "builtin.scalar/parse_json/v1"
+        | "builtin.scalar/json_object/v1"
+        | "builtin.scalar/json_array/v1"
+        | "builtin.scalar/to_json/v1"
+        | "builtin.scalar/json_query/v1" => Some(novarocks_types::schema::SqlType::Json),
+        _ => None,
+    }
+}
+
 pub(crate) fn aggregate_result_type(binding: &ResolvedFunctionBinding) -> &FunctionValueType {
     match &binding.selected.result_type {
         FunctionResultType::Scalar(result) => result,
@@ -2131,6 +2150,63 @@ mod tests {
             panic!("scalar binding must have a scalar result")
         };
         result
+    }
+
+    #[test]
+    fn json_output_domain_uses_bound_identity_not_shadowed_function_spelling() {
+        let builtin = build_builtin_engine_function_catalog().unwrap();
+        let args = [value_argument(DataType::Utf8, false, None)];
+        let bound = resolve_exact_scalar(&builtin, "json_object", &args);
+        assert_eq!(
+            scalar_output_logical_type(&bound),
+            Some(novarocks_types::schema::SqlType::Json)
+        );
+
+        let signatures = registry::builtin_scalar_declarations()
+            .into_iter()
+            .find(|(name, _)| name == "json_object")
+            .unwrap()
+            .1;
+        let overloads = (0..signatures.len())
+            .map(|index| {
+                FunctionOverloadId::try_new(format!("test.shadow.json_object/{index}/v1")).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let declaration = FunctionBindingDeclaration::try_new(
+            FunctionId::try_new("test.shadow/json_object/v1").unwrap(),
+            FunctionKind::Scalar,
+            builtin_scalar_semantics("json_object"),
+            overloads
+                .iter()
+                .cloned()
+                .zip(&signatures)
+                .map(|(identity, signature)| FunctionOverloadDeclaration {
+                    identity,
+                    argument_pattern: signature.clone().into_boxed_str(),
+                    result_pattern: signature.clone().into_boxed_str(),
+                    aggregate: None,
+                }),
+        )
+        .unwrap();
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        builder
+            .register(
+                FunctionDefinition::try_new_bound(
+                    "json_object",
+                    FunctionVisibility::Public,
+                    declaration,
+                    Arc::new(BuiltinScalarResolver {
+                        canonical_name: "json_object".into(),
+                        overloads: overloads.into_boxed_slice(),
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let shadow = builder.seal().unwrap();
+        let bound = resolve_exact_scalar(&shadow, "json_object", &args);
+        assert_eq!(scalar_result(&bound).data_type, DataType::Utf8);
+        assert_eq!(scalar_output_logical_type(&bound), None);
     }
 
     #[test]

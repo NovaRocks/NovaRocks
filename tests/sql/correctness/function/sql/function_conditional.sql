@@ -156,3 +156,13 @@ SELECT nullif(ms, mi), ms, mi FROM tc ORDER BY i;
 -- IF returning NULL when condition is false
 USE ${case_db};
 SELECT if(i > 5, i, null) FROM tc;
+
+-- query 26
+-- @order_sensitive=true
+-- Freeze the migrated source maps, including parent NULL and NULL values.
+USE ${case_db};
+SELECT i, mi, ms, mi IS NULL AS mi_parent_null, ms IS NULL AS ms_parent_null FROM tc ORDER BY i;
+
+-- query 27
+USE ${case_db};
+SELECT COUNT(*) AS rows_total, COUNT(mi) AS mi_present, COUNT(ms) AS ms_present, COUNT(ms[1]) AS ms_nonnull_values FROM tc;

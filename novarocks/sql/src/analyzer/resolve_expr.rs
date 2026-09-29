@@ -1085,7 +1085,10 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             args.push(typed);
         }
-        resolved_scalar_call_at(self.function_catalog, "__array_literal", args, array.span)
+        let json_items = self.json_array_elements_provenance(array, &args, scope);
+        let physical =
+            resolved_scalar_call_at(self.function_catalog, "__array_literal", args, array.span)?;
+        self.adapt_json_list_output(physical, json_items, array.span)
     }
 
     /// Analyze `left -> right` as a JSON path operator. StarRocks treats
@@ -1632,40 +1635,14 @@ impl<'a> super::AnalyzerContext<'a> {
         let is_count_star = name == "count"
             && matches!(func.arguments.as_slice(), [ast::Expr::Identifier(ident)] if ident.value == "*");
 
-        // The native AST retains GROUP_CONCAT's `SEPARATOR` outside the
-        // regular argument list. The aggregate contract, order-by resolver,
-        // and type diagnostics expect it as the final typed argument. The
-        // legacy comma spelling is retained for compatibility: a trailing
-        // string literal remains a separator, while all other positional
-        // arguments are values and receive a default comma separator.
+        // SQL preparation makes separator ownership explicit. Analysis and
+        // output naming consume the same idempotently normalized syntax.
         let group_concat_args = if matches!(name.as_str(), "group_concat" | "string_agg") {
-            match (func.separator.as_deref(), func.arguments.as_slice()) {
-                (Some(separator), values) => values
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(separator.clone()))
-                    .collect(),
-                (None, []) => Vec::new(),
-                (None, values)
-                    if values.len() > 1
-                        && values.last().is_some_and(|argument| {
-                            matches!(
-                                argument,
-                                ast::Expr::Literal(ast::Literal {
-                                    kind: ast::LiteralKind::String(_),
-                                    ..
-                                })
-                            )
-                        }) =>
-                {
-                    values.to_vec()
-                }
-                (None, values) => {
-                    let mut arguments = values.to_vec();
-                    arguments.push(string_literal_expr(",".to_string(), func.span));
-                    arguments
-                }
-            }
+            func.arguments
+                .iter()
+                .cloned()
+                .chain(func.separator.as_deref().cloned())
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
@@ -2027,10 +2004,15 @@ impl<'a> super::AnalyzerContext<'a> {
             {
                 return Err(AnalyzeError::invalid_argument("Unknown error", func.span));
             }
-            if let Some(semantic_type) = args_typed
-                .first()
-                .and_then(json_semantic_group_by_type_name)
-            {
+            if let Some(semantic_type) = args_typed.first().and_then(|arg| {
+                // Metadata output adapters must preserve the existing JSON
+                // DISTINCT rejection after the literal's physical call is wrapped.
+                if self.json_list_provenance(effective_arg_exprs.first().copied(), arg, scope) {
+                    Some("array<json>".to_string())
+                } else {
+                    json_semantic_group_by_type_name(arg)
+                }
+            }) {
                 let arg_display = expr_display_name(arg_exprs[0]);
                 return Err(AnalyzeError::invalid_argument(
                     format!(
@@ -2188,22 +2170,30 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             };
             let ignore_nulls = matches!(func.null_treatment, Some(ast::NullTreatment::IgnoreNulls));
-            return Ok(TypedExpr {
-                kind: ExprKind::WindowCall {
-                    name,
-                    args: args_typed,
-                    distinct: is_distinct,
-                    binding,
-                    function_order_by: func_order_by,
-                    aggregate_binding,
-                    partition_by,
-                    order_by,
-                    window_frame,
-                    ignore_nulls,
-                },
-                data_type: result.data_type,
-                nullable: result.nullable,
+            let json_input = args_typed.first().is_some_and(|arg| {
+                self.logical_output_type(effective_arg_exprs.first().copied(), arg, scope)
+                    == Some(novarocks_types::schema::SqlType::Json)
             });
+            return self.adapt_json_list_output(
+                TypedExpr {
+                    kind: ExprKind::WindowCall {
+                        name,
+                        args: args_typed,
+                        distinct: is_distinct,
+                        binding,
+                        function_order_by: func_order_by,
+                        aggregate_binding,
+                        partition_by,
+                        order_by,
+                        window_frame,
+                        ignore_nulls,
+                    },
+                    data_type: result.data_type,
+                    nullable: result.nullable,
+                },
+                json_input,
+                func.span,
+            );
         }
 
         if apply_implicit_string_function_casts(&name, &mut args_typed) {
@@ -2303,6 +2293,14 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
 
+        // Freeze authoritative source provenance before exact scalar binding
+        // materializes plain List<T> coercions. Public target spelling alone
+        // cannot establish validated JSON values.
+        let json_list_input = effective_arg_exprs
+            .first()
+            .copied()
+            .zip(args_typed.first())
+            .is_some_and(|(source, value)| self.json_list_provenance(Some(source), value, scope));
         let mut bound_scalar = None;
         self.validate_percentile_arguments(&name, &args_typed, func.span)?;
         let mut bound_aggregate = None;
@@ -2473,17 +2471,25 @@ impl<'a> super::AnalyzerContext<'a> {
             let result = crate::functions::aggregate_result_type(&signature);
             let return_type = result.data_type.clone();
             let nullable = result.nullable;
-            Ok(TypedExpr {
-                kind: ExprKind::AggregateCall {
-                    name,
-                    args: args_typed,
-                    distinct: is_distinct,
-                    order_by: func_order_by,
-                    resolved: signature,
+            let json_input = args_typed.first().is_some_and(|arg| {
+                self.logical_output_type(effective_arg_exprs.first().copied(), arg, scope)
+                    == Some(novarocks_types::schema::SqlType::Json)
+            });
+            self.adapt_json_list_output(
+                TypedExpr {
+                    kind: ExprKind::AggregateCall {
+                        name,
+                        args: args_typed,
+                        distinct: is_distinct,
+                        order_by: func_order_by,
+                        resolved: signature,
+                    },
+                    data_type: return_type,
+                    nullable,
                 },
-                data_type: return_type,
-                nullable,
-            })
+                json_input,
+                func.span,
+            )
         } else {
             // Scalar function
             let mut return_type = bound_scalar
@@ -2590,17 +2596,21 @@ impl<'a> super::AnalyzerContext<'a> {
                 "analyzer result type must match the exact scalar binding"
             );
             let nullable = bound_result.nullable;
-            Ok(TypedExpr {
-                kind: ExprKind::FunctionCall {
-                    volatility: self.function_catalog.volatility(&name),
-                    name,
-                    args: args_typed,
-                    distinct: is_distinct,
-                    binding,
+            self.adapt_json_list_output(
+                TypedExpr {
+                    kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility(&name),
+                        name,
+                        args: args_typed,
+                        distinct: is_distinct,
+                        binding,
+                    },
+                    data_type: return_type,
+                    nullable,
                 },
-                data_type: return_type,
-                nullable,
-            })
+                json_list_input,
+                func.span,
+            )
         }
     }
 
@@ -5720,6 +5730,282 @@ mod tests {
             .ok_or_else(|| "expected projection".to_string())
     }
 
+    fn assert_json_list_scalar_adapter(expression: &crate::analysis::TypedExpr, expected_id: &str) {
+        use novarocks_types::logical::{LogicalType, logical_type_of_field};
+        let DataType::List(item) = &expression.data_type else {
+            panic!("expected List");
+        };
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(logical_type_of_field(item), Some(LogicalType::Json));
+        let ExprKind::Cast {
+            expr: physical,
+            target,
+        } = &expression.kind
+        else {
+            panic!("expected metadata output adapter");
+        };
+        assert_eq!(target, &expression.data_type);
+        assert_eq!(physical.nullable, expression.nullable);
+        let ExprKind::FunctionCall { binding, args, .. } = &physical.kind else {
+            panic!("expected exact scalar call");
+        };
+        assert_eq!(binding.function_id.as_str(), expected_id);
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("expected scalar result");
+        };
+        assert_eq!(physical.data_type, result.data_type);
+        let DataType::List(physical_item) = &physical.data_type else {
+            panic!("expected physical List");
+        };
+        assert_eq!(logical_type_of_field(physical_item), None);
+        for (argument, selected) in args.iter().zip(&binding.selected.argument_types) {
+            let novarocks_functions::FunctionArgumentType::Value(selected) = selected else {
+                panic!("expected value argument");
+            };
+            assert_eq!(argument.data_type, selected.data_type);
+            assert_eq!(argument.nullable, selected.nullable);
+        }
+    }
+
+    #[test]
+    fn json_array_literal_and_sortby_keep_exact_bindings_under_semantic_output_adapters() {
+        for sql in [
+            "select [json_object('k',1), json_object('k',2), null]",
+            "select array<json>[json_object('k',1), null]",
+            "select array<json>[]",
+            "select array<json>[null]",
+        ] {
+            let expression = analyze_projection_expr(sql).unwrap();
+            assert_json_list_scalar_adapter(&expression, "builtin.scalar/__array_literal/v1");
+        }
+        for sql in [
+            "select array_sortby([json_object('k',1), json_object('k',2)], [2,1])",
+            "select array_sortby(array<json>[json_object('k',1), json_object('k',2)], [2,1])",
+            "select array_sortby(cast([json_object('k',1), json_object('k',2)] as array<json>), [2,1])",
+            "with q as (select [json_object('k',1), json_object('k',2)] as j) select array_sortby(j,[2,1]) from q",
+            "select array_sortby(j2,[2,1]) from (select [json_object('k',1),json_object('k',2)] as j, j as j2) q",
+            "select array_sortby(j,[2,1]) from (values ([json_object('k',1),json_object('k',2)]), (null)) q(j)",
+            "select array_sortby(j,[2,1]) from (select [json_object('k',1),json_object('k',2)] as j union all select null) q",
+            "select array_sortby(case when true then [json_object('k',1),json_object('k',2)] else null end,[2,1])",
+        ] {
+            let expression =
+                analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_json_list_scalar_adapter(&expression, "builtin.scalar/array_sortby/v1");
+        }
+        for sql in [
+            "select ['{\"k\":1}', '{\"k\":2}']",
+            "select array<varchar>[json_object('k',1), json_object('k',2)]",
+            "select array_sortby(['{\"k\":1}', '{\"k\":2}'], [2,1])",
+            "select array_sortby(cast([json_object('k',1), json_object('k',2)] as array<varchar>), [2,1])",
+            "select array_sortby(cast(['not JSON', '123'] as array<json>), [2,1])",
+            "with q as (select cast(['not JSON', '123'] as array<json>) as j) select array_sortby(j,[2,1]) from q",
+            "select array_sortby(j2,[2,1]) from (select cast(['not JSON','123'] as array<json>) as j, j as j2) q",
+        ] {
+            let expression = analyze_projection_expr(sql).unwrap();
+            let DataType::List(item) = &expression.data_type else {
+                panic!("expected List");
+            };
+            assert_eq!(novarocks_types::logical::logical_type_of_field(item), None);
+            assert!(matches!(expression.kind, ExprKind::FunctionCall { .. }));
+        }
+    }
+
+    #[test]
+    fn json_list_output_adapters_preserve_existing_distinct_error_contract() {
+        let error =
+            analyze_projection_expr("select array_agg(distinct [json_object('2:3')])").unwrap_err();
+        assert!(
+            error.contains("can't rewrite distinct to group by on (array<json>)."),
+            "{error}"
+        );
+        let error =
+            analyze_projection_expr("select array_agg(distinct json_object('2:3'))").unwrap_err();
+        assert!(
+            error.contains("can't rewrite distinct to group by on (json)."),
+            "{error}"
+        );
+    }
+
+    fn assert_array_agg_json_adapter(expression: &crate::analysis::TypedExpr) {
+        use novarocks_types::logical::{LogicalType, logical_type_of_field};
+        let DataType::List(item) = &expression.data_type else {
+            panic!("expected List");
+        };
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(logical_type_of_field(item), Some(LogicalType::Json));
+        let ExprKind::Cast {
+            expr: physical,
+            target,
+        } = &expression.kind
+        else {
+            panic!("expected semantic output CAST");
+        };
+        assert_eq!(target, &expression.data_type);
+        assert_eq!(physical.nullable, expression.nullable);
+        let (binding, arguments) = match &physical.kind {
+            ExprKind::AggregateCall { resolved, args, .. } => (resolved, args),
+            ExprKind::WindowCall {
+                aggregate_binding: Some(binding),
+                args,
+                ..
+            } => (binding, args),
+            _ => panic!("expected intact aggregate binding under CAST"),
+        };
+        let result = crate::functions::aggregate_result_type(binding);
+        assert_eq!(physical.data_type, result.data_type);
+        let DataType::List(physical_item) = &result.data_type else {
+            panic!("expected physical List");
+        };
+        assert_eq!(logical_type_of_field(physical_item), None);
+        assert_eq!(arguments[0].data_type, DataType::Utf8);
+        let selected = crate::functions::aggregate_selection(binding);
+        match &selected.intermediate_type.data_type {
+            DataType::List(item) => assert_eq!(logical_type_of_field(item), None),
+            DataType::Struct(fields) => {
+                let DataType::List(item) = fields[0].data_type() else {
+                    panic!("expected update channel List");
+                };
+                assert_eq!(logical_type_of_field(item), None);
+            }
+            _ => panic!("unexpected ARRAY_AGG intermediate type"),
+        }
+    }
+
+    #[test]
+    fn array_agg_freezes_json_output_separately_from_physical_binding() {
+        for sql in [
+            "select array_agg(json_object('2:3'))",
+            "select array_agg(json_array(1))",
+            "select array_agg(j2) from (select cast(json_object('k',1) as json) as j, j as j2) s",
+            "select array_agg(j) from (values (cast(json_object('k',1) as json)), (null)) q(j)",
+            "select array_agg(j) from (select cast(json_object('k',1) as json) as j union all select null) q",
+            "select array_agg(case when true then json_object('k',1) else null end)",
+            "select array_agg(case when true then json_object('k',1) else json_object('k',2) end)",
+            "select array_agg(parse_json('{\"k\":1}'))",
+            "select array_agg(cast(json_object('k',1) as json))",
+            "select array_agg(json_object('k', 1) order by 1 desc)",
+            "select array_agg(json_object('k', 1)) over ()",
+            "select array_agg(j) from (select json_object('k', 1) as j) s",
+            "select array_agg(j) from (select cast(json_object('k',1) as json) as j) s",
+            "with s as (select cast(json_object('k',1) as json) as j) select array_agg(j) from s",
+            "with s as (select json_object('k',1) as j) select array_agg(a.j) from s a, s b",
+            "select array_agg(j) from (select json_object('k',1) as j union all select json_object('k',2)) s",
+        ] {
+            let expression =
+                analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_array_agg_json_adapter(&expression);
+        }
+    }
+
+    #[test]
+    fn array_agg_string_values_do_not_gain_json_semantics() {
+        use novarocks_types::logical::logical_type_of_field;
+        for sql in [
+            "select array_agg('{\"k\":1}')",
+            "select array_agg(cast('not JSON' as json))",
+            "with q as (select cast('not JSON' as json) as j) select array_agg(j) from q",
+            "select array_agg(j2) from (select cast('not JSON' as json) as j, j as j2) q",
+            "select array_agg(j) from (values (cast('{\"k\":1}' as varchar)), (null)) q(j)",
+            "select array_agg(j) from (values (cast(json_object('k',1) as json)), ('{\"k\":2}')) q(j)",
+            "select array_agg(cast(json_object('k',1) as varchar))",
+            "select array_agg(case when true then cast(json_object('k',1) as varchar) else cast(json_object('k',2) as varchar) end)",
+            "select array_agg(j) from (select cast(json_object('k',1) as varchar) as j) s",
+            "with s as (select cast(json_object('k',1) as varchar) as j) select array_agg(j) from s",
+        ] {
+            let expression =
+                analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let DataType::List(item) = &expression.data_type else {
+                panic!("expected List");
+            };
+            assert_eq!(logical_type_of_field(item), None);
+            assert!(matches!(expression.kind, ExprKind::AggregateCall { .. }));
+        }
+    }
+
+    #[test]
+    fn array_agg_catalog_json_provenance_survives_alias_and_cte_rebinding() {
+        struct JsonCatalog;
+        impl PlannerTableProvider for JsonCatalog {
+            fn resolve_table_for_analysis(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+            ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+                // Use the existing resolved table constructor so the logical tag
+                // comes from catalog metadata, not a name or physical-type guess.
+                let planner = crate::planner::table::TableDef {
+                    name: table.into(),
+                    columns: vec![
+                        novarocks_types::schema::ColumnDef {
+                            name: "j".into(),
+                            data_type: DataType::Utf8,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: Some(novarocks_types::schema::SqlType::Json),
+                        },
+                        novarocks_types::schema::ColumnDef {
+                            name: "ja".into(),
+                            data_type: DataType::List(std::sync::Arc::new(
+                                arrow::datatypes::Field::new("item", DataType::Utf8, true),
+                            )),
+                            nullable: true,
+                            write_default: None,
+                            logical_type: Some(novarocks_types::schema::SqlType::Array(Box::new(
+                                novarocks_types::schema::SqlType::Json,
+                            ))),
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::Sql(SqlScanSource::new(
+                        SqlTableBindingId::new(
+                            SqlTableBindingScopeId::new(NonZeroU64::new(44).unwrap()),
+                            NonZeroU32::new(1).unwrap(),
+                        ),
+                        SqlTableIdentity {
+                            catalog: catalog.unwrap_or("default_catalog").into(),
+                            namespace: database.into(),
+                            table: table.into(),
+                        },
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    )),
+                };
+                Ok(crate::catalog::ResolvedAnalyzerTable::from_planner(
+                    catalog, database, planner,
+                ))
+            }
+        }
+        for sql in [
+            "select array_agg(j) from json_input",
+            "select array_agg(q.payload) from (select j as renamed from json_input) q(payload)",
+            "with q as (select j as payload from json_input) select array_agg(payload) from q",
+        ] {
+            let expression = analyze_projection_expr_with_catalog(
+                sql,
+                &JsonCatalog,
+                crate::functions::builtin_sql_function_catalog(),
+            )
+            .unwrap();
+            assert_array_agg_json_adapter(&expression);
+        }
+        for sql in [
+            "select array_sortby(ja,[2,1]) from json_input",
+            "select array_sortby(q.payload,[2,1]) from (select ja as renamed from json_input) q(payload)",
+            "with q as (select ja as payload from json_input) select array_sortby(payload,[2,1]) from q",
+        ] {
+            let expression = analyze_projection_expr_with_catalog(
+                sql,
+                &JsonCatalog,
+                crate::functions::builtin_sql_function_catalog(),
+            )
+            .unwrap();
+            assert_json_list_scalar_adapter(&expression, "builtin.scalar/array_sortby/v1");
+        }
+    }
+
     struct UnaryInputCatalog {
         key_type: DataType,
         nullable: bool,
@@ -6725,5 +7011,65 @@ mod tests {
             panic!("expected inner ABS")
         };
         assert_eq!(args[0].data_type, DataType::Int8);
+    }
+
+    #[test]
+    fn concat_modes_control_argument_channels_ordinals_and_output_names() {
+        fn resolved(
+            sql: &str,
+            mode: &str,
+        ) -> Result<crate::analysis::ResolvedQuery, crate::analyze_error::AnalyzeError> {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query");
+            };
+            super::super::analyze_with_function_catalog_and_sql_semantics(
+                query,
+                &EmptyCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                &crate::sql_mode::SqlSemanticSettings::default()
+                    .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(mode)),
+            )
+            .map(|(query, _, _)| query)
+        }
+        for (mode, args_len, heading) in [
+            ("32", 3, "group_concat('a','-' SEPARATOR ',')"),
+            ("GROUP_CONCAT_LEGACY", 2, "group_concat('a' SEPARATOR '-')"),
+        ] {
+            let query = resolved("SELECT group_concat('a','-')", mode).unwrap();
+            let QueryBody::Select(select) = query.body else {
+                panic!("select");
+            };
+            assert_eq!(select.projection[0].output_name, heading);
+            let crate::analysis::ExprKind::AggregateCall { args, .. } =
+                &select.projection[0].expr.kind
+            else {
+                panic!("aggregate");
+            };
+            assert_eq!(args.len(), args_len);
+        }
+        resolved("SELECT group_concat('a','-' ORDER BY 2)", "32").unwrap();
+        let error = resolved(
+            "SELECT group_concat('a','-' ORDER BY 2)",
+            "GROUP_CONCAT_LEGACY",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ORDER BY position 2 is not in group_concat output list")
+        );
+        for mode in ["32", "GROUP_CONCAT_LEGACY"] {
+            let query = resolved("SELECT group_concat('a','-' SEPARATOR '|')", mode).unwrap();
+            let QueryBody::Select(select) = query.body else {
+                panic!("select");
+            };
+            assert_eq!(
+                select.projection[0].output_name,
+                "group_concat('a','-' SEPARATOR '|')"
+            );
+            assert!(resolved("SELECT string_agg('a','-' ORDER BY 2)", mode).is_err());
+        }
     }
 }

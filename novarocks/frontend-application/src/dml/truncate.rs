@@ -405,6 +405,7 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(30)),
             cancellation.view(),
             Default::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ))
     }
 

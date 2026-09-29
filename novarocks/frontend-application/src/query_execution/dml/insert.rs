@@ -553,6 +553,7 @@ mod tests {
             None,
             cancellation.view(),
             SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ));
         cancellation.request(QueryCancellationReason::ClientDisconnected);
         request.execution().clone()

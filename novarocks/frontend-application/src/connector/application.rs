@@ -253,6 +253,7 @@ mod request_context_tests {
             Some(deadline),
             cancellation.view(),
             SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ));
 
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
@@ -279,6 +280,7 @@ mod request_context_tests {
             None,
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ));
         let before = Instant::now();
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();

@@ -151,7 +151,10 @@ impl SqlFinalPlanCompileRequest {
         validate_dop_domain(dop_domain)?;
         validate_scan_read_budget(scan_read_budget)?;
         let display_intent = display_intent(&intent);
-        let query = super::parse_query(&statement)?;
+        let query = crate::sql_mode::normalize_concat_query(
+            super::parse_query(&statement)?,
+            &session.sql_semantics,
+        );
         let common = FinalPlanCommon {
             version,
             intent,
@@ -164,7 +167,14 @@ impl SqlFinalPlanCompileRequest {
             display_intent,
         };
 
-        let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled();
+        // A persisted semantic snapshot is required before an optional MV
+        // definition can be replayed. Decide before publishing discovery or
+        // catalog needs so an unrelated candidate cannot fail the base query.
+        let consumer_requires_semantic_snapshot =
+            crate::sql_mode::query_uses_group_concat_legacy(&common.session.sql_semantics, &query)
+                .map_err(SqlCompileError::Analyze)?;
+        let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
+            && !consumer_requires_semantic_snapshot;
         let initial_catalog = CatalogCompletionState::try_new(
             query.clone(),
             common.session.current_catalog.as_deref(),
@@ -423,6 +433,9 @@ pub(super) fn resume_materialized_view(
     }
     let additional_relations = definitions
         .iter()
+        // Keep rejected definitions for the late eligibility diagnostic, but
+        // never publish their additional source/target catalog obligations.
+        .filter(|definition| definition.completion_query_semantics_supported())
         .flat_map(SqlMvRewriteDefinitionFacts::completion_catalog_relations)
         .collect::<Vec<_>>();
     let mv_definitions = MvRewriteDefinitionIndex::try_new(definitions)
@@ -1133,6 +1146,7 @@ mod tests {
             SqlStatementInput::sql(sql),
             intent,
             SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: Some("iceberg".to_string()),
                 current_database: "db".to_string(),
                 optimizer_settings,
@@ -1491,6 +1505,180 @@ mod tests {
                 SqlCompileError::DeadlineExceeded
             ))
         ));
+    }
+
+    // Counters represent observation-port invocations, driven by the real
+    // completion need batches rather than a duplicate eligibility predicate.
+    fn complete_base_query_with_counters(
+        mut progress: SqlCompileProgress,
+        discovery_calls: &AtomicUsize,
+        target_catalog_reads: &AtomicUsize,
+    ) {
+        loop {
+            let compilation = match progress {
+                SqlCompileProgress::Complete(_) => break,
+                SqlCompileProgress::Incomplete(compilation) => compilation,
+            };
+            progress = match compilation.needs() {
+                SqlNeedBatch::MaterializedViews(_) => {
+                    discovery_calls.fetch_add(1, Ordering::AcqRel);
+                    panic!("unsupported consumer must not request optional MV discovery");
+                }
+                SqlNeedBatch::CatalogRelations(needs) => {
+                    for need in needs {
+                        if need.relation().table != "orders" {
+                            target_catalog_reads.fetch_add(1, Ordering::AcqRel);
+                            panic!(
+                                "unavailable optional MV relation must not block the base query"
+                            );
+                        }
+                    }
+                    answer_catalog(compilation)
+                }
+                SqlNeedBatch::Statistics(_) => answer_statistics(compilation),
+                SqlNeedBatch::ProviderReads(_) => answer_provider(compilation),
+            };
+        }
+    }
+
+    #[test]
+    fn unsupported_caller_never_discovers_optional_mv_definitions() {
+        use crate::sql_mode::SqlMode;
+        for (sql, connection_mode) in [
+            ("SELECT order_key FROM orders", "GROUP_CONCAT_LEGACY"),
+            (
+                "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders",
+                "32",
+            ),
+            (
+                "SELECT order_key FROM orders UNION ALL SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders",
+                "32",
+            ),
+            (
+                "SELECT order_key FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders) d",
+                "32",
+            ),
+        ] {
+            let mut request = request_with_mv(sql, SqlCompileIntent::Query, true);
+            request.session.sql_semantics = request
+                .session
+                .sql_semantics
+                .clone()
+                .with_sql_mode(SqlMode::from_assignment(connection_mode));
+            let seed = request.try_into_completion().expect("eligible base query");
+            let discovery_calls = AtomicUsize::new(0);
+            let target_catalog_reads = AtomicUsize::new(0);
+            complete_base_query_with_counters(
+                SqlCompiler::start(seed).expect("start base query"),
+                &discovery_calls,
+                &target_catalog_reads,
+            );
+            assert_eq!(
+                discovery_calls.load(Ordering::Acquire),
+                0,
+                "an unrelated bad MV cannot be observed for this query"
+            );
+            assert_eq!(target_catalog_reads.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn modern_root_override_keeps_existing_mv_discovery_policy() {
+        use crate::sql_mode::SqlMode;
+        let mut request = request_with_mv(
+            "SELECT /*+ SET_VAR(sql_mode=32) */ order_key FROM orders",
+            SqlCompileIntent::Query,
+            true,
+        );
+        request.session.sql_semantics = request
+            .session
+            .sql_semantics
+            .clone()
+            .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
+        let seed = request.try_into_completion().unwrap();
+        let compilation = incomplete(SqlCompiler::start(seed).unwrap());
+        assert!(matches!(
+            compilation.needs(),
+            SqlNeedBatch::MaterializedViews(_)
+        ));
+    }
+
+    #[test]
+    fn stored_unsupported_definition_never_requests_optional_target_catalog() {
+        use super::super::mv_rewrite::{
+            SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId,
+            SqlMvRewriteBaseTableFacts, SqlMvRewriteSourceOccurrenceFacts,
+        };
+        let seed = request_with_mv(
+            "SELECT order_key FROM orders",
+            SqlCompileIntent::Query,
+            true,
+        )
+        .try_into_completion()
+        .unwrap();
+        let mv = incomplete(SqlCompiler::start(seed).unwrap());
+        let need = match mv.needs() {
+            SqlNeedBatch::MaterializedViews(needs) => needs[0].clone(),
+            other => panic!("modern query retains MV discovery, got {other:?}"),
+        };
+        let discovery_calls = AtomicUsize::new(0);
+        discovery_calls.fetch_add(1, Ordering::AcqRel);
+        let table = novarocks_types::naming::TableIdentity {
+            catalog: "iceberg".to_string(),
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+        };
+        let mut statements = novarocks_parser::parse(
+            "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ order_key FROM orders",
+        )
+        .unwrap();
+        let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
+            panic!("query")
+        };
+        let definition = SqlMvRewriteDefinitionFacts::try_new(
+            91,
+            [11; 32],
+            query,
+            SqlMvDefinitionResolutionContext::try_new("iceberg".to_string(), "db".to_string())
+                .unwrap(),
+            "iceberg".to_string(),
+            Some(novarocks_types::naming::TableIdentity {
+                table: "missing_mv_target".to_string(),
+                ..table.clone()
+            }),
+            vec![
+                SqlMvRewriteSourceOccurrenceFacts::try_new(
+                    SqlMvRelationOccurrenceId::new(0),
+                    table,
+                    "orders".to_string(),
+                    None,
+                    SqlMvRewriteBaseTableFacts::unavailable("no publication".to_string()),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let progress = SqlCompiler::finish(
+            mv,
+            SqlFactBatch::MaterializedViews(Box::from([MaterializedViewFact::observed(
+                &need,
+                Box::from([definition]),
+            )])),
+            &SqlCompileControl::unbounded(),
+        )
+        .expect("stored unsupported candidate must not fail base query");
+        let target_catalog_reads = AtomicUsize::new(0);
+        complete_base_query_with_counters(progress, &discovery_calls, &target_catalog_reads);
+        assert_eq!(
+            discovery_calls.load(Ordering::Acquire),
+            1,
+            "modern discovery policy is unchanged"
+        );
+        assert_eq!(
+            target_catalog_reads.load(Ordering::Acquire),
+            0,
+            "no optional target read before late eligibility diagnostic"
+        );
     }
 
     #[test]

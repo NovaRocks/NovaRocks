@@ -36,7 +36,7 @@ fn every_active_manifest_descriptor_has_exactly_one_adapter_wire_mapping() {
         .filter(|descriptor| descriptor.status == ErrorCodeStatus::Active)
         .map(|descriptor| descriptor.code.as_str())
         .collect::<BTreeSet<_>>();
-    assert_eq!(descriptor_codes.len(), 29);
+    assert_eq!(descriptor_codes.len(), 30);
     for code in descriptor_codes {
         assert!(
             error_kind_for_domain_code(code).is_some(),

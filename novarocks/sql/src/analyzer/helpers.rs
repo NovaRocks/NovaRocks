@@ -799,31 +799,9 @@ fn format_function_display_name(function: &ast::FunctionCall) -> String {
     let distinct = matches!(function.quantifier, ast::FunctionQuantifier::Distinct)
         || original_name == "array_agg_distinct";
     let (arguments, order_arguments, implicit_separator) = if canonical_name == "group_concat" {
-        // The native AST stores an explicit `SEPARATOR` separately. Preserve
-        // the legacy comma spelling only when its final positional argument
-        // is a string literal; all other value lists use the default comma
-        // separator.
-        let (values, separator) = match function.separator.as_deref() {
-            Some(separator) => (function.arguments.as_slice(), Some(separator)),
-            None if function.arguments.len() > 1
-                && function.arguments.last().is_some_and(|argument| {
-                    matches!(
-                        argument,
-                        ast::Expr::Literal(ast::Literal {
-                            kind: ast::LiteralKind::String(_),
-                            ..
-                        })
-                    )
-                }) =>
-            {
-                function
-                    .arguments
-                    .split_last()
-                    .map(|(separator, values)| (values, Some(separator)))
-                    .expect("more than one GROUP_CONCAT argument")
-            }
-            None => (function.arguments.as_slice(), None),
-        };
+        // Prepared syntax owns values and separator in distinct fields.
+        let values = function.arguments.as_slice();
+        let separator = function.separator.as_deref();
         (
             values
                 .iter()
@@ -1376,7 +1354,8 @@ mod tests {
 
     #[test]
     fn expr_display_name_formats_group_concat_like_starrocks() {
-        let expr = parse_select_expr("SELECT group_concat(name, subject, ',' ORDER BY 1, 2)");
+        let expr =
+            parse_select_expr("SELECT group_concat(name, subject ORDER BY 1, 2 SEPARATOR ',')");
         assert_eq!(
             expr_display_name(&expr),
             "group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')"

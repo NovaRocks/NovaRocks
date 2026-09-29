@@ -959,6 +959,7 @@ fn test_request_context_with_role(
             current_catalog.map(str::to_string),
             current_database.to_string(),
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ),
         QueryExecutionContext::new(
             role,
@@ -988,6 +989,7 @@ fn test_request_context_with_role(
             None,
             cancellation.view(),
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
         ),
     )
 }
@@ -1086,6 +1088,7 @@ fn prepare_explain_query_with_ports(
             current_database,
             connector_context: Some(connector_context),
         },
+        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )?;
 
     // Time-travel refs become synthetic local tables. Ordinary Iceberg refs
@@ -1397,6 +1400,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
         novarocks_sql::compiler::SqlSessionContext {
+            sql_semantics: execution.sql_semantics().clone(),
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),

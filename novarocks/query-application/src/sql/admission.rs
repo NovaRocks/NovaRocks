@@ -27,6 +27,50 @@ use novarocks_parser::ast::{self, Statement as ParsedStatement};
 use novarocks_types::EngineErrorCode;
 use novarocks_workload_control::WorkClass;
 
+/// Reject uncaptured semantic settings before any definition side effects.
+/// Metadata-only statements remain available; refresh/repartition replays the
+/// stored query and must obey the same explicit consumer boundary.
+pub fn admit_persisted_definition_semantics(
+    source: &str,
+    statement: &ParsedStatement,
+    session: &novarocks_sql::sql_mode::SqlSemanticSettings,
+) -> Result<(), QueryServiceError> {
+    let (unsupported, span) = match statement {
+        ParsedStatement::View(ast::ViewStatement::Create(view)) => (
+            novarocks_sql::sql_mode::query_uses_group_concat_legacy(session, &view.query).map_err(
+                |error| QueryServiceError::from_user_error(error.to_user_error(Some(source))),
+            )?,
+            view.span,
+        ),
+        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Create(mv)) => (
+            novarocks_sql::sql_mode::query_uses_group_concat_legacy(session, &mv.query).map_err(
+                |error| QueryServiceError::from_user_error(error.to_user_error(Some(source))),
+            )?,
+            mv.span,
+        ),
+        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Refresh(mv)) => {
+            (session.sql_mode().group_concat_legacy(), mv.span)
+        }
+        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::ExplainRefresh(mv)) => {
+            (session.sql_mode().group_concat_legacy(), mv.span)
+        }
+        ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Alter(mv))
+            if matches!(&mv.action, ast::MaterializedViewAlterAction::Repartition(_)) =>
+        {
+            (session.sql_mode().group_concat_legacy(), mv.span)
+        }
+        _ => return Ok(()),
+    };
+    if unsupported {
+        return Err(QueryServiceError::from_user_error(
+            crate::sql::session_admit::SessionAdmitError::PersistedDefinitionSemanticsUnsupported
+                .to_user_error(source, span,
+                    "unsupported semantic setting: GROUP_CONCAT_LEGACY is not captured for persistent VIEW or MATERIALIZED VIEW definition replay"),
+        ));
+    }
+    Ok(())
+}
+
 /// Return whether this admitted statement needs the provider-publication
 /// deadline policy rather than only the session deadline.
 pub fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
@@ -192,6 +236,56 @@ pub fn admin_raise_engine_error(sql: &str) -> Result<Option<QueryServiceError>, 
 mod tests {
     use super::*;
     use crate::sql::parse_single_statement;
+
+    #[test]
+    fn definitions_and_direct_replay_have_explicit_semantic_admission() {
+        use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
+        let modern = SqlSemanticSettings::default();
+        let legacy = modern
+            .clone()
+            .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
+        for prefix in [
+            "CREATE VIEW v AS",
+            "CREATE OR REPLACE VIEW v AS",
+            "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(k) BUCKETS 1 AS",
+        ] {
+            let sql = format!("{prefix} SELECT 1");
+            let statement = parse_single_statement(&sql).unwrap();
+            assert!(admit_persisted_definition_semantics(&sql, &statement, &modern).is_ok());
+            let error =
+                admit_persisted_definition_semantics(&sql, &statement, &legacy).unwrap_err();
+            assert_eq!(
+                error.user_error().unwrap().code().as_str(),
+                "sql.admit.persisted_definition_semantics_unsupported"
+            );
+            let sql = format!("{prefix} SELECT /*+ SET_VAR(sql_mode=32) */ 1");
+            let statement = parse_single_statement(&sql).unwrap();
+            assert!(admit_persisted_definition_semantics(&sql, &statement, &legacy).is_ok());
+            let sql = format!(
+                "{prefix} SELECT * FROM (SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1) d"
+            );
+            let statement = parse_single_statement(&sql).unwrap();
+            assert!(admit_persisted_definition_semantics(&sql, &statement, &modern).is_err());
+        }
+        for sql in [
+            "REFRESH MATERIALIZED VIEW mv",
+            "EXPLAIN REFRESH MATERIALIZED VIEW mv",
+        ] {
+            let statement = parse_single_statement(sql).unwrap();
+            assert!(admit_persisted_definition_semantics(sql, &statement, &legacy).is_err());
+            assert!(admit_persisted_definition_semantics(sql, &statement, &modern).is_ok());
+        }
+        for sql in [
+            "SELECT 1",
+            "DROP VIEW v",
+            "SHOW CREATE VIEW v",
+            "DROP MATERIALIZED VIEW mv",
+            "ALTER MATERIALIZED VIEW mv PAUSE REFRESH",
+        ] {
+            let statement = parse_single_statement(sql).unwrap();
+            assert!(admit_persisted_definition_semantics(sql, &statement, &legacy).is_ok());
+        }
+    }
 
     #[test]
     fn unnegotiated_admission_ignores_empty_fragments_and_returns_one_statement() {

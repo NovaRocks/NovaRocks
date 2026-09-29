@@ -24,6 +24,7 @@ pub struct RequestSessionContext {
     current_catalog: Option<String>,
     current_database: String,
     optimizer_settings: SessionOptimizerSettings,
+    sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
 }
 
 impl RequestSessionContext {
@@ -31,11 +32,13 @@ impl RequestSessionContext {
         current_catalog: Option<String>,
         current_database: String,
         optimizer_settings: SessionOptimizerSettings,
+        sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Self {
         Self {
             current_catalog,
             current_database,
             optimizer_settings,
+            sql_semantics,
         }
     }
 
@@ -45,6 +48,10 @@ impl RequestSessionContext {
 
     pub fn current_database(&self) -> &str {
         &self.current_database
+    }
+
+    pub fn sql_semantics(&self) -> &novarocks_sql::sql_mode::SqlSemanticSettings {
+        &self.sql_semantics
     }
 
     pub fn optimizer_settings(&self) -> &SessionOptimizerSettings {
