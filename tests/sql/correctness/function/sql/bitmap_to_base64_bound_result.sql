@@ -27,7 +27,7 @@ SELECT bitmap_to_base64(bitmap_empty()) AS empty_text,
 -- query 3
 SELECT concat('bitmap:',bitmap_to_base64(to_bitmap(7))) AS text_consumer,
        bitmap_to_base64(NULL) IS NULL AS bare_null,
-       bitmap_to_base64(unhex('FF')) IS NULL AS malformed_null;
+       bitmap_to_base64(to_binary('FF','hex')) IS NULL AS malformed_null;
 
 -- query 4
 -- @order_sensitive=true
