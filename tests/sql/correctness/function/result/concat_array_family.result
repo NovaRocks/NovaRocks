@@ -1,0 +1,31 @@
+-- query 1
+empty_tail
+["a"]
+
+-- query 2
+mixed
+["a","b","c"]
+
+-- query 3
+null_element
+[null,"b"]
+
+-- query 4
+null_array
+NULL
+
+-- query 5
+nested
+[["a"],["b"]]
+
+-- query 6
+string_value
+ab
+
+-- query 7
+l	nested
+[]	[["a"],["b"]]
+
+-- query 8
+exact_integer
+[9223372036854775807,1]
