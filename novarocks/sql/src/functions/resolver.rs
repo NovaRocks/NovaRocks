@@ -732,4 +732,26 @@ mod tests {
             "the matching-arity enforced overload must still block legacy fallback"
         );
     }
+
+    #[test]
+    fn field_signature_requires_one_frozen_type_and_two_arguments() {
+        for ty in [
+            DataType::Utf8,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Decimal256(50, 2),
+            DataType::FixedSizeBinary(16),
+        ] {
+            let resolved =
+                resolve_scalar_function_signature("field", &[ty.clone(), ty.clone(), ty.clone()])
+                    .unwrap();
+            assert_eq!(resolved.argument_types, vec![ty.clone(), ty.clone(), ty]);
+            assert_eq!(resolved.return_type, DataType::Int32);
+        }
+        assert!(resolve_scalar_function_signature("field", &[DataType::Int64]).is_err());
+        assert!(
+            resolve_scalar_function_signature("field", &[DataType::Int64, DataType::Float64])
+                .is_err()
+        );
+    }
 }

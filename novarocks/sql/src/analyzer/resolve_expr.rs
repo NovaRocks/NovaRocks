@@ -4471,12 +4471,117 @@ fn bind_scalar_function_call(name: &str, args: Vec<TypedExpr>) -> Result<BoundSc
     )
 }
 
+// FIELD chooses one comparison family before ordinary argument binding. The
+// frozen signature must contain this common type for every value and candidate.
+fn normalize_field_arguments(args: Vec<TypedExpr>) -> Result<Vec<TypedExpr>, String> {
+    if args.len() < 2 {
+        return Err("field requires a value and at least one candidate".to_string());
+    }
+    if args.len() - 1 > i32::MAX as usize {
+        return Err("field candidate count exceeds INT range".to_string());
+    }
+    let numeric = |ty: &DataType| {
+        matches!(
+            ty,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+        ) || novarocks_types::largeint::is_largeint_data_type(ty)
+    };
+    let string = |ty: &DataType| matches!(ty, DataType::Utf8 | DataType::LargeUtf8);
+    for arg in &args {
+        if !numeric(&arg.data_type)
+            && !string(&arg.data_type)
+            && !matches!(
+                arg.data_type,
+                DataType::Null | DataType::Boolean | DataType::Date32 | DataType::Timestamp(_, _)
+            )
+        {
+            return Err(format!(
+                "field does not support argument type {:?}",
+                arg.data_type
+            ));
+        }
+    }
+    let mut non_null = args.iter().filter(|arg| arg.data_type != DataType::Null);
+    // NULL supplies no comparison type. Preserve the non-NULL candidates'
+    // capacity; an all-NULL call has an explicit INT comparison type.
+    let mut common = non_null
+        .next()
+        .map(|arg| arg.data_type.clone())
+        .unwrap_or(DataType::Int32);
+    for arg in non_null {
+        let other = &arg.data_type;
+        common = if string(&common) && string(other) {
+            DataType::Utf8
+        } else if numeric(&common) && numeric(other) {
+            if matches!(common, DataType::Float32 | DataType::Float64)
+                || matches!(other, DataType::Float32 | DataType::Float64)
+            {
+                // An existing approximate operand determines the numeric family.
+                DataType::Float64
+            } else if (novarocks_types::largeint::is_largeint_data_type(&common)
+                && matches!(
+                    other,
+                    DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+                ))
+                || (matches!(
+                    common,
+                    DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
+                ) && novarocks_types::largeint::is_largeint_data_type(other))
+            {
+                // All signed i128 values require 39 decimal integer digits.
+                let decimal = |ty: &DataType| {
+                    if novarocks_types::largeint::is_largeint_data_type(ty) {
+                        DataType::Decimal256(39, 0)
+                    } else {
+                        ty.clone()
+                    }
+                };
+                novarocks_types::coercion::decimal_compare_type(&decimal(&common), &decimal(other))?
+            } else {
+                match comparison_common_type(&common, other)? {
+                    Some(target) => target,
+                    None if common == *other => common,
+                    None => {
+                        return Err(format!(
+                            "field has no exact numeric common type for {common:?} and {other:?}"
+                        ));
+                    }
+                }
+            }
+        } else {
+            // FIELD's mixed-family contract is DOUBLE, unlike ordinary `=`.
+            // Ordinary SQL CAST owns invalid string handling; never parse here.
+            DataType::Float64
+        };
+    }
+    args.into_iter()
+        .map(|arg| {
+            let can_introduce_null =
+                arg.data_type != common && string(&arg.data_type) && !string(&common);
+            let mut cast = coerce_function_argument(arg, &common)?;
+            // Ordinary string-to-numeric CAST may produce NULL for invalid input.
+            cast.nullable |= can_introduce_null;
+            Ok(cast)
+        })
+        .collect()
+}
+
 pub(super) fn bind_scalar_function_call_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     mut args: Vec<TypedExpr>,
 ) -> Result<BoundScalarCall, String> {
     apply_implicit_string_function_casts(name, &mut args);
+    if name.eq_ignore_ascii_case("field") {
+        args = normalize_field_arguments(args)?;
+    }
     let arg_types = args
         .iter()
         .map(|arg| arg.data_type.clone())
@@ -7001,6 +7106,135 @@ mod tests {
         assert_eq!(
             err,
             "try_variant_get type argument must be a string literal"
+        );
+    }
+
+    #[test]
+    fn field_binding_freezes_the_comparison_family() {
+        use crate::analysis::ExprKind;
+        for (sql, expected) in [
+            ("select field('01', '1')", DataType::Utf8),
+            ("select field('01', '1', 1)", DataType::Float64),
+            (
+                "select field(cast(1 as int), cast(1 as bigint))",
+                DataType::Int64,
+            ),
+            (
+                "select field(cast(1 as float), cast(1 as double))",
+                DataType::Float64,
+            ),
+            ("select field(true, true)", DataType::Float64),
+            (
+                "select field(cast('2022-02-02' as date), cast('2022-02-02' as datetime))",
+                DataType::Float64,
+            ),
+            ("select field(NULL, NULL)", DataType::Int32),
+            ("select field(NULL, 2147483648)", DataType::Int64),
+            ("select field(NULL, NULL, 1)", DataType::Int64),
+            ("select field(NULL, 2147483648, 'bad')", DataType::Float64),
+        ] {
+            let expr = analyze_projection_expr(sql).unwrap();
+            assert_eq!(expr.data_type, DataType::Int32, "{sql}");
+            assert!(
+                !expr.nullable,
+                "FIELD result is always a non-NULL INT: {sql}"
+            );
+            let ExprKind::FunctionCall { args, binding, .. } = expr.kind else {
+                panic!("expected FIELD");
+            };
+            assert!(
+                args.iter().all(|arg| arg.data_type == expected),
+                "{sql}: {args:?}"
+            );
+            assert!(binding.selected.argument_types.iter().all(|arg| matches!(arg,
+                novarocks_functions::FunctionArgumentType::Value(value) if value.data_type == expected)), "{sql}");
+        }
+        let expr = analyze_projection_expr("select field('bad', '1', 1)").unwrap();
+        let ExprKind::FunctionCall { args, .. } = expr.kind else {
+            panic!("expected FIELD");
+        };
+        assert!(matches!(args[0].kind, ExprKind::Cast { .. }));
+        assert!(
+            args[0].nullable && args[1].nullable,
+            "invalid numeric strings may cast to NULL"
+        );
+    }
+
+    #[test]
+    fn field_common_type_retains_explicit_cast_boundaries() {
+        use crate::analysis::ExprKind;
+        let expr = analyze_projection_expr("select field(cast('01' as varchar), 1)").unwrap();
+        let ExprKind::FunctionCall { args, .. } = expr.kind else {
+            panic!("expected FIELD");
+        };
+        let ExprKind::Cast {
+            expr: inner,
+            target,
+        } = &args[0].kind
+        else {
+            panic!("expected common DOUBLE cast");
+        };
+        assert_eq!(*target, DataType::Float64);
+        assert!(matches!(
+            &inner.kind,
+            ExprKind::Cast {
+                target: DataType::Utf8,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn field_exact_numeric_binding_preserves_largeint_and_decimal_capacity() {
+        use crate::analysis::{ExprKind, LiteralValue, TypedExpr};
+        let arg = |data_type: DataType| TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Null),
+            data_type,
+            nullable: true,
+        };
+        for (types, expected) in [
+            (
+                vec![DataType::Int64, DataType::FixedSizeBinary(16)],
+                DataType::FixedSizeBinary(16),
+            ),
+            (
+                vec![DataType::Decimal128(20, 1), DataType::Int64],
+                DataType::Decimal128(20, 1),
+            ),
+            (
+                vec![DataType::Decimal128(38, 20), DataType::Int64],
+                DataType::Decimal256(39, 20),
+            ),
+            (
+                vec![DataType::FixedSizeBinary(16), DataType::Decimal128(38, 2)],
+                DataType::Decimal256(41, 2),
+            ),
+        ] {
+            let bound =
+                super::bind_scalar_function_call("field", types.into_iter().map(arg).collect())
+                    .unwrap();
+            assert!(bound.args.iter().all(|arg| arg.data_type == expected));
+        }
+        let error = match super::bind_scalar_function_call(
+            "field",
+            vec![
+                arg(DataType::Decimal256(76, 0)),
+                arg(DataType::Decimal256(76, 38)),
+            ],
+        ) {
+            Ok(_) => panic!("precision overflow must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("precision overflow"), "{error}");
+    }
+
+    #[test]
+    fn field_rejects_arity_and_container_types_during_binding() {
+        assert!(analyze_projection_expr("select field(1)").is_err());
+        assert!(
+            analyze_projection_expr("select field([1], [1])")
+                .unwrap_err()
+                .contains("does not support argument type")
         );
     }
 

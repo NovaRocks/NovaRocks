@@ -16,59 +16,77 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, StringArray};
-use arrow::compute::cast;
+use arrow::array::{Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array};
+use arrow::compute::kernels::cmp::eq;
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
+// Arrow's equality uses IEEE totalOrder for floats (-0 != +0 and NaN == NaN).
+// FIELD uses scalar equality, matching its typed comparison contract.
+fn field_equal(first: &ArrayRef, candidate: &ArrayRef) -> Result<BooleanArray, String> {
+    macro_rules! float_equal {
+        ($array:ty) => {{
+            let left = first
+                .as_any()
+                .downcast_ref::<$array>()
+                .ok_or_else(|| "field float downcast failed".to_string())?;
+            let right = candidate
+                .as_any()
+                .downcast_ref::<$array>()
+                .ok_or_else(|| "field float downcast failed".to_string())?;
+            Ok(BooleanArray::from_iter((0..left.len()).map(|row| {
+                (!left.is_null(row) && !right.is_null(row))
+                    .then(|| left.value(row) == right.value(row))
+            })))
+        }};
+    }
+    match first.data_type() {
+        DataType::Float32 => float_equal!(Float32Array),
+        DataType::Float64 => float_equal!(Float64Array),
+        _ => eq(
+            &first.as_ref() as &dyn arrow::array::Datum,
+            &candidate.as_ref() as &dyn arrow::array::Datum,
+        )
+        .map_err(|error| error.to_string()),
+    }
+}
+
 pub fn eval_field(
     arena: &ExprArena,
-    expr: ExprId,
+    _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    let _ = expr;
-    let first = arena.eval(args[0], chunk)?;
-    let first = if first.data_type() == &DataType::Utf8 {
-        first
-    } else {
-        cast(first.as_ref(), &DataType::Utf8).map_err(|_| "field expects string".to_string())?
-    };
-    let first_arr = first
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "field expects string".to_string())?;
-    let mut arrays = Vec::with_capacity(args.len() - 1);
-    for arg in &args[1..] {
-        let arr = arena.eval(*arg, chunk)?;
-        let arr = if arr.data_type() == &DataType::Utf8 {
-            arr
-        } else {
-            cast(arr.as_ref(), &DataType::Utf8).map_err(|_| "field expects string".to_string())?
-        };
-        arrays.push(
-            arr.as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "field expects string".to_string())?
-                .clone(),
-        );
+    if args.len() < 2 || args.len() - 1 > i32::MAX as usize {
+        return Err("field requires a value and an INT-bounded candidate list".to_string());
     }
-    let len = first_arr.len();
-    let mut out = Vec::with_capacity(len);
-    for row in 0..len {
-        if first_arr.is_null(row) {
-            out.push(Some(0_i32));
+    let first = arena.eval(args[0], chunk)?;
+    let mut indices = vec![0_i32; first.len()];
+    for (index, arg) in args[1..].iter().enumerate() {
+        let candidate = arena.eval(*arg, chunk)?;
+        if candidate.len() != first.len() {
+            return Err("field frozen argument length mismatch".to_string());
+        }
+        if first.data_type() == &DataType::Null {
+            // Untyped NULL has no comparable values. Candidate evaluation still
+            // occurs; ordinary SQL binding normally retags NULL to the common type.
             continue;
         }
-        let target = first_arr.value(row);
-        let mut idx = 0_i32;
-        for (i, arr) in arrays.iter().enumerate() {
-            if !arr.is_null(row) && arr.value(row) == target {
-                idx = (i + 1) as i32;
-                break;
+        if candidate.data_type() != first.data_type() {
+            return Err(format!(
+                "field frozen argument mismatch: {:?}/{} vs {:?}/{}",
+                first.data_type(),
+                first.len(),
+                candidate.data_type(),
+                candidate.len()
+            ));
+        }
+        let equal = field_equal(&first, &candidate)?;
+        for (row, output) in indices.iter_mut().enumerate() {
+            if *output == 0 && !equal.is_null(row) && equal.value(row) {
+                *output = (index + 1) as i32;
             }
         }
-        out.push(Some(idx));
     }
-    Ok(Arc::new(arrow::array::Int32Array::from(out)) as ArrayRef)
+    Ok(Arc::new(Int32Array::from(indices)))
 }

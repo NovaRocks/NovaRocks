@@ -264,7 +264,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "position",
         "find_in_set",
         "strcmp",
-        "field",
         "regexp_position",
     ] {
         add(
@@ -298,12 +297,15 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             TypeSpec::Int32,
         ),
     );
-    // field(value, ...candidates) reports which candidate the value equals,
-    // over any comparable type rather than text alone.
+    // FIELD's SQL owner normalizes all arguments to one comparison type.
+    // Two fixed arguments plus the repeated variadic tail enforce min arity 2.
     add(
         m,
         "field",
-        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Int32),
+        Signature::variadic(
+            vec![TypeSpec::Any("T"), TypeSpec::Any("T"), TypeSpec::Any("T")],
+            TypeSpec::Int32,
+        ),
     );
     // `equiwidth_bucket` and `regexp_count` return Int64 instead of Int32.
     add(

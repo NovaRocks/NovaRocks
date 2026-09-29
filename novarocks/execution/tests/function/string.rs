@@ -2501,3 +2501,138 @@ fn test_split_unicode_and_empty_delimiter() {
     // delimiter not found
     split_eq!("测隔试隔试", "a", ["测隔试隔试"]);
 }
+
+// Evaluate frozen homogeneous arguments in both batched and sliced chunks.
+fn field_column_indices(columns: Vec<ArrayRef>) -> Vec<i32> {
+    let mut arena = ExprArena::default();
+    let expr = common::typed_null(&mut arena, DataType::Int32);
+    let args = columns
+        .iter()
+        .enumerate()
+        .map(|(i, column)| common::slot_ref(&mut arena, (i + 1) as u32, column.data_type().clone()))
+        .collect::<Vec<_>>();
+    let evaluate = |chunk: &novarocks_execution::exec::chunk::Chunk| {
+        let out = eval_string_function("field", &arena, expr, &args, chunk).unwrap();
+        let out = out.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(out.null_count(), 0);
+        out.values().to_vec()
+    };
+    let batched = evaluate(&common::chunk_from_columns(columns.clone()));
+    let sliced = common::single_row_chunks(&columns)
+        .iter()
+        .flat_map(evaluate)
+        .collect::<Vec<_>>();
+    assert_eq!(batched, sliced);
+    batched
+}
+
+#[test]
+fn field_typed_numeric_keys_nulls_and_first_match() {
+    let first = Arc::new(Int64Array::from(vec![
+        Some(9007199254740993),
+        Some(2),
+        None,
+        Some(4),
+    ])) as ArrayRef;
+    let a = Arc::new(Int64Array::from(vec![
+        Some(9007199254740992),
+        Some(2),
+        None,
+        None,
+    ])) as ArrayRef;
+    let b = Arc::new(Int64Array::from(vec![
+        Some(9007199254740993),
+        Some(2),
+        Some(0),
+        Some(4),
+    ])) as ArrayRef;
+    assert_eq!(field_column_indices(vec![first, a, b]), vec![2, 1, 0, 2]);
+    let large =
+        novarocks_types::largeint::array_from_i128(&[Some(i128::MAX), Some(i128::MAX - 1), None])
+            .unwrap();
+    let other =
+        novarocks_types::largeint::array_from_i128(&[Some(i128::MAX - 1), Some(i128::MAX), None])
+            .unwrap();
+    assert_eq!(
+        field_column_indices(vec![large.clone(), other, large]),
+        vec![2, 2, 0]
+    );
+    let a = Arc::new(
+        arrow::array::Decimal128Array::from(vec![Some(123450), None, Some(9)])
+            .with_precision_and_scale(20, 4)
+            .unwrap(),
+    ) as ArrayRef;
+    let b = Arc::new(
+        arrow::array::Decimal128Array::from(vec![Some(123450), Some(0), Some(8)])
+            .with_precision_and_scale(20, 4)
+            .unwrap(),
+    ) as ArrayRef;
+    assert_eq!(field_column_indices(vec![a.clone(), b, a]), vec![1, 0, 2]);
+    let wide = arrow::datatypes::i256::from_i128(i128::MAX)
+        .wrapping_mul(arrow::datatypes::i256::from_i128(100));
+    let a = Arc::new(
+        arrow::array::Decimal256Array::from(vec![Some(wide), None])
+            .with_precision_and_scale(50, 2)
+            .unwrap(),
+    ) as ArrayRef;
+    assert_eq!(field_column_indices(vec![a.clone(), a]), vec![1, 0]);
+}
+
+#[test]
+fn field_float_equality_is_ieee_not_total_order() {
+    let first = Arc::new(Float64Array::from(vec![
+        Some(-0.0),
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        None,
+    ])) as ArrayRef;
+    let a = Arc::new(Float64Array::from(vec![
+        Some(0.0),
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        None,
+    ])) as ArrayRef;
+    assert_eq!(field_column_indices(vec![first, a]), vec![1, 0, 1, 0]);
+    let first = Arc::new(arrow::array::Float32Array::from(vec![-0.0, f32::NAN])) as ArrayRef;
+    let a = Arc::new(arrow::array::Float32Array::from(vec![0.0, f32::NAN])) as ArrayRef;
+    assert_eq!(field_column_indices(vec![first, a]), vec![1, 0]);
+}
+
+#[test]
+fn field_keeps_string_identity_and_rejects_unfrozen_arguments() {
+    let a = Arc::new(StringArray::from(vec![Some("01"), Some("a"), None])) as ArrayRef;
+    let b = Arc::new(StringArray::from(vec![Some("1"), Some("a"), None])) as ArrayRef;
+    assert_eq!(field_column_indices(vec![a, b]), vec![0, 1, 0]);
+    let mut arena = ExprArena::default();
+    let expr = common::typed_null(&mut arena, DataType::Int32);
+    let first = common::literal_i64(&mut arena, 1);
+    let candidate = common::literal_string(&mut arena, "1");
+    let error = eval_string_function(
+        "field",
+        &arena,
+        expr,
+        &[first, candidate],
+        &common::chunk_len_1(),
+    )
+    .unwrap_err();
+    assert!(error.contains("frozen argument mismatch"), "{error}");
+    assert!(eval_string_function("field", &arena, expr, &[first], &common::chunk_len_1()).is_err());
+}
+
+#[test]
+fn field_null_first_preserves_candidate_evaluation_errors() {
+    let mut arena = ExprArena::default();
+    let expr = common::typed_null(&mut arena, DataType::Int32);
+    let first = common::typed_null(&mut arena, DataType::Null);
+    let missing_candidate = common::slot_ref(&mut arena, 2, DataType::Int64);
+    assert!(
+        eval_string_function(
+            "field",
+            &arena,
+            expr,
+            &[first, missing_candidate],
+            &common::chunk_len_1()
+        )
+        .is_err()
+    );
+}
