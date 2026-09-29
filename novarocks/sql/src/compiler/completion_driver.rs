@@ -2403,6 +2403,10 @@ mod tests {
                     analyze: false,
                 },
             );
+            // Match the SQL fixtures' fixed probe/build roles. Otherwise join
+            // commutativity may legally broadcast the smaller probe relation.
+            compile_request.session.optimizer_settings.disabled_rules =
+                vec!["JoinReorder".to_string(), "JoinCommutativity".to_string()];
             compile_request
                 .session
                 .optimizer_settings
