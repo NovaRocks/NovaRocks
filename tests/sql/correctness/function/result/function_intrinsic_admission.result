@@ -1,0 +1,23 @@
+-- query 1
+lowercase	caught_parse
+a	1
+
+-- query 2
+all_true	winning_value
+1	1
+
+-- query 3
+row_number_value
+1
+
+-- query 4
+negated	narrow_type
+-1	tinyint
+
+-- query 5
+first_match
+1
+
+-- query 10
+sorted_empty	minimum_null	maximum_null	top_empty	top_single_null	null_key_order
+[]	1	1	[]	[null]	[[2],[1]]

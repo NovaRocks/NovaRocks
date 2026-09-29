@@ -58,6 +58,7 @@ fn semantics() -> FunctionSemantics {
         volatility: FunctionVolatility::Immutable,
         argument_evaluation: FunctionArgumentEvaluation::Eager,
         failure_behavior: FunctionFailureBehavior::Propagate,
+        intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
     }
 }
 
@@ -74,10 +75,15 @@ fn declaration(
     kind: FunctionKind,
     overloads: Vec<FunctionOverloadDeclaration>,
 ) -> FunctionBindingDeclaration {
+    let mut semantics = semantics();
+    if matches!(kind, FunctionKind::Aggregate | FunctionKind::Window) {
+        semantics.intrinsic_row_error =
+            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated;
+    }
     FunctionBindingDeclaration::try_new(
         FunctionId::try_new("test/function/v1").unwrap(),
         kind,
-        semantics(),
+        semantics,
         overloads,
     )
     .unwrap()
@@ -349,7 +355,7 @@ fn catalog_digest_covers_explicit_binding_contract_and_ignores_registration_orde
     let digest = |declaration| catalog(Arc::new(EchoResolver::default()), declaration).digest();
     let baseline = digest(base.clone());
     assert_eq!(baseline, digest(reversed));
-    for field in 0..7 {
+    for field in 0..8 {
         let mut changed = base.clone();
         match field {
             0 => changed.function_id = FunctionId::try_new("test/function/v2").unwrap(),
@@ -359,6 +365,10 @@ fn catalog_digest_covers_explicit_binding_contract_and_ignores_registration_orde
             4 => changed.semantics.failure_behavior = FunctionFailureBehavior::ReturnsNull,
             5 => changed.overloads[0].argument_pattern = "(U)".into(),
             6 => changed.overloads[0].result_pattern = "U".into(),
+            7 => {
+                changed.semantics.intrinsic_row_error =
+                    novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
+            }
             _ => unreachable!(),
         }
         assert_ne!(baseline, digest(changed), "field {field}");
@@ -861,4 +871,56 @@ fn table_and_window_bindings_have_distinct_result_shapes() {
         };
         assert!(catalog.validate_bound(&changed, request(&[])).is_err());
     }
+}
+
+#[test]
+fn intrinsic_row_error_is_independent_of_catching_and_closed_by_function_kind() {
+    use novarocks_type_contract::FunctionIntrinsicRowError as Own;
+    for kind in [
+        FunctionKind::Scalar,
+        FunctionKind::Table,
+        FunctionKind::Aggregate,
+        FunctionKind::Window,
+    ] {
+        for own in [Own::NoRowError, Own::MayRaise, Own::NotRowEvaluated] {
+            let mut semantics = semantics();
+            semantics.failure_behavior = FunctionFailureBehavior::ReturnsNull;
+            semantics.intrinsic_row_error = own;
+            let mut selected = overload("test/intrinsic/T/v1", "(T)");
+            if kind == FunctionKind::Aggregate {
+                selected.aggregate = Some(AggregateBindingDeclaration {
+                    intermediate_pattern: "binary".into(),
+                    state_format: AggregateStateFormatIdentity::try_new("test/intrinsic/state-v1")
+                        .unwrap(),
+                });
+            }
+            let result = FunctionBindingDeclaration::try_new(
+                FunctionId::try_new("test/intrinsic/v1").unwrap(),
+                kind,
+                semantics,
+                [selected],
+            );
+            assert_eq!(
+                result.is_ok(),
+                own.is_valid_for_kind(kind),
+                "{kind:?}/{own:?}"
+            );
+        }
+    }
+    let declaration = declaration(
+        FunctionKind::Scalar,
+        vec![overload("test/echo/T/v1", "(T)")],
+    );
+    let catalog = catalog(Arc::new(EchoResolver::default()), declaration);
+    let arguments = [argument(DataType::Int32, false)];
+    let original = catalog
+        .resolve_bound_user("echo", FunctionKind::Scalar, request(&arguments))
+        .unwrap();
+    let mut forged = original.clone();
+    forged.semantics.intrinsic_row_error = Own::MayRaise;
+    assert!(
+        catalog
+            .validate_bound(&forged, request(&arguments))
+            .is_err()
+    );
 }

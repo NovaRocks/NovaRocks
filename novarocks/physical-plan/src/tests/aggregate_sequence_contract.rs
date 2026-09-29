@@ -62,6 +62,8 @@ fn aggregate_binding(phase: AggregatePhase, drift: BindingDrift) -> AggregateBin
             volatility: FunctionVolatility::Immutable,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error:
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
         },
         phase,
         logical_argument_count: 1,

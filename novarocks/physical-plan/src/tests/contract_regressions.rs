@@ -1960,6 +1960,8 @@ fn table_function_fragment(
                     volatility: FunctionVolatility::Immutable,
                     argument_evaluation: FunctionArgumentEvaluation::Eager,
                     failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 arguments: Box::from([argument]),
                 outputs: Box::from([
@@ -2045,6 +2047,8 @@ fn table_function_binding_cannot_be_published_as_a_scalar_call() {
                     volatility: FunctionVolatility::Immutable,
                     argument_evaluation: FunctionArgumentEvaluation::Eager,
                     failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 args: Box::default(),
             },
@@ -2163,6 +2167,8 @@ fn higher_order_function_fragment(
                     volatility: FunctionVolatility::Immutable,
                     argument_evaluation: FunctionArgumentEvaluation::Eager,
                     failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 args: arguments,
             },
@@ -2616,6 +2622,8 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
                 volatility: FunctionVolatility::Immutable,
                 argument_evaluation: FunctionArgumentEvaluation::Eager,
                 failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error:
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
             },
             phase: AggregatePhase::Final {
                 sequence: AggregateSequenceId::new(1),

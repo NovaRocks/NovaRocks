@@ -517,6 +517,7 @@ pub(crate) fn test_function_binding(
             volatility,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
         },
         logical_argument_count: args.len(),
         selected: novarocks_functions::FunctionBindingSelection {
@@ -557,6 +558,8 @@ pub(crate) fn test_window_binding(
     binding.function_id = FunctionId::try_new(format!("test.window/{name}/v1"))
         .expect("test window function identity");
     binding.kind = FunctionKind::Window;
+    binding.semantics.intrinsic_row_error =
+        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated;
     binding.selected.overload =
         FunctionOverloadId::try_new(format!("test.window/{name}/overload-v1"))
             .expect("test window function overload identity");
@@ -805,4 +808,25 @@ pub(crate) struct SubqueryInfo {
     pub data_type: DataType,
     /// For IN subquery: the left-hand expression from the outer query.
     pub in_expr: Option<Box<SqlExpr>>,
+}
+
+#[cfg(test)]
+mod intrinsic_binding_helper_tests {
+    use super::*;
+
+    #[test]
+    fn structural_window_binding_preserves_non_row_boundary() {
+        let binding = test_window_binding("row_number", &[], DataType::Int64, false);
+        assert_eq!(binding.kind, novarocks_functions::FunctionKind::Window);
+        assert_eq!(
+            binding.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated
+        );
+        assert!(
+            binding
+                .semantics
+                .intrinsic_row_error
+                .is_valid_for_kind(binding.kind)
+        );
+    }
 }

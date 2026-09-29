@@ -443,6 +443,7 @@ fn window_function() -> BoundFunction {
         volatility: FunctionVolatility::Immutable,
         argument_evaluation: FunctionArgumentEvaluation::Eager,
         failure_behavior: FunctionFailureBehavior::Propagate,
+        intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
     }
 }
 
@@ -1002,6 +1003,8 @@ fn finish_table_function_with_sink(
                     },
                     argument_evaluation: FunctionArgumentEvaluation::Eager,
                     failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 arguments: Box::default(),
                 outputs,

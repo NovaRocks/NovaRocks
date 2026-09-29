@@ -542,6 +542,7 @@ pub(crate) fn test_function_binding(
             volatility,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
         },
         logical_argument_count: args.len(),
         selected: novarocks_functions::FunctionBindingSelection {
@@ -580,6 +581,8 @@ pub(crate) fn test_window_binding(
     binding.function_id = FunctionId::try_new(format!("test.window/{name}/v1"))
         .expect("test window function identity");
     binding.kind = FunctionKind::Window;
+    binding.semantics.intrinsic_row_error =
+        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated;
     binding.selected.overload =
         FunctionOverloadId::try_new(format!("test.window/{name}/overload-v1"))
             .expect("test window function overload identity");
@@ -1333,5 +1336,33 @@ mod bridge_tests {
         );
         let id2 = intern_typed(&mut a, &e);
         assert_eq!(id1, id2, "complex expr must dedup to one id");
+    }
+}
+
+#[cfg(test)]
+mod intrinsic_binding_helper_tests {
+    use super::*;
+
+    #[test]
+    fn structural_window_and_table_bindings_keep_their_row_boundaries() {
+        let arena = ScalarArena::new();
+        let window = test_window_binding(&arena, "row_number", &[], DataType::Int64, false);
+        let table = test_table_binding(&arena, "unnest", &[], &[]);
+        assert_eq!(
+            window.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated
+        );
+        assert_eq!(
+            table.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+        );
+        for binding in [window, table] {
+            assert!(
+                binding
+                    .semantics
+                    .intrinsic_row_error
+                    .is_valid_for_kind(binding.kind)
+            );
+        }
     }
 }

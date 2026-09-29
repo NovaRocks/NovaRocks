@@ -137,6 +137,28 @@ pub enum FunctionFailureBehavior {
     ReturnsNull,
 }
 
+/// Externally visible errors owned by a selected row implementation on legally
+/// bound inputs. Child-expression, frozen-contract, resource and lifecycle errors
+/// are outside this fact; it does not depend on `FunctionFailureBehavior`.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FunctionIntrinsicRowError {
+    NoRowError,
+    MayRaise,
+    /// Aggregate/window owners do not evaluate a scalar row implementation.
+    NotRowEvaluated,
+}
+
+impl FunctionIntrinsicRowError {
+    pub const fn is_valid_for_kind(self, kind: FunctionKind) -> bool {
+        match kind {
+            FunctionKind::Scalar | FunctionKind::Table => !matches!(self, Self::NotRowEvaluated),
+            FunctionKind::Aggregate | FunctionKind::Window => {
+                matches!(self, Self::NotRowEvaluated)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FunctionIdentityError {
     Empty { kind: &'static str },

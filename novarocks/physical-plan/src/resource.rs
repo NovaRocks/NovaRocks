@@ -1682,6 +1682,8 @@ mod tests {
             volatility: novarocks_type_contract::FunctionVolatility::Immutable,
             argument_evaluation: novarocks_type_contract::FunctionArgumentEvaluation::Eager,
             failure_behavior: novarocks_type_contract::FunctionFailureBehavior::Propagate,
+            intrinsic_row_error:
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
         };
         let binding = AggregateBinding {
             function,

@@ -454,6 +454,8 @@ mod validation_error_tests {
                 volatility: crate::FunctionVolatility::Immutable,
                 argument_evaluation: crate::FunctionArgumentEvaluation::Eager,
                 failure_behavior: crate::FunctionFailureBehavior::Propagate,
+                intrinsic_row_error:
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
             },
             phase: AggregatePhase::Partial { sequence },
             logical_argument_count: 1,

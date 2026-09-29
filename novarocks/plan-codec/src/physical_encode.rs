@@ -1649,6 +1649,7 @@ fn validate_table_binding(
             volatility: function.volatility,
             argument_evaluation: function.argument_evaluation,
             failure_behavior: function.failure_behavior,
+            intrinsic_row_error: function.intrinsic_row_error,
         },
         logical_argument_count: request_arguments.len(),
         selected: FunctionBindingSelection {
@@ -1755,6 +1756,7 @@ fn validate_bound_function(
             volatility: function.volatility,
             argument_evaluation: function.argument_evaluation,
             failure_behavior: function.failure_behavior,
+            intrinsic_row_error: function.intrinsic_row_error,
         },
         logical_argument_count,
         selected: FunctionBindingSelection {
@@ -4820,6 +4822,7 @@ mod tests {
             volatility: FunctionVolatility::Immutable,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
         };
         let selected = FunctionBindingSelection {
             overload: overload.clone(),
@@ -4860,6 +4863,7 @@ mod tests {
             volatility: semantics.volatility,
             argument_evaluation: semantics.argument_evaluation,
             failure_behavior: semantics.failure_behavior,
+            intrinsic_row_error: semantics.intrinsic_row_error,
         };
         (catalog, function)
     }
@@ -4895,6 +4899,10 @@ mod tests {
         let mut forged_semantics = function.clone();
         forged_semantics.volatility = FunctionVolatility::Stable;
         assert!(validate_test_scalar(&catalog, &forged_semantics).is_err());
+        let mut forged_intrinsic = function.clone();
+        forged_intrinsic.intrinsic_row_error =
+            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise;
+        assert!(validate_test_scalar(&catalog, &forged_intrinsic).is_err());
 
         let mut forged_argument = function.clone();
         forged_argument.argument_types = Box::from([FunctionArgumentType::Value(

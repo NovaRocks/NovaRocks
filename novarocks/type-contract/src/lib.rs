@@ -36,8 +36,9 @@ pub use array_generate::array_generate_item_type;
 pub use comparison::OrderedComparisonAlgorithm;
 pub use function::{
     AggregateStateFormatId, FunctionArgumentEvaluation, FunctionArgumentType,
-    FunctionFailureBehavior, FunctionId, FunctionIdentityError, FunctionKind, FunctionOverloadId,
-    FunctionValueType, FunctionVolatility, fits_nested_nullability,
+    FunctionFailureBehavior, FunctionId, FunctionIdentityError, FunctionIntrinsicRowError,
+    FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility,
+    fits_nested_nullability,
 };
 pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 pub use partition::{

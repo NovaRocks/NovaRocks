@@ -358,4 +358,35 @@ mod tests {
         assert_ne!(current.id(), legacy.id());
         assert_eq!(current.descriptor_digest(), legacy.descriptor_digest());
     }
+    #[test]
+    fn prior_intrinsic_binding_peer_has_a_distinct_plan_contract_digest() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
+                .unwrap();
+        // Revision 2 predates intrinsic facts; revision 3 is reserved for the
+        // independent Add/Sub semantic root. Both peers lack this closed fact.
+        // Equal catalog and implementation digests isolate the plan revision.
+        for revision in [2, 3] {
+            let prior = novarocks_version::derive_repository_native_compatibility_material(
+                native_carrier_declarations(manifest.contracts()).unwrap(),
+                [0x31; 32],
+                [0x41; 32],
+                revision,
+            )
+            .unwrap();
+            assert!(current.plan_contract_revision() > revision);
+            assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+            assert_ne!(current.id(), prior.id());
+            assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+            assert_eq!(
+                current.function_catalog_digest(),
+                prior.function_catalog_digest()
+            );
+            assert_eq!(
+                current.execution_implementation_manifest_digest(),
+                prior.execution_implementation_manifest_digest()
+            );
+        }
+    }
 }
