@@ -889,7 +889,7 @@ mod tests {
             "group_concat",
             false,
             selected.intermediate_type.clone(),
-            input_type.clone(),
+            DataType::Utf8,
             order,
         );
         // Exercise the generic option binder before the legacy implementation
