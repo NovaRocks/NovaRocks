@@ -185,9 +185,9 @@ pub(super) fn prepare_repeat_input(
         None,
     );
 
-    // Apply substitutions to group_by, projection, having so that every
-    // place the original rollup-key expression appeared now reads from
-    // the materialized alias slot.
+    // Rewrite grouping keys and their post-aggregate uses to materialized
+    // Repeat slots. Aggregate arguments and aggregate-local ordering keep
+    // original row inputs so rolled-up levels do not aggregate forced NULLs.
     for gb_expr in &mut select.group_by {
         substitute_expr_in_place(gb_expr, &substitutions);
     }
@@ -231,8 +231,8 @@ pub(super) fn prepare_repeat_input(
 
 /// In-place substitution: when any sub-expression's `typed_expr_display_name`
 /// matches an entry's first field, replace that sub-expression with the
-/// second field. Walks AggregateCall / FunctionCall / BinaryOp / UnaryOp /
-/// IsNull / Cast / Case / InList / Nested children recursively.
+/// second field. Walks scalar and window children recursively, preserving
+/// AggregateCall as the boundary of the original row-input domain.
 ///
 /// Used after `prepare_repeat_input` to rewrite group-by / projection /
 /// having references to the original rollup-key expression into ColumnRefs
@@ -247,6 +247,11 @@ struct RepeatSubstitution {
 }
 
 fn substitute_expr_in_place(expr: &mut TypedExpr, substitutions: &[RepeatSubstitution]) {
+    // A quoted grouping-column name can equal an aggregate's display name.
+    // Close the original-row aggregate domain before any name/id matching.
+    if matches!(&expr.kind, ExprKind::AggregateCall { .. }) {
+        return;
+    }
     let name = typed_expr_display_name(expr);
     if let Some(substitution) = substitutions.iter().find(|substitution| {
         substitution.display_name == name
@@ -257,74 +262,15 @@ fn substitute_expr_in_place(expr: &mut TypedExpr, substitutions: &[RepeatSubstit
         *expr = substitution.replacement.clone();
         return;
     }
-    match &mut expr.kind {
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for a in args {
-                substitute_expr_in_place(a, substitutions);
-            }
-            for s in order_by {
-                substitute_expr_in_place(&mut s.expr, substitutions);
-            }
-        }
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for a in args {
-                substitute_expr_in_place(a, substitutions);
-            }
-            for p in partition_by {
-                substitute_expr_in_place(p, substitutions);
-            }
-            for s in order_by {
-                substitute_expr_in_place(&mut s.expr, substitutions);
-            }
-        }
-        ExprKind::FunctionCall { args, .. } => {
-            for a in args {
-                substitute_expr_in_place(a, substitutions);
-            }
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            substitute_expr_in_place(left, substitutions);
-            substitute_expr_in_place(right, substitutions);
-        }
-        ExprKind::UnaryOp { expr: inner, .. } => substitute_expr_in_place(inner, substitutions),
-        ExprKind::IsNull { expr: inner, .. } => substitute_expr_in_place(inner, substitutions),
-        ExprKind::Cast { expr: inner, .. } => substitute_expr_in_place(inner, substitutions),
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(op) = operand {
-                substitute_expr_in_place(op, substitutions);
-            }
-            for (w, t) in when_then {
-                substitute_expr_in_place(w, substitutions);
-                substitute_expr_in_place(t, substitutions);
-            }
-            if let Some(e) = else_expr {
-                substitute_expr_in_place(e, substitutions);
-            }
-        }
-        ExprKind::InList {
-            expr: inner, list, ..
-        } => {
-            substitute_expr_in_place(inner, substitutions);
-            for v in list {
-                substitute_expr_in_place(v, substitutions);
-            }
-        }
-        ExprKind::Nested(inner) => substitute_expr_in_place(inner, substitutions),
-        // ColumnRef, Literal, LambdaParamRef, SubqueryPlaceholder, etc. —
-        // either leaves with no sub-exprs or contexts where substitution
-        // would change semantics. Top-level match above already handles
-        // any whole-expr replacement.
-        _ => {}
-    }
+    // Aggregate inputs belong to the original row domain, including an
+    // ordered aggregate's ORDER BY expressions. The shared scalar traversal
+    // treats AggregateCall as opaque while visiting post-aggregate scalar and
+    // window expressions that must observe Repeat's nullified group keys.
+    *expr = rewrite_expr_children(expr, |child| {
+        let mut rewritten = child.clone();
+        substitute_expr_in_place(&mut rewritten, substitutions);
+        rewritten
+    });
 }
 
 fn collect_repeat_input_refs(
@@ -359,55 +305,15 @@ fn collect_repeat_input_refs(
                 collect_repeat_input_refs(&sort_item.expr, out, seen);
             }
         }
-        ExprKind::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_repeat_input_refs(arg, out, seen);
-            }
+        _ => {
+            // Unlike output substitution, input collection deliberately enters
+            // aggregate argument and aggregate-local ordering domains above.
+            // All scalar and window children share the complete traversal.
+            let _ = rewrite_expr_children(expr, |child| {
+                collect_repeat_input_refs(child, out, seen);
+                child.clone()
+            });
         }
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_repeat_input_refs(left, out, seen);
-            collect_repeat_input_refs(right, out, seen);
-        }
-        ExprKind::UnaryOp { expr: inner, .. }
-        | ExprKind::Cast { expr: inner, .. }
-        | ExprKind::Nested(inner)
-        | ExprKind::IsNull { expr: inner, .. }
-        | ExprKind::IsTruthValue { expr: inner, .. } => {
-            collect_repeat_input_refs(inner, out, seen);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(op) = operand {
-                collect_repeat_input_refs(op, out, seen);
-            }
-            for (when, then) in when_then {
-                collect_repeat_input_refs(when, out, seen);
-                collect_repeat_input_refs(then, out, seen);
-            }
-            if let Some(el) = else_expr {
-                collect_repeat_input_refs(el, out, seen);
-            }
-        }
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_repeat_input_refs(arg, out, seen);
-            }
-            for part in partition_by {
-                collect_repeat_input_refs(part, out, seen);
-            }
-            for sort_item in order_by {
-                collect_repeat_input_refs(&sort_item.expr, out, seen);
-            }
-        }
-        _ => {}
     }
 }
 

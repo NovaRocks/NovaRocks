@@ -2264,6 +2264,208 @@ fn p2_rollup_materialized_key_has_real_id() {
     );
 }
 
+fn grouping_input_source_and_repeat_key(plan: &LogicalPlanNode) -> (ColumnId, ColumnId) {
+    let (repeat_plan, repeat) = first_repeat_node(plan);
+    let LogicalPlanKind::Project(project) = &repeat_plan.unary_input().kind else {
+        panic!("expected materialized Repeat input");
+    };
+    let source = project
+        .items
+        .iter()
+        .find(|item| item.output_name == "a")
+        .expect("original row input must remain available to aggregates");
+    let key = project
+        .items
+        .iter()
+        .find(|item| item.output_name == "__repeat_group_key_0")
+        .expect("Repeat must have a separate nullifiable grouping key");
+    assert_ne!(source.output_column_id, ColumnId::UNSET);
+    assert_ne!(source.output_column_id, key.output_column_id);
+    assert_eq!(repeat.all_rollup_column_ids[0], key.output_column_id);
+    (source.output_column_id, key.output_column_id)
+}
+
+fn grouping_input_expr_column_ids(expr: &TypedExpr) -> std::collections::HashSet<ColumnId> {
+    let mut ids = std::collections::HashSet::new();
+    if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
+        ids.insert(*column_id);
+    }
+    // These assertions inspect scalar argument trees or expressions whose
+    // aggregate calls have already been replaced by result ColumnRefs.
+    let _ = rewrite_expr_children(expr, |child| {
+        ids.extend(grouping_input_expr_column_ids(child));
+        child.clone()
+    });
+    ids
+}
+
+#[test]
+fn grouping_input_sum_distinct_count_and_ordered_array_keep_original_rows() {
+    for grouping in ["ROLLUP(a)", "CUBE(a)", "GROUPING SETS ((a), ())"] {
+        let plan = plan_test_query(&format!(
+            "SELECT a, sum(a), count(DISTINCT a), array_agg(a ORDER BY a DESC) \
+             FROM t GROUP BY {grouping}"
+        ));
+        let (source_id, repeat_key_id) = grouping_input_source_and_repeat_key(&plan);
+        let (project, aggregate) = root_project_over_aggregate(&plan);
+        assert_eq!(column_ref_id(&aggregate.group_by[0]), repeat_key_id);
+        assert_eq!(column_ref_id(&project.items[0].expr), repeat_key_id);
+        assert_eq!(aggregate.aggregates.len(), 3);
+        for call in &aggregate.aggregates {
+            assert_eq!(call.args.len(), 1);
+            assert_eq!(
+                grouping_input_expr_column_ids(&call.args[0]),
+                [source_id].into(),
+                "{grouping}: {} must aggregate the original input, including total levels",
+                call.name
+            );
+            if call.name == "count" {
+                assert!(call.distinct);
+            }
+            if call.name == "array_agg" {
+                assert_eq!(call.order_by.len(), 1);
+                assert!(!call.order_by[0].asc);
+                assert_eq!(
+                    grouping_input_expr_column_ids(&call.order_by[0].expr),
+                    [source_id].into(),
+                    "ordered aggregate sorting belongs to the original row domain"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn grouping_input_computed_key_does_not_replace_aggregate_arithmetic() {
+    let plan = plan_test_query("SELECT a + 1 AS k, sum(a + 1) AS s FROM t GROUP BY ROLLUP(a + 1)");
+    let (source_id, repeat_key_id) = grouping_input_source_and_repeat_key(&plan);
+    let (project, aggregate) = root_project_over_aggregate(&plan);
+    assert_eq!(column_ref_id(&project.items[0].expr), repeat_key_id);
+    assert_eq!(column_ref_id(&aggregate.group_by[0]), repeat_key_id);
+    let [call] = aggregate.aggregates.as_slice() else {
+        panic!("expected SUM");
+    };
+    assert_eq!(call.name, "sum");
+    let [arg] = call.args.as_slice() else {
+        panic!("expected SUM input expression");
+    };
+    assert!(
+        matches!(&arg.kind, ExprKind::BinaryOp { op: BinOp::Add, right, .. }
+        if matches!(&right.kind, ExprKind::Literal(LiteralValue::Int(1))))
+    );
+    assert_eq!(grouping_input_expr_column_ids(arg), [source_id].into());
+}
+
+#[test]
+fn grouping_input_having_uses_group_outputs_and_original_aggregate_inputs() {
+    let plan = plan_test_query(
+        "SELECT a, sum(a) AS s FROM t GROUP BY ROLLUP(a) \
+         HAVING sum(a) > 0 OR a IS NULL",
+    );
+    let (source_id, repeat_key_id) = grouping_input_source_and_repeat_key(&plan);
+    let (project, filter, aggregate) = root_project_filter_aggregate(&plan);
+    let [sum] = aggregate.aggregates.as_slice() else {
+        panic!("expected one deduplicated SUM");
+    };
+    assert_eq!(
+        grouping_input_expr_column_ids(&sum.args[0]),
+        [source_id].into()
+    );
+    assert_eq!(column_ref_id(&project.items[0].expr), repeat_key_id);
+    assert_eq!(
+        grouping_input_expr_column_ids(&filter.predicate),
+        [repeat_key_id, sum.output_column_id].into(),
+        "HAVING must consume aggregate results and the nullifiable grouping output"
+    );
+}
+
+#[test]
+fn grouping_input_window_orders_group_outputs_without_rewriting_inner_sum() {
+    let plan = plan_test_query(
+        "SELECT a, sum(sum(a)) OVER (PARTITION BY a ORDER BY a) AS running_sum \
+         FROM t GROUP BY ROLLUP(a)",
+    );
+    let (source_id, repeat_key_id) = grouping_input_source_and_repeat_key(&plan);
+    let aggregate = first_aggregate_node(&plan).expect("inner SUM aggregate");
+    let [sum] = aggregate.aggregates.as_slice() else {
+        panic!("expected one inner SUM");
+    };
+    assert_eq!(
+        grouping_input_expr_column_ids(&sum.args[0]),
+        [source_id].into()
+    );
+    let windows = first_window_exprs(&plan);
+    let [window] = windows.as_slice() else {
+        panic!("expected one window SUM");
+    };
+    assert_eq!(column_ref_id(&window.args[0]), sum.output_column_id);
+    assert_eq!(column_ref_id(&window.partition_by[0]), repeat_key_id);
+    assert_eq!(column_ref_id(&window.order_by[0].expr), repeat_key_id);
+}
+
+#[test]
+fn grouping_input_scalar_predicate_preserves_non_group_argument_columns() {
+    let plan =
+        plan_test_query("SELECT a, sum(IF(b BETWEEN 1 AND 2, 1, 0)) FROM t GROUP BY ROLLUP(a)");
+    let (_, repeat_key_id) = grouping_input_source_and_repeat_key(&plan);
+    let (repeat_plan, _) = first_repeat_node(&plan);
+    let LogicalPlanKind::Project(project) = &repeat_plan.unary_input().kind else {
+        panic!("expected Repeat input Project");
+    };
+    let b = project
+        .items
+        .iter()
+        .find(|item| item.output_name == "b")
+        .expect("aggregate predicate's non-group input must survive Repeat materialization");
+    let aggregate = first_aggregate_node(&plan).expect("SUM aggregate");
+    let [sum] = aggregate.aggregates.as_slice() else {
+        panic!("expected one SUM");
+    };
+    assert_eq!(
+        grouping_input_expr_column_ids(&sum.args[0]),
+        [b.output_column_id].into()
+    );
+    assert_ne!(b.output_column_id, repeat_key_id);
+}
+
+#[test]
+fn grouping_input_quoted_column_name_cannot_replace_an_entire_aggregate() {
+    let (resolved, registry, mut factory) = parse_analyze_query(
+        "SELECT `sum(a)` AS k, sum(a) AS total \
+         FROM (SELECT a, b AS `sum(a)` FROM t) AS s \
+         GROUP BY ROLLUP(`sum(a)`)",
+    )
+    .expect("quoted column and real aggregate should analyze");
+    let QueryBody::Select(select) = &resolved.body else {
+        panic!("expected SELECT");
+    };
+    let ExprKind::AggregateCall { args, .. } = &select.projection[1].expr.kind else {
+        panic!("expected genuine SUM expression");
+    };
+    let source_id = column_ref_id(&args[0]);
+    assert_eq!(
+        crate::analysis::expr_display::typed_expr_display_name(&select.group_by[0]),
+        crate::analysis::expr_display::typed_expr_display_name(&select.projection[1].expr),
+        "the quoted grouping key and real aggregate intentionally share a display name"
+    );
+
+    let plan = plan_query(resolved, registry, &mut factory).expect("collision must preserve SUM");
+    let (_, repeat) = first_repeat_node(&plan);
+    let key_id = repeat.all_rollup_column_ids[0];
+    let (project, aggregate) = root_project_over_aggregate(&plan);
+    let [sum] = aggregate.aggregates.as_slice() else {
+        panic!("group-key substitution must not erase the genuine aggregate");
+    };
+    assert_eq!(sum.name, "sum");
+    assert_eq!(
+        grouping_input_expr_column_ids(&sum.args[0]),
+        [source_id].into()
+    );
+    assert_eq!(column_ref_id(&project.items[0].expr), key_id);
+    assert_eq!(column_ref_id(&project.items[1].expr), sum.output_column_id);
+    assert_ne!(sum.output_column_id, key_id);
+}
+
 #[test]
 fn p2_rollup_column_key_uses_distinct_repeat_materialization_id() {
     let plan = parse_analyze_and_plan("SELECT a, count(*) FROM t GROUP BY ROLLUP(a)")
