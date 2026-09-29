@@ -2123,6 +2123,7 @@ mod bitmap_base64_type_tests {
                 vec![novarocks_functions::FunctionArgumentType::Value(
                     FunctionValueType::new(DataType::Binary, nullable)
                 )]
+                .into_boxed_slice()
             );
             // Exact validation consumes already-coerced expressions, as SQL does.
             let coerced = [FunctionArgument::Value {
