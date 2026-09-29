@@ -1571,6 +1571,15 @@ pub(crate) fn validate_node_semantics(
             outputs,
             left_outer,
         } => {
+            if !function
+                .intrinsic_row_error
+                .is_valid_for_kind(crate::FunctionKind::Table)
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "bound table function has a non-row intrinsic fact",
+                ));
+            }
             if function.result_types.is_empty() {
                 errors.push(ValidationError::new(
                     path,

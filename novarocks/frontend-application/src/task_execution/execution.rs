@@ -54,7 +54,7 @@ use novarocks_types::identity::{StageId, TaskId};
 use super::clock::TaskProtocolClock;
 use super::completion::{ReadCompletionTracker, ReadVerdict};
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
-use novarocks_query_application::coordination::AcceptedRootSuccessSealRequest;
+use novarocks_query_application::coordination::AcceptedRootControlRequest;
 use novarocks_types::identity::BackendProcessId;
 
 use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
@@ -272,7 +272,7 @@ pub struct StatusReport {
     pub resubscribe: bool,
     /// The first success-seal request in the same intake order. Entries after
     /// it remain queued as residual status work.
-    pub success_seal: Option<AcceptedRootSuccessSealRequest>,
+    pub root_control: Option<AcceptedRootControlRequest>,
 }
 
 /// The release-carried runtime-filter contributions of one attempt.
@@ -336,6 +336,7 @@ pub struct QueryTaskExecution {
     failure: TerminationLatch,
     read: ReadCompletionTracker,
     required_evidence_deadlines: BTreeMap<TaskIdentity, MonotonicInstant>,
+    required_result_terminal_control_deadline: Option<MonotonicInstant>,
     drained_tasks: BTreeSet<TaskId>,
     released_outputs: BTreeSet<TaskId>,
     released_children_of: BTreeSet<StageId>,
@@ -610,6 +611,7 @@ impl QueryTaskExecution {
             failure: TerminationLatch::open(),
             read,
             required_evidence_deadlines: BTreeMap::new(),
+            required_result_terminal_control_deadline: None,
             drained_tasks: BTreeSet::new(),
             released_outputs: BTreeSet::new(),
             released_children_of: BTreeSet::new(),
@@ -1781,8 +1783,8 @@ impl QueryTaskExecution {
                         "legacy observation entered the covered intake".to_owned(),
                     ));
                 }
-                ObservationIntakeEntry::SuccessSeal(request) => {
-                    report.success_seal = Some(request);
+                ObservationIntakeEntry::RootControl(request) => {
+                    report.root_control = Some(request);
                     break;
                 }
                 #[cfg(test)]
@@ -2063,8 +2065,8 @@ impl QueryTaskExecution {
                 StatusIntakeEntry::ObservationLoss => {
                     report.resubscribe = true;
                 }
-                StatusIntakeEntry::SuccessSeal(request) => {
-                    report.success_seal = Some(request);
+                StatusIntakeEntry::RootControl(request) => {
+                    report.root_control = Some(request);
                     break;
                 }
             }
@@ -2278,6 +2280,31 @@ impl QueryTaskExecution {
                 .or_insert(deadline);
         }
         Ok(())
+    }
+
+    pub(crate) fn require_result_terminal_control(
+        &mut self,
+        root: TaskIdentity,
+    ) -> Result<(), TaskExecutionError> {
+        if root != self.graph.root_identity() {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        let deadline = self.clock.now().saturating_add(Duration::from_secs(30));
+        self.required_result_terminal_control_deadline
+            .get_or_insert(deadline);
+        Ok(())
+    }
+
+    pub(crate) fn result_terminal_control_required(&self) -> bool {
+        self.required_result_terminal_control_deadline.is_some()
+    }
+
+    pub(crate) fn required_result_terminal_control_expired(&self) -> bool {
+        self.required_result_terminal_control_deadline
+            .is_some_and(|deadline| {
+                self.clock.now().has_reached(deadline)
+                    && self.failure.cause().is_none_or(|cause| cause.is_derived())
+            })
     }
 
     pub(crate) fn required_terminal_evidence_expired(&self) -> Option<TaskIdentity> {

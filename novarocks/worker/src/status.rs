@@ -855,6 +855,10 @@ impl RootResultBinding {
 pub enum RootResultRoute {
     /// This exact live task owns the query's client-visible result.
     Serve(RootResultBinding),
+    /// This exact result owner belongs to a context whose output was revoked
+    /// by a latched termination. The accepted Task control stream supplies
+    /// the originating cause; absence of its revoked buffer is not a refusal.
+    AwaitTerminalControl,
     /// No task of this identity exists on this exact backend process.
     UnknownTask,
     /// A live task, but the sink its creation winner validated is not the
@@ -876,7 +880,7 @@ impl RootResultRoute {
     /// error field.
     pub fn refusal_detail(&self) -> Option<String> {
         match self {
-            Self::Serve(_) => None,
+            Self::Serve(_) | Self::AwaitTerminalControl => None,
             Self::UnknownTask => {
                 Some("result poll names a task this backend process does not own".to_owned())
             }

@@ -982,8 +982,8 @@ pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> 
         | "bitmap_subset_limit"
         | "bitmap_subset_in_range"
         | "bitmap_to_binary"
-        | "bitmap_from_binary"
-        | "bitmap_to_base64" => DataType::Binary,
+        | "bitmap_from_binary" => DataType::Binary,
+        "bitmap_to_base64" => DataType::Utf8,
         "bitmap_contains" | "bitmap_has_any" => DataType::Boolean,
         "bitmap_min" | "bitmap_max" | "bitmap_count" | "hll_cardinality" => DataType::Int64,
         "count_state_union"
@@ -2012,5 +2012,20 @@ mod tests {
             );
             validate_scalar_function_call("arrays_overlap", &[scalar_array, string_array]).unwrap();
         }
+    }
+    #[test]
+    fn bitmap_base64_legacy_and_selected_result_types_remain_text() {
+        assert_eq!(
+            infer_scalar_return_type("bitmap_to_base64", &[DataType::Binary]),
+            DataType::Utf8
+        );
+        assert_eq!(
+            dynamic_scalar_return_type("bitmap_to_base64", &[DataType::Binary]),
+            Some(DataType::Utf8)
+        );
+        assert_eq!(
+            dynamic_scalar_return_type("bitmap_to_binary", &[DataType::Binary]),
+            Some(DataType::Binary)
+        );
     }
 }

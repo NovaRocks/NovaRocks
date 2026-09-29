@@ -6670,6 +6670,7 @@ impl ContractLoweringVisitor {
                     volatility: binding.semantics.volatility,
                     argument_evaluation: binding.semantics.argument_evaluation,
                     failure_behavior: binding.semantics.failure_behavior,
+                    intrinsic_row_error: binding.semantics.intrinsic_row_error,
                 },
                 arguments: arguments.into_boxed_slice(),
                 outputs: outputs.into_boxed_slice(),
@@ -7591,6 +7592,7 @@ impl ContractLoweringVisitor {
                         volatility: binding.semantics.volatility,
                         argument_evaluation: binding.semantics.argument_evaluation,
                         failure_behavior: binding.semantics.failure_behavior,
+                        intrinsic_row_error: binding.semantics.intrinsic_row_error,
                     },
                     args: lowered_args.into_boxed_slice(),
                 }
@@ -8802,6 +8804,7 @@ fn bound_function_from_resolved(
         volatility: binding.semantics.volatility,
         argument_evaluation: binding.semantics.argument_evaluation,
         failure_behavior: binding.semantics.failure_behavior,
+        intrinsic_row_error: binding.semantics.intrinsic_row_error,
     }
 }
 
@@ -8944,6 +8947,7 @@ fn lower_aggregate_binding(
             volatility: resolved.semantics.volatility,
             argument_evaluation: resolved.semantics.argument_evaluation,
             failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
         },
         phase,
         logical_argument_count: u32::try_from(resolved.logical_argument_count).map_err(|_| {

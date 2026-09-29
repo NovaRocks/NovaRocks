@@ -4358,4 +4358,76 @@ mod tests {
         );
         assert_eq!(fixture.host.installs.load(Ordering::SeqCst), 2);
     }
+    #[test]
+    fn real_owner_result_revocation_waits_for_terminal_control() {
+        use crate::task_protocol::TaskExecutionIngress;
+        let fixture = OwnerFixture::new(90_503);
+        let root = fixture.identity(1);
+        let descriptor = consistent_descriptor(root, UniqueId::new(90_503, 1));
+        let body = Body::with_sink(
+            1,
+            plan::DataSink {
+                kind: Some(plan::data_sink::Kind::Result(true)),
+            },
+            Vec::new(),
+        );
+        let receipt = fixture.create(&descriptor, &body);
+        assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
+        assert!(
+            matches!(
+                fixture.registry.root_result_route(root),
+                novarocks_worker::RootResultRoute::Serve(_)
+            ),
+            "the production host installed the exact result before create returned"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let limit =
+            novarocks_execution_contract::task_execution::operation::ResultByteLimit::new(1024)
+                .unwrap();
+        assert!(
+            !matches!(
+                runtime.block_on(novarocks_worker::result_buffer::wait_fetch_task_typed(
+                    root,
+                    None,
+                    Duration::ZERO,
+                    limit,
+                )),
+                novarocks_worker::result_buffer::TryFetchTypedResult::Error(_)
+            ),
+            "production preparation registered the result carrier"
+        );
+        let abort = fixture.registry.abort_query_context(
+            &novarocks_execution_contract::task_execution::operation::AbortQueryContext::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                AbortCause::PeerTaskFailed,
+            ),
+        );
+        assert_eq!(abort.outcome(), OperationOutcome::Accepted);
+        assert!(matches!(
+            fixture.registry.root_result_route(root),
+            novarocks_worker::RootResultRoute::AwaitTerminalControl
+        ));
+        let ingress = crate::task_protocol_ingress::RegistryTaskExecutionIngress::new(
+            Arc::clone(&fixture.registry),
+            NativeCompatibilityId::new([0x71; 32]),
+        );
+        let response = runtime
+            .block_on(ingress.fetch_task_result(proto::FetchTaskResultRequest {
+                root_task: Some(novarocks_task_codec::identity::encode_task_identity(root)),
+                max_wait_millis: 1_000,
+                acknowledged_packet_sequence: None,
+                max_result_bytes: 1024,
+            }))
+            .unwrap();
+        assert_eq!(
+            response.status,
+            proto::fetch_result_response::Status::AwaitTerminalControl as i32
+        );
+        assert!(response.message.is_empty() && response.result_arrow_ipc.is_empty());
+        assert!(!response.eos);
+    }
 }

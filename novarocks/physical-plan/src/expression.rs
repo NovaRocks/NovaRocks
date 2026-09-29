@@ -36,6 +36,7 @@ pub struct BoundFunction {
     pub volatility: FunctionVolatility,
     pub argument_evaluation: FunctionArgumentEvaluation,
     pub failure_behavior: FunctionFailureBehavior,
+    pub intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError,
 }
 
 /// Exact binding for a function whose result is a relation rather than a
@@ -50,6 +51,7 @@ pub struct BoundTableFunction {
     pub volatility: FunctionVolatility,
     pub argument_evaluation: FunctionArgumentEvaluation,
     pub failure_behavior: FunctionFailureBehavior,
+    pub intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

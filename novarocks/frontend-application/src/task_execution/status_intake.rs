@@ -37,7 +37,7 @@ use novarocks_execution::task_execution::{
     TaskConvergenceReceipt, TaskIdentity, TaskStatus,
 };
 use novarocks_query_application::coordination::{
-    AcceptedRootSuccessSealPort, AcceptedRootSuccessSealRequest, MonotonicInstant,
+    AcceptedRootControlPort, AcceptedRootControlRequest, MonotonicInstant,
 };
 
 use super::clock::{ProcessMonotonicClock, TaskProtocolClock};
@@ -145,14 +145,14 @@ struct StatusIntakeQueue {
     entries: VecDeque<StatusIntakeEntry>,
     status_count: usize,
     observation_loss_queued: bool,
-    success_seal_queued: bool,
+    root_control_queued: bool,
 }
 
 #[derive(Debug)]
 pub(super) enum StatusIntakeEntry {
     Status(StatusEvent),
     ObservationLoss,
-    SuccessSeal(AcceptedRootSuccessSealRequest),
+    RootControl(AcceptedRootControlRequest),
 }
 
 impl StatusIntakeQueue {
@@ -220,14 +220,14 @@ impl StatusIntakeHandle {
     }
 }
 
-impl AcceptedRootSuccessSealPort for StatusIntakeHandle {
-    fn enqueue_success_seal(
+impl AcceptedRootControlPort for StatusIntakeHandle {
+    fn enqueue_root_control(
         &self,
-        request: AcceptedRootSuccessSealRequest,
-    ) -> Result<(), AcceptedRootSuccessSealRequest> {
+        request: AcceptedRootControlRequest,
+    ) -> Result<(), AcceptedRootControlRequest> {
         {
             let mut queue = self.inner.queue.lock().expect("status intake queue");
-            if queue.success_seal_queued {
+            if queue.root_control_queued {
                 return Err(request);
             }
             // One result pump owns one move-only request. It is the queue's
@@ -235,8 +235,8 @@ impl AcceptedRootSuccessSealPort for StatusIntakeHandle {
             // success decision or make it wait for new capacity.
             queue
                 .entries
-                .push_back(StatusIntakeEntry::SuccessSeal(request));
-            queue.success_seal_queued = true;
+                .push_back(StatusIntakeEntry::RootControl(request));
+            queue.root_control_queued = true;
         }
         self.inner.wake.wake();
         Ok(())
@@ -323,14 +323,14 @@ impl StatusIntakeRunner<'_> {
                     queue.observation_loss_queued = false;
                     observation_loss = true;
                 }
-                Some(StatusIntakeEntry::SuccessSeal(_)) | None => break,
+                Some(StatusIntakeEntry::RootControl(_)) | None => break,
             }
         }
         (observation_loss, statuses)
     }
 
-    /// Drains in publication order and stops at the first success-seal
-    /// request. Entries behind that request remain residual work.
+    /// Drains in publication order and stops at the first root-control
+    /// request. Entries behind that request remain for the next serial turn.
     pub(super) fn drain_ordered(&mut self, max: usize) -> Vec<StatusIntakeEntry> {
         let mut queue = self.intake.inner.queue.lock().expect("status intake queue");
         let mut entries = Vec::new();
@@ -338,14 +338,14 @@ impl StatusIntakeRunner<'_> {
             let Some(entry) = queue.entries.pop_front() else {
                 break;
             };
-            let is_seal = matches!(entry, StatusIntakeEntry::SuccessSeal(_));
+            let is_root_control = matches!(entry, StatusIntakeEntry::RootControl(_));
             match &entry {
                 StatusIntakeEntry::Status(_) => queue.status_count -= 1,
                 StatusIntakeEntry::ObservationLoss => queue.observation_loss_queued = false,
-                StatusIntakeEntry::SuccessSeal(_) => queue.success_seal_queued = false,
+                StatusIntakeEntry::RootControl(_) => queue.root_control_queued = false,
             }
             entries.push(entry);
-            if is_seal {
+            if is_root_control {
                 break;
             }
         }
@@ -413,7 +413,7 @@ pub(crate) struct ObservationSubscriptionLimit;
 #[derive(Debug)]
 pub(crate) enum ObservationIntakeEntry {
     Frame(ObservationFrame),
-    SuccessSeal(AcceptedRootSuccessSealRequest),
+    RootControl(AcceptedRootControlRequest),
     #[cfg(test)]
     TestSeal,
 }
@@ -446,7 +446,7 @@ struct ObservationQueue {
     queued_frames: usize,
     data_count: usize,
     data_bytes: usize,
-    success_seal_queued: bool,
+    root_control_queued: bool,
 }
 
 #[derive(Debug)]
@@ -483,7 +483,7 @@ impl ObservationIntake {
         Self::new_with_clock(
             4096,
             4098,
-            max_frame * 4 + std::mem::size_of::<AcceptedRootSuccessSealRequest>(),
+            max_frame * 4 + std::mem::size_of::<AcceptedRootControlRequest>(),
             max_frame,
             wake,
             clock,
@@ -524,7 +524,7 @@ impl ObservationIntake {
         if max_frame_bytes == 0 {
             return Err(ObservationIntakeConfigError::NoFrameCapacity);
         }
-        let control_bytes = std::mem::size_of::<AcceptedRootSuccessSealRequest>().max(1);
+        let control_bytes = std::mem::size_of::<AcceptedRootControlRequest>().max(1);
         if total_bytes < max_frame_bytes.saturating_add(control_bytes) {
             return Err(ObservationIntakeConfigError::NoControlByteCapacity);
         }
@@ -598,22 +598,22 @@ impl ObservationIntake {
 
     /// The seal uses its reserved control entry. Its registration shares the
     /// same mutex as frames, so an already accepted pending frame stays first.
-    pub(crate) fn enqueue_success_seal(
+    pub(crate) fn enqueue_root_control(
         &self,
-        request: AcceptedRootSuccessSealRequest,
-    ) -> Result<(), AcceptedRootSuccessSealRequest> {
+        request: AcceptedRootControlRequest,
+    ) -> Result<(), AcceptedRootControlRequest> {
         let mut queue = self.inner.queue.lock().expect("observation intake queue");
-        if queue.success_seal_queued {
+        if queue.root_control_queued {
             return Err(request);
         }
         queue.entries.push_back(RegisteredObservation {
             registered_at: self.inner.clock.now(),
-            entry: ObservationIntakeEntry::SuccessSeal(request),
+            entry: ObservationIntakeEntry::RootControl(request),
             subscription: None,
             pending: false,
             charged_bytes: 0,
         });
-        queue.success_seal_queued = true;
+        queue.root_control_queued = true;
         drop(queue);
         self.inner.wake.wake();
         Ok(())
@@ -630,7 +630,7 @@ impl ObservationIntake {
     #[cfg(test)]
     fn enqueue_test_seal(&self) {
         let mut queue = self.inner.queue.lock().expect("observation intake queue");
-        assert!(!queue.success_seal_queued);
+        assert!(!queue.root_control_queued);
         queue.entries.push_back(RegisteredObservation {
             registered_at: self.inner.clock.now(),
             entry: ObservationIntakeEntry::TestSeal,
@@ -638,18 +638,18 @@ impl ObservationIntake {
             pending: false,
             charged_bytes: 0,
         });
-        queue.success_seal_queued = true;
+        queue.root_control_queued = true;
         drop(queue);
         self.inner.wake.wake();
     }
 }
 
-impl AcceptedRootSuccessSealPort for ObservationIntake {
-    fn enqueue_success_seal(
+impl AcceptedRootControlPort for ObservationIntake {
+    fn enqueue_root_control(
         &self,
-        request: AcceptedRootSuccessSealRequest,
-    ) -> Result<(), AcceptedRootSuccessSealRequest> {
-        ObservationIntake::enqueue_success_seal(self, request)
+        request: AcceptedRootControlRequest,
+    ) -> Result<(), AcceptedRootControlRequest> {
+        ObservationIntake::enqueue_root_control(self, request)
     }
 }
 
@@ -849,7 +849,7 @@ impl ObservationIntakeRunner<'_> {
                 break;
             };
             let seal = match &registered.entry {
-                ObservationIntakeEntry::SuccessSeal(_) => true,
+                ObservationIntakeEntry::RootControl(_) => true,
                 ObservationIntakeEntry::Frame(_) => false,
                 #[cfg(test)]
                 ObservationIntakeEntry::TestSeal => true,
@@ -874,7 +874,7 @@ impl ObservationIntakeRunner<'_> {
                     queue.queued_frames -= 1;
                 }
             } else {
-                queue.success_seal_queued = false;
+                queue.root_control_queued = false;
             }
             drained.push(registered.entry);
             if seal {
@@ -1036,7 +1036,7 @@ mod observation_tests {
 
     #[tokio::test]
     async fn drained_frames_retain_count_and_bytes_until_the_reducer_applies_them() {
-        let control_bytes = std::mem::size_of::<AcceptedRootSuccessSealRequest>().max(1);
+        let control_bytes = std::mem::size_of::<AcceptedRootControlRequest>().max(1);
         for (total_count, total_bytes, charged_bytes) in [
             (3, 4096, 64),
             (

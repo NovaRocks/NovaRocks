@@ -506,54 +506,88 @@ impl Scenario for BlockingSaturationControl {
         wait_ingress_slot(context, "ordinary", "waiting", 1.0)?;
         context.action("ninth ordinary request visibly waited at Native gate");
 
-        let control: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
-            &connector,
-            CONTROL_PATH,
-            &authorization,
-            control_cancel(backend),
+        // No task was created in this context. A typed Worker refusal proves
+        // control-lane progress without claiming that a real task was canceled.
+        let cancel_request = control_cancel(backend);
+        let cancel_id = cancel_request.operations[0]
+            .envelope
+            .as_ref()
+            .and_then(|envelope| envelope.operation_id.clone())
+            .context("Cancel probe omitted operation id")?;
+        let control = raw_unary_response(&connector, CONTROL_PATH, &authorization, cancel_request)?;
+        let receipt = exact_probe_receipt(
+            control,
+            &cancel_id,
+            proto::TaskOperationOutcome::InvalidStateOrRequest,
+            "Cancel",
         )?;
         ensure!(
-            control.grpc_status == 0
-                && control
-                    .message
-                    .as_ref()
-                    .is_some_and(|body| body.receipts.len() == 1),
-            "small Cancel did not progress while ordinary pool was full: status={} detail={:?}",
-            control.grpc_status,
-            control.grpc_message,
+            receipt.ack.is_none()
+                && receipt.safe_field_path.is_none()
+                && receipt.safe_detail == "cancel names a task this backend does not own",
+            "task-free Cancel did not return its Worker-owned refusal: {receipt:?}"
         );
         context.action(
-            "small Cancel completed while eight ordinary closures and one waiter were present",
+            "task-free Cancel returned the exact Worker refusal while eight ordinary closures and one waiter were present",
         );
 
-        let release: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
-            &connector,
-            CONTROL_PATH,
-            &authorization,
-            control_release(releasable),
+        let quiesce_request = control_quiesce(releasable.clone());
+        let quiesce_id = quiesce_request.operations[0]
+            .envelope
+            .as_ref()
+            .and_then(|envelope| envelope.operation_id.clone())
+            .context("Quiesce probe omitted operation id")?;
+        let quiesce =
+            raw_unary_response(&connector, CONTROL_PATH, &authorization, quiesce_request)?;
+        let receipt = exact_probe_receipt(
+            quiesce,
+            &quiesce_id,
+            proto::TaskOperationOutcome::Accepted,
+            "Quiesce",
         )?;
-        ensure!(
-            release.grpc_status == 0
-                && release
-                    .message
-                    .as_ref()
-                    .is_some_and(|body| body.receipts.len() == 1),
-            "Release did not progress while ordinary pool was full: status={} detail={:?}",
-            release.grpc_status,
-            release.grpc_message,
-        );
-        let receipt = &release.message.as_ref().expect("checked above").receipts[0];
-        let Some(proto::task_operation_receipt::Ack::ReleaseQueryContext(ack)) = &receipt.ack
+        let Some(proto::task_operation_receipt::Ack::QuiesceQueryContext(ack)) = &receipt.ack
         else {
-            anyhow::bail!("Release control omitted its typed acknowledgement");
+            anyhow::bail!("Quiesce control omitted its typed acknowledgement: {receipt:?}");
         };
         ensure!(
-            proto::ReleaseQueryContextOutcome::try_from(ack.outcome)
-                == Ok(proto::ReleaseQueryContextOutcome::Released),
-            "task-free context did not release under ordinary saturation: {ack:?}"
+            ack.query_context.as_ref() == Some(&releasable)
+                && ack.fence_version == 1
+                && ack.accepted_tasks.is_empty()
+                && proto::QueryContextState::try_from(ack.state)
+                    == Ok(proto::QueryContextState::Quiescing),
+            "task-free Quiesce did not freeze the exact empty accepted-task set: {ack:?}"
+        );
+        context.action("Quiesce installed fence version one with an empty accepted-task set under ordinary saturation");
+
+        let release_request = control_release(releasable.clone());
+        let release_id = release_request.operations[0]
+            .envelope
+            .as_ref()
+            .and_then(|envelope| envelope.operation_id.clone())
+            .context("Release probe omitted operation id")?;
+        let release =
+            raw_unary_response(&connector, CONTROL_PATH, &authorization, release_request)?;
+        let receipt = exact_probe_receipt(
+            release,
+            &release_id,
+            proto::TaskOperationOutcome::Accepted,
+            "Release",
+        )?;
+        let Some(proto::task_operation_receipt::Ack::ReleaseQueryContext(ack)) = &receipt.ack
+        else {
+            anyhow::bail!("Release control omitted its typed acknowledgement: {receipt:?}");
+        };
+        ensure!(
+            ack.query_context.as_ref() == Some(&releasable)
+                && proto::ReleaseQueryContextOutcome::try_from(ack.outcome)
+                    == Ok(proto::ReleaseQueryContextOutcome::Released)
+                && proto::QueryContextState::try_from(ack.state)
+                    == Ok(proto::QueryContextState::TerminalRetained)
+                && ack.termination_cause.is_none(),
+            "task-free context did not release normally under ordinary saturation: {ack:?}"
         );
         context.action(
-            "Release of an established, task-free context returned Released under ordinary saturation",
+            "Release of the exact quiesced, task-free context returned Released and TerminalRetained under ordinary saturation",
         );
 
         held.release_and_join()?;
@@ -1243,7 +1277,12 @@ fn establish_releasable_context(
         }
         _ => anyhow::bail!("ticket helper produced wrong operation"),
     };
-    let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
+    let acquisition_id = acquisition
+        .envelope
+        .as_ref()
+        .and_then(|envelope| envelope.operation_id.clone())
+        .context("ticket acquisition omitted operation id")?;
+    let response = raw_unary_response(
         connector,
         ORDINARY_PATH,
         authorization,
@@ -1251,45 +1290,61 @@ fn establish_releasable_context(
             operations: vec![acquisition],
         },
     )?;
-    ensure!(
-        response.grpc_status == 0,
-        "ticket acquisition failed before control probe"
-    );
-    let receipt = response
-        .message
-        .context("ticket acquisition omitted response")?
-        .receipts
-        .into_iter()
-        .next()
-        .context("ticket acquisition omitted receipt")?;
+    let receipt = exact_probe_receipt(
+        response,
+        &acquisition_id,
+        proto::TaskOperationOutcome::Accepted,
+        "Admission ticket",
+    )?;
     let Some(proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(ticket)) = receipt.ack
     else {
         anyhow::bail!("ticket acquisition omitted ticket acknowledgement");
     };
+    ensure!(
+        ticket.query_context.as_ref() == Some(&context) && ticket.valid_for_millis == 10_000,
+        "admission ticket did not bind the exact context and requested validity: {ticket:?}"
+    );
     let ticket_id = ticket
         .ticket_id
         .context("ticket acknowledgement omitted id")?;
-    let establish: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
+    let operation = raw_establish(context.clone(), ticket_id, Some(compatibility_id.to_vec()));
+    let establish_id = operation
+        .envelope
+        .as_ref()
+        .and_then(|envelope| envelope.operation_id.clone())
+        .context("Establish probe omitted operation id")?;
+    let establish = raw_unary_response(
         connector,
         ORDINARY_PATH,
         authorization,
         proto::ApplyTaskOperationsRequest {
-            operations: vec![raw_establish(
-                context.clone(),
-                ticket_id,
-                Some(compatibility_id.to_vec()),
-            )],
+            operations: vec![operation],
         },
     )?;
+    let receipt = exact_probe_receipt(
+        establish,
+        &establish_id,
+        proto::TaskOperationOutcome::Accepted,
+        "Establish",
+    )?;
+    let Some(proto::task_operation_receipt::Ack::QueryContext(ack)) = receipt.ack else {
+        anyhow::bail!("Establish omitted its typed context acknowledgement");
+    };
+    let lease = ack
+        .lease
+        .as_ref()
+        .context("Establish omitted its initial lease receipt")?;
     ensure!(
-        establish.grpc_status == 0
-            && establish
-                .message
-                .as_ref()
-                .is_some_and(|body| body.receipts.len() == 1),
-        "Establish failed before control probe: status={} detail={:?}",
-        establish.grpc_status,
-        establish.grpc_message
+        ack.query_context.as_ref() == Some(&context)
+            && proto::QueryContextState::try_from(ack.state)
+                == Ok(proto::QueryContextState::Active)
+            && ack.termination_cause.is_none()
+            && ack.accepted_domains.is_empty()
+            && lease.sequence == 0
+            && lease.requested_valid_for_millis == 30_000
+            && lease.effective_valid_for_millis > 0
+            && lease.effective_valid_for_millis <= lease.requested_valid_for_millis,
+        "Establish did not install the exact active context and initial facts: {ack:?}"
     );
     Ok(context)
 }
@@ -1309,6 +1364,48 @@ fn control_cancel(backend: BackendProcessId) -> proto::ApplyTaskControlOperation
                         }),
                     }),
                     reason: proto::TaskCancelReason::UpstreamNoLongerNeeded as i32,
+                },
+            )),
+        }],
+    }
+}
+
+fn exact_probe_receipt(
+    response: RawUnaryResponse<proto::ApplyTaskOperationsResponse>,
+    operation_id: &proto::TaskOperationId,
+    expected: proto::TaskOperationOutcome,
+    label: &str,
+) -> Result<proto::TaskOperationReceipt> {
+    ensure!(
+        response.grpc_status == 0,
+        "{label} failed at transport: status={} detail={:?}",
+        response.grpc_status,
+        response.grpc_message
+    );
+    let mut body = response
+        .message
+        .context("Native control probe omitted response")?;
+    ensure!(
+        body.receipts.len() == 1,
+        "{label} expected exactly one receipt, got {}",
+        body.receipts.len()
+    );
+    let receipt = body.receipts.remove(0);
+    ensure!(
+        receipt.operation_id.as_ref() == Some(operation_id)
+            && proto::TaskOperationOutcome::try_from(receipt.outcome) == Ok(expected),
+        "{label} did not return the exact operation and expected owner outcome: {receipt:?}"
+    );
+    Ok(receipt)
+}
+
+fn control_quiesce(context: proto::QueryContextRef) -> proto::ApplyTaskControlOperationsRequest {
+    proto::ApplyTaskControlOperationsRequest {
+        operations: vec![proto::TaskControlOperation {
+            envelope: Some(raw_operation_envelope(15_000)),
+            control: Some(proto::task_control_operation::Control::QuiesceQueryContext(
+                proto::QuiesceQueryContextRequest {
+                    query_context: Some(context),
                 },
             )),
         }],

@@ -38,7 +38,9 @@
 //!
 //! [`functions.py`]: https://github.com/StarRocks/starrocks/blob/main/gensrc/script/functions.py
 
+mod intrinsic;
 pub(crate) mod registry;
+pub(crate) use intrinsic::{BuiltinDisposition, builtin_disposition};
 pub(crate) mod resolver;
 pub(crate) mod signature;
 
@@ -843,6 +845,250 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
     declarations
 }
 
+// These generic declarations still freeze an exact installed input domain.
+// Unsupported types must fail binding, before an optimizer can remove the call.
+// ARRAY equality and hash share this recursive carrier domain. This is a
+// selected-overload admission fact, not a runtime or optimizer name dispatch.
+fn builtin_array_equality_item(ty: &DataType) -> bool {
+    match ty {
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Utf8
+        | DataType::Date32
+        | DataType::Decimal128(..)
+        | DataType::Timestamp(_, None) => true,
+        DataType::List(item) => builtin_array_equality_item(item.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|field| builtin_array_equality_item(field.data_type())),
+        DataType::Map(entries, _) => {
+            matches!(entries.data_type(),DataType::Struct(fields) if fields.len()==2)
+                && builtin_array_equality_item(entries.data_type())
+        }
+        _ => novarocks_types::largeint::is_largeint_data_type(ty),
+    }
+}
+
+fn validate_builtin_selected_domain(
+    name: &str,
+    arguments: &[DataType],
+) -> Result<(), FunctionBindingError> {
+    // Empty constructors ignore arguments. Value consumers must have every
+    // argument they actually read, and an input carrier implemented by that
+    // consumer. Do not infer this domain from the legacy Any declaration.
+    let binary_or_null = |ty: &DataType| matches!(ty, DataType::Binary | DataType::Null);
+    let text_or_bytes = |ty: &DataType| {
+        matches!(
+            ty,
+            DataType::Null
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::LargeBinary
+        )
+    };
+    let numeric = |ty: &DataType| {
+        matches!(
+            ty,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(..)
+        ) || novarocks_types::largeint::is_largeint_data_type(ty)
+    };
+    let consumed = match name {
+        "bitmap_and" | "bitmap_has_any" => {
+            arguments.len() >= 2 && arguments.iter().take(2).all(binary_or_null)
+        }
+        "bitmap_count" | "bitmap_to_binary" | "bitmap_to_base64" => {
+            arguments.first().is_some_and(binary_or_null)
+        }
+        "bitmap_from_binary" | "bitmap_from_string" => arguments.first().is_some_and(text_or_bytes),
+        "percentile_hash" => arguments.first().is_some_and(numeric),
+        "hll_hash" => arguments.first().is_some_and(|ty| {
+            matches!(
+                ty,
+                DataType::Boolean
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Date32
+                    | DataType::Timestamp(..)
+                    | DataType::Decimal128(..)
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Binary
+                    | DataType::LargeBinary
+            )
+        }),
+        "to_bitmap" => arguments.first().is_some_and(|ty| {
+            matches!(
+                ty,
+                DataType::Boolean
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Binary
+                    | DataType::LargeBinary
+            )
+        }),
+        "array_cum_sum" | "array_difference" => {
+            arguments.len() == 1
+                && matches!(&arguments[0], DataType::List(item) if matches!(item.data_type(),
+                DataType::Boolean | DataType::Int8 | DataType::Int16 | DataType::Int32
+                    | DataType::Int64 | DataType::Float32 | DataType::Float64
+                    | DataType::Decimal128(..)))
+        }
+        _ => true,
+    };
+    if !consumed {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    let ordered_item = |ty: &DataType| {
+        matches!(
+            ty,
+            DataType::Null
+                | DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Decimal128(..)
+                | DataType::Timestamp(_, None)
+        ) || novarocks_types::largeint::is_largeint_data_type(ty)
+    };
+    let ordered_list =
+        |ty: &DataType| matches!(ty, DataType::List(item) if ordered_item(item.data_type()));
+    // The shared comparator supports one closed primitive item domain. SORTBY
+    // compares only key lists; arbitrary output values remain admitted.
+    let bool_item = |ty: &DataType| arrow::compute::can_cast_types(ty, &DataType::Boolean);
+    let shape = match name {
+        "arrays_zip" => !arguments.is_empty() && arguments.iter().all(|ty| matches!(ty,DataType::List(_) | DataType::Null)),
+        "map_entries" => arguments.len()==1 && matches!(&arguments[0],DataType::Map(_, _)),
+        "array_contains" | "array_position" | "array_remove" | "array_distinct" =>
+            arguments.first().is_some_and(|ty| matches!(ty,DataType::List(item) if builtin_array_equality_item(item.data_type()))),
+        "all_match" | "any_match" => arguments.first().is_some_and(|ty| matches!(ty,DataType::List(item)
+            if bool_item(item.data_type()) || novarocks_types::largeint::is_largeint_data_type(item.data_type()))),
+        "array_filter" => arguments.get(1).is_some_and(|ty| matches!(ty,DataType::List(item) if bool_item(item.data_type()))),
+        "array_flatten" => arguments.len()==1 && matches!(&arguments[0],DataType::List(outer) if matches!(outer.data_type(),DataType::List(_))),
+        "array_repeat" => arguments.len()==2 && arrow::compute::can_cast_types(&arguments[1],&DataType::Int64),
+        "distinct_map_keys" => arguments.first().is_some_and(|ty| matches!(ty,DataType::Map(entries,_) if
+            matches!(entries.data_type(),DataType::Struct(fields) if fields.len()==2 &&
+                ((ordered_item(fields[0].data_type()) && *fields[0].data_type()!=DataType::Null)
+                    || matches!(fields[0].data_type(),DataType::Decimal256(..)))))),
+        "array_contains_all" | "array_contains_seq" => match arguments {
+            [DataType::List(left), DataType::List(right)] => {
+                if arrow::compute::can_cast_types(right.data_type(),left.data_type()) {
+                    builtin_array_equality_item(left.data_type())
+                } else {
+                    builtin_array_equality_item(right.data_type())
+                        && arrow::compute::can_cast_types(left.data_type(),right.data_type())
+                }
+            },
+            _ => false,
+        },
+        _ => true,
+    };
+    if !shape {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    let ordered = match name {
+        "array_sort" | "array_top_n" | "array_min" | "array_max" => {
+            arguments.first().is_some_and(ordered_list)
+        }
+        "array_sortby" => arguments.iter().skip(1).all(ordered_list),
+        _ => true,
+    };
+    if !ordered {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    }
+    let admitted = |ty: &DataType| match name {
+        "field" => {
+            matches!(
+                ty,
+                DataType::Null
+                    | DataType::Boolean
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128(..)
+                    | DataType::Decimal256(..)
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Date32
+                    | DataType::Timestamp(..)
+            ) || novarocks_types::largeint::is_largeint_data_type(ty)
+        }
+        "mv_group_row_id" => matches!(
+            ty,
+            DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Date32
+                | DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+                | DataType::Utf8
+                | DataType::Decimal128(..)
+        ),
+        "encode_sort_key" | "encode_row_id" => {
+            matches!(
+                ty,
+                DataType::Null
+                    | DataType::Boolean
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Date32
+                    | DataType::Timestamp(..)
+                    | DataType::Utf8
+                    | DataType::Binary
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128(..)
+            ) || matches!(ty, DataType::FixedSizeBinary(16))
+        }
+        _ => true,
+    };
+    if arguments.iter().all(admitted) {
+        Ok(())
+    } else {
+        Err(FunctionBindingError::NoMatchingOverload)
+    }
+}
+
 struct BuiltinScalarResolver {
     canonical_name: Box<str>,
     overloads: Box<[FunctionOverloadId]>,
@@ -892,6 +1138,13 @@ fn builtin_scalar_semantics(name: &str) -> FunctionSemantics {
         volatility: builtin_function_volatility(name),
         argument_evaluation,
         failure_behavior: FunctionFailureBehavior::Propagate,
+        intrinsic_row_error: match builtin_disposition(name) {
+            Some(BuiltinDisposition::InstalledScalar(fact)) => fact,
+            Some(BuiltinDisposition::WindowBoundary) => {
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated
+            }
+            _ => unreachable!("only explicitly admitted builtin implementations have semantics"),
+        },
     }
 }
 
@@ -1010,6 +1263,7 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
             &argument_types,
         )
         .map_err(binding_resolution_error)?;
+        validate_builtin_selected_domain(&self.canonical_name, &resolved.argument_types)?;
         let selected_argument_types = request
             .arguments
             .iter()
@@ -1053,6 +1307,7 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
             &argument_types,
         )
         .map_err(binding_resolution_error)?;
+        validate_builtin_selected_domain(&self.canonical_name, &resolved.argument_types)?;
         let expected = FunctionBindingSelection {
             overload: selected.overload.clone(),
             argument_types: request
@@ -1515,6 +1770,7 @@ fn bind_dynamic_scalar_result(
     request: FunctionBindingRequest<'_>,
 ) -> Result<FunctionValueType, FunctionBindingError> {
     let argument_types = dynamic_argument_data_types(request);
+    validate_builtin_selected_domain(name, &argument_types)?;
     let mut result = match name {
         "array_generate" => list_type(
             novarocks_type_contract::array_generate_item_type(&argument_types)
@@ -1729,6 +1985,15 @@ pub fn contribute_builtin_functions(
     builder: &mut EngineFunctionCatalogBuilder,
 ) -> Result<(), FunctionCatalogError> {
     for name in DYNAMIC_SCALAR_FUNCTIONS {
+        if !matches!(
+            builtin_disposition(name),
+            Some(BuiltinDisposition::InstalledScalar(_))
+        ) {
+            return Err(FunctionCatalogError::InvalidStableIdentity {
+                subject: "unclassified dynamic scalar implementation",
+                value: (*name).into(),
+            });
+        }
         let function_id =
             FunctionId::try_new(format!("builtin.scalar/{name}/v1")).map_err(|error| {
                 FunctionCatalogError::InvalidStableIdentity {
@@ -1767,10 +2032,20 @@ pub fn contribute_builtin_functions(
         )?)?;
     }
     for (name, signatures) in registry::builtin_scalar_declarations() {
-        let kind = if builtin_window_only(&name) {
-            FunctionKind::Window
-        } else {
-            FunctionKind::Scalar
+        let kind = match builtin_disposition(&name) {
+            Some(BuiltinDisposition::InstalledScalar(_)) => FunctionKind::Scalar,
+            Some(BuiltinDisposition::WindowBoundary) => FunctionKind::Window,
+            Some(
+                BuiltinDisposition::AggregateBoundary
+                | BuiltinDisposition::LoweredOnly
+                | BuiltinDisposition::Unavailable,
+            ) => continue,
+            None => {
+                return Err(FunctionCatalogError::InvalidStableIdentity {
+                    subject: "unclassified builtin implementation",
+                    value: name.into(),
+                });
+            }
         };
         let overloads = signatures
             .iter()
@@ -1831,6 +2106,8 @@ pub fn contribute_builtin_functions(
                 volatility: FunctionVolatility::Immutable,
                 argument_evaluation: FunctionArgumentEvaluation::Eager,
                 failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error:
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
             },
             [FunctionOverloadDeclaration {
                 identity: overload_id,
@@ -1869,6 +2146,7 @@ pub fn contribute_builtin_functions(
             volatility: FunctionVolatility::Immutable,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
         },
         [FunctionOverloadDeclaration {
             identity: FunctionOverloadId::try_new(BUILTIN_UNNEST_OVERLOAD_ID).map_err(|error| {
@@ -2035,6 +2313,8 @@ pub(crate) fn test_exact_aggregate_catalog(
             volatility: FunctionVolatility::Immutable,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error:
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
         },
         overloads
             .iter()
@@ -2371,6 +2651,20 @@ mod tests {
             )
             .expect("UNNEST binding");
         assert_eq!(binding.function_id.as_str(), BUILTIN_UNNEST_FUNCTION_ID);
+        assert_eq!(binding.kind, FunctionKind::Table);
+        assert_eq!(
+            binding.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+        );
+        catalog
+            .validate_bound(
+                &binding,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                },
+            )
+            .expect("exact installed table binding");
         assert_eq!(
             binding.selected.argument_types.as_ref(),
             &[FunctionArgumentType::Value(FunctionValueType::new(
@@ -2689,9 +2983,16 @@ mod tests {
                     )
                     .expect("the frozen ABS profile must validate without changing the input type");
 
-                let negative = resolve_exact_scalar(&catalog, "negative", &arguments);
-                assert_eq!(scalar_result(&negative).data_type, input);
-                assert_eq!(scalar_result(&negative).nullable, nullable);
+                let negative = resolver::resolve_scalar_function_signature(
+                    "negative",
+                    std::slice::from_ref(&input),
+                )
+                .unwrap();
+                assert_eq!(negative.return_type, input);
+                assert!(matches!(
+                    builtin_disposition("negative"),
+                    Some(BuiltinDisposition::LoweredOnly)
+                ));
             }
         }
     }
@@ -2722,5 +3023,617 @@ mod tests {
                 "a stale same-width result must fail exact catalog validation before encoding"
             );
         }
+    }
+    #[test]
+    fn selected_builtin_row_effects_follow_exact_implementation_contract() {
+        use novarocks_type_contract::FunctionIntrinsicRowError as Own;
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for (name, arguments, expected) in [
+            (
+                "lower",
+                vec![value_argument(DataType::Utf8, true, None)],
+                Own::NoRowError,
+            ),
+            (
+                "parse_json",
+                vec![value_argument(DataType::Utf8, true, None)],
+                Own::NoRowError,
+            ),
+            (
+                "assert_true",
+                vec![value_argument(DataType::Boolean, true, None)],
+                Own::MayRaise,
+            ),
+            (
+                "bar",
+                vec![
+                    value_argument(DataType::Int64, false, None),
+                    value_argument(DataType::Int64, false, None),
+                    value_argument(DataType::Int64, false, None),
+                    value_argument(DataType::Int64, false, None),
+                ],
+                Own::MayRaise,
+            ),
+            (
+                "count_state_visible",
+                vec![value_argument(DataType::Binary, false, None)],
+                Own::MayRaise,
+            ),
+        ] {
+            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            assert_eq!(bound.semantics.intrinsic_row_error, expected, "{name}");
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len(),
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn variadic_typed_encoders_close_unsupported_shape_before_optimization() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for name in ["mv_group_row_id", "encode_sort_key", "encode_row_id"] {
+            let arguments = [value_argument(
+                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Int32,
+                    true,
+                ))),
+                true,
+                None,
+            )];
+            assert!(
+                catalog
+                    .resolve_bound_user(
+                        name,
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: 1
+                        }
+                    )
+                    .is_err(),
+                "{name}"
+            );
+        }
+        let arguments = [
+            value_argument(DataType::Int16, true, None),
+            value_argument(DataType::Utf8, true, None),
+        ];
+        for name in ["mv_group_row_id", "encode_sort_key", "encode_row_id"] {
+            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            assert_eq!(
+                bound.selected.argument_types.as_ref(),
+                arguments
+                    .iter()
+                    .map(FunctionArgument::argument_type)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                bound.semantics.intrinsic_row_error,
+                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+            );
+        }
+        // Fingerprint intentionally ignores complex inputs in its installed owner.
+        let complex = [value_argument(
+            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Int32,
+                true,
+            ))),
+            true,
+            None,
+        )];
+        let bound = resolve_exact_scalar(&catalog, "encode_fingerprint_sha256", &complex);
+        assert_eq!(
+            bound.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+        );
+    }
+    #[test]
+    fn field_exact_binding_rejects_containers_and_preserves_comparable_profiles() {
+        use arrow::datatypes::{Field, Fields, TimeUnit};
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let item = Arc::new(Field::new("item", DataType::Int64, true));
+        let fields: Fields = vec![
+            Arc::new(Field::new("key", DataType::Int64, false)),
+            Arc::new(Field::new("value", DataType::Utf8, true)),
+        ]
+        .into();
+        for ty in [
+            DataType::List(item),
+            DataType::Struct(fields.clone()),
+            DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                false,
+            ),
+        ] {
+            let arguments = [
+                value_argument(ty.clone(), true, None),
+                value_argument(ty, true, None),
+            ];
+            assert!(
+                catalog
+                    .resolve_bound_user(
+                        "field",
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: 2
+                        }
+                    )
+                    .is_err()
+            );
+        }
+        for ty in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int64,
+            DataType::Decimal128(38, 9),
+            DataType::Decimal256(60, 9),
+            DataType::FixedSizeBinary(16),
+            DataType::Utf8,
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        ] {
+            let arguments = [
+                value_argument(ty.clone(), true, None),
+                value_argument(ty, true, None),
+            ];
+            let bound = resolve_exact_scalar(&catalog, "field", &arguments);
+            assert_eq!(
+                bound.semantics.intrinsic_row_error,
+                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+            );
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 2,
+                    },
+                )
+                .unwrap();
+        }
+    }
+    #[test]
+    fn array_ordering_binding_closes_comparator_domain_and_preserves_sortby_values() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
+        for ty in [
+            list(DataType::Int64),
+            DataType::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(arrow::datatypes::Field::new("key", DataType::Int64, true)),
+                            Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            DataType::Struct(
+                vec![Arc::new(arrow::datatypes::Field::new(
+                    "x",
+                    DataType::Int64,
+                    true,
+                ))]
+                .into(),
+            ),
+            DataType::Decimal256(60, 2),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        ] {
+            for name in ["array_sort", "array_min", "array_max", "array_top_n"] {
+                let mut arguments = vec![value_argument(list(ty.clone()), true, None)];
+                if name == "array_top_n" {
+                    arguments.push(value_argument(DataType::Int64, false, None));
+                }
+                assert!(
+                    catalog
+                        .resolve_bound_user(
+                            name,
+                            FunctionKind::Scalar,
+                            FunctionBindingRequest {
+                                arguments: &arguments,
+                                logical_argument_count: arguments.len()
+                            }
+                        )
+                        .is_err(),
+                    "{name}"
+                );
+            }
+            let arguments = [
+                value_argument(list(DataType::Utf8), true, None),
+                value_argument(list(ty), true, None),
+            ];
+            assert!(
+                catalog
+                    .resolve_bound_user(
+                        "array_sortby",
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: 2
+                        }
+                    )
+                    .is_err()
+            );
+        }
+        for ty in [
+            DataType::Null,
+            DataType::Int8,
+            DataType::Date32,
+            DataType::Decimal128(38, 2),
+            DataType::FixedSizeBinary(16),
+        ] {
+            let arguments = [value_argument(list(ty), true, None)];
+            let bound = resolve_exact_scalar(&catalog, "array_sort", &arguments);
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 1,
+                    },
+                )
+                .unwrap();
+        }
+        // A nested output list needs no comparison: only the independent keys do.
+        let arguments = [
+            value_argument(list(list(DataType::Int64)), true, None),
+            value_argument(list(DataType::Int64), true, None),
+        ];
+        let bound = resolve_exact_scalar(&catalog, "array_sortby", &arguments);
+        catalog
+            .validate_bound(
+                &bound,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 2,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn object_value_binding_rejects_unimplemented_carriers_and_missing_inputs() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let list = DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        )));
+        for name in [
+            "hll_hash",
+            "percentile_hash",
+            "to_bitmap",
+            "bitmap_count",
+            "bitmap_to_binary",
+            "bitmap_from_binary",
+            "bitmap_from_string",
+            "bitmap_and",
+        ] {
+            for types in [vec![], vec![list.clone()], vec![list.clone(), list.clone()]] {
+                let arguments = types
+                    .into_iter()
+                    .map(|ty| value_argument(ty, true, None))
+                    .collect::<Vec<_>>();
+                assert!(
+                    catalog
+                        .resolve_bound_user(
+                            name,
+                            FunctionKind::Scalar,
+                            FunctionBindingRequest {
+                                arguments: &arguments,
+                                logical_argument_count: arguments.len()
+                            }
+                        )
+                        .is_err(),
+                    "{name}"
+                );
+            }
+        }
+        for (name, ty) in [
+            ("hll_hash", DataType::Date32),
+            ("hll_hash", DataType::FixedSizeBinary(16)),
+            ("percentile_hash", DataType::Decimal128(38, 2)),
+            ("percentile_hash", DataType::FixedSizeBinary(16)),
+            ("to_bitmap", DataType::UInt64),
+            ("to_bitmap", DataType::LargeBinary),
+            ("bitmap_count", DataType::Null),
+            ("bitmap_from_binary", DataType::LargeUtf8),
+        ] {
+            let arguments = [value_argument(ty, true, None)];
+            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            assert_eq!(
+                bound.semantics.intrinsic_row_error,
+                novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+            );
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 1,
+                    },
+                )
+                .unwrap();
+        }
+        let arguments = [
+            value_argument(DataType::Binary, true, None),
+            value_argument(DataType::Binary, true, None),
+        ];
+        for name in ["bitmap_and", "bitmap_has_any"] {
+            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 2,
+                    },
+                )
+                .unwrap();
+        }
+        // These installed constructors consume no row values, including no input.
+        for name in ["bitmap_empty", "percentile_empty"] {
+            let bound = resolve_exact_scalar(&catalog, name, &[]);
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &[],
+                        logical_argument_count: 0,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn dynamic_array_numeric_binding_closes_the_installed_output_domain() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
+        for name in ["array_cum_sum", "array_difference"] {
+            for ty in [
+                DataType::Null,
+                DataType::Utf8,
+                DataType::Decimal256(60, 2),
+                list(DataType::Int64),
+            ] {
+                let arguments = [value_argument(list(ty), true, None)];
+                assert!(
+                    catalog
+                        .resolve_bound_user(
+                            name,
+                            FunctionKind::Scalar,
+                            FunctionBindingRequest {
+                                arguments: &arguments,
+                                logical_argument_count: 1
+                            }
+                        )
+                        .is_err(),
+                    "{name}"
+                );
+            }
+            for (input, output) in [
+                (DataType::Boolean, DataType::Int64),
+                (DataType::Int16, DataType::Int64),
+                (DataType::Float32, DataType::Float64),
+                (DataType::Decimal128(38, 2), DataType::Float64),
+            ] {
+                let arguments = [value_argument(list(input), true, None)];
+                let bound = resolve_exact_scalar(&catalog, name, &arguments);
+                assert_eq!(
+                    bound.selected.result_type,
+                    FunctionResultType::Scalar(FunctionValueType::new(list(output), true))
+                );
+                catalog
+                    .validate_bound(
+                        &bound,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: 1,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    #[test]
+    fn selected_collection_shapes_preserve_recursive_equality_and_masks() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
+        for name in [
+            "array_contains",
+            "array_position",
+            "array_remove",
+            "array_distinct",
+        ] {
+            let mut arguments = vec![value_argument(
+                list(DataType::Decimal256(60, 2)),
+                true,
+                None,
+            )];
+            if name != "array_distinct" {
+                arguments.push(value_argument(DataType::Decimal256(60, 2), true, None));
+            }
+            assert!(
+                catalog
+                    .resolve_bound_user(
+                        name,
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len()
+                        }
+                    )
+                    .is_err(),
+                "{name}"
+            );
+        }
+        for name in ["all_match", "any_match", "array_filter"] {
+            let mut arguments = vec![value_argument(list(DataType::Int64), true, None)];
+            if name == "array_filter" {
+                arguments.push(value_argument(list(list(DataType::Boolean)), true, None));
+            } else {
+                arguments[0] = value_argument(list(list(DataType::Boolean)), true, None);
+            }
+            assert!(
+                catalog
+                    .resolve_bound_user(
+                        name,
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len()
+                        }
+                    )
+                    .is_err(),
+                "{name}"
+            );
+            let mut arguments = vec![value_argument(list(DataType::Int8), true, None)];
+            if name == "array_filter" {
+                arguments.push(value_argument(list(DataType::Int8), true, None));
+            }
+            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len(),
+                    },
+                )
+                .unwrap();
+        }
+        for name in ["array_contains", "array_position", "array_remove"] {
+            let item = list(DataType::FixedSizeBinary(16));
+            let arguments = [
+                value_argument(list(item.clone()), true, None),
+                value_argument(item, true, None),
+            ];
+            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: 2,
+                    },
+                )
+                .unwrap();
+        }
+        for (name, types) in [
+            ("array_flatten", vec![list(DataType::Int64)]),
+            ("array_repeat", vec![DataType::Int64]),
+            ("arrays_zip", vec![]),
+            ("arrays_zip", vec![DataType::Int64]),
+            ("map_entries", vec![DataType::Int64]),
+        ] {
+            let arguments = types
+                .into_iter()
+                .map(|ty| value_argument(ty, true, None))
+                .collect::<Vec<_>>();
+            assert!(
+                catalog
+                    .resolve_bound_user(
+                        name,
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len()
+                        }
+                    )
+                    .is_err(),
+                "{name}"
+            );
+        }
+        let arguments = [
+            value_argument(list(DataType::Date32), true, None),
+            value_argument(list(DataType::Utf8), true, None),
+        ];
+        let bound = resolve_exact_scalar(&catalog, "arrays_overlap", &arguments);
+        assert_eq!(
+            bound.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
+        );
+    }
+    #[test]
+    fn selected_array_domain_is_checked_after_argument_widening() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
+        for name in ["array_contains", "array_position", "array_remove"] {
+            let arguments = [
+                value_argument(list(DataType::Int64), true, None),
+                value_argument(DataType::Decimal256(60, 2), true, None),
+            ];
+            assert!(
+                catalog
+                    .resolve_bound_user(
+                        name,
+                        FunctionKind::Scalar,
+                        FunctionBindingRequest {
+                            arguments: &arguments,
+                            logical_argument_count: 2
+                        }
+                    )
+                    .is_err(),
+                "{name}"
+            );
+        }
+    }
+    #[test]
+    fn selected_array_ordering_retains_null_only_and_empty_profiles() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        let list = |ty| DataType::List(Arc::new(arrow::datatypes::Field::new("item", ty, true)));
+        for name in ["array_sort", "array_min", "array_max", "array_top_n"] {
+            let mut arguments = vec![value_argument(list(DataType::Null), true, None)];
+            if name == "array_top_n" {
+                arguments.push(value_argument(DataType::Int64, false, None));
+            }
+            let bound = resolve_exact_scalar(&catalog, name, &arguments);
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                bound.semantics.intrinsic_row_error,
+                if name == "array_top_n" {
+                    novarocks_type_contract::FunctionIntrinsicRowError::MayRaise
+                } else {
+                    novarocks_type_contract::FunctionIntrinsicRowError::NoRowError
+                }
+            );
+        }
+        let arguments = [
+            value_argument(list(list(DataType::Int64)), true, None),
+            value_argument(list(DataType::Null), true, None),
+        ];
+        let bound = resolve_exact_scalar(&catalog, "array_sortby", &arguments);
+        catalog
+            .validate_bound(
+                &bound,
+                FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(scalar_result(&bound).data_type, list(list(DataType::Int64)));
     }
 }

@@ -482,6 +482,9 @@ message FetchResultResponse {
     NOT_READY = 2;
     EOF = 3;
     ERROR = 4;
+    // The exact result owner has revoked output for a latched termination.
+    // No payload/EOF/ACK is implied; accepted Task control supplies its cause.
+    AWAIT_TERMINAL_CONTROL = 5;
   }
 
   Status status = 1;             // result lifecycle state for this poll

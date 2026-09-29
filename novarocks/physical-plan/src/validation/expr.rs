@@ -1007,6 +1007,15 @@ pub(crate) fn validate_function_call(
     path: &str,
     errors: &mut ValidationContext,
 ) {
+    if !function
+        .intrinsic_row_error
+        .is_valid_for_kind(function.kind)
+    {
+        errors.push(ValidationError::new(
+            path,
+            "bound function intrinsic row-error fact differs from its kind",
+        ));
+    }
     validate_function_arguments(
         fragment,
         &function.function_id,
@@ -1218,6 +1227,16 @@ pub(crate) fn validate_aggregate_arguments(
     path: &str,
     errors: &mut ValidationContext,
 ) {
+    if !binding
+        .function
+        .intrinsic_row_error
+        .is_valid_for_kind(binding.function.kind)
+    {
+        errors.push(ValidationError::new(
+            path,
+            "bound aggregate intrinsic row-error fact differs from its kind",
+        ));
+    }
     match binding.phase {
         AggregatePhase::Single | AggregatePhase::Partial { .. } => {
             let logical_count =

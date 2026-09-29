@@ -36,6 +36,7 @@ pub struct FunctionSemantics {
     pub volatility: FunctionVolatility,
     pub argument_evaluation: FunctionArgumentEvaluation,
     pub failure_behavior: FunctionFailureBehavior,
+    pub intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError,
 }
 
 /// The aggregate state contract remains separate from its Arrow carrier.
@@ -70,6 +71,11 @@ impl FunctionBindingDeclaration {
         semantics: FunctionSemantics,
         overloads: impl IntoIterator<Item = FunctionOverloadDeclaration>,
     ) -> Result<Self, FunctionBindingError> {
+        if !semantics.intrinsic_row_error.is_valid_for_kind(kind) {
+            return Err(invalid(
+                "intrinsic row-error fact differs from the function kind",
+            ));
+        }
         let mut overloads = overloads.into_iter().collect::<Vec<_>>();
         if overloads.is_empty() {
             return Err(invalid("function has no declared overloads"));
@@ -327,6 +333,8 @@ pub(crate) fn parametric_aggregate_binding(
             volatility,
             argument_evaluation: FunctionArgumentEvaluation::Eager,
             failure_behavior: FunctionFailureBehavior::Propagate,
+            intrinsic_row_error:
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
         },
         declared,
     )
@@ -752,6 +760,11 @@ pub(crate) fn digest_binding_definition(
             .expect("overload count fits u32")
             .to_be_bytes(),
     );
+    hasher.update([match declaration.semantics.intrinsic_row_error {
+        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError => 1,
+        novarocks_type_contract::FunctionIntrinsicRowError::MayRaise => 2,
+        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated => 3,
+    }]);
     for overload in &declaration.overloads {
         digest_text(hasher, overload.identity.as_str());
         digest_text(hasher, &overload.argument_pattern);

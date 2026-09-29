@@ -317,25 +317,30 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
         // remains asynchronous on the listener runtime.
         let registry = Arc::clone(&self.registry);
         let queued_at = std::time::Instant::now();
+        let first_lookup_ownership = ownership.clone();
         let route = tokio::task::spawn_blocking(move || {
             crate::backend_metrics::native_blocking_queue_wait(
                 "fetch_task_result_route",
                 queued_at.elapsed(),
             );
-            let _ownership = ownership;
+            let _ownership = first_lookup_ownership;
             registry.root_result_route(identity)
         })
         .await
         .map_err(|error| TaskResultReadError::new(format!("root result route failed: {error}")))?;
         let binding = match route {
             RootResultRoute::Serve(binding) => binding,
-            RootResultRoute::TerminalResultOwner(_)
+            RootResultRoute::TerminalResultOwner(_) | RootResultRoute::AwaitTerminalControl
                 if replays_task_terminal_ack(identity, acknowledged) =>
             {
                 let packet_sequence =
                     acknowledged.expect("an exact terminal replay carries its sequence");
                 emit_task_fetch_marker(identity, FetchStatus::Eof, packet_sequence, true, 0);
                 return Ok(TaskResultRead::EndOfStream { packet_sequence });
+            }
+            RootResultRoute::AwaitTerminalControl => {
+                emit_task_fetch_marker(identity, FetchStatus::AwaitTerminalControl, 0, false, 0);
+                return Ok(TaskResultRead::AwaitTerminalControl);
             }
             route => {
                 let detail = route
@@ -396,13 +401,66 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
                 }
                 TryFetchTypedResult::NotReady => TaskResultRead::NotReady,
                 TryFetchTypedResult::Error(error) => {
-                    emit_task_fetch_marker(identity, FetchStatus::Error, 0, false, 0);
-                    TaskResultRead::Error {
-                        detail: error.message,
+                    let resolved = self
+                        .resolve_task_result_error(identity, error, ownership)
+                        .await?;
+                    match &resolved {
+                        TaskResultRead::AwaitTerminalControl => {
+                            emit_task_fetch_marker(
+                                identity,
+                                FetchStatus::AwaitTerminalControl,
+                                0,
+                                false,
+                                0,
+                            );
+                        }
+                        TaskResultRead::Error { .. } => {
+                            emit_task_fetch_marker(identity, FetchStatus::Error, 0, false, 0);
+                        }
+                        _ => {
+                            return Err(TaskResultReadError::new(
+                                "terminal result recheck returned an invalid state",
+                            ));
+                        }
                     }
+                    resolved
                 }
             },
         )
+    }
+}
+
+impl RegistryTaskExecutionIngress {
+    /// Rechecks one exact owner when its served buffer disappeared. No error
+    /// detail is inspected, and an active missing buffer remains a refusal.
+    pub(crate) async fn resolve_task_result_error(
+        &self,
+        identity: novarocks_execution_contract::task_execution::identity::TaskIdentity,
+        error: novarocks_worker::result_buffer::FetchError,
+        ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
+    ) -> Result<TaskResultRead, TaskResultReadError> {
+        if matches!(
+            error.kind,
+            novarocks_worker::result_buffer::FetchErrorKind::NotFound
+        ) {
+            let registry = Arc::clone(&self.registry);
+            let route = tokio::task::spawn_blocking(move || {
+                // The closure can remain queued after its RPC future is canceled.
+                // Keep the original ingress slot until this exact work exits.
+                let _ownership = ownership;
+                registry.root_result_route(identity)
+            })
+            .await
+            .map_err(|error| {
+                TaskResultReadError::new(format!("root result terminal recheck failed: {error}"))
+            })?;
+            if matches!(route, RootResultRoute::AwaitTerminalControl) {
+                return Ok(TaskResultRead::AwaitTerminalControl);
+            }
+        }
+        Ok(TaskResultRead::Error {
+            detail: error.message,
+        })
     }
 }
 

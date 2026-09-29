@@ -2159,6 +2159,26 @@ impl<'a> super::AnalyzerContext<'a> {
                 let executable_name =
                     novarocks_types::aggregate::mangle_distinct_aggregate_name(&name, is_distinct);
                 if !self.function_catalog.contains_aggregate(&executable_name) {
+                    // Legacy declarations are type-inspection facts, not installed selected bindings.
+                    // A custom contribution of the same name is resolved by its own catalog identity.
+                    if matches!(
+                        self.function_catalog
+                            .resolve_scalar_signature(&name, &arg_types),
+                        Err(crate::functions::ResolveError::UnknownFunction)
+                    ) && matches!(
+                        crate::functions::builtin_disposition(&name),
+                        Some(
+                            crate::functions::BuiltinDisposition::Unavailable
+                                | crate::functions::BuiltinDisposition::LoweredOnly
+                        )
+                    ) {
+                        return Err(AnalyzeError::unsupported_expression(
+                            format!(
+                                "builtin function `{name}` has no admitted selected scalar implementation"
+                            ),
+                            func.span,
+                        ));
+                    }
                     if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
                         return Err(AnalyzeError::unknown_function(
                             format!("Unknown function: {name}"),
@@ -2425,6 +2445,26 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             validate_scalar_function_call_typed(&name, &args_typed)
                 .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
+            // Legacy declarations are type-inspection facts, not installed selected bindings.
+            // A custom contribution of the same name is resolved by its own catalog identity.
+            if matches!(
+                self.function_catalog
+                    .resolve_scalar_signature(&name, &arg_types),
+                Err(crate::functions::ResolveError::UnknownFunction)
+            ) && matches!(
+                crate::functions::builtin_disposition(&name),
+                Some(
+                    crate::functions::BuiltinDisposition::Unavailable
+                        | crate::functions::BuiltinDisposition::LoweredOnly
+                )
+            ) {
+                return Err(AnalyzeError::unsupported_expression(
+                    format!(
+                        "builtin function `{name}` has no admitted selected scalar implementation"
+                    ),
+                    func.span,
+                ));
+            }
             if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
                 return Err(AnalyzeError::unknown_function(
                     format!("Unknown function: {name}"),
@@ -6434,7 +6474,7 @@ mod tests {
     fn array_agg_freezes_json_output_separately_from_physical_binding() {
         for sql in [
             "select array_agg(json_object('2:3'))",
-            "select array_agg(json_array(1))",
+            "select array_agg(parse_json('[1]'))",
             "select array_agg(j2) from (select cast(json_object('k',1) as json) as j, j as j2) s",
             "select array_agg(j) from (values (cast(json_object('k',1) as json)), (null)) q(j)",
             "select array_agg(j) from (select cast(json_object('k',1) as json) as j union all select null) q",
@@ -6453,6 +6493,20 @@ mod tests {
             let expression =
                 analyze_projection_expr(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
             assert_array_agg_json_adapter(&expression);
+        }
+        // JSON_ARRAY has a legacy declaration but no installed scalar kernel.
+        // Keep its admission control alongside the JSON aggregate boundary.
+        for sql in [
+            "select array_agg(json_array(1))",
+            "select array_agg(json_array(1)) where false",
+        ] {
+            let error = analyze_projection_expr(sql).unwrap_err();
+            assert!(
+                error.contains(
+                    "builtin function `json_array` has no admitted selected scalar implementation"
+                ),
+                "{sql}: {error}"
+            );
         }
     }
 
@@ -8340,5 +8394,125 @@ mod tests {
         ] {
             resolved(sql);
         }
+    }
+
+    #[test]
+    fn decimal_largeint_add_sub_seal_exact_result_without_operand_retagging() {
+        let largeint = DataType::FixedSizeBinary(16);
+        for op in ["+", "-"] {
+            for reverse in [false, true] {
+                let (left, right) = if reverse {
+                    ("cast(1 as largeint)", "cast(1.25 as decimal(38,15))")
+                } else {
+                    ("cast(1.25 as decimal(38,15))", "cast(1 as largeint)")
+                };
+                let sql = format!("select {left} {op} {right}");
+                let expr = analyze_projection_expr(&sql).unwrap();
+                assert_eq!(expr.data_type, DataType::Decimal256(55, 15));
+                let ExprKind::BinaryOp { left, right, .. } = expr.kind else {
+                    panic!("expected frozen arithmetic");
+                };
+                assert_eq!(
+                    left.data_type,
+                    if reverse {
+                        largeint.clone()
+                    } else {
+                        DataType::Decimal128(38, 15)
+                    }
+                );
+                assert_eq!(
+                    right.data_type,
+                    if reverse {
+                        DataType::Decimal128(38, 15)
+                    } else {
+                        largeint.clone()
+                    }
+                );
+            }
+        }
+        assert_eq!(analyze_projection_expr("select cast(0.000000000000000000000000000000000001 as decimal(38,36)) + cast(1 as largeint)").unwrap().data_type,DataType::Decimal256(76,36));
+        for query in [
+            "select cast(0 as decimal(38,37)) + cast(1 as largeint)",
+            "select cast(1 as decimal(38,15)) * cast(1 as largeint)",
+            "select cast(1 as decimal(38,15)) / cast(1 as largeint)",
+            "select cast(1 as decimal(38,15)) % cast(1 as largeint)",
+        ] {
+            assert!(
+                analyze_projection_expr(query)
+                    .unwrap_err()
+                    .contains("no frozen result rule"),
+                "{query}"
+            );
+        }
+    }
+    #[test]
+    fn unavailable_builtin_is_explicitly_rejected_before_false_filter_pruning() {
+        for sql in [
+            "select array_reverse([1,2]) where false",
+            "select array_to_string([1,2], ',') where false",
+            "select isnull(1) where false",
+            "select next_day('2020-01-01') where false",
+            "select cosh(1) where false",
+        ] {
+            let error = analyze_projection_expr(sql).unwrap_err();
+            assert!(
+                error.contains("no admitted selected scalar implementation"),
+                "{sql}: {error}"
+            );
+        }
+        let unknown =
+            analyze_projection_expr("select not_an_advertised_builtin(1) where false").unwrap_err();
+        assert!(unknown.contains("Unknown function"), "{unknown}");
+    }
+
+    #[test]
+    fn authoritative_lowering_retains_alias_and_non_row_boundaries() {
+        for (sql, expected) in [
+            ("select every(true)", "bool_and"),
+            (
+                "select approx_count_distinct_hll_sketch(1)",
+                "ds_hll_count_distinct",
+            ),
+            ("select max_by(1,2)", "max_by"),
+        ] {
+            let typed = analyze_projection_expr(sql).unwrap();
+            let ExprKind::AggregateCall { name, resolved, .. } = typed.kind else {
+                panic!("{sql}: expected aggregate boundary")
+            };
+            assert_eq!(name, expected);
+            assert_eq!(resolved.kind, novarocks_functions::FunctionKind::Aggregate);
+            assert_eq!(
+                resolved.semantics.intrinsic_row_error,
+                novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated
+            );
+        }
+        let typed = analyze_projection_expr("select row_number() over ()").unwrap();
+        let ExprKind::WindowCall { binding, .. } = typed.kind else {
+            panic!("expected window boundary")
+        };
+        assert_eq!(binding.kind, novarocks_functions::FunctionKind::Window);
+        assert_eq!(
+            binding.semantics.intrinsic_row_error,
+            novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated
+        );
+        assert!(matches!(
+            analyze_projection_expr("select typeof(cast(1 as tinyint))")
+                .unwrap()
+                .kind,
+            ExprKind::Literal(LiteralValue::String(_))
+        ));
+        assert!(matches!(
+            analyze_projection_expr("select -cast(1 as smallint)")
+                .unwrap()
+                .kind,
+            ExprKind::UnaryOp { .. }
+        ));
+        assert!(matches!(
+            analyze_projection_expr("select case when true then 1 else 2 end")
+                .unwrap()
+                .kind,
+            ExprKind::Case { .. }
+        ));
+        // Existing grouping-marker tests prove GROUPING is replaced by exact ColumnId.
     }
 }

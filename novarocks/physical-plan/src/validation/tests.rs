@@ -34,6 +34,39 @@ mod validation_error_tests {
     use super::*;
 
     #[test]
+    fn mixed_decimal_largeint_validates_only_exact_new_add_sub_output() {
+        let expression = |id, data_type| crate::ExprNode {
+            id: ExprId::new(id),
+            owner: NodeId::new(1),
+            lambda_scope: None,
+            ty: ValueType::new(data_type, true),
+            kind: ExprKind::Literal(crate::LiteralValue::Null),
+        };
+        let decimal = expression(1, DataType::Decimal128(38, 15));
+        let integer = expression(2, DataType::FixedSizeBinary(16));
+        for op in [crate::BinaryOperator::Add, crate::BinaryOperator::Subtract] {
+            let exact = expression(3, DataType::Decimal256(55, 15));
+            let mut errors = ValidationContext::new();
+            validate_binary_types(&decimal, op, &integer, &exact, "binary", &mut errors);
+            assert!(errors.is_empty());
+            let wrong = expression(3, DataType::Decimal128(38, 15));
+            let mut errors = ValidationContext::new();
+            validate_binary_types(&decimal, op, &integer, &wrong, "binary", &mut errors);
+            assert!(!errors.is_empty());
+        }
+        for op in [
+            crate::BinaryOperator::Multiply,
+            crate::BinaryOperator::Divide,
+            crate::BinaryOperator::Modulo,
+        ] {
+            let exact = expression(3, DataType::Decimal256(55, 15));
+            let mut errors = ValidationContext::new();
+            validate_binary_types(&decimal, op, &integer, &exact, "binary", &mut errors);
+            assert!(!errors.is_empty());
+        }
+    }
+
+    #[test]
     fn validation_diagnostics_have_a_fixed_cardinality_and_display_bound() {
         let mut collector = ValidationContext::new();
         for ordinal in 0..(MAX_VALIDATION_ERRORS * 4) {
@@ -421,6 +454,8 @@ mod validation_error_tests {
                 volatility: crate::FunctionVolatility::Immutable,
                 argument_evaluation: crate::FunctionArgumentEvaluation::Eager,
                 failure_behavior: crate::FunctionFailureBehavior::Propagate,
+                intrinsic_row_error:
+                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
             },
             phase: AggregatePhase::Partial { sequence },
             logical_argument_count: 1,

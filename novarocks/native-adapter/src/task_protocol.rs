@@ -157,6 +157,9 @@ pub enum TaskResultRead {
     EndOfStream { packet_sequence: i64 },
     /// No result is ready before the accepted read bound.
     NotReady,
+    /// Output was revoked by the exact owner's latched context termination.
+    /// The Task control stream, not this response, identifies the originator.
+    AwaitTerminalControl,
     /// A settled, in-band failure or refusal from the role-local owner.
     Error { detail: String },
 }
@@ -637,6 +640,13 @@ pub async fn fetch_task_result_with_ownership(
         TaskResultRead::NotReady => {
             task_result_response(FetchStatus::NotReady, String::new(), 0, false, Bytes::new())
         }
+        TaskResultRead::AwaitTerminalControl => task_result_response(
+            FetchStatus::AwaitTerminalControl,
+            String::new(),
+            0,
+            false,
+            Bytes::new(),
+        ),
         TaskResultRead::Error { detail } => {
             task_result_response(FetchStatus::Error, detail, 0, false, Bytes::new())
         }

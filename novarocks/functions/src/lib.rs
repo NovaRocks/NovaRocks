@@ -33,11 +33,11 @@ mod binding;
 pub use binding::*;
 pub use novarocks_type_contract::{
     AggregateStateFormatId as AggregateStateFormatIdentity, FunctionArgumentEvaluation,
-    FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionKind, FunctionOverloadId,
-    FunctionValueType, FunctionVolatility,
+    FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
+    FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility,
 };
 
-const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v3\0";
+const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v4\0";
 const RESOLVED_AGGREGATE_DIGEST_DOMAIN: &[u8] = b"novarocks.resolved-aggregate/v1\0";
 
 const fn function_kind_tag(kind: FunctionKind) -> u8 {
