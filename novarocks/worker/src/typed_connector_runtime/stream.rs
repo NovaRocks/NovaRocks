@@ -106,7 +106,13 @@ impl ScanStreamSource for TypedScanStreamSource {
         }
         Ok(Box::pin(TypedConnectorScanStream {
             provider: self.shared.provider.resolve()?,
-            converter: SourcePageConverter::new(self.shared.slot_ids.clone()),
+            converter: if self.shared.output_materialization.is_some() {
+                // Derived columns consume a read intermediate, then the frozen
+                // output is bound after the explicit transform.
+                SourcePageConverter::new(self.shared.slot_ids.clone())
+            } else {
+                SourcePageConverter::with_output_schema(Arc::clone(&self.shared.output_schema))
+            },
             shared: Arc::clone(&self.shared),
             queue: Arc::clone(&self.queue),
             split_wake: Arc::clone(&self.split_wake),
@@ -611,7 +617,13 @@ impl ScanStreamSource for TypedSystemTableStreamSource {
         }
         Ok(Box::pin(TypedSystemTableStream {
             provider: self.shared.provider.resolve()?,
-            converter: SourcePageConverter::new(self.shared.slot_ids.clone()),
+            converter: if self.shared.output_materialization.is_some() {
+                // Derived columns consume a read intermediate, then the frozen
+                // output is bound after the explicit transform.
+                SourcePageConverter::new(self.shared.slot_ids.clone())
+            } else {
+                SourcePageConverter::with_output_schema(Arc::clone(&self.shared.output_schema))
+            },
             shared: Arc::clone(&self.shared),
             budget,
             profile,
