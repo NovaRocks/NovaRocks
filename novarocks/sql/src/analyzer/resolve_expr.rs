@@ -3766,7 +3766,7 @@ fn normalize_slice_arguments(
     };
     fn control_string(expr: &TypedExpr) -> Option<&str> {
         match &expr.kind {
-            ExprKind::Literal(LiteralValue::Utf8(value)) => Some(value),
+            ExprKind::Literal(LiteralValue::String(value)) => Some(value),
             ExprKind::Nested(nested) => control_string(nested),
             _ => None,
         }
@@ -3805,7 +3805,7 @@ fn normalize_slice_arguments(
         ));
     }
     args[2] = TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Utf8(unit.into())),
+        kind: ExprKind::Literal(LiteralValue::String(unit.into())),
         data_type: DataType::Utf8,
         nullable: false,
     };
@@ -3826,7 +3826,7 @@ fn normalize_slice_arguments(
             ));
         }
         *boundary = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Utf8(value)),
+            kind: ExprKind::Literal(LiteralValue::String(value)),
             data_type: DataType::Utf8,
             nullable: false,
         };
