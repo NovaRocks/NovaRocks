@@ -87,7 +87,16 @@ native-compatibility-test-fixture = ["novarocks-version/native-compatibility-tes
 # plan-tree interpreter.
 physical-wire-v2-candidate = ["dep:novarocks-arrow-ipc-frame", "dep:novarocks-plan-codec"]
 
+[[test]]
+name = "be_type_metadata_funding"
+required-features = ["physical-wire-v2-candidate"]
+
 [dev-dependencies]
+arrow.workspace = true
+novarocks-native-adapter = { workspace = true, features = ["test-support"] }
+novarocks-plan-codec = { workspace = true, features = ["test-support"] }
+novarocks-proto-models.workspace = true
+novarocks-worker = { workspace = true, features = ["test-support"] }
 arrow-schema.workspace = true
 serde_json.workspace = true
 # `server_binary_smoke` spawns the real `novarocks` binary and drives it over

@@ -785,6 +785,7 @@ mod tests {
             &self,
             _descriptor: &TaskDescriptor,
             input: TaskCreationInput,
+            _preparation: &novarocks_worker::PreparationControlLoan<'_>,
         ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
             let (fragment, _assignment) = input.into_parts();
             self.prepared

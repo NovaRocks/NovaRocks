@@ -41,6 +41,7 @@
 mod compiled_package;
 mod context_host;
 mod execution_host;
+mod type_materialization;
 
 #[cfg(test)]
 mod tests;
@@ -51,3 +52,10 @@ pub use compiled_package::{
 };
 pub use context_host::NativeQueryContextHost;
 pub use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
+
+pub use type_materialization::{
+    TypeMaterializationHost, TypeMaterializationJournal, TypeMaterializationRefusal,
+};
+
+#[cfg(any(test, feature = "test-support"))]
+pub use type_materialization::materialize_package_types_for_test;

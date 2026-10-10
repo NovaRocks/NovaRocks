@@ -202,6 +202,8 @@ struct TestTaskHost {
     retain_normal_close: bool,
     inbound_capabilities: Option<Arc<TaskInboundCapabilities>>,
     install_gate: Option<Arc<InstallGate>>,
+    /// Mark entry into the original loan wait, then hold cleanup after stop.
+    pending_stop_gates: Option<(Arc<InstallGate>, Arc<InstallGate>)>,
     /// Restricts `install_gate` to creations of this static plan, so a peer
     /// task of the same context can install while another one is held.
     install_gate_plan: Option<&'static [u8]>,
@@ -269,7 +271,23 @@ impl TaskExecutionHost for TestTaskHost {
         &self,
         _descriptor: &TaskDescriptor,
         input: TaskCreationInput,
+        preparation: &crate::PreparationControlLoan<'_>,
     ) -> Result<crate::PreparedTaskInstallation, HostRejection> {
+        if let Some((entered, exiting)) = &self.pending_stop_gates {
+            {
+                let mut state = entered.state.lock().unwrap();
+                state.waiter_entered = true;
+                entered.changed.notify_all();
+            }
+            // No body runs while the same winner is Pending. The real loan
+            // owns its bounded wait, and an original stop interrupts it.
+            while preparation.wait().is_ok() {}
+            exiting.wait_for_release();
+            return Err(HostRejection::new(
+                TaskFailureCategory::Internal,
+                "preparation stopped before body",
+            ));
+        }
         let (plan, _assignment) = input.into_parts();
         if let Some(gate) = &self.install_gate
             && self
@@ -4124,5 +4142,110 @@ fn preparation_rollback_concludes_on_the_stand_down_that_won() {
                 "case {case}: every task is a terminal record"
             );
         }
+    }
+}
+
+#[test]
+fn accepted_preparation_control_pending_stop_wakes_same_worker_and_keeps_charges_until_exit() {
+    for kind in 0..3 {
+        let entered = Arc::new(InstallGate::held());
+        let exiting = Arc::new(InstallGate::held());
+        let _release = PreparationGateRelease(Arc::clone(&exiting));
+        let fixture = Fixture::with_config(
+            TestTaskHost {
+                pending_stop_gates: Some((Arc::clone(&entered), Arc::clone(&exiting))),
+                ..TestTaskHost::default()
+            },
+            |config| {
+                config.max_prepare_workers = 1;
+                config.max_preparing_tasks_per_context = 1;
+                config.gate_poll_interval = Duration::from_secs(30);
+            },
+        );
+        let execution = execution(37_001 + kind);
+        let context = fixture.context(execution);
+        establish(&fixture.registry, context);
+        let identity = task(execution, fixture.backend);
+        let request = fixture.create(descriptor(identity), Vec::new());
+        assert_eq!(
+            fixture
+                .registry
+                .accept_create_task(&request, body(RESULT_PLAN))
+                .outcome(),
+            OperationOutcome::Accepted
+        );
+        entered.wait_until_entered();
+        let pending = fixture.registry.preparation_snapshot();
+        assert_eq!(
+            (
+                pending.positions,
+                pending.workers,
+                pending.context_positions
+            ),
+            (1, 1, 1)
+        );
+        assert!(pending.bytes > 0);
+        let stop = if kind == 1 {
+            fixture
+                .registry
+                .abort_query_context(&AbortQueryContext::new(
+                    TaskOperationId::new_v7(),
+                    context,
+                    AbortCause::QueryFailed,
+                ))
+                .outcome()
+        } else if kind == 0 {
+            fixture
+                .registry
+                .cancel_task(&CancelTask::new(
+                    TaskOperationId::new_v7(),
+                    identity,
+                    CancelReason::UpstreamNoLongerNeeded,
+                ))
+                .outcome()
+        } else {
+            fixture.clock.advance(Duration::from_secs(10));
+            assert_eq!(fixture.registry.advance_deadlines().leases_expired, 1);
+            OperationOutcome::Accepted
+        };
+        assert_eq!(stop, OperationOutcome::Accepted);
+        // Stop must notify the existing waiter rather than require the next
+        // 30-second admission poll or another queued preparation worker.
+        {
+            let state = exiting.state.lock().unwrap();
+            let (state, _) = exiting
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(1), |state| !state.waiter_entered)
+                .unwrap();
+            assert!(
+                state.waiter_entered,
+                "original stop did not wake preparation"
+            );
+        }
+        let stopped = fixture.registry.preparation_snapshot();
+        assert_eq!(
+            (stopped.positions, stopped.workers, stopped.bytes),
+            (pending.positions, pending.workers, pending.bytes)
+        );
+        assert!(fixture.task_host.prepared_bodies().is_empty());
+        assert_eq!(
+            fixture.task_host.receivers_installed.load(Ordering::SeqCst),
+            0
+        );
+        exiting.release();
+        wait_for_terminal_record(&fixture.registry, identity);
+        wait_for_preparation_exit(&fixture.registry, identity);
+        wait_for_accepted_state(
+            &fixture.registry,
+            &request,
+            if kind == 0 {
+                TaskState::Canceled
+            } else {
+                TaskState::Aborted
+            },
+        );
+        let exited = fixture.registry.preparation_snapshot();
+        assert_eq!((exited.positions, exited.workers, exited.bytes), (0, 0, 0));
+        assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
     }
 }

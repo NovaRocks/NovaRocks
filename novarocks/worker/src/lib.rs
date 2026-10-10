@@ -112,8 +112,8 @@ pub use domain::{
 };
 pub use drain::WorkerDrainState;
 pub use host::{
-    HostRejection, PreparedTaskInstallation, QueryContextHost, ReleasedContextEvidence,
-    RunnableTask, SharedFactsRequest, TaskExecutionHost,
+    HostRejection, PreparationControlLoan, PreparedTaskInstallation, QueryContextHost,
+    ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
 };
 pub use inbound_capability::{
     InboundFrameAdmission, InboundFrameClaim, NormalClosedInbound, TaskInboundCapabilities,
@@ -205,3 +205,7 @@ impl WorkerResultRetainedLimits {
         self.per_process
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub use host::TestPreparationControl;
+pub use task_registry_entry::PreparationStop;

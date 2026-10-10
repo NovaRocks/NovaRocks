@@ -35,6 +35,60 @@ use crate::RuntimeFilterReleaseObservation;
 use crate::TaskStatusReporter;
 use crate::root_result_channel::RootResultChannel;
 
+/// Borrowed cancellation and bounded wait on the original creation winner.
+/// Pending keeps its synchronous continuation and preparation charges on that
+/// same worker. This capability lends no account, grant, scope or runtime.
+pub struct PreparationControlLoan<'a> {
+    cell: &'a crate::task_registry_entry::CreationCell,
+    cadence: std::time::Duration,
+}
+impl<'a> PreparationControlLoan<'a> {
+    pub(crate) fn new(
+        cell: &'a crate::task_registry_entry::CreationCell,
+        cadence: std::time::Duration,
+    ) -> Self {
+        Self { cell, cadence }
+    }
+    pub fn checkpoint(&self) -> Result<(), crate::PreparationStop> {
+        match self.cell.stop() {
+            Some(stop) => Err(stop),
+            None => Ok(()),
+        }
+    }
+    /// Return after the explicit worker cadence, a spurious wake, or an original stop. The
+    /// caller requalifies its original request OUTSIDE the decision lock.
+    pub fn wait(&self) -> Result<(), crate::PreparationStop> {
+        self.cell.wait_preparation(self.cadence)
+    }
+}
+
+/// An actual creation cell for direct host contract tests. Production obtains
+/// its loan only from the Worker creation winner, never from this test owner.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestPreparationControl {
+    cell: crate::task_registry_entry::CreationCell,
+    cadence: std::time::Duration,
+}
+#[cfg(any(test, feature = "test-support"))]
+impl TestPreparationControl {
+    pub fn new(cadence: std::time::Duration) -> Self {
+        assert!(
+            !cadence.is_zero(),
+            "test preparation cadence must be explicit and nonzero"
+        );
+        Self {
+            cell: crate::task_registry_entry::CreationCell::new(),
+            cadence,
+        }
+    }
+    pub fn loan(&self) -> PreparationControlLoan<'_> {
+        PreparationControlLoan::new(&self.cell, self.cadence)
+    }
+    pub fn stop(&self, stop: crate::PreparationStop) -> bool {
+        self.cell.request_stop(stop)
+    }
+}
+
 /// Pure preparation facts and the exact runtime owner created alongside them.
 /// The context's creation transaction takes the optional root atomically;
 /// transport handles never enter the shared execution-contract vocabulary.
@@ -372,6 +426,7 @@ pub trait TaskExecutionHost: Send + Sync {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
+        _preparation: &crate::PreparationControlLoan<'_>,
     ) -> Result<PreparedTaskInstallation, HostRejection>;
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);
@@ -428,5 +483,45 @@ mod tests {
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(rejection.is_closed_queue());
         assert!(rejection.detail().as_str().len() < 8 * 1024);
+    }
+
+    #[test]
+    fn preparation_control_stop_before_wait_and_notification_race_never_lose_stop() {
+        for before in [false, true] {
+            for _ in 0..64 {
+                let owner = std::sync::Arc::new(TestPreparationControl::new(
+                    std::time::Duration::from_secs(30),
+                ));
+                let stop = crate::PreparationStop::Cancel(CancelReason::UpstreamNoLongerNeeded);
+                if before {
+                    assert!(owner.stop(stop));
+                }
+                let (send, receive) = std::sync::mpsc::channel();
+                let other = Arc::clone(&owner);
+                let worker = std::thread::spawn(move || {
+                    send.send(other.loan().wait()).unwrap();
+                });
+                if !before {
+                    assert!(owner.stop(stop));
+                }
+                assert!(matches!(
+                    receive
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .unwrap(),
+                    Err(crate::PreparationStop::Cancel(
+                        CancelReason::UpstreamNoLongerNeeded
+                    ))
+                ));
+                worker.join().unwrap();
+                assert!(owner.loan().checkpoint().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn preparation_control_explicit_cadence_returns_retry_without_creating_stop() {
+        let owner = TestPreparationControl::new(std::time::Duration::from_millis(1));
+        assert!(owner.loan().wait().is_ok());
+        assert!(owner.loan().checkpoint().is_ok());
     }
 }

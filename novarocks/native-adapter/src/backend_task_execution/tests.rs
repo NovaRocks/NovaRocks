@@ -433,6 +433,7 @@ impl TaskExecutionHost for FakeTaskHost {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
+        _preparation: &novarocks_worker::PreparationControlLoan<'_>,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         self.ledger
             .installs_attempted

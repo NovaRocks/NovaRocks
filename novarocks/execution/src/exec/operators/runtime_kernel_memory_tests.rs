@@ -15,25 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
-use super::super::RuntimeKernelControl;
-use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
+use super::RuntimeKernelControl;
+use super::runtime_kernel_memory::*;
 use crate::runtime::execution_runtime::test_execution_runtime;
+use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
+use crate::runtime::query_memory::QueryMemoryBinding;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_execution_contract::TaskIdentity;
-use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
-use novarocks_memory::attribution::{AttributingAllocator, binding};
 use novarocks_memory::attribution::scope::{AmbientEntryObservation, AmbientExitObservation};
+use novarocks_memory::attribution::{AttributingAllocator, binding};
 use novarocks_memory::lane::RecordRef;
+use novarocks_memory::{AccountKind, AuthorityConfig, CapacityError, ExternalRef, MemoryAuthority};
 use novarocks_types::{
     QueryId,
-    identity::{QueryExecutionId, AttemptId, StageId, TaskId, BackendProcessId},
+    identity::{AttemptId, BackendProcessId, QueryExecutionId, StageId, TaskId},
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    sync::Arc,
-    ptr::NonNull,
     cell::Cell,
+    ptr::NonNull,
+    sync::Arc,
 };
 
 fn execution() -> QueryExecutionId {

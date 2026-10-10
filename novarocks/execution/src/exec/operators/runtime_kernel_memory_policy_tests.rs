@@ -56,8 +56,8 @@ fn by_runtime_memory_policy_complete_operation_uses_exact_same_authority_workset
     let KernelMemoryAdmission::Granted(ready) = admitted else {
         panic!("actual complete-operation request: {admitted:?}");
     };
-    assert_eq!(ready.stock_bytes, 608);
-    assert_eq!(ready.threshold_bytes, 0);
+    assert_eq!(ready.stock_bytes(), 608);
+    assert_eq!(ready.threshold_bytes(), 0);
     assert_eq!(ready.domain().snapshot().authorized, 608);
     assert_eq!(
         ready.domain().lane().affiliation().id(),

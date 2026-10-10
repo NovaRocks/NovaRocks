@@ -185,6 +185,7 @@ impl TaskExecutionHost for Host {
         &self,
         _: &TaskDescriptor,
         _: TaskCreationInput,
+        _preparation: &novarocks_worker::PreparationControlLoan<'_>,
     ) -> Result<PreparedTaskInstallation, HostRejection> {
         if let Some(gate) = &self.gate {
             gate.wait();

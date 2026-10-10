@@ -4374,6 +4374,7 @@ name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "arrow-schema",
  "atty",
  "bytes",
@@ -4401,6 +4402,7 @@ dependencies = [
  "novarocks-native-trust",
  "novarocks-physical-plan",
  "novarocks-plan-codec",
+ "novarocks-proto-models",
  "novarocks-query-application",
  "novarocks-secret",
  "novarocks-spi",

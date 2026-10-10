@@ -255,3 +255,119 @@ fn mem_a1_v2_context_removal_is_not_funded_domain_teardown_evidence() {
     assert!(authority.maintain(64).complete);
     assert_eq!(authority.live_accounts(), 1);
 }
+
+#[test]
+fn native_fragment_query_early_type_binding_and_later_admission_consume_same_account() {
+    let authority = authority(32);
+    let manager = QueryContextManager::new_for_test();
+    let runtime =
+        NativeFragmentQueryRuntime::new_for_test(Arc::clone(&manager), Arc::clone(&authority));
+    let execution = execution(37);
+    let first = UniqueId::new(37, 1);
+    let second = UniqueId::new(37, 2);
+    let lease = runtime
+        .register_fragment_execution(
+            execution,
+            first,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    let early = runtime
+        .prepare_query_memory_typed(
+            execution,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Some(1 << 20),
+        )
+        .unwrap();
+    let account = early.binding().account().id();
+    let other_lease = runtime
+        .register_fragment_execution(
+            execution,
+            second,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    let other = runtime
+        .prepare_query_memory_typed(
+            execution,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            None,
+        )
+        .unwrap();
+    assert_eq!(other.binding().account().id(), account);
+    assert_eq!(
+        other.binding().account().snapshot().policy_limit_bytes,
+        Some(1 << 20)
+    );
+    assert!(Arc::ptr_eq(other.binding().authority(), &authority));
+    drop(other);
+    drop(other_lease);
+    assert_eq!(
+        manager
+            .native_execution_resource_snapshot()
+            .active_fragments,
+        1
+    );
+    assert_eq!(
+        manager
+            .query_memory_account_execution(execution_key(execution))
+            .unwrap()
+            .account()
+            .id(),
+        account
+    );
+    let admission = runtime.prepare_admission_with_memory(first, early, None);
+    assert_eq!(admission.query_memory().unwrap().account().id(), account);
+    assert_eq!(
+        admission
+            .query_memory()
+            .unwrap()
+            .account()
+            .snapshot()
+            .granted_bytes,
+        0
+    );
+    drop(admission);
+    drop(lease);
+    assert_eq!(
+        manager
+            .native_execution_resource_snapshot()
+            .active_fragments,
+        0
+    );
+}
+
+#[test]
+fn native_fragment_query_refused_early_type_memory_rolls_back_only_its_original_lease() {
+    let authority = authority(1);
+    let manager = QueryContextManager::new_for_test();
+    let runtime = NativeFragmentQueryRuntime::new_for_test(Arc::clone(&manager), authority);
+    let execution = execution(38);
+    let lease = runtime
+        .register_fragment_execution(
+            execution,
+            UniqueId::new(38, 1),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    assert!(matches!(
+        runtime.prepare_query_memory_typed(
+            execution,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            None
+        ),
+        Err(NativeFragmentAdmissionError::MemoryAccount(
+            QueryMemoryAccountError::Capacity(CapacityError::MetadataExhausted { .. })
+        ))
+    ));
+    drop(lease);
+    let state = manager.native_execution_resource_snapshot();
+    assert_eq!(state.active_fragments, 0);
+    assert_eq!(state.active_contexts, 0);
+}

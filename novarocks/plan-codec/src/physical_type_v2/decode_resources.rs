@@ -150,7 +150,7 @@ impl TypeDecodeModel {
         model.request(array::<Loan>(table.fields.len())?, 2)?;
         model.request(arc(array::<Loan>(table.fields.len())?)?, 1)?;
         // One terminal ConnectorError contains fixed writer-law text or a
-        // bounded logical-enum diagnostic (under128 bytes). Rust1.92 String
+        // bounded logical-enum diagnostic (under128 bytes). Rust1.98 String
         // growth has at most128 requests and <=4*128 cumulative payload bytes.
         // This is an error-path request upper, not a semantic message limit.
         model.requests = add(model.requests, 128)?;
@@ -184,8 +184,8 @@ impl TypeDecodeModel {
                 let n = fields.fields.len();
                 self.request(array::<i8>(n)?, 1)?;
                 self.request(array::<Arc<Field>>(n)?, 1)?;
-                // Arrow58.2 UnionFields::try_new owns Vec::new()+push, followed
-                // by Arc::from(Vec). Rust1.92 amortized capacities start at4
+                // Arrow58.4 UnionFields::try_new owns Vec::new()+push, followed
+                // by Arc::from(Vec). Rust1.98 amortized capacities start at4
                 // tuples and double: at mostN requests, cumulative <=4N tuples.
                 if n != 0 {
                     let growth = array::<(i8, Arc<Field>)>(mul(n, 4)?)?;
@@ -262,7 +262,7 @@ impl TypeDecodeModel {
     /// Requests of the unchanged strict Value walker, which starts with one
     /// heap tuple and grows its Vec on child pushes. No tree grammar is copied.
     /// The caller supplies its original unfolded Carrier summary before the
-    /// walk: Rust1.92 min-four/doubling growth has at most N requests and
+    /// walk: Rust1.98 min-four/doubling growth has at most N requests and
     /// cumulative payload at most 4N tuples, including the initial singleton.
     fn metadata_validation(&mut self, visits: usize) -> Result<(), E> {
         let key = NR_LOGICAL_TYPE_KEY.len();
