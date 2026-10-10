@@ -73,7 +73,7 @@ under the License.
 
 - [DML（INSERT / DELETE / UPDATE / MERGE INTO / OVERWRITE / TRUNCATE）](dml.md)
 - [维护操作（OPTIMIZE / EXPIRE / ORPHAN / REWRITE）](maintenance.md)
-- [Lake publication 与 CommitUnknown 人工核对](lake-publication.md)
+- [Lake publication：冲突、重试、清理与 CommitUnknown 人工核对](lake-publication.md)
 
 ### NovaRocks 差异化
 

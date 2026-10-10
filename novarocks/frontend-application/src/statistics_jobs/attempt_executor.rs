@@ -302,10 +302,20 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
                     },
                 }
             }
-            ExternalMutationOutcome::KnownUncommitted { .. } => StatisticsPublicationOutcome {
-                fact: StatisticsPublicationFact::KnownUncommitted,
-                finalization_failure: None,
-            },
+            ExternalMutationOutcome::KnownUncommitted { cleanup, .. } => {
+                StatisticsPublicationOutcome {
+                    fact: StatisticsPublicationFact::KnownUncommitted,
+                    finalization_failure: match cleanup {
+                        ExternalMutationFinalization::Complete => None,
+                        ExternalMutationFinalization::Failed(error) => Some(StatisticsFailure {
+                            // Provider finalization has no compile-control provenance;
+                            // the original attempt failure retains its typed compile cause.
+                            compile_control: None,
+                            message: Arc::from(error.to_string()),
+                        }),
+                    },
+                }
+            }
             ExternalMutationOutcome::CommitUnknown { .. } => StatisticsPublicationOutcome {
                 fact: StatisticsPublicationFact::CommitUnknown,
                 finalization_failure: None,
@@ -622,6 +632,28 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn uncommitted_statistics_cleanup_is_retained_as_a_separate_failure() {
+        let outcome = super::FrontendThreePhaseStatisticsAttemptExecutor::publication_outcome(
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Conflict,
+                    "snapshot changed",
+                ),
+                cleanup: ExternalMutationFinalization::Failed(
+                    novarocks_spi::connector::ConnectorMutationFailure::new(
+                        novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                        "Puffin delete completion absent",
+                    ),
+                ),
+            },
+        );
+        assert_eq!(outcome.fact, StatisticsPublicationFact::KnownUncommitted);
+        let failure = outcome.finalization_failure.unwrap();
+        assert_eq!(failure.compile_control, None);
+        assert!(failure.message.contains("Puffin delete completion absent"));
+    }
 
     fn test_root_capacity() -> (
         novarocks_workload_control::RootWork,

@@ -289,7 +289,7 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         _metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
         CatalogOutcome::Unsupported(
-            self.refuse_operation(CatalogOperation::BootstrapSnapshot, _table),
+            self.refuse_operation(CatalogOperation::AnchorWrittenMetadata, _table),
         )
     }
 

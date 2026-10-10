@@ -78,24 +78,32 @@ impl TransactionAction for UpdateLocationAction {
 
 #[cfg(test)]
 mod tests {
+    use as_any::Downcast;
+
     use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
     use crate::transaction::tests::make_v2_table;
+    use crate::transaction::update_location::UpdateLocationAction;
 
-    #[tokio::test]
-    async fn test_set_location() {
+    #[test]
+    fn test_set_location() {
         let table = make_v2_table();
         let tx = Transaction::new(&table);
         let tx = tx
             .update_location()
             .set_location(String::from("s3://bucket/prefix/new_table"))
             .apply(tx)
-            .await
+            .unwrap();
+
+        assert_eq!(tx.actions.len(), 1);
+
+        let action = (*tx.actions[0])
+            .downcast_ref::<UpdateLocationAction>()
             .unwrap();
 
         assert_eq!(
-            tx.staged_table().metadata().location(),
-            "s3://bucket/prefix/new_table"
+            action.location,
+            Some(String::from("s3://bucket/prefix/new_table"))
         )
     }
 }

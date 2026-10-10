@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::iceberg::spec::{Datum, PrimitiveType, Type};
 use std::collections::{BTreeMap, HashMap};
+use std::str::FromStr;
 
 use crate::iceberg::spec::{Literal, PartitionSpecRef, PrimitiveLiteral, Struct};
 use base64::Engine;
@@ -315,6 +317,13 @@ mod tests {
         };
 
         let report = writer_report_from_written_file(&file, &metadata).expect("writer report");
+        let decoded = written_file_from_report(report.clone(), metadata.current_schema().as_ref())
+            .expect("decode immutable output without a commit collector");
+        assert_eq!(decoded.path, file.path);
+        assert_eq!(decoded.partition_values, file.partition_values);
+        assert_eq!(decoded.partition_spec_id, file.partition_spec_id);
+        assert_eq!(decoded.record_count, file.record_count);
+        assert_eq!(decoded.nan_value_counts, file.nan_value_counts);
 
         assert_eq!(
             report
@@ -385,4 +394,204 @@ mod tests {
 
         assert!(err.contains("cardinality"), "got: {err}");
     }
+}
+
+/// Decode immutable writer output facts without owning a commit or cleanup ledger.
+pub(crate) fn written_file_from_report(
+    report: IcebergWriterReport,
+    schema: &crate::iceberg::spec::Schema,
+) -> Result<WrittenFile, String> {
+    use crate::delete_file::IcebergFileContent;
+    use crate::iceberg::spec::{DataContentType, DataFileFormat};
+
+    let IcebergWriterReport { file, .. } = report;
+    let format_name = file.format.clone();
+    let format = DataFileFormat::from_str(&format_name)
+        .map_err(|e| format!("unsupported Iceberg writer report format `{format_name}`: {e}"))?;
+    let content = match file.content {
+        IcebergFileContent::Data => DataContentType::Data,
+        IcebergFileContent::PositionDeletes => DataContentType::PositionDeletes,
+        IcebergFileContent::EqualityDeletes => DataContentType::EqualityDeletes,
+    };
+    validate_puffin_dv_descriptor(
+        format,
+        content,
+        file.referenced_data_file.as_deref(),
+        file.content_offset,
+        file.content_size_in_bytes,
+        file.cardinality,
+    )?;
+
+    let partition = file.partition;
+    let stats = file.column_stats.unwrap_or_default();
+    let column_sizes = i64_map_to_u64(Some(stats.column_sizes), "column_sizes")?;
+    let value_counts = i64_map_to_u64(Some(stats.value_counts), "value_counts")?;
+    let null_value_counts = i64_map_to_u64(Some(stats.null_value_counts), "null_value_counts")?;
+    let nan_value_counts = i64_map_to_u64(Some(stats.nan_value_counts), "nan_value_counts")?;
+    let lower_bounds = decode_report_bounds(schema, Some(stats.lower_bounds), "lower_bounds")?;
+    let upper_bounds = decode_report_bounds(schema, Some(stats.upper_bounds), "upper_bounds")?;
+    let split_offsets = i64_vec_non_negative(file.split_offsets, "split_offsets")?;
+    let first_row_id = i64_option_non_negative(file.first_row_id, "first_row_id")?;
+    let content_offset = i64_option_non_negative(file.content_offset, "content_offset")?;
+    let content_size_in_bytes =
+        i64_option_non_negative(file.content_size_in_bytes, "content_size_in_bytes")?;
+
+    let written = WrittenFile {
+        path: file.path,
+        format,
+        content,
+        partition_values: partition.partition_values,
+        partition_spec_id: partition.partition_spec_id,
+        record_count: i64_to_u64(file.record_count, "record_count")?,
+        file_size_in_bytes: i64_to_u64(file.file_size_in_bytes, "file_size_in_bytes")?,
+        split_offsets,
+        column_sizes,
+        value_counts,
+        null_value_counts,
+        nan_value_counts,
+        lower_bounds,
+        upper_bounds,
+        key_metadata: file.key_metadata,
+        referenced_data_file: file.referenced_data_file,
+        equality_ids: file.equality_ids,
+        first_row_id,
+        content_offset,
+        content_size_in_bytes,
+        cardinality: file
+            .cardinality
+            .map(|c| i64_to_u64(c, "cardinality"))
+            .transpose()?,
+    };
+    written
+        .entry_identity()
+        .map_err(|error| error.to_string())?;
+    Ok(written)
+}
+
+fn decode_report_bounds(
+    schema: &crate::iceberg::spec::Schema,
+    bounds: Option<BTreeMap<i32, Vec<u8>>>,
+    field: &str,
+) -> Result<HashMap<i32, Datum>, String> {
+    let mut out = HashMap::new();
+    for (field_id, bytes) in bounds.unwrap_or_default() {
+        // Iceberg writers may leave bounds for retired field-ids in a file
+        // after a column is dropped. We cannot decode bytes without the
+        // field's type, so skip unknown ids rather than failing the commit.
+        // This matches the inject path (`data_file_to_written_file`), which
+        // carries bounds through without validating against the schema.
+        let Some(schema_field) = schema.field_by_id(field_id) else {
+            continue;
+        };
+        let prim = match &*schema_field.field_type {
+            Type::Primitive(p) => p.clone(),
+            other => {
+                return Err(format!(
+                    "column stat {field} field id {field_id} has non-primitive type {other:?}"
+                ));
+            }
+        };
+        if matches!(prim, PrimitiveType::Variant) {
+            continue;
+        }
+        let datum = Datum::try_from_bytes(&bytes, prim)
+            .map_err(|e| format!("decode column stat {field}[{field_id}] failed: {e}"))?;
+        out.insert(field_id, datum);
+    }
+    Ok(out)
+}
+
+fn validate_puffin_dv_descriptor(
+    format: crate::iceberg::spec::DataFileFormat,
+    content: crate::iceberg::spec::DataContentType,
+    referenced_data_file: Option<&str>,
+    content_offset: Option<i64>,
+    content_size_in_bytes: Option<i64>,
+    cardinality: Option<i64>,
+) -> Result<(), String> {
+    use crate::iceberg::spec::{DataContentType, DataFileFormat};
+
+    if format != DataFileFormat::Puffin || content != DataContentType::PositionDeletes {
+        return Ok(());
+    }
+    match referenced_data_file {
+        Some(path) if !path.is_empty() => {}
+        _ => {
+            return Err(
+                "Puffin position-delete DV requires non-empty referenced_data_file".to_string(),
+            );
+        }
+    }
+    match content_offset {
+        Some(offset) if offset >= 0 => {}
+        Some(offset) => {
+            return Err(format!(
+                "Puffin position-delete DV content_offset must be non-negative, got {offset}"
+            ));
+        }
+        None => {
+            return Err("Puffin position-delete DV requires content_offset".to_string());
+        }
+    }
+    match content_size_in_bytes {
+        Some(size) if size >= 0 => {}
+        Some(size) => {
+            return Err(format!(
+                "Puffin position-delete DV content_size_in_bytes must be non-negative, got {size}"
+            ));
+        }
+        None => {
+            return Err("Puffin position-delete DV requires content_size_in_bytes".to_string());
+        }
+    }
+    match cardinality {
+        Some(value) if value >= 0 => Ok(()),
+        Some(value) => Err(format!(
+            "Puffin position-delete DV cardinality must be non-negative, got {value}"
+        )),
+        None => Err("Puffin position-delete DV requires cardinality".to_string()),
+    }
+}
+
+/// Convert signed writer-report counts into the `WrittenFile`
+/// `HashMap<i32, u64>` representation.
+fn i64_to_u64(value: i64, field: &str) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| format!("iceberg {field} value {value} is negative"))
+}
+
+fn i64_option_non_negative(value: Option<i64>, field: &str) -> Result<Option<i64>, String> {
+    if let Some(value) = value
+        && value < 0
+    {
+        return Err(format!("iceberg {field} value {value} is negative"));
+    }
+    Ok(value)
+}
+
+fn i64_vec_non_negative(values: Option<Vec<i64>>, field: &str) -> Result<Vec<i64>, String> {
+    values
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if value < 0 {
+                Err(format!("iceberg {field}[{idx}] value {value} is negative"))
+            } else {
+                Ok(value)
+            }
+        })
+        .collect()
+}
+
+fn i64_map_to_u64(
+    map: Option<BTreeMap<i32, i64>>,
+    field: &str,
+) -> Result<HashMap<i32, u64>, String> {
+    map.unwrap_or_default()
+        .into_iter()
+        .map(|(field_id, value)| {
+            i64_to_u64(value, &format!("column stat {field}[{field_id}]"))
+                .map(|value| (field_id, value))
+        })
+        .collect()
 }

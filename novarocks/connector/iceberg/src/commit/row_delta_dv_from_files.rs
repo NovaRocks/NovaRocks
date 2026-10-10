@@ -15,728 +15,289 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! v3 row-lineage DV commit for BE-written deletion-vector files.
+//! Prepare immutable v3 row mutations while preserving full logical DV identity.
 //!
-//! The BE `DeletionVectors` sink has already read and merged old DVs and
-//! written replacement Puffin files. Multiple drivers may still report separate
-//! replacement DVs for the same referenced data file, so this commit action
-//! coalesces those reports before registering one live Puffin DV per data file
-//! in Iceberg metadata.
+//! Multiple new blobs for one referenced data file are coalesced under the
+//! attempt owner. Physical superseded-object cleanup belongs to finalization.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
 
-use crate::iceberg::io::FileIO;
-use crate::iceberg::spec::{
-    DataContentType, DataFileFormat, FormatVersion, ManifestFile, Operation, SchemaRef, Snapshot,
-    SnapshotReference, SnapshotRetention, Summary,
-};
-use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{ActionCommit, TransactionAction};
-use crate::iceberg::{TableRequirement, TableUpdate};
+use crate::iceberg::spec::{FormatVersion, Operation};
 use async_trait::async_trait;
-use uuid::Uuid;
 
-use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::fast_append::commit_empty_iceberg_mv_snapshot;
-use super::helpers::{
-    OccSubmit, debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
-    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
-    submit_snapshot_occ_action, target_ref_snapshot_id, write_manifest_list,
-};
-use super::row_delta_dv_metadata::{
-    WrittenDvFile, build_snapshot_index_metadata_only, dv_summary, dv_total_records,
-    group_live_files_by_partition_spec, group_written_dvs_by_partition_spec, partition_spec_by_id,
-    to_iceberg_unexpected, write_added_dv_manifest, write_existing_delete_manifest,
-};
-use crate::commit::abort::AbortLog;
-use crate::commit::{CommitOutcome, WrittenFile};
+use super::helpers::{snapshot_total_records, target_ref_snapshot_id};
+use super::row_delta_dv_metadata::{WrittenDvFile, dv_total_records, to_iceberg_unexpected};
 use crate::commit::{
     DeletionVector, read_deletion_vector_puffin, write_single_deletion_vector_puffin,
 };
 
-pub struct RowDeltaDvFromFilesCommit;
+/// MoR preparation preserves full logical DV identity across a shared Puffin object.
+pub(crate) struct RowDeltaDvFromFilesPreparer;
 
 #[async_trait]
-impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
-    async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
-        let written = ctx.collector.take_written_files()?;
-        // M3b: net-new INSERT data files from a folded MERGE not-matched branch
-        // arrive on a dedicated collector channel (the reuse `written` channel
-        // above carries only MOR-UPDATE replacement rows that preserve their
-        // `_row_id`s). The executor knows which writers were the INSERT branch
-        // and routed them here; the entry does NOT content-sniff. Empty for a
-        // plain MOR UPDATE / DELETE, keeping those paths byte-identical.
-        let appended_files = ctx.collector.take_appended_files();
-        let groups = ctx.collector.take_delete_groups();
-        if !groups.is_empty() {
-            return Err(
-                "RowDeltaDvFromFilesCommit does not accept coordinator delete groups; expected BE-written Puffin DV files"
-                    .to_string(),
-            );
-        }
-
-        if written.is_empty() && appended_files.is_empty() {
-            return commit_empty_iceberg_mv_snapshot(ctx).await;
-        }
-        // Every appended file must be net-new INSERT data (content == Data); a
-        // DV/position-delete in this channel is a routing bug. Mirrors the
-        // `(Data, _)` partition guard for the reuse channel below.
-        for file in &appended_files {
-            if file.content != DataContentType::Data {
-                return Err(format!(
-                    "RowDeltaDvFromFilesCommit appended file {} has content {:?}; expected Data (net-new INSERT)",
-                    file.path, file.content
-                ));
-            }
-        }
-        let (written_dvs, written_data) = partition_written_for_dv_from_files(written)?;
-        let (written_dvs, superseded_writer_dvs) = coalesce_written_dvs_by_referenced_file(
-            ctx.file_io,
-            ctx.table.metadata().location(),
-            ctx.commit_uuid,
-            written_dvs,
-            ctx.abort_handle.as_ref(),
-        )
-        .await?;
-
-        let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let action = Arc::new(RowDeltaDvFromFilesTxnAction {
-            written_dvs,
-            written: written_data,
-            // Fresh INSERT rows: see the channel comment above. The action leaves
-            // their manifest UNMARKED so the v3 manifest-list writer allocates
-            // fresh `_row_id`s and advances `next_row_id`.
-            appended_files,
-            commit_uuid: ctx.commit_uuid,
-            file_io: ctx.file_io.clone(),
-            schema: ctx.table.metadata().current_schema().clone(),
-            schema_id: ctx.table.metadata().current_schema_id(),
-            row_lineage_first_row_id: effective_next_row_id(ctx.table.metadata())?,
-            abort_handle: ctx.abort_handle.clone(),
-            manifest_paths_out: manifest_paths_out.clone(),
-            target_ref: ctx.target_ref.to_string(),
-            snapshot_properties: ctx.snapshot_properties.clone(),
-        });
-
-        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-        let written_manifest_paths = || {
-            manifest_paths_out
-                .lock()
-                .expect("manifest_paths_out poisoned")
-                .clone()
+impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
+    async fn prepare(
+        &self,
+        view: &crate::commit::staging::StagedView<'_>,
+        intent: &crate::commit::model::OperationIntent,
+    ) -> crate::iceberg::Result<crate::commit::staging::PreparedChange> {
+        use super::row_delta_dv_metadata::{
+            RowLiveIndex, logical_file_size, write_added_entry_groups,
         };
-
-        match submit_snapshot_occ_action(
-            ctx.catalog,
-            ctx.table,
-            action,
-            "RowDeltaDvFromFiles",
-            None,
-            ctx.snapshot_properties,
-        )
-        .await
-        {
-            Ok(OccSubmit::Committed(table_after)) => {
-                // Only a published snapshot makes the superseded writer DVs
-                // unreachable; every failure path leaves them for abort cleanup.
-                cleanup_superseded_writer_dvs(ctx.file_io, superseded_writer_dvs).await;
-                let new_snapshot_id = required_target_ref_snapshot_id(
-                    table_after.metadata(),
-                    ctx.target_ref,
-                    "RowDeltaDvFromFiles",
-                )?;
-                Ok(CommitOutcome {
-                    new_snapshot_id,
-                    written_manifest_paths: written_manifest_paths(),
-                })
-            }
-            // Fully empty input already returned through
-            // `commit_empty_iceberg_mv_snapshot` above, and the action always
-            // stages a snapshot, so this arm reports the same value that path
-            // reports for an empty change set.
-            Ok(OccSubmit::NoOp) => Ok(CommitOutcome {
-                new_snapshot_id: prev_snapshot_id.unwrap_or(0),
-                written_manifest_paths: written_manifest_paths(),
-            }),
-            Err(error) => Err(error.into_detail()),
-        }
-    }
-}
-
-struct RowDeltaDvFromFilesTxnAction {
-    written_dvs: Vec<WrittenDvFile>,
-    /// Replacement data files produced by an MOR UPDATE. Empty for a plain
-    /// metadata-only DELETE. Each file already carries stored row-lineage
-    /// columns, so the snapshot must NOT allocate fresh row IDs for them — the
-    /// added-data manifest is marked with `first_row_id` to suppress
-    /// allocation.
-    written: Vec<WrittenFile>,
-    /// Net-new INSERT data files (e.g. a folded MERGE not-matched INSERT) that
-    /// are genuinely new rows carrying NO preserved `_row_id`. Unlike `written`,
-    /// these MUST draw FRESH `_row_id`s: their manifest is left UNMARKED so the
-    /// v3 manifest-list writer allocates ids starting at the table's effective
-    /// next-row-id and advances `next_row_id` by their `Σ record_count`. Empty
-    /// for MOR UPDATE / plain DELETE, keeping those paths byte-identical.
-    appended_files: Vec<WrittenFile>,
-    commit_uuid: Uuid,
-    file_io: FileIO,
-    schema: SchemaRef,
-    schema_id: i32,
-    row_lineage_first_row_id: u64,
-    abort_handle: Arc<AbortLog>,
-    manifest_paths_out: Arc<Mutex<Vec<String>>>,
-    target_ref: String,
-    snapshot_properties: BTreeMap<String, String>,
-}
-
-#[async_trait]
-impl TransactionAction for RowDeltaDvFromFilesTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> crate::iceberg::Result<ActionCommit> {
-        let m = table.metadata();
-        let format_version = m.format_version();
-        if format_version != FormatVersion::V3 {
-            return Err(crate::iceberg::Error::new(
-                crate::iceberg::ErrorKind::DataInvalid,
-                "RowDeltaDvFromFilesCommit requires an Iceberg v3 table",
+        use crate::commit::model::{EntryIdentity, SeqField};
+        if view.metadata().format_version() != FormatVersion::V3 {
+            return Err(to_iceberg_unexpected(
+                "Deletion vectors require an Iceberg V3 table".into(),
             ));
         }
-        let new_seq = m.last_sequence_number() + 1;
-        let new_snapshot_id = generate_snapshot_id();
-        let target_ref = &self.target_ref;
-        let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
-        let metadata_dir = metadata_dir(table);
-
-        // FRESH base for net-new appended INSERT rows. `row_lineage_first_row_id`
-        // is the REUSE floor (the MOR-UPDATE replacement / DV path never advances
-        // it). When appended INSERT rows are present they draw fresh ids starting
-        // at the table's effective next-row-id; otherwise this equals the reuse
-        // floor so the row-range shape `(floor, 0)` is unchanged.
-        let appended_rows = self.appended_files.iter().try_fold(0u64, |sum, f| {
-            sum.checked_add(f.record_count)
-                .ok_or_else(|| to_iceberg_unexpected("appended row count overflow".to_string()))
-        })?;
-        let has_appended = !self.appended_files.is_empty();
-        let appended_first_row_id = if has_appended {
-            effective_next_row_id(m).map_err(to_iceberg_unexpected)?
-        } else {
-            self.row_lineage_first_row_id
-        };
-
-        let touched_files = self
-            .written_dvs
-            .iter()
-            .map(|dv| dv.referenced_data_file.clone())
-            .collect::<HashSet<_>>();
-        let index =
-            build_snapshot_index_metadata_only(table, &self.file_io, &touched_files, target_ref)
-                .await
-                .map_err(to_iceberg_unexpected)?;
-
-        for referenced in &touched_files {
-            if !index.data_files.contains_key(referenced) {
+        if intent.changes().added.is_empty() {
+            return Ok(crate::commit::staging::PreparedChange {
+                updates: vec![],
+                requirements: vec![],
+            });
+        }
+        let index = RowLiveIndex::load(view).await?;
+        let mut data = Vec::new();
+        let mut dvs = Vec::new();
+        let mut identities = HashSet::new();
+        for added in &intent.changes().added {
+            if added.data_sequence() != SeqField::Inherit {
+                return Err(to_iceberg_unexpected(
+                    "MoR additions must inherit their actual commit sequence".into(),
+                ));
+            }
+            let identity = EntryIdentity::try_from(added.file())?;
+            if !identities.insert(identity.clone()) || index.live.contains_key(&identity) {
                 return Err(to_iceberg_unexpected(format!(
-                    "row-lineage DELETE referenced data file `{referenced}` is not present in the current snapshot"
+                    "Duplicate or already-live MoR addition {identity:?}"
                 )));
             }
+            match identity {
+                EntryIdentity::DataFile { .. } => {
+                    if added.file().first_row_id().is_some() {
+                        return Err(to_iceberg_unexpected("MoR output can contain new rows and must leave first-row-id unassigned".into()));
+                    }
+                    data.push(added.clone());
+                }
+                EntryIdentity::DeletionVector {
+                    referenced_data_file,
+                    ..
+                } => {
+                    let source = index
+                        .live
+                        .get(&EntryIdentity::DataFile {
+                            path: referenced_data_file.clone(),
+                        })
+                        .ok_or_else(|| {
+                            to_iceberg_unexpected(format!(
+                                "Deletion vector references absent data file {referenced_data_file}"
+                            ))
+                        })?;
+                    if added.file().partition() != source.file.partition()
+                        || added.partition_spec_id() != source.frozen.facts().partition_spec_id
+                    {
+                        return Err(to_iceberg_unexpected(
+                            "Deletion-vector partition does not match referenced data file".into(),
+                        ));
+                    }
+                    dvs.push(added.clone());
+                }
+                _ => {
+                    return Err(to_iceberg_unexpected(
+                        "MoR row-lineage output requires Data or Puffin deletion vectors".into(),
+                    ));
+                }
+            }
         }
-
-        // Carried verbatim. Base data manifests written by this engine carry a `first_row_id`;
-        // a foreign/pre-v3 manifest with `first_row_id == None` AND rows > 0 would be treated as
-        // an unmarked advancer and trip the post-write next_row_id assertion below — that
-        // fail-fast is intentional (no silent row-lineage corruption), not a bug.
-        let mut new_manifests = index.untouched_manifests;
-        for (idx, (spec_id, files)) in
-            group_live_files_by_partition_spec(index.touched_delete_existing)
-                .into_iter()
-                .enumerate()
-        {
-            let path = format!(
-                "{metadata_dir}/{}-row-delta-dv-existing-{idx}.avro",
-                self.commit_uuid,
-            );
-            self.abort_handle.record_manifest(path.clone());
-            self.manifest_paths_out
-                .lock()
-                .expect("manifest_paths_out poisoned")
-                .push(path.clone());
-            let mf = write_existing_delete_manifest(
-                &self.file_io,
-                &path,
-                &files,
-                partition_spec_by_id(m, spec_id)?,
-                self.schema.clone(),
-                new_snapshot_id,
-            )
-            .await
-            .map_err(to_iceberg_unexpected)?;
-            new_manifests.push(mf);
-        }
-
-        for (idx, (spec_id, dvs)) in
-            group_written_dvs_by_partition_spec(&self.written_dvs, &index.data_files)
-                .map_err(to_iceberg_unexpected)?
-                .into_iter()
-                .enumerate()
-        {
-            let added_path = format!(
-                "{metadata_dir}/{}-row-delta-dv-added-{idx}.avro",
-                self.commit_uuid
-            );
-            self.abort_handle.record_manifest(added_path.clone());
-            self.manifest_paths_out
-                .lock()
-                .expect("manifest_paths_out poisoned")
-                .push(added_path.clone());
-            let added = write_added_dv_manifest(
-                &self.file_io,
-                &added_path,
-                &dvs,
-                &index.data_files,
-                partition_spec_by_id(m, spec_id)?,
-                self.schema.clone(),
-                new_seq,
-                new_snapshot_id,
-            )
-            .await
-            .map_err(to_iceberg_unexpected)?;
-            new_manifests.push(added);
-        }
-
-        if !self.written.is_empty() {
-            let data_path = format!(
-                "{metadata_dir}/{}-row-delta-update-data-0.avro",
-                self.commit_uuid
-            );
-            self.abort_handle.record_manifest(data_path.clone());
-            self.manifest_paths_out
-                .lock()
-                .expect("manifest_paths_out poisoned")
-                .push(data_path.clone());
-            let data_manifest = super::overwrite::write_added_data_manifest(
-                &self.file_io,
-                &data_path,
-                &self.written,
-                m.default_partition_spec().clone(),
-                self.schema.clone(),
-                new_seq,
-                new_snapshot_id,
-                format_version,
-            )
-            .await
-            .map_err(to_iceberg_unexpected)?;
-            // The replacement data files reuse the matched rows' `_row_id`s
-            // (stored in the row-lineage columns). Mark the manifest as
-            // already-assigned so the v3 manifest-list writer does NOT
-            // allocate fresh row IDs for them.
-            new_manifests.push(mark_replacement_manifest_row_id_assigned(
-                data_manifest,
-                self.row_lineage_first_row_id,
+        let touched = dvs
+            .iter()
+            .map(|a| a.file().referenced_data_file().expect("validated DV"))
+            .collect::<HashSet<_>>();
+        let replaced = touched
+            .iter()
+            .filter_map(|p| index.dvs_by_data.get(p).cloned())
+            .collect::<HashSet<_>>();
+        let frozen_removed = intent
+            .changes()
+            .removed
+            .iter()
+            .map(|e| e.identity().clone())
+            .collect::<HashSet<_>>();
+        if frozen_removed.len() != intent.changes().removed.len() || frozen_removed != replaced {
+            return Err(to_iceberg_unexpected(
+                "MoR removed DV identities do not match the exact touched live set".into(),
             ));
         }
-
-        // Net-new appended INSERT data (folded MERGE not-matched branch). Unlike
-        // the reuse `written` block above, this manifest is left UNMARKED so the
-        // v3 manifest-list writer assigns it `first_row_id = appended_first_row_id`
-        // and advances `next_row_id` by `Σ appended record_count` — mirroring
-        // `overwrite.rs` / `fast_append.rs`. It is pushed LAST so the preceding
-        // marked data manifest and delete manifests leave the writer's counter at
-        // `appended_first_row_id` when this manifest is assigned.
-        if has_appended {
-            let appended_path = format!(
-                "{metadata_dir}/{}-row-delta-appended-data-0.avro",
-                self.commit_uuid
-            );
-            self.abort_handle.record_manifest(appended_path.clone());
-            self.manifest_paths_out
-                .lock()
-                .expect("manifest_paths_out poisoned")
-                .push(appended_path.clone());
-            let appended_manifest = super::overwrite::write_added_data_manifest(
-                &self.file_io,
-                &appended_path,
-                &self.appended_files,
-                m.default_partition_spec().clone(),
-                self.schema.clone(),
-                new_seq,
-                new_snapshot_id,
-                format_version,
-            )
-            .await
-            .map_err(to_iceberg_unexpected)?;
-            new_manifests.push(appended_manifest);
-        }
-
-        let manifest_list_path = format!(
-            "{metadata_dir}/snap-{}-{}.avro",
-            new_snapshot_id, self.commit_uuid
-        );
-        self.abort_handle
-            .record_manifest(manifest_list_path.clone());
-        self.manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .push(manifest_list_path.clone());
-        // The writer starts at `appended_first_row_id`. The marked reuse data
-        // manifest and the delete manifests are `(Some, Some)` / Deletes and
-        // never move the counter; only the unmarked appended manifest (if any)
-        // draws fresh ids and advances it. With no appended files this equals
-        // `row_lineage_first_row_id`, so the MOR-UPDATE / DELETE path is
-        // byte-identical (final next-row-id == floor, row-range `(floor, 0)`).
-        debug_assert_single_unmarked_row_bearing_data_manifest(&new_manifests, has_appended);
-        let manifest_list_next_row_id = write_manifest_list(
-            &self.file_io,
-            &manifest_list_path,
-            new_manifests,
-            new_snapshot_id,
-            parent_snapshot_id,
-            new_seq,
-            format_version,
-            Some(appended_first_row_id),
-        )
-        .await
-        .map_err(to_iceberg_unexpected)?;
-        let expected_next_row_id = appended_first_row_id.checked_add(appended_rows).ok_or_else(|| {
-            to_iceberg_unexpected(format!(
-                "Row ID overflow computing row-delta row lineage range: first_row_id={appended_first_row_id}, appended_rows={appended_rows}"
-            ))
-        })?;
-        if manifest_list_next_row_id != Some(expected_next_row_id) {
-            return Err(to_iceberg_unexpected(format!(
-                "row-lineage row-delta row lineage mismatch: expected next-row-id {expected_next_row_id}, got {manifest_list_next_row_id:?}"
-            )));
-        }
-
-        let added_position_deletes = self.written_dvs.iter().try_fold(0u64, |sum, dv| {
-            sum.checked_add(dv.cardinality)
-                .ok_or_else(|| to_iceberg_unexpected("DV cardinality overflow".to_string()))
-        })?;
-        let newly_deleted_records = added_position_deletes
-            .checked_sub(index.replaced_delete_records)
-            .ok_or_else(|| {
-                to_iceberg_unexpected(format!(
-                    "DV delete summary underflow: added_position_deletes={added_position_deletes}, replaced_position_deletes={}",
-                    index.replaced_delete_records
-                ))
-            })?;
-        // Summary `added-*` / `total-records` must count BOTH reuse replacement
-        // rows and net-new appended INSERT rows. When `appended_files` is empty
-        // this borrows `self.written` unchanged, keeping the MOR-UPDATE / DELETE
-        // summary byte-identical.
-        let all_added_data: std::borrow::Cow<'_, [WrittenFile]> = if has_appended {
-            let mut v = self.written.clone();
-            v.extend(self.appended_files.iter().cloned());
-            std::borrow::Cow::Owned(v)
-        } else {
-            std::borrow::Cow::Borrowed(&self.written)
-        };
-        let added_data_records = all_added_data.iter().try_fold(0u64, |sum, file| {
-            sum.checked_add(file.record_count).ok_or_else(|| {
-                to_iceberg_unexpected("DV added data record count overflow".to_string())
-            })
-        })?;
-        let total_records = dv_total_records(
-            snapshot_total_records(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?,
-            newly_deleted_records,
-            added_data_records,
-        )
-        .map_err(to_iceberg_unexpected)?;
-
-        let mut dv_props = dv_summary(
-            &self.written_dvs,
-            &all_added_data,
-            total_records,
-            newly_deleted_records,
-            index.replaced_delete_files,
-            index.replaced_delete_records,
-        )
-        .map_err(to_iceberg_unexpected)?;
-        if index.replaced_delete_files_size > 0 {
-            dv_props.insert(
-                "removed-files-size".to_string(),
-                index.replaced_delete_files_size.to_string(),
-            );
-        }
-        let parent_summary =
-            snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
-        let summary_props = merge_snapshot_summary_properties(
-            finalize_snapshot_summary(dv_props, parent_summary, false),
-            &self.snapshot_properties,
-            m.uuid(),
-            new_snapshot_id,
-        )
-        .map_err(to_iceberg_unexpected)?;
-        let snapshot = Snapshot::builder()
-            .with_snapshot_id(new_snapshot_id)
-            .with_parent_snapshot_id(parent_snapshot_id)
-            .with_sequence_number(new_seq)
-            .with_timestamp_ms(now_ms())
-            .with_manifest_list(manifest_list_path)
-            .with_summary(Summary {
-                operation: Operation::Delete,
-                additional_properties: summary_props,
-            })
-            .with_schema_id(self.schema_id)
-            // Reuse rows (DV deletes + MOR-UPDATE replacements) contribute 0;
-            // only fresh appended INSERT rows extend the row-range.
-            // `appended_rows == 0` for MOR UPDATE / DELETE, preserving the prior
-            // `(first_row_id, 0)` shape.
-            .with_row_range(appended_first_row_id, appended_rows)
-            .build();
-
-        Ok(ActionCommit::new(
-            vec![
-                TableUpdate::AddSnapshot { snapshot },
-                TableUpdate::SetSnapshotRef {
-                    ref_name: target_ref.clone(),
-                    reference: SnapshotReference {
-                        snapshot_id: new_snapshot_id,
-                        retention: SnapshotRetention::Branch {
-                            min_snapshots_to_keep: None,
-                            max_snapshot_age_ms: None,
-                            max_ref_age_ms: None,
-                        },
-                    },
-                },
-            ],
-            vec![
-                TableRequirement::CurrentSchemaIdMatch {
-                    current_schema_id: m.current_schema_id(),
-                },
-                TableRequirement::DefaultSpecIdMatch {
-                    default_spec_id: m.default_partition_spec_id(),
-                },
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: target_ref.clone(),
-                    snapshot_id: parent_snapshot_id,
-                },
-            ],
-        ))
-    }
-}
-
-pub(super) fn dv_descriptor_from_written(file: &WrittenFile) -> Result<WrittenDvFile, String> {
-    if file.format != DataFileFormat::Puffin {
-        return Err(format!(
-            "RowDeltaDvFromFilesCommit expected Puffin DV file {}, got format {:?}",
-            file.path, file.format
-        ));
-    }
-    if file.content != DataContentType::PositionDeletes {
-        return Err(format!(
-            "RowDeltaDvFromFilesCommit expected PositionDeletes content for {}, got {:?}",
-            file.path, file.content
-        ));
-    }
-    let referenced_data_file = file
-        .referenced_data_file
-        .as_ref()
-        .filter(|path| !path.is_empty())
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "RowDeltaDvFromFilesCommit Puffin DV {} missing referenced_data_file",
-                file.path
-            )
-        })?;
-    let content_offset =
-        require_non_negative_i64(file.content_offset, "content_offset", &file.path)?;
-    let content_size_in_bytes = require_positive_i64(
-        file.content_size_in_bytes,
-        "content_size_in_bytes",
-        &file.path,
-    )?;
-    let cardinality = file.cardinality.ok_or_else(|| {
-        format!(
-            "RowDeltaDvFromFilesCommit Puffin DV {} missing cardinality",
-            file.path
-        )
-    })?;
-    if file.record_count != cardinality {
-        return Err(format!(
-            "RowDeltaDvFromFilesCommit Puffin DV {} record_count {} does not match cardinality {}",
-            file.path, file.record_count, cardinality
-        ));
-    }
-    if file.file_size_in_bytes == 0 {
-        return Err(format!(
-            "RowDeltaDvFromFilesCommit Puffin DV {} missing file_size_in_bytes",
-            file.path
-        ));
-    }
-    validate_content_range(
-        content_offset,
-        content_size_in_bytes,
-        file.file_size_in_bytes,
-        &file.path,
-    )?;
-
-    Ok(WrittenDvFile {
-        path: file.path.clone(),
-        referenced_data_file,
-        cardinality,
-        content_offset,
-        content_size_in_bytes,
-        file_size_in_bytes: file.file_size_in_bytes,
-    })
-}
-
-fn require_non_negative_i64(value: Option<i64>, field: &str, path: &str) -> Result<i64, String> {
-    match value {
-        Some(value) if value >= 0 => Ok(value),
-        Some(value) => Err(format!(
-            "RowDeltaDvFromFilesCommit Puffin DV {path} {field} must be non-negative, got {value}"
-        )),
-        None => Err(format!(
-            "RowDeltaDvFromFilesCommit Puffin DV {path} missing {field}"
-        )),
-    }
-}
-
-fn require_positive_i64(value: Option<i64>, field: &str, path: &str) -> Result<i64, String> {
-    match value {
-        Some(value) if value > 0 => Ok(value),
-        Some(value) => Err(format!(
-            "RowDeltaDvFromFilesCommit Puffin DV {path} {field} must be positive, got {value}"
-        )),
-        None => Err(format!(
-            "RowDeltaDvFromFilesCommit Puffin DV {path} missing {field}"
-        )),
-    }
-}
-
-fn validate_content_range(
-    content_offset: i64,
-    content_size_in_bytes: i64,
-    file_size_in_bytes: u64,
-    path: &str,
-) -> Result<(), String> {
-    let content_end = content_offset
-        .checked_add(content_size_in_bytes)
-        .ok_or_else(|| {
-            format!(
-                "RowDeltaDvFromFilesCommit Puffin DV {path} content range overflows i64: offset={content_offset}, size={content_size_in_bytes}"
-            )
-        })?;
-    let content_end = u64::try_from(content_end).map_err(|_| {
-        format!(
-            "RowDeltaDvFromFilesCommit Puffin DV {path} content range must be non-negative, got end={content_end}"
-        )
-    })?;
-    if content_end > file_size_in_bytes {
-        return Err(format!(
-            "RowDeltaDvFromFilesCommit Puffin DV {path} content range offset={content_offset}, size={content_size_in_bytes} exceeds file_size_in_bytes={file_size_in_bytes}"
-        ));
-    }
-    Ok(())
-}
-
-async fn coalesce_written_dvs_by_referenced_file(
-    file_io: &FileIO,
-    table_location: &str,
-    commit_uuid: Uuid,
-    dvs: Vec<WrittenDvFile>,
-    abort_handle: &AbortLog,
-) -> Result<(Vec<WrittenDvFile>, Vec<String>), String> {
-    let mut by_referenced: BTreeMap<String, Vec<WrittenDvFile>> = BTreeMap::new();
-    for dv in dvs {
-        by_referenced
-            .entry(dv.referenced_data_file.clone())
-            .or_default()
-            .push(dv);
-    }
-
-    let mut coalesced = Vec::with_capacity(by_referenced.len());
-    let mut superseded_paths = Vec::new();
-    for (idx, (referenced, group)) in by_referenced.into_iter().enumerate() {
-        if group.len() == 1 {
-            coalesced.push(group.into_iter().next().expect("one DV"));
-            continue;
-        }
-
-        let mut merged = DeletionVector::new();
-        for dv in &group {
-            let existing = read_deletion_vector_puffin(
-                file_io,
-                &dv.path,
-                dv.content_offset,
-                dv.content_size_in_bytes,
-            )
-            .await
-            .map_err(|e| {
-                format!(
-                    "RowDeltaDvFromFilesCommit read BE-written Puffin DV {} failed: {e}",
-                    dv.path
-                )
-            })?;
-            merged.merge(&existing);
-        }
-
-        let path = format!(
-            "{table_location}/data/_staging/{commit_uuid}/dv-from-files-merge-{idx:08x}.puffin"
-        );
-        abort_handle.record_data_file(path.clone());
-        let written = write_single_deletion_vector_puffin(file_io, &path, &referenced, &merged)
-            .await
-            .map_err(|e| {
-                format!("RowDeltaDvFromFilesCommit write coalesced Puffin DV {path} failed: {e}")
-            })?;
-        coalesced.push(WrittenDvFile::from(written));
-        superseded_paths.extend(group.into_iter().map(|dv| dv.path));
-    }
-
-    Ok((coalesced, superseded_paths))
-}
-
-async fn cleanup_superseded_writer_dvs(file_io: &FileIO, paths: Vec<String>) {
-    for path in paths {
-        if let Err(err) = file_io.delete(&path).await {
-            tracing::warn!(
-                path = %path,
-                error = %err,
-                "failed to delete superseded BE-written Puffin DV after coalesced commit"
-            );
-        }
-    }
-}
-
-/// Partition BE-written files into Puffin DV descriptors and replacement data
-/// files. A MOR UPDATE commits both in one snapshot: the updated rows arrive as
-/// `(Data, *)` files and the old-version deletes arrive as `(PositionDeletes,
-/// Puffin)` DV files. Any other combination — notably a Parquet
-/// position-delete — is a contract violation and is rejected.
-fn partition_written_for_dv_from_files(
-    written: Vec<WrittenFile>,
-) -> Result<(Vec<WrittenDvFile>, Vec<WrittenFile>), String> {
-    let mut dvs = Vec::new();
-    let mut data = Vec::new();
-    for file in written {
-        match (file.content, file.format) {
-            (DataContentType::PositionDeletes, DataFileFormat::Puffin) => {
-                dvs.push(dv_descriptor_from_written(&file)?);
-            }
-            (DataContentType::Data, _) => {
-                data.push(file);
-            }
-            (content, format) => {
-                return Err(format!(
-                    "RowDeltaDvFromFilesCommit received unsupported written file {} with content {:?} and format {:?}; expected Puffin PositionDeletes or Data",
-                    file.path, content, format
+        for frozen in &intent.changes().removed {
+            if index
+                .live
+                .get(frozen.identity())
+                .is_none_or(|entry| entry.frozen != *frozen)
+            {
+                return Err(to_iceberg_unexpected(
+                    "Removed deletion vector no longer matches its frozen source facts".into(),
                 ));
             }
         }
+        let dvs = coalesce_intent_dvs(view, &index, dvs).await?;
+        let new_dv_records = dvs.iter().try_fold(0u64, |sum, a| {
+            sum.checked_add(a.file().record_count())
+                .ok_or_else(|| to_iceberg_unexpected("DV cardinality overflow".into()))
+        })?;
+        let removed_records = replaced.iter().try_fold(0u64, |sum, id| {
+            sum.checked_add(index.live[id].file.record_count())
+                .ok_or_else(|| to_iceberg_unexpected("Removed DV cardinality overflow".into()))
+        })?;
+        let newly_deleted = new_dv_records.checked_sub(removed_records).ok_or_else(|| {
+            to_iceberg_unexpected(
+                "Replacement deletion vector lost source deleted positions".into(),
+            )
+        })?;
+        let data_records = data.iter().try_fold(0u64, |sum, a| {
+            sum.checked_add(a.file().record_count())
+                .ok_or_else(|| to_iceberg_unexpected("MoR data count overflow".into()))
+        })?;
+        let parent = target_ref_snapshot_id(view.metadata(), view.target_ref());
+        let total = dv_total_records(
+            snapshot_total_records(view.metadata(), parent).map_err(to_iceberg_unexpected)?,
+            newly_deleted,
+            data_records,
+        )
+        .map_err(to_iceberg_unexpected)?;
+        let mut summary = std::collections::HashMap::new();
+        if !dvs.is_empty() {
+            summary.insert("added-delete-files".into(), dvs.len().to_string());
+            summary.insert("added-position-delete-files".into(), dvs.len().to_string());
+            summary.insert("added-position-deletes".into(), new_dv_records.to_string());
+            summary.insert("deleted-records".into(), newly_deleted.to_string());
+        }
+        if !data.is_empty() {
+            summary.insert("added-data-files".into(), data.len().to_string());
+            summary.insert("added-records".into(), data_records.to_string());
+        }
+        if !replaced.is_empty() {
+            summary.insert("removed-delete-files".into(), replaced.len().to_string());
+            summary.insert(
+                "removed-position-delete-files".into(),
+                replaced.len().to_string(),
+            );
+            summary.insert(
+                "removed-position-deletes".into(),
+                removed_records.to_string(),
+            );
+            let removed_size = replaced.iter().try_fold(0u64, |sum, id| {
+                sum.checked_add(logical_file_size(&index.live[id].file)?)
+                    .ok_or_else(|| to_iceberg_unexpected("Removed DV size overflow".into()))
+            })?;
+            summary.insert("removed-files-size".into(), removed_size.to_string());
+        }
+        let added_size = dvs.iter().chain(&data).try_fold(0u64, |sum, a| {
+            sum.checked_add(logical_file_size(a.file())?)
+                .ok_or_else(|| to_iceberg_unexpected("MoR added size overflow".into()))
+        })?;
+        summary.insert("added-files-size".into(), added_size.to_string());
+        if let Some(total) = total {
+            summary.insert("total-records".into(), total.to_string());
+        }
+        let snapshot_id = crate::commit::staging::new_snapshot_id(view.metadata());
+        let mut manifests = super::overwrite::write_live_entry_groups(
+            view,
+            snapshot_id,
+            index
+                .live
+                .into_iter()
+                .map(|(identity, live)| (live, replaced.contains(&identity)))
+                .collect(),
+        )
+        .await?;
+        let operation = if data.is_empty() {
+            Operation::Delete
+        } else if dvs.is_empty() {
+            Operation::Append
+        } else {
+            Operation::Overwrite
+        };
+        manifests.extend(
+            write_added_entry_groups(view, snapshot_id, dvs.into_iter().chain(data)).await?,
+        );
+        // The preparer never deletes a superseded BE object: another logical DV
+        // may still use the same physical Puffin. Finalization owns reachability.
+        super::overwrite::prepare_snapshot_change(
+            view,
+            intent,
+            snapshot_id,
+            operation,
+            manifests,
+            summary,
+            false,
+        )
+        .await
     }
-    Ok((dvs, data))
 }
 
-fn mark_replacement_manifest_row_id_assigned(
-    mut manifest: ManifestFile,
-    row_lineage_first_row_id: u64,
-) -> ManifestFile {
-    // MOR UPDATE replacement files carry stored row-lineage columns. The
-    // manifest first-row-id is assigned only to prevent the v3 manifest-list
-    // writer from allocating new row IDs for those replacement rows.
-    manifest.first_row_id = Some(row_lineage_first_row_id);
-    manifest
+async fn coalesce_intent_dvs(
+    view: &crate::commit::staging::StagedView<'_>,
+    index: &super::row_delta_dv_metadata::RowLiveIndex,
+    dvs: Vec<crate::commit::model::AddedContent>,
+) -> crate::iceberg::Result<Vec<crate::commit::model::AddedContent>> {
+    use crate::commit::model::{AddedContent, ArtifactClass, ArtifactKind, EntryIdentity};
+    let mut groups: BTreeMap<String, Vec<AddedContent>> = BTreeMap::new();
+    for added in dvs {
+        groups
+            .entry(added.file().referenced_data_file().expect("validated DV"))
+            .or_default()
+            .push(added);
+    }
+    let mut out = Vec::new();
+    for (referenced, group) in groups {
+        if group.len() == 1 {
+            out.push(group.into_iter().next().expect("one DV"));
+            continue;
+        }
+        let mut merged = DeletionVector::new();
+        for added in group {
+            view.artifacts().check_active()?;
+            let file = added.file();
+            merged.merge(
+                &read_deletion_vector_puffin(
+                    view.artifacts().file_io(),
+                    file.file_path(),
+                    file.content_offset().expect("validated DV"),
+                    file.content_size_in_bytes().expect("validated DV"),
+                )
+                .await
+                .map_err(|e| to_iceberg_unexpected(format!("Read coalesced DV failed: {e}")))?,
+            );
+        }
+        let object = view
+            .artifacts()
+            .allocate(ArtifactClass::Attempt, ArtifactKind::DeletionVector)?;
+        let written = write_single_deletion_vector_puffin(
+            view.artifacts().file_io(),
+            object.path(),
+            &referenced,
+            &merged,
+        )
+        .await
+        .map_err(|e| to_iceberg_unexpected(format!("Write coalesced DV failed: {e}")))?;
+        let source = &index.live[&EntryIdentity::DataFile { path: referenced }];
+        let facts = source.frozen.facts();
+        let live = super::row_delta_dv_metadata::LiveFile {
+            data_file: source.file.clone(),
+            partition_spec_id: facts.partition_spec_id,
+            snapshot_id: facts
+                .added_snapshot_id
+                .ok_or_else(|| to_iceberg_unexpected("Data source has no added snapshot".into()))?,
+            sequence_number: facts.data_sequence.ok_or_else(|| {
+                to_iceberg_unexpected("Data source has no assigned sequence".into())
+            })?,
+            file_sequence_number: facts.file_sequence,
+        };
+        out.push(AddedContent::new_logical_data(
+            super::row_delta_dv_metadata::dv_data_file(&WrittenDvFile::from(written), &live)
+                .map_err(to_iceberg_unexpected)?,
+            facts.partition_spec_id,
+        )?);
+    }
+    Ok(out)
 }

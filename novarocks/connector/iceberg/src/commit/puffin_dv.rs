@@ -451,6 +451,56 @@ fn read_le_u64_from(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+/// Write a DV through the explicit operation or attempt artifact owner.
+pub(crate) async fn write_single_deletion_vector_puffin_allocated(
+    writer: &dyn super::model::ArtifactWriter,
+    class: super::model::ArtifactClass,
+    referenced_data_file: &str,
+    dv: &DeletionVector,
+) -> Result<WrittenPuffinDv> {
+    validate_allocated_dv_class(class)?;
+    writer.check_active()?;
+    let object = writer.allocate(class, super::model::ArtifactKind::DeletionVector)?;
+    let written = write_single_deletion_vector_puffin(
+        writer.file_io(),
+        object.path(),
+        referenced_data_file,
+        dv,
+    )
+    .await?;
+    writer.check_active()?;
+    Ok(written)
+}
+
+pub(crate) async fn write_multi_deletion_vector_puffin_allocated(
+    writer: &dyn super::model::ArtifactWriter,
+    class: super::model::ArtifactClass,
+    inputs: &[DeletionVectorBlobInput],
+) -> Result<Vec<WrittenPuffinDv>> {
+    validate_allocated_dv_class(class)?;
+    ensure!(
+        !inputs.is_empty(),
+        "Allocated DV Puffin requires at least one blob"
+    );
+    writer.check_active()?;
+    let object = writer.allocate(class, super::model::ArtifactKind::DeletionVector)?;
+    let written =
+        write_multi_deletion_vector_puffin(writer.file_io(), object.path(), inputs).await?;
+    writer.check_active()?;
+    Ok(written)
+}
+
+fn validate_allocated_dv_class(class: super::model::ArtifactClass) -> Result<()> {
+    ensure!(
+        matches!(
+            class,
+            super::model::ArtifactClass::Operation | super::model::ArtifactClass::Attempt
+        ),
+        "DV Puffin requires operation or attempt artifact ownership"
+    );
+    Ok(())
+}
+
 pub async fn write_single_deletion_vector_puffin(
     file_io: &crate::iceberg::io::FileIO,
     path: &str,

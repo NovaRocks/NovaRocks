@@ -1551,6 +1551,61 @@ mod scalar_domain_tests {
     }
 
     #[test]
+    fn m07_projection_occurrences_retain_exact_binary_producer_witnesses() {
+        for (sql, expected) in [
+            (
+                "select percentile_hash(cast(1 as double)),to_bitmap(1),hll_hash('x')",
+                vec![
+                    Some(SqlType::Percentile),
+                    Some(SqlType::Bitmap),
+                    Some(SqlType::Hll),
+                ],
+            ),
+            (
+                "select percentile_hash(cast(1 as double)) as p,to_bitmap(1) as b,hll_hash('x') as h",
+                vec![
+                    Some(SqlType::Percentile),
+                    Some(SqlType::Bitmap),
+                    Some(SqlType::Hll),
+                ],
+            ),
+            (
+                "with q as (select percentile_hash(cast(1 as double)) as p) select p,p as again from q",
+                vec![Some(SqlType::Percentile); 2],
+            ),
+            (
+                "select to_bitmap(1) as b,b as again,bitmap_to_binary(b) as raw",
+                vec![Some(SqlType::Bitmap), Some(SqlType::Bitmap), None],
+            ),
+            (
+                "with q as (select percentile_hash(cast(1 as double)) as p) select cast(p as varbinary) as raw,p from q",
+                vec![None, Some(SqlType::Percentile)],
+            ),
+        ] {
+            let (query, _, factory) = super::super::analyze(&query(sql), &Catalog, "db").unwrap();
+            assert_eq!(
+                query
+                    .output_columns
+                    .iter()
+                    .map(|column| factory.borrowed_logical_type(column.column_id).cloned())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{sql}",
+            );
+            // Native V1's selected Binary signatures retain their exact type
+            // contracts; the root occurrence carries the existing source proof.
+            assert!(
+                query
+                    .output_columns
+                    .iter()
+                    .all(|column| column.value_type.logical_type
+                        == novarocks_type_contract::ValueLogicalType::Physical),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn m07_scalar_exact_aggregate_and_window_producers_forward_domains() {
         assert_eq!(
             output_domains(

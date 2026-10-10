@@ -24,7 +24,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
-use crate::iceberg::{Catalog, TableCommit, TableIdent};
+use crate::commit::model::FrozenRequest;
+use crate::iceberg::{Catalog, TableIdent};
 
 use super::transaction::{CatalogCommitDispatch, CommitProof};
 
@@ -77,12 +78,12 @@ impl UpdateTableDispatch {
 impl CatalogCommitDispatch for UpdateTableDispatch {
     async fn dispatch_once(
         &self,
-        staged: Option<TableCommit>,
+        staged: Option<&FrozenRequest>,
     ) -> Result<CommitProof, crate::iceberg::Error> {
         let Some(staged) = staged else {
             return Ok(CommitProof::no_op());
         };
-        if staged.is_empty() {
+        if !staged.has_updates() {
             // Nothing to publish, and nothing was sent. This is a proven no-op
             // rather than a commit, and it must not reach the catalog.
             return Ok(CommitProof::no_op());
@@ -93,8 +94,8 @@ impl CatalogCommitDispatch for UpdateTableDispatch {
                 "staged Iceberg commit target does not match the admitted publication target",
             ));
         }
-        let expected_snapshot_id = staged.updated_ref_snapshot_id(&self.target_ref);
-        let table = self.client.update_table(staged).await?;
+        let expected_snapshot_id = staged.ref_snapshot_after(&self.target_ref);
+        let table = self.client.update_table(staged.into_table_commit()).await?;
         let snapshot_id =
             committed_snapshot_id(table.metadata(), &self.target_ref, expected_snapshot_id)?;
         Ok(CommitProof::applied(snapshot_id).with_table_uuid(table.metadata().uuid().to_string()))
@@ -138,7 +139,7 @@ impl CatalogCommitDispatch for UpdateTableDispatch {
     }
 }
 
-fn committed_snapshot_id(
+pub(crate) fn committed_snapshot_id(
     metadata: &crate::iceberg::spec::TableMetadata,
     target_ref: &str,
     expected_snapshot_id: Option<i64>,
@@ -205,7 +206,7 @@ impl CreateTableDispatch {
 impl CatalogCommitDispatch for CreateTableDispatch {
     async fn dispatch_once(
         &self,
-        _staged: Option<TableCommit>,
+        _staged: Option<&FrozenRequest>,
     ) -> Result<CommitProof, crate::iceberg::Error> {
         let creation = self
             .creation
@@ -295,7 +296,7 @@ impl ConditionalCreateDispatch {
 impl CatalogCommitDispatch for ConditionalCreateDispatch {
     async fn dispatch_once(
         &self,
-        _staged: Option<TableCommit>,
+        _staged: Option<&FrozenRequest>,
     ) -> Result<CommitProof, crate::iceberg::Error> {
         let attempt = self
             .attempt

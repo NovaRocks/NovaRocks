@@ -21,6 +21,7 @@
 //! filesystem so that "missing", "corrupt", and "stale" are genuine I/O
 //! outcomes rather than mocked verdicts.
 
+use crate::commit::model::EntryIdentity;
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
@@ -54,8 +55,8 @@ use parquet::arrow::ArrowWriter;
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::CommitOpKind;
 use crate::commit::write_stack::control::{
-    eager_conflict_backoff, release_session_state, session_freezes_old_deletes,
-    session_plan_from_targets, settle_empty_write_without_commit, validate_prepared_set,
+    release_session_state, session_freezes_old_deletes, session_plan_from_targets,
+    settle_empty_write_without_commit, validate_prepared_set,
 };
 use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
@@ -95,30 +96,6 @@ fn request_context() -> ConnectorRequestContext {
         1024 * 1024,
     )
     .expect("request context")
-}
-
-#[test]
-fn conflict_backoff_observes_cancellation_before_another_attempt() {
-    let (_executor, runtime) = unreachable_rest_runtime();
-    let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
-    let context = ConnectorRequestContext::try_new(
-        Instant::now() + Duration::from_secs(1),
-        cancellation.view(),
-        64 * 1024,
-        1024 * 1024,
-    )
-    .expect("context");
-    let cancel = Arc::clone(&cancellation);
-    let worker = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(12));
-        cancel.request_stop();
-    });
-    let started = Instant::now();
-    let error =
-        eager_conflict_backoff(runtime.as_ref(), &context, 2).expect_err("cancelled backoff");
-    worker.join().expect("cancel thread");
-    assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
-    assert!(started.elapsed() < Duration::from_millis(80));
 }
 
 fn descriptor(catalog: &str) -> ConnectorInstanceDescriptor {
@@ -213,7 +190,14 @@ fn multiple_old_delete_files_for_one_data_file_are_read_and_merged() {
     );
     assert_eq!(
         merged.merged_references(),
-        &[location(&first), location(&second)],
+        &[
+            EntryIdentity::DeleteFile {
+                path: location(&first)
+            },
+            EntryIdentity::DeleteFile {
+                path: location(&second)
+            }
+        ],
         "the artifact records exactly which references it superseded"
     );
 }
@@ -411,7 +395,9 @@ fn every_fragment_kind_round_trips_through_its_own_adapter() {
             sample_partition(),
             sample_metrics(3, 512),
             "s3://b/data/f.parquet".to_string(),
-            vec!["s3://b/data/old.parquet".to_string()],
+            vec![EntryIdentity::DeleteFile {
+                path: "s3://b/data/old.parquet".to_string(),
+            }],
         )
         .expect("position delete artifact"),
     );
@@ -510,7 +496,7 @@ fn prepared(
     ConnectorPreparedWriteSet::try_new(0, wrapped, expected).expect("prepared set")
 }
 
-fn dv_fragment(path: &str, referenced: &str, merged: Vec<String>) -> IcebergCommitFragment {
+fn dv_fragment(path: &str, referenced: &str, merged: Vec<EntryIdentity>) -> IcebergCommitFragment {
     IcebergCommitFragment::deletion_vector(
         crate::commit::write_stack::domain::IcebergDeletionVectorArtifact::try_new(
             path.to_string(),
@@ -563,7 +549,9 @@ fn a_valid_prepared_set_passes_every_sealed_check() {
                 dv_fragment(
                     "s3://b/wh/db/t/data/v.puffin",
                     "s3://b/wh/db/t/data/a.parquet",
-                    vec!["s3://b/wh/db/t/data/old.parquet".to_string()],
+                    vec![EntryIdentity::DeleteFile {
+                        path: "s3://b/wh/db/t/data/old.parquet".to_string(),
+                    }],
                 ),
             ),
         ],
@@ -678,12 +666,69 @@ fn a_repeated_staged_path_is_rejected() {
 }
 
 #[test]
+fn a_prepared_set_accepts_distinct_vectors_in_the_same_puffin_object() {
+    let paths = [
+        "s3://b/wh/db/t/data/a.parquet",
+        "s3://b/wh/db/t/data/b.parquet",
+    ];
+    let (handle, _) = plan_write_session(
+        IcebergWriteSessionId::new(),
+        IcebergWriteSessionPlanInput {
+            flavor: IcebergWriteFlavor::RowMutationDeletionVector,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            table: table_facts(),
+            base_version_digest: None,
+            staged_metadata: None,
+            data: data_branch_plan(),
+            deletes: vec![delete_branch_plan(
+                IcebergWriteBranch::DeletionVector,
+                paths
+                    .iter()
+                    .map(|path| merge_target(path, 100, Vec::new()))
+                    .collect(),
+            )],
+        },
+    )
+    .unwrap();
+    let adapter = adapter("unit", 1);
+    let fragments = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            (
+                ordinal(1),
+                IcebergCommitFragment::deletion_vector(
+                    dv_artifact(
+                        "s3://b/wh/db/t/data/shared.puffin",
+                        path,
+                        3,
+                        1024,
+                        4 + index as i64 * 128,
+                        64,
+                    )
+                    .unwrap(),
+                ),
+            )
+        })
+        .collect();
+    let set = prepared(&adapter, fragments, &handle.expected_targets());
+    let validated = validate_prepared_set(&handle, &adapter, &set).unwrap();
+    assert_eq!(validated.len(), 2);
+    let first = adapter.commit_fragment(&set.fragments()[0].1).unwrap();
+    let second = adapter.commit_fragment(&set.fragments()[1].1).unwrap();
+    assert_eq!(first.path(), second.path());
+    assert_ne!(first.entry_identity(), second.entry_identity());
+}
+
+#[test]
 fn a_delete_artifact_must_supersede_exactly_the_frozen_references() {
     let (handle, adapter) = dv_session();
     let frozen = handle.frozen_old_references();
     assert_eq!(
         frozen[&ordinal(1)]["s3://b/wh/db/t/data/a.parquet"],
-        vec!["s3://b/wh/db/t/data/old.parquet".to_string()]
+        vec![EntryIdentity::DeleteFile {
+            path: "s3://b/wh/db/t/data/old.parquet".to_string()
+        }]
     );
 
     let matching = prepared(
@@ -693,7 +738,9 @@ fn a_delete_artifact_must_supersede_exactly_the_frozen_references() {
             dv_fragment(
                 "s3://b/wh/db/t/data/v.puffin",
                 "s3://b/wh/db/t/data/a.parquet",
-                vec!["s3://b/wh/db/t/data/old.parquet".to_string()],
+                vec![EntryIdentity::DeleteFile {
+                    path: "s3://b/wh/db/t/data/old.parquet".to_string(),
+                }],
             ),
         )],
         &handle.expected_targets(),
@@ -763,7 +810,9 @@ fn a_session_dispatches_at_most_one_snapshot_commit() {
     assert!(second.message().contains("already has a commit in flight"));
 
     handle
-        .settle(IcebergWriteSessionState::KnownCommitted { snapshot_id: 42 })
+        .settle(IcebergWriteSessionState::KnownCommitted {
+            snapshot_id: Some(42),
+        })
         .expect("settle committed");
     assert!(
         handle.begin_commit().is_err(),
@@ -774,6 +823,20 @@ fn a_session_dispatches_at_most_one_snapshot_commit() {
 #[test]
 fn a_commit_unknown_session_stays_unknown_through_release() {
     let (handle, _adapter) = dv_session();
+    let checked_evidence = novarocks_spi::connector::ExternalMutationEvidence::try_new(
+        crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
+        descriptor("unit"),
+        ProviderBindingEpoch::from_bytes([9; 16]),
+        novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+            handle.session_id().to_bytes(),
+        ),
+        crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_OPERATION_KIND,
+        bytes::Bytes::from_static(b"complete checked ledger with retained attempt objects"),
+    )
+    .unwrap();
+    handle
+        .retain_recovery_evidence(checked_evidence.clone())
+        .unwrap();
     handle.begin_commit().expect("commit attempt");
     handle
         .settle(IcebergWriteSessionState::CommitUnknown {
@@ -790,6 +853,10 @@ fn a_commit_unknown_session_stays_unknown_through_release() {
     .expect("release");
     match outcome {
         ConnectorWriteAbortOutcome::CommitUnknown { failure, evidence } => {
+            assert_eq!(
+                evidence, checked_evidence,
+                "release must reuse exact preflight bytes"
+            );
             assert!(failure.message().contains("connection reset by peer"));
             assert!(failure.message().contains("staged files remain at"));
             assert_eq!(
@@ -810,7 +877,9 @@ fn a_known_committed_session_cannot_be_aborted_into_uncommitted() {
     let (handle, _adapter) = dv_session();
     handle.begin_commit().expect("commit attempt");
     handle
-        .settle(IcebergWriteSessionState::KnownCommitted { snapshot_id: 7 })
+        .settle(IcebergWriteSessionState::KnownCommitted {
+            snapshot_id: Some(7),
+        })
         .expect("settle committed");
     let outcome = release_session_state(
         &descriptor("unit"),
@@ -1859,13 +1928,17 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
     // what a writer produced, and a group whose rows were all compacted away
     // produces nothing at all while still having to be retired.
     //
-    // `run_iceberg_commit` refuses `CommitOpKind::SelectedRewrite` outright
+    // The frozen publication runner rejects a selected rewrite without its exact file set
     // when its frozen file set is absent, so before the session carried its
     // frozen groups every rewrite commit failed with "requires its frozen file
     // set". This asserts the session now supplies exactly the union it froze.
     let live_deletes = std::collections::BTreeSet::from([
-        "s3://b/wh/db/t/data/d0.puffin".to_string(),
-        "s3://b/wh/db/t/data/d1.puffin".to_string(),
+        EntryIdentity::DeleteFile {
+            path: "s3://b/wh/db/t/data/d0.parquet".to_string(),
+        },
+        EntryIdentity::DeleteFile {
+            path: "s3://b/wh/db/t/data/d1.parquet".to_string(),
+        },
     ]);
     let groups = data_rewrite_branches(
         crate::distributed_rewrite::plan_data_file_groups(
@@ -1897,8 +1970,12 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
     assert_eq!(
         files.data_paths,
         std::collections::BTreeSet::from([
-            "s3://b/wh/db/t/data/a/f.parquet".to_string(),
-            "s3://b/wh/db/t/data/b/f.parquet".to_string(),
+            EntryIdentity::DataFile {
+                path: "s3://b/wh/db/t/data/a/f.parquet".to_string()
+            },
+            EntryIdentity::DataFile {
+                path: "s3://b/wh/db/t/data/b/f.parquet".to_string()
+            },
         ])
     );
     // Every live delete artifact is retired with the data it applied to: the
@@ -1998,13 +2075,23 @@ fn a_position_delete_rewrite_commits_the_delete_artifacts_it_froze() {
     assert_eq!(
         files.delete_paths,
         std::collections::BTreeSet::from([
-            "s3://b/wh/db/t/data/a/d0.puffin".to_string(),
-            "s3://b/wh/db/t/data/a/d1.puffin".to_string(),
+            crate::distributed_rewrite::delete_entry_identity(&rewrite_deletion_vector(
+                "s3://b/wh/db/t/data/a/d0.puffin",
+                "s3://b/wh/db/t/data/a/f.parquet"
+            ))
+            .unwrap(),
+            crate::distributed_rewrite::delete_entry_identity(&rewrite_deletion_vector(
+                "s3://b/wh/db/t/data/a/d1.puffin",
+                "s3://b/wh/db/t/data/a/f.parquet"
+            ))
+            .unwrap(),
         ])
     );
     assert_eq!(
         files.data_paths,
-        std::collections::BTreeSet::from(["s3://b/wh/db/t/data/a/f.parquet".to_string()])
+        std::collections::BTreeSet::from([EntryIdentity::DataFile {
+            path: "s3://b/wh/db/t/data/a/f.parquet".to_string()
+        }])
     );
 }
 
@@ -2079,7 +2166,9 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
             staged_metadata: None,
             rewrite_inputs: vec![
                 crate::commit::write_stack::domain::IcebergFrozenRewriteBranchInput::try_new(
-                    std::collections::BTreeSet::from(["s3://b/wh/db/t/data/a.parquet".to_string()]),
+                    std::collections::BTreeSet::from([EntryIdentity::DataFile {
+                        path: "s3://b/wh/db/t/data/a.parquet".to_string(),
+                    }]),
                     std::collections::BTreeSet::new(),
                 )
                 .expect("frozen rewrite input"),
@@ -2108,7 +2197,7 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
 #[test]
 fn a_rewrite_is_not_gated_by_the_external_write_fence() {
     // The rewrite is arbitrated by the ordinary Iceberg base-state compare and
-    // swap `dispatch_commit` already performs against the frozen snapshot, so
+    // swap the frozen publication runner already performs against the frozen snapshot, so
     // it must not also take the distributed external write fence. Every other
     // flavor keeps it.
     for flavor in [

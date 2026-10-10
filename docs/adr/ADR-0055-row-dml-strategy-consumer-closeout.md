@@ -5,6 +5,10 @@ domain: [provider-spi, frontend-dml]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0171
+    scope: "Compromise 5: forward written-version prediction; source facts and provider strategy ownership remain effective"
+    link: "ADR-0171-commit-operation-model.md"
 date: 2026-08-11
 provenance:
   - "discussion: 2026-08-11 row-DML physical routing closeout"

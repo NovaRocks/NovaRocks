@@ -353,7 +353,7 @@ impl IcebergWriteSessionControl {
                 table_name,
                 request.target_ref.as_str(),
                 snapshot_id,
-                metadata.last_sequence_number(),
+                source_snapshot_sequence(&metadata, snapshot_id)?,
                 metadata.current_schema_id(),
                 metadata.default_partition_spec_id(),
                 format_version_number(&metadata),
@@ -519,60 +519,10 @@ impl IcebergWriteSessionControl {
                 },
             )?;
             scope.active()?;
-            // COW cleanup preflight owns only table strings and one maximum UUID;
-            // its canonical JSON is a bounded representation of these same facts.
-            // Admission evidence clones two formatted subjects into its DTO,
-            // then serializes that DTO into a geometrically grown byte Vec.
-            // Borrow the exact subjects before any format/clone/encode occurs.
-            let table_ident = add(
-                add(
-                    handle.table().namespace().len() as u64,
-                    handle.table().table_name().len() as u64,
-                )?,
-                1,
-            )?;
-            let staging = add(
-                handle.table().data_location().trim_end_matches('/').len() as u64,
-                ("/_staging/".len() + 36) as u64,
-            )?;
-            let op = match handle.commit_op_kind() {
-                crate::commit::types::CommitOpKind::FastAppend => "FastAppend",
-                crate::commit::types::CommitOpKind::Overwrite => "Overwrite",
-                crate::commit::types::CommitOpKind::RowDelta => "RowDelta",
-                crate::commit::types::CommitOpKind::RowDeltaDv => "RowDeltaDv",
-                crate::commit::types::CommitOpKind::RowDeltaDvFromFiles => "RowDeltaDvFromFiles",
-                crate::commit::types::CommitOpKind::RewriteDataFiles => "RewriteDataFiles",
-                crate::commit::types::CommitOpKind::SelectedRewrite => "SelectedRewrite",
-                crate::commit::types::CommitOpKind::CowUpdate => "CowUpdate",
-                crate::commit::types::CommitOpKind::Truncate => "Truncate",
-                crate::commit::types::CommitOpKind::OverwritePartitions => "OverwritePartitions",
-                crate::commit::types::CommitOpKind::RewriteManifests => "RewriteManifests",
-            };
-            let dto_text = add(
-                add(table_ident, staging)?,
-                add(
-                    handle.table().target_ref().len() as u64,
-                    (op.len() + 36 + 36) as u64,
-                )?,
-            )?;
-            // Empty string slots plus maximum decimal widths describe every
-            // fixed delimiter/key/scalar emitted by this exact COW DTO.
-            const FIXED_JSON: &str = r#"{"version":65535,"session_id":"","table_ident":"","target_ref":"","op_kind":"","base_snapshot_id":-9223372036854775808,"base_sequence_number":-9223372036854775808,"staging_dir":"","manifest_cleanup_token":"","document_manifest_digest":null}"#;
-            let json = add(FIXED_JSON.len() as u64, mul(dto_text, 6)?)?;
-            let formatted = mul(add(table_ident.max(8), staging.max(8))?, 3)?;
-            let string_buffers = add(
-                add(formatted, dto_text)?,
-                add(36, mul((op.len() as u64).max(8), 3)?)?,
-            )?;
-            let evidence = add(
-                add(string_buffers, mul(json.max(128), 3)?)?,
-                (size_of::<crate::commit::service::RecoveryEvidence>()
-                    + size_of::<super::IcebergWriteSessionEvidenceV1>()
-                    + size_of::<novarocks_spi::connector::ExternalMutationEvidence>()
-                    + 3 * size_of::<usize>()) as u64,
-            )?;
-            scope.reserve(evidence)?;
-            self.preflight_evidence_at_admission(&handle)?;
+            // Admission has no frozen attempt or owned-object ledger to encode.
+            // IRU-5 constructs and size-checks the complete recovery envelope
+            // immediately before dispatch, once those actual facts exist.
+            let handle = handle.with_source_metadata(Arc::clone(&read_metadata))?;
             let target_headers = mul(
                 targets.len() as u64,
                 (size_of::<ConnectorWriteTargetPlan>()

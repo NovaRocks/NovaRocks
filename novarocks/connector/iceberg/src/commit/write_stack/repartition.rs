@@ -41,20 +41,30 @@ use novarocks_spi::connector::{
 use crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY;
 use crate::commit::write_stack::domain::{corrupt, invalid};
 
-/// One prepared atomic partition replacement: the exact metadata updates the
-/// single external commit must carry ahead of its snapshot updates, the
-/// prospective metadata every writer and every staged artifact is interpreted
-/// against, and the partitioning the commit will have established.
+/// One prepared atomic replacement: declarative updates for common staging,
+/// exact prospective metadata for writer binding, and committed partitioning.
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergPreparedRepartition {
     metadata_updates: Vec<crate::iceberg::TableUpdate>,
     prospective_metadata: crate::iceberg::spec::TableMetadata,
+    metadata_requirements: Vec<crate::iceberg::TableRequirement>,
     committed: novarocks_spi::connector::ConnectorCommittedPartitioning,
 }
 
 impl IcebergPreparedRepartition {
     pub(crate) fn metadata_updates(&self) -> &[crate::iceberg::TableUpdate] {
         &self.metadata_updates
+    }
+
+    pub(crate) fn metadata_requirements(&self) -> &[crate::iceberg::TableRequirement] {
+        &self.metadata_requirements
+    }
+
+    pub(crate) fn prepared_change(&self) -> crate::commit::staging::PreparedChange {
+        crate::commit::staging::PreparedChange {
+            updates: self.metadata_updates.clone(),
+            requirements: self.metadata_requirements.clone(),
+        }
     }
 
     pub(crate) fn prospective_metadata(&self) -> &crate::iceberg::spec::TableMetadata {
@@ -81,7 +91,7 @@ pub(crate) fn prepare_managed_repartition(
         prepared.prospective_metadata.clone(),
         None,
     )
-    .set_properties(descriptor_properties)
+    .set_properties(descriptor_properties.clone())
     .map_err(|error| invalid(format!("bind managed MV descriptor properties: {error}")))?
     .build()
     .map_err(|error| {
@@ -89,18 +99,12 @@ pub(crate) fn prepare_managed_repartition(
             "finalize managed MV descriptor properties: {error}"
         ))
     })?;
-    if build.changes.len() != 1
-        || !matches!(
-            build.changes[0],
-            crate::iceberg::TableUpdate::SetProperties { .. }
-        )
-    {
-        return Err(invalid(
-            "Iceberg managed partition replacement did not append one SetProperties update",
-        ));
-    }
     prepared.prospective_metadata = build.metadata;
-    prepared.metadata_updates.extend(build.changes);
+    prepared
+        .metadata_updates
+        .push(crate::iceberg::TableUpdate::SetProperties {
+            updates: descriptor_properties,
+        });
     Ok(prepared)
 }
 
@@ -158,9 +162,10 @@ pub(crate) fn preview_managed_repartition(
                 invalid(format!("build Iceberg replacement partition spec: {error}"))
             })?;
     }
+    let requested_spec = builder.build();
     let build =
         crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(metadata.clone(), None)
-            .add_default_partition_spec(builder.build())
+            .add_default_partition_spec(requested_spec.clone())
             .map_err(|error| invalid(format!("bind Iceberg replacement partition spec: {error}")))?
             .build()
             .map_err(|error| {
@@ -168,20 +173,6 @@ pub(crate) fn preview_managed_repartition(
                     "finalize Iceberg replacement partition spec: {error}"
                 ))
             })?;
-    if build.changes.len() != 2
-        || !matches!(
-            build.changes[0],
-            crate::iceberg::TableUpdate::AddSpec { .. }
-        )
-        || !matches!(
-            build.changes[1],
-            crate::iceberg::TableUpdate::SetDefaultSpec { .. }
-        )
-    {
-        return Err(invalid(
-            "Iceberg managed partition replacement did not produce AddSpec then SetDefaultSpec",
-        ));
-    }
     let spec_id = build.metadata.default_partition_spec_id();
     if spec_id == metadata.default_partition_spec_id() {
         return Err(invalid(
@@ -192,23 +183,14 @@ pub(crate) fn preview_managed_repartition(
         .metadata
         .partition_spec_by_id(spec_id)
         .ok_or_else(|| corrupt("Iceberg prospective default partition spec is missing"))?;
-    // `TableMetadataBuilder` assigns the actual field IDs while binding the
-    // prospective spec, but its emitted `AddSpec` update retains the original
-    // unbound fields. That shape is accepted by the in-memory apply path yet
-    // serializes as `field-id: null`, which the REST Catalog rejects. Publish
-    // the same bound spec in the existing atomic TableCommit instead.
-    let mut metadata_updates = build.changes;
-    let crate::iceberg::TableUpdate::AddSpec { spec } = &mut metadata_updates[0] else {
-        return Err(corrupt(
-            "Iceberg managed partition replacement is missing its AddSpec update",
-        ));
-    };
-    *spec = committed_spec.as_ref().clone().into_unbound();
-    if spec.fields().iter().any(|field| field.field_id.is_none()) {
-        return Err(corrupt(
-            "Iceberg managed partition replacement emitted an unassigned partition field ID",
-        ));
-    }
+    // Declarative updates are normalized by the common staging engine. Reusing
+    // a historical spec is valid even when the builder emits only a selector.
+    let metadata_updates = vec![
+        crate::iceberg::TableUpdate::AddSpec {
+            spec: requested_spec,
+        },
+        crate::iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
+    ];
     let committed_fields = committed_spec
         .fields()
         .iter()
@@ -239,6 +221,14 @@ pub(crate) fn preview_managed_repartition(
     Ok(IcebergPreparedRepartition {
         prospective_metadata: build.metadata,
         metadata_updates,
+        metadata_requirements: vec![
+            crate::iceberg::TableRequirement::DefaultSpecIdMatch {
+                default_spec_id: metadata.default_partition_spec_id(),
+            },
+            crate::iceberg::TableRequirement::LastAssignedPartitionIdMatch {
+                last_assigned_partition_id: metadata.last_partition_id(),
+            },
+        ],
         committed,
     })
 }
@@ -468,10 +458,11 @@ mod tests {
         let crate::iceberg::TableUpdate::AddSpec { spec } = &prepared.metadata_updates()[0] else {
             panic!("partition replacement must start with AddSpec");
         };
-        assert!(
-            spec.fields().iter().all(|field| field.field_id.is_some()),
-            "REST Catalog rejects an AddSpec update containing an unassigned field ID"
-        );
+        assert!(spec.fields().iter().all(|field| field.field_id.is_none()));
+        assert!(prepared.metadata_requirements().iter().any(|r| matches!(
+            r,
+            crate::iceberg::TableRequirement::LastAssignedPartitionIdMatch { .. }
+        )));
 
         let new_spec_id = prepared.committed().spec_id();
         assert_ne!(new_spec_id, metadata.default_partition_spec_id());
@@ -561,10 +552,8 @@ mod tests {
     fn a_no_op_replacement_is_refused() {
         // Replaying the table's existing partitioning would change nothing
         // while still claiming a partition transition, so it must not reach the
-        // commit. `TableMetadataBuilder` re-binds the identical spec instead of
-        // adding one, emitting no updates at all, so the structural check is
-        // what refuses here — the `spec_id` no-op check behind it stays as the
-        // second line of defense.
+        // commit. Binding an equivalent spec resolves to the current ID, so
+        // the exact prospective default-spec comparison refuses the no-op.
         let metadata = {
             let base = unpartitioned_metadata();
             let replacement = replacement(prior_observation(&base), identity_on_id());
@@ -580,7 +569,7 @@ mod tests {
         assert!(
             error
                 .message()
-                .contains("did not produce AddSpec then SetDefaultSpec"),
+                .contains("identical to the current default spec"),
             "a no-op replacement must be refused as an absent partition transition: {error}"
         );
     }
@@ -670,5 +659,139 @@ mod tests {
             managed_partition_fields(prepared.prospective_metadata().default_partition_spec())
                 .expect("observe the prospective default");
         assert_eq!(observed, identity_on_id());
+    }
+    #[tokio::test]
+    async fn repartition_staging_binds_new_ids_and_reuses_an_exact_historical_spec() {
+        use crate::commit::model::{
+            FileChanges, IsolationLevel, OperationIntent, OperationIntentParts, RequestShape,
+            TableTarget,
+        };
+        use crate::commit::staging::{StagingBase, StagingEngine};
+        let fixture = crate::commit::overwrite::preparer_tests::Fixture::new();
+        let base = fixture.metadata(crate::iceberg::spec::FormatVersion::V2);
+        let intent = |metadata: &crate::iceberg::spec::TableMetadata| {
+            OperationIntent::new(OperationIntentParts {
+                target: TableTarget {
+                    ident: crate::iceberg::TableIdent::new(
+                        crate::iceberg::NamespaceIdent::new("db".into()),
+                        "t".into(),
+                    ),
+                    uuid: Some(metadata.uuid()),
+                },
+                target_ref: "main".into(),
+                start: None,
+                changes: FileChanges::default(),
+                dependencies: Vec::new(),
+                isolation: IsolationLevel::Snapshot,
+                shape: RequestShape::MetadataOnly,
+                summary: std::collections::BTreeMap::new(),
+                token: fixture.operation.token(),
+            })
+            .unwrap()
+        };
+        let first = prepare_managed_repartition(
+            &base,
+            &replacement(prior_observation(&base), identity_on_id()),
+            &descriptor_properties(),
+        )
+        .unwrap();
+        let operation = intent(&base);
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: base.clone(),
+                metadata_location: "s3://b/base.metadata.json".into(),
+            },
+            &operation,
+            &attempt,
+        )
+        .unwrap();
+        engine.stage_change(first.prepared_change()).unwrap();
+        let partitioned = engine.metadata().clone();
+        let request = engine.freeze(&[]).unwrap();
+        let json = request.to_rest_json().unwrap();
+        let fields = json["updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["action"] == "add-spec")
+            .unwrap()["spec"]["fields"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(fields.iter().all(|f| f["field-id"].is_i64()));
+        assert!(request.requirements().contains(
+            &crate::iceberg::TableRequirement::LastAssignedPartitionIdMatch {
+                last_assigned_partition_id: base.last_partition_id(),
+            }
+        ));
+        let middle = preview_managed_repartition(
+            &partitioned,
+            &replacement(
+                prior_observation(&partitioned),
+                vec![
+                    ConnectorManagedPartitionField::try_new(
+                        1,
+                        0,
+                        ConnectorManagedPartitionTransform::Bucket { buckets: 8 },
+                    )
+                    .unwrap(),
+                ],
+            ),
+        )
+        .unwrap();
+        let operation = intent(&partitioned);
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: partitioned.clone(),
+                metadata_location: "s3://b/partitioned.metadata.json".into(),
+            },
+            &operation,
+            &attempt,
+        )
+        .unwrap();
+        engine.stage_change(middle.prepared_change()).unwrap();
+        let bucketed = engine.metadata().clone();
+        engine.freeze(&[]).unwrap();
+        let back = preview_managed_repartition(
+            &bucketed,
+            &replacement(prior_observation(&bucketed), identity_on_id()),
+        )
+        .unwrap();
+        assert_eq!(
+            back.committed().spec_id(),
+            partitioned.default_partition_spec_id()
+        );
+        let operation = intent(&bucketed);
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: bucketed.clone(),
+                metadata_location: "s3://b/partitioned.metadata.json".into(),
+            },
+            &operation,
+            &attempt,
+        )
+        .unwrap();
+        engine.stage_change(back.prepared_change()).unwrap();
+        assert_eq!(
+            engine.metadata().default_partition_spec_id(),
+            partitioned.default_partition_spec_id()
+        );
+        let request = engine.freeze(&[]).unwrap();
+        assert!(
+            request
+                .updates()
+                .iter()
+                .all(|u| !matches!(u, crate::iceberg::TableUpdate::AddSpec { .. }))
+        );
+        assert!(
+            request
+                .updates()
+                .contains(&crate::iceberg::TableUpdate::SetDefaultSpec {
+                    spec_id: partitioned.default_partition_spec_id(),
+                })
+        );
     }
 }

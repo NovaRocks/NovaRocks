@@ -218,6 +218,8 @@ pub enum ExternalMutationOutcome<T> {
     },
     KnownUncommitted {
         failure: ConnectorMutationFailure,
+        /// Cleanup completion is independent of the proven publication verdict.
+        cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,
@@ -508,21 +510,6 @@ pub enum ConnectorCatalogMutationOperation {
         properties: Vec<(Arc<str>, Arc<str>)>,
         policy: CreatePolicy,
     },
-    /// Establish the first, data-free snapshot of a newly created table.
-    ///
-    /// This operation is intentionally distinct from a writer: it accepts no
-    /// Arrow data or staged report. Providers must fail closed unless the
-    /// table's current snapshot is still absent, then make the supplied
-    /// bounded properties durable on the bootstrap snapshot.
-    BootstrapEmptyTableSnapshot {
-        table: ConnectorTableIdentity,
-        /// The only supported bootstrap precondition is an empty table.
-        ///
-        /// Keeping this explicit makes a caller's CAS expectation part of the
-        /// provider-neutral request instead of an implicit provider default.
-        expected_current_snapshot: Option<i64>,
-        properties: Vec<(Arc<str>, Arc<str>)>,
-    },
     /// Replace application-owned opaque documents in one exact table metadata
     /// commit. Providers must not reinterpret this as an arbitrary property
     /// patch or publish a new data snapshot.
@@ -586,7 +573,6 @@ impl ConnectorCatalogMutationOperation {
             Self::CreateNamespace { .. } => "create-namespace",
             Self::DropNamespace { .. } => "drop-namespace",
             Self::CreateTable { .. } => "create-table",
-            Self::BootstrapEmptyTableSnapshot { .. } => "bootstrap-empty-table-snapshot",
             Self::UpdateApplicationDocuments { .. } => "update-application-documents",
             Self::DropTable { .. } => "drop-table",
             Self::CreateView { .. } => "create-view",

@@ -101,10 +101,13 @@ pub(crate) fn execute_with_ports(
                 );
             }
         }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
+            failure,
+            cleanup,
+        } => {
             return Err(
                 novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
-                    failure.to_string(),
+                    crate::connector::mutation::known_uncommitted_message(failure, &cleanup),
                 )
                 .to_string(),
             );

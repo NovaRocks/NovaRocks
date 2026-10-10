@@ -30,6 +30,7 @@
 //! and any writer can stage, so an unprovable routing fails with nothing
 //! written.
 
+use crate::commit::model::EntryIdentity;
 use std::collections::BTreeMap;
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
@@ -234,7 +235,7 @@ impl IcebergWriteBranchPlan {
 
     /// The old data files this branch claims exclusive ownership of, with the
     /// exact old delete references it must supersede for each one.
-    fn owned_data_files(&self) -> BTreeMap<String, Vec<String>> {
+    fn owned_data_files(&self) -> BTreeMap<String, Vec<EntryIdentity>> {
         match self {
             // An equality delete names no data file at all, so it owns no
             // old-delete merge for the same reason a data branch does not.
@@ -246,7 +247,7 @@ impl IcebergWriteBranchPlan {
                     let mut references = target
                         .references()
                         .iter()
-                        .map(|reference| reference.path().to_string())
+                        .map(|reference| reference.entry_identity())
                         .collect::<Vec<_>>();
                     references.sort();
                     (target.data_file_path().to_string(), references)

@@ -596,7 +596,45 @@ impl HadoopFileSystemCatalog {
         check_active()?;
         let table_location = self.table_location(table);
         let file_io = crate::fs_io::build_file_io_for_location(&table_location, binding);
-        let version = Self::read_version_hint_with_io(&file_io, &table_location).await;
+        self.load_table_using_io(table, file_io, check_active, false)
+            .await
+    }
+
+    pub(crate) async fn load_table_for_commit(
+        &self,
+        table: &TableIdent,
+        file_io: FileIO,
+    ) -> Result<Table> {
+        self.load_table_using_io(table, file_io, || Ok(()), true)
+            .await
+    }
+
+    async fn load_table_using_io<F>(
+        &self,
+        table: &TableIdent,
+        file_io: FileIO,
+        check_active: F,
+        strict_hint_read: bool,
+    ) -> Result<Table>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+    {
+        check_active()?;
+        let table_location = self.table_location(table);
+        let version = if strict_hint_read {
+            let path = Self::version_hint_path(&table_location);
+            if file_io.exists(&path).await? {
+                let bytes = file_io.new_input(&path)?.read().await?;
+                String::from_utf8_lossy(&bytes)
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            Self::read_version_hint_with_io(&file_io, &table_location).await
+        };
         check_active()?;
         let metadata_location = if version == 0 {
             let v1 = Self::metadata_path(&table_location, 1);
@@ -627,6 +665,7 @@ impl HadoopFileSystemCatalog {
                     ErrorKind::Unexpected,
                     format!("read metadata from {metadata_location}: {error}"),
                 )
+                .with_source(error)
             })?;
         check_active()?;
         Table::builder()
@@ -1688,6 +1727,83 @@ mod tests {
             .load_table(&ident)
             .await
             .expect("generation client remains usable");
+    }
+
+    #[tokio::test]
+    async fn commit_reload_uses_operation_io_and_fresh_hint_without_replacing_catalog_io() {
+        use crate::commit::model::ArtifactWriter;
+        let directory = tempfile::tempdir().unwrap();
+        let warehouse = directory.path().to_string_lossy().to_string();
+        let catalog = test_catalog(&warehouse);
+        let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+        let operation = crate::commit::operation::IcebergCommitOperation::new(
+            crate::commit::model::OperationToken::from_write(
+                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([7; 16]),
+            ),
+            warehouse.clone(),
+            local_test_binding(),
+            read_request(stop.clone(), Instant::now() + Duration::from_secs(30)),
+            crate::resources::IcebergCatalogRuntime::new(tokio::runtime::Handle::current()),
+            crate::commit::operation::OperationLimits::default(),
+        )
+        .unwrap();
+        let namespace = NamespaceIdent::new("analytics".into());
+        let ident = TableIdent::new(namespace.clone(), "events".into());
+        catalog
+            .create_table_fenced(&namespace, test_creation("events"), "commit-reload".into())
+            .await
+            .unwrap();
+        let original = catalog.load_table(&ident).await.unwrap();
+        let mut json = serde_json::to_value(original.metadata()).unwrap();
+        json["properties"]["external-change"] = "visible-on-reload".into();
+        let table_location = catalog.table_location(&ident);
+        let v2 = HadoopFileSystemCatalog::metadata_path(&table_location, 2);
+        std::fs::write(&v2, serde_json::to_vec(&json).unwrap()).unwrap();
+        std::fs::write(
+            HadoopFileSystemCatalog::version_hint_path(&table_location),
+            b"2\n",
+        )
+        .unwrap();
+        let attempt = operation.begin_attempt().unwrap();
+        let reloaded = catalog
+            .load_table_for_commit(&ident, attempt.file_io().clone())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.metadata_location(), Some(v2.as_str()));
+        assert_eq!(
+            reloaded
+                .metadata()
+                .properties()
+                .get("external-change")
+                .unwrap(),
+            "visible-on-reload"
+        );
+        assert!(
+            original
+                .metadata()
+                .properties()
+                .get("external-change")
+                .is_none()
+        );
+        stop.request_stop();
+        let error = catalog
+            .load_table_for_commit(&ident, attempt.file_io().clone())
+            .await
+            .unwrap_err();
+        let mut source: &dyn std::error::Error = &error;
+        loop {
+            if let Some(stop) = source.downcast_ref::<ConnectorError>() {
+                assert_eq!(stop.kind(), ConnectorErrorKind::Cancelled);
+                break;
+            }
+            source = source
+                .source()
+                .expect("typed operation cancellation is preserved");
+        }
+        catalog
+            .load_table(&ident)
+            .await
+            .expect("catalog generation remains usable");
     }
 
     fn test_creation(name: &str) -> TableCreation {

@@ -4506,16 +4506,13 @@ mod tests {
 
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
-            .expect(0)
+            .expect(1)
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",
                 env!("CARGO_MANIFEST_DIR"),
                 "load_table_response.json"
             ))
-            // The sibling transaction uses its frozen base instead of
-            // reloading metadata while applying an action.
-            .expect(0)
             .create_async()
             .await;
 
@@ -4559,7 +4556,6 @@ mod tests {
             .upgrade_table_version()
             .set_format_version(FormatVersion::V2)
             .apply(tx)
-            .await
             .unwrap()
             .commit(&catalog)
             .await
@@ -4648,16 +4644,13 @@ mod tests {
 
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
-            .expect(0)
+            .expect(1)
             .with_status(200)
             .with_body_from_file(format!(
                 "{}/testdata/{}",
                 env!("CARGO_MANIFEST_DIR"),
                 "load_table_response.json"
             ))
-            // The sibling transaction uses its frozen base instead of
-            // reloading metadata while applying an action.
-            .expect(0)
             .create_async()
             .await;
 
@@ -4707,7 +4700,6 @@ mod tests {
             .upgrade_table_version()
             .set_format_version(FormatVersion::V2)
             .apply(tx)
-            .await
             .unwrap()
             .commit(&catalog)
             .await;

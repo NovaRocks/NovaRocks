@@ -372,7 +372,10 @@ fn settle_unpublished_stage(
     primary: MvProviderFailure,
 ) -> MvProductError {
     let primary = primary.into_product_error();
-    if primary.kind() == MvProductErrorKind::CommitUnknown {
+    if matches!(
+        primary.kind(),
+        MvProductErrorKind::CommitUnknown | MvProductErrorKind::KnownCommittedFinalizeFailed
+    ) {
         return primary;
     }
     match provider.abort_staged_target(operation, staged) {
@@ -1017,6 +1020,23 @@ mod tests {
             ["stage", "publish"],
             "aborting could delete a create that actually succeeded"
         );
+    }
+
+    #[test]
+    fn a_proven_committed_publication_finalization_failure_keeps_its_stage() {
+        let service = MvProductService::default();
+        let effects = CreateEffects {
+            fail_publish: Some(MvProviderFailureKind::KnownCommittedFinalizeFailed),
+            ..Default::default()
+        };
+        let error = service
+            .create(operation(), create_command(), &effects, &effects)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            MvProductErrorKind::KnownCommittedFinalizeFailed
+        );
+        assert_eq!(effects.events(), ["stage", "publish"]);
     }
 
     #[test]

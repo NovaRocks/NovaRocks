@@ -41,7 +41,7 @@ use crate::fs_io;
 use crate::resources::IcebergCatalogRuntime;
 use novarocks_spi::connector::{
     ConnectorDataMutationAddFilesDomain, ConnectorDataMutationSourceScope, ConnectorError,
-    ConnectorErrorKind, ConnectorListingBound, ConnectorListingBudget,
+    ConnectorErrorKind, ConnectorListingBound, ConnectorListingBudget, ConnectorOperationControl,
     MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
     MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
@@ -138,14 +138,14 @@ pub(crate) fn plan_manifest_for_table(
     let files = runtime
         .block_on(async move {
             listing_admission
-                .run(&context, async move {
+                .run_wait_for_exit(&context, async move {
                     list_direct_files_async(&directory, &owned_binding, ConnectorListingBound::V1)
                         .await
                 })
                 .await
         })
         .map_err(add_files_invalid)??;
-    plan_manifest(
+    let manifest = plan_manifest(
         files,
         source_directory,
         binding,
@@ -153,8 +153,11 @@ pub(crate) fn plan_manifest_for_table(
         &default_ids,
         canonical_name_mapping,
         runtime,
-    )
-    .map_err(super::data_mutation::map_provider_error)
+    );
+    // Preserve the sticky typed stop/deadline when an internal footer helper
+    // returns its existing diagnostic string after refusing a new request.
+    check_source_active(binding)?;
+    manifest.map_err(super::data_mutation::map_provider_error)
 }
 
 pub(crate) fn revalidate_manifest_for_table(
@@ -558,6 +561,7 @@ async fn list_direct_files_async(
 ) -> Result<Vec<ListedFile>, ConnectorError> {
     let mut source_budget = ConnectorListingBudget::new(bound)?;
     let mut retained_budget = ConnectorListingBudget::new(bound)?;
+    check_source_active(binding)?;
     let access = fs_io::resolve_access_for_location(directory, binding).map_err(|error| {
         add_files_invalid(format!("resolve ADD FILES directory {directory}: {error}"))
     })?;
@@ -570,6 +574,7 @@ async fn list_direct_files_async(
     let operator = access.operator();
     let location_prefix =
         fs_io::format_resolved_location(access.handle(), "").map_err(add_files_invalid)?;
+    check_source_active(binding)?;
     let mut entries = operator
         .lister_with(&prefix)
         .limit(bound.page_entries)
@@ -578,7 +583,13 @@ async fn list_direct_files_async(
             ConnectorError::from(novarocks_fs::map_object_store_listing_error(error))
         })?;
     let mut files = Vec::new();
-    while let Some(entry) = entries.next().await {
+    loop {
+        // A buffered page may finish without yielding. Check each potential
+        // page request, rather than relying on the outer listing select.
+        check_source_active(binding)?;
+        let Some(entry) = entries.next().await else {
+            break;
+        };
         let entry = entry.map_err(|error| {
             ConnectorError::from(novarocks_fs::map_object_store_listing_error(error))
         })?;
@@ -603,6 +614,7 @@ async fn list_direct_files_async(
                 entry.path()
             )));
         }
+        check_source_active(binding)?;
         let metadata = operator.stat(entry.path()).await.map_err(|error| {
             add_files_unavailable(format!("stat ADD FILES entry {}: {error}", entry.path()))
         })?;
@@ -670,6 +682,13 @@ async fn list_direct_files_async(
     Ok(files)
 }
 
+fn check_source_active(binding: &IcebergReadBinding) -> Result<(), ConnectorError> {
+    if let Some(context) = binding.request_context() {
+        context.check_active()?;
+    }
+    Ok(())
+}
+
 fn add_files_invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
 }
@@ -690,16 +709,21 @@ fn read_parquet_footer(
     binding: &IcebergReadBinding,
     runtime: &IcebergCatalogRuntime,
 ) -> Result<ParquetFooterFacts, String> {
+    check_source_active(binding).map_err(|error| error.to_string())?;
     let access = fs_io::resolve_access_for_location(location, binding)
         .map_err(|error| format!("resolve ADD FILES Parquet file {location}: {error}"))?;
     let key = access.single_relative_path()?.to_string();
     let operator = access.operator();
     let location = location.to_string();
+    let binding = binding.clone();
     runtime
         .block_on(async move {
             if file_size < 12 {
                 return Err(format!("ADD FILES Parquet file is too small: {location}"));
             }
+            check_source_active(&binding).map_err(|error| error.to_string())?;
+            // Already-issued reads are awaited to their actual completion. Stop
+            // only prevents the next request; it does not drop the current read.
             let tail = operator
                 .read_with(&key)
                 .range(file_size - 8..file_size)
@@ -722,6 +746,7 @@ fn read_parquet_footer(
             let footer_start = file_size
                 .checked_sub(8 + footer_len)
                 .ok_or_else(|| format!("invalid ADD FILES Parquet footer length: {location}"))?;
+            check_source_active(&binding).map_err(|error| error.to_string())?;
             let footer = operator
                 .read_with(&key)
                 .range(footer_start..file_size - 8)
@@ -1326,5 +1351,226 @@ mod tests {
             &DataType::Decimal128(10, 2),
             &DataType::Decimal128(12, 3)
         ));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod source_control_tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct SourceRequest {
+        pub method: String,
+        pub target: String,
+        pub range: Option<String>,
+    }
+
+    /// A real S3 accessor reads immutable external Parquet through this HTTP
+    /// endpoint. An armed stat HEAD or footer-tail GET is held; no production hook is used.
+    pub(crate) struct SourceHttpFixture {
+        address: std::net::SocketAddr,
+        bytes: Arc<Vec<u8>>,
+        requests: Arc<Mutex<Vec<SourceRequest>>>,
+        armed: Arc<AtomicBool>,
+        stat_armed: Arc<AtomicBool>,
+        tail_started: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+        stopped: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SourceHttpFixture {
+        pub(crate) fn new(bytes: Vec<u8>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let bytes = Arc::new(bytes);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let armed = Arc::new(AtomicBool::new(false));
+            let stat_armed = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let (tail_tx, tail_started) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            let state = (
+                bytes.clone(),
+                requests.clone(),
+                armed.clone(),
+                stat_armed.clone(),
+                stopped.clone(),
+            );
+            let thread = std::thread::spawn(move || {
+                let (bytes, requests, armed, stat_armed, stopped) = state;
+                while !stopped.load(Ordering::SeqCst) {
+                    let (stream, _) = match listener.accept() {
+                        Ok(accepted) => accepted,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("source HTTP accept: {error}"),
+                    };
+                    // Accepted sockets may inherit the listener's nonblocking
+                    // flag on BSD/macOS; the bounded HTTP reader is blocking.
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap().to_string();
+                    let target = parts.next().unwrap().to_string();
+                    let mut range = None;
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("range") {
+                                range = Some(value.trim().to_string());
+                            }
+                        }
+                    }
+                    requests.lock().unwrap().push(SourceRequest {
+                        method: method.clone(),
+                        target: target.clone(),
+                        range: range.clone(),
+                    });
+                    let mut stream = reader.into_inner();
+                    let is_object = target.split('?').next().unwrap().ends_with(".parquet");
+                    let mut status = "200 OK";
+                    let mut extra = String::new();
+                    let mut content_length = bytes.len();
+                    let body = if method == "GET" && !is_object {
+                        let listing = format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>source-bucket</Name><Prefix>incoming/</Prefix><KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>incoming/a.parquet</Key><LastModified>2026-10-10T00:00:00.000Z</LastModified><ETag>\"external-stable\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>incoming/b.parquet</Key><LastModified>2026-10-10T00:00:00.000Z</LastModified><ETag>\"external-stable\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>",
+                            bytes.len(),
+                            bytes.len()
+                        );
+                        content_length = listing.len();
+                        listing.into_bytes()
+                    } else if method == "HEAD" && is_object {
+                        if stat_armed.swap(false, Ordering::SeqCst) {
+                            tail_tx.send(()).unwrap();
+                            release_rx
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("release issued source stat");
+                        }
+                        Vec::new()
+                    } else if method == "GET" && is_object {
+                        let (start, end) = match range.as_deref() {
+                            Some(range) => {
+                                let (start, end) = range
+                                    .strip_prefix("bytes=")
+                                    .unwrap()
+                                    .split_once('-')
+                                    .unwrap();
+                                (
+                                    start.parse::<usize>().unwrap(),
+                                    if end.is_empty() {
+                                        bytes.len() - 1
+                                    } else {
+                                        end.parse().unwrap()
+                                    },
+                                )
+                            }
+                            None => (0, bytes.len() - 1),
+                        };
+                        if start == bytes.len() - 8 && armed.swap(false, Ordering::SeqCst) {
+                            tail_tx.send(()).unwrap();
+                            release_rx
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("release issued source tail");
+                        }
+                        status = "206 Partial Content";
+                        extra = format!("Content-Range: bytes {start}-{end}/{}\r\n", bytes.len());
+                        content_length = end - start + 1;
+                        bytes[start..=end].to_vec()
+                    } else {
+                        status = "405 Method Not Allowed";
+                        content_length = 0;
+                        Vec::new()
+                    };
+                    write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {content_length}\r\nETag: \"external-stable\"\r\nLast-Modified: Sat, 10 Oct 2026 00:00:00 GMT\r\nAccept-Ranges: bytes\r\n{extra}Connection: close\r\n\r\n").unwrap();
+                    stream.write_all(&body).unwrap();
+                    stream.flush().unwrap();
+                }
+            });
+            Self {
+                address,
+                bytes,
+                requests,
+                armed,
+                stat_armed,
+                tail_started,
+                release,
+                stopped,
+                thread: Some(thread),
+            }
+        }
+
+        pub(crate) fn config(&self) -> novarocks_fs::ObjectStoreConfig {
+            novarocks_fs::ObjectStoreConfig {
+                endpoint: format!("http://{}", self.address),
+                access_key_id: novarocks_fs::SecretValue::new("source-test-key"),
+                access_key_secret: novarocks_fs::SecretValue::new("source-test-secret"),
+                session_token: None,
+                enable_path_style_access: Some(true),
+                region: Some("us-east-1".into()),
+                retry_max_times: Some(0),
+                retry_min_delay_ms: None,
+                retry_max_delay_ms: None,
+                timeout_ms: Some(10000),
+                io_timeout_ms: Some(10000),
+            }
+        }
+        pub(crate) fn source(&self) -> &'static str {
+            "s3://source-bucket/incoming/"
+        }
+        pub(crate) fn arm_tail(&self) {
+            self.requests.lock().unwrap().clear();
+            self.armed.store(true, Ordering::SeqCst);
+        }
+        pub(crate) fn arm_stat(&self) {
+            self.requests.lock().unwrap().clear();
+            self.stat_armed.store(true, Ordering::SeqCst);
+        }
+        pub(crate) fn wait_for_tail(&self) {
+            self.tail_started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("actual tail GET started");
+        }
+        pub(crate) fn release_tail(&self) {
+            self.release.send(()).unwrap();
+        }
+        pub(crate) fn requests(&self) -> Vec<SourceRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+        pub(crate) fn bytes(&self) -> &[u8] {
+            self.bytes.as_slice()
+        }
+        pub(crate) fn tail_range(&self) -> String {
+            format!("bytes={}-{}", self.bytes.len() - 8, self.bytes.len() - 1)
+        }
+    }
+    impl Drop for SourceHttpFixture {
+        fn drop(&mut self) {
+            self.stopped.store(true, Ordering::SeqCst);
+            let _ = self.release.send(());
+            let _ = TcpStream::connect(self.address);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
     }
 }

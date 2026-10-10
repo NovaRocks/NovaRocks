@@ -429,8 +429,8 @@ fn plan_connector_failure(error: ConnectorError) -> AddFilesPlanError {
 
 fn project_plan_error(outcome: ResolvedDataMutation) -> AddFilesPlanError {
     match outcome {
-        ResolvedDataMutation::KnownUncommitted { failure } => {
-            AddFilesPlanError::KnownUncommitted(project_uncommitted(failure))
+        ResolvedDataMutation::KnownUncommitted { failure, cleanup } => {
+            AddFilesPlanError::KnownUncommitted(project_uncommitted(failure, cleanup))
         }
         ResolvedDataMutation::ContractFailure { error, dispatch } => {
             AddFilesPlanError::ContractFailure {
@@ -453,9 +453,11 @@ fn project_plan_error(outcome: ResolvedDataMutation) -> AddFilesPlanError {
 fn project_outcome(outcome: ResolvedDataMutation) -> AddFilesOutcome {
     match outcome {
         ResolvedDataMutation::KnownCommitted(completed) => project_committed(completed),
-        ResolvedDataMutation::KnownUncommitted { failure } => AddFilesOutcome::KnownUncommitted {
-            failure: project_uncommitted(failure),
-        },
+        ResolvedDataMutation::KnownUncommitted { failure, cleanup } => {
+            AddFilesOutcome::KnownUncommitted {
+                failure: project_uncommitted(failure, cleanup),
+            }
+        }
         ResolvedDataMutation::CommitUnknown { failure, evidence } => {
             match evidence.try_to_wire_v1() {
                 Ok(wire) => AddFilesOutcome::CommitUnknown {
@@ -524,11 +526,17 @@ fn project_committed(completed: CompletedDataMutation) -> AddFilesOutcome {
     }
 }
 
-fn project_uncommitted(failure: KnownUncommittedDataMutation) -> AddFilesFailure {
-    match failure {
+fn project_uncommitted(
+    failure: KnownUncommittedDataMutation,
+    cleanup: novarocks_spi::connector::ExternalMutationFinalization,
+) -> AddFilesFailure {
+    let mut projected = match failure {
         KnownUncommittedDataMutation::Planning(error) => project_connector_error(error),
         KnownUncommittedDataMutation::Provider(failure) => project_mutation_failure(failure),
-    }
+    };
+    projected.message =
+        crate::connector::mutation::known_uncommitted_message(&projected.message, &cleanup);
+    projected
 }
 
 fn project_connector_error(error: ConnectorError) -> AddFilesFailure {

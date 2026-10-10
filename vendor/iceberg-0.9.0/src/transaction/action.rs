@@ -25,20 +25,18 @@ use crate::table::Table;
 use crate::transaction::Transaction;
 use crate::{Result, TableRequirement, TableUpdate};
 
+/// A boxed, thread-safe reference to a `TransactionAction`.
+pub(crate) type BoxedTransactionAction = Arc<dyn TransactionAction>;
+
 /// A trait representing an atomic action that can be part of a transaction.
 ///
-/// Implementors define how a specific action is evaluated against a staged table.
+/// Implementors of this trait define how a specific action is committed to a table.
 /// Each action is responsible for generating the updates and requirements needed
 /// to modify the table metadata.
-//
-// NovaRocks patch: visibility raised from pub(crate) to pub so that downstream
-// crates (NovaRocks IcebergCommitAction implementations) can implement custom
-// transaction actions for INSERT OVERWRITE / DELETE flows that iceberg-rust 0.9
-// does not yet ship as built-in actions. Tracked under spec §0.4 / Plan Task 9.
 #[async_trait]
-pub trait TransactionAction: AsAny + Sync + Send {
-    /// Evaluates this action against the provided table and returns the resulting updates.
-    /// NOTE: This function is intended for transaction staging and should not normally be called directly.
+pub(crate) trait TransactionAction: AsAny + Sync + Send {
+    /// Commits this action against the provided table and returns the resulting updates.
+    /// NOTE: This function is intended for internal use only and should not be called directly by users.
     ///
     /// # Arguments
     ///
@@ -47,7 +45,7 @@ pub trait TransactionAction: AsAny + Sync + Send {
     /// # Returns
     ///
     /// An `ActionCommit` containing table updates and table requirements,
-    /// or an error if staging fails.
+    /// or an error if the commit fails.
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit>;
 }
 
@@ -55,9 +53,8 @@ pub trait TransactionAction: AsAny + Sync + Send {
 ///
 /// This is implemented for all `TransactionAction` types
 /// to allow easy chaining of actions into a transaction context.
-#[async_trait]
 pub trait ApplyTransactionAction {
-    /// Eagerly stages this action against the transaction-local table.
+    /// Adds this action to the given transaction.
     ///
     /// # Arguments
     ///
@@ -66,16 +63,14 @@ pub trait ApplyTransactionAction {
     /// # Returns
     ///
     /// The modified transaction containing this action, or an error if the operation fails.
-    async fn apply(self, tx: Transaction) -> Result<Transaction>;
+    fn apply(self, tx: Transaction) -> Result<Transaction>;
 }
 
-#[async_trait]
 impl<T: TransactionAction + 'static> ApplyTransactionAction for T {
-    async fn apply(self, tx: Transaction) -> Result<Transaction>
-    where
-        Self: Sized,
-    {
-        tx.stage_action(Arc::new(self)).await
+    fn apply(self, mut tx: Transaction) -> Result<Transaction>
+    where Self: Sized {
+        tx.actions.push(Arc::new(self));
+        Ok(tx)
     }
 }
 
@@ -113,6 +108,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
+    use as_any::Downcast;
     use async_trait::async_trait;
     use uuid::Uuid;
 
@@ -148,31 +144,27 @@ mod tests {
         let updates = action_commit.take_updates();
         let requirements = action_commit.take_requirements();
 
-        assert_eq!(
-            updates[0],
-            TableUpdate::SetLocation {
-                location: String::from("s3://bucket/prefix/table/")
-            }
-        );
-        assert_eq!(
-            requirements[0],
-            TableRequirement::UuidMatch {
-                uuid: Uuid::from_str("9c12d441-03fe-4693-9a96-a0705ddf69c1").unwrap()
-            }
-        );
+        assert_eq!(updates[0], TableUpdate::SetLocation {
+            location: String::from("s3://bucket/prefix/table/")
+        });
+        assert_eq!(requirements[0], TableRequirement::UuidMatch {
+            uuid: Uuid::from_str("9c12d441-03fe-4693-9a96-a0705ddf69c1").unwrap()
+        });
     }
 
-    #[tokio::test]
-    async fn test_apply_transaction_action() {
+    #[test]
+    fn test_apply_transaction_action() {
         let table = make_v2_table();
         let action = TestAction;
         let tx = Transaction::new(&table);
 
-        let updated_tx = action.apply(tx).await.unwrap();
-        assert_eq!(
-            updated_tx.staged_table().metadata().location(),
-            "s3://bucket/prefix/table"
-        );
+        let updated_tx = action.apply(tx).unwrap();
+        // There should be one action in the transaction now
+        assert_eq!(updated_tx.actions.len(), 1);
+
+        (*updated_tx.actions[0])
+            .downcast_ref::<TestAction>()
+            .expect("TestAction was not applied to Transaction!");
     }
 
     #[test]

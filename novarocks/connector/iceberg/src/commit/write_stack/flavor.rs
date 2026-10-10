@@ -42,6 +42,7 @@
 //!   per rewritten data file, plus a trailing append branch when the statement
 //!   also has net-new rows.
 
+use crate::commit::model::EntryIdentity;
 use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
 use novarocks_spi::connector::write_stack::session::{
     ConnectorWriteProviderDerivedValue, ConnectorWriteRouteFacts, ConnectorWriteSelectionBinding,
@@ -549,7 +550,9 @@ fn frozen_rewrite_branch_input(
         group
             .data_files
             .iter()
-            .map(|file| file.path.clone())
+            .map(|file| EntryIdentity::DataFile {
+                path: file.path.clone(),
+            })
             .collect(),
         delete_paths,
     )

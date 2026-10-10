@@ -60,7 +60,7 @@ pub struct PositionDeleteGroup {
 /// Write each group to a single position-delete Parquet file under
 /// `<table_metadata_dir>/data/_staging/<query_uuid>/`. Returns the
 /// [`WrittenFile`] entries ready to be injected into
-/// [`super::collector::IcebergCommitCollector`].
+/// the task-owned writer output contract.
 pub async fn write_position_delete_files(
     file_io: &FileIO,
     staging_dir: &str,

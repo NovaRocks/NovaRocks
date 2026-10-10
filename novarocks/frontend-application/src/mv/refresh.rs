@@ -763,12 +763,12 @@ fn require_catalog_commit(
                 )),
             }
         }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
-            Err(MvApplicationError::new(
-                MvApplicationErrorKind::Engine,
-                format!("{operation} was not committed: {failure}"),
-            ))
-        }
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
+            failure, ..
+        } => Err(MvApplicationError::new(
+            MvApplicationErrorKind::Engine,
+            format!("{operation} was not committed: {failure}"),
+        )),
         crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
             Err(MvApplicationError::new(
                 MvApplicationErrorKind::CommitUnknown,
@@ -855,10 +855,12 @@ fn interpret_committed_write(
                 error.to_string(),
             )),
         },
-        ExternalMutationOutcome::KnownUncommitted { failure } => Err(MvApplicationError::new(
-            MvApplicationErrorKind::Engine,
-            failure.to_string(),
-        )),
+        ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+            Err(MvApplicationError::new(
+                MvApplicationErrorKind::Engine,
+                crate::connector::mutation::known_uncommitted_message(failure, &cleanup),
+            ))
+        }
         ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(MvApplicationError::new(
             MvApplicationErrorKind::CommitUnknown,
             format!("MV refresh commit outcome is unknown: {failure}"),

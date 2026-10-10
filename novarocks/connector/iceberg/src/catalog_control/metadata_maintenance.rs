@@ -606,6 +606,8 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
                                 ConnectorMutationFailureKind::Conflict,
                                 error.to_string(),
                             ),
+                            cleanup:
+                                novarocks_spi::connector::ExternalMutationFinalization::Complete,
                         }
                     }
                     Err(ExecFailure::Unknown(error)) => ExternalMutationOutcome::CommitUnknown {

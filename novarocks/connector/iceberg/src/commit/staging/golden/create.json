@@ -1,0 +1,93 @@
+{
+  "identifier": {
+    "name": "t",
+    "namespace": [
+      "db"
+    ]
+  },
+  "requirements": [
+    {
+      "type": "assert-create"
+    }
+  ],
+  "updates": [
+    {
+      "action": "upgrade-format-version",
+      "format-version": 2
+    },
+    {
+      "action": "assign-uuid",
+      "uuid": "01010101-0101-0101-0101-010101010101"
+    },
+    {
+      "action": "add-schema",
+      "schema": {
+        "fields": [
+          {
+            "id": 1,
+            "name": "id",
+            "required": true,
+            "type": "long"
+          }
+        ],
+        "schema-id": 0,
+        "type": "struct"
+      }
+    },
+    {
+      "action": "set-current-schema",
+      "schema-id": 0
+    },
+    {
+      "action": "add-spec",
+      "spec": {
+        "fields": [],
+        "spec-id": 0
+      }
+    },
+    {
+      "action": "set-default-spec",
+      "spec-id": 0
+    },
+    {
+      "action": "add-sort-order",
+      "sort-order": {
+        "fields": [],
+        "order-id": 0
+      }
+    },
+    {
+      "action": "set-default-sort-order",
+      "sort-order-id": 0
+    },
+    {
+      "action": "set-location",
+      "location": "s3://bucket/table"
+    },
+    {
+      "action": "set-properties",
+      "updates": {
+        "owner": "test"
+      }
+    },
+    {
+      "action": "add-snapshot",
+      "snapshot": {
+        "manifest-list": "s3://bucket/table/metadata/snap-11.avro",
+        "schema-id": 0,
+        "sequence-number": 1,
+        "snapshot-id": 11,
+        "summary": {
+          "operation": "append"
+        },
+        "timestamp-ms": 1700000000011
+      }
+    },
+    {
+      "action": "set-snapshot-ref",
+      "ref-name": "main",
+      "snapshot-id": 11,
+      "type": "branch"
+    }
+  ]
+}

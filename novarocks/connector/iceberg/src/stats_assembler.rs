@@ -136,3 +136,34 @@ pub fn puffin_path_for_statistics_operation(
     let operation_id = uuid::Uuid::from_bytes(operation_id);
     format!("{location}/metadata/snap-{snapshot_id}-statistics-{operation_id}.puffin")
 }
+
+/// Allocate the statistics object with the attempt that binds its provenance.
+/// An empty draft set allocates no object. Storage admission and actual writer
+/// exit are owned by the supplied operation capability.
+pub(crate) async fn write_puffin_artifacts_allocated(
+    writer: &dyn crate::commit::model::ArtifactWriter,
+    snapshot_id: i64,
+    sequence_number: i64,
+    artifacts: &[StatisticsArtifactDraft],
+) -> Result<Option<StatisticsFile>, String> {
+    writer.check_active().map_err(|error| error.to_string())?;
+    if artifacts.is_empty() {
+        return Ok(None);
+    }
+    let object = writer
+        .allocate(
+            crate::commit::model::ArtifactClass::Attempt,
+            crate::commit::model::ArtifactKind::Statistics,
+        )
+        .map_err(|error| error.to_string())?;
+    let statistics = write_puffin_artifacts(
+        writer.file_io(),
+        object.path(),
+        snapshot_id,
+        sequence_number,
+        artifacts,
+    )
+    .await?;
+    writer.check_active().map_err(|error| error.to_string())?;
+    Ok(statistics)
+}

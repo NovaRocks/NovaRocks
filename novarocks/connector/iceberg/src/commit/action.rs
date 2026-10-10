@@ -15,42 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Trait abstraction over the three commit-action implementations
-//! (FastAppend / Overwrite / RowDelta).
-//!
-//! `CommitCtx` carries everything an action needs to write manifests and
-//! call `Catalog::update_table`. `FileIO` is supplied explicitly rather than
-//! lifted from `table.file_io()` so that engine-side staging credentials and
-//! catalog-default credentials can differ when needed.
+//! Resolve provider-owned snapshot summary declarations.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
-
-use crate::iceberg::Catalog;
-use crate::iceberg::io::FileIO;
-use crate::iceberg::table::Table;
-use async_trait::async_trait;
-use uuid::Uuid;
-
-use super::collector::IcebergCommitCollector;
-use crate::commit::CommitOutcome;
-use crate::commit::abort::AbortLog;
 use crate::commit::{
     MV_PUBLICATION_PROVENANCE_PROP, MV_REFRESH_ROW_COUNT_PROP, MvPublicationProvenanceV2,
 };
-
-pub struct CommitCtx<'a> {
-    pub collector: &'a IcebergCommitCollector,
-    pub table: &'a Table,
-    pub catalog: &'a dyn Catalog,
-    pub file_io: &'a FileIO,
-    pub commit_uuid: Uuid,
-    pub abort_handle: Arc<AbortLog>,
-    /// Target ref for this commit. `"main"` is the default; non-`main`
-    /// values are used for branch-qualified DML (`INSERT INTO t.branch_<x>`).
-    pub target_ref: &'a str,
-    pub snapshot_properties: &'a BTreeMap<String, String>,
-}
+use std::collections::{BTreeMap, HashMap};
 
 pub(super) fn merge_snapshot_summary_properties(
     mut built_in: HashMap<String, String>,
@@ -91,14 +61,4 @@ pub(super) fn merge_snapshot_summary_properties(
     }
     built_in.extend(provider_properties);
     Ok(built_in)
-}
-
-#[async_trait]
-pub trait IcebergCommitAction: Send + Sync {
-    /// Stage any manifests required, build a `TableCommit`, and submit it via
-    /// `Catalog::update_table`. Implementations must record every staged
-    /// manifest path on `ctx.abort_handle` so that a later failure can clean
-    /// them up. On the success path the orchestrator does not call
-    /// `AbortLog::cleanup`, so the records are harmless.
-    async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String>;
 }

@@ -2,56 +2,19 @@
 
 Upstream source: https://crates.io/crates/iceberg/0.9.0
 
-These patches are the minimum required to let NovaRocks use an eagerly staged,
-single-dispatch transaction and implement custom Transaction actions for INSERT
-OVERWRITE and DELETE flows that iceberg-rust 0.9 does not yet ship as built-in
-actions (`overwrite_files`, `row_delta`).
+The remaining patches provide Iceberg format/read primitives, view support,
+authoritative staged-create initialization and the public terminal TableCommit
+builder. NovaRocks owns immutable commit intents, staging, retry and publication;
+production mutation preparation does not use the SDK transaction/action layer.
 
-When upstream lands native equivalents — likely in 0.10/0.11 — this whole
-vendor directory and the corresponding `[patch.crates-io]` block in the root
-`Cargo.toml` should be deleted, and the NovaRocks `OverwriteCommit` and
-`RowDeltaCommit` impls (`src/connector/iceberg/commit/{overwrite,row_delta}.rs`)
-should be re-pointed at the upstream actions.
+## Retired transaction changes
 
-Tracked under spec §0.4 / Plan Task 9.
-
-## Patch 9 — eager transaction staging and side-effect-free commit export
-
-Upstream 0.9 stores actions in `Transaction` and evaluates them only from
-`commit()`. That method reloads the table and transparently replays the whole
-action list on retryable errors. A later action therefore cannot read metadata
-created by an earlier action before catalog publication, and a caller cannot
-give one already-frozen commit to an external publication owner.
-
-This patch changes the generic transaction model rather than adding a
-NovaRocks-specific shadow transaction:
-
-* `ApplyTransactionAction::apply` is asynchronous and evaluates the action
-  immediately against the transaction-local staged table.
-* Each action's updates are applied to that staged table before the next action
-  runs. Action requirements are checked against that stage-local table, then
-  normalized to the equivalent OCC requirement against the transaction's
-  original base before publication. Exact duplicates are collapsed, so two
-  snapshot actions do not export mutually exclusive `assert-ref-snapshot-id`
-  values.
-* `Transaction::staged_table` and `Transaction::staged_snapshot` expose the
-  read-only local result needed to construct a later action.
-* `Transaction::stage_action` and `Transaction::stage_action_commit` are public
-  eager composition points for connector-owned actions and already-assembled
-  provider updates. Both update only transaction-local metadata and perform no
-  catalog I/O.
-* `Transaction::into_table_commit` consumes the transaction and exports the
-  complete `TableCommit` without catalog I/O, refresh, dispatch, or retry.
-* `Transaction` is no longer `Clone`; staging, export, and commit carry one
-  structurally consuming authority rather than permitting the same staged
-  update set to be duplicated.
-* The convenience `Transaction::commit` performs at most one
-  `Catalog::update_table` call. Retryable errors are returned to the caller and
-  never replay actions inside the library.
-* The now-unused `backon` dependency is removed.
-
-Library tests lock down append-then-statistics visibility, zero-effect export,
-and one dispatch for retryable and non-retryable catalog errors.
+P1 (public TransactionAction) and P9 (eager SDK staging/export) are removed.
+The transaction sources are restored byte-for-byte to the published 0.9.0 crate,
+including its backon dependency. U1's TableCommit mutation/query helpers are
+removed. U6's MemoryCatalog test adaptations are restored to upstream synchronous
+apply. Ordinary SDK test seeds use that upstream API; they grant no production
+publication or cleanup authority.
 
 ## Patch 8 — authoritative REST staged-create initialization updates
 
@@ -63,23 +26,12 @@ sort-order IDs, high-watermarks, format version, and properties. The helper
 rejects non-initial metadata that the initialization update set cannot
 represent exactly instead of guessing or silently dropping state.
 
-## Patch 1 — `src/transaction/action.rs`
-
-Raise `TransactionAction` trait visibility from `pub(crate)` to `pub` so that
-downstream crates can implement the trait.
-
-```diff
-- #[async_trait]
-- pub(crate) trait TransactionAction: AsAny + Sync + Send {
-+ #[async_trait]
-+ pub trait TransactionAction: AsAny + Sync + Send {
-```
-
 ## Patch 2 — `src/catalog/mod.rs`
 
 Raise `TableCommit::builder().build()` visibility from `pub(crate)` to `pub`
-so that downstream crates can construct `TableCommit` directly when invoking
-`Catalog::update_table` from a custom action.
+so that the NovaRocks FrozenRequest owner can convert one complete terminal
+request for `Catalog::update_table`. This boundary is retained through IRU-6;
+custom SDK actions are no longer its caller.
 
 ```diff
 - #[builder(build_method(vis = "pub(crate)"))]
@@ -289,20 +241,17 @@ literals); each is rewritten to
 preserving the previous panic-on-overflow semantics while clearing the
 `-D warnings` build.
 
-When upstream iceberg-rust 0.10 lands with its own arrow/parquet bump,
-this entry is removed by the same path that already retires PATCH 1–5.
+A future upstream upgrade must compare its Arrow/Parquet vocabulary and the
+remaining reader/format changes before retiring this dependency patch.
 
 ## Verification after rebase
 
-When bumping the vendored copy to a newer iceberg-rust patch release:
-
-1. `diff -ru` against the new upstream source to confirm only those two lines
-   diverge (plus this `PATCH.md` and the inline `// NovaRocks patch:` comments).
-2. `cargo build -p novarocks` from the worktree root.
-3. `cargo test -p novarocks --lib commit:: -- --nocapture` should still pass.
-
-If upstream changes the surrounding code substantially, re-apply by hand and
-update this file.
+Compare the restored transaction directory and MemoryCatalog source with the
+published crate byte-for-byte. Compare all other vendor changes against this
+remaining inventory; the public TableCommit builder and view/format patches must
+not disappear with transaction restoration. Build the workspace and run the
+connector commit tests, the upstream SDK tests and the REST catalog tests using
+the root workspace dependency graph.
 
 ## View API surface (NovaRocks)
 

@@ -144,6 +144,26 @@ struct AccumulatedWriteSet {
     retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
 
+pub(crate) fn require_uncommitted_release(
+    outcome: novarocks_spi::connector::ConnectorWriteAbortOutcome,
+) -> Result<(), String> {
+    use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
+    match outcome {
+        ConnectorWriteAbortOutcome::KnownUncommitted { cleanup } => match cleanup {
+            ExternalMutationFinalization::Complete => Ok(()),
+            ExternalMutationFinalization::Failed(error) => {
+                Err(format!("write release cleanup failed: {error}"))
+            }
+        },
+        ConnectorWriteAbortOutcome::KnownCommitted { .. } => {
+            Err("write release observed a known committed publication".into())
+        }
+        ConnectorWriteAbortOutcome::CommitUnknown { failure, .. } => Err(format!(
+            "write release publication outcome is unknown: {failure}"
+        )),
+    }
+}
+
 impl ConnectorWriteSession {
     /// Admit the write and freeze its recipes. On return either a session
     /// exists and nothing external has happened yet, or an error was raised and
@@ -1608,6 +1628,7 @@ pub(crate) mod tests {
                     novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
                     "scripted",
                 ),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             },
         )
     }
@@ -1700,6 +1721,7 @@ pub(crate) mod tests {
                     novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
                     "scripted",
                 ),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             })),
         });
         let group = ConnectorControlWriteBinding::new(
@@ -2452,6 +2474,7 @@ pub(crate) mod tests {
                     novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
                     "scripted",
                 ),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             },
         );
 

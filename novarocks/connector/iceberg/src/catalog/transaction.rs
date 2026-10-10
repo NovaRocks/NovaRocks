@@ -170,7 +170,7 @@ pub(crate) trait CatalogCommitDispatch: std::fmt::Debug + Send + Sync {
     /// dispatch question to [`super::error::proves_uncommitted`].
     async fn dispatch_once(
         &self,
-        staged: Option<crate::iceberg::TableCommit>,
+        staged: Option<&crate::commit::model::FrozenRequest>,
     ) -> Result<CommitProof, crate::iceberg::Error>;
 
     /// Re-read the catalog and report whether this exact publication is
@@ -262,7 +262,7 @@ pub(crate) struct Transaction {
     shape: TransactionShape,
     evidence: CatalogCommitEvidence,
     dispatch: Arc<dyn CatalogCommitDispatch>,
-    staged: Option<crate::iceberg::TableCommit>,
+    staged: Option<crate::commit::model::FrozenRequest>,
     admission: AdmissionFacts,
     state: TransactionState,
 }
@@ -325,7 +325,7 @@ impl Transaction {
     /// mean publishing something other than what was admitted.
     pub(crate) fn stage(
         &mut self,
-        staged: crate::iceberg::TableCommit,
+        staged: crate::commit::model::FrozenRequest,
     ) -> Result<(), ConnectorError> {
         if !matches!(self.state, TransactionState::Admitted) {
             return Err(ConnectorError::new(
@@ -334,6 +334,14 @@ impl Transaction {
                     "Iceberg publication {} has already left admission; staging is refused",
                     self.identity.hex()
                 ),
+            ));
+        }
+        if self.staged.is_some()
+            || super::CatalogTableName::from_identifier(staged.identifier()) != self.target
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg transaction refuses duplicate staging or a different frozen target",
             ));
         }
         self.staged = Some(staged);
@@ -385,7 +393,7 @@ impl Transaction {
         }
 
         let staged = self.staged.take();
-        match self.dispatch.dispatch_once(staged).await {
+        match self.dispatch.dispatch_once(staged.as_ref()).await {
             Ok(proof) => {
                 self.state = TransactionState::Committed;
                 let effect = proof.effect;
@@ -529,7 +537,7 @@ mod tests {
     impl CatalogCommitDispatch for FakeDispatch {
         async fn dispatch_once(
             &self,
-            _staged: Option<crate::iceberg::TableCommit>,
+            _staged: Option<&crate::commit::model::FrozenRequest>,
         ) -> Result<CommitProof, IcebergError> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
             match self.behavior {

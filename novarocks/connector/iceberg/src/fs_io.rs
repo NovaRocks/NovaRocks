@@ -37,6 +37,105 @@ use novarocks_spi::connector::{
 
 use crate::access_binding::IcebergReadBinding;
 
+/// The output capability belongs to one logical commit operation, never to the process.
+#[async_trait]
+pub(crate) trait IcebergWriteAdmission: Send + Sync + std::fmt::Debug {
+    fn check_active(&self) -> Result<()>;
+    fn check_output_active(&self, object: &crate::commit::model::ObjectIdentity) -> Result<()>;
+    fn cancellation(&self) -> novarocks_fs::FileCancellation;
+    fn runtime(&self) -> crate::resources::IcebergCatalogRuntime;
+    fn admit(self: Arc<Self>, path: &str) -> Result<WritePermit>;
+    fn mark_written(&self, object: &crate::commit::model::ObjectIdentity) -> Result<()>;
+    fn record_exit_failure(
+        &self,
+        object: &crate::commit::model::ObjectIdentity,
+        failure: StreamExitFailure,
+    );
+    async fn io_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit>;
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum StreamExitFailure {
+    Unconfirmed,
+    AbortFailed(String),
+    BridgeFailed(String),
+}
+impl std::fmt::Display for StreamExitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unconfirmed => {
+                f.write_str("Multipart writer exited without confirmed close or abort")
+            }
+            Self::AbortFailed(reason) => write!(f, "Multipart abort failed: {reason}"),
+            Self::BridgeFailed(reason) => write!(f, "Multipart abort bridge failed: {reason}"),
+        }
+    }
+}
+
+pub(crate) struct WritePermit {
+    admission: Arc<dyn IcebergWriteAdmission>,
+    object: crate::commit::model::ObjectIdentity,
+    io: Option<tokio::sync::OwnedSemaphorePermit>,
+    stream_started: std::sync::atomic::AtomicBool,
+    exit_confirmed: std::sync::atomic::AtomicBool,
+}
+
+impl WritePermit {
+    pub(crate) fn new(
+        admission: Arc<dyn IcebergWriteAdmission>,
+        object: crate::commit::model::ObjectIdentity,
+    ) -> Self {
+        Self {
+            admission,
+            object,
+            io: None,
+            stream_started: std::sync::atomic::AtomicBool::new(false),
+            exit_confirmed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    async fn acquire(mut self) -> Result<Self> {
+        self.io = Some(self.admission.io_permit().await?);
+        self.admission.check_output_active(&self.object)?;
+        Ok(self)
+    }
+    fn check_active(&self) -> Result<()> {
+        self.admission.check_active()
+    }
+    fn complete(&self) -> Result<()> {
+        self.confirm_exit();
+        self.admission.mark_written(&self.object)
+    }
+    fn confirm_exit(&self) {
+        self.exit_confirmed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+impl Drop for WritePermit {
+    fn drop(&mut self) {
+        if self
+            .stream_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .exit_confirmed
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Publish an unconfirmed exit before the I/O permit field is released, including
+            // panic or runtime-bridge failure. Cleanup cannot race this into a false Complete.
+            self.admission
+                .record_exit_failure(&self.object, StreamExitFailure::Unconfirmed);
+        }
+    }
+}
+
+async fn optional_io_permit(
+    admission: Option<&Arc<dyn IcebergWriteAdmission>>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    match admission {
+        Some(admission) => admission.io_permit().await.map(Some),
+        None => Ok(None),
+    }
+}
+
 pub(crate) const HADOOP_LISTING_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn listing_refusal() -> Error {
@@ -215,6 +314,8 @@ pub struct IcebergFileSystemFactory {
     binding: Option<IcebergReadBinding>,
     #[serde(skip, default)]
     listing: Option<(ConnectorListingBound, usize)>,
+    #[serde(skip, default)]
+    admission: Option<Arc<dyn IcebergWriteAdmission>>,
 }
 
 impl IcebergFileSystemFactory {
@@ -222,6 +323,7 @@ impl IcebergFileSystemFactory {
         Self {
             binding: Some(binding),
             listing: None,
+            admission: None,
         }
     }
 }
@@ -238,6 +340,7 @@ impl StorageFactory for IcebergFileSystemFactory {
         Ok(Arc::new(IcebergFsStorage {
             binding: Some(binding),
             listing: self.listing,
+            admission: self.admission.clone(),
         }))
     }
 }
@@ -248,6 +351,8 @@ pub struct IcebergFsStorage {
     binding: Option<IcebergReadBinding>,
     #[serde(skip, default)]
     listing: Option<(ConnectorListingBound, usize)>,
+    #[serde(skip, default)]
+    admission: Option<Arc<dyn IcebergWriteAdmission>>,
 }
 
 impl IcebergFsStorage {
@@ -255,6 +360,7 @@ impl IcebergFsStorage {
         Self {
             binding: Some(binding),
             listing: None,
+            admission: None,
         }
     }
 
@@ -265,6 +371,9 @@ impl IcebergFsStorage {
     }
 
     fn check_read_active(&self, operation: &str) -> Result<()> {
+        if let Some(admission) = &self.admission {
+            admission.check_active()?;
+        }
         check_read_active(self.read_control().as_ref(), operation)
     }
 
@@ -318,6 +427,7 @@ impl IcebergFsStorage {
 impl Storage for IcebergFsStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
         self.check_read_active("exists")?;
+        let _io = optional_io_permit(self.admission.as_ref()).await?;
         let (access, relative_path) = self.resolve_path("exists", path)?;
         let result = access.operator().exists(&relative_path).await;
         self.check_read_active("exists")?;
@@ -328,6 +438,7 @@ impl Storage for IcebergFsStorage {
 
     async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
         self.check_read_active("list_directories")?;
+        let _io = optional_io_permit(self.admission.as_ref()).await?;
         let (bound, workspace_bytes) = self
             .listing
             .unwrap_or((ConnectorListingBound::V1, HADOOP_LISTING_WORKSPACE_BYTES));
@@ -382,6 +493,7 @@ impl Storage for IcebergFsStorage {
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         self.check_read_active("metadata")?;
+        let _io = optional_io_permit(self.admission.as_ref()).await?;
         let (access, relative_path) = self.resolve_path("metadata", path)?;
         let result = access.operator().stat(&relative_path).await;
         self.check_read_active("metadata")?;
@@ -398,6 +510,7 @@ impl Storage for IcebergFsStorage {
 
     async fn read(&self, path: &str) -> Result<Bytes> {
         self.check_read_active("read")?;
+        let _io = optional_io_permit(self.admission.as_ref()).await?;
         let (access, relative_path) = self.resolve_path("read", path)?;
         let result = access.operator().read(&relative_path).await;
         self.check_read_active("read")?;
@@ -412,40 +525,77 @@ impl Storage for IcebergFsStorage {
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
         self.check_read_active("reader")?;
+        let _io = optional_io_permit(self.admission.as_ref()).await?;
         let (access, relative_path) = self.resolve_path("reader", path)?;
         self.check_read_active("reader")?;
         Ok(Box::new(IcebergFsFileRead {
             access,
             relative_path,
             control: self.read_control(),
+            admission: self.admission.clone(),
         }))
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        let permit = match &self.admission {
+            Some(admission) => Some(admission.clone().admit(path)?.acquire().await?),
+            None => None,
+        };
         let (access, relative_path) = self.resolve_path("write", path)?;
         let op = access.operator();
+        if let Some(permit) = &permit {
+            permit.check_active()?;
+        }
         Self::ensure_parent_dir(&op, &relative_path).await?;
+        if let Some(permit) = &permit {
+            permit.check_active()?;
+        }
+        // A dispatched single PUT is awaited to actual exit. Cancellation cannot
+        // drop its future and pretend that its external write stopped.
         op.write(&relative_path, bs).await.map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
                 format!("fs write({path}) through {relative_path}: {e}"),
             )
         })?;
+        if let Some(permit) = &permit {
+            permit.complete()?;
+            permit.check_active()?;
+        }
         Ok(())
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        let permit = match &self.admission {
+            Some(admission) => Some(admission.clone().admit(path)?.acquire().await?),
+            None => None,
+        };
         let (access, relative_path) = self.resolve_path("writer", path)?;
         let op = access.operator();
+        if let Some(permit) = &permit {
+            permit.check_active()?;
+        }
         Self::ensure_parent_dir(&op, &relative_path).await?;
-        let writer = op.writer(&relative_path).await.map_err(|e| {
+        if let Some(permit) = &permit {
+            permit.check_active()?;
+        }
+        let mut writer = op.writer(&relative_path).await.map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
                 format!("fs writer({path}) through {relative_path}: {e}"),
             )
         })?;
+        if let Some(permit) = &permit {
+            permit
+                .stream_started
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Err(error) = permit.check_active() {
+                return Err(abort_after_failure(&mut writer, error, Some(permit)).await);
+            }
+        }
         Ok(Box::new(IcebergFsFileWrite {
             writer: Some(writer),
+            permit,
         }))
     }
 
@@ -486,6 +636,7 @@ struct IcebergFsFileRead {
     access: IcebergFsAccess,
     relative_path: String,
     control: Option<Arc<dyn ConnectorOperationControl>>,
+    admission: Option<Arc<dyn IcebergWriteAdmission>>,
 }
 
 impl std::fmt::Debug for IcebergFsFileRead {
@@ -513,6 +664,9 @@ fn check_read_active(
 #[async_trait]
 impl FileRead for IcebergFsFileRead {
     async fn read(&self, range: Range<u64>) -> Result<Bytes> {
+        if let Some(admission) = &self.admission {
+            admission.check_active()?;
+        }
         check_read_active(self.control.as_ref(), "range read")?;
         if range.end < range.start {
             return Err(Error::new(
@@ -521,12 +675,16 @@ impl FileRead for IcebergFsFileRead {
             ));
         }
 
+        let _io = optional_io_permit(self.admission.as_ref()).await?;
         let operator = self.access.operator();
         let relative_path = self.relative_path.clone();
         let result = operator
             .read_with(&relative_path)
             .range(range.clone())
             .await;
+        if let Some(admission) = &self.admission {
+            admission.check_active()?;
+        }
         check_read_active(self.control.as_ref(), "range read")?;
         result.map(|buffer| buffer.to_bytes()).map_err(|e| {
             Error::new(
@@ -542,6 +700,7 @@ impl FileRead for IcebergFsFileRead {
 
 struct IcebergFsFileWrite {
     writer: Option<crate::opendal::Writer>,
+    permit: Option<WritePermit>,
 }
 
 impl std::fmt::Debug for IcebergFsFileWrite {
@@ -552,30 +711,170 @@ impl std::fmt::Debug for IcebergFsFileWrite {
     }
 }
 
+async fn abort_after_failure(
+    writer: &mut crate::opendal::Writer,
+    error: Error,
+    permit: Option<&WritePermit>,
+) -> Error {
+    match writer.abort().await {
+        Ok(()) => {
+            if let Some(permit) = permit {
+                permit.confirm_exit();
+            }
+            error
+        }
+        Err(abort) => {
+            if let Some(permit) = permit {
+                permit.admission.record_exit_failure(
+                    &permit.object,
+                    StreamExitFailure::AbortFailed(abort.to_string()),
+                );
+            }
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("fs write failed: {error}; multipart abort failed: {abort}"),
+            )
+        }
+    }
+}
+
+impl Drop for IcebergFsFileWrite {
+    fn drop(&mut self) {
+        // FileWrite has no public abort method. An abandoned governed writer must
+        // still release its multipart upload before its operation's permit exits.
+        if let (Some(mut writer), Some(permit)) = (self.writer.take(), self.permit.take()) {
+            let runtime = permit.admission.runtime();
+            let admission = permit.admission.clone();
+            let object = permit.object.clone();
+            let result = runtime.block_on(async move {
+                let result = writer.abort().await;
+                match &result {
+                    Ok(()) => permit.confirm_exit(),
+                    Err(error) => permit.admission.record_exit_failure(
+                        &permit.object,
+                        StreamExitFailure::AbortFailed(error.to_string()),
+                    ),
+                }
+                drop(permit);
+                result
+            });
+            let failure = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(_)) => None, // recorded before releasing the permit
+                Err(error) => Some(StreamExitFailure::BridgeFailed(error)),
+            };
+            if let Some(failure) = failure {
+                admission.record_exit_failure(&object, failure);
+            }
+        }
+    }
+}
+
+/// RetryWrapper moves the writer into the pending future. Never drop that future
+/// on cancellation: wait for its actual exit so the owner can abort the next segment.
+async fn await_stream_step<T>(
+    permit: Option<&WritePermit>,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<(T, Option<Error>)> {
+    let Some(permit) = permit else {
+        return future.await.map(|value| (value, None));
+    };
+    permit.check_active()?;
+    let cancellation = permit.admission.cancellation();
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        error = cancellation.ended() => {
+            let value = future.await?;
+            Ok((value, Some(crate::commit::operation::stopped_error(error))))
+        },
+        result = &mut future => result.map(|value| (value, permit.check_active().err())),
+    }
+}
+
 #[async_trait]
 impl FileWrite for IcebergFsFileWrite {
     async fn write(&mut self, bs: Bytes) -> Result<()> {
-        let writer = self
+        if self.permit.is_none() {
+            return self
+                .writer
+                .as_mut()
+                .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "write to closed fs file"))?
+                .write(bs)
+                .await
+                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs write: {e}")));
+        }
+        let mut writer = self
             .writer
-            .as_mut()
+            .take()
             .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "write to closed fs file"))?;
-        writer
-            .write(bs)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs write: {e}")))
+        let result = await_stream_step(self.permit.as_ref(), async {
+            writer.write(bs).await.map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "fs stream write failed").with_source(e)
+            })
+        })
+        .await;
+        match result {
+            Ok(((), None)) => {
+                self.writer = Some(writer);
+                Ok(())
+            }
+            Ok(((), Some(error))) | Err(error) => {
+                let error = abort_after_failure(&mut writer, error, self.permit.as_ref()).await;
+                self.permit.take();
+                Err(error)
+            }
+        }
     }
 
     async fn close(&mut self) -> Result<()> {
+        if self.permit.is_none() {
+            let mut writer = self
+                .writer
+                .take()
+                .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "fs file already closed"))?;
+            writer
+                .close()
+                .await
+                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs close: {e}")))?;
+            return Ok(());
+        }
         let mut writer = self
             .writer
             .take()
             .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "fs file already closed"))?;
-        writer
-            .close()
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs close: {e}")))?;
-        Ok(())
+        let result = await_stream_step(self.permit.as_ref(), async {
+            writer.close().await.map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "fs stream close failed").with_source(e)
+            })
+        })
+        .await;
+        let result = match result {
+            Ok((_metadata, stopped)) => {
+                // Close has already completed externally. There is no multipart upload
+                // left to abort; retain its object in the ledger for known-uncommitted cleanup.
+                self.permit.as_ref().map_or(Ok(()), WritePermit::complete)?;
+                stopped.map_or(Ok(()), Err)
+            }
+            Err(error) => Err(abort_after_failure(&mut writer, error, self.permit.as_ref()).await),
+        };
+        self.permit.take();
+        result
     }
+}
+
+pub(crate) fn build_admitted_file_io_for_location(
+    location: &str,
+    binding: IcebergReadBinding,
+    admission: Arc<dyn IcebergWriteAdmission>,
+) -> FileIO {
+    let _ = location;
+    FileIOBuilder::new(Arc::new(IcebergFileSystemFactory {
+        binding: Some(binding),
+        listing: None,
+        admission: Some(admission),
+    }))
+    .build()
 }
 
 pub fn build_file_io_for_location(location: &str, binding: IcebergReadBinding) -> FileIO {
@@ -599,6 +898,7 @@ pub(crate) fn build_bounded_file_io_for_location(
     let factory = IcebergFileSystemFactory {
         binding: Some(binding),
         listing: Some((bound, workspace_bytes)),
+        admission: None,
     };
     Ok(FileIOBuilder::new(Arc::new(factory)).build())
 }
@@ -709,6 +1009,296 @@ mod tests {
         build_file_io_for_location, format_resolved_location, resolve_access_for_location,
         resolve_access_for_locations,
     };
+
+    #[derive(Debug)]
+    struct ControlledAdmission {
+        cancellation: novarocks_fs::FileCancellation,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        runtime: crate::resources::IcebergCatalogRuntime,
+        completed: std::sync::atomic::AtomicUsize,
+        exit_failures: std::sync::Mutex<Vec<super::StreamExitFailure>>,
+    }
+    #[async_trait::async_trait]
+    impl super::IcebergWriteAdmission for ControlledAdmission {
+        fn check_active(&self) -> crate::iceberg::Result<()> {
+            self.cancellation
+                .check()
+                .map_err(crate::commit::operation::stopped_error)
+        }
+        fn check_output_active(
+            &self,
+            _: &crate::commit::model::ObjectIdentity,
+        ) -> crate::iceberg::Result<()> {
+            self.check_active()
+        }
+        fn cancellation(&self) -> novarocks_fs::FileCancellation {
+            self.cancellation.clone()
+        }
+        fn runtime(&self) -> crate::resources::IcebergCatalogRuntime {
+            self.runtime.clone()
+        }
+        fn admit(self: Arc<Self>, path: &str) -> crate::iceberg::Result<super::WritePermit> {
+            Ok(super::WritePermit::new(
+                self,
+                crate::commit::model::ObjectIdentity::new(path)?,
+            ))
+        }
+        fn mark_written(
+            &self,
+            _: &crate::commit::model::ObjectIdentity,
+        ) -> crate::iceberg::Result<()> {
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn record_exit_failure(
+            &self,
+            _: &crate::commit::model::ObjectIdentity,
+            failure: super::StreamExitFailure,
+        ) {
+            let mut failures = self.exit_failures.lock().unwrap();
+            if failures.is_empty() || !matches!(failure, super::StreamExitFailure::Unconfirmed) {
+                failures.push(failure);
+            }
+        }
+        async fn io_permit(&self) -> crate::iceberg::Result<tokio::sync::OwnedSemaphorePermit> {
+            Ok(self.semaphore.clone().acquire_owned().await.unwrap())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct WriterEvents {
+        started: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+        log: std::sync::Mutex<Vec<&'static str>>,
+        fail_abort: std::sync::atomic::AtomicBool,
+    }
+    #[derive(Debug, Clone)]
+    struct ControlledWriterService {
+        events: Arc<WriterEvents>,
+        delay_close: bool,
+        fail_write: bool,
+    }
+    impl crate::opendal::raw::Access for ControlledWriterService {
+        type Reader = crate::opendal::raw::oio::Reader;
+        type Writer = crate::opendal::raw::oio::Writer;
+        type Lister = crate::opendal::raw::oio::Lister;
+        type Deleter = crate::opendal::raw::oio::Deleter;
+        fn info(&self) -> Arc<crate::opendal::raw::AccessorInfo> {
+            let info = crate::opendal::raw::AccessorInfo::default();
+            info.set_scheme("mock")
+                .set_native_capability(crate::opendal::Capability {
+                    write: true,
+                    write_can_multi: true,
+                    ..Default::default()
+                });
+            Arc::new(info)
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: crate::opendal::raw::OpWrite,
+        ) -> crate::opendal::Result<(crate::opendal::raw::RpWrite, Self::Writer)> {
+            Ok((
+                crate::opendal::raw::RpWrite::new(),
+                Box::new(ControlledWriter(self.clone())),
+            ))
+        }
+    }
+    #[derive(Debug)]
+    struct ControlledWriter(ControlledWriterService);
+    impl crate::opendal::raw::oio::Write for ControlledWriter {
+        async fn write(&mut self, _: crate::opendal::Buffer) -> crate::opendal::Result<()> {
+            self.0.events.log.lock().unwrap().push("write-start");
+            if self.0.fail_write {
+                return Err(crate::opendal::Error::new(
+                    crate::opendal::ErrorKind::Unexpected,
+                    "injected write failure",
+                ));
+            }
+            if !self.0.delay_close {
+                self.0.events.started.notify_one();
+                self.0.events.resume.notified().await;
+            }
+            self.0.events.log.lock().unwrap().push("write-exit");
+            Ok(())
+        }
+        async fn close(&mut self) -> crate::opendal::Result<crate::opendal::Metadata> {
+            self.0.events.log.lock().unwrap().push("close-start");
+            if self.0.delay_close {
+                self.0.events.started.notify_one();
+                self.0.events.resume.notified().await;
+            }
+            self.0.events.log.lock().unwrap().push("close-exit");
+            Ok(crate::opendal::Metadata::new(
+                crate::opendal::EntryMode::FILE,
+            ))
+        }
+        async fn abort(&mut self) -> crate::opendal::Result<()> {
+            self.0.events.log.lock().unwrap().push("abort-exit");
+            if self
+                .0
+                .events
+                .fail_abort
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::opendal::Error::new(
+                    crate::opendal::ErrorKind::Unexpected,
+                    "injected abort failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    async fn governed_mock_writer(
+        delay_close: bool,
+        fail_write: bool,
+    ) -> (
+        super::IcebergFsFileWrite,
+        Arc<ControlledAdmission>,
+        Arc<WriterEvents>,
+    ) {
+        use super::IcebergWriteAdmission;
+        let events = Arc::new(WriterEvents::default());
+        let service = ControlledWriterService {
+            events: events.clone(),
+            delay_close,
+            fail_write,
+        };
+        let accessor: crate::opendal::raw::Accessor = Arc::new(service);
+        // Exercise the exact SDK wrapper which moves inner ownership into the pending future.
+        let operator = crate::opendal::Operator::from_inner(accessor)
+            .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
+        let admission = Arc::new(ControlledAdmission {
+            cancellation: novarocks_fs::FileCancellation::new(),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            runtime: crate::resources::IcebergCatalogRuntime::new(tokio::runtime::Handle::current()),
+            completed: std::sync::atomic::AtomicUsize::new(0),
+            exit_failures: std::sync::Mutex::new(Vec::new()),
+        });
+        let permit = admission
+            .clone()
+            .admit("mock.puffin")
+            .unwrap()
+            .acquire()
+            .await
+            .unwrap();
+        let writer = operator.writer("mock.puffin").await.unwrap();
+        permit
+            .stream_started
+            .store(true, std::sync::atomic::Ordering::Release);
+        (
+            super::IcebergFsFileWrite {
+                writer: Some(writer),
+                permit: Some(permit),
+            },
+            admission,
+            events,
+        )
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_waits_for_retry_writer_exit_then_aborts_before_permit_release() {
+        use crate::iceberg::io::FileWrite;
+        let (mut writer, admission, events) = governed_mock_writer(false, false).await;
+        let task = tokio::spawn(async move { writer.write(Bytes::from_static(b"part")).await });
+        events.started.notified().await;
+        admission.cancellation.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "issued write must actually exit before abort"
+        );
+        assert_eq!(admission.semaphore.available_permits(), 0);
+        assert_eq!(*events.log.lock().unwrap(), ["write-start"]);
+        events.resume.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(
+            *events.log.lock().unwrap(),
+            ["write-start", "write-exit", "abort-exit"]
+        );
+        assert_eq!(admission.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_stream_aborts_with_restored_retry_owner() {
+        use crate::iceberg::io::FileWrite;
+        let (mut writer, admission, events) = governed_mock_writer(false, true).await;
+        assert!(writer.write(Bytes::from_static(b"part")).await.is_err());
+        assert_eq!(*events.log.lock().unwrap(), ["write-start", "abort-exit"]);
+        assert_eq!(admission.semaphore.available_permits(), 1);
+        assert!(writer.write(Bytes::from_static(b"part")).await.is_err());
+        assert_eq!(
+            events.log.lock().unwrap().len(),
+            2,
+            "no segment follows abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_waits_for_actual_close_and_retains_completed_object() {
+        use crate::iceberg::io::FileWrite;
+        let (mut writer, admission, events) = governed_mock_writer(true, false).await;
+        let task = tokio::spawn(async move { writer.close().await });
+        events.started.notified().await;
+        admission.cancellation.cancel();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(admission.semaphore.available_permits(), 0);
+        events.resume.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(*events.log.lock().unwrap(), ["close-start", "close-exit"]);
+        assert_eq!(
+            admission
+                .completed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(admission.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_governed_writer_waits_for_abort_on_injected_runtime() {
+        let (writer, admission, events) = governed_mock_writer(false, false).await;
+        drop(writer);
+        assert_eq!(*events.log.lock().unwrap(), ["abort-exit"]);
+        assert_eq!(admission.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_stream_retains_abort_failure_diagnostic() {
+        use crate::iceberg::io::FileWrite;
+        let (mut writer, admission, events) = governed_mock_writer(false, true).await;
+        events
+            .fail_abort
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(writer.write(Bytes::from_static(b"part")).await.is_err());
+        assert_eq!(admission.semaphore.available_permits(), 1);
+        assert_eq!(admission.exit_failures.lock().unwrap().len(), 1);
+        assert!(
+            admission.exit_failures.lock().unwrap()[0]
+                .to_string()
+                .contains("injected abort failure")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_writer_retains_abort_failure_instead_of_claiming_cleanup() {
+        let (writer, admission, events) = governed_mock_writer(false, false).await;
+        events
+            .fail_abort
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(writer);
+        assert_eq!(*events.log.lock().unwrap(), ["abort-exit"]);
+        assert_eq!(admission.semaphore.available_permits(), 1);
+        assert_eq!(admission.exit_failures.lock().unwrap().len(), 1);
+        assert!(
+            admission.exit_failures.lock().unwrap()[0]
+                .to_string()
+                .contains("Multipart abort failed")
+        );
+    }
 
     #[test]
     fn directory_listing_checks_names_and_old_new_backing_before_growth() {

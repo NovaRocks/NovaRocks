@@ -454,6 +454,25 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         }
     }
 
+    async fn load_commit_base(
+        &self,
+        table: CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+    ) -> crate::iceberg::Result<super::CatalogCommitBase> {
+        let ident = super::delegate::table_ident(&table).map_err(|error| {
+            crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.to_string())
+                .with_source(error)
+        })?;
+        let response = self
+            .client
+            .load_table_deferred_with_access_delegation(&ident)
+            .await?;
+        let (materialization, _response_delegation) = response.into_parts();
+        // This reload consumes metadata only. The already-admitted operation
+        // retains its exact resolver and renews credentials through its owner.
+        super::CatalogCommitBase::from_table(materialization.materialize_with_file_io(file_io)?)
+    }
+
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
         self.delegate.view_exists(&view).await
     }
@@ -550,9 +569,10 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         table: CatalogTableName,
         _metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::BootstrapSnapshot, &table.clone().into())
-        {
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::AnchorWrittenMetadata,
+            &table.clone().into(),
+        ) {
             return CatalogOutcome::Unsupported(reason);
         }
         // This catalog owns its own metadata pointer, so a committed write is

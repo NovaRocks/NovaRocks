@@ -321,6 +321,20 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             .map_err(|error| super::error::map_read_error(&error))
     }
 
+    async fn load_commit_base(
+        &self,
+        table: CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+    ) -> crate::iceberg::Result<super::CatalogCommitBase> {
+        let ident = super::delegate::table_ident(&table).map_err(|error| {
+            crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.to_string())
+                .with_source(error)
+        })?;
+        super::CatalogCommitBase::from_table(
+            self.client.load_table_for_commit(&ident, file_io).await?,
+        )
+    }
+
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
         self.delegate.view_exists(&view).await
     }
@@ -379,9 +393,10 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         table: CatalogTableName,
         metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::BootstrapSnapshot, &table.clone().into())
-        {
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::AnchorWrittenMetadata,
+            &table.clone().into(),
+        ) {
             return CatalogOutcome::Unsupported(reason);
         }
         // The namespace has to exist before the table can be anchored under it.

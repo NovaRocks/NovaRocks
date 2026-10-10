@@ -531,7 +531,6 @@ mod tests {
                 "true".to_string(),
             )]))
             .apply(transaction)
-            .await
             .expect("stage empty fast append");
         transaction
             .commit(fixture.catalog.as_ref())

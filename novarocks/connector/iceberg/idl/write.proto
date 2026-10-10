@@ -175,12 +175,27 @@ message IcebergDataFileArtifact {
   optional int64 first_row_id = 5;
 }
 
+// Exact logical delete entry; a Puffin object may contain multiple DV entries.
+message IcebergMergedDeleteReference {
+  oneof entry {
+    string delete_file_path = 1;
+    IcebergDeletionVectorReference deletion_vector = 2;
+  }
+}
+
+message IcebergDeletionVectorReference {
+  string path = 1;
+  int64 content_offset = 2;
+  int64 content_size_in_bytes = 3;
+  string referenced_data_file = 4;
+}
+
 message IcebergPositionDeleteFileArtifact {
   string path = 1;
   IcebergArtifactPartition partition = 2;
   IcebergArtifactMetrics metrics = 3;
   string referenced_data_file = 4;
-  repeated string merged_old_references = 5;
+  repeated IcebergMergedDeleteReference merged_old_references = 5;
 }
 
 message IcebergDeletionVectorArtifact {
@@ -190,7 +205,7 @@ message IcebergDeletionVectorArtifact {
   string referenced_data_file = 4;
   IcebergContentRange content_range = 5;
   uint64 cardinality = 6;
-  repeated string merged_old_references = 7;
+  repeated IcebergMergedDeleteReference merged_old_references = 7;
 }
 
 message IcebergEqualityDeleteFileArtifact {

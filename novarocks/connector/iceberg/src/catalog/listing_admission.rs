@@ -117,6 +117,45 @@ impl ListingAdmission {
         self.positions.available_permits()
     }
 
+    /// Source revalidation retains admission until the already-issued SDK call
+    /// actually exits. Its caller checks stop/deadline before each subsequent
+    /// page or stat request, so waiting never authorizes another source request.
+    pub(crate) async fn run_wait_for_exit<T>(
+        &self,
+        context: &ConnectorRequestContext,
+        call: impl Future<Output = Result<T, ConnectorError>>,
+    ) -> Result<T, ConnectorError> {
+        context.check_active()?;
+        let deadline = tokio::time::Instant::from_std(context.deadline());
+        let permit = tokio::select! {
+            biased;
+            _ = context.stop().stopped() => return Err(cancelled()),
+            _ = tokio::time::sleep_until(deadline) => return Err(expired()),
+            permit = self.positions.clone().acquire_owned() => permit.map_err(|_| ConnectorError::new(ConnectorErrorKind::Internal, "catalog listing admission was closed"))?,
+        };
+        context.check_active()?;
+        let result = {
+            tokio::pin!(call);
+            tokio::select! {
+                biased;
+                _ = context.stop().stopped() => {
+                    let _ = call.await;
+                    Err(cancelled())
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = call.await;
+                    Err(expired())
+                },
+                result = &mut call => {
+                    context.check_active()?;
+                    result
+                },
+            }
+        };
+        drop(permit);
+        result
+    }
+
     pub(crate) async fn run<T>(
         &self,
         context: &ConnectorRequestContext,
@@ -192,6 +231,50 @@ mod tests {
             );
             self.dropped.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn source_stop_retains_position_until_the_issued_call_actually_exits() {
+        let gate = ListingAdmission {
+            positions: Arc::new(Semaphore::new(1)),
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            observer: Default::default(),
+        };
+        let stop = ConnectorStopOwner::new();
+        let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
+        let polled = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let call = {
+            let polled = polled.clone();
+            let exited = exited.clone();
+            async move {
+                polled.store(true, Ordering::SeqCst);
+                released.await.unwrap();
+                exited.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let outcome = gate.run_wait_for_exit(&ctx, call);
+        tokio::pin!(outcome);
+        assert!(futures::poll!(outcome.as_mut()).is_pending());
+        assert!(polled.load(Ordering::SeqCst));
+        assert_eq!(gate.positions.available_permits(), 0);
+
+        stop.request_stop();
+        // Poll after the selected stop, while the real call remains pending.
+        // Dropping the SDK future on stop would return Ready here.
+        assert!(futures::poll!(outcome.as_mut()).is_pending());
+        assert!(!exited.load(Ordering::SeqCst));
+        assert_eq!(gate.positions.available_permits(), 0);
+
+        release.send(()).unwrap();
+        assert_eq!(
+            outcome.await.unwrap_err().kind(),
+            ConnectorErrorKind::Cancelled
+        );
+        assert!(exited.load(Ordering::SeqCst));
+        assert_eq!(gate.positions.available_permits(), 1);
     }
 
     #[tokio::test]

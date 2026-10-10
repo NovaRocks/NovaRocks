@@ -236,7 +236,15 @@ fn finish_standard_publication(
     publish: crate::query_execution::dml::ctas::PreparedStandardCtasCatalogAction,
 ) -> Result<(), DmlError> {
     match engine.publish_standard_ctas(publish.handle.as_ref()) {
-        Ok(StandardCtasPublishOutcome::KnownUncommitted { failure }) => {
+        Ok(StandardCtasPublishOutcome::KnownUncommitted {
+            mut failure,
+            cleanup,
+        }) => {
+            if let ExternalMutationFinalization::Failed(cleanup_failure) = cleanup {
+                failure
+                    .message
+                    .push_str(&format!("; cleanup failed: {cleanup_failure}"));
+            }
             Err(pre_dispatch_failure(attempt, "", failure))
         }
         Ok(StandardCtasPublishOutcome::Applied { finalization, .. })

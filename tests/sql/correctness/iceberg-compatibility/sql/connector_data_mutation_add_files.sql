@@ -72,9 +72,9 @@ ORDER BY new_id;
 
 -- query 4
 -- A second statement reaches the refreshed target base and is rejected by the
--- lake-side duplicate-file validation; no frontend source-scope ledger is a
--- correctness authority.
--- @expect_error=source already exists in the target table
+-- RegisteredFilesNotLive dependency against the exact target-ref live set;
+-- no frontend source-scope ledger is a correctness authority.
+-- @expect_error=Broken { dependency: RegisteredFilesNotLive
 ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0}
   ADD FILES FROM 's3://warehouse/c2-add-files-${uuid0}';
 

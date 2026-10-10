@@ -42,6 +42,7 @@ pub enum ResolvedCatalogMutation {
     KnownCommitted(CompletedCatalogMutation),
     KnownUncommitted {
         failure: ConnectorMutationFailure,
+        cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,
@@ -62,6 +63,20 @@ pub enum ResolvedCatalogMutation {
 pub enum MutationDispatchState {
     ConfirmedNotDispatched,
     PossiblyDispatched,
+}
+
+/// Cleanup failure accompanies the definite publication failure; it never
+/// changes the verdict or makes the mutation eligible for a replay.
+pub(crate) fn known_uncommitted_message(
+    failure: impl std::fmt::Display,
+    cleanup: &ExternalMutationFinalization,
+) -> String {
+    match cleanup {
+        ExternalMutationFinalization::Complete => failure.to_string(),
+        ExternalMutationFinalization::Failed(error) => {
+            format!("{failure}; artifact cleanup failed: {error}")
+        }
+    }
 }
 
 /// Executes an external mutation once. A provider may return `CommitUnknown`
@@ -85,9 +100,10 @@ pub fn execute_catalog_mutation(
                 Ok(completed)
             }
         }
-        ResolvedCatalogMutation::KnownUncommitted { failure } => {
-            Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
-        }
+        ResolvedCatalogMutation::KnownUncommitted { failure, cleanup } => Err(
+            EngineError::commit_known_uncommitted(known_uncommitted_message(failure, &cleanup))
+                .to_string(),
+        ),
         ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
             Err(EngineError::commit_unknown(failure.to_string()).to_string())
         }
@@ -167,8 +183,8 @@ pub fn dispatch_catalog_mutation_once_with_lease(
             receipt,
             finalization,
         }),
-        Ok(ExternalMutationOutcome::KnownUncommitted { failure }) => {
-            ResolvedCatalogMutation::KnownUncommitted { failure }
+        Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup }) => {
+            ResolvedCatalogMutation::KnownUncommitted { failure, cleanup }
         }
         Ok(ExternalMutationOutcome::CommitUnknown { failure, evidence }) => {
             ResolvedCatalogMutation::CommitUnknown { failure, evidence }
@@ -209,8 +225,8 @@ fn resolve_outcome(
             receipt,
             finalization,
         }),
-        ExternalMutationOutcome::KnownUncommitted { failure } => {
-            ResolvedCatalogMutation::KnownUncommitted { failure }
+        ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+            ResolvedCatalogMutation::KnownUncommitted { failure, cleanup }
         }
         ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
             ResolvedCatalogMutation::CommitUnknown { failure, evidence }

@@ -134,6 +134,7 @@ pub enum ResolvedMetadataMaintenance {
     KnownCommitted(CompletedMetadataMaintenance),
     KnownUncommitted {
         failure: KnownUncommittedMetadataMaintenance,
+        cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,
@@ -175,9 +176,12 @@ pub fn execute_metadata_maintenance(
                 Ok(completed)
             }
         }
-        ResolvedMetadataMaintenance::KnownUncommitted { failure } => {
-            Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
-        }
+        ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => Err(
+            EngineError::commit_known_uncommitted(super::mutation::known_uncommitted_message(
+                failure, &cleanup,
+            ))
+            .to_string(),
+        ),
         ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
             Err(EngineError::commit_unknown(failure.to_string()).to_string())
         }
@@ -203,9 +207,12 @@ pub fn execute_planned_metadata_maintenance(
                 Ok(completed)
             }
         }
-        ResolvedMetadataMaintenance::KnownUncommitted { failure } => {
-            Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
-        }
+        ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => Err(
+            EngineError::commit_known_uncommitted(super::mutation::known_uncommitted_message(
+                failure, &cleanup,
+            ))
+            .to_string(),
+        ),
         ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
             Err(EngineError::commit_unknown(failure.to_string()).to_string())
         }
@@ -228,7 +235,9 @@ pub fn plan_metadata_maintenance_session(
 
 fn resolved_error_message(value: ResolvedMetadataMaintenance) -> String {
     match value {
-        ResolvedMetadataMaintenance::KnownUncommitted { failure } => failure.to_string(),
+        ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => {
+            super::mutation::known_uncommitted_message(failure, &cleanup)
+        }
         ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => failure.to_string(),
         ResolvedMetadataMaintenance::ContractFailure { error, .. } => error.to_string(),
         ResolvedMetadataMaintenance::KnownCommitted(_) => {
@@ -345,6 +354,7 @@ impl MetadataMaintenanceSession {
             })
             .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Planning(error),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             })?;
         if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
             return Err(contract_failure(
@@ -358,12 +368,14 @@ impl MetadataMaintenanceSession {
         let operation = intent.into_operation(metadata.table).map_err(|error| {
             ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Planning(error),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             }
         })?;
         let plan = lease
             .plan_operation(operation_id, operation, context.clone())
             .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Planning(error),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             })?;
         Ok(Self {
             lease,
@@ -425,9 +437,10 @@ fn resolve_terminal_outcome(
                 finalization: merge_finalization(finalization, generic_finalization),
             })
         }
-        ExternalMutationOutcome::KnownUncommitted { failure } => {
+        ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Provider(failure),
+                cleanup,
             }
         }
         ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
@@ -948,7 +961,8 @@ mod tests {
                 context()
             ),
             ResolvedMetadataMaintenance::KnownUncommitted {
-                failure: KnownUncommittedMetadataMaintenance::Planning(_)
+                failure: KnownUncommittedMetadataMaintenance::Planning(_),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete
             }
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);

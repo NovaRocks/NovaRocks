@@ -210,7 +210,9 @@ pub(crate) fn reserve_window(
     scope: &WorkScope,
     class: ResultWindowClass,
 ) -> Result<ResultWindowGrant, WorkError> {
-    if state.closed {
+    // Admission closure rejects new computation; an existing owner's bounded
+    // terminal delivery still requires its independent Closing position.
+    if state.closed && class != ResultWindowClass::Closing {
         return Err(WorkError::Closed);
     }
     let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
@@ -670,6 +672,153 @@ mod tests {
         let alias = window.retain_alias();
         assert!(alias.is_for_scope(&a.owner.scope()));
         assert!(!alias.is_for_scope(&b.owner.scope()));
+    }
+
+    #[test]
+    fn closed_admission_preserves_only_bounded_existing_cancel_delivery() {
+        let (control, capacity) = control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = root.owner.scope();
+        control.close_admission();
+        assert!(matches!(
+            control.try_begin_root(WorkRequest::new(WorkClass::Management)),
+            Err(WorkError::Closed)
+        ));
+        // Internal also covers scalar result delivery. None of the ordinary
+        // classes can admit fresh backing after the root gate has closed.
+        for class in [
+            ResultWindowClass::Client,
+            ResultWindowClass::Local,
+            ResultWindowClass::Internal,
+        ] {
+            assert!(matches!(
+                capacity.try_acquire(&scope, class),
+                Err(WorkError::Closed)
+            ));
+        }
+        assert!(matches!(
+            capacity.try_acquire(&scope, ResultWindowClass::Closing),
+            Err(WorkError::Conflict)
+        ));
+        assert!(matches!(
+            capacity.try_acquire_closing(&scope, ResultClosingCut::AcceptedCancellation),
+            Err(WorkError::Conflict)
+        ));
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(
+            control.cancel_active_roots(crate::CancellationReason::FrontendDrainDeadlineExceeded),
+            1
+        );
+        let closing = capacity
+            .try_acquire_closing(&scope, ResultClosingCut::AcceptedCancellation)
+            .unwrap();
+        assert_eq!(closing.class(), ResultWindowClass::Closing);
+        assert_eq!(
+            closing.closing_cut(),
+            Some(ResultClosingCut::AcceptedCancellation)
+        );
+        assert!(closing.is_for_scope(&scope));
+        assert!(
+            closing
+                .check_backing_total(closing.all_objects_bytes())
+                .is_ok()
+        );
+        assert!(matches!(
+            closing.check_backing_total(closing.all_objects_bytes() + 1),
+            Err(WorkError::Capacity("result backing envelope"))
+        ));
+        assert!(matches!(
+            capacity.try_acquire_closing(&scope, ResultClosingCut::AcceptedCancellation),
+            Err(WorkError::Capacity("complete result window"))
+        ));
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 0, 1]);
+
+        let alias = closing.retain_alias();
+        root.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
+        drop(closing);
+        assert_eq!(control.snapshot().businesses, 0);
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 0, 1]);
+        assert!(matches!(
+            capacity.try_acquire_closing(&scope, ResultClosingCut::AcceptedCancellation),
+            Err(WorkError::Capacity("complete result window"))
+        ));
+        drop(alias);
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert!(matches!(
+            capacity.try_acquire_closing(&scope, ResultClosingCut::AcceptedCancellation),
+            Err(WorkError::Released)
+        ));
+    }
+
+    #[test]
+    fn closed_admission_originating_failure_delivery_preserves_no_cancel_fact() {
+        let (control, capacity) = control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = root.owner.scope();
+        control.close_admission();
+        let closing = capacity
+            .try_acquire_closing(&scope, ResultClosingCut::OriginatingFailure)
+            .unwrap();
+        assert_eq!(
+            closing.closing_cut(),
+            Some(ResultClosingCut::OriginatingFailure)
+        );
+        assert!(scope.cancellation().unwrap().reason().is_none());
+        assert!(matches!(
+            capacity.try_acquire_closing(&scope, ResultClosingCut::AcceptedCancellation),
+            Err(WorkError::Conflict)
+        ));
+        assert!(matches!(
+            capacity.try_acquire_closing(&scope, ResultClosingCut::OriginatingFailure),
+            Err(WorkError::Capacity("complete result window"))
+        ));
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        drop(closing);
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert!(matches!(
+            capacity.try_acquire_closing(&scope, ResultClosingCut::OriginatingFailure),
+            Err(WorkError::Released)
+        ));
+    }
+
+    #[test]
+    fn closed_admission_closing_refuses_foreign_numeric_scope_identity() {
+        let (first, capacity) = control();
+        let (second, _) = control();
+        let own = first
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let foreign = second
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        assert_eq!(own.owner.scope().id(), foreign.owner.scope().id());
+        first.close_admission();
+        for cut in [
+            ResultClosingCut::AcceptedCancellation,
+            ResultClosingCut::OriginatingFailure,
+        ] {
+            assert!(matches!(
+                capacity.try_acquire_closing(&foreign.owner.scope(), cut),
+                Err(WorkError::ForeignAuthority)
+            ));
+        }
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        own.owner.complete();
+        own.business.release();
+        foreign.owner.complete();
+        foreign.business.release();
+        assert_eq!(first.snapshot().root_responsibilities, 0);
+        assert_eq!(second.snapshot().root_responsibilities, 0);
     }
 
     #[test]

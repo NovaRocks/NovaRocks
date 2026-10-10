@@ -1682,7 +1682,7 @@ impl<'a> AnalyzerContext<'a> {
                     let (name, column_id) = match &typed.kind {
                         ExprKind::ColumnRef {
                             column_id, column, ..
-                        } => (column.clone(), *column_id),
+                        } if !matches!(expr, ast::Expr::Cast(_)) => (column.clone(), *column_id),
                         _ => {
                             let n = expr_display_name(expr);
                             let id =
@@ -1690,6 +1690,20 @@ impl<'a> AnalyzerContext<'a> {
                             (n, id)
                         }
                     };
+                    // A direct reference keeps its original source record. New
+                    // occurrences retain the exact producer's complete witness
+                    // before planner symbol rewrites hand it to the root owner.
+                    // A same-carrier explicit CAST may simplify to a reference,
+                    // but still owns a separate output domain occurrence.
+                    if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                        || matches!(expr, ast::Expr::Cast(_))
+                    {
+                        let logical =
+                            self.logical_output_type(Some(expr), &typed, &effective_scope);
+                        self.factory
+                            .borrow_mut()
+                            .set_logical_type(column_id, logical);
+                    }
                     output_columns.push(OutputColumn {
                         column_id,
                         name: name.clone(),
@@ -1709,9 +1723,27 @@ impl<'a> AnalyzerContext<'a> {
                         self.substitute_select_aliases_for_select(typed, &projection, scope);
                     let name = alias.value.clone();
                     let column_id = match &typed.kind {
-                        ExprKind::ColumnRef { column_id, .. } => *column_id,
+                        ExprKind::ColumnRef { column_id, .. }
+                            if !matches!(expr, ast::Expr::Cast(_)) =>
+                        {
+                            *column_id
+                        }
                         _ => self.alloc_column_id(None, name.clone(), typed.value_type.clone()),
                     };
+                    // A direct reference keeps its original source record. New
+                    // occurrences retain the exact producer's complete witness
+                    // before planner symbol rewrites hand it to the root owner.
+                    // A same-carrier explicit CAST may simplify to a reference,
+                    // but still owns a separate output domain occurrence.
+                    if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
+                        || matches!(expr, ast::Expr::Cast(_))
+                    {
+                        let logical =
+                            self.logical_output_type(Some(expr), &typed, &effective_scope);
+                        self.factory
+                            .borrow_mut()
+                            .set_logical_type(column_id, logical);
+                    }
                     output_columns.push(OutputColumn {
                         column_id,
                         name: name.clone(),

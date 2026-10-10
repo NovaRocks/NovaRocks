@@ -44,6 +44,7 @@
 //! There is deliberately no branch that turns any of those into an empty old
 //! delete set, and no fallback to a frontend-inlined bitmap.
 
+use crate::commit::model::EntryIdentity;
 use std::collections::BTreeSet;
 
 use novarocks_fs::FileCancellation;
@@ -270,6 +271,26 @@ impl IcebergOldDeleteArtifactRef {
         })
     }
 
+    pub fn entry_identity(&self) -> EntryIdentity {
+        match self.file_format {
+            IcebergFileFormat::Puffin => {
+                let range = self.content_range.expect("validated Puffin content range");
+                EntryIdentity::DeletionVector {
+                    path: self.path.clone(),
+                    offset: range.offset(),
+                    length: range.size_in_bytes(),
+                    referenced_data_file: self
+                        .referenced_data_file
+                        .clone()
+                        .expect("validated Puffin referenced data file"),
+                }
+            }
+            _ => EntryIdentity::DeleteFile {
+                path: self.path.clone(),
+            },
+        }
+    }
+
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -359,10 +380,10 @@ impl IcebergOldDeleteMergeTarget {
                 "Iceberg old delete merge target requires a frozen base snapshot",
             ));
         }
-        references.sort_by(|left, right| left.path.cmp(&right.path));
+        references.sort_by_key(IcebergOldDeleteArtifactRef::entry_identity);
         let mut seen = BTreeSet::new();
         for reference in &references {
-            if !seen.insert(reference.path.as_str()) {
+            if !seen.insert(reference.entry_identity()) {
                 return Err(invalid(
                     "Iceberg old delete merge target repeats a delete artifact",
                 ));
@@ -426,7 +447,7 @@ impl IcebergOldDeleteMergeTarget {
 #[derive(Clone, Debug, Default)]
 pub struct IcebergOldDeleteMergeOutcome {
     positions: RoaringTreemap,
-    merged_references: Vec<String>,
+    merged_references: Vec<EntryIdentity>,
 }
 
 impl IcebergOldDeleteMergeOutcome {
@@ -441,7 +462,7 @@ impl IcebergOldDeleteMergeOutcome {
     /// The exact artifacts that were read, sorted. A staged artifact records
     /// this so `finish_write` can prove the new artifact superseded exactly the
     /// references the session froze.
-    pub fn merged_references(&self) -> &[String] {
+    pub fn merged_references(&self) -> &[EntryIdentity] {
         &self.merged_references
     }
 }
@@ -512,7 +533,7 @@ pub fn read_and_merge_old_deletes(
             .map_err(crate::file_reader::map_file_error)?;
         validate_decoded_positions(target, reference, &decoded)?;
         positions |= decoded;
-        merged_references.push(reference.path().to_string());
+        merged_references.push(reference.entry_identity());
     }
     file_context
         .check_active()

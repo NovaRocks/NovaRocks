@@ -1026,7 +1026,11 @@ fn aggregate_insert_expr_for_output(
         }
     }
 
-    if is_reuse_lineage_metadata_column(&output.name) {
+    // Preserve row identity while updated rows inherit their actual commit sequence.
+    if output
+        .name
+        .eq_ignore_ascii_case(crate::common::ICEBERG_ROW_ID_COL)
+    {
         return source_expr_by_name(input_outputs, old_outputs, &output.name)
             .map_err(SqlCompileError::from);
     }
@@ -3684,6 +3688,57 @@ mod tests {
             "INSERT row position locator must be NULL"
         );
         assert!(pos_item.expr.value_type.nullable);
+    }
+
+    #[test]
+    fn rewrite_aggregate_updated_target_inherits_sequence_and_preserves_physical_row_id() {
+        let mut ctx = build_ctx();
+        let arena_rc = ctx.scalar_arena();
+        let expr = to_optimizer_expr(
+            &delta(aggregate_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
+        let result = RewriteAggregateStateRule
+            .apply(expr, &mut ctx)
+            .expect("aggregate rewrite");
+        let changed = expect_changed_plan(result, &arena_rc.borrow());
+        let project = aggregate_change_stream_project(&changed);
+        let old_outputs = plan_output_columns(changed.unary_input().unary_input().left().right())
+            .expect("old outputs");
+        let row_id_item = project
+            .items
+            .iter()
+            .find(|item| item.output_name == crate::common::ICEBERG_ROW_ID_COL)
+            .unwrap();
+        let old_row_id =
+            find_output_column_by_name(&old_outputs, crate::common::ICEBERG_ROW_ID_COL)
+                .unwrap()
+                .column_id;
+        assert_eq!(
+            case_arm_column_ids(&row_id_item.expr),
+            (old_row_id, old_row_id)
+        );
+        let sequence_item = project
+            .items
+            .iter()
+            .find(|item| item.output_name == crate::common::ICEBERG_LAST_UPDATED_SEQ_COL)
+            .unwrap();
+        let (delete_sequence, insert_sequence) = case_arm_exprs(&sequence_item.expr);
+        assert_eq!(
+            column_id_through_cast(delete_sequence),
+            find_output_column_by_name(&old_outputs, crate::common::ICEBERG_LAST_UPDATED_SEQ_COL)
+                .unwrap()
+                .column_id
+        );
+        assert!(
+            matches!(
+                uncast_expr(insert_sequence).kind,
+                ExprKind::Literal(LiteralValue::Null)
+            ),
+            "updated MV target rows must inherit their actual commit sequence"
+        );
+        assert!(insert_sequence.value_type.nullable);
+        assert_eq!(insert_sequence.value_type.data_type, DataType::Int64);
     }
 
     #[test]

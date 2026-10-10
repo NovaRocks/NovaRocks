@@ -142,6 +142,8 @@ enum MessageKind {
     PositionDeleteFile,
     DeletionVector,
     EqualityDeleteFile,
+    MergedDeleteReference,
+    DeletionVectorReference,
 }
 
 #[derive(Clone, Copy)]
@@ -261,13 +263,19 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::PositionDeleteFile, 1) | (M::PositionDeleteFile, 4) => Some(singular(F::Text)),
         (M::PositionDeleteFile, 2) => Some(singular(F::Message(M::Partition))),
         (M::PositionDeleteFile, 3) => Some(singular(F::Message(M::Metrics))),
-        (M::PositionDeleteFile, 5) => Some(repeated(F::Text)),
+        (M::PositionDeleteFile, 5) => Some(repeated(F::Message(M::MergedDeleteReference))),
         (M::DeletionVector, 1) | (M::DeletionVector, 4) => Some(singular(F::Text)),
         (M::DeletionVector, 2) => Some(singular(F::Message(M::Partition))),
         (M::DeletionVector, 3) => Some(singular(F::Message(M::Metrics))),
         (M::DeletionVector, 5) => Some(singular(F::Message(M::ContentRange))),
         (M::DeletionVector, 6) => Some(singular(F::Varint)),
-        (M::DeletionVector, 7) => Some(repeated(F::Text)),
+        (M::DeletionVector, 7) => Some(repeated(F::Message(M::MergedDeleteReference))),
+        (M::MergedDeleteReference, 1) => Some(FieldRule::oneof(F::Text)),
+        (M::MergedDeleteReference, 2) => {
+            Some(FieldRule::oneof(F::Message(M::DeletionVectorReference)))
+        }
+        (M::DeletionVectorReference, 1 | 4) => Some(singular(F::Text)),
+        (M::DeletionVectorReference, 2 | 3) => Some(singular(F::Varint)),
         (M::EqualityDeleteFile, 1) => Some(singular(F::Text)),
         (M::EqualityDeleteFile, 2) => Some(singular(F::Message(M::Partition))),
         (M::EqualityDeleteFile, 3) => Some(singular(F::Message(M::Metrics))),
@@ -857,22 +865,42 @@ fn validate_old_delete_target(
             MAX_OLD_DELETE_REFERENCES,
             path.field("references"),
         )?;
-        let mut previous = None;
+        let mut previous: Option<LogicalDeleteReference<'_>> = None;
         for (index, reference) in target.references.iter().enumerate() {
-            validate_old_delete_ref(reference, path.field("references").index(index), context)?;
-            if match previous {
-                Some(value) => {
-                    compare_text(value, &reference.path, context)? != std::cmp::Ordering::Less
+            let entry_path = path.field("references").index(index);
+            validate_old_delete_ref(reference, entry_path.clone(), context)?;
+            let identity = if reference.file_format == dto::IcebergWriteFileFormat::Puffin as i32 {
+                let range = reference.content_range.as_ref().ok_or_else(|| {
+                    missing(
+                        entry_path.field("content_range"),
+                        "DV reference requires its range",
+                    )
+                })?;
+                let data_file = reference.referenced_data_file.as_deref().ok_or_else(|| {
+                    missing(
+                        entry_path.field("referenced_data_file"),
+                        "DV reference requires its data file",
+                    )
+                })?;
+                LogicalDeleteReference::Vector {
+                    path: &reference.path,
+                    offset: range.offset,
+                    length: range.size_in_bytes,
+                    referenced_data_file: data_file,
                 }
-                None => false,
-            } {
-                return Err(inconsistent(
-                    path.field("references").index(index).field("path"),
-                    "old-delete references must be sorted and unique",
-                ));
+            } else {
+                LogicalDeleteReference::File(&reference.path)
+            };
+            identity.validate(entry_path.clone(), context)?;
+            if let Some(previous) = previous {
+                if previous.compare(identity, context)? != std::cmp::Ordering::Less {
+                    return Err(inconsistent(
+                        entry_path,
+                        "old-delete references must be sorted and unique by logical entry",
+                    ));
+                }
             }
-            previous = Some(reference.path.as_str());
-
+            previous = Some(identity);
             context.observe_compile_step()?;
         }
         Ok(())
@@ -1058,7 +1086,7 @@ fn validate_delete_artifact_common(
     partition: Option<&dto::IcebergArtifactPartition>,
     metrics: Option<&dto::IcebergArtifactMetrics>,
     referenced_data_file: &str,
-    merged: &[String],
+    merged: &[dto::IcebergMergedDeleteReference],
     path: ConnectorFieldPath,
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<(), ConnectorCodecError> {
@@ -1077,30 +1105,148 @@ fn validate_delete_artifact_common(
             MAX_MERGED_OLD_REFERENCES,
             path.field("merged_old_references"),
         )?;
-        let mut previous = None;
+        let mut previous: Option<LogicalDeleteReference<'_>> = None;
         for (index, value) in merged.iter().enumerate() {
-            bounded_text(
-                value,
-                MAX_PATH_BYTES,
-                path.field("merged_old_references").index(index),
-                false,
-            )?;
-            if match previous {
-                Some(previous) => {
-                    compare_text(previous, value, context)? != std::cmp::Ordering::Less
+            let entry_path = path.field("merged_old_references").index(index);
+            let identity = validate_merged_reference(value, entry_path.clone(), context)?;
+            if let Some(previous) = previous {
+                if previous.compare(identity, context)? != std::cmp::Ordering::Less {
+                    return Err(inconsistent(
+                        entry_path,
+                        "merged old references must be sorted and unique",
+                    ));
                 }
-                None => false,
-            } {
-                return Err(inconsistent(
-                    path.field("merged_old_references").index(index),
-                    "merged old references must be sorted and unique",
-                ));
             }
-            previous = Some(value);
-
+            previous = Some(identity);
             context.observe_compile_step()?;
         }
         Ok(())
+    })();
+    context.observe_compile_step()?;
+    result
+}
+
+// Match EntryIdentity's variant/field ordering without copying DTO strings.
+#[derive(Clone, Copy)]
+enum LogicalDeleteReference<'a> {
+    File(&'a str),
+    Vector {
+        path: &'a str,
+        offset: i64,
+        length: i64,
+        referenced_data_file: &'a str,
+    },
+}
+impl LogicalDeleteReference<'_> {
+    fn validate(
+        self,
+        path: ConnectorFieldPath,
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<(), ConnectorCodecError> {
+        let result = (|| {
+            match self {
+                Self::File(value) => {
+                    bounded_text(value, MAX_PATH_BYTES, path.field("path"), false)?
+                }
+                Self::Vector {
+                    path: value,
+                    offset,
+                    length,
+                    referenced_data_file,
+                } => {
+                    bounded_text(value, MAX_PATH_BYTES, path.field("path"), false)?;
+                    bounded_text(
+                        referenced_data_file,
+                        MAX_PATH_BYTES,
+                        path.field("referenced_data_file"),
+                        false,
+                    )?;
+                    nonnegative(offset, path.field("content_offset"))?;
+                    if length <= 0 || offset.checked_add(length).is_none() {
+                        return Err(inconsistent(
+                            path,
+                            "DV reference requires a positive, non-overflowing range",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        context.observe_compile_step()?;
+        result
+    }
+    fn compare(
+        self,
+        other: Self,
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<std::cmp::Ordering, ConnectorCodecError> {
+        use std::cmp::Ordering;
+        context.flush_compile_control()?;
+        let ordering = match (self, other) {
+            (Self::File(left), Self::File(right)) => compare_text(left, right, context)?,
+            (Self::File(_), Self::Vector { .. }) => Ordering::Less,
+            (Self::Vector { .. }, Self::File(_)) => Ordering::Greater,
+            (
+                Self::Vector {
+                    path: left,
+                    offset: lo,
+                    length: ll,
+                    referenced_data_file: ld,
+                },
+                Self::Vector {
+                    path: right,
+                    offset: ro,
+                    length: rl,
+                    referenced_data_file: rd,
+                },
+            ) => {
+                let mut ordering = compare_text(left, right, context)?;
+                if ordering == Ordering::Equal {
+                    ordering = lo.cmp(&ro);
+                    context.observe_compile_step()?;
+                }
+                if ordering == Ordering::Equal {
+                    ordering = ll.cmp(&rl);
+                    context.observe_compile_step()?;
+                }
+                if ordering == Ordering::Equal {
+                    ordering = compare_text(ld, rd, context)?;
+                }
+                ordering
+            }
+        };
+        context.observe_compile_step()?;
+        Ok(ordering)
+    }
+}
+fn validate_merged_reference<'a>(
+    value: &'a dto::IcebergMergedDeleteReference,
+    path: ConnectorFieldPath,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<LogicalDeleteReference<'a>, ConnectorCodecError> {
+    context.flush_compile_control()?;
+    let result = (|| {
+        let identity = match value.entry.as_ref() {
+            Some(dto::iceberg_merged_delete_reference::Entry::DeleteFilePath(value)) => {
+                LogicalDeleteReference::File(value)
+            }
+            Some(dto::iceberg_merged_delete_reference::Entry::DeletionVector(value)) => {
+                LogicalDeleteReference::Vector {
+                    path: &value.path,
+                    offset: value.content_offset,
+                    length: value.content_size_in_bytes,
+                    referenced_data_file: &value.referenced_data_file,
+                }
+            }
+            None => {
+                return Err(inconsistent(
+                    path.clone(),
+                    "merged old reference requires an exact delete entry",
+                ));
+            }
+        };
+        identity.validate(path, context)?;
+        Ok(identity)
     })();
     context.observe_compile_step()?;
     result
@@ -1596,7 +1742,9 @@ mod compile_control_tests {
     fn fragments() -> Vec<dto::IcebergCommitFragment> {
         let merged = || {
             (0..321)
-                .map(|i| format!("s3://b/data/old-{i:04}.parquet"))
+                .map(|i| crate::commit::model::EntryIdentity::DeleteFile {
+                    path: format!("s3://b/data/old-{i:04}.parquet"),
+                })
                 .collect()
         };
         let artifacts = [
@@ -1964,6 +2112,80 @@ mod compile_control_tests {
             vec![0, 255, 3]
         );
     }
+    #[test]
+    fn logical_vector_reference_comparison_observes_the_complete_last_data_path() {
+        let expected = header(ConnectorCodecCategory::CommitFragment);
+        let data_left = format!("s3://b/{}a", "x".repeat(768));
+        let data_right = format!("s3://b/{}b", "x".repeat(768));
+        let left = LogicalDeleteReference::Vector {
+            path: "s3://b/shared.puffin",
+            offset: 4,
+            length: 64,
+            referenced_data_file: &data_left,
+        };
+        let right = LogicalDeleteReference::Vector {
+            path: "s3://b/shared.puffin",
+            offset: 4,
+            length: 64,
+            referenced_data_file: &data_right,
+        };
+        let baseline = Control::default();
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &baseline).unwrap();
+        assert_eq!(
+            left.compare(right, &mut context).unwrap(),
+            std::cmp::Ordering::Less
+        );
+        context.flush_compile_control().unwrap();
+        let trace = baseline.trace.lock().unwrap().clone();
+        // Constructor and comparison-entry checks can observe zero units.
+        // The short Puffin path and scalar range fields cannot fill a slice;
+        // the first full slice therefore reaches the final data-file field.
+        let refuse_at = trace
+            .iter()
+            .position(|(_, units)| *units == 256)
+            .expect("long referenced data path must perform a full observed slice")
+            + 1;
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((refuse_at, cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            let error = left.compare(right, &mut context).unwrap_err();
+            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(*control.trace.lock().unwrap(), trace[..refuse_at]);
+            assert_eq!(control.trace.lock().unwrap().last().unwrap().1, 256);
+            let count = control.trace.lock().unwrap().len();
+            assert_eq!(
+                context
+                    .flush_compile_control()
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+            assert_eq!(control.trace.lock().unwrap().len(), count);
+        }
+        let mut budget = ledger();
+        let mut context = ConnectorDecodeContext::new(&expected, &mut budget);
+        assert_eq!(
+            left.compare(right, &mut context).unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            right.compare(left, &mut context).unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            left.compare(left, &mut context).unwrap(),
+            std::cmp::Ordering::Equal
+        );
+    }
+
     #[test]
     fn legacy_unknown_duplicate_and_capacity_refusals_keep_their_original_categories() {
         let mut unknown = handles().remove(0).encode_to_vec();

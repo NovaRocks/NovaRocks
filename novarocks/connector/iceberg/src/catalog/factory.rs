@@ -406,7 +406,7 @@ mod tests {
             CreateTable(CatalogCreateIntent::EmptyTable),
             CreateTable(CatalogCreateIntent::CreateTableAsSelect),
             DropTable,
-            BootstrapSnapshot,
+            AnchorWrittenMetadata,
             AlterSchema,
             AlterProperties,
             AlterPartitionSpec,

@@ -26,14 +26,11 @@ pub enum CommitOpKind {
     FastAppend,
     Overwrite,
     RowDelta,
-    RowDeltaDv,
     RowDeltaDvFromFiles,
-    RewriteDataFiles,
     SelectedRewrite,
     CowUpdate,
     Truncate,
     OverwritePartitions,
-    RewriteManifests,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,10 +93,45 @@ pub struct WrittenFile {
     pub cardinality: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommitOutcome {
-    pub new_snapshot_id: i64,
-    pub written_manifest_paths: Vec<String>,
+impl WrittenFile {
+    pub(crate) fn entry_identity(
+        &self,
+    ) -> crate::iceberg::Result<crate::commit::model::EntryIdentity> {
+        use crate::commit::model::EntryIdentity;
+        let identity = match (self.content, self.format) {
+            (DataContentType::Data, _) => EntryIdentity::DataFile {
+                path: self.path.clone(),
+            },
+            (DataContentType::PositionDeletes, DataFileFormat::Puffin) => {
+                EntryIdentity::DeletionVector {
+                    path: self.path.clone(),
+                    offset: self.content_offset.ok_or_else(|| {
+                        crate::iceberg::Error::new(
+                            crate::iceberg::ErrorKind::DataInvalid,
+                            "Deletion vector has no content offset",
+                        )
+                    })?,
+                    length: self.content_size_in_bytes.ok_or_else(|| {
+                        crate::iceberg::Error::new(
+                            crate::iceberg::ErrorKind::DataInvalid,
+                            "Deletion vector has no content length",
+                        )
+                    })?,
+                    referenced_data_file: self.referenced_data_file.clone().ok_or_else(|| {
+                        crate::iceberg::Error::new(
+                            crate::iceberg::ErrorKind::DataInvalid,
+                            "Deletion vector has no referenced data file",
+                        )
+                    })?,
+                }
+            }
+            _ => EntryIdentity::DeleteFile {
+                path: self.path.clone(),
+            },
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
 }
 
 #[cfg(test)]

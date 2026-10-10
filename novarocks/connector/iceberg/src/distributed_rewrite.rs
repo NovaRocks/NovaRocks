@@ -22,6 +22,7 @@
 //! registry, process-global runtime, or current-generation lookup participates
 //! in this capability.
 
+use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -55,15 +56,15 @@ use crate::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
 };
 
-pub(crate) const ARTIFACT_VERSION: u16 = 2;
-pub(crate) const GROUP_PAYLOAD_VERSION: u16 = 1;
+pub(crate) const ARTIFACT_VERSION: u16 = 3;
+pub(crate) const GROUP_PAYLOAD_VERSION: u16 = 2;
 pub(crate) const REWRITE_ARTIFACT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const REWRITE_ARTIFACT_MAX_GROUPS: usize = 4096;
 pub(crate) const REWRITE_ARTIFACT_MAX_PARTS: usize = 64;
 pub(crate) const REWRITE_ARTIFACT_MAX_PART_BYTES: usize = 1024 * 1024;
 pub(crate) const REWRITE_ARTIFACT_MAX_ROOT_BYTES: usize = 64 * 1024;
 
-const GROUP_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.group.v1\0";
+const GROUP_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.group.v2\0";
 const STATE_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.state.v1\0";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -432,9 +433,8 @@ pub(crate) struct IcebergFrozenRewriteGroupV1 {
     pub partition_spec_id: Option<i32>,
     pub partition_key: Option<String>,
     pub data_files: Vec<IcebergDataFileInfo>,
-    pub selected_position_delete_files: Vec<String>,
-    #[serde(default)]
-    pub owned_data_delete_files: Vec<String>,
+    pub selected_position_delete_files: Vec<EntryIdentity>,
+    pub owned_data_delete_files: Vec<EntryIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -663,7 +663,7 @@ fn split_artifact_parts(
 
 pub(crate) fn plan_data_file_groups(
     files: Vec<DataFileWithStats>,
-    live_delete_paths: &BTreeSet<String>,
+    live_delete_paths: &BTreeSet<EntryIdentity>,
 ) -> Result<Vec<IcebergFrozenRewriteGroupV1>, ConnectorError> {
     let files = files
         .into_iter()
@@ -671,7 +671,8 @@ pub(crate) fn plan_data_file_groups(
         .collect::<Vec<_>>();
     let mut groups = group_data_files(files, false, None)?;
     assign_unattached_delete_owners(&mut groups, live_delete_paths)?;
-    Ok(groups)
+    refresh_data_group_digests(&mut groups)?;
+    bounded_groups(groups)
 }
 
 pub(crate) fn plan_position_delete_groups(
@@ -719,15 +720,21 @@ fn group_data_files(
                     "V2 Parquet position delete rewrite is not supported",
                 ));
             }
-            let selected = file
+            let mut selected = file
                 .delete_files
                 .iter()
                 .filter(|delete| {
                     delete.file_content == IcebergDeleteFileContent::Position
                         && delete.file_format == IcebergDeleteFileFormat::Puffin
                 })
-                .map(|delete| delete.path.clone())
-                .collect::<Vec<_>>();
+                .map(delete_entry_identity)
+                .collect::<Result<Vec<_>, _>>()?;
+            selected.sort();
+            if selected.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(corrupt(
+                    "Iceberg rewrite data file repeats a logical delete entry",
+                ));
+            }
             if selected.is_empty() || (!rewrite_all && selected.len() < min_inputs) {
                 continue;
             }
@@ -755,52 +762,68 @@ fn group_data_files(
         .into_iter()
         .map(|((partition_spec_id, partition_key), mut data_files)| {
             data_files.sort_by(|left, right| left.path.cmp(&right.path));
-            IcebergFrozenRewriteGroupV1 {
+            Ok(IcebergFrozenRewriteGroupV1 {
                 group_digest_hex: hex::encode(data_group_digest(
                     partition_spec_id,
                     partition_key.as_deref(),
                     &data_files,
-                )),
+                    &[],
+                )?),
                 partition_spec_id,
                 partition_key,
                 data_files,
                 selected_position_delete_files: Vec::new(),
                 owned_data_delete_files: Vec::new(),
-            }
+            })
         })
-        .collect::<Vec<_>>();
-    assign_attached_delete_owners(&mut groups);
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    assign_attached_delete_owners(&mut groups)?;
+    refresh_data_group_digests(&mut groups)?;
     bounded_groups(groups)
 }
 
-fn assign_attached_delete_owners(groups: &mut [IcebergFrozenRewriteGroupV1]) {
-    let mut owners = BTreeMap::<String, usize>::new();
+fn refresh_data_group_digests(
+    groups: &mut [IcebergFrozenRewriteGroupV1],
+) -> Result<(), ConnectorError> {
+    for group in groups {
+        group.group_digest_hex = hex::encode(data_group_digest(
+            group.partition_spec_id,
+            group.partition_key.as_deref(),
+            &group.data_files,
+            &group.owned_data_delete_files,
+        )?);
+    }
+    Ok(())
+}
+
+fn assign_attached_delete_owners(
+    groups: &mut [IcebergFrozenRewriteGroupV1],
+) -> Result<(), ConnectorError> {
+    let mut owners = BTreeMap::<EntryIdentity, usize>::new();
     for (index, group) in groups.iter().enumerate() {
-        for path in group
-            .data_files
-            .iter()
-            .flat_map(|file| file.delete_files.iter().map(|delete| delete.path.as_str()))
-        {
-            match owners.get(path) {
+        for delete in group.data_files.iter().flat_map(|file| &file.delete_files) {
+            let identity = delete_entry_identity(delete)?;
+            match owners.get(&identity) {
                 Some(existing) if groups[*existing].group_digest_hex <= group.group_digest_hex => {}
                 _ => {
-                    owners.insert(path.to_string(), index);
+                    owners.insert(identity, index);
                 }
             }
         }
     }
-    for (path, owner) in owners {
-        groups[owner].owned_data_delete_files.push(path);
+    for (identity, owner) in owners {
+        groups[owner].owned_data_delete_files.push(identity);
     }
     for group in groups {
         group.owned_data_delete_files.sort();
         group.owned_data_delete_files.dedup();
     }
+    Ok(())
 }
 
 fn assign_unattached_delete_owners(
     groups: &mut [IcebergFrozenRewriteGroupV1],
-    live: &BTreeSet<String>,
+    live: &BTreeSet<EntryIdentity>,
 ) -> Result<(), ConnectorError> {
     let owned = groups
         .iter()
@@ -1144,7 +1167,7 @@ pub(crate) fn plan_rewrite_position_delete_splits(
 /// relation describing deletes that no artifact holds.
 fn select_rewrite_position_delete_artifacts(
     group: &IcebergFrozenRewriteGroupV1,
-    live_delete_paths: &BTreeSet<String>,
+    live_delete_paths: &BTreeSet<EntryIdentity>,
     snapshot_id: i64,
 ) -> Result<(IcebergDataFileInfo, Vec<IcebergDeleteFileInfo>), ConnectorError> {
     // A position-delete group is cut one data file at a time, because the
@@ -1166,8 +1189,11 @@ fn select_rewrite_position_delete_artifacts(
     let selected = data_file
         .delete_files
         .iter()
-        .filter(|delete| named.contains(&delete.path))
-        .cloned()
+        .map(|delete| Ok((delete_entry_identity(delete)?, delete)))
+        .collect::<Result<Vec<_>, ConnectorError>>()?
+        .into_iter()
+        .filter(|(identity, _)| named.contains(identity))
+        .map(|(_, delete)| delete.clone())
         .collect::<Vec<_>>();
     if selected.len() != named.len() {
         return Err(invalid(
@@ -1176,10 +1202,10 @@ fn select_rewrite_position_delete_artifacts(
     }
     if let Some(missing) = named
         .iter()
-        .find(|path| !live_delete_paths.contains(path.as_str()))
+        .find(|identity| !live_delete_paths.contains(*identity))
     {
         return Err(corrupt(format!(
-            "Iceberg rewrite position delete artifact {missing} is no longer live at snapshot {snapshot_id}"
+            "Iceberg rewrite position delete artifact {missing:?} is no longer live at snapshot {snapshot_id}"
         )));
     }
     Ok((data_file.clone(), selected))
@@ -1189,7 +1215,7 @@ fn live_delete_file_paths(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     context: &ConnectorRequestContext,
-) -> Result<BTreeSet<String>, ConnectorError> {
+) -> Result<BTreeSet<EntryIdentity>, ConnectorError> {
     let Some(snapshot) = table.metadata().current_snapshot().cloned() else {
         return Ok(BTreeSet::new());
     };
@@ -1201,7 +1227,7 @@ pub(crate) fn live_delete_file_paths_at(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     snapshot_id: i64,
-) -> Result<BTreeSet<String>, ConnectorError> {
+) -> Result<BTreeSet<EntryIdentity>, ConnectorError> {
     live_delete_file_paths_at_with_control(runtime, table, snapshot_id, None)
 }
 
@@ -1210,7 +1236,7 @@ fn live_delete_file_paths_at_with_control(
     table: &crate::iceberg::table::Table,
     snapshot_id: i64,
     context: Option<&ConnectorRequestContext>,
-) -> Result<BTreeSet<String>, ConnectorError> {
+) -> Result<BTreeSet<EntryIdentity>, ConnectorError> {
     let snapshot = table
         .metadata()
         .snapshot_by_id(snapshot_id)
@@ -1228,7 +1254,7 @@ fn live_delete_file_paths_of(
     table: &crate::iceberg::table::Table,
     snapshot: std::sync::Arc<crate::iceberg::spec::Snapshot>,
     context: Option<&ConnectorRequestContext>,
-) -> Result<BTreeSet<String>, ConnectorError> {
+) -> Result<BTreeSet<EntryIdentity>, ConnectorError> {
     if let Some(context) = context {
         validate_context(context)?;
     }
@@ -1263,7 +1289,13 @@ fn live_delete_file_paths_of(
             for entry in manifest.entries() {
                 check_active()?;
                 if entry.is_alive() {
-                    paths.insert(entry.data_file().file_path().to_string());
+                    let identity = EntryIdentity::try_from(entry.data_file())
+                        .map_err(|error| error.to_string())?;
+                    if !paths.insert(identity) {
+                        return Err(
+                            "Iceberg rewrite snapshot repeats a logical delete entry".to_string()
+                        );
+                    }
                 }
             }
         }
@@ -1367,7 +1399,8 @@ fn data_group_digest(
     spec_id: Option<i32>,
     partition_key: Option<&str>,
     files: &[IcebergDataFileInfo],
-) -> [u8; 32] {
+    owned_deletes: &[EntryIdentity],
+) -> Result<[u8; 32], ConnectorError> {
     let mut hash = Sha256::new();
     hash.update(GROUP_DOMAIN);
     hash.update(b"data\0");
@@ -1377,20 +1410,95 @@ fn data_group_digest(
         digest_bytes(&mut hash, file.path.as_bytes());
         hash.update(file.size.to_be_bytes());
         hash.update(file.row_count.unwrap_or(-1).to_be_bytes());
-        for delete in &file.delete_files {
-            digest_bytes(&mut hash, delete.path.as_bytes());
+        let mut deletes = file
+            .delete_files
+            .iter()
+            .map(delete_entry_identity)
+            .collect::<Result<Vec<_>, _>>()?;
+        deletes.sort();
+        if deletes.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(corrupt(
+                "Iceberg rewrite data file repeats a logical delete entry",
+            ));
+        }
+        for identity in &deletes {
+            digest_entry_identity(&mut hash, identity);
         }
     }
-    hash.finalize().into()
+    // Include the assigned retirement set, including deletes with no attached live data.
+    hash.update(b"owned-delete-entries\0");
+    hash.update((owned_deletes.len() as u64).to_be_bytes());
+    for identity in owned_deletes {
+        identity
+            .validate()
+            .map_err(|error| corrupt(error.to_string()))?;
+        digest_entry_identity(&mut hash, identity);
+    }
+    Ok(hash.finalize().into())
 }
 
-fn position_group_digest(data_path: &str, delete_paths: &[String]) -> [u8; 32] {
+pub(crate) fn delete_entry_identity(
+    delete: &IcebergDeleteFileInfo,
+) -> Result<EntryIdentity, ConnectorError> {
+    let identity = if delete.file_content == IcebergDeleteFileContent::Position
+        && delete.file_format == IcebergDeleteFileFormat::Puffin
+    {
+        EntryIdentity::DeletionVector {
+            path: delete.path.clone(),
+            offset: delete
+                .content_offset
+                .ok_or_else(|| corrupt("Frozen DV is missing content_offset"))?,
+            length: delete
+                .content_size_in_bytes
+                .ok_or_else(|| corrupt("Frozen DV is missing content_size_in_bytes"))?,
+            referenced_data_file: delete
+                .referenced_data_file
+                .clone()
+                .ok_or_else(|| corrupt("Frozen DV is missing referenced data file"))?,
+        }
+    } else {
+        EntryIdentity::DeleteFile {
+            path: delete.path.clone(),
+        }
+    };
+    identity
+        .validate()
+        .map_err(|error| corrupt(error.to_string()))?;
+    Ok(identity)
+}
+
+fn digest_entry_identity(hash: &mut Sha256, identity: &EntryIdentity) {
+    match identity {
+        EntryIdentity::DataFile { path } => {
+            hash.update([0]);
+            digest_bytes(hash, path.as_bytes());
+        }
+        EntryIdentity::DeleteFile { path } => {
+            hash.update([1]);
+            digest_bytes(hash, path.as_bytes());
+        }
+        EntryIdentity::DeletionVector {
+            path,
+            offset,
+            length,
+            referenced_data_file,
+        } => {
+            hash.update([2]);
+            digest_bytes(hash, path.as_bytes());
+            hash.update(offset.to_be_bytes());
+            hash.update(length.to_be_bytes());
+            digest_bytes(hash, referenced_data_file.as_bytes());
+        }
+    }
+}
+
+fn position_group_digest(data_path: &str, delete_paths: &[EntryIdentity]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(GROUP_DOMAIN);
     hash.update(b"position-delete\0");
     digest_bytes(&mut hash, data_path.as_bytes());
     for path in delete_paths {
-        digest_bytes(&mut hash, path.as_bytes());
+        digest_entry_identity(&mut hash, path);
     }
     hash.finalize().into()
 }
@@ -1540,13 +1648,19 @@ mod tests {
             partition_spec_id: Some(0),
             partition_key: None,
             data_files: vec![data_file],
-            selected_position_delete_files: named.iter().map(|path| (*path).to_string()).collect(),
+            selected_position_delete_files: named
+                .iter()
+                .map(|path| delete_entry_identity(&dv(path)).unwrap())
+                .collect(),
             owned_data_delete_files: Vec::new(),
         }
     }
 
-    fn live(paths: &[&str]) -> BTreeSet<String> {
-        paths.iter().map(|path| (*path).to_string()).collect()
+    fn live(paths: &[&str]) -> BTreeSet<EntryIdentity> {
+        paths
+            .iter()
+            .map(|path| delete_entry_identity(&dv(path)).unwrap())
+            .collect()
     }
 
     /// The group is the authority on what this procedure instance rewrites, and
@@ -1653,6 +1767,45 @@ mod tests {
     }
 
     #[test]
+    fn shared_puffin_vectors_keep_distinct_identity_and_digest() {
+        let path = "s3://bucket/shared.puffin";
+        let first = dv(path);
+        let mut second = first.clone();
+        second.content_offset = Some(first.content_offset.unwrap() + 128);
+        let mut file = IcebergDataFileInfo::for_test("s3://bucket/a.parquet", 10, 1);
+        file.delete_files = vec![second.clone(), first.clone()];
+        let groups = group_data_files(vec![file.clone()], true, Some(2)).unwrap();
+        assert_eq!(groups[0].selected_position_delete_files.len(), 2);
+        let encoded = serde_json::to_vec(&groups[0]).unwrap();
+        let decoded: IcebergFrozenRewriteGroupV1 = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            decoded.selected_position_delete_files,
+            groups[0].selected_position_delete_files
+        );
+        let mut old_shape = serde_json::to_value(&groups[0]).unwrap();
+        old_shape["selected_position_delete_files"] = serde_json::json!([path]);
+        assert!(serde_json::from_value::<IcebergFrozenRewriteGroupV1>(old_shape).is_err());
+        file.delete_files.reverse();
+        let reverse = group_data_files(vec![file.clone()], true, Some(2)).unwrap();
+        assert_eq!(groups[0].group_digest_hex, reverse[0].group_digest_hex);
+        file.delete_files[0].content_size_in_bytes =
+            Some(second.content_size_in_bytes.unwrap() + 1);
+        let changed = group_data_files(vec![file], true, Some(2)).unwrap();
+        assert_ne!(groups[0].group_digest_hex, changed[0].group_digest_hex);
+        let data_groups = group_data_files(
+            vec![{
+                let mut data = IcebergDataFileInfo::for_test("s3://bucket/a.parquet", 10, 1);
+                data.delete_files = vec![first, second];
+                data
+            }],
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(data_groups[0].owned_data_delete_files.len(), 2);
+    }
+
+    #[test]
     fn shared_delete_file_has_one_canonical_owner() {
         let delete = IcebergDeleteFileInfo {
             record_count: Some(1),
@@ -1681,10 +1834,29 @@ mod tests {
             groups
                 .iter()
                 .flat_map(|group| &group.owned_data_delete_files)
-                .filter(|path| path.as_str() == "s3://bucket/shared-delete.parquet")
+                .filter(|path| path.path() == "s3://bucket/shared-delete.parquet")
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn data_group_digest_covers_the_unattached_retirement_identity() {
+        let data = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
+        let first = dv("s3://bucket/orphan.puffin");
+        let mut second = first.clone();
+        second.content_offset = Some(first.content_offset.unwrap() + 128);
+        let build = |delete: &IcebergDeleteFileInfo| {
+            let mut groups = group_data_files(vec![data.clone()], false, None).unwrap();
+            assign_unattached_delete_owners(
+                &mut groups,
+                &BTreeSet::from([delete_entry_identity(delete).unwrap()]),
+            )
+            .unwrap();
+            refresh_data_group_digests(&mut groups).unwrap();
+            groups[0].group_digest_hex.clone()
+        };
+        assert_ne!(build(&first), build(&second));
     }
 
     #[test]
@@ -1693,12 +1865,12 @@ mod tests {
         let mut groups = group_data_files(vec![data], false, None).expect("groups");
         assign_unattached_delete_owners(
             &mut groups,
-            &BTreeSet::from(["s3://bucket/orphan.puffin".to_string()]),
+            &BTreeSet::from([delete_entry_identity(&dv("s3://bucket/orphan.puffin")).unwrap()]),
         )
         .expect("owner");
         assert_eq!(
             groups[0].owned_data_delete_files,
-            vec!["s3://bucket/orphan.puffin".to_string()]
+            vec![delete_entry_identity(&dv("s3://bucket/orphan.puffin")).unwrap()]
         );
     }
 

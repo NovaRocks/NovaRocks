@@ -209,7 +209,7 @@ pub struct StatisticsJob {
     pub query_attempt_id: Option<StatisticsQueryAttemptId>,
     pub publication_id: StatisticsPublicationId,
     pub publication: StatisticsPublicationFact,
-    /// A known commit remains a fact when post-commit projection fails; that
+    /// A definite publication remains a fact when cleanup or projection fails; that
     /// failure must not authorize another provider mutation.
     pub publication_finalization_failure: Option<StatisticsFailure>,
     pub convergence: StatisticsConvergence,
@@ -959,7 +959,7 @@ impl StatisticsWorker {
             ),
             Ok(StatisticsPublicationOutcome {
                 fact: StatisticsPublicationFact::KnownUncommitted,
-                ..
+                finalization_failure,
             }) => (
                 StatisticsJobConclusion::Failed,
                 StatisticsPublicationFact::KnownUncommitted,
@@ -967,7 +967,7 @@ impl StatisticsWorker {
                     compile_control: None,
                     message: Arc::from("provider publication was not committed"),
                 }),
-                None,
+                finalization_failure,
             ),
             Ok(StatisticsPublicationOutcome {
                 fact: StatisticsPublicationFact::NotStarted,
@@ -1080,10 +1080,13 @@ impl StatisticsWorker {
             .iter_mut()
             .find(|entry| entry.job.id == id)
             .ok_or_else(|| StatisticsJobRepository::not_found(id))?;
-        if entry.job.publication != StatisticsPublicationFact::KnownCommitted {
+        if !matches!(
+            entry.job.publication,
+            StatisticsPublicationFact::KnownCommitted | StatisticsPublicationFact::KnownUncommitted
+        ) {
             return Err(StatisticsRepositoryError::new(
                 StatisticsRepositoryErrorKind::InvalidTransition,
-                "only a known provider commit can retain a finalization failure",
+                "only a definite provider publication outcome can retain a finalization failure",
             ));
         }
         entry.job.publication_finalization_failure = Some(failure);

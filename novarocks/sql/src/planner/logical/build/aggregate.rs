@@ -452,7 +452,13 @@ pub(super) fn split_projection_for_aggregate(
         .map(|item| {
             let expr = rewrite_agg_calls_to_refs(&item.expr, &agg_calls, control)?;
             let expr = rewrite_group_by_expr_refs(&expr, &group_by_rewrite_targets, control)?;
-            let output_column_id = direct_column_ref_id(&expr).unwrap_or(item.output_column_id);
+            // The expression can share one aggregate runtime symbol while
+            // each analyzer-authored output retains its own value domain.
+            let output_column_id = if item.output_column_id == ColumnId::UNSET {
+                direct_column_ref_id(&expr).unwrap_or(ColumnId::UNSET)
+            } else {
+                item.output_column_id
+            };
             Ok(ProjectItem {
                 expr,
                 output_name: item.output_name.clone(),

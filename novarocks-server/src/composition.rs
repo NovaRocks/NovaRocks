@@ -398,7 +398,6 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
             observed.ref_snapshot_ids,
             observed.field_ids,
             observed.main_ancestor_snapshot_ids,
-            observed.current_snapshot_is_empty_bootstrap,
             observed
                 .snapshot_markers
                 .into_iter()

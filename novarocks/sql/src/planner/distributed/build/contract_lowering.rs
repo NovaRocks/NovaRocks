@@ -9738,7 +9738,19 @@ impl<'a> ContractLoweringVisitor<'a> {
             return self.author_literal_expression(owner, &LiteralValue::Null, target);
         }
         let lowered = self.lower_expression(owner, expression, visible)?;
-        self.convert_expression_to(owner, lowered, target, policy)
+        // A carrier conversion preserves an actual source NULL, including a
+        // value null-extended after analysis. Keep that fact before the CASE
+        // or CAST owner publishes its final output type.
+        if self.expression_value_type(lowered)?.nullable && !target.nullable {
+            self.work.flush()?;
+            let mut target = target.clone();
+            self.work.step()?;
+            self.work.flush()?;
+            target.nullable = true;
+            self.convert_expression_to(owner, lowered, &target, policy)
+        } else {
+            self.convert_expression_to(owner, lowered, target, policy)
+        }
     }
 
     /// The type a NULL constant is lowered in, or `None` for any other
@@ -16304,6 +16316,65 @@ mod tests {
     }
 
     #[test]
+    fn late_case_and_cast_preserve_outer_join_source_nullability() {
+        let left = column(1, "left_key", DataType::Int64, false);
+        let right = column(2, "right_key", DataType::Int64, false);
+        let nullable_right = column(2, "right_key", DataType::Int64, true);
+        let joined = hash_join(
+            crate::common::JoinKind::LeftOuter,
+            PhysicalHashJoinBuildSide::Right,
+            SqlJoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            values(vec![left.clone()], vec![vec![literal_int(1)]]),
+            redistribute(
+                values(vec![right.clone()], vec![vec![literal_int(2)]]),
+                RedistributeMode::Broadcast,
+            ),
+            vec![left, nullable_right],
+        );
+        for kind in [
+            ExprKind::Case {
+                operand: None,
+                when_then: vec![(literal_bool(true), column_ref(&right))],
+                else_expr: Some(Box::new(literal_int(0))),
+            },
+            ExprKind::Cast {
+                expr: Box::new(column_ref(&right)),
+                target: DataType::Int64,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+        ] {
+            // This authored expression predates physical null extension.
+            let output = column(3, "answer", DataType::Int64, false);
+            let project = PhysicalPlanNode {
+                kind: PhysicalPlanKind::Project(PlanProjectNode {
+                    items: vec![ProjectItem {
+                        expr: TypedExpr {
+                            kind,
+                            value_type: output.value_type.clone(),
+                        },
+                        output_name: output.name.clone(),
+                        output_column_id: output.column_id,
+                    }],
+                    output_qualifier: None,
+                }),
+                children: vec![joined.clone()],
+                output_columns: vec![output],
+                stats: stats(),
+                probe_runtime_filters: Vec::new(),
+            };
+            let final_plan = finish_for_test(&project).unwrap();
+            let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+            let root = fragment.nodes().get(&fragment.root()).unwrap();
+            let actual = fragment.values().get(&root.output.columns[0]).unwrap();
+            assert_eq!(actual.ty.data_type, DataType::Int64);
+            assert!(actual.ty.nullable);
+            assert!(final_plan.result_port().unwrap().fields[0].ty.nullable);
+            novarocks_physical_plan::validate_plan(&final_plan).unwrap();
+        }
+    }
+
+    #[test]
     fn lowers_global_sort_and_limit_with_exact_order_and_row_counts() {
         let input = column(1, "number", DataType::Int64, false);
         let sort = PhysicalPlanNode {
@@ -17576,7 +17647,10 @@ mod tests {
                         } else {
                             LiteralValue::String(format!("{row}_{col}"))
                         }),
-                        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, row == 0 && col == 0),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            row == 0 && col == 0,
+                        ),
                     })
                     .collect()
             })
@@ -17584,9 +17658,26 @@ mod tests {
         let final_plan = finish_for_test(&values(columns, rows)).unwrap();
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         assert_eq!(fragment.expressions().len(), 65_536);
-        for (_, expression) in fragment.expressions().iter() {
-            assert_eq!(expression.ty, ValueType::new(DataType::Utf8, true));
-            assert!(matches!(expression.kind, ContractExprKind::Literal(_)));
+        let root = fragment.nodes().get(&fragment.root()).unwrap();
+        let NodeKind::Values { rows } = &root.kind else {
+            panic!("expected Values root");
+        };
+        assert_eq!(rows.len(), 16_384);
+        for (row, expressions) in rows.iter().enumerate() {
+            assert_eq!(expressions.len(), 4);
+            for (col, expression) in expressions.iter().enumerate() {
+                let expression = fragment.expressions().get(*expression).unwrap();
+                assert_eq!(expression.ty, ValueType::new(DataType::Utf8, true));
+                let value = checked_constant_for_test(&final_plan, expression);
+                if row == 0 && col == 0 {
+                    assert_eq!(value.try_utf8().unwrap(), None);
+                } else {
+                    assert_eq!(
+                        value.try_utf8().unwrap(),
+                        Some(format!("{row}_{col}").as_str())
+                    );
+                }
+            }
         }
     }
     #[test]

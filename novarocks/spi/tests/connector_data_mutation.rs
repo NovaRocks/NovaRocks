@@ -216,7 +216,10 @@ impl ConnectorDataMutation for FakeDataMutation {
                 receipt: self.receipt(&request.plan, self.descriptor.clone()),
                 finalization: ExternalMutationFinalization::Complete,
             },
-            ExecuteMode::Uncommitted => ExternalMutationOutcome::KnownUncommitted { failure },
+            ExecuteMode::Uncommitted => ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            },
             ExecuteMode::Unknown => ExternalMutationOutcome::CommitUnknown {
                 failure,
                 evidence: self.evidence(&request.plan),

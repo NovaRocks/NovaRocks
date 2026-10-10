@@ -504,6 +504,12 @@ impl<'a> super::AnalyzerContext<'a> {
                                     col.name.clone(),
                                     col.value_type.clone(),
                                 );
+                                // A consume changes only the symbol identity. Carry
+                                // the producer's complete same-value source facts.
+                                self.factory
+                                    .borrow_mut()
+                                    .transfer_value_provenance(col.column_id, new_id)
+                                    .map_err(AnalyzeError::internal)?;
                                 Ok(OutputColumn {
                                     column_id: new_id,
                                     name: col.name,

@@ -129,7 +129,7 @@ under the License.
 | DELETE 跨历史 partition spec | ✅ | |
 | OPTIMIZE 跨历史 spec（compact 到当前 spec） | ✅ | |
 | partition transform `void`（V3） | ❌ | |
-| dynamic partition overwrite（仅替换被写到的分区） | ❌ | |
+| dynamic partition overwrite（仅替换被写到的分区） | ✅ | v3 分区表，目标 ref 未变；当前拒绝跨历史 spec 范围 |
 | partition stats puffin（V3）写入与消费 | ❌ | |
 | partition spec 修复 / 等价合并 | ❌ | |
 
@@ -226,11 +226,12 @@ under the License.
 | UPDATE（COW + MOR + UPDATE FROM source） | ✅ | PR #76 |
 | OPTIMIZE TABLE（whole-table 重写） | ✅ | |
 | MERGE INTO（matched UPDATE / matched DELETE / not matched INSERT） | ✅ | PR #78 |
-| INSERT OVERWRITE 动态分区（`OVERWRITE PARTITIONS`） | ❌ | |
-| CTAS（写 Iceberg） | ❌ | |
-| CTAS 默认 V3 row-lineage | ❌ | |
+| INSERT OVERWRITE 动态分区（`INSERT OVERWRITE PARTITIONS`） | ✅ | 见 [DML](../dml.md) |
+| CTAS（写 Iceberg） | ✅ | 标准 REST staged-create + 显式 warehouse；Hadoop/HMS 在副作用前拒绝 |
+| CTAS 默认 V3 row-lineage | ❌ | 默认格式 v2，v3 需显式声明 |
+| 提交依赖验证、`commit.retry.*` 与有界 owned-object 清理 | ✅ | 见 [lake-publication](../lake-publication.md)；读依赖操作当前要求目标 ref 未变 |
 | Lake publication unknown 人工核对 | ✅ | 见 [lake-publication](../lake-publication.md)：marker、target UUID、ancestry 三项同时为正才是 Published |
-| TRUNCATE TABLE | ❌ | |
+| TRUNCATE TABLE | ✅ | 仅清空目标 ref，保留 schema 和历史 snapshot |
 | CDC sink（Flink-style 持续写入） | ❌ | |
 
 ## 11. 维护 / 治理
@@ -251,10 +252,10 @@ under the License.
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | `_row_id` / `_last_updated_sequence_number` 元数据列读 | ✅ | |
-| INSERT / OVERWRITE 写出 `first_row_id` + `row_range` | ✅ | |
+| INSERT / OVERWRITE 实际分配 `first_row_id` 与 snapshot row range | ✅ | 包括未赋值历史 EXISTING 文件的首次分配 |
 | DELETE 不分配新 `_row_id`（DV 合并保留语义） | ✅ | |
-| COW UPDATE 保留 `_row_id` + 写 `novarocks.update.sidecar` JSON | ✅ | |
-| MOR UPDATE 复用 `_row_id` + 显式赋 `DataFile.first_row_id` | ✅ | |
+| COW UPDATE 保留 `_row_id` | ✅ | 源身份与 replacement/append 输出分别冻结 |
+| MOR UPDATE 复用 `_row_id`，新行版本继承实际提交 | ✅ | `_last_updated_sequence_number` 写 NULL |
 | OPTIMIZE 重写后保留每行 `_row_id`（写到 reserved field id `i32::MAX-107` / `-108`） | ✅ | PR #85 |
 | `_row_id` 跨 snapshot 唯一性 invariant 测试（含 OPTIMIZE 后） | ✅ | PR #85（`iceberg_v3_row_lineage_uniqueness.sql`） |
 | Branch / tag 切换 `_row_id` 一致性回归 | ❌ | |
@@ -264,11 +265,12 @@ under the License.
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| `deletion-vector-v1` blob 编解码 | ✅ | `src/connector/iceberg/commit/puffin_dv.rs` |
+| `deletion-vector-v1` blob 编解码 | ✅ | `novarocks/connector/iceberg/src/commit/puffin_dv.rs` |
 | DV 写入（DELETE / MOR UPDATE） | ✅ | |
 | DV 读取并应用到 scan | ✅ | |
 | 多次 DELETE 合并到同一 DV blob | ✅ | |
 | 跨 partition spec 的 DV 写入 | ✅ | |
+| 同一 Puffin 中多个 DV blob | ✅ | 完整逻辑身份；单个 data file 至多一个存活 DV，逻辑移除不授权物理删除 |
 | Puffin `apache-datasketches-theta-v1`（NDV） | ❌ | |
 | Puffin `partition-stats-blob`（V3） | ❌ | |
 | Puffin `bloom-filter-v1` | ❌ | |

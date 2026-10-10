@@ -1401,20 +1401,11 @@ pub(crate) fn stage_prepared_update_mutation(
         }
         novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead => {
             let PreparedMorUpdateWriteTarget {
-                preparations,
+                preparations: _preparations,
                 planning_lease: write_planning_lease,
             } = mor_write_target.ok_or_else(|| {
                 "MOR UPDATE reached stage without an admitted frozen write target".to_string()
             })?;
-            // The version rewritten rows belong to, signed at admission: a
-            // merge-on-read writer stamps it on every row it emits, and it must
-            // not be re-derived from a table that may have moved since.
-            let written_version = preparations
-                .preparation
-                .written_version_ordinal()
-                .ok_or_else(|| {
-                    "MOR UPDATE requires a provider-signed written version".to_string()
-                })?;
             // The write lease was derived once at preparation so the
             // coordinator could fence it before dispatch; re-deriving here
             // would mint a fresh fence cell and silently discard that fence.
@@ -1434,7 +1425,6 @@ pub(crate) fn stage_prepared_update_mutation(
                 current_catalog.as_deref(),
                 &target_columns,
                 &target_ref,
-                written_version,
                 &execution,
                 &connector_context,
                 &write_session,
@@ -1610,7 +1600,6 @@ fn build_update_mor_change_stream_write_plan(
     current_catalog: Option<&str>,
     target_columns: &[novarocks_types::schema::ColumnDef],
     target_ref: &str,
-    new_sequence_number: i64,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &Arc<ConnectorWriteSession>,
@@ -1652,7 +1641,6 @@ fn build_update_mor_change_stream_write_plan(
         query,
         DmlChangeStreamKind::Update {
             target_columns: target_columns.to_vec(),
-            new_sequence_number,
         },
         Some(DmlPreExpandKeyedAssert {
             key_column_name: "__nr_row_id".to_string(),
@@ -1824,7 +1812,8 @@ impl MorUpdateChangeStreamExecutor {
         completion
             .session()
             .abort(self.connector_context.clone())
-            .map(|_| ())
+            .map_err(|error| error.to_string())
+            .and_then(crate::query_execution::write_session::require_uncommitted_release)
             .map_err(|error| format!("release empty MOR UPDATE write session: {error}"))
     }
 
@@ -1880,7 +1869,8 @@ impl MorMergeChangeStreamExecutor {
         completion
             .session()
             .abort(self.connector_context.clone())
-            .map(|_| ())
+            .map_err(|error| error.to_string())
+            .and_then(crate::query_execution::write_session::require_uncommitted_release)
             .map_err(|error| format!("release empty MOR MERGE write session: {error}"))
     }
 
@@ -2767,7 +2757,8 @@ impl DistributedCowUpdateExecutor {
     fn release_empty_write_session(&self) -> Result<(), String> {
         self.write_session
             .abort(self.connector_context.clone())
-            .map(|_| ())
+            .map_err(|error| error.to_string())
+            .and_then(crate::query_execution::write_session::require_uncommitted_release)
             .map_err(|error| format!("release empty COW write session: {error}"))
     }
 }
@@ -3828,16 +3819,11 @@ pub(crate) fn stage_prepared_merge_mutation(
             return Ok(MutationStagedWrite::NoOp);
         }
         let PreparedMorMergeWriteTarget {
-            preparations,
+            preparations: _preparations,
             planning_lease: write_planning_lease,
         } = mor_write_target.ok_or_else(|| {
             "MOR MERGE reached stage without an admitted frozen write target".to_string()
         })?;
-        // See the MOR UPDATE path: the written version is signed at admission.
-        let written_version = preparations
-            .preparation
-            .written_version_ordinal()
-            .ok_or_else(|| "MOR MERGE requires a provider-signed written version".to_string())?;
         // The write lease was derived once at preparation so the coordinator
         // could fence it before dispatch; re-deriving here would mint a fresh
         // fence cell and silently discard that fence.
@@ -3858,7 +3844,6 @@ pub(crate) fn stage_prepared_merge_mutation(
             &target_columns,
             insert_columns_resolved.as_deref(),
             &target_ref,
-            written_version,
             &execution,
             &connector_context,
             &write_session,
@@ -4497,7 +4482,6 @@ fn build_merge_mor_change_stream_write_plan(
     target_columns: &[novarocks_types::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
     target_ref: &str,
-    new_sequence_number: i64,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &Arc<ConnectorWriteSession>,
@@ -4628,7 +4612,6 @@ fn build_merge_mor_change_stream_write_plan(
         query,
         DmlChangeStreamKind::Merge {
             target_columns: target_columns.to_vec(),
-            new_sequence_number,
             matched_update: has_matched_update,
             matched_delete: has_matched_delete,
             not_matched_insert: has_not_matched_insert,
@@ -4999,7 +4982,6 @@ mod tests {
             match_contract,
             ConnectorRowMutationStrategy::CopyOnWrite,
             base_version_ordinal,
-            Some(42),
             bytes::Bytes::from_static(b"row-mutation"),
         )
         .expect("row-mutation preparation")
@@ -5202,7 +5184,6 @@ mod tests {
             match_contract,
             ConnectorRowMutationStrategy::CopyOnWrite,
             Some(41),
-            Some(42),
             bytes::Bytes::from_static(b"row-mutation"),
         )
         .expect("row-mutation preparation");
@@ -6921,6 +6902,7 @@ mod tests {
                 novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
                 "scripted",
             ),
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         }
     }
 

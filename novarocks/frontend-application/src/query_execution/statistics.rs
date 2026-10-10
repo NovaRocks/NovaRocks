@@ -399,6 +399,13 @@ pub fn prepare_completed_statistics_collection(
     .map_err(DistributedQueryError::from_compile)?;
     let version = plan.plan().version();
     let candidate = CompletedPhysicalPlanCandidate::for_sql_program(plan, &completion_control)
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+                ),
+            )
+        })
         .map_err(|error| contract_violation(error.to_string()))?;
     let output =
         novarocks_query_application::preparation::OutputContract::from_completed_candidate(

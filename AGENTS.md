@@ -351,6 +351,13 @@ Execution, and do not recreate a Backend facade around it.
 - `novarocks/connector/iceberg/**`
   Iceberg control/execution contracts, catalog integrations, and storage facts.
 
+  Iceberg 提交契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)。修改前先读：
+  - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑条目与物理对象身份、继承字段、冻结请求及发布/清理结果。
+  - `novarocks/connector/iceberg/src/commit/dependency/**`：按类别惰性读取 metadata、目标 ref 存活集和连续历史窗口，验证操作依赖。
+  - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
+  - `novarocks/connector/iceberg/src/commit/attempt.rs`：加载、验证、准备、冻结、单次派发和确定冲突的重试。
+  - `novarocks/connector/iceberg/src/commit/operation.rs`：操作内 I/O 并发、先登记后写入、实际退出监督和有界 owned-object 清理。
+
 - `novarocks/connector/paimon/**`
   Read-only Paimon Filesystem Catalog, private wire codec, snapshot planning,
   and append-only / `deduplicate` primary-key table reads.
@@ -867,6 +874,11 @@ suspected case against a clean server before attributing it to the change.
   `delete/**`, `mutation_flow.rs`, `truncate.rs`, `add_files.rs`,
   `iceberg_writer.rs`); catalog/table DDL is in
   `novarocks/frontend-application/src/catalog_application/statement.rs`.
+- **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
+  `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
+  单次派发 owner 在 `catalog/transaction.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
+  `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
+  读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md) 后再改身份、字段继承或清理授权。
 - **Execution semantics/operator behavior**: inspect
   `novarocks/execution/src/exec/node/**` and
   `novarocks/execution/src/exec/operators/**`.

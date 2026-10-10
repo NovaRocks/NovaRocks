@@ -186,11 +186,10 @@ incremental = true
 lto = false
 codegen-units = 256
 
-# Vendored iceberg-rust 0.9 with two visibility patches that allow downstream
-# crates to implement custom Transaction actions (TransactionAction trait + the
-# TableCommit::builder().build() method). Required by NovaRocks RowDeltaCommit
-# and OverwriteCommit (Plan Tasks 9 / 10) until upstream ships native RowDelta
-# and OverwriteFiles actions. See vendor/iceberg-0.9.0/PATCH.md for the diff.
+# Vendored iceberg-rust 0.9 retains format/read primitives, view support and
+# authoritative staged-create facts. NovaRocks owns commit preparation and
+# retry; the public TableCommit builder remains its terminal owner boundary.
+# See vendor/iceberg-0.9.0/PATCH.md for the remaining patch inventory.
 [patch.crates-io]
 # Only the entries below are allowed; none of them exists to meter allocations
 # inside a third-party crate. Design: ADR-0168

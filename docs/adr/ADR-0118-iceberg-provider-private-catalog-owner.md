@@ -5,6 +5,10 @@ domain: [provider-spi, crate-boundary]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0171
+    scope: "Internal reuse of vendored transaction/action preparation; catalog owner and late TableCommit carrier remain effective"
+    link: "ADR-0171-commit-operation-model.md"
 date: 2026-08-26
 provenance:
   - "discussion: 2026-08-26 Trino 风格 Iceberg Catalog 与操作型准入"

@@ -1,0 +1,3 @@
+first_write	total_rows	assigned_rows	unique_rows
+empty-append	4	4	4
+insert	5	5	5

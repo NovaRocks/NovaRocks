@@ -165,9 +165,7 @@ pub fn validate_target_snapshot(
 ) -> Result<(), String> {
     let actual = binding.current_snapshot_id();
     let expected = published_target_snapshot_id(mv_definition)?;
-    if actual != expected
-        && !(expected.is_none() && binding.observation().current_snapshot_is_empty_bootstrap())
-    {
+    if actual != expected {
         return Err(format!(
             "target table {}.{}.{} was modified outside NovaRocks: expected snapshot {:?}, current snapshot {:?}",
             target.catalog, target.namespace, target.table, expected, actual

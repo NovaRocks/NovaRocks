@@ -20,37 +20,40 @@
 //! These modules contain only Iceberg catalog/file-format facts and do not
 //! depend on Core SQL, execution, or application state.
 
-pub mod abort;
 mod action;
-mod collector;
+pub(crate) mod attempt;
 mod data_file;
 pub mod data_writer;
+pub(crate) mod dependency;
 pub mod equality_delete_writer;
-mod fast_append;
+pub(crate) mod fast_append;
 pub mod frozen_write;
 pub(crate) mod helpers;
+pub(crate) mod model;
 pub mod mv_provenance;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
-mod overwrite;
+pub(crate) mod operation;
+pub(crate) mod overwrite;
 mod overwrite_partitions;
 pub mod position_delete_writer;
 pub mod puffin_dv;
+pub(crate) mod recovery;
 pub mod ref_action;
 pub mod report;
 pub mod retry;
 mod rewrite_data_files;
 mod row_delta;
-mod row_delta_dv;
 mod row_delta_dv_from_files;
 pub mod row_delta_dv_metadata;
 mod row_mutation_preparation;
-mod run;
+#[cfg(test)]
+pub(crate) mod run;
 mod selected_rewrite;
-pub mod service;
 pub mod snapshot_lifecycle_helpers;
+pub(crate) mod staging;
 pub mod statistics;
-mod truncate;
+pub(crate) mod truncate;
 pub mod types;
 mod update_cow;
 pub mod validation;
@@ -62,7 +65,6 @@ mod write_preparation;
 mod write_shared;
 pub mod write_stack;
 
-pub use abort::{AbortLog, CleanupError};
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use mv_provenance::{
     MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MV_REFRESH_ROW_COUNT_PROP,
@@ -90,17 +92,12 @@ pub use retry::{
 pub use rewrite_data_files::{
     LiveDataFileCompactionStats, current_live_data_file_compaction_stats,
 };
-pub(crate) use service::RecoveryEvidence;
-pub use service::{
-    CleanupAttempt, CommitFailureKind, CommitServiceError, CommitServiceOutcome,
-    classify_commit_error,
-};
 pub use snapshot_lifecycle_helpers::{
     FileSet, build_dv_index, compute_live_snapshot_set, enumerate_files_for_snapshots,
     is_puffin_path, puffin_half_reference_protection,
 };
 pub use types::{
-    CommitOpKind, CommitOutcome, IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE,
+    CommitOpKind, IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE,
     NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_MODE_MOR, WrittenFile,
 };
 pub use validation::{
@@ -113,8 +110,6 @@ pub use validation::{
 };
 pub use write_control::IcebergWriteControl;
 
-pub(crate) use action::CommitCtx;
-pub(crate) use collector::IcebergCommitCollector;
-pub(crate) use fast_append::build_staged_fast_append_action;
-pub(crate) use run::{CleanupPathMapper, RunInput, run_iceberg_commit};
+pub(crate) use data_file::from_written_file as frozen_data_file_from_written;
+pub(crate) use fast_append::FastAppendPreparer;
 pub(crate) use update_cow::{CowUpdateRewriteSet, CowUpdateTouchedFile};

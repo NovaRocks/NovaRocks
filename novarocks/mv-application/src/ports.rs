@@ -32,6 +32,7 @@ pub enum MvProviderFailureKind {
     Unavailable,
     KnownUncommitted,
     CommitUnknown,
+    KnownCommittedFinalizeFailed,
     TargetReplaced,
     Corruption,
 }
@@ -81,6 +82,9 @@ impl MvProviderFailure {
             MvProviderFailureKind::Unavailable => MvProductErrorKind::Unavailable,
             MvProviderFailureKind::KnownUncommitted => MvProductErrorKind::ProviderKnownUncommitted,
             MvProviderFailureKind::CommitUnknown => MvProductErrorKind::CommitUnknown,
+            MvProviderFailureKind::KnownCommittedFinalizeFailed => {
+                MvProductErrorKind::KnownCommittedFinalizeFailed
+            }
             MvProviderFailureKind::TargetReplaced => MvProductErrorKind::TargetReplaced,
             MvProviderFailureKind::Corruption => MvProductErrorKind::Corruption,
         };

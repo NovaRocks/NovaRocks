@@ -394,8 +394,8 @@ fn plan_connector_failure(error: ConnectorError) -> TruncatePlanError {
 
 fn project_plan_error(outcome: ResolvedDataMutation) -> TruncatePlanError {
     match outcome {
-        ResolvedDataMutation::KnownUncommitted { failure } => {
-            TruncatePlanError::KnownUncommitted(project_uncommitted(failure))
+        ResolvedDataMutation::KnownUncommitted { failure, cleanup } => {
+            TruncatePlanError::KnownUncommitted(project_uncommitted(failure, cleanup))
         }
         ResolvedDataMutation::ContractFailure { error, dispatch } => {
             TruncatePlanError::ContractFailure {
@@ -418,9 +418,11 @@ fn project_plan_error(outcome: ResolvedDataMutation) -> TruncatePlanError {
 fn project_outcome(outcome: ResolvedDataMutation) -> TruncateOutcome {
     match outcome {
         ResolvedDataMutation::KnownCommitted(completed) => project_committed(completed),
-        ResolvedDataMutation::KnownUncommitted { failure } => TruncateOutcome::KnownUncommitted {
-            failure: project_uncommitted(failure),
-        },
+        ResolvedDataMutation::KnownUncommitted { failure, cleanup } => {
+            TruncateOutcome::KnownUncommitted {
+                failure: project_uncommitted(failure, cleanup),
+            }
+        }
         ResolvedDataMutation::CommitUnknown { failure, evidence } => {
             match evidence.try_to_wire_v1() {
                 Ok(wire) => TruncateOutcome::CommitUnknown {
@@ -487,11 +489,17 @@ fn project_committed(completed: CompletedDataMutation) -> TruncateOutcome {
     }
 }
 
-fn project_uncommitted(failure: KnownUncommittedDataMutation) -> TruncateFailure {
-    match failure {
+fn project_uncommitted(
+    failure: KnownUncommittedDataMutation,
+    cleanup: novarocks_spi::connector::ExternalMutationFinalization,
+) -> TruncateFailure {
+    let mut projected = match failure {
         KnownUncommittedDataMutation::Planning(error) => project_connector_error(error),
         KnownUncommittedDataMutation::Provider(failure) => project_mutation_failure(failure),
-    }
+    };
+    projected.message =
+        crate::connector::mutation::known_uncommitted_message(&projected.message, &cleanup);
+    projected
 }
 
 fn project_connector_error(error: ConnectorError) -> TruncateFailure {
@@ -586,6 +594,7 @@ mod tests {
                 ConnectorErrorKind::ResourceExhausted,
                 "Iceberg TRUNCATE evidence exceeds durable wire cap",
             )),
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         };
         assert!(matches!(
             project_plan_error(outcome),

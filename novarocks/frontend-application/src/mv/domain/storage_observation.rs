@@ -43,7 +43,7 @@ use novarocks_mv_application::persistence::{
     descriptor::MvDescriptorV3, schema::MvPartitionContract,
 };
 
-/// Exact target-schema facts observed immediately after CREATE/bootstrap.
+/// Exact target-schema facts observed immediately after CREATE.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvTargetCreationObservation {
     pub table: ConnectorTableIdentity,
@@ -454,7 +454,6 @@ pub(crate) struct MvRefreshTargetObservation {
     ref_snapshot_ids: BTreeMap<String, i64>,
     field_ids: Vec<i32>,
     main_ancestor_snapshot_ids: Vec<i64>,
-    current_snapshot_is_empty_bootstrap: bool,
     snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
 }
 
@@ -481,7 +480,6 @@ impl MvRefreshTargetObservation {
         ref_snapshot_ids: BTreeMap<String, i64>,
         field_ids: Vec<i32>,
         main_ancestor_snapshot_ids: Vec<i64>,
-        current_snapshot_is_empty_bootstrap: bool,
         snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
@@ -532,7 +530,6 @@ impl MvRefreshTargetObservation {
             ref_snapshot_ids,
             field_ids,
             main_ancestor_snapshot_ids,
-            current_snapshot_is_empty_bootstrap,
             snapshot_markers,
         })
     }
@@ -541,12 +538,6 @@ impl MvRefreshTargetObservation {
     /// Arrow schema in the neutral metadata.
     pub fn field_ids(&self) -> &[i32] {
         &self.field_ids
-    }
-
-    /// Is the current snapshot the empty bootstrap snapshot CREATE MV
-    /// establishes before the first refresh publishes data?
-    pub const fn current_snapshot_is_empty_bootstrap(&self) -> bool {
-        self.current_snapshot_is_empty_bootstrap
     }
 
     /// `main`'s snapshot chain, newest first.
@@ -1004,7 +995,6 @@ fn refresh_target_from_spi(
         observation.ref_snapshot_ids().clone(),
         observation.field_ids().to_vec(),
         observation.main_ancestor_snapshot_ids().to_vec(),
-        observation.current_snapshot_is_empty_bootstrap(),
         observation
             .snapshot_markers()
             .iter()
@@ -1780,7 +1770,6 @@ mod tests {
             refs,
             Vec::new(),
             Vec::new(),
-            false,
             BTreeMap::new(),
             &context(4096),
         )
@@ -1826,7 +1815,6 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
             Vec::new(),
-            false,
             BTreeMap::new(),
             &context(4096),
         )
@@ -1845,7 +1833,6 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
             Vec::new(),
-            false,
             BTreeMap::new(),
             &context(4096),
         )

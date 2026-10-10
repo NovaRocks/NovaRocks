@@ -362,7 +362,7 @@ impl MvObservedPartitionSpec {
     }
 }
 
-/// Exact target facts observed immediately after creation/bootstrap.
+/// Exact target facts observed immediately after creation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvCreatedTargetObservation {
     table: ConnectorTableIdentity,
@@ -704,7 +704,7 @@ pub struct MvLakePackageObservation {
 
 /// Exact target snapshot metadata projected from the same sealed metadata
 /// value as an MV lake package. It is a revision identity, not a refresh
-/// watermark: a never-published bootstrap snapshot may legitimately appear.
+/// watermark: a never-published target snapshot may legitimately appear.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MvLakeTargetSnapshotObservation {
     snapshot_id: i64,
@@ -880,7 +880,6 @@ pub struct MvRefreshTargetObservation {
     ref_snapshot_ids: BTreeMap<String, i64>,
     field_ids: Vec<i32>,
     main_ancestor_snapshot_ids: Vec<i64>,
-    current_snapshot_is_empty_bootstrap: bool,
     snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
 }
 
@@ -895,7 +894,6 @@ impl MvRefreshTargetObservation {
         ref_snapshot_ids: BTreeMap<String, i64>,
         field_ids: Vec<i32>,
         main_ancestor_snapshot_ids: Vec<i64>,
-        current_snapshot_is_empty_bootstrap: bool,
         snapshot_markers: BTreeMap<i64, MvObservedRefreshMarker>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
@@ -959,7 +957,6 @@ impl MvRefreshTargetObservation {
             ref_snapshot_ids,
             field_ids,
             main_ancestor_snapshot_ids,
-            current_snapshot_is_empty_bootstrap,
             snapshot_markers,
         })
     }
@@ -986,9 +983,6 @@ impl MvRefreshTargetObservation {
     }
     pub fn main_ancestor_snapshot_ids(&self) -> &[i64] {
         &self.main_ancestor_snapshot_ids
-    }
-    pub const fn current_snapshot_is_empty_bootstrap(&self) -> bool {
-        self.current_snapshot_is_empty_bootstrap
     }
     pub fn snapshot_marker(&self, snapshot_id: i64) -> Option<&MvObservedRefreshMarker> {
         self.snapshot_markers.get(&snapshot_id)
@@ -1651,7 +1645,6 @@ mod tests {
             BTreeMap::new(),
             vec![1, 1],
             vec![],
-            false,
             BTreeMap::new(),
             &context(),
         )

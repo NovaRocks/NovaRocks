@@ -17,6 +17,8 @@
 
 //! Exact root occurrence provenance carried through the owned compiler phases.
 
+use std::borrow::Cow;
+
 use novarocks_physical_plan::ResultValueDomain;
 use novarocks_result_contract::{ScalarField, ScalarSchema};
 use novarocks_types::schema::SqlType;
@@ -43,12 +45,15 @@ impl RootOutputSemantics {
         // for preflight, then construct one bounded owned field; do not clone
         // a nested declaration once per repeated output occurrence.
         let scalar_field = match columns {
-            [column] => super::root_scalar_type::scalar_field(
-                &column.value_type.data_type,
-                column.value_type.nullable,
-                factory.borrowed_logical_type(column.column_id),
-            )
-            .ok(),
+            [column] => {
+                let logical = output_logical_type(column, factory);
+                super::root_scalar_type::scalar_field(
+                    &column.value_type.data_type,
+                    column.value_type.nullable,
+                    logical.as_deref(),
+                )
+                .ok()
+            }
             _ => None,
         };
         let private_persistence_domain =
@@ -56,8 +61,8 @@ impl RootOutputSemantics {
                 .iter()
                 .filter(|column| !column.is_internal)
                 .any(|column| {
-                    factory
-                        .borrowed_logical_type(column.column_id)
+                    output_logical_type(column, factory)
+                        .as_deref()
                         .is_some_and(private_persistence_domain)
                 });
         Ok(Self {
@@ -66,7 +71,7 @@ impl RootOutputSemantics {
             occurrences: columns
                 .iter()
                 .map(|column| {
-                    let domain = match factory.borrowed_logical_type(column.column_id) {
+                    let domain = match output_logical_type(column, factory).as_deref() {
                         Some(SqlType::Json) => ResultValueDomain::Json,
                         Some(SqlType::Variant) => ResultValueDomain::Variant,
                         Some(SqlType::Hll) => ResultValueDomain::Hll,
@@ -135,6 +140,31 @@ impl RootOutputSemantics {
     }
 }
 
+/// Root value identity comes from the unified value contract. A complete
+/// nested catalog declaration remains borrowed, without copying its type tree.
+fn output_logical_type<'a>(
+    column: &OutputColumn,
+    factory: &'a ColumnRefFactory,
+) -> Option<Cow<'a, SqlType>> {
+    use novarocks_type_contract::ValueLogicalType as V;
+    let logical = match column.value_type.logical_type {
+        V::Physical => {
+            return factory
+                .borrowed_logical_type(column.column_id)
+                .map(Cow::Borrowed);
+        }
+        V::Json => SqlType::Json,
+        V::Variant => SqlType::Variant,
+        V::Hll => SqlType::Hll,
+        V::Bitmap => SqlType::Bitmap,
+        V::Object => SqlType::Object,
+        V::Percentile => SqlType::Percentile,
+        V::LargeInt => SqlType::LargeInt,
+        V::Uuid => SqlType::Uuid,
+    };
+    Some(Cow::Owned(logical))
+}
+
 fn private_persistence_domain(logical: &SqlType) -> bool {
     match logical {
         SqlType::Object | SqlType::Percentile => true,
@@ -157,6 +187,80 @@ mod tests {
     use novarocks_physical_plan::ValueType;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
     use std::sync::Arc;
+
+    #[test]
+    fn unified_root_value_domains_survive_without_a_legacy_declaration() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType as V};
+        for (logical, storage, domain, private) in [
+            (V::Physical, D::Binary, ResultValueDomain::Plain, false),
+            (V::Json, D::Utf8, ResultValueDomain::Json, false),
+            (
+                V::Variant,
+                D::LargeBinary,
+                ResultValueDomain::Variant,
+                false,
+            ),
+            (V::Hll, D::Binary, ResultValueDomain::Hll, false),
+            (V::Bitmap, D::Binary, ResultValueDomain::Bitmap, false),
+            (V::Object, D::Binary, ResultValueDomain::Object, true),
+            (
+                V::Percentile,
+                D::Binary,
+                ResultValueDomain::Percentile,
+                true,
+            ),
+            (
+                V::LargeInt,
+                D::FixedSizeBinary(16),
+                ResultValueDomain::Plain,
+                false,
+            ),
+            (
+                V::Uuid,
+                D::FixedSizeBinary(16),
+                ResultValueDomain::Plain,
+                false,
+            ),
+        ] {
+            let value_type =
+                FunctionValueType::try_with_logical_type(storage, true, logical).unwrap();
+            let mut factory = ColumnRefFactory::new();
+            let column_id = factory.create(None, "value".into(), value_type.clone());
+            assert!(factory.borrowed_logical_type(column_id).is_none());
+            let column = OutputColumn {
+                column_id,
+                name: "value".into(),
+                value_type,
+                is_internal: false,
+            };
+            let semantics =
+                RootOutputSemantics::capture(std::slice::from_ref(&column), &factory).unwrap();
+            assert_eq!(
+                semantics.domains(std::slice::from_ref(&column)).unwrap(),
+                [domain]
+            );
+            assert_eq!(semantics.has_private_persistence_domain(), private);
+            if logical == V::LargeInt {
+                assert_eq!(
+                    semantics.scalar_field.as_ref().unwrap().value_type,
+                    novarocks_result_contract::ScalarValueType::LargeInt
+                );
+            }
+            if logical == V::Uuid {
+                // ScalarValueV1 has no UUID value: never reinterpret the equal
+                // FixedSizeBinary(16) carrier as a LargeInt scalar.
+                assert!(semantics.scalar_field.is_none());
+            }
+            if logical == V::Percentile {
+                assert_eq!(
+                    semantics.scalar_field.as_ref().unwrap().value_type,
+                    novarocks_result_contract::ScalarValueType::Opaque(
+                        novarocks_result_contract::ScalarOpaqueType::Percentile
+                    )
+                );
+            }
+        }
+    }
 
     fn declared_map(marked: bool) -> (ColumnRefFactory, OutputColumn) {
         let mut value = Field::new("value", D::Binary, true);

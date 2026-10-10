@@ -1,0 +1,66 @@
+{
+  "identifier": {
+    "name": "t",
+    "namespace": [
+      "db"
+    ]
+  },
+  "requirements": [
+    {
+      "type": "assert-table-uuid",
+      "uuid": "01010101-0101-0101-0101-010101010101"
+    },
+    {
+      "ref": "main",
+      "snapshot-id": null,
+      "type": "assert-ref-snapshot-id"
+    },
+    {
+      "last-assigned-partition-id": 999,
+      "type": "assert-last-assigned-partition-id"
+    },
+    {
+      "default-spec-id": 0,
+      "type": "assert-default-spec-id"
+    }
+  ],
+  "updates": [
+    {
+      "action": "add-spec",
+      "spec": {
+        "fields": [
+          {
+            "field-id": 1000,
+            "name": "id_part",
+            "source-id": 1,
+            "transform": "identity"
+          }
+        ],
+        "spec-id": 1
+      }
+    },
+    {
+      "action": "set-default-spec",
+      "spec-id": 1
+    },
+    {
+      "action": "add-snapshot",
+      "snapshot": {
+        "manifest-list": "s3://bucket/table/metadata/snap-11.avro",
+        "schema-id": 0,
+        "sequence-number": 1,
+        "snapshot-id": 11,
+        "summary": {
+          "operation": "append"
+        },
+        "timestamp-ms": 1700000000011
+      }
+    },
+    {
+      "action": "set-snapshot-ref",
+      "ref-name": "main",
+      "snapshot-id": 11,
+      "type": "branch"
+    }
+  ]
+}

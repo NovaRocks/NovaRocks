@@ -290,12 +290,6 @@ mod tests {
                 TableRequirement::UuidMatch {
                     uuid: table.metadata().uuid()
                 },
-                TableRequirement::CurrentSchemaIdMatch {
-                    current_schema_id: table.metadata().current_schema_id()
-                },
-                TableRequirement::DefaultSpecIdMatch {
-                    default_spec_id: table.metadata().default_partition_spec_id()
-                },
                 TableRequirement::RefSnapshotIdMatch {
                     r#ref: MAIN_BRANCH.to_string(),
                     snapshot_id: table.metadata().current_snapshot_id

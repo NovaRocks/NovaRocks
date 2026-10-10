@@ -705,9 +705,11 @@ pub enum ConnectorStagedCreatePublishOutcome {
     },
     Conflict {
         failure: ConnectorMutationFailure,
+        cleanup: ExternalMutationFinalization,
     },
     KnownUncommitted {
         failure: ConnectorMutationFailure,
+        cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,
@@ -2271,6 +2273,7 @@ mod tests {
             self.publishes.fetch_add(1, Ordering::SeqCst);
             if self.conflict_publish {
                 return Ok(ConnectorStagedCreatePublishOutcome::Conflict {
+                    cleanup: ExternalMutationFinalization::Complete,
                     failure: ConnectorMutationFailure::new(
                         super::super::ConnectorMutationFailureKind::AlreadyExists,
                         "the staged-create target already exists",

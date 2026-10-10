@@ -400,3 +400,12 @@ fn original_stock_signer_and_append_freeze_are_identical_for_shared_and_previous
     assert!(shared_recipes[0].rewrite_source().is_none());
     assert!(owned_recipes[0].rewrite_source().is_none());
 }
+
+#[test]
+fn source_metadata_retains_the_exact_shared_generation() {
+    let original = Arc::new(stock_metadata());
+    let table = table(Arc::clone(&original));
+    let source =
+        IcebergAdmissionStatisticsMetadata::from_loaded_table(&table, true).into_source_metadata();
+    assert!(Arc::ptr_eq(&original, &source));
+}

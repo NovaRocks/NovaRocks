@@ -818,17 +818,30 @@ pub(crate) fn execute_drop_table_statement(
             }
             Ok(StatementResult::Ok)
         }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure }
-            if if_exists
-                && failure.kind()
-                    == novarocks_spi::connector::ConnectorMutationFailureKind::NotFound =>
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
+            failure,
+            ref cleanup,
+        } if if_exists
+            && matches!(
+                cleanup,
+                novarocks_spi::connector::ExternalMutationFinalization::Complete
+            )
+            && failure.kind()
+                == novarocks_spi::connector::ConnectorMutationFailureKind::NotFound =>
         {
             if target.provider_id.as_str() == "iceberg" {
                 cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
             }
             Ok(StatementResult::Ok)
         }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
+            failure,
+            cleanup,
+        } => {
+            let failure = novarocks_spi::connector::ConnectorMutationFailure::new(
+                failure.kind(),
+                crate::connector::mutation::known_uncommitted_message(&failure, &cleanup),
+            );
             // A DROP TABLE aimed at a view must say so instead of "unknown
             // table" — views and tables are separate REST resources.
             drop_table_failure_with_view_check(failure, || {

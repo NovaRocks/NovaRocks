@@ -23,11 +23,12 @@ under the License.
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| `deletion-vector-v1` blob 编解码 | ✅ | `src/connector/iceberg/commit/puffin_dv.rs` |
+| `deletion-vector-v1` blob 编解码 | ✅ | `novarocks/connector/iceberg/src/commit/puffin_dv.rs` |
 | DV 写入（DELETE / MOR UPDATE） | ✅ | |
 | DV 读取并应用到 scan | ✅ | |
 | 多次 DELETE 合并到同一 DV blob | ✅ | |
 | 跨 partition spec 的 DV 写入 | ✅ | |
+| 同一 Puffin 中多个 DV blob | ✅ | 按精确逻辑身份跟踪，单个 data file 至多一个存活 DV |
 | V2 position-delete 写入 | ✅ | |
 | V2 position-delete 读取合并 | ✅ | |
 | Equality delete 读取合并 | ✅ | |
@@ -47,7 +48,7 @@ NovaRocks 的 DV blob 严格按 spec 编排：
 - magic 字节 + 分段 Roaring bitmap（每段一个 partition / data file）
 - 末尾 CRC32
 
-实现入口：`src/connector/iceberg/commit/puffin_dv.rs`
+实现入口：`novarocks/connector/iceberg/src/commit/puffin_dv.rs`。
 
 ### 写入
 
@@ -58,7 +59,23 @@ DELETE FROM orders WHERE id IN (1, 2, 3);
 -- 实际行为：在对应 data file 的 DV 上把这几行置 1
 ```
 
-多次 DELETE 在同一 commit 内会合并到同一 DV blob，避免 Puffin 文件碎片化。
+对同一个 data file 的旧 DV 与新增删除位置合并为一个存活 DV。物理 Puffin 可以承载多个 blob，
+不能按文件路径把它们当成同一个逻辑条目。
+
+### 多 blob 的身份与清理
+
+一个 DV 条目的身份为：Puffin 路径 + `content_offset` + `content_size_in_bytes` + referenced data file。
+同一 data file 同时至多有一个存活 DV；不同 data file 的 DV 可以位于同一个 Puffin。
+manifest EXISTING/DELETED 和依赖验证使用完整逻辑身份，保留原 data/file sequence、spec 和分区事实。
+
+例如 Puffin 中有 A、B 两个 data file 的 DV，DELETE 替换 A 的 blob 时，B 的 blob 继续存活。
+COW UPDATE 或动态分区覆盖移除 A 的 data file 时，也显式移除 A 的精确 DV，不能留下悬空引用；
+这两种情况均不授权删除承载 B 的 Puffin。快照摘要按逻辑 blob 字节和成员数计数，不能把整个物理
+Puffin 的大小重复算给每个 DV。
+
+物理清理只处理操作实际拥有且不再被保留发布引用的对象；外部引擎写出的对象永不纳入该清理登记。
+已提交历史引用与年龄窗仍约束 GC，CommitUnknown 时全部对象保留。
+清理结果与提交证据分开，见 [lake-publication](lake-publication.md)。
 
 ### 跨 partition spec 写入
 

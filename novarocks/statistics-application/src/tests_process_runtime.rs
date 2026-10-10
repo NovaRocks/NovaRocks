@@ -210,6 +210,41 @@ async fn known_commit_finalization_failure_retains_the_provider_fact() {
 }
 
 #[tokio::test]
+async fn known_uncommitted_cleanup_failure_remains_a_failed_definite_publication() {
+    let repository = StatisticsJobRepository::new();
+    let executor = Arc::new(PublishExecutor {
+        publications: AtomicUsize::new(0),
+        outcome: StatisticsPublicationFact::KnownUncommitted,
+        finalization_failure: true,
+    });
+    let worker = StatisticsWorker::new(repository.clone(), executor.clone());
+    repository
+        .create_admitted(create(1), root().await)
+        .await
+        .unwrap();
+    let terminal = worker.run_one(2).await.unwrap().unwrap();
+    assert_eq!(
+        terminal.state,
+        StatisticsJobState::Terminal(StatisticsJobConclusion::Failed)
+    );
+    assert_eq!(
+        terminal.publication,
+        StatisticsPublicationFact::KnownUncommitted
+    );
+    assert!(terminal.failure.is_some());
+    assert_eq!(
+        terminal
+            .publication_finalization_failure
+            .unwrap()
+            .message
+            .as_ref(),
+        "finalization projection failed"
+    );
+    assert_eq!(executor.publications.load(Ordering::SeqCst), 1);
+    assert!(worker.run_one(3).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn submitted_is_a_phase_not_a_success_conclusion() {
     let repository = StatisticsJobRepository::new();
     let job = repository

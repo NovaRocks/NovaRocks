@@ -1,0 +1,22 @@
+{
+  "identifier": {
+    "name": "t",
+    "namespace": [
+      "db"
+    ]
+  },
+  "requirements": [
+    {
+      "type": "assert-table-uuid",
+      "uuid": "01010101-0101-0101-0101-010101010101"
+    }
+  ],
+  "updates": [
+    {
+      "action": "set-properties",
+      "updates": {
+        "analyzed": "true"
+      }
+    }
+  ]
+}

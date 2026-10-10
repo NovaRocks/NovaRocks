@@ -15,476 +15,129 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `RowDeltaCommit` — the DELETE-FROM commit-action.
+//! Prepare immutable position/equality-delete additions for the exact target ref.
 //!
-//! Iceberg-rust 0.9 does not ship a public `Transaction::row_delta()` action,
-//! so this is implemented as a custom `TransactionAction` (the
-//! `vendor/iceberg-0.9.0` patch raises the trait visibility — see
-//! `vendor/iceberg-0.9.0/PATCH.md`). The action:
-//!
-//! 1. Writes one v2/v3 deletes manifest containing the freshly-written
-//!    position-delete files via `ManifestWriter::add_delete_file`.
-//! 2. Inherits every entry from the base snapshot's manifest list.
-//! 3. Writes a new manifest list combining the inherited entries with the
-//!    new delete manifest entry.
-//! 4. Constructs a `Snapshot` whose `summary.operation = "delete"`.
-//! 5. Returns an `ActionCommit` containing `AddSnapshot + SetSnapshotRef` and
-//!    `AssertRefSnapshotId / AssertCurrentSchemaId / AssertDefaultSpecId`
-//!    requirements for OCC. iceberg-rust's `Transaction::do_commit` packages
-//!    this into a `TableCommit` and calls `Catalog::update_table`.
+//! Added entries inherit their actual publication sequences. The canonical
+//! manifest-list writer determines any first row-ID assignment for history.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
-use crate::iceberg::io::FileIO;
-use crate::iceberg::spec::{
-    DataContentType, FormatVersion, ManifestContentType, ManifestFile, ManifestWriterBuilder,
-    Operation, PartitionSpecRef, Snapshot, SnapshotReference, SnapshotRetention, Summary,
-};
-use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{ActionCommit, TransactionAction};
-use crate::iceberg::{TableRequirement, TableUpdate};
+use crate::iceberg::spec::{DataContentType, Operation};
 use async_trait::async_trait;
-use uuid::Uuid;
 
-use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::helpers::{
-    OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
-    metadata_dir, now_ms, read_snapshot_manifest_list, required_target_ref_snapshot_id,
-    snapshot_summary, submit_snapshot_occ_action, target_ref_snapshot_id, write_manifest_list,
-};
-use crate::commit::abort::AbortLog;
-use crate::commit::{CommitOutcome, WrittenFile};
-
-pub struct RowDeltaCommit;
-
-#[async_trait]
-impl IcebergCommitAction for RowDeltaCommit {
-    async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
-        let written = ctx.collector.take_written_files()?;
-
-        // Spec §4.1: empty input → no-op.
-        if written.is_empty() {
-            let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
-            return Ok(CommitOutcome {
-                new_snapshot_id: id,
-                written_manifest_paths: vec![],
-            });
-        }
-        for f in &written {
-            if f.content != DataContentType::PositionDeletes
-                && f.content != DataContentType::EqualityDeletes
-            {
-                return Err(format!(
-                    "RowDeltaCommit received {:?} content; expected delete-file content",
-                    f.content
-                ));
-            }
-            if f.content == DataContentType::EqualityDeletes
-                && f.equality_ids.as_ref().is_none_or(Vec::is_empty)
-            {
-                return Err(format!(
-                    "RowDeltaCommit received equality-delete file {} without equality_ids",
-                    f.path
-                ));
-            }
-        }
-
-        let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let action = Arc::new(RowDeltaTxnAction {
-            written,
-            commit_uuid: ctx.commit_uuid,
-            file_io: ctx.file_io.clone(),
-            schema_id: ctx.table.metadata().current_schema_id(),
-            abort_handle: ctx.abort_handle.clone(),
-            manifest_paths_out: manifest_paths_out.clone(),
-            target_ref: ctx.target_ref.to_string(),
-            snapshot_properties: ctx.snapshot_properties.clone(),
-        });
-
-        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-        let written_manifest_paths = || {
-            manifest_paths_out
-                .lock()
-                .expect("manifest_paths_out poisoned")
-                .clone()
-        };
-
-        match submit_snapshot_occ_action(
-            ctx.catalog,
-            ctx.table,
-            action,
-            "RowDelta",
-            None,
-            ctx.snapshot_properties,
-        )
-        .await
-        {
-            Ok(OccSubmit::Committed(table_after)) => {
-                let new_snapshot_id = required_target_ref_snapshot_id(
-                    table_after.metadata(),
-                    ctx.target_ref,
-                    "RowDelta",
-                )?;
-                Ok(CommitOutcome {
-                    new_snapshot_id,
-                    written_manifest_paths: written_manifest_paths(),
-                })
-            }
-            // Delete-file input is non-empty here (spec §4.1 handled the empty
-            // case above) and the action always stages a snapshot, so this arm
-            // reports the same value the empty-input no-op above reports.
-            Ok(OccSubmit::NoOp) => Ok(CommitOutcome {
-                new_snapshot_id: prev_snapshot_id.unwrap_or(0),
-                written_manifest_paths: written_manifest_paths(),
-            }),
-            Err(error) => Err(error.into_detail()),
-        }
-    }
-}
-
-struct RowDeltaTxnAction {
-    written: Vec<WrittenFile>,
-    commit_uuid: Uuid,
-    file_io: FileIO,
-    schema_id: i32,
-    abort_handle: Arc<AbortLog>,
-    /// Mutex<Vec<String>> shared with the outer RowDeltaCommit so the wrapper
-    /// can return the written manifest paths in `CommitOutcome` after the
-    /// transaction completes.
-    manifest_paths_out: Arc<Mutex<Vec<String>>>,
-    target_ref: String,
-    snapshot_properties: BTreeMap<String, String>,
-}
-
-#[async_trait]
-impl TransactionAction for RowDeltaTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> crate::iceberg::Result<ActionCommit> {
-        let m = table.metadata();
-        let format_version = m.format_version();
-        let new_seq = m.last_sequence_number() + 1;
-        let new_snapshot_id = generate_snapshot_id();
-        let target_ref = &self.target_ref;
-        let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
-        let metadata_dir = metadata_dir(table);
-
-        // 1. Write one new delete manifest per referenced partition spec.
-        let mut new_delete_manifests = Vec::new();
-        for (idx, (spec_id, files)) in group_written_by_spec(self.written.clone())
-            .into_iter()
-            .enumerate()
-        {
-            let spec = m.partition_spec_by_id(spec_id).cloned().ok_or_else(|| {
-                to_iceberg_unexpected(format!(
-                    "RowDelta delete file references unknown partition spec id {spec_id}"
-                ))
-            })?;
-            let delete_manifest_path = format!(
-                "{metadata_dir}/{}-row-delta-deletes-{idx}.avro",
-                self.commit_uuid
-            );
-            self.abort_handle
-                .record_manifest(delete_manifest_path.clone());
-            self.manifest_paths_out
-                .lock()
-                .expect("manifest_paths_out poisoned")
-                .push(delete_manifest_path.clone());
-            let manifest = write_delete_manifest(
-                &self.file_io,
-                &delete_manifest_path,
-                &files,
-                spec,
-                m.current_schema().clone(),
-                new_seq,
-                new_snapshot_id,
-                format_version,
-            )
-            .await
-            .map_err(to_iceberg_unexpected)?;
-            new_delete_manifests.push(manifest);
-        }
-
-        // 2. Inherit every entry from the base manifest list.
-        let mut entries = read_snapshot_manifest_list(m, &self.file_io, parent_snapshot_id)
-            .await
-            .map_err(to_iceberg_unexpected)?;
-        entries.extend(new_delete_manifests);
-
-        // 3. Write the new manifest list.
-        let row_lineage_first_row_id = if format_version == FormatVersion::V3 {
-            Some(effective_next_row_id(m).map_err(to_iceberg_unexpected)?)
-        } else {
-            None
-        };
-        let manifest_list_path = format!(
-            "{metadata_dir}/snap-{}-{}.avro",
-            new_snapshot_id, self.commit_uuid
-        );
-        self.abort_handle
-            .record_manifest(manifest_list_path.clone());
-        self.manifest_paths_out
-            .lock()
-            .expect("manifest_paths_out poisoned")
-            .push(manifest_list_path.clone());
-        write_manifest_list(
-            &self.file_io,
-            &manifest_list_path,
-            entries,
-            new_snapshot_id,
-            parent_snapshot_id,
-            new_seq,
-            format_version,
-            row_lineage_first_row_id,
-        )
-        .await
-        .map_err(to_iceberg_unexpected)?;
-
-        // 4. Construct the new Snapshot.
-        let parent_summary =
-            snapshot_summary(m, parent_snapshot_id).map_err(to_iceberg_unexpected)?;
-        let snapshot_summary = Summary {
-            operation: Operation::Delete,
-            additional_properties: merge_snapshot_summary_properties(
-                finalize_snapshot_summary(row_delta_summary(&self.written), parent_summary, false),
-                &self.snapshot_properties,
-                m.uuid(),
-                new_snapshot_id,
-            )
-            .map_err(to_iceberg_unexpected)?,
-        };
-        let snapshot = if let Some(first_row_id) = row_lineage_first_row_id {
-            Snapshot::builder()
-                .with_snapshot_id(new_snapshot_id)
-                .with_parent_snapshot_id(parent_snapshot_id)
-                .with_sequence_number(new_seq)
-                .with_timestamp_ms(now_ms())
-                .with_manifest_list(manifest_list_path)
-                .with_summary(snapshot_summary)
-                .with_schema_id(self.schema_id)
-                .with_row_range(first_row_id, 0)
-                .build()
-        } else {
-            Snapshot::builder()
-                .with_snapshot_id(new_snapshot_id)
-                .with_parent_snapshot_id(parent_snapshot_id)
-                .with_sequence_number(new_seq)
-                .with_timestamp_ms(now_ms())
-                .with_manifest_list(manifest_list_path)
-                .with_summary(snapshot_summary)
-                .with_schema_id(self.schema_id)
-                .build()
-        };
-
-        // 5. Build TableUpdate / TableRequirement set. iceberg-rust's
-        //    Transaction::do_commit packages this into a TableCommit and
-        //    submits via Catalog::update_table.
-        let updates = vec![
-            TableUpdate::AddSnapshot { snapshot },
-            TableUpdate::SetSnapshotRef {
-                ref_name: target_ref.clone(),
-                reference: SnapshotReference {
-                    snapshot_id: new_snapshot_id,
-                    retention: SnapshotRetention::Branch {
-                        min_snapshots_to_keep: None,
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
-                },
-            },
-        ];
-        let mut requirements = vec![
-            TableRequirement::CurrentSchemaIdMatch {
-                current_schema_id: m.current_schema_id(),
-            },
-            TableRequirement::DefaultSpecIdMatch {
-                default_spec_id: m.default_partition_spec_id(),
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: target_ref.clone(),
-                snapshot_id: parent_snapshot_id,
-            },
-        ];
-        // De-dup is not required by iceberg-rust; placed deterministically.
-        requirements.sort_by_key(|r| match r {
-            TableRequirement::CurrentSchemaIdMatch { .. } => 0,
-            TableRequirement::DefaultSpecIdMatch { .. } => 1,
-            TableRequirement::RefSnapshotIdMatch { .. } => 2,
-            _ => 99,
-        });
-
-        Ok(ActionCommit::new(updates, requirements))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn write_delete_manifest(
-    file_io: &FileIO,
-    out_path: &str,
-    written: &[WrittenFile],
-    partition_spec: PartitionSpecRef,
-    schema: crate::iceberg::spec::SchemaRef,
-    new_seq: i64,
-    new_snapshot_id: i64,
-    format_version: FormatVersion,
-) -> Result<ManifestFile, String> {
-    let output_file = file_io
-        .new_output(out_path)
-        .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
-    let builder = ManifestWriterBuilder::new(
-        output_file,
-        Some(new_snapshot_id),
-        None,
-        schema,
-        (*partition_spec).clone(),
-    );
-    let mut writer = match format_version {
-        FormatVersion::V2 => builder.build_v2_deletes(),
-        FormatVersion::V3 => builder.build_v3_deletes(),
-        FormatVersion::V1 => {
-            return Err("v1 tables do not support delete files; phase 1 rejects v1".to_string());
-        }
-    };
-    for f in written {
-        // We don't have a per-file IcebergCommitCollector handy in this scope;
-        // the conversion only needs schema-derived hints which are not used
-        // (DataFileBuilder ignores the collector parameter for now).
-        let df = written_file_to_iceberg_data_file_minimal(f)?;
-        // Newly-introduced position-delete files must be recorded with
-        // `ManifestStatus::Added` so downstream readers (e.g., the
-        // `plan_changes` / `collect_files` lineage walk) include them in
-        // the delete-bearing change set.  iceberg-rust's `add_delete_file`
-        // helper sets `status=Deleted` — that variant is reserved for
-        // marking files REMOVED in compaction-style snapshots, not for
-        // adding new delete files — its name is misleading.  Use
-        // `add_file`, which builds a status=Added entry that the writer
-        // accepts for `Deletes`-content manifests too (`check_data_file`
-        // verifies the file's `DataContentType` is `PositionDeletes` or
-        // `EqualityDeletes`).
-        writer
-            .add_file(df, new_seq)
-            .map_err(|e| format!("ManifestWriter::add_file failed: {e}"))?;
-    }
-    let manifest_file = writer
-        .write_manifest_file()
-        .await
-        .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))?;
-
-    // Sanity-check the content stamped by the writer matches what we asked for.
-    debug_assert_eq!(manifest_file.content, ManifestContentType::Deletes);
-    Ok(manifest_file)
-}
-
-/// Construct a DataFile from a WrittenFile without needing the full collector.
-/// Mirrors `written_file_to_iceberg_data_file` but avoids the unused
-/// `_collector` argument.
-fn written_file_to_iceberg_data_file_minimal(
-    f: &WrittenFile,
-) -> Result<crate::iceberg::spec::DataFile, String> {
-    use crate::iceberg::spec::DataFileBuilder;
-    let mut builder = DataFileBuilder::default();
-    builder
-        .content(f.content)
-        .file_path(f.path.clone())
-        .file_format(f.format)
-        .partition(f.partition_values.clone())
-        .partition_spec_id(f.partition_spec_id)
-        .record_count(f.record_count)
-        .file_size_in_bytes(f.file_size_in_bytes);
-    if !f.split_offsets.is_empty() {
-        builder.split_offsets(Some(f.split_offsets.clone()));
-    }
-    if let Some(km) = &f.key_metadata {
-        builder.key_metadata(Some(km.clone()));
-    }
-    if let Some(ref_path) = &f.referenced_data_file {
-        builder.referenced_data_file(Some(ref_path.clone()));
-    }
-    if let Some(equality_ids) = &f.equality_ids {
-        builder.equality_ids(Some(equality_ids.clone()));
-    }
-    if let Some(offset) = f.content_offset {
-        builder.content_offset(Some(offset));
-    }
-    if let Some(size) = f.content_size_in_bytes {
-        builder.content_size_in_bytes(Some(size));
-    }
-    if !f.column_sizes.is_empty() {
-        builder.column_sizes(f.column_sizes.clone());
-    }
-    if !f.value_counts.is_empty() {
-        builder.value_counts(f.value_counts.clone());
-    }
-    if !f.null_value_counts.is_empty() {
-        builder.null_value_counts(f.null_value_counts.clone());
-    }
-    if !f.lower_bounds.is_empty() {
-        builder.lower_bounds(f.lower_bounds.clone());
-    }
-    if !f.upper_bounds.is_empty() {
-        builder.upper_bounds(f.upper_bounds.clone());
-    }
-    builder
-        .build()
-        .map_err(|e| format!("DataFileBuilder::build failed: {e}"))
-}
-
-fn row_delta_summary(written: &[WrittenFile]) -> HashMap<String, String> {
-    let mut p = HashMap::new();
-    let position_files = written
-        .iter()
-        .filter(|f| f.content == DataContentType::PositionDeletes)
-        .count();
-    let equality_files = written
-        .iter()
-        .filter(|f| f.content == DataContentType::EqualityDeletes)
-        .count();
-    let position_records: u64 = written
-        .iter()
-        .filter(|f| f.content == DataContentType::PositionDeletes)
-        .map(|f| f.record_count)
-        .sum();
-    let equality_records: u64 = written
-        .iter()
-        .filter(|f| f.content == DataContentType::EqualityDeletes)
-        .map(|f| f.record_count)
-        .sum();
-    let total_size: u64 = written.iter().map(|f| f.file_size_in_bytes).sum();
-    if position_files > 0 {
-        p.insert(
-            "added-position-delete-files".to_string(),
-            position_files.to_string(),
-        );
-        p.insert(
-            "added-position-deletes".to_string(),
-            position_records.to_string(),
-        );
-    }
-    if equality_files > 0 {
-        p.insert(
-            "added-equality-delete-files".to_string(),
-            equality_files.to_string(),
-        );
-        p.insert(
-            "added-equality-deletes".to_string(),
-            equality_records.to_string(),
-        );
-    }
-    p.insert("added-delete-files".to_string(), written.len().to_string());
-    p.insert("added-files-size".to_string(), total_size.to_string());
-    p
-}
-
-fn group_written_by_spec(written: Vec<WrittenFile>) -> BTreeMap<i32, Vec<WrittenFile>> {
-    let mut grouped = BTreeMap::new();
-    for file in written {
-        grouped
-            .entry(file.partition_spec_id)
-            .or_insert_with(Vec::new)
-            .push(file);
-    }
-    grouped
-}
+use super::helpers::target_ref_snapshot_id;
 
 fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, s)
+}
+
+/// Position/equality-delete preparation consumes frozen additions once per attempt.
+pub(crate) struct RowDeltaPreparer;
+
+#[async_trait]
+impl crate::commit::staging::Preparer for RowDeltaPreparer {
+    async fn prepare(
+        &self,
+        view: &crate::commit::staging::StagedView<'_>,
+        intent: &crate::commit::model::OperationIntent,
+    ) -> crate::iceberg::Result<crate::commit::staging::PreparedChange> {
+        use crate::commit::model::{EntryIdentity, SeqField};
+        use crate::commit::row_delta_dv_metadata::{logical_file_size, write_added_entry_groups};
+        if intent.changes().added.is_empty() {
+            return Ok(crate::commit::staging::PreparedChange {
+                updates: vec![],
+                requirements: vec![],
+            });
+        }
+        if !intent.changes().removed.is_empty() {
+            return Err(to_iceberg_unexpected(
+                "Position-delete intent cannot remove entries".into(),
+            ));
+        }
+        let parent = target_ref_snapshot_id(view.metadata(), view.target_ref());
+        let mut inputs = crate::commit::dependency::ValidationInputs::new(
+            view.metadata(),
+            parent,
+            view.artifacts(),
+        );
+        let live = inputs.live_set().await?;
+        let mut summary = HashMap::new();
+        let mut records = [0u64; 2];
+        let mut counts = [0usize; 2];
+        let mut size = 0u64;
+        for added in &intent.changes().added {
+            let file = added.file();
+            if added.data_sequence() != SeqField::Inherit {
+                return Err(to_iceberg_unexpected(
+                    "New delete entries must inherit their data sequence".into(),
+                ));
+            }
+            let idx =
+                match file.content_type() {
+                    DataContentType::PositionDeletes => 0,
+                    DataContentType::EqualityDeletes
+                        if file.equality_ids().is_some_and(|ids| !ids.is_empty()) =>
+                    {
+                        1
+                    }
+                    _ => return Err(to_iceberg_unexpected(
+                        "Row delta requires position deletes or equality deletes with equality IDs"
+                            .into(),
+                    )),
+                };
+            if let Some(path) = file.referenced_data_file() {
+                if !live.contains_key(&EntryIdentity::DataFile { path: path.clone() }) {
+                    return Err(to_iceberg_unexpected(format!(
+                        "Position delete references absent data file {path}"
+                    )));
+                }
+            }
+            counts[idx] += 1;
+            records[idx] = records[idx]
+                .checked_add(file.record_count())
+                .ok_or_else(|| to_iceberg_unexpected("Delete record count overflow".into()))?;
+            size = size
+                .checked_add(logical_file_size(file)?)
+                .ok_or_else(|| to_iceberg_unexpected("Delete file size overflow".into()))?;
+        }
+        for (idx, kind) in ["position", "equality"].into_iter().enumerate() {
+            if counts[idx] > 0 {
+                summary.insert(
+                    format!("added-{kind}-delete-files"),
+                    counts[idx].to_string(),
+                );
+                summary.insert(format!("added-{kind}-deletes"), records[idx].to_string());
+            }
+        }
+        summary.insert(
+            "added-delete-files".into(),
+            intent.changes().added.len().to_string(),
+        );
+        summary.insert("added-files-size".into(), size.to_string());
+        let snapshot_id = crate::commit::staging::new_snapshot_id(view.metadata());
+        let mut manifests = if let Some(parent) = parent {
+            view.metadata()
+                .snapshot_by_id(parent)
+                .ok_or_else(|| to_iceberg_unexpected("Target parent snapshot is absent".into()))?
+                .load_manifest_list(view.artifacts().file_io(), view.metadata())
+                .await?
+                .entries()
+                .to_vec()
+        } else {
+            vec![]
+        };
+        manifests.extend(
+            write_added_entry_groups(view, snapshot_id, intent.changes().added.clone()).await?,
+        );
+        crate::commit::overwrite::prepare_snapshot_change(
+            view,
+            intent,
+            snapshot_id,
+            Operation::Delete,
+            manifests,
+            summary,
+            false,
+        )
+        .await
+    }
 }

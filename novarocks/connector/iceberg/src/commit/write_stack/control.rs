@@ -35,6 +35,10 @@
 //!   recovery evidence. Marker absence during reconciliation is *not* proof of
 //!   non-commit, so an unresolved session stays unknown.
 
+mod publication;
+mod recovery_codec;
+
+use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -84,12 +88,8 @@ use crate::commit::write_stack::old_delete::{
 };
 use crate::commit::write_stack::planning::{IcebergBranchSessionPlanInput, plan_branch_session};
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
-use crate::commit::{
-    CommitOpKind, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
-    IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
-};
+use crate::commit::{CommitOpKind, CowUpdateRewriteSet, CowUpdateTouchedFile, WrittenFile};
 use crate::iceberg::spec::{DataContentType, DataFileFormat, TableMetadata};
-use crate::iceberg::transaction::ApplyTransactionAction;
 use crate::metadata_context::IcebergMetadataContext;
 use crate::write_descriptor::decode_partition_descriptor;
 
@@ -99,7 +99,7 @@ use crate::write_descriptor::decode_partition_descriptor;
 pub const ICEBERG_WRITE_SESSION_MARKER_PROPERTY: &str = "novarocks.write.session.v1";
 
 /// The evidence schema version this control produces and accepts.
-pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 1;
+pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 3;
 
 /// The operation-kind tag on the evidence envelope.
 pub const ICEBERG_WRITE_SESSION_OPERATION_KIND: &str = "iceberg.connector_write_session.v1";
@@ -171,6 +171,13 @@ fn add_finalization_failure(
     ExternalMutationFinalization::Failed(failure(ConnectorMutationFailureKind::Internal, message))
 }
 
+fn unprojected_committed_receipt() -> ConnectorWriteReceipt {
+    // A fixed empty payload is structurally within the SPI receipt bound. It
+    // preserves a proven publication whose version projection failed.
+    ConnectorWriteReceipt::try_new(Bytes::new())
+        .expect("a fixed empty write receipt is within the SPI payload bound")
+}
+
 fn committed_write_receipt(
     snapshot_id: i64,
     resulting_row_count: Option<u64>,
@@ -207,20 +214,15 @@ fn committed_write_receipt(
     }
 }
 
-/// The canonical provider payload inside a reconciliation evidence envelope.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IcebergWriteSessionEvidenceV1 {
-    version: u16,
-    session_id: String,
-    table_ident: String,
-    target_ref: String,
-    op_kind: String,
-    base_snapshot_id: Option<i64>,
-    base_sequence_number: i64,
-    staging_dir: String,
-    manifest_cleanup_token: Option<String>,
-    document_manifest_digest: Option<[u8; 32]>,
+use publication::RecoveryPayload as IcebergWriteSessionEvidenceV3;
+
+#[cfg(test)]
+pub(crate) fn decode_write_recovery_facts_for_test(
+    evidence: &ExternalMutationEvidence,
+) -> Result<serde_json::Value, ConnectorError> {
+    let payload: IcebergWriteSessionEvidenceV3 =
+        recovery_codec::decode(evidence.provider_payload().as_ref())?;
+    serde_json::to_value(payload).map_err(|error| corrupt(error.to_string()))
 }
 
 /// The frontend-only Iceberg write authority of one exact catalog generation.
@@ -326,7 +328,7 @@ pub(crate) fn validate_prepared_set<'a>(
         .iter()
         .map(|target| (target.ordinal(), target.branch()))
         .collect::<BTreeMap<_, _>>();
-    let mut paths = BTreeSet::new();
+    let mut identities = BTreeSet::new();
     let mut delete_artifact_owner: BTreeMap<&str, WriteTargetOrdinal> = BTreeMap::new();
     let mut validated = Vec::with_capacity(prepared.fragments().len());
 
@@ -346,7 +348,7 @@ pub(crate) fn validate_prepared_set<'a>(
                 branch.as_str()
             )));
         }
-        if !paths.insert(fragment.path()) {
+        if !identities.insert(fragment.entry_identity()) {
             return Err(corrupt(format!(
                 "Iceberg prepared write set repeats staged artifact {}",
                 fragment.path()
@@ -408,7 +410,7 @@ pub(crate) fn validate_prepared_set<'a>(
 /// Demanding one artifact per frozen data file would therefore refuse every
 /// `DELETE` that does not happen to touch the whole table.
 pub(crate) fn validate_merged_old_references(
-    plans: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
+    plans: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
     validated: &[ValidatedFragment<'_>],
 ) -> Result<(), ConnectorError> {
     for entry in validated {
@@ -545,58 +547,7 @@ fn normalized_theta_artifact(
     )
 }
 
-fn cleanup_eager_logs(
-    runtime: &IcebergMetadataContext,
-    fs: crate::opendal::Operator,
-    mapper: crate::commit::CleanupPathMapper,
-    logs: Vec<Arc<crate::commit::abort::AbortLog>>,
-) {
-    let _ = runtime.resources().catalog_runtime().block_on(async move {
-        for log in logs {
-            for error in log
-                .cleanup_with_path_mapper(&fs, |path| mapper(path))
-                .await
-            {
-                tracing::warn!(path = %error.path, source = ?error.source, "eager Iceberg cleanup failed");
-            }
-        }
-    });
-}
-
-pub(crate) fn eager_conflict_backoff(
-    runtime: &IcebergMetadataContext,
-    context: &ConnectorRequestContext,
-    next_attempt: usize,
-) -> Result<(), ConnectorError> {
-    validate_context(context)?;
-    let delay = std::time::Duration::from_millis(
-        crate::commit::retry::COMMIT_RETRY_BACKOFF_MS[next_attempt - 1],
-    );
-    if context
-        .deadline()
-        .saturating_duration_since(std::time::Instant::now())
-        <= delay
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::DeadlineExceeded,
-            "Iceberg write deadline does not permit another conflict attempt",
-        ));
-    }
-    let end = std::time::Instant::now() + delay;
-    while std::time::Instant::now() < end {
-        validate_context(context)?;
-        let step = end
-            .saturating_duration_since(std::time::Instant::now())
-            .min(std::time::Duration::from_millis(5));
-        runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { tokio::time::sleep(step).await })
-            .map_err(unavailable)?;
-    }
-    validate_context(context)
-}
-
+#[cfg(test)]
 fn commit_proof_matches_eager_snapshot(
     proof: &crate::catalog::transaction::CommitProof,
     snapshot_id: i64,
@@ -609,6 +560,7 @@ fn commit_proof_matches_eager_snapshot(
             .is_none_or(|observed| observed == table_uuid)
 }
 
+#[cfg(test)]
 fn eager_proof_finalization(
     proof: &crate::catalog::transaction::CommitProof,
     snapshot_id: i64,
@@ -622,8 +574,32 @@ fn eager_proof_finalization(
     })
 }
 
+#[cfg(test)]
 async fn artifacts_for_staged_snapshot(
     base: &crate::iceberg::table::Table,
+    staged: &TableMetadata,
+    target_ref: &str,
+    op_kind: CommitOpKind,
+    current: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+) -> Result<Vec<novarocks_spi::connector::StatisticsArtifactDraft>, ConnectorError> {
+    let parent = crate::ref_snapshot::resolve_branch_head_snapshot_id(base.metadata(), target_ref)
+        .map_err(invalid)?;
+    artifacts_for_staged_metadata(
+        base.metadata(),
+        base.file_io(),
+        parent,
+        staged,
+        target_ref,
+        op_kind,
+        current,
+    )
+    .await
+}
+
+async fn artifacts_for_staged_metadata(
+    base: &TableMetadata,
+    file_io: &crate::iceberg::io::FileIO,
+    parent_id: Option<i64>,
     staged_metadata: &TableMetadata,
     target_ref: &str,
     op_kind: CommitOpKind,
@@ -632,14 +608,10 @@ async fn artifacts_for_staged_snapshot(
     if current.is_empty() || op_kind == CommitOpKind::Overwrite {
         return Ok(current);
     }
-    let parent_id =
-        crate::ref_snapshot::resolve_branch_head_snapshot_id(base.metadata(), target_ref)
-            .map_err(invalid)?;
     let Some(parent_id) = parent_id else {
         return Ok(current);
     };
     let parent_is_empty = base
-        .metadata()
         .snapshot_by_id(parent_id)
         .and_then(|snapshot| {
             snapshot
@@ -652,19 +624,18 @@ async fn artifacts_for_staged_snapshot(
     if parent_is_empty {
         return Ok(current);
     }
-    let Some(parent_statistics) = base.metadata().statistics_for_snapshot(parent_id) else {
+    let Some(parent_statistics) = base.statistics_for_snapshot(parent_id) else {
         // A non-empty parent without an artifact for a field cannot prove
         // whole-table coverage for that field after append.
         return Ok(Vec::new());
     };
     let parent_bodies = crate::stats_loader::StatsLoader::load_theta_bodies_from_file(
         &parent_statistics.statistics_path,
-        base.file_io(),
+        file_io,
     )
     .await
     .map_err(corrupt)?;
     let parent_snapshot = base
-        .metadata()
         .snapshot_by_id(parent_id)
         .ok_or_else(|| corrupt(format!("Iceberg parent snapshot {parent_id} is absent")))?;
     let current_snapshot = staged_metadata
@@ -675,7 +646,7 @@ async fn artifacts_for_staged_snapshot(
         )
         .ok_or_else(|| corrupt("staged Iceberg snapshot is absent"))?;
     let parent_schema = parent_snapshot
-        .schema(base.metadata())
+        .schema(base)
         .map_err(|error| corrupt(format!("resolve Iceberg parent statistics schema: {error}")))?;
     let current_schema = current_snapshot
         .schema(staged_metadata)
@@ -808,12 +779,14 @@ fn written_file_from_fragment(
 /// owner enters the catalog attempt loop. A fresh attempt may rebuild only
 /// attempt-bound metadata; it must never turn either value back into a source
 /// that can reopen the user's data files or recompute the aggregate.
+#[cfg(test)]
 #[derive(Clone)]
 struct ReusableEagerWriteInputs {
     files: Arc<[WrittenFile]>,
     statistics: Arc<[novarocks_spi::connector::StatisticsArtifactDraft]>,
 }
 
+#[cfg(test)]
 impl ReusableEagerWriteInputs {
     fn new(
         files: Vec<WrittenFile>,
@@ -825,15 +798,12 @@ impl ReusableEagerWriteInputs {
         }
     }
 
-    fn install_files(&self, collector: &IcebergCommitCollector) {
-        collector.inject_reusable_written_files(self.files.iter().cloned().collect());
-    }
-
     fn statistics_for_attempt(&self) -> Vec<novarocks_spi::connector::StatisticsArtifactDraft> {
         self.statistics.iter().cloned().collect()
     }
 }
 
+#[cfg(test)]
 fn permits_fresh_eager_attempt(
     outcome: &CatalogOutcome<crate::catalog::transaction::CommitProof>,
     attempt: usize,
@@ -1116,7 +1086,7 @@ impl IcebergWriteSessionControl {
         handle: &IcebergCommitHandle,
         prepared: &ConnectorPreparedWriteSet,
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
-        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
+        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
         document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
@@ -1143,47 +1113,53 @@ impl IcebergWriteSessionControl {
         handle.begin_commit()?;
         emit_iceberg_write_phase_marker(session_id, 0, "publication_admission_exit", phase_started);
         emit_iceberg_write_phase_marker(session_id, 0, "publication_dispatch_enter", phase_started);
-        let outcome = if matches!(
-            handle.commit_op_kind(),
-            CommitOpKind::FastAppend | CommitOpKind::Overwrite
-        ) {
-            self.dispatch_eager_commit(
-                handle,
-                &validated,
-                statistics,
-                document_publication,
-                context,
-            )
-        } else {
-            debug_assert!(statistics.is_empty());
-            self.dispatch_commit(handle, &validated, document_publication, context)
-        };
+        let mut outcome = self.dispatch_operation(
+            handle,
+            &validated,
+            statistics,
+            document_publication,
+            context,
+        );
         emit_iceberg_write_phase_marker(session_id, 0, "publication_dispatch_exit", phase_started);
-        match &outcome {
-            Ok(ExternalMutationOutcome::KnownCommitted { receipt, .. }) => {
-                let snapshot_id = receipt
-                    .committed_version()
-                    .and_then(|version| version.snapshot_id())
-                    .unwrap_or_default();
-                handle.settle(IcebergWriteSessionState::KnownCommitted { snapshot_id })?;
+        let terminal = match &outcome {
+            Ok(ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                ..
+            }) => {
+                handle.retain_finalization(finalization.clone());
+                IcebergWriteSessionState::KnownCommitted {
+                    snapshot_id: receipt
+                        .committed_version()
+                        .and_then(|version| version.snapshot_id()),
+                }
             }
-            Ok(ExternalMutationOutcome::KnownUncommitted { failure }) => {
-                handle.settle(IcebergWriteSessionState::KnownUncommitted {
+            Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup }) => {
+                handle.retain_finalization(cleanup.clone());
+                IcebergWriteSessionState::KnownUncommitted {
                     message: failure.message().to_string(),
-                })?;
+                }
             }
             Ok(ExternalMutationOutcome::CommitUnknown { failure, .. }) => {
-                handle.settle(IcebergWriteSessionState::CommitUnknown {
+                IcebergWriteSessionState::CommitUnknown {
                     message: failure.message().to_string(),
                     staging_dir: handle.staging_dir(),
-                })?;
+                }
             }
-            Err(error) => {
-                // A refusal raised before dispatch never touched the catalog,
-                // so the session stays uncommitted rather than unknown.
-                handle.settle(IcebergWriteSessionState::KnownUncommitted {
-                    message: error.message().to_string(),
-                })?;
+            Err(error) => IcebergWriteSessionState::KnownUncommitted {
+                message: error.message().to_string(),
+            },
+        };
+        if let Err(error) = handle.settle(terminal) {
+            // Local state recording cannot erase an already proven publication verdict.
+            if let Ok(ExternalMutationOutcome::KnownCommitted { finalization, .. }) = &mut outcome {
+                *finalization = add_finalization_failure(finalization.clone(), error.message());
+                handle.retain_finalization(finalization.clone());
+            } else if let Ok(ExternalMutationOutcome::KnownUncommitted { cleanup, .. }) =
+                &mut outcome
+            {
+                *cleanup = add_finalization_failure(cleanup.clone(), error.message());
+                handle.retain_finalization(cleanup.clone());
             }
         }
         emit_iceberg_write_phase_marker(session_id, 0, "publication_settle_exit", phase_started);
@@ -1212,7 +1188,7 @@ impl IcebergWriteSessionControl {
         &self,
         handle: &IcebergCommitHandle,
         prepared: &ConnectorPreparedWriteSet,
-        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
+        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         validate_context(context)?;
@@ -1271,834 +1247,6 @@ impl IcebergWriteSessionControl {
         })
     }
 
-    fn dispatch_commit(
-        &self,
-        handle: &IcebergCommitHandle,
-        validated: &[ValidatedFragment<'_>],
-        document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
-        context: &ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        let facts = handle.table();
-        let physical = self
-            .runtime
-            .load_table_for_request(facts.namespace(), facts.table_name(), context)
-            .map_err(|error| unavailable(error.to_string()))?;
-        let table = physical.into_table();
-        let metadata = table.metadata().clone();
-        if metadata.uuid().to_string() != facts.table_uuid()
-            || metadata.current_schema_id() != facts.schema_id()
-            || metadata.default_partition_spec_id() != facts.default_partition_spec_id()
-            || crate::ref_snapshot::resolve_branch_head_snapshot_id(&metadata, facts.target_ref())
-                .ok()
-                .flatten()
-                != facts.base_snapshot_id()
-        {
-            return Err(invalid(
-                "Iceberg write target no longer matches its exact sealed session",
-            ));
-        }
-
-        // The staged artifacts were written under the generation the *writers*
-        // were built against. Under an atomic partition replacement that is the
-        // prospective one, whose new spec the loaded table does not have yet, so
-        // interpreting the artifacts against the loaded metadata would fail to
-        // resolve their own partition spec.
-        let commit_metadata = handle
-            .repartition()
-            .map_or(&metadata, |prepared| prepared.prospective_metadata());
-
-        let files = validated
-            .iter()
-            .map(|entry| written_file_from_fragment(entry.fragment, commit_metadata))
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_facts = crate::write_codec::written_output_facts(&files).map_err(invalid)?;
-
-        let table_ident =
-            crate::iceberg::TableIdent::from_strs([facts.namespace(), facts.table_name()])
-                .map_err(|error| invalid(error.to_string()))?;
-        let op_kind = handle.commit_op_kind();
-        let collector = Arc::new(
-            IcebergCommitCollector::new(
-                op_kind,
-                table_ident,
-                facts.base_snapshot_id(),
-                metadata.last_sequence_number(),
-                commit_metadata.current_schema().clone(),
-                commit_metadata.default_partition_spec().clone(),
-                handle.staging_dir(),
-            )
-            .with_table_metadata(commit_metadata.clone()),
-        );
-        // Every data row this write staged, counted before the files are moved
-        // into the collector. It seeds the publication provenance the commit
-        // action later refines into the committed snapshot's `total-records`.
-        let staged_data_rows = files
-            .iter()
-            .filter(|file| file.content == DataContentType::Data)
-            .fold(0u64, |total, file| total.saturating_add(file.record_count));
-        // Branch `i`'s replacement artifacts are the ones its own writers
-        // staged, so the record is keyed by the write target ordinal the
-        // fragment carried and by nothing else.
-        let cow_update_rewrite = cow_update_rewrite_set(
-            handle,
-            &validated
-                .iter()
-                .map(|entry| entry.ordinal)
-                .zip(files.iter().cloned())
-                .collect::<Vec<_>>(),
-        )?;
-        collector.inject_written_files(files);
-
-        let snapshot_properties = session_snapshot_properties_with_documents(
-            handle,
-            staged_data_rows,
-            document_publication,
-        )?;
-
-        let binding = self
-            .runtime
-            .resources()
-            .planning_binding()
-            .for_request(context.clone());
-        let access = binding.resolve_access(metadata.location())?;
-        let fs = access.operator();
-        let cleanup_access = access.clone();
-        let cleanup_path_mapper: crate::commit::CleanupPathMapper = Arc::new(move |path: &str| {
-            cleanup_access
-                .bind_location(path, novarocks_fs::FileIdentity::new(path, 0, None))
-                .map(|file| file.operator_relative_path().to_string())
-                .unwrap_or_else(|_| path.to_string())
-        });
-        let catalog = self.runtime.novarocks_catalog().vendored_client();
-        let input = RunInput {
-            collector,
-            catalog,
-            table: table.clone(),
-            fs,
-            file_io: table.file_io().clone(),
-            cleanup_path_mapper: Some(cleanup_path_mapper),
-            cow_update_rewrite,
-            selected_rewrite: selected_rewrite_files(handle),
-            // A partition replacement is a change to the table itself, and the
-            // one commit that carries it has to be the one that publishes the
-            // rows written under the new spec. `main` is where a managed
-            // publication's default partitioning lives, so the replacement's
-            // commit targets it exactly.
-            target_ref: match handle.repartition() {
-                Some(_) => "main".to_string(),
-                None => facts.target_ref().to_string(),
-            },
-            snapshot_properties,
-            atomic_partition_replacement: publication_metadata_updates(
-                handle.repartition(),
-                document_publication,
-                &metadata,
-            )?
-            .map(crate::commit::run::AtomicPartitionReplacement::try_new)
-            .transpose()
-            .map_err(invalid)?,
-        };
-        // The runtime bridge wraps the commit, so a bridge failure says nothing
-        // about whether the catalog request went out. Calling it uncommitted
-        // would authorize deleting files a committed snapshot may reference, so
-        // it is deliberately an unknown outcome carrying real evidence.
-        let bridge_collector = Arc::clone(&input.collector);
-        let result = match self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { run_iceberg_commit(input).await })
-        {
-            Ok(Ok(outcome)) => Ok(outcome),
-            Ok(Err(error)) => Err(error),
-            Err(bridge) => Err(CommitServiceError::unknown(
-                format!("Iceberg commit runtime bridge: {bridge}"),
-                crate::commit::service::RecoveryEvidence::from_collector(&bridge_collector),
-            )),
-        };
-        match result {
-            Ok(outcome) => {
-                // The commit is proven. Everything below only *describes* it,
-                // so a failure here degrades the finalization and never the
-                // verdict: calling a published snapshot uncommitted would
-                // authorize deleting files it already references.
-                let (resulting_row_count, finalization) =
-                    match self.publication_row_count(handle, outcome.new_snapshot_id, context) {
-                        Ok(rows) => (rows, ExternalMutationFinalization::Complete),
-                        Err(error) => (
-                            None,
-                            ExternalMutationFinalization::Failed(failure(
-                                ConnectorMutationFailureKind::Internal,
-                                error.message().to_string(),
-                            )),
-                        ),
-                    };
-                let (receipt, finalization) = committed_write_receipt(
-                    outcome.new_snapshot_id,
-                    resulting_row_count,
-                    handle
-                        .repartition()
-                        .map(|prepared| prepared.committed().clone()),
-                    Some(output_facts),
-                    finalization,
-                );
-                Ok(ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt,
-                    finalization,
-                })
-            }
-            Err(CommitServiceError::InvalidInput { message }) => Err(invalid(message)),
-            Err(CommitServiceError::KnownUncommitted { message, cleanup }) => {
-                Ok(ExternalMutationOutcome::KnownUncommitted {
-                    failure: failure(
-                        ConnectorMutationFailureKind::Conflict,
-                        format!(
-                            "{message}; staged cleanup attempted={}, errors={}",
-                            cleanup.attempted, cleanup.error_count
-                        ),
-                    ),
-                })
-            }
-            Err(CommitServiceError::Unknown { message, evidence }) => {
-                Ok(ExternalMutationOutcome::CommitUnknown {
-                    failure: failure(ConnectorMutationFailureKind::Unavailable, message),
-                    evidence: self.encode_evidence_after_preflight(handle, &evidence),
-                })
-            }
-            Err(CommitServiceError::FinalizeFailedKnownCommitted {
-                outcome,
-                finalize_error,
-                evidence,
-            }) => match outcome {
-                Some(committed) => {
-                    let (receipt, finalization) = committed_write_receipt(
-                        committed.new_snapshot_id,
-                        None,
-                        handle
-                            .repartition()
-                            .map(|prepared| prepared.committed().clone()),
-                        Some(output_facts),
-                        ExternalMutationFinalization::Failed(failure(
-                            ConnectorMutationFailureKind::Internal,
-                            finalize_error,
-                        )),
-                    );
-                    Ok(ExternalMutationOutcome::KnownCommitted {
-                        effect: ExternalMutationEffect::Applied,
-                        receipt,
-                        finalization,
-                    })
-                }
-                None => Ok(ExternalMutationOutcome::CommitUnknown {
-                    failure: failure(ConnectorMutationFailureKind::Internal, finalize_error),
-                    evidence: self.encode_evidence_after_preflight(handle, &evidence),
-                }),
-            },
-        }
-    }
-
-    fn dispatch_eager_commit(
-        &self,
-        handle: &IcebergCommitHandle,
-        validated: &[ValidatedFragment<'_>],
-        statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
-        document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
-        context: &ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        let phase_started = std::time::Instant::now();
-        let session_id = handle.session_id();
-        emit_iceberg_write_phase_marker(session_id, 0, "eager_enter", phase_started);
-        let facts = handle.table();
-        let session_abort = Arc::new(crate::commit::abort::AbortLog::new());
-        for entry in validated {
-            session_abort.record_data_file(entry.fragment.path().to_string());
-        }
-        let binding = self
-            .runtime
-            .resources()
-            .planning_binding()
-            .for_request(context.clone());
-        let cleanup_access = binding.resolve_access(facts.table_location())?;
-        let cleanup_fs = cleanup_access.operator();
-        let cleanup_mapper: crate::commit::CleanupPathMapper = Arc::new(move |path: &str| {
-            cleanup_access
-                .bind_location(path, novarocks_fs::FileIdentity::new(path, 0, None))
-                .map(|file| file.operator_relative_path().to_string())
-                .unwrap_or_else(|_| path.to_string())
-        });
-        let cleanup_session = || {
-            cleanup_eager_logs(
-                self.runtime.as_ref(),
-                cleanup_fs.clone(),
-                Arc::clone(&cleanup_mapper),
-                vec![Arc::clone(&session_abort)],
-            );
-        };
-        emit_iceberg_write_phase_marker(session_id, 0, "initial_table_load_enter", phase_started);
-        let initial = match self.runtime.load_table_for_request(
-            facts.namespace(),
-            facts.table_name(),
-            context,
-        ) {
-            Ok(table) => table.into_table(),
-            Err(error) => {
-                cleanup_session();
-                return Err(unavailable(error.to_string()));
-            }
-        };
-        emit_iceberg_write_phase_marker(session_id, 0, "initial_table_load_exit", phase_started);
-        if initial.metadata().uuid().to_string() != facts.table_uuid()
-            || initial.metadata().current_schema_id() != facts.schema_id()
-        {
-            cleanup_session();
-            return Err(invalid(
-                "Iceberg write target no longer matches its sealed table generation/schema",
-            ));
-        }
-        let observed_head = crate::ref_snapshot::resolve_branch_head_snapshot_id(
-            initial.metadata(),
-            facts.target_ref(),
-        )
-        .map_err(invalid)?;
-        if (handle.repartition().is_some() || handle.document_publication().is_some())
-            && (observed_head != facts.base_snapshot_id()
-                || initial.metadata().default_partition_spec_id()
-                    != facts.default_partition_spec_id())
-        {
-            cleanup_session();
-            return Ok(ExternalMutationOutcome::KnownUncommitted {
-                failure: failure(
-                    ConnectorMutationFailureKind::Conflict,
-                    "atomic partition replacement cannot rebase its frozen metadata updates",
-                ),
-            });
-        }
-        let commit_metadata = handle.repartition().map_or(initial.metadata(), |prepared| {
-            prepared.prospective_metadata()
-        });
-        let files = match validated
-            .iter()
-            .map(|entry| written_file_from_fragment(entry.fragment, commit_metadata))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(files) => files,
-            Err(error) => {
-                cleanup_session();
-                return Err(error);
-            }
-        };
-        let output_facts = match crate::write_codec::written_output_facts(&files) {
-            Ok(facts) => facts,
-            Err(error) => {
-                cleanup_session();
-                return Err(invalid(error));
-            }
-        };
-        let staged_data_rows = files
-            .iter()
-            .filter(|file| file.content == DataContentType::Data)
-            .fold(0u64, |total, file| total.saturating_add(file.record_count));
-        let reusable = ReusableEagerWriteInputs::new(files, statistics);
-        let snapshot_properties = match session_snapshot_properties_with_documents(
-            handle,
-            staged_data_rows,
-            document_publication,
-        ) {
-            Ok(properties) => properties,
-            Err(error) => {
-                cleanup_session();
-                return Err(error);
-            }
-        };
-        let table_ident =
-            match crate::iceberg::TableIdent::from_strs([facts.namespace(), facts.table_name()]) {
-                Ok(ident) => ident,
-                Err(error) => {
-                    cleanup_session();
-                    return Err(invalid(error.to_string()));
-                }
-            };
-        let expected_uuid = initial.metadata().uuid();
-        let expected_uuid_rendered = expected_uuid.to_string();
-        let mut current = initial;
-        const MAX_ATTEMPTS: usize = 3;
-        for attempt in 0..MAX_ATTEMPTS {
-            let attempt_number = attempt + 1;
-            emit_iceberg_write_phase_marker(
-                session_id,
-                attempt_number,
-                "attempt_enter",
-                phase_started,
-            );
-            if let Err(error) = validate_context(context) {
-                cleanup_session();
-                return Err(error);
-            }
-            if attempt > 0 {
-                self.runtime
-                    .control_state()
-                    .invalidate_table_cache(facts.namespace(), facts.table_name());
-                emit_iceberg_write_phase_marker(
-                    session_id,
-                    attempt_number,
-                    "retry_table_load_enter",
-                    phase_started,
-                );
-                current = match self.runtime.load_table_for_request(
-                    facts.namespace(),
-                    facts.table_name(),
-                    context,
-                ) {
-                    Ok(table) => table.into_table(),
-                    Err(error) => {
-                        cleanup_session();
-                        return Err(unavailable(error.to_string()));
-                    }
-                };
-                emit_iceberg_write_phase_marker(
-                    session_id,
-                    attempt_number,
-                    "retry_table_load_exit",
-                    phase_started,
-                );
-                if current.metadata().uuid() != expected_uuid
-                    || current.metadata().current_schema_id() != facts.schema_id()
-                {
-                    cleanup_session();
-                    return Ok(ExternalMutationOutcome::KnownUncommitted {
-                        failure: failure(
-                            ConnectorMutationFailureKind::Conflict,
-                            "Iceberg write conflict retry resolved a different table generation or schema",
-                        ),
-                    });
-                }
-            }
-
-            let attempt_metadata = handle.repartition().map_or(current.metadata(), |prepared| {
-                prepared.prospective_metadata()
-            });
-            let attempt_partition_spec = if handle.repartition().is_some() {
-                attempt_metadata.default_partition_spec().clone()
-            } else {
-                match current
-                    .metadata()
-                    .partition_spec_by_id(facts.default_partition_spec_id())
-                    .cloned()
-                {
-                    Some(spec) => spec,
-                    None => {
-                        cleanup_session();
-                        return Err(invalid(
-                            "Iceberg write conflict retry lost the sealed partition spec",
-                        ));
-                    }
-                }
-            };
-            let attempt_base_snapshot = match crate::ref_snapshot::resolve_branch_head_snapshot_id(
-                current.metadata(),
-                facts.target_ref(),
-            ) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    cleanup_session();
-                    return Err(invalid(error));
-                }
-            };
-            let collector = Arc::new(
-                IcebergCommitCollector::new(
-                    handle.commit_op_kind(),
-                    table_ident.clone(),
-                    attempt_base_snapshot,
-                    current.metadata().last_sequence_number(),
-                    attempt_metadata.current_schema().clone(),
-                    attempt_partition_spec,
-                    handle.staging_dir(),
-                )
-                .with_table_metadata(attempt_metadata.clone()),
-            );
-            reusable.install_files(&collector);
-            let commit_uuid = uuid::Uuid::new_v4();
-            collector.set_manifest_cleanup_token(commit_uuid.to_string());
-            let attempt_evidence = self.encode_evidence_after_preflight(
-                handle,
-                &crate::commit::service::RecoveryEvidence::from_collector(&collector),
-            );
-            let abort_handle = Arc::clone(&collector.abort_log);
-            let vendored = self.runtime.novarocks_catalog().vendored_client();
-            let provider_catalog = Arc::clone(self.runtime.novarocks_catalog());
-            let table = current.clone();
-            let file_io = table.file_io().clone();
-            let target_ref = facts.target_ref().to_string();
-            let snapshot_properties = snapshot_properties.clone();
-            let current_artifacts = reusable.statistics_for_attempt();
-            let initial_updates = publication_metadata_updates(
-                handle.repartition(),
-                document_publication,
-                current.metadata(),
-            )?
-            .unwrap_or_default();
-            let mut identity = handle.session_id().to_bytes();
-            identity[15] ^= attempt as u8;
-            let target =
-                crate::catalog::CatalogTableName::new(facts.namespace(), facts.table_name());
-            let target_ref_for_request = Arc::<str>::from(facts.target_ref());
-            let expected_uuid_string = Arc::<str>::from(expected_uuid_rendered.as_str());
-            let marker = Some((
-                Arc::<str>::from(ICEBERG_WRITE_SESSION_MARKER_PROPERTY),
-                Arc::<str>::from(handle.session_id().to_string()),
-            ));
-            let operation = handle.commit_op_kind();
-            let bridge_collector = Arc::clone(&collector);
-            let dispatch_context = context.clone();
-            let dispatch_context_failure = Arc::new(std::sync::OnceLock::new());
-            let dispatch_context_failure_for_attempt = Arc::clone(&dispatch_context_failure);
-            emit_iceberg_write_phase_marker(
-                session_id,
-                attempt_number,
-                "runtime_bridge_enter",
-                phase_started,
-            );
-            let attempt_result = self
-                .runtime
-                .resources()
-                .catalog_runtime()
-                .block_on(async move {
-                    let ctx = crate::commit::action::CommitCtx {
-                        collector: &collector,
-                        table: &table,
-                        catalog: vendored.as_ref(),
-                        file_io: &file_io,
-                        commit_uuid,
-                        abort_handle,
-                        target_ref: &target_ref,
-                        snapshot_properties: &snapshot_properties,
-                    };
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "data_stage_enter",
-                        phase_started,
-                    );
-                    let (mut transaction, data_outcome) = match operation {
-                        CommitOpKind::FastAppend => {
-                            crate::commit::fast_append::stage_eager_fast_append(ctx).await?
-                        }
-                        CommitOpKind::Overwrite => {
-                            crate::commit::overwrite::stage_eager_overwrite(ctx, initial_updates)
-                                .await?
-                        }
-                        _ => unreachable!("eager write path only accepts append/overwrite"),
-                    };
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "data_stage_exit",
-                        phase_started,
-                    );
-                    let staged_metadata = transaction.staged_table().metadata().clone();
-                    let sequence_number = staged_metadata.last_sequence_number();
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "statistics_merge_enter",
-                        phase_started,
-                    );
-                    let merged = artifacts_for_staged_snapshot(
-                        &table,
-                        &staged_metadata,
-                        &target_ref,
-                        operation,
-                        current_artifacts,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "statistics_merge_exit",
-                        phase_started,
-                    );
-                    if !merged.is_empty() {
-                        let path = crate::stats_assembler::puffin_path_for_statistics_operation(
-                            &staged_metadata,
-                            data_outcome.new_snapshot_id,
-                            identity,
-                        );
-                        collector.abort_log.record_manifest(path.clone());
-                        emit_iceberg_write_phase_marker(
-                            session_id,
-                            attempt_number,
-                            "puffin_write_enter",
-                            phase_started,
-                        );
-                        let statistics_file = crate::stats_assembler::write_puffin_artifacts(
-                            &file_io,
-                            &path,
-                            data_outcome.new_snapshot_id,
-                            sequence_number,
-                            &merged,
-                        )
-                        .await?
-                        .ok_or_else(|| {
-                            "non-empty write statistics produced no Puffin file".to_string()
-                        })?;
-                        emit_iceberg_write_phase_marker(
-                            session_id,
-                            attempt_number,
-                            "puffin_write_exit",
-                            phase_started,
-                        );
-                        emit_iceberg_write_phase_marker(
-                            session_id,
-                            attempt_number,
-                            "statistics_stage_enter",
-                            phase_started,
-                        );
-                        transaction = transaction
-                            .update_statistics()
-                            .set_statistics(statistics_file)
-                            .apply(transaction)
-                            .await
-                            .map_err(|error| {
-                                format!("stage Iceberg write SetStatistics: {error}")
-                            })?;
-                        emit_iceberg_write_phase_marker(
-                            session_id,
-                            attempt_number,
-                            "statistics_stage_exit",
-                            phase_started,
-                        );
-                    }
-                    let mut staged = transaction.into_table_commit();
-                    staged.add_requirement(crate::iceberg::TableRequirement::UuidMatch {
-                        uuid: expected_uuid,
-                    });
-                    let request = TransactionRequest {
-                        identity: TransactionIdentity::new("write-attempt", identity),
-                        target,
-                        target_ref: target_ref_for_request,
-                        base_snapshot_id: crate::ref_snapshot::resolve_branch_head_snapshot_id(
-                            table.metadata(),
-                            &target_ref,
-                        )
-                        .map_err(|error| error.to_string())?,
-                        expected_table_uuid: Some(expected_uuid_string),
-                        marker,
-                    };
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "transaction_admission_enter",
-                        phase_started,
-                    );
-                    let transaction_start = provider_catalog.new_transaction(request).await;
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "transaction_admission_exit",
-                        phase_started,
-                    );
-                    let mut frontier = match transaction_start {
-                        CatalogTransactionStart::Ready(frontier) => frontier,
-                        CatalogTransactionStart::KnownUncommitted { failure } => {
-                            return Ok((
-                                CatalogOutcome::KnownUncommitted { failure },
-                                data_outcome,
-                                collector,
-                            ));
-                        }
-                        CatalogTransactionStart::Unsupported(error) => {
-                            return Err(error.to_string());
-                        }
-                        CatalogTransactionStart::CommitUnknown { failure, evidence } => {
-                            return Ok((
-                                CatalogOutcome::CommitUnknown { failure, evidence },
-                                data_outcome,
-                                collector,
-                            ));
-                        }
-                    };
-                    frontier.stage(staged).map_err(|error| error.to_string())?;
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "catalog_dispatch_enter",
-                        phase_started,
-                    );
-                    let dispatch_result =
-                        commit_eager_frontier(&mut frontier, &dispatch_context).await;
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "catalog_dispatch_exit",
-                        phase_started,
-                    );
-                    let outcome = match dispatch_result {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            let _ = dispatch_context_failure_for_attempt.set(error.clone());
-                            return Err(error.to_string());
-                        }
-                    };
-                    Ok((outcome, data_outcome, collector))
-                });
-            emit_iceberg_write_phase_marker(
-                session_id,
-                attempt_number,
-                "runtime_bridge_exit",
-                phase_started,
-            );
-            let (catalog_outcome, data_outcome, collector) = match attempt_result {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    cleanup_eager_logs(
-                        self.runtime.as_ref(),
-                        cleanup_fs.clone(),
-                        Arc::clone(&cleanup_mapper),
-                        vec![
-                            Arc::clone(&bridge_collector.abort_log),
-                            Arc::clone(&session_abort),
-                        ],
-                    );
-                    if let Some(context_error) = dispatch_context_failure.get() {
-                        return Err(context_error.clone());
-                    }
-                    return Ok(ExternalMutationOutcome::KnownUncommitted {
-                        failure: failure(
-                            ConnectorMutationFailureKind::InvalidRequest,
-                            format!("Iceberg eager staging failed before dispatch: {error}"),
-                        ),
-                    });
-                }
-                Err(bridge) => {
-                    return Ok(ExternalMutationOutcome::CommitUnknown {
-                        failure: failure(
-                            ConnectorMutationFailureKind::Unavailable,
-                            format!("Iceberg eager commit runtime bridge: {bridge}"),
-                        ),
-                        evidence: attempt_evidence.clone(),
-                    });
-                }
-            };
-            emit_iceberg_write_phase_marker(
-                session_id,
-                attempt_number,
-                "attempt_outcome_ready",
-                phase_started,
-            );
-            let retry_conflict = permits_fresh_eager_attempt(
-                &catalog_outcome,
-                attempt,
-                MAX_ATTEMPTS,
-                handle.repartition().is_some() || handle.document_publication().is_some(),
-            );
-            match catalog_outcome {
-                CatalogOutcome::KnownCommitted {
-                    effect,
-                    receipt: proof,
-                    ..
-                } => {
-                    collector.mark_committed();
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "receipt_finalization_enter",
-                        phase_started,
-                    );
-                    let proof_finalization = eager_proof_finalization(
-                        &proof,
-                        data_outcome.new_snapshot_id,
-                        &expected_uuid_rendered,
-                    );
-                    let (resulting_row_count, finalization) =
-                        if let Some(finalization) = proof_finalization {
-                            (None, finalization)
-                        } else {
-                            match self.publication_row_count(
-                                handle,
-                                data_outcome.new_snapshot_id,
-                                context,
-                            ) {
-                                Ok(rows) => (rows, ExternalMutationFinalization::Complete),
-                                Err(error) => (
-                                    None,
-                                    ExternalMutationFinalization::Failed(failure(
-                                        ConnectorMutationFailureKind::Internal,
-                                        error.message().to_string(),
-                                    )),
-                                ),
-                            }
-                        };
-                    let (receipt, finalization) = committed_write_receipt(
-                        data_outcome.new_snapshot_id,
-                        resulting_row_count,
-                        handle
-                            .repartition()
-                            .map(|prepared| prepared.committed().clone()),
-                        Some(output_facts),
-                        finalization,
-                    );
-                    emit_iceberg_write_phase_marker(
-                        session_id,
-                        attempt_number,
-                        "receipt_finalization_exit",
-                        phase_started,
-                    );
-                    return Ok(ExternalMutationOutcome::KnownCommitted {
-                        effect,
-                        receipt,
-                        finalization,
-                    });
-                }
-                CatalogOutcome::KnownUncommitted { .. } if retry_conflict => {
-                    cleanup_eager_logs(
-                        self.runtime.as_ref(),
-                        cleanup_fs.clone(),
-                        Arc::clone(&cleanup_mapper),
-                        vec![Arc::clone(&collector.abort_log)],
-                    );
-                    if let Err(error) =
-                        eager_conflict_backoff(self.runtime.as_ref(), context, attempt + 1)
-                    {
-                        cleanup_eager_logs(
-                            self.runtime.as_ref(),
-                            cleanup_fs.clone(),
-                            Arc::clone(&cleanup_mapper),
-                            vec![Arc::clone(&session_abort)],
-                        );
-                        return Err(error);
-                    }
-                }
-                CatalogOutcome::KnownUncommitted { failure } => {
-                    cleanup_eager_logs(
-                        self.runtime.as_ref(),
-                        cleanup_fs.clone(),
-                        Arc::clone(&cleanup_mapper),
-                        vec![Arc::clone(&collector.abort_log), Arc::clone(&session_abort)],
-                    );
-                    return Ok(ExternalMutationOutcome::KnownUncommitted { failure });
-                }
-                CatalogOutcome::CommitUnknown { failure, .. } => {
-                    return Ok(ExternalMutationOutcome::CommitUnknown {
-                        failure,
-                        evidence: attempt_evidence,
-                    });
-                }
-                CatalogOutcome::Unsupported(error) => {
-                    cleanup_eager_logs(
-                        self.runtime.as_ref(),
-                        cleanup_fs.clone(),
-                        Arc::clone(&cleanup_mapper),
-                        vec![Arc::clone(&collector.abort_log), Arc::clone(&session_abort)],
-                    );
-                    return Err(invalid(error.to_string()));
-                }
-            }
-        }
-        unreachable!("bounded eager write attempt loop always returns")
-    }
-
     /// Project the committed snapshot's row count onto a publication's receipt.
     ///
     /// Only a managed publication claims one: its caller records the published
@@ -2107,7 +1255,7 @@ impl IcebergWriteSessionControl {
     /// answer, not a missing feature.
     ///
     /// The read has to reload, and the reload has to reach the catalog.
-    /// `dispatch_commit` loaded the table before the commit, and every cache
+    /// The frozen publication runner loaded the table before the commit, and every cache
     /// between here and the catalog -- the attempt's request scope included --
     /// still holds that pre-commit view, which by construction cannot know the
     /// snapshot just created. Declaring the external effect is what makes the
@@ -2142,47 +1290,11 @@ impl IcebergWriteSessionControl {
         publication_row_count_from_metadata(handle, table.metadata(), snapshot_id)
     }
 
-    fn encode_evidence(
-        &self,
-        handle: &IcebergCommitHandle,
-        recovery: &crate::commit::service::RecoveryEvidence,
-    ) -> Result<ExternalMutationEvidence, ConnectorError> {
-        encode_session_evidence(&self.descriptor, self.key.incarnation, handle, recovery)
-    }
-
-    fn preflight_evidence_at_admission(
-        &self,
-        handle: &IcebergCommitHandle,
-    ) -> Result<(), ConnectorError> {
-        let maximum = recovery_evidence_for_handle(
-            handle,
-            Some("00000000-0000-0000-0000-000000000000".to_string()),
-        );
-        encode_session_evidence_with_digest(
-            &self.descriptor,
-            self.key.incarnation,
-            handle,
-            &maximum,
-            handle.document_publication().map(|_| [u8::MAX; 32]),
-        )
-        .map(|_| ())
-    }
-
-    fn encode_evidence_after_preflight(
-        &self,
-        handle: &IcebergCommitHandle,
-        recovery: &crate::commit::service::RecoveryEvidence,
-    ) -> ExternalMutationEvidence {
-        self.encode_evidence(handle, recovery).expect(
-            "Iceberg write evidence was size-checked at admission with a maximum UUID token and document digest",
-        )
-    }
-
     fn decode_evidence(
         &self,
         handle: &IcebergCommitHandle,
         evidence: &ExternalMutationEvidence,
-    ) -> Result<IcebergWriteSessionEvidenceV1, ConnectorError> {
+    ) -> Result<IcebergWriteSessionEvidenceV3, ConnectorError> {
         if evidence.schema_version() != ICEBERG_WRITE_SESSION_EVIDENCE_VERSION
             || evidence.descriptor() != &self.descriptor
             || evidence.incarnation() != self.key.incarnation
@@ -2197,20 +1309,12 @@ impl IcebergWriteSessionControl {
                 "Iceberg write session evidence names a different write session",
             ));
         }
-        let payload: IcebergWriteSessionEvidenceV1 =
-            serde_json::from_slice(evidence.provider_payload().as_ref()).map_err(|error| {
-                corrupt(format!("decode Iceberg write session evidence: {error}"))
-            })?;
-        let expected_document_manifest_digest = handle
-            .document_manifest()?
-            .as_deref()
-            .map(crate::document_storage::publication::prepared_manifest_digest);
-        if payload.version != ICEBERG_WRITE_SESSION_EVIDENCE_VERSION
-            || payload.session_id != handle.session_id().to_string()
-            || payload.document_manifest_digest != expected_document_manifest_digest
-        {
+        let payload: IcebergWriteSessionEvidenceV3 =
+            recovery_codec::decode(evidence.provider_payload().as_ref())?;
+        payload.validate(&self.descriptor, self.key.incarnation, handle)?;
+        if handle.recovery_evidence()? != *evidence {
             return Err(corrupt(
-                "Iceberg write session evidence payload disagrees with its envelope",
+                "Iceberg recovery evidence differs from the exact checked dispatch carrier",
             ));
         }
         Ok(payload)
@@ -2293,6 +1397,7 @@ pub(crate) fn settle_empty_write_without_commit(
         })?;
         return Ok(ExternalMutationOutcome::KnownUncommitted {
             failure: failure(ConnectorMutationFailureKind::Conflict, message),
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         });
     };
     let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
@@ -2302,7 +1407,7 @@ pub(crate) fn settle_empty_write_without_commit(
     )
     .map_err(invalid)?;
     handle.settle(IcebergWriteSessionState::KnownCommitted {
-        snapshot_id: unchanged_snapshot_id,
+        snapshot_id: Some(unchanged_snapshot_id),
     })?;
     Ok(ExternalMutationOutcome::KnownCommitted {
         effect: ExternalMutationEffect::NoOp,
@@ -2314,8 +1419,8 @@ pub(crate) fn settle_empty_write_without_commit(
 /// The terminal verdict a release produces, decided purely from the session's
 /// own state so it can be reasoned about without a catalog.
 pub(crate) fn release_session_state(
-    descriptor: &ConnectorInstanceDescriptor,
-    incarnation: ProviderBindingEpoch,
+    _descriptor: &ConnectorInstanceDescriptor,
+    _incarnation: ProviderBindingEpoch,
     handle: &IcebergCommitHandle,
 ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
     {
@@ -2334,7 +1439,7 @@ pub(crate) fn release_session_state(
             )),
             IcebergWriteSessionState::KnownUncommitted { .. } => {
                 Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
-                    cleanup: ExternalMutationFinalization::Complete,
+                    cleanup: handle.terminal_finalization(),
                 })
             }
             // A sealed staged write never reached the catalog, so releasing it
@@ -2346,15 +1451,22 @@ pub(crate) fn release_session_state(
             }),
             IcebergWriteSessionState::KnownCommitted { snapshot_id } => {
                 // Abort cannot undo a proven commit.
-                let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
-                    snapshot_id,
-                    None,
-                    None,
-                )
-                .map_err(invalid)?;
+                let receipt = match snapshot_id {
+                    Some(id) => {
+                        committed_write_receipt(
+                            id,
+                            None,
+                            None,
+                            None,
+                            handle.terminal_finalization(),
+                        )
+                        .0
+                    }
+                    None => unprojected_committed_receipt(),
+                };
                 Ok(ConnectorWriteAbortOutcome::KnownCommitted {
                     receipt,
-                    finalization: ExternalMutationFinalization::Complete,
+                    finalization: handle.terminal_finalization(),
                 })
             }
             IcebergWriteSessionState::CommitUnknown {
@@ -2368,88 +1480,11 @@ pub(crate) fn release_session_state(
                         ConnectorMutationFailureKind::Unavailable,
                         format!("{message}; staged files remain at {staging_dir}"),
                     ),
-                    evidence: encode_session_evidence(
-                        descriptor,
-                        incarnation,
-                        handle,
-                        &recovery_evidence_for_handle(handle, None),
-                    )
-                    .expect(
-                        "a dispatched Iceberg write preflights larger recovery evidence before entering CommitUnknown",
-                    ),
+                    evidence: handle.recovery_evidence()?,
                 })
             }
         }
     }
-}
-
-/// Seal one session's recovery facts into a reconciliation evidence envelope.
-pub(crate) fn encode_session_evidence(
-    descriptor: &ConnectorInstanceDescriptor,
-    incarnation: ProviderBindingEpoch,
-    handle: &IcebergCommitHandle,
-    recovery: &crate::commit::service::RecoveryEvidence,
-) -> Result<ExternalMutationEvidence, ConnectorError> {
-    let document_manifest_digest = handle
-        .document_manifest()?
-        .as_deref()
-        .map(crate::document_storage::publication::prepared_manifest_digest);
-    encode_session_evidence_with_digest(
-        descriptor,
-        incarnation,
-        handle,
-        recovery,
-        document_manifest_digest,
-    )
-}
-
-fn recovery_evidence_for_handle(
-    handle: &IcebergCommitHandle,
-    manifest_cleanup_token: Option<String>,
-) -> crate::commit::service::RecoveryEvidence {
-    crate::commit::service::RecoveryEvidence {
-        table_ident: format!(
-            "{}.{}",
-            handle.table().namespace(),
-            handle.table().table_name()
-        ),
-        op_kind: handle.commit_op_kind(),
-        base_snapshot_id: handle.table().base_snapshot_id(),
-        base_sequence_number: handle.table().base_sequence_number(),
-        staging_dir: handle.staging_dir(),
-        manifest_cleanup_token,
-    }
-}
-
-fn encode_session_evidence_with_digest(
-    descriptor: &ConnectorInstanceDescriptor,
-    incarnation: ProviderBindingEpoch,
-    handle: &IcebergCommitHandle,
-    recovery: &crate::commit::service::RecoveryEvidence,
-    document_manifest_digest: Option<[u8; 32]>,
-) -> Result<ExternalMutationEvidence, ConnectorError> {
-    let payload = IcebergWriteSessionEvidenceV1 {
-        version: ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
-        session_id: handle.session_id().to_string(),
-        table_ident: recovery.table_ident.clone(),
-        target_ref: handle.table().target_ref().to_string(),
-        op_kind: format!("{:?}", recovery.op_kind),
-        base_snapshot_id: recovery.base_snapshot_id,
-        base_sequence_number: recovery.base_sequence_number,
-        staging_dir: recovery.staging_dir.clone(),
-        manifest_cleanup_token: recovery.manifest_cleanup_token.clone(),
-        document_manifest_digest,
-    };
-    let encoded = serde_json::to_vec(&payload)
-        .map_err(|error| internal(format!("encode Iceberg write session evidence: {error}")))?;
-    ExternalMutationEvidence::try_new(
-        ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
-        descriptor.clone(),
-        incarnation,
-        ConnectorMutationOperationId::from_bytes(handle.session_id().to_bytes()),
-        ICEBERG_WRITE_SESSION_OPERATION_KIND,
-        Bytes::from(encoded),
-    )
 }
 
 impl IcebergWriteSessionControl {
@@ -2467,10 +1502,18 @@ impl IcebergWriteSessionControl {
         validate_context(context)?;
         let decoded = self.decode_evidence(handle, evidence)?;
         let known_snapshot_id = match handle.state()? {
-            IcebergWriteSessionState::KnownCommitted { snapshot_id } => Some(snapshot_id),
+            IcebergWriteSessionState::KnownCommitted { snapshot_id: None } => {
+                return Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: unprojected_committed_receipt(),
+                    finalization: handle.terminal_finalization(),
+                });
+            }
+            IcebergWriteSessionState::KnownCommitted { snapshot_id } => snapshot_id,
             IcebergWriteSessionState::KnownUncommitted { message } => {
                 return Ok(ExternalMutationOutcome::KnownUncommitted {
                     failure: failure(ConnectorMutationFailureKind::Conflict, message),
+                    cleanup: handle.terminal_finalization(),
                 });
             }
             IcebergWriteSessionState::Active => {
@@ -2575,7 +1618,9 @@ impl IcebergWriteSessionControl {
                     )?;
                 }
                 let outcome = reconciled_known_committed_outcome(handle, snapshot_id, Ok(metadata));
-                handle.settle(IcebergWriteSessionState::KnownCommitted { snapshot_id })?;
+                handle.settle(IcebergWriteSessionState::KnownCommitted {
+                    snapshot_id: Some(snapshot_id),
+                })?;
                 Ok(outcome)
             }
             None => Ok(ExternalMutationOutcome::CommitUnknown {
@@ -2597,17 +1642,12 @@ fn reconciled_known_committed_outcome(
     snapshot_id: i64,
     metadata: Result<&TableMetadata, ConnectorError>,
 ) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
+    let retained = handle.terminal_finalization();
     let (resulting_row_count, finalization) = match metadata
         .and_then(|metadata| publication_row_count_from_metadata(handle, metadata, snapshot_id))
     {
-        Ok(rows) => (rows, ExternalMutationFinalization::Complete),
-        Err(error) => (
-            None,
-            ExternalMutationFinalization::Failed(failure(
-                ConnectorMutationFailureKind::Internal,
-                error.message().to_string(),
-            )),
-        ),
+        Ok(rows) => (rows, retained.clone()),
+        Err(error) => (None, add_finalization_failure(retained, error.message())),
     };
     let (receipt, finalization) = committed_write_receipt(
         snapshot_id,
@@ -2618,6 +1658,7 @@ fn reconciled_known_committed_outcome(
         None,
         finalization,
     );
+    handle.retain_finalization(finalization.clone());
     ExternalMutationOutcome::KnownCommitted {
         effect: ExternalMutationEffect::Applied,
         receipt,
@@ -2854,6 +1895,13 @@ impl IcebergAdmissionStatisticsMetadata {
         }
     }
 
+    fn into_source_metadata(self) -> Arc<TableMetadata> {
+        match self {
+            Self::Shared(value) => value,
+            Self::Owned(value) => Arc::new(value),
+        }
+    }
+
     fn for_statistics(
         &self,
         prospective: Option<&TableMetadata>,
@@ -2901,7 +1949,7 @@ impl IcebergWriteSessionControl {
     fn frozen_references_of(
         &self,
         handle: &IcebergCommitHandle,
-    ) -> BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>> {
+    ) -> BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>> {
         handle.frozen_old_references()
     }
 
@@ -3127,6 +2175,7 @@ impl IcebergWriteSessionControl {
             }
             base.validate()?;
         }
+        let base_sequence_number = source_snapshot_sequence(&metadata, base_snapshot_id)?;
         let facts = IcebergWriteTableFacts::try_new(
             metadata.uuid().to_string(),
             namespace.to_string(),
@@ -3135,7 +2184,7 @@ impl IcebergWriteSessionControl {
             iceberg_data_location(&metadata),
             target_ref.to_string(),
             base_snapshot_id,
-            metadata.last_sequence_number(),
+            base_sequence_number,
             metadata.current_schema_id(),
             metadata.default_partition_spec_id(),
             format_version_number(&metadata),
@@ -3217,7 +2266,7 @@ impl IcebergWriteSessionControl {
                 iceberg_data_location(writer_metadata),
                 target_ref.to_string(),
                 base_snapshot_id,
-                writer_metadata.last_sequence_number(),
+                base_sequence_number,
                 writer_metadata.current_schema_id(),
                 writer_metadata.default_partition_spec_id(),
                 format_version_number(writer_metadata),
@@ -3257,7 +2306,7 @@ impl IcebergWriteSessionControl {
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg row-level write requires a loaded target table")
                 })?;
-                self.freeze_old_delete_references(table, &metadata, snapshot_id)?
+                self.freeze_old_delete_references(table, &metadata, snapshot_id, &request.context)?
             } else {
                 Vec::new()
             },
@@ -3371,6 +2420,11 @@ impl IcebergWriteSessionControl {
                 branches,
             },
         )?;
+        let handle = if handle.flavor() == IcebergWriteFlavor::StagedCreate {
+            handle
+        } else {
+            handle.with_source_metadata(metadata.into_source_metadata())?
+        };
         Ok((handle, targets, statistics_metadata))
     }
 
@@ -3524,20 +2578,79 @@ impl IcebergWriteSessionControl {
         table: &crate::iceberg::table::Table,
         metadata: &TableMetadata,
         snapshot_id: i64,
+        context: &ConnectorRequestContext,
     ) -> Result<Vec<IcebergOldDeleteMergeTarget>, ConnectorError> {
+        validate_context(context)?;
         let owned = table.clone();
-        let files = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
-            })
-            .map_err(|error| unavailable(error.to_string()))?
-            .map_err(unavailable)?;
+        let control = context.clone();
+        let (files, facts) =
+            self.runtime
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    let check = || validate_context(&control).map_err(|error| error.to_string());
+                    check()?;
+                    let files = crate::manifest::extract_data_files_with_stats_at_with_control(
+                        &owned,
+                        snapshot_id,
+                        Some(&control),
+                    )
+                    .await?;
+                    let snapshot = owned.metadata().snapshot_by_id(snapshot_id).ok_or_else(||
+                format!("Iceberg frozen snapshot {snapshot_id} disappeared from pinned metadata"))?;
+                    let manifests = snapshot
+                        .load_manifest_list(owned.file_io(), owned.metadata())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    check()?;
+                    let mut facts = BTreeMap::new();
+                    for descriptor in manifests.entries() {
+                        check()?;
+                        let manifest = descriptor
+                            .load_manifest(owned.file_io())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        check()?;
+                        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                            check()?;
+                            let identity = EntryIdentity::try_from(entry.data_file())
+                                .map_err(|error| error.to_string())?;
+                            // An absent entry snapshot inherits the manifest's actual added snapshot.
+                            let fact = (
+                                entry.data_file().record_count(),
+                                entry.snapshot_id().unwrap_or(descriptor.added_snapshot_id),
+                            );
+                            if facts.insert(identity, fact).is_some() {
+                                return Err(
+                                    "Iceberg pinned snapshot repeats a logical entry".to_string()
+                                );
+                            }
+                        }
+                    }
+                    check()?;
+                    Ok::<_, String>((files, facts))
+                })
+                .map_err(|error| unavailable(error.to_string()))?
+                .map_err(corrupt)?;
+        validate_context(context)?;
         let mut targets = Vec::with_capacity(files.len());
         for file in files {
-            let references = frozen_old_delete_references(&file)?;
+            let identity = EntryIdentity::DataFile {
+                path: file.path.clone(),
+            };
+            let (count, _) = facts
+                .get(&identity)
+                .ok_or_else(|| corrupt("Iceberg data projection has no pinned manifest entry"))?;
+            if file
+                .record_count
+                .and_then(|value| u64::try_from(value).ok())
+                != Some(*count)
+            {
+                return Err(corrupt(
+                    "Iceberg data projection disagrees with pinned manifest record count",
+                ));
+            }
+            let references = frozen_old_delete_references(&file, &facts)?;
             targets.push(frozen_delete_merge_target(
                 &file,
                 metadata,
@@ -3601,7 +2714,11 @@ fn frozen_delete_merge_target(
         partition_spec_id,
         descriptor,
     )?;
-    let record_count = u64::try_from(file.record_count.unwrap_or_default()).map_err(|_| {
+    let record_count = u64::try_from(
+        file.record_count
+            .ok_or_else(|| corrupt("Iceberg frozen data file has no record count"))?,
+    )
+    .map_err(|_| {
         corrupt(format!(
             "Iceberg data file {} has a negative record count",
             file.path
@@ -3621,6 +2738,7 @@ fn frozen_delete_merge_target(
 /// data file. It records what exists; it never opens one of those artifacts.
 fn frozen_old_delete_references(
     file: &crate::manifest::DataFileWithStats,
+    facts: &BTreeMap<EntryIdentity, (u64, i64)>,
 ) -> Result<Vec<IcebergOldDeleteArtifactRef>, ConnectorError> {
     let partition_spec_id = file.partition_spec_id.ok_or_else(|| {
         corrupt(format!(
@@ -3669,16 +2787,25 @@ fn frozen_old_delete_references(
             crate::delete_file::IcebergFileContent::PositionDeletes,
             file_format,
             length,
-            // The Iceberg manifest carries a record count per delete file, but
-            // the provider's read-model projection does not surface it, so the
-            // reference is frozen without one rather than with a guessed value.
-            // The backend still rejects an exclusive artifact that decodes to
-            // nothing.
-            None,
+            Some(
+                facts
+                    .get(&crate::distributed_rewrite::delete_entry_identity(delete)?)
+                    .ok_or_else(|| {
+                        corrupt("Iceberg delete projection has no pinned manifest entry")
+                    })?
+                    .0,
+            ),
             content_range,
             delete.referenced_data_file.clone(),
             delete.sequence_number,
-            None,
+            Some(
+                facts
+                    .get(&crate::distributed_rewrite::delete_entry_identity(delete)?)
+                    .ok_or_else(|| {
+                        corrupt("Iceberg delete projection has no pinned manifest entry")
+                    })?
+                    .1,
+            ),
             delete.partition_spec_id.unwrap_or(partition_spec_id),
             route,
         )?);
@@ -3692,6 +2819,19 @@ fn iceberg_data_location(metadata: &TableMetadata) -> String {
         .get("write.data.path")
         .cloned()
         .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')))
+}
+
+fn source_snapshot_sequence(
+    metadata: &TableMetadata,
+    snapshot_id: Option<i64>,
+) -> Result<i64, ConnectorError> {
+    match snapshot_id {
+        None => Ok(0),
+        Some(id) => metadata
+            .snapshot_by_id(id)
+            .map(|snapshot| snapshot.sequence_number())
+            .ok_or_else(|| corrupt("Admitted source snapshot is absent from table metadata")),
+    }
 }
 
 fn format_version_number(metadata: &TableMetadata) -> u8 {
@@ -4016,11 +3156,6 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
     ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
         validate_context(&request.context)?;
         let (handle, targets, statistics_metadata) = self.admit(&request)?;
-        // Evidence shape is fixed before any backend can stage a writer
-        // artifact. Preflight the maximum cleanup token and, for document
-        // publications, a full-width digest here so no post-dispatch path can
-        // discover that CommitUnknown is unrepresentable.
-        self.preflight_evidence_at_admission(&handle)?;
         // The frozen old-delete map is derived from the same writer handles the
         // plan carries, so `finish_write` can re-derive it without a second
         // source of truth.
@@ -4141,6 +3276,73 @@ mod statistics_contract_tests {
         resolve_statistics_field, validate_theta_properties,
     };
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    #[tokio::test]
+    async fn frozen_source_sequence_tracks_its_ref_instead_of_the_global_allocator() {
+        use crate::commit::fast_append::FastAppendPreparer;
+        use crate::commit::model::AddedContent;
+        use crate::commit::overwrite::preparer_tests::{Fixture, data};
+        use crate::iceberg::spec::{FormatVersion, SnapshotReference, SnapshotRetention, Struct};
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let initial = fixture.intent(
+            &metadata,
+            "main",
+            vec![
+                AddedContent::new_logical_data(
+                    data("file:///initial.parquet", 3, Struct::empty()),
+                    0,
+                )
+                .unwrap(),
+            ],
+        );
+        let (metadata, _) = fixture.stage(metadata, &initial, &FastAppendPreparer).await;
+        let main = metadata.snapshot_for_ref("main").unwrap().snapshot_id();
+        let metadata = metadata
+            .into_builder(None)
+            .set_ref(
+                "dev".into(),
+                SnapshotReference::new(
+                    main,
+                    SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let next = fixture.intent(
+            &metadata,
+            "dev",
+            vec![
+                AddedContent::new_logical_data(
+                    data("file:///other-branch.parquet", 2, Struct::empty()),
+                    0,
+                )
+                .unwrap(),
+            ],
+        );
+        let (metadata, _) = fixture.stage(metadata, &next, &FastAppendPreparer).await;
+        assert_eq!(metadata.last_sequence_number(), 2);
+        assert_eq!(
+            super::source_snapshot_sequence(&metadata, Some(main)).unwrap(),
+            1
+        );
+        assert_eq!(
+            super::source_snapshot_sequence(
+                &metadata,
+                Some(metadata.snapshot_for_ref("dev").unwrap().snapshot_id())
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(super::source_snapshot_sequence(&metadata, None).unwrap(), 0);
+        assert!(super::source_snapshot_sequence(&metadata, Some(-1)).is_err());
+    }
 
     fn schema(fields: Vec<Arc<NestedField>>) -> Schema {
         Schema::builder()
@@ -4421,8 +3623,8 @@ mod eager_attempt_io_tests {
     use crate::catalog::error::CatalogCommitEvidence;
     use crate::catalog::transaction::{CatalogCommitDispatch, CommitProof, TransactionShape};
     use crate::iceberg::io::{
-        FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, MemoryStorage, OutputFile,
-        Storage, StorageConfig, StorageFactory,
+        FileIO, FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, MemoryStorage,
+        OutputFile, Storage, StorageConfig, StorageFactory,
     };
     use crate::iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use crate::iceberg::spec::{
@@ -4763,7 +3965,7 @@ mod eager_attempt_io_tests {
     impl CatalogCommitDispatch for CountingDispatch {
         async fn dispatch_once(
             &self,
-            staged: Option<crate::iceberg::TableCommit>,
+            staged: Option<&crate::commit::model::FrozenRequest>,
         ) -> Result<CommitProof, IcebergError> {
             assert!(
                 staged.is_some(),
@@ -4890,6 +4092,84 @@ mod eager_attempt_io_tests {
         }
     }
 
+    struct CountingArtifactWriter {
+        io: FileIO,
+        attempt: crate::commit::model::AttemptToken,
+        ledger: Mutex<crate::commit::model::ArtifactLedger>,
+        ordinal: AtomicUsize,
+    }
+    impl CountingArtifactWriter {
+        fn new(io: FileIO, ordinal: u32) -> Self {
+            let token = crate::commit::model::OperationToken::from_write(
+                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([19; 16]),
+            );
+            Self {
+                io,
+                attempt: crate::commit::model::AttemptToken::new(token, ordinal),
+                ledger: Mutex::new(crate::commit::model::ArtifactLedger::new(token)),
+                ordinal: AtomicUsize::new(0),
+            }
+        }
+        async fn confirm_completed_outputs(&self) {
+            let objects: Vec<_> = self
+                .ledger
+                .lock()
+                .unwrap()
+                .records()
+                .map(|record| record.object.clone())
+                .collect();
+            for object in objects {
+                assert!(self.io.exists(object.path()).await.unwrap());
+                let mut ledger = self.ledger.lock().unwrap();
+                ledger.mark_writing(&object).unwrap();
+                ledger.mark_written(&object).unwrap();
+            }
+        }
+    }
+    impl crate::commit::model::ArtifactWriter for CountingArtifactWriter {
+        fn attempt_token(&self) -> crate::commit::model::AttemptToken {
+            self.attempt
+        }
+        fn allocate(
+            &self,
+            class: crate::commit::model::ArtifactClass,
+            kind: crate::commit::model::ArtifactKind,
+        ) -> crate::iceberg::Result<crate::commit::model::ObjectIdentity> {
+            assert_eq!(class, crate::commit::model::ArtifactClass::Attempt);
+            let object = crate::commit::model::ObjectIdentity::new(format!(
+                "memory://warehouse/db/t/metadata/{}-{}.{}",
+                self.attempt.path_component(),
+                self.ordinal.fetch_add(1, Ordering::SeqCst),
+                kind.extension()
+            ))?;
+            self.ledger
+                .lock()
+                .unwrap()
+                .register(crate::commit::model::ArtifactRecord {
+                    object: object.clone(),
+                    class,
+                    attempt: Some(self.attempt),
+                    write_state: crate::commit::model::ArtifactWriteState::Allocated,
+                })?;
+            Ok(object)
+        }
+        fn file_io(&self) -> &FileIO {
+            &self.io
+        }
+        fn check_active(&self) -> crate::iceberg::Result<()> {
+            Ok(())
+        }
+        fn snapshot_artifacts(
+            &self,
+            references: &[crate::commit::model::ObjectIdentity],
+        ) -> crate::iceberg::Result<crate::commit::model::AttemptArtifacts> {
+            self.ledger
+                .lock()
+                .unwrap()
+                .snapshot_for_attempt(self.attempt, references.iter().cloned())
+        }
+    }
+
     struct StagedAttempt {
         frontier: crate::catalog::transaction::Transaction,
         snapshot_id: i64,
@@ -4903,37 +4183,60 @@ mod eager_attempt_io_tests {
         attempt: u8,
         dispatch: Arc<CountingDispatch>,
     ) -> StagedAttempt {
+        use crate::commit::model::{
+            AddedContent, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts,
+            RequestShape, TableTarget,
+        };
+        use crate::commit::staging::{StagingBase, StagingEngine};
         let table = fixture.table.clone();
-        let collector = Arc::new(
-            IcebergCommitCollector::new(
-                CommitOpKind::FastAppend,
-                table.identifier().clone(),
-                None,
-                table.metadata().last_sequence_number(),
-                table.metadata().current_schema().clone(),
-                table.metadata().default_partition_spec().clone(),
-                "memory://warehouse/db/t/staging".to_string(),
-            )
-            .with_table_metadata(table.metadata().clone()),
-        );
-        fixture.reusable.install_files(&collector);
-        let abort_handle = Arc::clone(&collector.abort_log);
-        let commit_uuid = uuid::Uuid::from_bytes([attempt; 16]);
-        let properties = BTreeMap::new();
-        let (mut transaction, outcome) =
-            crate::commit::fast_append::stage_eager_fast_append(crate::commit::action::CommitCtx {
-                collector: &collector,
-                table: &table,
-                catalog: &fixture.catalog,
-                file_io: table.file_io(),
-                commit_uuid,
-                abort_handle,
-                target_ref: "main",
-                snapshot_properties: &properties,
-            })
+        let writer = CountingArtifactWriter::new(table.file_io().clone(), u32::from(attempt));
+        let intent = OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: table.identifier().clone(),
+                uuid: Some(table.metadata().uuid()),
+            },
+            target_ref: "main".to_string(),
+            start: None,
+            changes: FileChanges {
+                added: fixture
+                    .reusable
+                    .files
+                    .iter()
+                    .map(|file| {
+                        AddedContent::new_logical_data(
+                            crate::commit::data_file::from_written_file(file).unwrap(),
+                            file.partition_spec_id,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+                removed: vec![],
+            },
+            dependencies: vec![crate::commit::model::Dependency::NoReadDependency],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::SnapshotProducing,
+            summary: BTreeMap::new(),
+            token: writer.attempt.operation(),
+        })
+        .unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: table.metadata().clone(),
+                metadata_location: "memory://warehouse/db/t/metadata/initial.metadata.json".into(),
+            },
+            &intent,
+            &writer,
+        )
+        .unwrap();
+        engine
+            .stage(&crate::commit::fast_append::FastAppendPreparer)
             .await
-            .expect("eager append stage");
-        let staged_metadata = transaction.staged_table().metadata().clone();
+            .unwrap();
+        let staged_metadata = engine.metadata().clone();
+        let snapshot_id = staged_metadata
+            .snapshot_for_ref("main")
+            .unwrap()
+            .snapshot_id();
         let artifacts = artifacts_for_staged_snapshot(
             &table,
             &staged_metadata,
@@ -4942,35 +4245,35 @@ mod eager_attempt_io_tests {
             fixture.reusable.statistics_for_attempt(),
         )
         .await
-        .expect("statistics for staged snapshot");
+        .unwrap();
         assert_eq!(artifacts.len(), 1);
         let body_address = artifacts[0].body().as_ptr() as usize;
-        let puffin_path = crate::stats_assembler::puffin_path_for_statistics_operation(
-            &staged_metadata,
-            outcome.new_snapshot_id,
-            [attempt; 16],
-        );
-        collector.abort_log.record_manifest(puffin_path.clone());
-        let statistics_file = crate::stats_assembler::write_puffin_artifacts(
-            table.file_io(),
-            &puffin_path,
-            outcome.new_snapshot_id,
+        let statistics_file = crate::stats_assembler::write_puffin_artifacts_allocated(
+            &writer,
+            snapshot_id,
             staged_metadata.last_sequence_number(),
             &artifacts,
         )
         .await
-        .expect("write attempt Puffin")
-        .expect("non-empty statistics file");
-        transaction = transaction
-            .update_statistics()
-            .set_statistics(statistics_file)
-            .apply(transaction)
+        .unwrap()
+        .unwrap();
+        let puffin_path = statistics_file.statistics_path.clone();
+        engine
+            .stage(&crate::commit::statistics::StatisticsPreparer {
+                statistics: statistics_file,
+            })
             .await
-            .expect("stage SetStatistics");
-        let mut commit = transaction.into_table_commit();
-        commit.add_requirement(crate::iceberg::TableRequirement::UuidMatch {
-            uuid: table.metadata().uuid(),
-        });
+            .unwrap();
+        writer.confirm_completed_outputs().await;
+        let commit = engine.freeze(&[]).unwrap();
+        let manifest_paths = writer
+            .ledger
+            .lock()
+            .unwrap()
+            .records()
+            .filter(|record| record.object.path().ends_with(".avro"))
+            .map(|record| record.object.path().to_string())
+            .collect();
         let mut frontier = crate::catalog::transaction::Transaction::new(
             TransactionIdentity::new("eager-I/O-test", [attempt; 16]),
             CatalogTableName::new("db", "t"),
@@ -4982,8 +4285,8 @@ mod eager_attempt_io_tests {
         frontier.stage(commit).expect("stage provider frontier");
         StagedAttempt {
             frontier,
-            snapshot_id: outcome.new_snapshot_id,
-            manifest_paths: outcome.written_manifest_paths,
+            snapshot_id,
+            manifest_paths,
             puffin_path,
             body_address,
         }
@@ -5111,6 +4414,115 @@ mod eager_attempt_io_tests {
         assert_eq!(lost.dispatches.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.trace.attempt_derivative_counts(), before_unknown);
         fixture.trace.assert_data_was_not_reopened();
+    }
+}
+
+#[cfg(test)]
+mod terminal_finalization_tests {
+    use super::*;
+    fn handle() -> IcebergCommitHandle {
+        use crate::commit::write_stack::planning::{
+            IcebergWriteSessionPlanInput, plan_write_session,
+        };
+        use crate::commit::write_stack::test_support::{data_branch_plan, table_facts};
+        plan_write_session(
+            IcebergWriteSessionId::new(),
+            IcebergWriteSessionPlanInput {
+                flavor: IcebergWriteFlavor::Append,
+                purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                table: table_facts(),
+                base_version_digest: None,
+                staged_metadata: None,
+                data: data_branch_plan(),
+                deletes: Vec::new(),
+            },
+        )
+        .unwrap()
+        .0
+    }
+    #[test]
+    fn rejected_release_retains_partial_cleanup_verdict() {
+        let handle = handle();
+        let cleanup = ExternalMutationFinalization::Failed(failure(
+            ConnectorMutationFailureKind::Unavailable,
+            "owned object delete failed",
+        ));
+        handle.retain_finalization(cleanup.clone());
+        handle
+            .settle(IcebergWriteSessionState::KnownUncommitted {
+                message: "validation failed".into(),
+            })
+            .unwrap();
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("terminal-test")
+                .unwrap(),
+        };
+        let ConnectorWriteAbortOutcome::KnownUncommitted { cleanup: actual } =
+            release_session_state(
+                &descriptor,
+                ProviderBindingEpoch::from_bytes([1; 16]),
+                &handle,
+            )
+            .unwrap()
+        else {
+            panic!("uncommitted verdict lost")
+        };
+        assert_eq!(actual, cleanup);
+    }
+    #[test]
+    fn committed_reconcile_keeps_previous_failure_and_adds_projection_failure() {
+        let handle = handle();
+        handle.retain_finalization(ExternalMutationFinalization::Failed(failure(
+            ConnectorMutationFailureKind::Unavailable,
+            "old attempt cleanup failed",
+        )));
+        let ExternalMutationOutcome::KnownCommitted { finalization, .. } =
+            reconciled_known_committed_outcome(
+                &handle,
+                77,
+                Err(internal("row count reload failed")),
+            )
+        else {
+            panic!("committed proof lost")
+        };
+        let ExternalMutationFinalization::Failed(error) = &finalization else {
+            panic!("cleanup verdict lost")
+        };
+        assert!(error.message().contains("old attempt cleanup failed"));
+        assert!(error.message().contains("row count reload failed"));
+        assert_eq!(handle.terminal_finalization(), finalization);
+    }
+    #[test]
+    fn committed_release_without_version_does_not_invent_snapshot_zero() {
+        let handle = handle();
+        let finalization = ExternalMutationFinalization::Failed(failure(
+            ConnectorMutationFailureKind::Internal,
+            "published version projection failed",
+        ));
+        handle.retain_finalization(finalization.clone());
+        handle
+            .settle(IcebergWriteSessionState::KnownCommitted { snapshot_id: None })
+            .unwrap();
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("terminal-test")
+                .unwrap(),
+        };
+        let ConnectorWriteAbortOutcome::KnownCommitted {
+            receipt,
+            finalization: actual,
+        } = release_session_state(
+            &descriptor,
+            ProviderBindingEpoch::from_bytes([1; 16]),
+            &handle,
+        )
+        .unwrap()
+        else {
+            panic!("committed proof lost")
+        };
+        assert!(receipt.committed_version().is_none());
+        assert_eq!(actual, finalization);
     }
 }
 

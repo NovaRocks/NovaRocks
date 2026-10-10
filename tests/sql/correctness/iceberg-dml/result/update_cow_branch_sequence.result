@@ -1,0 +1,19 @@
+-- query 2
+id	v
+1	a
+2	b
+
+-- query 4
+id	v
+1	a
+2	updated
+
+-- query 5
+id	v
+1	a
+2	b
+3	dev
+
+-- query 6
+preserved_row_ids
+2

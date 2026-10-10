@@ -27,6 +27,7 @@
 //! claims, merge, and write. A read that fails for any reason fails the writer
 //! and therefore the query — it never degrades into an empty old delete set.
 
+use crate::commit::model::EntryIdentity;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -440,7 +441,7 @@ impl IcebergDeleteStackWriter {
         &mut self,
         data_file: &str,
         positions: &roaring::RoaringTreemap,
-        merged: Vec<String>,
+        merged: Vec<EntryIdentity>,
     ) -> Result<IcebergCommitFragment, ConnectorError> {
         let target = self.handle.old_deletes().get(data_file).ok_or_else(|| {
             error(
@@ -514,7 +515,7 @@ impl IcebergDeleteStackWriter {
         &mut self,
         data_file: &str,
         positions: &roaring::RoaringTreemap,
-        merged: Vec<String>,
+        merged: Vec<EntryIdentity>,
     ) -> Result<IcebergCommitFragment, ConnectorError> {
         let target = self.handle.old_deletes().get(data_file).ok_or_else(|| {
             error(

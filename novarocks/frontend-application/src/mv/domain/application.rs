@@ -352,6 +352,7 @@ pub enum MvCreateProviderErrorKind {
     /// The effect may or may not have happened. It must not be compensated and
     /// must not be retried under the same identity.
     CommitUnknown,
+    KnownCommittedFinalizeFailed,
     DescriptorSync,
     CatalogRegistration,
 }

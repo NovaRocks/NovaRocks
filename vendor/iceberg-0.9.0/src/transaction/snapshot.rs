@@ -502,12 +502,6 @@ impl<'a> SnapshotProducer<'a> {
             TableRequirement::UuidMatch {
                 uuid: self.table.metadata().uuid(),
             },
-            TableRequirement::CurrentSchemaIdMatch {
-                current_schema_id: self.table.metadata().current_schema_id(),
-            },
-            TableRequirement::DefaultSpecIdMatch {
-                default_spec_id: self.table.metadata().default_partition_spec_id(),
-            },
             TableRequirement::RefSnapshotIdMatch {
                 r#ref: MAIN_BRANCH.to_string(),
                 snapshot_id: self.table.metadata().current_snapshot_id(),

@@ -46,10 +46,11 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
-use crate::commit::{
-    AbortLog, CommitCtx, CommitOpKind, IcebergCommitCollector, build_staged_fast_append_action,
-};
-use crate::iceberg::{Catalog, TableCommit, TableCreation, TableRequirement, TableUpdate};
+use crate::commit::WrittenFile;
+use crate::iceberg::{TableCreation, TableUpdate};
+
+#[path = "staged_create/publication.rs"]
+mod publication;
 use crate::loaded_table::{IcebergPhysicalTable, IcebergRestVendedS3LeaseRefresher};
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
@@ -82,6 +83,8 @@ pub(crate) struct UnanchoredCtasProvenanceFileV1 {
 pub(crate) struct RestStagedTableCreate {
     pub(crate) table: crate::iceberg::table::Table,
     pub(crate) initialization_updates: Vec<TableUpdate>,
+    /// Changes layered over the exact REST initialization by canonical staging.
+    publication_updates: Vec<TableUpdate>,
 }
 
 /// What a staged-create preparation failure proves about dispatch.
@@ -252,7 +255,7 @@ pub(crate) fn prepare_rest_staged_table(
                 "prepare staged REST table runtime: {error}"
             ))
         })?;
-    let (table, mut initialization_updates) = match staged {
+    let (table, initialization_updates) = match staged {
         crate::catalog::StagedCreateStart::Staged {
             table,
             initialization_updates,
@@ -353,17 +356,18 @@ pub(crate) fn prepare_rest_staged_table(
         CTAS_PROVENANCE_TABLE_UUID.to_string(),
         table.metadata().uuid().to_string(),
     );
-    initialization_updates.push(TableUpdate::SetProperties {
+    let mut publication_updates = vec![TableUpdate::SetProperties {
         updates: response_provenance,
-    });
+    }];
     if !publication_properties.is_empty() {
-        initialization_updates.push(TableUpdate::SetProperties {
+        publication_updates.push(TableUpdate::SetProperties {
             updates: publication_properties,
         });
     }
     Ok(RestStagedTableCreate {
         table,
         initialization_updates,
+        publication_updates,
     })
 }
 
@@ -481,6 +485,8 @@ pub struct IcebergStagedCreateAdapter {
 enum OperationState {
     Preparing,
     Prepared(PreparedOperation),
+    /// Definite non-publication permits only another bounded cleanup attempt.
+    CleanupPending(PreparedOperation),
     Published,
     Aborted,
     Unknown,
@@ -496,15 +502,15 @@ struct PreparedOperation {
     planning: Option<ConnectorStagedWritePlanningBinding>,
     write: Option<StagedWrite>,
     document_properties: Option<HashMap<String, String>>,
+    publication: Option<crate::commit::operation::IcebergCommitOperation>,
+    provenance_path: Option<String>,
+    publication_closed: bool,
 }
 
 #[derive(Clone)]
 struct StagedWrite {
     write: ConnectorStagedWriteProof,
-    updates: Vec<TableUpdate>,
-    expected_snapshot_id: Option<i64>,
-    abort_handle: Arc<AbortLog>,
-    action_built: bool,
+    files: Arc<[WrittenFile]>,
 }
 
 impl PreparedOperation {
@@ -537,11 +543,9 @@ fn sealed_artifacts(
 
 #[derive(Clone)]
 struct PublicationUnknownOperation {
-    evidence_digest: [u8; 32],
+    evidence: ExternalMutationEvidence,
     prepared: PreparedOperation,
 }
-
-type StagedCreateAction = (Vec<TableUpdate>, Option<i64>, Arc<AbortLog>);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PublishEvidenceV1 {
@@ -552,6 +556,7 @@ struct PublishEvidenceV1 {
     handle_digest: [u8; 32],
     namespace: String,
     table: String,
+    facts: crate::commit::recovery::FrozenPublicationFacts,
 }
 
 impl IcebergStagedCreateAdapter {
@@ -614,28 +619,6 @@ impl IcebergStagedCreateAdapter {
         )
     }
 
-    fn publish_evidence(
-        &self,
-        dispatch_operation_id: ConnectorStagedCreateOperationId,
-        _target_operation_id: ConnectorStagedCreateOperationId,
-        prepared: &PreparedOperation,
-        expected_snapshot_id: Option<i64>,
-    ) -> Result<ExternalMutationEvidence, ConnectorError> {
-        let ident = prepared.staged.table.identifier();
-        let payload = serde_json::to_vec(&PublishEvidenceV1 {
-            version: EVIDENCE_VERSION,
-            operation_marker: publication_marker(prepared.publication_id),
-            table_uuid: prepared.staged.table.metadata().uuid().to_string(),
-            expected_snapshot_id,
-            handle_digest: prepared.handle_digest,
-            namespace: ident.namespace.to_url_string(),
-            table: ident.name.clone(),
-        })
-        .map(Bytes::from)
-        .map_err(|error| internal(format!("encode staged-create publish evidence: {error}")))?;
-        self.evidence(dispatch_operation_id, "staged-create-publish", payload)
-    }
-
     fn record_terminal(
         &self,
         operation_id: ConnectorStagedCreateOperationId,
@@ -660,7 +643,7 @@ impl IcebergStagedCreateAdapter {
         self.record_terminal(
             operation_id,
             OperationState::PublicationUnknown(PublicationUnknownOperation {
-                evidence_digest: evidence.digest(),
+                evidence: evidence.clone(),
                 prepared,
             }),
         );
@@ -691,163 +674,61 @@ impl IcebergStagedCreateAdapter {
         })
     }
 
-    /// Turn the sealed write into the updates one assert-create commit carries.
-    ///
-    /// The artifacts come from the receipt the write session minted, which is
-    /// the only thing that crosses from that session to this publication. There
-    /// is deliberately no walk over cohorts, attempts, or writer reports here:
-    /// a publication has no use for who wrote a file, only for which files
-    /// exist.
-    fn build_action(
+    /// Decode full immutable output facts without creating a transaction.
+    fn staged_write_files(
         &self,
         prepared: &PreparedOperation,
         write: &ConnectorStagedWriteProof,
-        context: &ConnectorRequestContext,
-    ) -> Result<StagedCreateAction, ConnectorError> {
+    ) -> Result<Arc<[WrittenFile]>, ConnectorError> {
         let metadata = prepared.staged.table.metadata().clone();
-        let collector = Arc::new(
-            IcebergCommitCollector::new(
-                CommitOpKind::FastAppend,
-                prepared.staged.table.identifier().clone(),
-                None,
-                metadata.last_sequence_number(),
-                metadata.current_schema().clone(),
-                metadata.default_partition_spec().clone(),
-                staged_write_data_prefix(metadata.location(), prepared.operation_id()),
-            )
-            .with_table_metadata(metadata.clone()),
-        );
-        collector
-            .inject_writer_reports(sealed_artifacts(write, &metadata)?)
-            .map_err(corrupt)?;
-
-        let abort_handle = prepared
-            .write
-            .as_ref()
-            .map(|write| Arc::clone(&write.abort_handle))
-            .ok_or_else(|| invalid("staged-create action requires a bound write"))?;
-        // Never drive a later action through the table/FileIO captured by
-        // prepare. In particular, a vended response must resolve through this
-        // action's request-local capability, not through another action's.
-        let table = IcebergPhysicalTable::request_scoped(
-            &prepared.staged.table,
-            self.runtime
-                .resources()
-                .planning_binding()
-                .for_request(context.clone()),
-        )?
-        .into_table();
-        let catalog: Arc<dyn Catalog> = self.runtime.novarocks_catalog().vendored_client();
-        let file_io = table.file_io().clone();
-        let action_abort = Arc::clone(&abort_handle);
-        let action_collector = Arc::clone(&collector);
-        let built = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                let snapshot_properties = BTreeMap::new();
-                build_staged_fast_append_action(CommitCtx {
-                    collector: action_collector.as_ref(),
-                    table: &table,
-                    catalog: catalog.as_ref(),
-                    file_io: &file_io,
-                    commit_uuid: uuid::Uuid::now_v7(),
-                    abort_handle: action_abort,
-                    target_ref: "main",
-                    snapshot_properties: &snapshot_properties,
-                })
-                .await
-            })
-            .map_err(|error| internal(format!("build staged-create action runtime: {error}")))?
-            .map_err(|error| internal(format!("build staged-create action: {error}")))?;
-        let mut action = built.action;
-        let updates = action.take_updates();
-        let expected_snapshot_id = built.outcome.map(|outcome| outcome.new_snapshot_id);
-        Ok((updates, expected_snapshot_id, built.abort_handle))
-    }
-
-    /// The objects a staged write left behind, so aborting the target can
-    /// delete exactly them.
-    fn staged_write_abort_log(
-        &self,
-        prepared: &PreparedOperation,
-        write: &ConnectorStagedWriteProof,
-    ) -> Result<Arc<AbortLog>, ConnectorError> {
-        let metadata = prepared.staged.table.metadata().clone();
-        let collector = IcebergCommitCollector::new(
-            CommitOpKind::FastAppend,
-            prepared.staged.table.identifier().clone(),
-            None,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staged_write_data_prefix(metadata.location(), prepared.operation_id()),
-        )
-        .with_table_metadata(metadata.clone());
-        for report in sealed_artifacts(write, &metadata)? {
-            let file = collector.convert_writer_report(report).map_err(corrupt)?;
-            collector.abort_log.record_data_file(file.path);
-        }
-        Ok(collector.abort_log)
+        let files = sealed_artifacts(write, &metadata)?.into_iter().map(|report| {
+            let file = crate::commit::report::written_file_from_report(report, metadata.current_schema().as_ref()).map_err(corrupt)?;
+            if file.content != crate::iceberg::spec::DataContentType::Data
+                || metadata.partition_spec_by_id(file.partition_spec_id).is_none()
+            {
+                return Err(corrupt("Staged create output requires Data content and an authoritative partition spec"));
+            }
+            Ok(file)
+        }).collect::<Result<Vec<_>, ConnectorError>>()?;
+        Ok(files.into())
     }
 
     fn abort_prepared(
         &self,
-        prepared: &PreparedOperation,
+        prepared: &mut PreparedOperation,
         context: &ConnectorRequestContext,
     ) -> ExternalMutationFinalization {
-        let Some(write) = &prepared.write else {
-            return ExternalMutationFinalization::Complete;
-        };
-        let access = match self
-            .runtime
-            .resources()
-            .planning_binding()
-            .for_request(context.clone())
-            .resolve_access(prepared.staged.table.metadata().location())
-        {
-            Ok(access) => access,
-            Err(error) => {
-                return cleanup_failed(format!("resolve staged-create cleanup access: {error}"));
-            }
-        };
-        let operator = access.operator();
-        let cleanup_access = access.clone();
-        let abort = Arc::clone(&write.abort_handle);
-        let cleanup = match self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                abort
-                    .cleanup_with_path_mapper(&operator, move |path| {
-                        cleanup_access
-                            .bind_location(path, novarocks_fs::FileIdentity::new(path, 0, None))
-                            .map(|file| file.operator_relative_path().to_string())
-                            .unwrap_or_else(|_| path.to_string())
-                    })
+        let operation =
+            match publication::ensure_operation(self, prepared, prepared.operation_id(), context) {
+                Ok(operation) => operation,
+                Err(error) => return cleanup_failed(error.to_string()),
+            };
+        match operation.runtime().block_on({
+            let cleanup = operation.clone();
+            async move {
+                cleanup
+                    .cleanup(crate::commit::model::CleanupScope::EntireOperation)
                     .await
-            }) {
-            Ok(cleanup) => cleanup,
-            Err(error) => {
-                return cleanup_failed(format!("run staged-create cleanup: {error}"));
             }
-        };
-        if cleanup.is_empty() {
-            ExternalMutationFinalization::Complete
-        } else {
-            let paths = cleanup
-                .iter()
-                .take(8)
-                .map(|error| error.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            cleanup_failed(format!(
-                "staged-create cleanup failed for {} artifact(s): {paths}",
-                cleanup.len()
-            ))
+        }) {
+            Ok(report) => report.finalization(),
+            Err(error) => cleanup_failed(format!("Run staged-create owned cleanup: {error}")),
         }
+    }
+
+    fn record_cleanup_state(
+        &self,
+        operation_id: ConnectorStagedCreateOperationId,
+        mut prepared: PreparedOperation,
+        finalization: &ExternalMutationFinalization,
+    ) {
+        prepared.publication_closed = true;
+        let state = if matches!(finalization, ExternalMutationFinalization::Complete) {
+            OperationState::Aborted
+        } else {
+            OperationState::CleanupPending(prepared)
+        };
+        self.record_terminal(operation_id, state);
     }
 }
 
@@ -980,6 +861,13 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                         );
                     }
                 };
+                let provenance_path = match unanchored_ctas_provenance_location(&table_location) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return self
+                            .prepare_commit_unknown(request.operation_id, error.to_string());
+                    }
+                };
                 if let Err(error) = write_unanchored_ctas_provenance(
                     &self.runtime,
                     &table_location,
@@ -1059,6 +947,9 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                         planning: None,
                         write: None,
                         document_properties: None,
+                        publication: None,
+                        provenance_path: Some(provenance_path),
+                        publication_closed: false,
                     }),
                 );
                 Ok(ConnectorStagedCreatePrepareOutcome::Prepared {
@@ -1198,20 +1089,14 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         // Decoding the receipt here is the binding check: a receipt this
         // generation did not mint, or one whose artifacts do not fit this
         // target's schema, is refused before the target records a write at all.
-        let abort_handle = match self.staged_write_abort_log(&prepared, &write) {
-            Ok(abort_handle) => abort_handle,
+        let files = match self.staged_write_files(&prepared, &write) {
+            Ok(files) => files,
             Err(error) => {
                 self.record_terminal(operation_id, OperationState::Prepared(prepared));
                 return Err(error);
             }
         };
-        prepared.write = Some(StagedWrite {
-            write,
-            updates: Vec::new(),
-            expected_snapshot_id: None,
-            abort_handle,
-            action_built: false,
-        });
+        prepared.write = Some(StagedWrite { write, files });
         self.record_terminal(operation_id, OperationState::Prepared(prepared));
         Ok(())
     }
@@ -1243,12 +1128,6 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 "Iceberg staged-create publish write is not bound to this target",
             ));
         }
-        if let Err(error) = Self::validate_context(&request.context) {
-            self.record_terminal(operation_id, OperationState::Prepared(prepared));
-            return Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted {
-                failure: failure_from_connector(error),
-            });
-        }
         let document_properties =
             match publication_document_properties(&request.handle, &request.payload) {
                 Ok(properties) => properties,
@@ -1258,94 +1137,46 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 }
             };
         prepared.document_properties = document_properties;
-        if !write.action_built {
-            match self.build_action(&prepared, &request.write, &request.context) {
-                Ok((updates, expected_snapshot_id, abort_handle)) => {
-                    let write = prepared.write.as_mut().expect("validated staged write");
-                    write.updates = updates;
-                    write.expected_snapshot_id = expected_snapshot_id;
-                    write.abort_handle = abort_handle;
-                    write.action_built = true;
-                }
-                Err(error) => {
-                    self.record_terminal(operation_id, OperationState::Prepared(prepared));
-                    return Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted {
-                        failure: failure_from_connector(error),
-                    });
-                }
+        let outcome =
+            publication::publish(self, &mut prepared, request.operation_id, &request.context);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let cleanup = self.abort_prepared(&mut prepared, &request.context);
+                self.record_cleanup_state(operation_id, prepared, &cleanup);
+                return Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted {
+                    failure: failure_from_connector(error),
+                    cleanup,
+                });
             }
-        }
-        if let Err(error) = Self::validate_context(&request.context) {
-            self.record_terminal(operation_id, OperationState::Prepared(prepared));
-            return Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted {
-                failure: failure_from_connector(error),
-            });
-        }
-        let write = prepared.write.as_ref().expect("built staged write");
-        let mut updates = prepared.staged.initialization_updates.clone();
-        updates.extend(write.updates.clone());
-        if let Some(properties) = &prepared.document_properties {
-            updates.push(TableUpdate::SetProperties {
-                updates: properties.clone(),
-            });
-        }
-        let expected_snapshot_id = write.expected_snapshot_id;
-        let commit = TableCommit::builder()
-            .ident(prepared.staged.table.identifier().clone())
-            .requirements(vec![TableRequirement::NotExist])
-            .updates(updates)
-            .build();
-        // A vended REST commit response does not carry a fresh credential
-        // contribution, yet it must become a Table. Materialize it only with
-        // this target request's terminal lease; never install a generation-wide
-        // StorageFactory as a fallback.
-        let request_file_io = crate::fs_io::build_file_io_for_location(
-            prepared.staged.table.metadata().location(),
-            self.runtime
-                .resources()
-                .planning_binding()
-                .for_request(request.context.clone()),
-        );
-        let owner = Arc::clone(self.runtime.novarocks_catalog());
-        let result = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { owner.commit_staged_table(commit, request_file_io).await })
-            .map(staged_commit_to_legacy);
-        match result {
-            Ok(Ok(table))
-                if publication_matches(&table, operation_id, &prepared, expected_snapshot_id) =>
-            {
-                let receipt =
-                    publication_receipt(self, request.operation_id, &table, expected_snapshot_id)?;
+        };
+        match outcome {
+            novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                ..
+            } => {
                 invalidate_prepared(&self.runtime, &prepared);
                 self.record_terminal(operation_id, OperationState::Published);
                 Ok(ConnectorStagedCreatePublishOutcome::Applied {
                     receipt,
-                    finalization: ExternalMutationFinalization::Complete,
+                    finalization,
                 })
             }
-            Ok(Ok(_)) => {
-                let evidence = self.publish_evidence(
-                    request.operation_id,
-                    operation_id,
-                    &prepared,
-                    expected_snapshot_id,
-                )?;
-                self.set_publication_unknown(operation_id, &evidence, prepared);
-                Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        "REST response did not prove the exact staged-create publication",
-                    ),
-                    evidence,
-                })
-            }
-            Ok(Err(crate::iceberg_catalog_rest::StagedCommitError::Conflict(error))) => {
-                if prepared.policy == CreatePolicy::NoOpIfExists {
-                    let finalization = self.abort_prepared(&prepared, &request.context);
-                    self.record_terminal(operation_id, OperationState::Published);
+            novarocks_spi::connector::ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup,
+            } => {
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
+                    && prepared.policy == CreatePolicy::NoOpIfExists
+                {
+                    prepared.publication_closed = true;
+                    let state = if matches!(cleanup, ExternalMutationFinalization::Complete) {
+                        OperationState::Published
+                    } else {
+                        OperationState::CleanupPending(prepared)
+                    };
+                    self.record_terminal(operation_id, state);
                     Ok(ConnectorStagedCreatePublishOutcome::NoOp {
                         receipt: self.receipt(
                             request.operation_id,
@@ -1353,86 +1184,26 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                             ExternalMutationEffect::NoOp,
                             Bytes::new(),
                         )?,
-                        finalization,
+                        finalization: cleanup,
                     })
                 } else {
-                    self.record_terminal(operation_id, OperationState::Prepared(prepared));
-                    Ok(ConnectorStagedCreatePublishOutcome::Conflict {
-                        failure: ConnectorMutationFailure::new(
-                            ConnectorMutationFailureKind::Conflict,
-                            error.to_string(),
-                        ),
-                    })
+                    self.record_cleanup_state(operation_id, prepared, &cleanup);
+                    if failure.kind() == ConnectorMutationFailureKind::Conflict {
+                        Ok(ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup })
+                    } else {
+                        Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted {
+                            failure,
+                            cleanup,
+                        })
+                    }
                 }
             }
-            Ok(Err(crate::iceberg_catalog_rest::StagedCommitError::KnownNotDispatched(error))) => {
-                self.record_terminal(operation_id, OperationState::Prepared(prepared));
-                Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        error.to_string(),
-                    ),
-                })
-            }
-            Ok(Err(crate::iceberg_catalog_rest::StagedCommitError::PossiblyDispatched(error))) => {
-                let evidence = self.publish_evidence(
-                    request.operation_id,
-                    operation_id,
-                    &prepared,
-                    expected_snapshot_id,
-                )?;
+            novarocks_spi::connector::ExternalMutationOutcome::CommitUnknown {
+                failure,
+                evidence,
+            } => {
                 self.set_publication_unknown(operation_id, &evidence, prepared);
-                Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        error.to_string(),
-                    ),
-                    evidence,
-                })
-            }
-            Ok(Err(crate::iceberg_catalog_rest::StagedCommitError::CommittedResponseInvalid(
-                error,
-            ))) => {
-                let receipt = self.receipt(
-                    request.operation_id,
-                    ConnectorStagedCreateReceiptPhase::Published,
-                    ExternalMutationEffect::Applied,
-                    Bytes::copy_from_slice(&operation_id.to_bytes()),
-                )?;
-                invalidate_prepared(&self.runtime, &prepared);
-                self.record_terminal(operation_id, OperationState::Published);
-                Ok(ConnectorStagedCreatePublishOutcome::Applied {
-                    receipt,
-                    finalization: ExternalMutationFinalization::Failed(
-                        ConnectorMutationFailure::new(
-                            ConnectorMutationFailureKind::Unavailable,
-                            format!(
-                                "REST staged-create publication committed but response finalization failed: {error}"
-                            ),
-                        ),
-                    ),
-                })
-            }
-            Err(error) => {
-                // The runtime bridge wraps the assert-create commit, so it
-                // cannot prove the request never left this process. Reporting
-                // it as uncommitted would hand the slot back as `Prepared`,
-                // which re-opens both a second publish and an abort that
-                // deletes the data files of a publication that may have landed.
-                let evidence = self.publish_evidence(
-                    request.operation_id,
-                    operation_id,
-                    &prepared,
-                    expected_snapshot_id,
-                )?;
-                self.set_publication_unknown(operation_id, &evidence, prepared);
-                Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        format!("publish staged REST table runtime: {error}"),
-                    ),
-                    evidence,
-                })
+                Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, evidence })
             }
         }
     }
@@ -1445,9 +1216,14 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             return Err(invalid("Iceberg staged-create abort has a foreign owner"));
         }
         let operation_id = request.handle.operation_id();
-        let prepared = take_prepared(&self.operations, operation_id)?;
+        let mut prepared = take_abortable(&self.operations, operation_id)?;
         if prepared.handle_digest != request.handle.digest() {
-            self.record_terminal(operation_id, OperationState::Prepared(prepared));
+            let state = if prepared.publication_closed {
+                OperationState::CleanupPending(prepared)
+            } else {
+                OperationState::Prepared(prepared)
+            };
+            self.record_terminal(operation_id, state);
             return Err(invalid(
                 "Iceberg staged-create abort handle digest mismatch",
             ));
@@ -1458,11 +1234,16 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 .as_ref()
                 .is_none_or(|bound| &bound.write != offered)
         }) {
-            self.record_terminal(operation_id, OperationState::Prepared(prepared));
+            let state = if prepared.publication_closed {
+                OperationState::CleanupPending(prepared)
+            } else {
+                OperationState::Prepared(prepared)
+            };
+            self.record_terminal(operation_id, state);
             return Err(invalid("Iceberg staged-create abort write mismatch"));
         }
-        let finalization = self.abort_prepared(&prepared, &request.context);
-        self.record_terminal(operation_id, OperationState::Aborted);
+        let finalization = self.abort_prepared(&mut prepared, &request.context);
+        self.record_cleanup_state(operation_id, prepared, &finalization);
         Ok(ConnectorStagedCreateAbortOutcome::Aborted {
             receipt: self.receipt(
                 request.operation_id,
@@ -1502,7 +1283,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             };
             unknown.clone()
         };
-        if unknown.evidence_digest != request.evidence.digest() {
+        if unknown.evidence != request.evidence {
             return Err(invalid(
                 "Iceberg staged-create publication adjudication evidence digest mismatch",
             ));
@@ -1514,18 +1295,8 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     "Iceberg staged-create publish evidence is invalid: {error}"
                 ))
             })?;
+        validate_publish_evidence(&evidence, &prepared, dispatch_operation_id)?;
         let ident = prepared.staged.table.identifier();
-        if evidence.version != EVIDENCE_VERSION
-            || evidence.operation_marker != publication_marker(prepared.publication_id)
-            || evidence.handle_digest != prepared.handle_digest
-            || evidence.table_uuid != prepared.staged.table.metadata().uuid().to_string()
-            || evidence.namespace != ident.namespace.to_url_string()
-            || evidence.table != ident.name
-        {
-            return Err(invalid(
-                "Iceberg staged-create publish evidence does not match the exact operation",
-            ));
-        }
         let load = self
             .runtime
             .load_table_for_request(
@@ -1609,7 +1380,7 @@ fn take_prepared(
         .lock()
         .map_err(|error| internal(format!("staged-create operation lock: {error}")))?;
     match operations.remove(&operation_id) {
-        Some(OperationState::Prepared(prepared)) => Ok(prepared),
+        Some(OperationState::Prepared(prepared)) if !prepared.publication_closed => Ok(prepared),
         Some(state) => {
             operations.insert(operation_id, state);
             Err(invalid(
@@ -1618,6 +1389,58 @@ fn take_prepared(
         }
         None => Err(invalid("unknown Iceberg staged-create operation")),
     }
+}
+
+fn take_abortable(
+    operations: &Mutex<HashMap<ConnectorStagedCreateOperationId, OperationState>>,
+    operation_id: ConnectorStagedCreateOperationId,
+) -> Result<PreparedOperation, ConnectorError> {
+    let mut operations = operations
+        .lock()
+        .map_err(|error| internal(format!("staged-create operation lock: {error}")))?;
+    match operations.remove(&operation_id) {
+        Some(OperationState::Prepared(prepared) | OperationState::CleanupPending(prepared)) => {
+            Ok(prepared)
+        }
+        Some(state) => {
+            operations.insert(operation_id, state);
+            Err(invalid(
+                "Staged create publication state does not permit cleanup",
+            ))
+        }
+        None => Err(invalid("unknown Iceberg staged-create operation")),
+    }
+}
+
+fn validate_publish_evidence(
+    evidence: &PublishEvidenceV1,
+    prepared: &PreparedOperation,
+    dispatch_operation_id: ConnectorStagedCreateOperationId,
+) -> Result<(), ConnectorError> {
+    let ident = prepared.staged.table.identifier();
+    evidence
+        .facts
+        .validate_create_target(
+            crate::commit::model::OperationToken::from_mutation(dispatch_operation_id),
+            ident,
+            prepared.staged.table.metadata().uuid(),
+            prepared.staged.table.metadata().location(),
+            "main",
+            evidence.expected_snapshot_id,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+    if evidence.version != EVIDENCE_VERSION
+        || evidence.operation_marker != publication_marker(prepared.publication_id)
+        || evidence.handle_digest != prepared.handle_digest
+        || evidence.table_uuid != prepared.staged.table.metadata().uuid().to_string()
+        || evidence.namespace != ident.namespace.to_url_string()
+        || evidence.table != ident.name
+    {
+        return Err(invalid(
+            "Iceberg staged-create publish evidence does not match the exact operation",
+        ));
+    }
+    Ok(())
 }
 
 fn publication_matches(
@@ -1845,39 +1668,6 @@ fn prepared_document_field_bindings(
         .collect()
 }
 
-/// Project the owner's staged-commit result onto the shape this module's match
-/// arms already handle.
-///
-/// Each arm keeps its dispatch verdict: a conflict is a definite rejection,
-/// `KnownNotDispatched` proves the request never went out, `PossiblyDispatched`
-/// means it may have, and an invalid committed response is not an uncommitted
-/// result -- the create may well have landed.
-fn staged_commit_to_legacy(
-    result: crate::catalog::StagedCommitResult,
-) -> Result<crate::iceberg::table::Table, crate::iceberg_catalog_rest::StagedCommitError> {
-    use crate::catalog::StagedCommitResult as Owned;
-    use crate::iceberg_catalog_rest::StagedCommitError as Legacy;
-    match result {
-        Owned::Committed(table) => Ok(table),
-        Owned::Conflict(error) => Err(Legacy::Conflict(rest_error(error))),
-        Owned::KnownUncommitted(error) => Err(Legacy::KnownNotDispatched(rest_error(error))),
-        Owned::CommitUnknown(error) => Err(Legacy::PossiblyDispatched(rest_error(error))),
-        Owned::CommittedResponseInvalid(error) => {
-            Err(Legacy::CommittedResponseInvalid(rest_error(error)))
-        }
-        // A catalog with no staged-create protocol never reaches publication:
-        // admission refused it. Treat it as proven-not-dispatched rather than
-        // inventing an outcome.
-        Owned::Unsupported(reason) => Err(Legacy::KnownNotDispatched(rest_error(
-            reason.message().to_string(),
-        ))),
-    }
-}
-
-fn rest_error(message: String) -> crate::iceberg::Error {
-    crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2010,11 +1800,15 @@ mod tests {
             staged: RestStagedTableCreate {
                 table,
                 initialization_updates: Vec::new(),
+                publication_updates: Vec::new(),
             },
             policy: CreatePolicy::FailIfExists,
             planning: None,
             write: None,
             document_properties: None,
+            publication: None,
+            provenance_path: None,
+            publication_closed: false,
         }
     }
 
@@ -2446,10 +2240,9 @@ mod tests {
     /// A possibly-applied publication can never be aborted or driven again.
     ///
     /// `take_prepared` is the single gate in front of `plan_write`,
-    /// `bind_write`, `publish` and `abort`, and `abort_prepared` — the only
-    /// code here that deletes objects — is reachable only after that gate
-    /// hands out the aggregate. So proving the gate refuses every
-    /// non-`Prepared` state, and puts it back untouched, proves that a
+    /// `bind_write` and `publish`; abort's cleanup-only gate also refuses
+    /// unknown states. Proving these gates put closed states back untouched
+    /// proves that a
     /// `PublicationUnknown` operation cannot be cleaned up, re-published, or
     /// silently re-prepared under the same identity.
     #[test]
@@ -2458,7 +2251,18 @@ mod tests {
         let operation_id = ConnectorMutationOperationId::new();
         let closed = [
             OperationState::PublicationUnknown(PublicationUnknownOperation {
-                evidence_digest: [5u8; 32],
+                evidence: ExternalMutationEvidence::try_new(
+                    EVIDENCE_VERSION,
+                    ConnectorInstanceDescriptor {
+                        provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                        instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+                    },
+                    ProviderBindingEpoch::new(),
+                    operation_id,
+                    "staged-create-publish",
+                    Bytes::new(),
+                )
+                .unwrap(),
                 prepared: prepared_operation(&runtime),
             }),
             OperationState::Unknown,
@@ -2472,6 +2276,10 @@ mod tests {
             take_prepared(&operations, operation_id)
                 .err()
                 .unwrap_or_else(|| panic!("{label} must not hand out an abortable aggregate"));
+            assert!(
+                take_abortable(&operations, operation_id).is_err(),
+                "{label} must not grant cleanup authority"
+            );
             assert!(
                 operations
                     .lock()
@@ -2513,6 +2321,30 @@ mod tests {
     /// this generation did not mint fails to decode rather than being
     /// interpreted as "no artifacts", which would publish an empty table over a
     /// write that actually staged files.
+    #[test]
+    fn cleanup_pending_can_retry_cleanup_without_reopening_publication() {
+        let runtime = rest_runtime();
+        let operation_id = ConnectorMutationOperationId::new();
+        let mut prepared = prepared_operation(&runtime);
+        prepared.publication_closed = true;
+        let operations = Mutex::new(HashMap::from([(
+            operation_id,
+            OperationState::CleanupPending(prepared),
+        )]));
+        assert!(take_prepared(&operations, operation_id).is_err());
+        let prepared = take_abortable(&operations, operation_id)
+            .expect("definite non-publication still permits cleanup");
+        assert!(prepared.publication_closed);
+        operations
+            .lock()
+            .unwrap()
+            .insert(operation_id, OperationState::Prepared(prepared));
+        assert!(
+            take_prepared(&operations, operation_id).is_err(),
+            "closed aggregate cannot be reopened by an incorrect state projection"
+        );
+    }
+
     #[test]
     fn a_foreign_receipt_is_refused_rather_than_read_as_an_empty_write() {
         let runtime = rest_runtime();

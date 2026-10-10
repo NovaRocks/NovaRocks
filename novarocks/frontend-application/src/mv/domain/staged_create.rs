@@ -65,6 +65,7 @@ use novarocks_spi::connector::{
 #[derive(Debug)]
 pub(crate) enum StagedPublishOutcome {
     Published(ConnectorTableObjectId),
+    CommittedFinalizeFailed(String),
     NotPublished(String),
     Unknown(String),
 }
@@ -291,13 +292,28 @@ impl StagedMvCreateTarget {
             context: context.clone(),
         });
         match outcome {
-            Ok(ConnectorStagedCreatePublishOutcome::Applied { .. })
-            | Ok(ConnectorStagedCreatePublishOutcome::NoOp { .. }) => {
-                settle_published(management, catalog_handle, table, object_id)
+            Ok(ConnectorStagedCreatePublishOutcome::Applied { finalization, .. })
+            | Ok(ConnectorStagedCreatePublishOutcome::NoOp { finalization, .. }) => {
+                let settled = settle_published(management, catalog_handle, table, object_id);
+                match finalization {
+                    novarocks_spi::connector::ExternalMutationFinalization::Complete => settled,
+                    novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) => {
+                        let mut message = format!(
+                            "MV CREATE committed but provider finalization failed: {failure}"
+                        );
+                        if let StagedPublishOutcome::CommittedFinalizeFailed(local) = settled {
+                            message.push_str(&format!("; {local}"));
+                        }
+                        StagedPublishOutcome::CommittedFinalizeFailed(message)
+                    }
+                }
             }
-            Ok(ConnectorStagedCreatePublishOutcome::Conflict { failure })
-            | Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure }) => {
-                settle_publish_known_uncommitted(management, failure.message().to_string())
+            Ok(ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup })
+            | Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure, cleanup }) => {
+                settle_publish_known_uncommitted(
+                    management,
+                    crate::connector::mutation::known_uncommitted_message(failure, &cleanup),
+                )
             }
             Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, .. }) => {
                 StagedPublishOutcome::Unknown(format!(
@@ -325,9 +341,24 @@ impl StagedMvCreateTarget {
             context: context.clone(),
         });
         match outcome {
-            Ok(ConnectorStagedCreateAbortOutcome::Aborted { .. })
-            | Ok(ConnectorStagedCreateAbortOutcome::KnownUncommitted { .. }) => {
-                record_terminal(management, EffectDisposition::KnownUncommitted)
+            Ok(ConnectorStagedCreateAbortOutcome::Aborted { finalization, .. }) => {
+                let terminal = record_terminal(management, EffectDisposition::KnownUncommitted);
+                match finalization {
+                    novarocks_spi::connector::ExternalMutationFinalization::Complete => terminal,
+                    novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) => {
+                        Err(format!(
+                            "MV CREATE staged abort cleanup failed: {failure}{}",
+                            terminal.err().map(|e| format!("; {e}")).unwrap_or_default()
+                        ))
+                    }
+                }
+            }
+            Ok(ConnectorStagedCreateAbortOutcome::KnownUncommitted { failure }) => {
+                let terminal = record_terminal(management, EffectDisposition::KnownUncommitted);
+                Err(format!(
+                    "MV CREATE staged abort did not complete: {failure}{}",
+                    terminal.err().map(|e| format!("; {e}")).unwrap_or_default()
+                ))
             }
             Ok(ConnectorStagedCreateAbortOutcome::CommitUnknown { failure, .. }) => Err(format!(
                 "MV CREATE staged abort outcome is unknown: {}",
@@ -375,13 +406,13 @@ fn settle_published(
                 .map_err(|error| format!("late-bind the MV CREATE responsibility: {error:?}"))
         });
     if let Err(error) = bound {
-        return StagedPublishOutcome::Unknown(error);
+        return StagedPublishOutcome::CommittedFinalizeFailed(error);
     }
     match record_terminal(management, EffectDisposition::KnownCommitted) {
         Ok(()) => StagedPublishOutcome::Published(object_id),
         // The create is committed either way; only the responsibility record
         // failed to close, which must not be reported as a failed create.
-        Err(error) => StagedPublishOutcome::Unknown(error),
+        Err(error) => StagedPublishOutcome::CommittedFinalizeFailed(error),
     }
 }
 

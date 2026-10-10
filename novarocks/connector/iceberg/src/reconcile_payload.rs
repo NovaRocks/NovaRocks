@@ -86,12 +86,6 @@ pub enum IcebergMutationEvidenceTarget {
         managed_owner: String,
         managed_incarnation: String,
     },
-    BootstrapEmptyTableSnapshot {
-        namespace: String,
-        table: String,
-        table_uuid: String,
-        operation_marker: String,
-    },
     MvMetadataOnlyStage {
         namespace: String,
         table: String,

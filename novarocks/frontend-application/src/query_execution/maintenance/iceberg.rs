@@ -89,8 +89,10 @@ pub(crate) fn execute_automatic_metadata_action_with_ports(
         connector_context,
     ) {
         ResolvedMetadataMaintenance::KnownCommitted(completed) => completed,
-        ResolvedMetadataMaintenance::KnownUncommitted { failure } => {
-            return Err(TerminalError::known_uncommitted(failure.to_string()));
+        ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => {
+            return Err(TerminalError::known_uncommitted(
+                crate::connector::mutation::known_uncommitted_message(failure, &cleanup),
+            ));
         }
         ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
             return Err(TerminalError::commit_unknown(failure.to_string()));

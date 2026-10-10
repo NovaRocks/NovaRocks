@@ -135,7 +135,7 @@ code-anchors:
 - ADR-0125 — Backend catalog runtime、Frontend effect owner 与 provider-private proof 为何使用三种不互换 identity（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
-- ADR-0055 — row-DML 调用方为何只读 Provider 签发的 strategy，而 SQL 谓词合法性为何留在 Core（active）
+- ADR-0055 — row-DML 调用方为何只读 Provider 签发的 strategy，而 SQL 谓词合法性为何留在 Core（active；妥协 5 的 forward written-version 预测由 ADR-0171 部分取代，源 facts 与策略归属仍有效）
 - ADR-0056 — 摘除 Core 对 provider 的测试依赖时，无法用冻结 SPI facts 表达的断言为何归位到实现旁而非复刻或删除（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
 - ADR-0077 — Hadoop catalog 创建表为何以 storage 条件创建 v1 metadata 作为线性化点（active）
@@ -149,7 +149,8 @@ code-anchors:
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
-- ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
+- ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active；SDK transaction/action 准备复用许可由 ADR-0171 部分取代，catalog owner 与 late TableCommit carrier 仍有效）
+- [ADR-0171](ADR-0171-commit-operation-model.md) — Iceberg 提交为何由不可变意图、依赖验证、attempt staging 与产物 owner 共同完成（active；部分取代 ADR-0118、ADR-0055，细化 lake publication ADR-0110）
 - ADR-0169 — catalog owner 为何在零副作用点统一准入、HMS 永久只读，并让单写者作业留在提交语句生命周期内（active；延伸 ADR-0118）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
 - ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）

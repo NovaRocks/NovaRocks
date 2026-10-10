@@ -120,6 +120,7 @@ pub enum ResolvedDataMutation {
     KnownCommitted(CompletedDataMutation),
     KnownUncommitted {
         failure: KnownUncommittedDataMutation,
+        cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,
@@ -164,9 +165,12 @@ pub fn execute_data_mutation(
                 Ok(completed)
             }
         }
-        ResolvedDataMutation::KnownUncommitted { failure } => {
-            Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
-        }
+        ResolvedDataMutation::KnownUncommitted { failure, cleanup } => Err(
+            EngineError::commit_known_uncommitted(super::mutation::known_uncommitted_message(
+                failure, &cleanup,
+            ))
+            .to_string(),
+        ),
         ResolvedDataMutation::CommitUnknown { failure, .. } => {
             Err(EngineError::commit_unknown(failure.to_string()).to_string())
         }
@@ -255,6 +259,7 @@ impl DataMutationSession {
             })
             .map_err(|error| ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(error),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             })?;
         if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
             return Err(contract_failure(
@@ -268,12 +273,14 @@ impl DataMutationSession {
         let operation = intent.into_operation(metadata.table).map_err(|error| {
             ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(error),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             }
         })?;
         let plan = lease
             .plan_operation(operation_id, operation, context.clone())
             .map_err(|error| ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(error),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             })?;
         Ok(Self {
             lease,
@@ -403,9 +410,10 @@ fn resolve_terminal_outcome(
                 finalization: merge_finalization(finalization, generic_finalization),
             })
         }
-        ExternalMutationOutcome::KnownUncommitted { failure } => {
+        ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Provider(failure),
+                cleanup,
             }
         }
         ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
@@ -662,6 +670,7 @@ mod tests {
                         ConnectorMutationFailureKind::Conflict,
                         "base state changed",
                     ),
+                    cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 });
             }
             self.events.lock().expect("events").push("provider");
@@ -804,6 +813,44 @@ mod tests {
             namespace: Arc::from("db"),
             table: Arc::from("orders"),
         }
+    }
+
+    #[test]
+    fn uncommitted_cleanup_is_preserved_without_any_cache_finalization() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let finalizer = Finalizer {
+            events: events.clone(),
+            fail: false,
+        };
+        let cleanup = ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Unavailable,
+            "two owned files remain",
+        ));
+        let outcome = resolve_terminal_outcome(
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Conflict,
+                    "ref changed",
+                ),
+                cleanup: cleanup.clone(),
+            },
+            &table(&ConnectorInstanceId::parse("cleanup-test").unwrap()),
+            &finalizer,
+        );
+        let ResolvedDataMutation::KnownUncommitted {
+            failure,
+            cleanup: observed,
+        } = outcome
+        else {
+            panic!("definite refusal")
+        };
+        assert_eq!(observed, cleanup);
+        assert_eq!(failure.to_string(), "Conflict: ref changed");
+        assert!(
+            super::super::mutation::known_uncommitted_message(failure, &observed)
+                .contains("two owned files remain")
+        );
+        assert!(events.lock().unwrap().is_empty());
     }
 
     fn truncate_intent() -> DataMutationIntent {
@@ -958,7 +1005,8 @@ mod tests {
         assert!(matches!(
             resolve(&provider, &finalizer),
             ResolvedDataMutation::KnownUncommitted {
-                failure: KnownUncommittedDataMutation::Planning(_)
+                failure: KnownUncommittedDataMutation::Planning(_),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete
             }
         ));
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
@@ -975,7 +1023,8 @@ mod tests {
         assert!(matches!(
             resolve(&provider, &finalizer),
             ResolvedDataMutation::KnownUncommitted {
-                failure: KnownUncommittedDataMutation::Planning(_)
+                failure: KnownUncommittedDataMutation::Planning(_),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete
             }
         ));
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
@@ -1009,7 +1058,8 @@ mod tests {
         assert!(matches!(
             resolve(&provider, &finalizer),
             ResolvedDataMutation::KnownUncommitted {
-                failure: KnownUncommittedDataMutation::Provider(_)
+                failure: KnownUncommittedDataMutation::Provider(_),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete
             }
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);

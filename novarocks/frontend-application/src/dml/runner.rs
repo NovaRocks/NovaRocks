@@ -21,7 +21,8 @@ use std::convert::Infallible;
 
 use novarocks_spi::connector::{
     ConnectorWriteAbortOutcome, ConnectorWriteReceipt, ExternalMutationEvidence,
-    ExternalMutationOutcome, LakePublicationFamily, LakePublicationId, LakePublicationTarget,
+    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
+    LakePublicationId, LakePublicationTarget,
 };
 
 use crate::dml::attempt::{
@@ -134,7 +135,12 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         match report {
             CoordinatedWriteReport::NoOp => {
                 attempt.mark_dispatch_possible().map_err(attempt_error)?;
-                self.finish_committed(&spec, &mut attempt, None)
+                self.finish_committed(
+                    &spec,
+                    &mut attempt,
+                    None,
+                    ExternalMutationFinalization::Complete,
+                )
             }
             CoordinatedWriteReport::CommitRequired(handle) => {
                 attempt.mark_dispatch_possible().map_err(attempt_error)?;
@@ -150,15 +156,26 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
             }
             CoordinatedWriteReport::AbortRequired { reason, handle } => {
                 match self.executor.abort(&spec, &handle) {
-                    Ok(ConnectorWriteAbortOutcome::KnownUncommitted { .. }) => {
+                    Ok(ConnectorWriteAbortOutcome::KnownUncommitted { cleanup, .. }) => {
                         attempt
                             .terminal_known_uncommitted()
                             .map_err(attempt_error)?;
-                        Err(with_terminal(DmlError::executor(reason), &attempt))
+                        Err(with_terminal(
+                            DmlError::executor(
+                                crate::connector::mutation::known_uncommitted_message(
+                                    reason, &cleanup,
+                                ),
+                            ),
+                            &attempt,
+                        ))
                     }
-                    Ok(ConnectorWriteAbortOutcome::KnownCommitted { receipt, .. }) => {
+                    Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+                        receipt,
+                        finalization,
+                        ..
+                    }) => {
                         attempt.mark_dispatch_possible().map_err(attempt_error)?;
-                        self.finish_committed(&spec, &mut attempt, Some(receipt))
+                        self.finish_committed(&spec, &mut attempt, Some(receipt), finalization)
                     }
                     Ok(ConnectorWriteAbortOutcome::CommitUnknown { failure, .. }) => {
                         attempt.mark_dispatch_possible().map_err(attempt_error)?;
@@ -186,20 +203,32 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
     ) -> Result<WriteTransactionOutcome, DmlError> {
         match outcome {
-            ExternalMutationOutcome::KnownCommitted { receipt, .. } => {
-                self.finish_committed(spec, attempt, Some(receipt))
-            }
-            ExternalMutationOutcome::KnownUncommitted { failure } => {
+            ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                ..
+            } => self.finish_committed(spec, attempt, Some(receipt), finalization),
+            ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
                 attempt
                     .terminal_known_uncommitted()
                     .map_err(attempt_error)?;
-                Err(with_terminal(DmlError::commit(failure.message()), attempt))
+                Err(with_terminal(
+                    DmlError::commit(crate::connector::mutation::known_uncommitted_message(
+                        failure, &cleanup,
+                    )),
+                    attempt,
+                ))
             }
             ExternalMutationOutcome::CommitUnknown { evidence, .. } => {
                 let token = attempt.begin_adjudication().map_err(attempt_error)?;
                 match self.executor.adjudicate_publication(spec, handle, evidence) {
-                    Ok(ExternalMutationOutcome::KnownCommitted { receipt, .. }) => {
-                        let finalize = self.executor.finalize(spec);
+                    Ok(ExternalMutationOutcome::KnownCommitted {
+                        receipt,
+                        finalization,
+                        ..
+                    }) => {
+                        let finalize =
+                            combine_finalization(finalization, self.executor.finalize(spec));
                         let finalization = if finalize.is_ok() {
                             DmlPublicationFinalization::Succeeded
                         } else {
@@ -222,7 +251,7 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                             committed_receipt: Some(receipt),
                         })
                     }
-                    Ok(ExternalMutationOutcome::KnownUncommitted { failure }) => {
+                    Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup }) => {
                         attempt
                             .finish_adjudication(
                                 token,
@@ -230,7 +259,14 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                                 DmlPublicationFinalization::NotApplicable,
                             )
                             .map_err(attempt_error)?;
-                        Err(with_terminal(DmlError::commit(failure.message()), attempt))
+                        Err(with_terminal(
+                            DmlError::commit(
+                                crate::connector::mutation::known_uncommitted_message(
+                                    failure, &cleanup,
+                                ),
+                            ),
+                            attempt,
+                        ))
                     }
                     Ok(ExternalMutationOutcome::CommitUnknown { failure, .. }) => {
                         attempt
@@ -263,8 +299,10 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         spec: &WriteTransactionSpec,
         attempt: &mut DmlPublicationAttempt,
         receipt: Option<ConnectorWriteReceipt>,
+        provider_finalization: ExternalMutationFinalization,
     ) -> Result<WriteTransactionOutcome, DmlError> {
-        let finalization = if self.executor.finalize(spec).is_ok() {
+        let finalized = combine_finalization(provider_finalization, self.executor.finalize(spec));
+        let finalization = if finalized.is_ok() {
             DmlPublicationFinalization::Succeeded
         } else {
             DmlPublicationFinalization::Failed
@@ -273,15 +311,27 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
             .terminal_known_committed(finalization)
             .map_err(attempt_error)?
             .clone();
-        if finalization == DmlPublicationFinalization::Failed {
+        if let Err(message) = finalized {
             return Err(DmlError::known_committed_finalization_failed(
-                terminal,
-                "post-commit finalization failed",
+                terminal, message,
             ));
         }
         Ok(WriteTransactionOutcome {
             committed_receipt: receipt,
         })
+    }
+}
+
+fn combine_finalization(
+    provider: ExternalMutationFinalization,
+    local: Result<(), String>,
+) -> Result<(), String> {
+    match (provider, local) {
+        (ExternalMutationFinalization::Complete, local) => local,
+        (ExternalMutationFinalization::Failed(error), Ok(())) => Err(error.to_string()),
+        (ExternalMutationFinalization::Failed(error), Err(local)) => {
+            Err(format!("{error}; {local}"))
+        }
     }
 }
 
@@ -312,6 +362,7 @@ mod tests {
 
     enum Adjudication {
         Committed,
+        CommittedCleanupFailed,
         Unproven,
     }
 
@@ -385,16 +436,29 @@ mod tests {
         ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
             self.adjudications.fetch_add(1, Ordering::SeqCst);
             match self.adjudication {
-                Adjudication::Committed => Ok(ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt: Self::receipt(),
-                    finalization: ExternalMutationFinalization::Complete,
-                }),
+                Adjudication::Committed | Adjudication::CommittedCleanupFailed => {
+                    Ok(ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        receipt: Self::receipt(),
+                        finalization: if matches!(
+                            self.adjudication,
+                            Adjudication::CommittedCleanupFailed
+                        ) {
+                            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                                ConnectorMutationFailureKind::Unavailable,
+                                "owned artifact cleanup incomplete",
+                            ))
+                        } else {
+                            ExternalMutationFinalization::Complete
+                        },
+                    })
+                }
                 Adjudication::Unproven => Ok(ExternalMutationOutcome::KnownUncommitted {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::NotFound,
                         "exact marker is absent",
                     ),
+                    cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 }),
             }
         }
@@ -430,6 +494,88 @@ mod tests {
             .run(spec())
             .expect("exact positive adjudication commits");
         assert!(outcome.committed_receipt.is_some());
+        assert_eq!(executor.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.adjudications.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.finalizations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn direct_known_commit_keeps_failed_cleanup_without_adjudication_or_retry() {
+        let executor = UnknownCommitExecutor {
+            adjudication: Adjudication::Unproven,
+            commits: AtomicUsize::new(0),
+            adjudications: AtomicUsize::new(0),
+            finalizations: AtomicUsize::new(0),
+        };
+        let spec = spec();
+        let target = LakePublicationTarget::try_new(
+            spec.target.catalog.clone(),
+            spec.target.namespace.clone(),
+            Some(spec.target.table.clone()),
+            spec.target.reference.clone(),
+        )
+        .unwrap();
+        let mut attempt = DmlPublicationAttempt::new(
+            spec.publication_id,
+            LakePublicationFamily::Write,
+            target,
+            None,
+        );
+        attempt.mark_dispatch_possible().unwrap();
+        let error = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+            .complete_commit(
+                &spec,
+                &mut attempt,
+                &(),
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: UnknownCommitExecutor::receipt(),
+                    finalization: ExternalMutationFinalization::Failed(
+                        ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::Unavailable,
+                            "prior attempt artifacts remain",
+                        ),
+                    ),
+                },
+            )
+            .expect_err("cleanup failure is visible after proven publication");
+        assert_eq!(
+            error.publication_terminal().unwrap().disposition(),
+            LakePublicationDisposition::KnownCommitted
+        );
+        assert!(error.publication_terminal().unwrap().do_not_retry());
+        assert_eq!(
+            attempt.finalization(),
+            Some(DmlPublicationFinalization::Failed)
+        );
+        assert!(error.to_string().contains("prior attempt artifacts remain"));
+        assert_eq!(executor.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.adjudications.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.finalizations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn positive_adjudication_keeps_known_commit_when_provider_cleanup_failed() {
+        let executor = UnknownCommitExecutor {
+            adjudication: Adjudication::CommittedCleanupFailed,
+            commits: AtomicUsize::new(0),
+            adjudications: AtomicUsize::new(0),
+            finalizations: AtomicUsize::new(0),
+        };
+        let error = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+            .run(spec())
+            .expect_err("known commit cleanup failure is visible");
+        let terminal = error.publication_terminal().unwrap();
+        assert_eq!(
+            terminal.disposition(),
+            LakePublicationDisposition::KnownCommitted
+        );
+        assert!(terminal.do_not_retry());
+        assert!(
+            error
+                .to_string()
+                .contains("owned artifact cleanup incomplete")
+        );
         assert_eq!(executor.commits.load(Ordering::SeqCst), 1);
         assert_eq!(executor.adjudications.load(Ordering::SeqCst), 1);
         assert_eq!(executor.finalizations.load(Ordering::SeqCst), 1);

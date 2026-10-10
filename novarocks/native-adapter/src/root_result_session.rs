@@ -175,11 +175,29 @@ struct ProducerState {
     /// cancel (for example a pool shutdown racing the job's removal) cannot
     /// turn a completed producer into a failed one.
     completed: bool,
+    // Rollback is not a runtime result terminal. Observation follows actual exit.
+    abort_is_rollback: bool,
+    terminal_observed: bool,
     failed: Option<&'static str>,
     producer: Option<RootProducerExit>,
     cleanup_panic: Option<Box<dyn std::any::Any + Send>>,
 }
 impl ProducerState {
+    fn take_terminal_observation(&mut self) -> Option<&'static str> {
+        if self.terminal_observed {
+            return None;
+        }
+        let terminal = if self.completed {
+            "finished"
+        } else if self.failed.is_some() && !self.abort_is_rollback {
+            "aborted"
+        } else {
+            return None;
+        };
+        self.terminal_observed = true;
+        Some(terminal)
+    }
+
     fn cleanup(&mut self, action: impl FnOnce()) {
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action))
             && self.cleanup_panic.is_none()
@@ -215,6 +233,8 @@ pub struct NativeRootResultSession {
     registration: OnceLock<RootProducerRegistration>,
     wake_subscription: OnceLock<ObserverSubscription>,
     exited: AtomicBool,
+    #[cfg(test)]
+    terminal_observations: Mutex<Vec<&'static str>>,
     _metadata: Arc<RootMetadataReservation>,
 }
 impl NativeRootResultSession {
@@ -277,6 +297,8 @@ impl NativeRootResultSession {
                 scalar_rows: 0,
                 sealed: false,
                 completed: false,
+                abort_is_rollback: false,
+                terminal_observed: false,
                 failed: None,
                 producer: None,
                 cleanup_panic: None,
@@ -284,6 +306,8 @@ impl NativeRootResultSession {
             registration: OnceLock::new(),
             wake_subscription: OnceLock::new(),
             exited: AtomicBool::new(true),
+            #[cfg(test)]
+            terminal_observations: Mutex::new(Vec::new()),
             _metadata: metadata,
         });
         drop(
@@ -327,6 +351,15 @@ impl NativeRootResultSession {
     }
     pub fn channel(&self) -> &Arc<RootResultChannel> {
         &self.channel
+    }
+
+    fn observe_terminal(&self, terminal: &'static str) {
+        crate::backend_metrics::record_fragment_result_terminal(terminal);
+        #[cfg(test)]
+        self.terminal_observations
+            .lock()
+            .expect("root terminal observations lock")
+            .push(terminal);
     }
 
     fn state(&self) -> MutexGuard<'_, ProducerState> {
@@ -827,10 +860,19 @@ impl RootResultSession for NativeRootResultSession {
     fn producer_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
     }
-    fn abort(&self, _reason: ResultAbort) {
+    fn abort(&self, reason: ResultAbort) {
         let mut state = self.state();
+        // End is committed before observer wakeups. A wakeup panic cannot
+        // replace that immutable publication with a later cancellation.
+        state.completed |= self.channel.snapshot().end_sequence.is_some();
         if state.completed {
             return;
+        }
+        if state.failed.is_none() {
+            state.abort_is_rollback = matches!(
+                reason,
+                ResultAbort::PrepareRollback | ResultAbort::NeverStarted
+            );
         }
         state.failed.get_or_insert("root producer was cancelled");
         state.sealed = true;
@@ -843,6 +885,14 @@ impl RootResultSession for NativeRootResultSession {
 impl RootProducerJob for NativeRootResultSession {
     fn turn(&self) -> RootProducerTurn {
         let mut state = self.state();
+        state.completed |= self.channel.snapshot().end_sequence.is_some();
+        if state.completed {
+            assert!(
+                state.input.is_none() && state.builder.is_none(),
+                "published End must have released its original input and builder"
+            );
+            return RootProducerTurn::Complete;
+        }
         let turn = self.advance(&mut state);
         if turn == RootProducerTurn::Complete && state.failed.is_none() {
             state.completed = true;
@@ -853,13 +903,17 @@ impl RootProducerJob for NativeRootResultSession {
         self.abort(ResultAbort::Cancelled(String::new()));
     }
     fn exited(&self) {
-        let (producer, cleanup_panic) = {
+        let (producer, cleanup_panic, terminal) = {
             let mut state = self.state();
             assert!(
                 state.input.is_none() && state.builder.is_none(),
                 "producer's real backing exits before its guard"
             );
-            (state.producer.take(), state.cleanup_panic.take())
+            (
+                state.producer.take(),
+                state.cleanup_panic.take(),
+                state.take_terminal_observation(),
+            )
         };
         // Input/cursor/builder destruction and the actual pool turn have
         // completed. Publish this physical fact before guard notification:
@@ -869,6 +923,11 @@ impl RootProducerJob for NativeRootResultSession {
         self.exited.store(true, Ordering::Release);
         let producer_exit =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(producer)));
+        let terminal_exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(terminal) = terminal {
+                self.observe_terminal(terminal);
+            }
+        }));
         let readiness_exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.authority.observable().notify_observers();
         }));
@@ -879,6 +938,9 @@ impl RootProducerJob for NativeRootResultSession {
             std::panic::resume_unwind(panic);
         }
         if let Err(panic) = producer_exit {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = terminal_exit {
             std::panic::resume_unwind(panic);
         }
         if let Err(panic) = readiness_exit {
@@ -892,4 +954,363 @@ fn io_error(message: &'static str) -> FragmentIoError {
         FragmentIoErrorKind::Unavailable,
         message,
     )
+}
+
+#[cfg(test)]
+mod terminal_observation_tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+    use std::sync::Condvar;
+    use std::time::{Duration, Instant};
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::DataType;
+    use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use novarocks_execution_contract::TaskIdentity;
+    use novarocks_result_contract::{RootOutputContract, RootProfileId};
+    use novarocks_types::arrow_metadata_owner::{
+        ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
+    };
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, SlotId, StageId, TaskId,
+    };
+    use novarocks_worker::WorkerResultRetainedLimits;
+    use novarocks_worker::result_buffer::ResultRetainedBudget;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    // Occupies the one real CPU worker. The native session still owns its
+    // admitted input and producer guard; its turn cannot exit until release.
+    struct GatedTurn {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+    impl GatedTurn {
+        fn wait_entered(&self) {
+            let state = self.state.lock().unwrap();
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, WAIT, |state| !state.0)
+                .unwrap();
+            assert!(
+                state.0,
+                "the real pool worker must enter the controlled turn"
+            );
+        }
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
+        }
+    }
+    impl RootProducerJob for GatedTurn {
+        fn turn(&self) -> RootProducerTurn {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.changed.notify_all();
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, WAIT, |state| !state.1)
+                .unwrap();
+            assert!(
+                state.1,
+                "controlled pool turn must be released within its budget"
+            );
+            RootProducerTurn::Complete
+        }
+        fn cancel(&self) {
+            self.release();
+        }
+        fn exited(&self) {}
+    }
+
+    struct Fixture {
+        session: Arc<NativeRootResultSession>,
+        pool: Arc<RootProducerPool>,
+        blocker: Option<(Arc<GatedTurn>, RootProducerRegistration)>,
+    }
+    impl Fixture {
+        fn new(gated: bool) -> Self {
+            let limits =
+                WorkerResultRetainedLimits::try_new(256 * 1024 * 1024, 1024 * 1024 * 1024).unwrap();
+            let budget = ResultRetainedBudget::new(limits.per_process());
+            let pool = RootProducerPool::try_new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                1024 * 1024,
+                Arc::clone(&budget),
+            )
+            .unwrap();
+            let blocker = gated.then(|| {
+                let job = Arc::new(GatedTurn {
+                    state: Mutex::new((false, false)),
+                    changed: Condvar::new(),
+                });
+                let erased = Arc::clone(&job) as Arc<dyn RootProducerJob>;
+                let registration = pool.register(Arc::downgrade(&erased)).unwrap();
+                registration.wake().unwrap();
+                job.wait_entered();
+                (job, registration)
+            });
+            let task = TaskIdentity::new(
+                QueryExecutionId::new(QueryId::new(907, 908), AttemptId::new(1).unwrap()).unwrap(),
+                StageId::new(1).unwrap(),
+                TaskId::new(1).unwrap(),
+                BackendProcessId::new_v7(),
+            );
+            let channel = RootResultChannel::try_open(
+                RootResultWriteSpec {
+                    task,
+                    contract: Arc::new(RootOutputContract::new(
+                        RootProfileId::V1,
+                        FrozenRootOutput::CountOnly,
+                    )),
+                },
+                budget,
+                limits,
+            )
+            .unwrap();
+            let session = NativeRootResultSession::try_open(channel, &pool).unwrap();
+            Self {
+                session,
+                pool,
+                blocker,
+            }
+        }
+        fn observations(&self) -> Vec<&'static str> {
+            self.session.terminal_observations.lock().unwrap().clone()
+        }
+        fn wait_terminal(&self, expected: &'static str) {
+            let deadline = Instant::now() + WAIT;
+            loop {
+                let observed = self.observations();
+                if observed == [expected] {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native Root did not reach its real exit; observed={observed:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        fn submit(&self) {
+            let owner = ArrowMetadataOwner::try_new(
+                Vec::new(),
+                MetadataOwnerLimits {
+                    entries: 0,
+                    construction_bytes: 0,
+                },
+            )
+            .unwrap()
+            .into_field("value".into(), DataType::Int64, false);
+            let slot = ChunkSlotSchema::try_new_with_metadata_origins(
+                SlotId::new(1),
+                Arc::clone(owner.field()),
+                FieldMetadataOrigins::try_new(vec![owner], 1).unwrap(),
+                None,
+                None,
+            )
+            .unwrap();
+            let schema = Arc::new(ChunkSchema::try_new(vec![slot]).unwrap());
+            assert!(schema.field_metadata_origins().is_some());
+            assert!(schema.schema_metadata_origin().is_some());
+            let chunk =
+                Chunk::try_new_with_columns(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                    .unwrap();
+            let RootInputAdmission::Granted(permit) = self.session.try_acquire_input().unwrap()
+            else {
+                panic!("the actual native Root must admit its original input");
+            };
+            self.session.submit_input(chunk, permit).unwrap();
+        }
+        fn release(&self) {
+            if let Some((job, _registration)) = &self.blocker {
+                job.release();
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.release();
+            let _ = self.pool.shutdown();
+        }
+    }
+
+    #[test]
+    fn native_root_normal_end_observes_once_after_exit_and_late_abort_cannot_replace_it() {
+        let fixture = Fixture::new(false);
+        fixture.submit();
+        fixture.session.finish_input().unwrap();
+        fixture.wait_terminal("finished");
+        fixture.pool.shutdown().unwrap();
+        let snapshot = fixture
+            .session
+            .channel()
+            .try_ownership_snapshot()
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.ends_published, 1);
+        assert_eq!(snapshot.producers_running, 0);
+        assert_eq!(snapshot.producers_exited, 1);
+        assert!(fixture.session.producer_exited());
+        fixture
+            .session
+            .abort(ResultAbort::Cancelled("late cancellation".into()));
+        fixture
+            .session
+            .abort(ResultAbort::Failed("late failure".into()));
+        RootProducerJob::exited(fixture.session.as_ref());
+        RootProducerJob::exited(fixture.session.as_ref());
+        assert_eq!(fixture.observations(), ["finished"]);
+    }
+
+    #[test]
+    fn native_root_published_end_wakeup_panic_preserves_finished_after_actual_exit() {
+        let fixture = Fixture::new(false);
+        let panicked = Arc::new(AtomicBool::new(false));
+        let notified = Arc::clone(&panicked);
+        let channel = Arc::downgrade(fixture.session.channel());
+        let subscription = fixture
+            .session
+            .channel()
+            .writable_observable()
+            .try_subscribe(Arc::new(move || {
+                if channel
+                    .upgrade()
+                    .is_some_and(|channel| channel.snapshot().end_sequence.is_some())
+                    && !notified.swap(true, Ordering::AcqRel)
+                {
+                    std::panic::panic_any("published End wakeup panic");
+                }
+            }))
+            .unwrap();
+        fixture.submit();
+        fixture.session.finish_input().unwrap();
+        fixture.wait_terminal("finished");
+        fixture.pool.shutdown().unwrap();
+        assert!(panicked.load(Ordering::Acquire));
+        assert!(fixture.session.producer_exited());
+        let snapshot = fixture
+            .session
+            .channel()
+            .try_ownership_snapshot()
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.ends_published, 1);
+        assert_eq!(snapshot.producers_running, 0);
+        assert_eq!(snapshot.producers_exited, 1);
+        assert!(!fixture.session.channel().is_closed());
+        let state = fixture.session.state();
+        assert!(state.completed);
+        assert_eq!(state.failed, Some("root producer turn panicked"));
+        assert!(state.input.is_none());
+        assert!(state.builder.is_none());
+        assert!(state.producer.is_none());
+        drop(state);
+        fixture
+            .session
+            .abort(ResultAbort::Cancelled("late cancellation".into()));
+        RootProducerJob::exited(fixture.session.as_ref());
+        assert_eq!(fixture.observations(), ["finished"]);
+        drop(subscription);
+    }
+
+    #[test]
+    fn native_root_cold_installed_runtime_cancel_observes_exactly_one_abort() {
+        let fixture = Fixture::new(false);
+        assert!(fixture.session.state().producer.is_none());
+        assert!(fixture.session.producer_exited());
+        fixture
+            .session
+            .abort(ResultAbort::Cancelled("cold root deadline".into()));
+        fixture.wait_terminal("aborted");
+        fixture.pool.shutdown().unwrap();
+        fixture
+            .session
+            .abort(ResultAbort::Cancelled("repeated cancellation".into()));
+        RootProducerJob::exited(fixture.session.as_ref());
+        RootProducerJob::exited(fixture.session.as_ref());
+        assert_eq!(fixture.observations(), ["aborted"]);
+        assert_eq!(
+            fixture
+                .session
+                .channel()
+                .try_ownership_snapshot()
+                .unwrap()
+                .unwrap()
+                .ends_published,
+            0
+        );
+    }
+
+    #[test]
+    fn native_root_live_cancel_or_failure_observes_only_after_real_pool_exit() {
+        for reason in [
+            ResultAbort::Cancelled("live root deadline".into()),
+            ResultAbort::Failed("live root failure".into()),
+        ] {
+            let fixture = Fixture::new(true);
+            fixture.submit();
+            assert!(!fixture.session.producer_exited());
+            fixture.session.abort(reason.clone());
+            fixture.session.abort(reason);
+            // The only pool worker is already inside the gate. This assertion
+            // cannot pass merely because the canceled worker has not scheduled.
+            assert!(fixture.session.state().input.is_some());
+            assert!(fixture.observations().is_empty());
+            assert!(!fixture.session.producer_exited());
+            assert_eq!(
+                fixture
+                    .session
+                    .channel()
+                    .try_ownership_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .producers_running,
+                1
+            );
+            fixture.release();
+            fixture.wait_terminal("aborted");
+            fixture.pool.shutdown().unwrap();
+            let state = fixture.session.state();
+            assert!(state.input.is_none());
+            assert!(state.builder.is_none());
+            assert!(state.producer.is_none());
+            drop(state);
+            let snapshot = fixture
+                .session
+                .channel()
+                .try_ownership_snapshot()
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.producers_running, 0);
+            assert_eq!(snapshot.producers_exited, 1);
+            assert_eq!(snapshot.ends_published, 0);
+            RootProducerJob::exited(fixture.session.as_ref());
+            assert_eq!(fixture.observations(), ["aborted"]);
+        }
+    }
+
+    #[test]
+    fn native_root_prepare_rollback_and_never_started_do_not_publish_runtime_terminal() {
+        for reason in [ResultAbort::PrepareRollback, ResultAbort::NeverStarted] {
+            let fixture = Fixture::new(false);
+            fixture.session.abort(reason);
+            // Shutdown joins the real worker, including its dormant/cold job.
+            fixture.pool.shutdown().unwrap();
+            assert!(fixture.session.producer_exited());
+            RootProducerJob::exited(fixture.session.as_ref());
+            assert!(fixture.observations().is_empty());
+            assert_eq!(
+                fixture
+                    .session
+                    .channel()
+                    .try_ownership_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .ends_published,
+                0
+            );
+        }
+    }
 }

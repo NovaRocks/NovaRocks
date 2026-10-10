@@ -134,6 +134,32 @@ impl std::fmt::Display for CatalogTableName {
     }
 }
 
+/// Only authoritative metadata facts cross a commit reload. REST response
+/// credentials never replace the original operation's storage authority.
+#[derive(Debug)]
+pub(crate) struct CatalogCommitBase {
+    pub metadata: crate::iceberg::spec::TableMetadata,
+    pub metadata_location: String,
+}
+
+impl CatalogCommitBase {
+    pub(crate) fn from_table(table: crate::iceberg::table::Table) -> crate::iceberg::Result<Self> {
+        let metadata_location = table
+            .metadata_location()
+            .ok_or_else(|| {
+                crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::DataInvalid,
+                    "Commit reload returned no metadata location",
+                )
+            })?
+            .to_owned();
+        Ok(Self {
+            metadata: table.metadata().clone(),
+            metadata_location,
+        })
+    }
+}
+
 /// What a table creation is ultimately for.
 ///
 /// This is the reason admission is a per-request question rather than a
@@ -488,6 +514,21 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         _binding: crate::access_binding::IcebergReadBinding,
     ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
         self.load_table(table).await
+    }
+
+    /// Reload commit metadata using the operation's authorized object-store
+    /// I/O. Catalog HTTP calls remain catalog-owned; filesystem pointer and
+    /// metadata reads must use the supplied governor, never a cached FileIO.
+    async fn load_commit_base(
+        &self,
+        table: CatalogTableName,
+        _file_io: crate::iceberg::io::FileIO,
+    ) -> crate::iceberg::Result<CatalogCommitBase> {
+        let ident = delegate::table_ident(&table).map_err(|error| {
+            crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.to_string())
+                .with_source(error)
+        })?;
+        CatalogCommitBase::from_table(self.vendored_client().load_table(&ident).await?)
     }
 
     /// Whether the view exists.

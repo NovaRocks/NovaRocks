@@ -1133,6 +1133,8 @@ impl Scenario for NormalCloseCapacity {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
+        let exchange_authorization =
+            authorization_header(&context.handle().native_backend_probe_trust()?)?;
         let retained = RawBackendSession::establish(context, 0)?;
         let live = RawBackendSession::establish(context, 0)?;
         let receiver = |session: &RawBackendSession, id| {
@@ -1177,12 +1179,12 @@ impl Scenario for NormalCloseCapacity {
         context.action(format!("real Native Create accepted {occupied} installed inbound receivers, then returned ResourceExhausted at the configured {} bound", if self.byte_limited { "byte" } else { "record" }));
 
         retained.release_when_ready(context)?;
-        assert_normal_close(&retained, &first)?;
+        assert_normal_close(&retained, &first, &exchange_authorization)?;
         ensure_capacity_refused(&live, &refused)?;
         // A still-live exact receiver accepts EOS after another Context has
         // moved its reservation from active into retained; capacity pressure
         // neither evicts that route nor lets a new Create overtake it.
-        let response = exchange_probe(&live, &active[0], true)?;
+        let response = exchange_probe(&live, &active[0], true, &exchange_authorization)?;
         ensure!(
             response
                 .status
@@ -1199,7 +1201,7 @@ impl Scenario for NormalCloseCapacity {
         let blocked_create = receiver(&blocked, 1);
         ensure_capacity_refused(&blocked, &blocked_create)?;
         blocked.release_when_ready(context)?;
-        assert_normal_close(&retained, &first)?;
+        assert_normal_close(&retained, &first, &exchange_authorization)?;
         context.action("both receiver Contexts released, but their retained normal-close reservations still refused a fresh Context");
 
         let horizon = Duration::from_secs(120);
@@ -1233,7 +1235,7 @@ impl Scenario for NormalCloseCapacity {
             }
         }
         await_installed(context, &recovered, &recovered_create)?;
-        let forgotten = exchange_probe(&retained, &first, false)?;
+        let forgotten = exchange_probe(&retained, &first, false, &exchange_authorization)?;
         ensure!(
             forgotten.normal_closed.is_none()
                 && forgotten
@@ -1302,11 +1304,12 @@ fn exchange_probe(
     session: &RawBackendSession,
     create: &RawCreate,
     eos: bool,
+    exchange_authorization: &str,
 ) -> Result<proto::ExchangeResponse> {
     raw_unary(
         session.connector.clone(),
-        "/novarocks.NovaRocksGrpc/Exchange",
-        &session.authorization,
+        "/novarocks.NovaRocksGrpc/ExchangeUnary",
+        exchange_authorization,
         proto::ExchangeRequest {
             finst_id_hi: 0x5b,
             finst_id_lo: create.kernel_key_low,
@@ -1324,8 +1327,12 @@ fn exchange_probe(
     )
 }
 
-fn assert_normal_close(session: &RawBackendSession, create: &RawCreate) -> Result<()> {
-    let response = exchange_probe(session, create, false)?;
+fn assert_normal_close(
+    session: &RawBackendSession,
+    create: &RawCreate,
+    exchange_authorization: &str,
+) -> Result<()> {
+    let response = exchange_probe(session, create, false, exchange_authorization)?;
     ensure!(
         response
             .status
