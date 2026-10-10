@@ -39,6 +39,7 @@ use crate::runtime::fragment::io::{
 use crate::runtime::fragment::scan::compiled_fixture::{
     FixtureScanOp, FixtureScanSource, SCAN_NODE, rows, scan_chunk, scan_program,
 };
+use crate::runtime::fragment::{ExecutionFailureCause, ExecutionResult};
 use crate::runtime::observable::Observable;
 use crate::runtime::query_options::QueryOptions;
 
@@ -374,4 +375,246 @@ fn a_compiled_scan_submission_refuses_unbound_and_unaddressed_scans() {
     ));
     assert!(error.to_string().contains("bind failed"), "{error}");
     assert_eq!(op.claims(), 0, "no refused submission claims the stream");
+}
+
+struct RecordingProjectSchemaHost<'a> {
+    program: &'a Arc<LocalProgram>,
+    sites: Vec<crate::runtime::preparation_metadata::ProjectSchemaSite>,
+    body_calls: usize,
+    refusal: Option<(
+        usize,
+        crate::runtime::preparation_metadata::PreparationMetadataFailure,
+    )>,
+}
+impl crate::runtime::preparation_metadata::CompiledSchemaMetadataScope
+    for RecordingProjectSchemaHost<'_>
+{
+    fn materialize<B>(
+        &mut self,
+        program: &Arc<LocalProgram>,
+        site: crate::runtime::preparation_metadata::ProjectSchemaSite,
+        layout: &novarocks_local_program::StaticLayout,
+        body: B,
+    ) -> ExecutionResult<crate::exec::chunk::ChunkSchemaRef>
+    where
+        B: FnOnce() -> Result<crate::exec::chunk::ChunkSchemaRef, String>,
+    {
+        use crate::runtime::preparation_metadata::ProjectSchemaSite;
+        assert!(Arc::ptr_eq(program, self.program));
+        let node = match site {
+            ProjectSchemaSite::Project(id) => {
+                let node = &program.graph().nodes()[id.index()];
+                assert!(matches!(
+                    node.kind(),
+                    novarocks_local_program::ProgramNodeKind::Project { .. }
+                ));
+                node
+            }
+            ProjectSchemaSite::FinalResult => {
+                &program.graph().nodes()[program.graph().root().index()]
+            }
+        };
+        assert!(std::ptr::eq(layout, node.output_layout()));
+        self.sites.push(site);
+        if let Some((at, cause)) = &self.refusal
+            && self.sites.len() == *at
+        {
+            return Err(cause.clone().into());
+        }
+        self.body_calls += 1;
+        body().map_err(Into::into)
+    }
+}
+
+#[test]
+fn project_metadata_borrow_reaches_nested_projects_before_running() {
+    use crate::runtime::preparation_metadata::ProjectSchemaSite;
+    let program = program(SeedMode::Input, false);
+    let submission = CompiledFragmentSubmission::try_new(
+        Arc::clone(&program),
+        CompiledScanSources::new(),
+        instance(
+            UniqueId::new(231, 232),
+            1,
+            ExchangeInputAssignments::default(),
+        ),
+    )
+    .unwrap();
+    let session = Arc::new(CollectingSession::default());
+    let context = FragmentPrepareContext {
+        result_writer: Arc::new(CollectingWriter {
+            session: Arc::clone(&session),
+        }),
+        ..FragmentPrepareContext::default()
+    };
+    let mut host = RecordingProjectSchemaHost {
+        program: &program,
+        sites: Vec::new(),
+        body_calls: 0,
+        refusal: None,
+    };
+    let handle =
+        prepare_compiled_fragment_with_metadata_host(submission, context, &mut host).unwrap();
+    let expected: Vec<_> = program
+        .graph()
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            matches!(
+                node.kind(),
+                novarocks_local_program::ProgramNodeKind::Project { .. }
+            )
+        })
+        .map(|(index, _)| {
+            ProjectSchemaSite::Project(novarocks_local_program::ProgramNodeId::new(index))
+        })
+        .collect();
+    assert_eq!(host.sites.len(), expected.len());
+    for site in expected {
+        assert_eq!(
+            host.sites.iter().filter(|&&actual| actual == site).count(),
+            1
+        );
+    }
+    assert_eq!(host.body_calls, host.sites.len());
+    assert!(session.chunks.lock().unwrap().is_empty());
+    // A caller-local host can be destroyed before any driver is scheduled.
+    drop(host);
+    assert!(matches!(
+        handle.start().join().outcome(),
+        FragmentOutcome::Succeeded
+    ));
+    let chunks = session.chunks.lock().unwrap();
+    assert_eq!(chunks.iter().map(Chunk::len).sum::<usize>(), 1);
+    let batch = &chunks.iter().find(|chunk| chunk.len() == 1).unwrap().batch;
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+            .to_bits(),
+        SEED_42_FIRST
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        42
+    );
+}
+
+#[test]
+fn project_metadata_refusal_keeps_nominal_cause_through_the_original_prepare_chain() {
+    use crate::runtime::{
+        preparation_memory::{PreparationMemoryRefusal, PreparationMemoryStop},
+        preparation_metadata::PreparationMetadataFailure,
+    };
+    use novarocks_execution_contract::task_execution::status::AbortCause;
+    let causes = [
+        PreparationMetadataFailure::Host(PreparationMemoryRefusal::Stopped(
+            PreparationMemoryStop::Abort(AbortCause::LeaseExpired),
+        )),
+        PreparationMetadataFailure::Host(PreparationMemoryRefusal::Capacity(
+            novarocks_memory::CapacityError::Invalid {
+                detail: "original host capacity refusal",
+            },
+        )),
+        PreparationMetadataFailure::Request(
+            novarocks_type_contract::MetadataRequestError::SourceModel("original source refusal"),
+        ),
+    ];
+    for cause in causes {
+        for at in [1, 2] {
+            let program = program(SeedMode::Input, false);
+            let submission = CompiledFragmentSubmission::try_new(
+                Arc::clone(&program),
+                CompiledScanSources::new(),
+                instance(
+                    UniqueId::new(233, 234),
+                    1,
+                    ExchangeInputAssignments::default(),
+                ),
+            )
+            .unwrap();
+            let session = Arc::new(CollectingSession::default());
+            let context = FragmentPrepareContext {
+                result_writer: Arc::new(CollectingWriter {
+                    session: Arc::clone(&session),
+                }),
+                ..FragmentPrepareContext::default()
+            };
+            let mut host = RecordingProjectSchemaHost {
+                program: &program,
+                sites: Vec::new(),
+                body_calls: 0,
+                refusal: Some((at, cause.clone())),
+            };
+            let error = refused(prepare_compiled_fragment_with_metadata_host(
+                submission, context, &mut host,
+            ));
+            assert_eq!(error.stage(), FragmentLaunchStage::BuildPipelines);
+            assert_eq!(error.kind(), FragmentLaunchErrorKind::PipelineBuild);
+            assert_eq!(
+                error.cause().cause(),
+                &ExecutionFailureCause::PreparationMetadata(cause.clone())
+            );
+            assert_eq!(host.sites.len(), at);
+            assert_eq!(host.body_calls, at - 1);
+            assert!(session.chunks.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn project_metadata_borrow_reaches_the_actual_final_result_boundary() {
+    use crate::runtime::preparation_metadata::{PreparationMetadataFailure, ProjectSchemaSite};
+    for project in [None, Some(false), Some(true)] {
+        for refuse_final in [false, true] {
+            let program = crate::exec::pipeline::builder::compiled_root_result_fixture(project);
+            let submission = CompiledFragmentSubmission::try_new(
+                Arc::clone(&program),
+                CompiledScanSources::new(),
+                instance(
+                    UniqueId::new(235, 236),
+                    1,
+                    ExchangeInputAssignments::default(),
+                ),
+            )
+            .unwrap();
+            let context = super::super::compiled_root_result_context_fixture();
+            let cause = PreparationMetadataFailure::Request(
+                novarocks_type_contract::MetadataRequestError::Arithmetic,
+            );
+            let expected = 1 + usize::from(project.is_some());
+            let mut host = RecordingProjectSchemaHost {
+                program: &program,
+                sites: Vec::new(),
+                body_calls: 0,
+                refusal: refuse_final.then(|| (expected, cause.clone())),
+            };
+            let result =
+                prepare_compiled_fragment_with_metadata_host(submission, context, &mut host);
+            assert_eq!(host.sites.len(), expected);
+            assert_eq!(host.sites.last(), Some(&ProjectSchemaSite::FinalResult));
+            assert_eq!(host.body_calls, expected - usize::from(refuse_final));
+            if refuse_final {
+                assert_eq!(
+                    refused(result).cause().cause(),
+                    &ExecutionFailureCause::PreparationMetadata(cause)
+                );
+            } else {
+                // Original RootResult production is already covered by its own
+                // oracle; this probe ends before scheduling its producer.
+                let dormant = result.unwrap();
+                drop(host);
+                drop(dormant);
+            }
+        }
+    }
 }

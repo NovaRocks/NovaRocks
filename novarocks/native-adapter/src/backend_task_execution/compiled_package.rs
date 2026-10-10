@@ -32,8 +32,8 @@ use std::time::Duration;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
 use novarocks_local_compiler::{
-    FragmentCompileError, LocalCompileOptions, ProviderPreparationError, compile_fragment,
-    validate_fragment_providers,
+    FragmentCompileError, LocalCompileOptions, ProviderPreparationError,
+    compile_fragment_with_project_metadata_host, validate_fragment_providers,
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_plan_codec::physical_package_v2::{
@@ -43,9 +43,12 @@ use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorStopView;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 
+use super::project_materialization::ProjectMetadataHost;
 use super::type_materialization::{TypeMaterializationHost, TypeMaterializationRefusal};
 use crate::compiled_runtime_filter::CompiledRuntimeFilterEndpoints;
+use novarocks_execution::runtime::preparation_memory::PreparationMemoryRefusal;
 use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
+use novarocks_type_contract::MetadataRequestError;
 
 /// The task facts a compiled program is specialized for.
 #[derive(Clone, Copy, Debug)]
@@ -64,6 +67,8 @@ pub enum CompiledPackageError {
     /// compiler refuses one of its shapes.
     Refused(String),
     TypeMaterialization(TypeMaterializationRefusal),
+    ProjectMetadata(PreparationMemoryRefusal),
+    ProjectMetadataRequest(MetadataRequestError),
 }
 
 impl fmt::Display for CompiledPackageError {
@@ -72,6 +77,8 @@ impl fmt::Display for CompiledPackageError {
             Self::Control(cause) => cause.fmt(f),
             Self::Refused(detail) => f.write_str(detail),
             Self::TypeMaterialization(cause) => cause.fmt(f),
+            Self::ProjectMetadata(cause) => cause.fmt(f),
+            Self::ProjectMetadataRequest(cause) => cause.fmt(f),
         }
     }
 }
@@ -86,8 +93,85 @@ impl Error for CompiledPackageError {}
 /// package's cuts, so it is projected here, before the package is consumed.
 #[derive(Debug)]
 pub struct CompiledTaskProgram {
-    pub program: LocalProgram,
+    output: CompiledProgramOutput,
     pub runtime_filters: CompiledRuntimeFilterEndpoints,
+}
+
+#[derive(Debug)]
+enum CompiledProgramOutput {
+    Native(ValidatedNativeProgram),
+    Direct(LocalProgram),
+}
+#[derive(Debug)]
+struct ValidatedNativeProgram {
+    program: LocalProgram,
+}
+impl CompiledTaskProgram {
+    /// Independently authored programs retain their original Direct preparation.
+    pub fn direct(program: LocalProgram, runtime_filters: CompiledRuntimeFilterEndpoints) -> Self {
+        Self {
+            output: CompiledProgramOutput::Direct(program),
+            runtime_filters,
+        }
+    }
+    pub fn program(&self) -> &LocalProgram {
+        match &self.output {
+            CompiledProgramOutput::Native(source) => &source.program,
+            CompiledProgramOutput::Direct(program) => program,
+        }
+    }
+    fn native(program: LocalProgram, runtime_filters: CompiledRuntimeFilterEndpoints) -> Self {
+        Self {
+            output: CompiledProgramOutput::Native(ValidatedNativeProgram { program }),
+            runtime_filters,
+        }
+    }
+    /// Consume the sealed output at the original Arc allocation handoff.
+    /// No owned program or detachable provenance can be recombined by callers.
+    pub(crate) fn into_preparation(self) -> PreparedCompiledProgram {
+        match self.output {
+            CompiledProgramOutput::Native(source) => PreparedCompiledProgram {
+                program: Arc::new(source.program),
+                source: PreparedCompiledSource::Native,
+                _runtime_filters: self.runtime_filters,
+            },
+            CompiledProgramOutput::Direct(program) => PreparedCompiledProgram {
+                program: Arc::new(program),
+                source: PreparedCompiledSource::Direct,
+                _runtime_filters: self.runtime_filters,
+            },
+        }
+    }
+}
+enum PreparedCompiledSource {
+    Native,
+    Direct,
+}
+pub(crate) struct PreparedCompiledProgram {
+    program: Arc<LocalProgram>,
+    source: PreparedCompiledSource,
+    _runtime_filters: CompiledRuntimeFilterEndpoints,
+}
+impl PreparedCompiledProgram {
+    pub(crate) fn program(&self) -> &Arc<LocalProgram> {
+        &self.program
+    }
+    pub(crate) fn native_metadata_loan(&self) -> Option<NativeCompiledMetadataLoan<'_>> {
+        match self.source {
+            PreparedCompiledSource::Native => Some(NativeCompiledMetadataLoan {
+                program: &self.program,
+            }),
+            PreparedCompiledSource::Direct => None,
+        }
+    }
+}
+pub(crate) struct NativeCompiledMetadataLoan<'a> {
+    program: &'a Arc<LocalProgram>,
+}
+impl NativeCompiledMetadataLoan<'_> {
+    pub(crate) fn program(&self) -> &Arc<LocalProgram> {
+        self.program
+    }
 }
 
 /// Turns one task's package bytes into its LocalProgram.
@@ -98,6 +182,7 @@ pub trait CompiledPackageCompiler: Send + Sync + 'static {
         options: CompiledTaskOptions,
         control: &dyn PureCompileControl,
         type_host: &mut TypeMaterializationHost<'_>,
+        project_host: &mut ProjectMetadataHost<'_>,
     ) -> Result<CompiledTaskProgram, CompiledPackageError>;
 }
 
@@ -139,6 +224,7 @@ where
         options: CompiledTaskOptions,
         control: &dyn PureCompileControl,
         type_host: &mut TypeMaterializationHost<'_>,
+        project_host: &mut ProjectMetadataHost<'_>,
     ) -> Result<CompiledTaskProgram, CompiledPackageError> {
         let package = decode_fragment_package_with_type_host(
             package,
@@ -176,7 +262,7 @@ where
                     CompiledPackageError::Refused(format!("package providers refuse it: {other}"))
                 }
             })?;
-        let program = compile_fragment(
+        let program = compile_fragment_with_project_metadata_host(
             validated,
             &self.functions,
             LocalCompileOptions {
@@ -187,15 +273,26 @@ where
                 exchange_wait: options.exchange_wait,
             },
             control,
+            project_host,
         )
         .map_err(|error| match error {
             FragmentCompileError::Control(cause) => CompiledPackageError::Control(cause),
+            FragmentCompileError::ProjectMetadataRequest(cause) => {
+                CompiledPackageError::ProjectMetadataRequest(cause)
+            }
+            FragmentCompileError::ProjectMetadataHost { error } => {
+                match error.downcast::<PreparationMemoryRefusal>() {
+                    Ok(cause) => CompiledPackageError::ProjectMetadata(*cause),
+                    Err(_) => CompiledPackageError::ProjectMetadataRequest(
+                        MetadataRequestError::SourceModel(
+                            "Project metadata host returned an unknown refusal type",
+                        ),
+                    ),
+                }
+            }
             other => CompiledPackageError::Refused(format!("package does not compile: {other}")),
         })?;
-        Ok(CompiledTaskProgram {
-            program,
-            runtime_filters,
-        })
+        Ok(CompiledTaskProgram::native(program, runtime_filters))
     }
 }
 
@@ -224,3 +321,7 @@ impl PureCompileControl for TaskPreparationControl<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "compiled_metadata_host_tests.rs"]
+mod metadata_host_tests;

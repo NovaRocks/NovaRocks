@@ -35,6 +35,17 @@ pub struct FreshTableFacts {
     pub allocation_requests_upper_bound: usize,
     pub request_bytes_upper_bound: usize,
 }
+
+/// Cumulative requests of an originally empty insertion-only table. Calls,
+/// rather than distinct keys, bound growth even when a duplicate is searched
+/// after a reserve. This describes new library requests, never a retained map.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FreshInsertionFacts {
+    pub insertion_calls: usize,
+    pub final_bucket_upper_bound: usize,
+    pub allocation_requests_upper_bound: usize,
+    pub request_bytes_upper_bound: usize,
+}
 fn add(a: usize, b: usize) -> Result<usize, HashMapResourceError> {
     a.checked_add(b)
         .ok_or(Arithmetic("HashMap resource sum overflow"))
@@ -168,6 +179,68 @@ pub fn fresh_table_layout<K, V>(
         allocation_requests_upper_bound: 1,
         request_bytes_upper_bound: size,
     })
+}
+
+/// The original `HashMap::new` followed by at most `insertion_calls` insert or
+/// entry operations, without removals, reserve, mutable escape or rebuilding.
+/// Values and keys remain separately caller-authored; RandomState/OS seeding
+/// is not an allocator/CPU promise from this numerical table projection.
+///
+/// Rust 1.98.1 hashbrown 0.17.1 reserve_rehash_inner grows to
+/// capacity_to_buckets(max(items + 1, full_capacity + 1)). With no deletions,
+/// allocated bucket counts increase through a power-of-two subsequence from
+/// the first table through capacity_to_buckets(insertion_calls). Enumerating
+/// every such extent dominates duplicates and early exits, including old/new
+/// coexistence during resize. Each extent uses the SAME table-layout author
+/// as the one-reserve port above; that port's single-reserve contract is not
+/// reinterpreted as a cumulative request bound.
+pub fn original_fresh_insertion_allocation_requests_observed<
+    K,
+    V,
+    E: From<HashMapResourceError>,
+>(
+    insertion_calls: usize,
+    allocation: &mut impl FnMut(Layout) -> Result<(), E>,
+) -> Result<FreshInsertionFacts, E> {
+    let last = fresh_table_layout::<K, V>(insertion_calls).map_err(E::from)?;
+    let mut result = FreshInsertionFacts {
+        insertion_calls,
+        final_bucket_upper_bound: last.buckets,
+        allocation_requests_upper_bound: 0,
+        request_bytes_upper_bound: 0,
+    };
+    if insertion_calls == 0 {
+        return Ok(result);
+    }
+    let mut table = fresh_table_layout::<K, V>(1).map_err(E::from)?;
+    loop {
+        let layout = table
+            .layout
+            .ok_or_else(|| E::from(SourceModel("fresh HashMap insertion table has no layout")))?;
+        result.allocation_requests_upper_bound =
+            add(result.allocation_requests_upper_bound, 1).map_err(E::from)?;
+        result.request_bytes_upper_bound =
+            add(result.request_bytes_upper_bound, layout.size()).map_err(E::from)?;
+        allocation(layout)?;
+        if table.buckets == last.buckets {
+            return Ok(result);
+        }
+        // The original bucket_mask_to_capacity is b-1 below eight buckets,
+        // then 7/8 of b. Requesting one beyond it selects the next table.
+        let full_capacity = if table.buckets < 8 {
+            table.buckets - 1
+        } else {
+            mul(table.buckets / 8, 7).map_err(E::from)?
+        };
+        let next =
+            fresh_table_layout::<K, V>(add(full_capacity, 1).map_err(E::from)?).map_err(E::from)?;
+        if next.buckets <= table.buckets || next.buckets > last.buckets {
+            return Err(E::from(SourceModel(
+                "fresh HashMap insertion growth source model drift",
+            )));
+        }
+        table = next;
+    }
 }
 
 /// Only std String/&str keys and std RandomState/SipHasher13, not arbitrary

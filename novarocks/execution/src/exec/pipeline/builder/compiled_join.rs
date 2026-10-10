@@ -100,7 +100,7 @@ fn compiled_join_producers(
     .map(|factory| Some(Arc::new(factory)))
 }
 
-pub(super) fn build_hash_join(
+pub(super) fn build_hash_join<H: CompiledSchemaMetadataScope>(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     node_id: i32,
@@ -108,7 +108,8 @@ pub(super) fn build_hash_join(
     build: ProgramNodeId,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    metadata: &mut CompiledMetadataMode<'_, H>,
+) -> ExecutionResult<PipelineBuildResult> {
     // A refused node, or a refused runtime-filter producer, builds no driver.
     let plan = Arc::new(CompiledHashJoinPlan::try_new(program, id)?);
     let producers = compiled_join_producers(program, id, &plan, ctx)?;
@@ -129,15 +130,15 @@ pub(super) fn build_hash_join(
     let consumers = super::compiled_runtime_filter_consumers(
         "Join", "join", program, id, &bindings, ctx, error,
     )?;
-    let probe_build = build_node(program, probe, ctx, error)?;
-    let build_build = build_node(program, build, ctx, error)?;
+    let probe_build = build_node(program, probe, ctx, error, metadata)?;
+    let build_build = build_node(program, build, ctx, error, metadata)?;
     let mut build_build = gather_to_one(build_build, ctx, node_id);
     if producers.is_some() && build_build.pipeline.dop != COMPILED_JOIN_BUILD_PARTITIONS {
         return Err(format!(
             "compiled hash join at local node {} builds on {} drivers, not on the one partition its runtime-filter producers declare",
             id.index(),
             build_build.pipeline.dop
-        ));
+        ).into());
     }
     let probe_dop = probe_build.pipeline.dop.max(1) as usize;
     let state = Arc::new(BroadcastJoinSharedState::new(
@@ -173,7 +174,7 @@ pub(super) fn build_hash_join(
     Ok(finish(probe_build, build_build))
 }
 
-pub(super) fn build_nested_loop_join(
+pub(super) fn build_nested_loop_join<H: CompiledSchemaMetadataScope>(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     node_id: i32,
@@ -181,10 +182,11 @@ pub(super) fn build_nested_loop_join(
     build: ProgramNodeId,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    metadata: &mut CompiledMetadataMode<'_, H>,
+) -> ExecutionResult<PipelineBuildResult> {
     let plan = Arc::new(CompiledNlJoinPlan::try_new(program, id)?);
-    let mut probe_build = build_node(program, probe, ctx, error)?;
-    let build_build = build_node(program, build, ctx, error)?;
+    let mut probe_build = build_node(program, probe, ctx, error, metadata)?;
+    let build_build = build_node(program, build, ctx, error, metadata)?;
     let mut build_build = gather_to_one(build_build, ctx, node_id);
     let state = Arc::new(NlJoinSharedState::new(
         node_id,

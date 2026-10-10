@@ -59,6 +59,10 @@ use crate::exec::operators::compiled_table_function::CompiledTableFunctionProces
 use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
 use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
 use crate::exec::operators::runtime_filter::CompiledRuntimeFilterConsumers;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::preparation_metadata::{
+    CompiledMetadataMode, CompiledSchemaMetadataScope, DirectCompiledSchemaMetadataScope,
+};
 use crate::runtime::runtime_state::RuntimeErrorState;
 use novarocks_local_program::{
     AssertRowsMode, BindingRequirement, FilterConsumerActivation, FilterConsumerAtExpr,
@@ -343,13 +347,78 @@ pub(crate) fn build_compiled_pipeline_graph(
     function_set: Arc<SealedExecutionFunctionSet>,
     error: Arc<RuntimeErrorState>,
 ) -> Result<PipelineGraph, String> {
+    build_compiled_pipeline_graph_in(
+        program,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        runtime_filter_session,
+        dep_manager,
+        pipeline_dop,
+        root_sink_dop,
+        function_set,
+        error,
+        &mut CompiledMetadataMode::<DirectCompiledSchemaMetadataScope>::Direct,
+    )
+    .map_err(ExecutionFailure::into_pipeline_message)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compiled program and its Task capabilities are independent inputs"
+)]
+pub(crate) fn build_compiled_pipeline_graph_with_metadata_host<H: CompiledSchemaMetadataScope>(
+    program: &Arc<LocalProgram>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
+    dep_manager: DependencyManager,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    function_set: Arc<SealedExecutionFunctionSet>,
+    error: Arc<RuntimeErrorState>,
+    host: &mut H,
+) -> ExecutionResult<PipelineGraph> {
+    build_compiled_pipeline_graph_in(
+        program,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        runtime_filter_session,
+        dep_manager,
+        pipeline_dop,
+        root_sink_dop,
+        function_set,
+        error,
+        &mut CompiledMetadataMode::Hosted(host),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compiled program and its Task capabilities are independent inputs"
+)]
+pub(crate) fn build_compiled_pipeline_graph_in<H: CompiledSchemaMetadataScope>(
+    program: &Arc<LocalProgram>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
+    dep_manager: DependencyManager,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    function_set: Arc<SealedExecutionFunctionSet>,
+    error: Arc<RuntimeErrorState>,
+    metadata: &mut CompiledMetadataMode<'_, H>,
+) -> ExecutionResult<PipelineGraph> {
     let graph = program.graph();
     if graph
         .nodes()
         .iter()
         .any(|node| node.legacy_native_node_id().is_some())
     {
-        return Err("legacy-lowered nodes cannot enter the compiled pipeline".to_string());
+        return Err("legacy-lowered nodes cannot enter the compiled pipeline".into());
     }
     validate_compiled_exchange_bindings(program, &exchange_bindings)?;
     validate_compiled_scan_bindings(program, &scan_bindings)?;
@@ -372,7 +441,7 @@ pub(crate) fn build_compiled_pipeline_graph(
         local_exchange_max_buffered_rows: 0,
         precomputed_keyed_assert_keys: std::collections::HashMap::new(),
     };
-    let mut build = build_node(program, graph.root(), &mut ctx, &error)?;
+    let mut build = build_node(program, graph.root(), &mut ctx, &error, metadata)?;
     // Statistics owns its specific original bounded materializer. Other root
     // purposes validate the actual computing root output at one final boundary.
     if let Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) = graph.sink()
@@ -381,10 +450,21 @@ pub(crate) fn build_compiled_pipeline_graph(
                 novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
             )
     {
-        let factory = CompiledProjectProcessorFactory::try_new_final_result_boundary(
-            Arc::clone(program),
-            Arc::clone(&error),
-        )?;
+        let factory = match metadata {
+            CompiledMetadataMode::Direct => {
+                CompiledProjectProcessorFactory::try_new_final_result_boundary(
+                    Arc::clone(program),
+                    Arc::clone(&error),
+                )?
+            }
+            CompiledMetadataMode::Hosted(host) => {
+                CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
+                    Arc::clone(program),
+                    Arc::clone(&error),
+                    *host,
+                )?
+            }
+        };
         build.pipeline.factories.push(Box::new(factory));
     }
     match root_sink_dop {
@@ -392,9 +472,7 @@ pub(crate) fn build_compiled_pipeline_graph(
         // The frozen profile places the root sink on one driver.
         Some(1) => build = gather_to_one(build, &mut ctx, ROOT_SINK_LOCAL_EXCHANGE_NODE_ID),
         Some(other) => {
-            return Err(format!(
-                "compiled root sink width {other} is not executable yet"
-            ));
+            return Err(format!("compiled root sink width {other} is not executable yet").into());
         }
     }
     build.pipeline.needs_sink = true;
@@ -404,12 +482,13 @@ pub(crate) fn build_compiled_pipeline_graph(
     Ok(PipelineGraph { pipelines, root_id })
 }
 
-fn build_node(
+fn build_node<H: CompiledSchemaMetadataScope>(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    metadata: &mut CompiledMetadataMode<'_, H>,
+) -> ExecutionResult<PipelineBuildResult> {
     let node = program
         .graph()
         .nodes()
@@ -440,7 +519,7 @@ fn build_node(
             })
         }
         ProgramNodeKind::GenerateSeries { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, metadata)?;
             build.pipeline.factories.push(Box::new(
                 CompiledGenerateSeriesProcessorFactory::try_new(
                     Arc::clone(program),
@@ -451,19 +530,16 @@ fn build_node(
             Ok(build)
         }
         ProgramNodeKind::Project { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error)?;
-            build
-                .pipeline
-                .factories
-                .push(Box::new(CompiledProjectProcessorFactory::try_new(
-                    Arc::clone(program),
-                    id,
-                    Arc::clone(error),
-                )?));
+            let mut build = build_node(program, *input, ctx, error, metadata)?;
+            let factory = match metadata {
+                CompiledMetadataMode::Direct => CompiledProjectProcessorFactory::try_new(Arc::clone(program), id, Arc::clone(error))?,
+                CompiledMetadataMode::Hosted(host) => CompiledProjectProcessorFactory::try_new_with_metadata_host(Arc::clone(program), id, Arc::clone(error), *host)?,
+            };
+            build.pipeline.factories.push(Box::new(factory));
             Ok(build)
         }
         ProgramNodeKind::Filter { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, metadata)?;
             build
                 .pipeline
                 .factories
@@ -487,7 +563,7 @@ fn build_node(
                 return Err(format!(
                     "scan at local node {} carries no compiled provider read",
                     id.index()
-                ));
+                ).into());
             }
             // Consumers are built first, so a refused binding builds no driver.
             let runtime_filters = compiled_runtime_filter_consumers(
@@ -503,7 +579,7 @@ fn build_node(
                 return Err(format!(
                     "compiled scan at local node {} with a scan limit is not executable yet",
                     id.index()
-                ));
+                ).into());
             }
             let scan_node = scan_node_id(program, id)?;
             let op = ctx.scan_bindings.get(scan_node).ok_or_else(|| {
@@ -558,13 +634,13 @@ fn build_node(
                 return Err(format!(
                     "compiled exchange source at local node {} with runtime-filter consumers is not executable yet",
                     id.index()
-                ));
+                ).into());
             }
             if !hash_partition_exprs.is_empty() {
                 return Err(format!(
                     "compiled exchange source at local node {} with hash-key expressions is not executable yet",
                     id.index()
-                ));
+                ).into());
             }
             let receiver = receiver_node_id(program, id)?;
             let binding = ctx.exchange_bindings.get(receiver).ok_or_else(|| {
@@ -590,7 +666,7 @@ fn build_node(
             limit,
             offset,
         } => {
-            let build = build_node(program, *input, ctx, error)?;
+            let build = build_node(program, *input, ctx, error, metadata)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build
                 .pipeline
@@ -616,14 +692,14 @@ fn build_node(
             // re-pruning them locally would evaluate a key twice.
             let factory =
                 CompiledSortProcessorFactory::try_new(Arc::clone(program), id, Arc::clone(error))?;
-            let build = build_node(program, *input, ctx, error)?;
+            let build = build_node(program, *input, ctx, error, metadata)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
             Ok(build)
         }
         ProgramNodeKind::UnionAll { inputs } => {
-            build_union_all(program, id, node_id, inputs, ctx, error)
+            build_union_all(program, id, node_id, inputs, ctx, error, metadata)
         }
         ProgramNodeKind::Aggregate { input, .. } => {
             // Preserve the original driver-local Partial -> exchange -> Final
@@ -635,7 +711,7 @@ fn build_node(
                 Arc::clone(error),
             )?;
             let complete = factory.completes_groups();
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, metadata)?;
             if factory.requires_local_update_stages() && build.pipeline.dop > 1 {
                 let partition_slots = factory.local_group_partition_slots();
                 let (partial, final_stage) = factory.into_local_update_stages()?;
@@ -671,7 +747,7 @@ fn build_node(
                 id,
                 Arc::clone(error),
             )?;
-            let build = build_node(program, *input, ctx, error)?;
+            let build = build_node(program, *input, ctx, error, metadata)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
@@ -683,7 +759,7 @@ fn build_node(
             // at most one row per key, so the assertion runs on one driver.
             // The keyed mode keeps the existing owner's key identity: a NULL
             // key equals a NULL key, and values compare by type and display.
-            let build = build_node(program, *input, ctx, error)?;
+            let build = build_node(program, *input, ctx, error, metadata)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
@@ -691,7 +767,7 @@ fn build_node(
         }
         ProgramNodeKind::Repeat { input, .. } => {
             let factory = CompiledRepeatProcessorFactory::try_new(program, id)?;
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, metadata)?;
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
@@ -705,7 +781,7 @@ fn build_node(
             max_output_rows,
             max_output_bytes,
         } => {
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, metadata)?;
             let statistics_root = id == program.graph().root()
                 && matches!(program.graph().sink(),
                 Some(novarocks_local_program::StaticSinkProgram::RootResult(contract))
@@ -784,7 +860,7 @@ fn build_node(
                 id,
                 Arc::clone(error),
             )?;
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, metadata)?;
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
@@ -798,31 +874,31 @@ fn build_node(
                 id,
                 Arc::clone(error),
             )?;
-            let mut build = build_node(program, *input, ctx, error)?;
+            let mut build = build_node(program, *input, ctx, error, metadata)?;
             build.pipeline.factories.push(Box::new(factory));
             Ok(build)
         }
         ProgramNodeKind::TableWriter { input, .. } => {
-            writer_pipelines::build_table_writer(program, id, node_id, *input, ctx, error)
+            writer_pipelines::build_table_writer(program, id, node_id, *input, ctx, error, metadata)
         }
         ProgramNodeKind::TableFinish { inputs, .. } => {
-            writer_pipelines::build_table_finish(program, id, node_id, inputs, ctx, error)
+            writer_pipelines::build_table_finish(program, id, node_id, inputs, ctx, error, metadata)
         }
         // The probe is the left input and the build the right input.
         ProgramNodeKind::Join { left, right, .. } => {
-            join_pipelines::build_hash_join(program, id, node_id, *left, *right, ctx, error)
+            join_pipelines::build_hash_join(program, id, node_id, *left, *right, ctx, error, metadata)
         }
         ProgramNodeKind::NestedLoopJoin { left, right, .. } => {
-            join_pipelines::build_nested_loop_join(program, id, node_id, *left, *right, ctx, error)
+            join_pipelines::build_nested_loop_join(program, id, node_id, *left, *right, ctx, error, metadata)
         }
         ProgramNodeKind::RuntimeFilterConsumer { .. } => Err(format!(
             "compiled join probe-key runtime-filter consumer at local node {} is not executable yet",
             id.index()
-        )),
+        ).into()),
         _ => Err(format!(
             "compiled node family at local node {} has no compiled processor yet",
             id.index()
-        )),
+        ).into()),
     }
 }
 
@@ -831,19 +907,20 @@ fn build_node(
 /// output layout, so each branch owns the union's channels in their frozen
 /// order and its chunks pass through unchanged. The branches fan in through
 /// the shared UnionAll queue, which carries no expression and no ordering.
-fn build_union_all(
+fn build_union_all<H: CompiledSchemaMetadataScope>(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     node_id: i32,
     inputs: &[ProgramNodeId],
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    metadata: &mut CompiledMetadataMode<'_, H>,
+) -> ExecutionResult<PipelineBuildResult> {
     validate_union_branches(program, id, inputs)?;
     let mut builds = Vec::with_capacity(inputs.len());
     let mut producers = 0usize;
     for input in inputs {
-        let child = build_node(program, *input, ctx, error)?;
+        let child = build_node(program, *input, ctx, error, metadata)?;
         producers =
             producers.saturating_add(usize::try_from(child.pipeline.dop.max(1)).unwrap_or(1));
         builds.push(child);
@@ -993,7 +1070,7 @@ mod topn_split_tests;
 
 #[cfg(test)]
 #[path = "compiled_values_tests.rs"]
-mod values_tests;
+pub(crate) mod values_tests;
 
 #[cfg(test)]
 #[path = "compiled_generate_series_tests.rs"]

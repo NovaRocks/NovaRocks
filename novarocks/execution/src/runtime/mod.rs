@@ -13,6 +13,8 @@ pub mod kernel_memory;
 pub mod mem_tracker;
 pub mod observable;
 pub mod operator_statistics;
+pub mod preparation_memory;
+pub mod preparation_metadata;
 pub mod profile;
 pub mod query_memory;
 pub mod query_options;

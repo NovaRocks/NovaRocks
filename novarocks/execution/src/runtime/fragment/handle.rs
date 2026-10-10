@@ -208,7 +208,7 @@ mod owner_tests {
             panic!("a frozen bounded root must not open the legacy result buffer");
         }
     }
-    struct BoundedRootSession {
+    pub(super) struct BoundedRootSession {
         spec: crate::runtime::fragment::io::RootResultWriteSpec,
         authority: crate::runtime::fragment::io::RootInputAuthority,
         input: Mutex<Option<(Chunk, crate::runtime::fragment::io::RootInputPermit)>>,
@@ -217,7 +217,7 @@ mod owner_tests {
         aborts: Mutex<Vec<ResultAbort>>,
     }
     impl BoundedRootSession {
-        fn new() -> Arc<Self> {
+        pub(super) fn new() -> Arc<Self> {
             use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, StageId, TaskId};
             let task = novarocks_execution_contract::TaskIdentity::new(
                 QueryExecutionId::new(QueryId::new(390, 391), AttemptId::new(1).unwrap()).unwrap(),
@@ -247,7 +247,7 @@ mod owner_tests {
             self.exited.store(true, Ordering::Release);
             self.authority.observable().notify_observers();
         }
-        fn context(self: &Arc<Self>) -> FragmentPrepareContext {
+        pub(super) fn context(self: &Arc<Self>) -> FragmentPrepareContext {
             FragmentPrepareContext {
                 result_writer: Arc::new(RejectLegacyRootWriter),
                 ..Default::default()
@@ -1398,7 +1398,7 @@ impl Drop for RunningFragmentInner {
 mod compiled_prepare;
 pub use compiled_prepare::{
     CompiledFragmentSubmission, CompiledWriterBindings, compiled_sink_kind,
-    prepare_compiled_fragment,
+    prepare_compiled_fragment, prepare_compiled_fragment_with_metadata_host,
 };
 
 pub fn prepare_fragment(
@@ -1576,4 +1576,11 @@ mod typed_failure_tests {
             FragmentOutcome::Succeeded
         );
     }
+}
+
+#[cfg(test)]
+fn compiled_root_result_context_fixture() -> FragmentPrepareContext {
+    let mut context = owner_tests::BoundedRootSession::new().context();
+    context.root_sink_dop = Some(1);
+    context
 }

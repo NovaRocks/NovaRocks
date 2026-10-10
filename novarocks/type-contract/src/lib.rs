@@ -121,3 +121,5 @@ pub use to_base64_source::{
 
 pub mod result_render_type;
 pub mod result_scalar_type;
+
+pub use owned_resources::metadata_request::{CompleteMetadataRequestFacts, MetadataRequestError};

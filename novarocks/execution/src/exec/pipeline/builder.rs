@@ -32,7 +32,9 @@ use std::sync::Arc;
 
 mod compiled;
 mod local;
-pub(crate) use compiled::build_compiled_pipeline_graph;
+pub(crate) use compiled::{
+    build_compiled_pipeline_graph, build_compiled_pipeline_graph_with_metadata_host,
+};
 pub(crate) use local::build_native_pipeline_graph_for_local_program_with_runtime_settings;
 
 use crate::runtime_filter as execution;
@@ -3474,4 +3476,11 @@ mod tests {
 
         assert_eq!(local_exchange_source_count(&graph), 0);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn compiled_root_result_fixture(
+    project: Option<bool>,
+) -> Arc<novarocks_local_program::LocalProgram> {
+    compiled::values_tests::root_result_boundary_tests::boundary_program(project)
 }

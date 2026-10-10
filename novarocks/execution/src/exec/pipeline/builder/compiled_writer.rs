@@ -29,14 +29,15 @@ use crate::exec::operators::compiled_writer::{
     compiled_table_finish_factory, compiled_table_writer_factory,
 };
 
-pub(super) fn build_table_writer(
+pub(super) fn build_table_writer<H: CompiledSchemaMetadataScope>(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     node_id: i32,
     input: ProgramNodeId,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    metadata: &mut CompiledMetadataMode<'_, H>,
+) -> ExecutionResult<PipelineBuildResult> {
     // The factory copies the Task capability it needs, so a refused binding
     // builds no driver.
     let binding = ctx.compiled_writers.writer(id).ok_or_else(|| {
@@ -46,7 +47,7 @@ pub(super) fn build_table_writer(
         )
     })?;
     let factory = compiled_table_writer_factory(program, id, node_id, binding, error)?;
-    let mut build = build_node(program, input, ctx, error)?;
+    let mut build = build_node(program, input, ctx, error, metadata)?;
     if matches!(
         program.graph().nodes()[input.index()].kind(),
         ProgramNodeKind::ExchangeSource { .. }
@@ -73,14 +74,15 @@ pub(super) fn build_table_writer(
     Ok(build)
 }
 
-pub(super) fn build_table_finish(
+pub(super) fn build_table_finish<H: CompiledSchemaMetadataScope>(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     node_id: i32,
     inputs: &[ProgramNodeId],
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    metadata: &mut CompiledMetadataMode<'_, H>,
+) -> ExecutionResult<PipelineBuildResult> {
     let binding = ctx.compiled_writers.finisher(id).ok_or_else(|| {
         format!(
             "missing Task finish binding for compiled table finish at local node {}",
@@ -92,9 +94,10 @@ pub(super) fn build_table_finish(
         return Err(format!(
             "compiled table finish at local node {} reads more than one writer input",
             id.index()
-        ));
+        )
+        .into());
     };
-    let build = build_node(program, *input, ctx, error)?;
+    let build = build_node(program, *input, ctx, error, metadata)?;
     let mut build = gather_to_one(build, ctx, node_id);
     build.pipeline.factories.push(Box::new(factory));
     build.stream = StreamDesc::single();

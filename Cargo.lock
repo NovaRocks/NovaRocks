@@ -4416,6 +4416,7 @@ dependencies = [
  "novarocks-version",
  "novarocks-worker",
  "novarocks-workload-control",
+ "prost 0.13.5",
  "serde",
  "serde_json",
  "tempfile",

@@ -122,3 +122,6 @@ pub use table_function_processor::TableFunctionProcessorFactory;
 pub use table_writer::TableWriterOperatorFactory;
 pub use unpivot_processor::UnpivotProcessorFactory;
 pub use values_source::ValuesSourceFactory;
+
+#[cfg(feature = "test-support")]
+pub use compiled_expression::{CompiledProjectProcessorFactory, prepare_project_factory_for_test};

@@ -11,6 +11,7 @@ workspace = true
 doctest = false
 
 [features]
+test-support = []
 core-pipeline-integration = []
 
 [dependencies]

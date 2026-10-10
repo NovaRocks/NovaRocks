@@ -556,4 +556,4 @@ fn values_cell_root_is_evaluated_only_over_its_empty_one_row_port() {
 }
 
 #[path = "compiled_root_result_boundary_tests.rs"]
-mod root_result_boundary_tests;
+pub(crate) mod root_result_boundary_tests;
