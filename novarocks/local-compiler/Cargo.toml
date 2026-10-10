@@ -17,7 +17,7 @@ novarocks-local-program.workspace = true
 novarocks-functions.workspace = true
 novarocks-types.workspace = true
 arrow-array.workspace = true
-arrow-select = "58.2.0"
+arrow-select.workspace = true
 arrow-schema.workspace = true
 novarocks-type-contract.workspace = true
 
