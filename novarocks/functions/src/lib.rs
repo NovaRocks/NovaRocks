@@ -85,6 +85,8 @@ pub mod largeint;
 pub mod largeint_text;
 pub mod math_numeric;
 pub mod opaque_memory;
+pub mod parse_json_core;
+mod parse_json_resources;
 pub mod pattern_memo;
 pub mod percentile_hash_core;
 pub mod percentile_input;

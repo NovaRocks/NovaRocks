@@ -58,6 +58,15 @@ impl HostAggregateAllocator {
         };
         Ok(Self { inner: pointer })
     }
+    /// Typed single-block custody allocation on the same actual host. Unlike
+    /// allocator-api2 containers, this path needs no AllocError journal and
+    /// never locks its potentially allocating platform Mutex.
+    pub(crate) fn allocate_typed_block(
+        &self,
+        layout: Layout,
+    ) -> Result<NonNull<u8>, KernelFailure> {
+        self.inner().host.allocate(layout)
+    }
     fn inner(&self) -> &HostAllocatorInner {
         // SAFETY: this owning handle contributes one reference, so the block
         // cannot be destroyed for the lifetime of the returned borrow.

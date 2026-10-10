@@ -50,7 +50,7 @@ fn checked_mul(a: usize, b: usize) -> Result<usize, KernelFailure> {
     a.checked_mul(b).ok_or(KernelFailure::ResourceExhausted)
 }
 
-/// Conservative metadata peak of the pinned Arrow 58.2.0 custom-buffer route.
+/// Conservative metadata peak of the pinned Arrow 58.4.0 custom-buffer route.
 /// Its private Bytes contains pointer, length and the three-word Deallocation
 /// (Arrow's own alloc::tests::test_size_of_deallocation proves that bound).
 /// Arc headers are two atomic usize counters; padding is covered by one extra
@@ -295,11 +295,51 @@ pub(crate) struct RetainedArrowResult {
 /// remaining bytes must cover this metadata transition before it is entered.
 pub(crate) fn retain_result_backing(
     original: ArrayRef,
-    mut charge: OpaqueRetainedCharge,
+    charge: OpaqueRetainedCharge,
     reservation: &mut OpaqueReservation,
     allocator: HostAggregateAllocator,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<RetainedArrowResult, KernelFailure> {
+    retain_result_backing_with(
+        (original, charge),
+        reservation,
+        allocator,
+        work,
+        HostShared::try_new,
+    )
+}
+
+/// Same custody author, with a single typed host block and no failure journal.
+/// The supplied allocator is dedicated to this direct custody path.
+pub(crate) fn retain_result_backing_direct(
+    original: ArrayRef,
+    charge: OpaqueRetainedCharge,
+    reservation: &mut OpaqueReservation,
+    allocator: HostAggregateAllocator,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<RetainedArrowResult, KernelFailure> {
+    retain_result_backing_with(
+        (original, charge),
+        reservation,
+        allocator,
+        work,
+        HostShared::try_new_direct,
+    )
+}
+
+fn retain_result_backing_with(
+    input: (ArrayRef, OpaqueRetainedCharge),
+    reservation: &mut OpaqueReservation,
+    allocator: HostAggregateAllocator,
+    work: &mut EvaluationCheckpoints<'_>,
+    make_owner: impl FnOnce(
+        OriginalBacking<OpaqueRetainedCharge>,
+        HostAggregateAllocator,
+        &mut EvaluationCheckpoints<'_>,
+    )
+        -> Result<HostShared<OriginalBacking<OpaqueRetainedCharge>>, KernelFailure>,
+) -> Result<RetainedArrowResult, KernelFailure> {
+    let (original, mut charge) = input;
     work.flush()?;
     let data = original.to_data();
     work.flush()?;
@@ -318,7 +358,15 @@ pub(crate) fn retain_result_backing(
     let retained = checked_add(original_carrier_stock, metadata)?;
     work.flush()?;
     charge.reconcile_under_reservation(retained, reservation)?;
-    let owner = granted_original_group(original, data, charge, allocator, work)?;
+    let owner = make_owner(
+        OriginalBacking {
+            original,
+            data,
+            custody: charge,
+        },
+        allocator,
+        work,
+    )?;
     let retained_envelope = checked_add(retained, owner.block_bytes())?;
     let values = wrap_original_group(owner, work)?;
     Ok(RetainedArrowResult {

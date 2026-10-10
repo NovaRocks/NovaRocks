@@ -44,12 +44,32 @@ impl<T> HostShared<T> {
         allocator: HostAggregateAllocator,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<Self, KernelFailure> {
+        Self::try_new_with(value, allocator, work, |allocator, layout| {
+            allocator
+                .allocate(layout)
+                .map(|pointer| pointer.cast::<u8>())
+                .map_err(|_| allocator.take_failure())
+        })
+    }
+    /// Same holder/refcount/Drop author, with direct typed host failure.
+    pub(crate) fn try_new_direct(
+        value: T,
+        allocator: HostAggregateAllocator,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Self, KernelFailure> {
+        Self::try_new_with(value, allocator, work, |allocator, layout| {
+            allocator.allocate_typed_block(layout)
+        })
+    }
+    fn try_new_with(
+        value: T,
+        allocator: HostAggregateAllocator,
+        work: &mut EvaluationCheckpoints<'_>,
+        allocate: impl FnOnce(&HostAggregateAllocator, Layout) -> Result<NonNull<u8>, KernelFailure>,
+    ) -> Result<Self, KernelFailure> {
         work.flush()?;
-        let pointer = allocator
-            .allocate(Layout::new::<SharedBlock<T>>())
-            .map_err(|_| allocator.take_failure())?
-            .cast::<u8>()
-            .cast::<SharedBlock<T>>();
+        let pointer =
+            allocate(&allocator, Layout::new::<SharedBlock<T>>())?.cast::<SharedBlock<T>>();
         // SAFETY: allocator admitted this exact nonzero layout and pointer; initialize before publishing.
         unsafe {
             pointer.as_ptr().write(SharedBlock {

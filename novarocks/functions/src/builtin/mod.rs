@@ -115,6 +115,8 @@ pub mod crc32;
 mod crc32_owner;
 mod bitmap_to_string_owner;
 mod bitmap_to_string_selected;
+mod parse_json_owner;
+mod parse_json_selected;
 mod percentile_hash_owner;
 mod percentile_hash_selected;
 mod date;

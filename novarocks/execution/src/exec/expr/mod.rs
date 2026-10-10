@@ -1671,3 +1671,8 @@ mod split_part_actual_sql_source_tests;
 
 #[cfg(test)]
 mod approx_top_k_actual_sql_source_tests;
+
+#[cfg(test)]
+mod parse_json_original_runtime_baseline_tests;
+#[cfg(test)]
+mod parse_json_actual_sql_source_tests;

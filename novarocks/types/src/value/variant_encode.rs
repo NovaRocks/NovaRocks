@@ -33,8 +33,8 @@ use super::variant::VariantValue;
 
 /// Encode JSON text into NovaRocks' size-prefixed variant payload.
 pub fn encode_json_text_to_variant_bytes(json_text: &str) -> Result<Vec<u8>, String> {
-    let value: Value =
-        serde_json::from_str(json_text).map_err(|e| format!("parse_json: invalid JSON: {e}"))?;
+    let value: Value = novarocks_functions::parse_json_core::parse_value(json_text)
+        .map_err(|e| format!("parse_json: invalid JSON: {e}"))?;
     encode_json_value_to_variant_bytes(&value)
 }
 
