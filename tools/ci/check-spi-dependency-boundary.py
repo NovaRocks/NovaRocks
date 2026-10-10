@@ -44,7 +44,14 @@ PACKAGE_NAME = "novarocks-spi"
 
 # Internal crates the Connector contract closure may legitimately contain.
 # This is an allow-list, not a required set.
-NEUTRAL_INTERNAL_PACKAGES = frozenset({"novarocks-connector-contract", "novarocks-secret"})
+NEUTRAL_INTERNAL_PACKAGES = frozenset(
+    {
+        "novarocks-connector-contract",
+        "novarocks-secret",
+        "novarocks-type-contract",
+        "novarocks-result-contract",
+    }
+)
 
 
 class Capability:
@@ -83,8 +90,8 @@ STORAGE_CONTRACT = Capability(
 # never consume them.
 # ``novarocks-connector-`` names a provider implementation, with one exception
 # that shares the prefix by history rather than by role: the Connector contract
-# crate itself, which declares shared read vocabulary and depends on nothing but
-# ``bytes``. The prefix rule exists to keep providers out of the contract they
+# crate itself, which declares shared read and type vocabulary without owning a
+# provider runtime. The prefix rule keeps providers out of the contract they
 # implement; excluding a crate that implements nothing keeps it doing that.
 CONNECTOR_CONTRACT = "novarocks-connector-contract"
 
@@ -205,12 +212,29 @@ def capability_hits(names):
     return found
 
 
+def unexpected_internal_names(names):
+    return sorted(
+        name
+        for name in names
+        if name.startswith("novarocks-") and name not in NEUTRAL_INTERNAL_PACKAGES
+    )
+
+
 def verify_declared_boundary(package):
     declared = declared_normal_dependency_names(package)
     for label, hits in capability_hits(declared):
         fail(
             f"{PACKAGE_NAME} declares a normal dependency on a forbidden "
             f"{label}: " + ", ".join(hits)
+        )
+    unexpected_internal = unexpected_internal_names(declared)
+    if unexpected_internal:
+        fail(
+            f"{PACKAGE_NAME} declares normal dependencies on internal crates "
+            "outside the neutral allow-list ("
+            + ", ".join(sorted(NEUTRAL_INTERNAL_PACKAGES))
+            + "): "
+            + ", ".join(unexpected_internal)
         )
 
 
@@ -222,11 +246,7 @@ def verify_default_dependency_dag(metadata, package):
             f"{label}: " + ", ".join(hits)
         )
 
-    unexpected_internal = sorted(
-        name
-        for name in closure
-        if name.startswith("novarocks-") and name not in NEUTRAL_INTERNAL_PACKAGES
-    )
+    unexpected_internal = unexpected_internal_names(closure)
     if unexpected_internal:
         fail(
             "default normal dependency DAG contains internal crates outside the "
