@@ -32,26 +32,34 @@ spec.loader.exec_module(guard)
 
 class BoundaryTests(unittest.TestCase):
     def fixture(self, root_dependency="", types_dependency="", extra="", build_script=False,
-                result_dependency=""):
+                result_dependency="", functions_dependency="", functions_build=None,
+                functions_extra=""):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         (root / "Cargo.toml").write_text(
-            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime", "result"]\n')
+            '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime", "result", "functions"]\n')
         for directory, name, dependencies in (
                 ("program", "novarocks-local-program", root_dependency),
                 ("types", "novarocks-types", types_dependency),
                 ("result", "novarocks-result-contract", result_dependency),
-                ("runtime", "tokio", "")):
+                ("runtime", "tokio", ""),
+                ("functions", "novarocks-functions", functions_dependency)):
             package = root / directory
             (package / "src").mkdir(parents=True)
             (package / "src/lib.rs").write_text("")
             (package / "Cargo.toml").write_text(
                 f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2024"\n'
                 + "[dependencies]\n" + dependencies
-                + (extra if directory == "program" else ""))
+                + (extra if directory == "program" else "")
+                + (functions_extra if directory == "functions" else ""))
         if build_script:
             (root / "program/build.rs").write_text("fn main() {}\n")
+        if functions_build is not None:
+            (root / "functions" / functions_build).write_text("fn main() {}\n")
+            manifest = root / "functions/Cargo.toml"
+            manifest.write_text(manifest.read_text().replace(
+                '[package]\n', f'[package]\nbuild = "{functions_build}"\n'))
         subprocess.run(["cargo", "generate-lockfile", "--offline", "--manifest-path",
                         str(root / "Cargo.toml")], check=True, capture_output=True)
         return subprocess.run(["python3", str(CHECKER), "--manifest-path",
@@ -110,6 +118,37 @@ class BoundaryTests(unittest.TestCase):
     def test_pure_owner_cannot_execute_build_script(self):
         self.assert_rejected(self.fixture(build_script=True), "executes a custom build script")
 
+    def test_functions_audited_build_host_is_allowed(self):
+        result = self.fixture('novarocks-functions = { path = "../functions" }\n',
+                              functions_build="build.rs")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_functions_build_host_cannot_select_another_source(self):
+        result = self.fixture('novarocks-functions = { path = "../functions" }\n',
+                              functions_build="other.rs")
+        self.assert_rejected(result, "novarocks-functions declares a custom build target")
+
+    def test_functions_build_host_cannot_acquire_build_runtime(self):
+        result = self.fixture('novarocks-functions = { path = "../functions" }\n',
+                              functions_build="build.rs",
+                              functions_extra='[build-dependencies]\ntokio = { path = "../runtime" }\n')
+        self.assert_rejected(result, "novarocks-functions declares a build dependency")
+        self.assertIn("runtime/wire/provider/storage capability: tokio", result.stderr)
+
+    def test_functions_build_host_cannot_acquire_macro_authority(self):
+        result = self.fixture('novarocks-functions = { path = "../functions" }\n',
+                              functions_build="build.rs", functions_extra='[lib]\nproc-macro = true\n')
+        self.assert_rejected(result, "novarocks-functions declares a proc-macro target")
+
+    def test_audited_build_host_does_not_admit_functions_to_physical_plan(self):
+        self.assertNotIn("novarocks-functions", guard.metadata_support().DIRECT_INTERNAL_ALLOW_LIST)
+        self.assertNotIn("novarocks-functions", guard.metadata_support().DIRECT_PACKAGE_ALLOW_LIST)
+        package = {"dependencies": [{"name": "novarocks-functions", "kind": None,
+                                    "optional": False, "target": None, "features": [],
+                                    "uses_default_features": True}], "features": {}}
+        _, violations = guard.metadata_support().verify_declared_dependencies(package)
+        self.assertIn("outside the exact direct allow-list", " ".join(violations))
+
     @staticmethod
     def external(name, version="1.0.0", source=guard.REGISTRY_SOURCE):
         return {"id": f"{source}#{name}@{version}", "name": name, "source": source,
@@ -124,9 +163,10 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(guard.verify_package(self.external(name, version), set()), [])
 
     def test_same_named_pure_contract_replacement_is_rejected(self):
-        package = self.external("novarocks-types")
-        self.assertIn("not the workspace-owned pure package", " ".join(
-            guard.verify_package(package, set())))
+        for name in ("novarocks-types", "novarocks-functions"):
+            package = self.external(name)
+            self.assertIn("not the workspace-owned pure package", " ".join(
+                guard.verify_package(package, set())))
 
     def test_provider_and_wire_capabilities_are_rejected(self):
         for name in ("novarocks-connector-iceberg", "novarocks-spi",

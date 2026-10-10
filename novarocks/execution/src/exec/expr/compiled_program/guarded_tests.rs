@@ -31,7 +31,9 @@ use novarocks_functions::{
     KernelFailure, PureCallPreparation, PureEngineFunctionCatalog, PureImplementationDeclaration,
     PureImplementationId, PureKernelAbi, ScopedExpressionEffects, Selection,
 };
-use novarocks_local_compiler::{LocalCompileOptions, compile_fragment, validate_fragment_providers};
+use novarocks_local_compiler::{
+    LocalCompileOptions, compile_fragment, validate_fragment_providers,
+};
 use novarocks_local_program::{
     KernelAbiVersion, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
     ProgramNodeId,

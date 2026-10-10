@@ -77,6 +77,12 @@ impl RuntimeErrorState {
         self.error.lock().expect("runtime error lock").clone()
     }
 
+    /// Cooperative kernels need presence, not a cloned diagnostic payload.
+    /// Keep the same lock and first-wins owner as the lossless error reader.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.error.lock().expect("runtime error lock").is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn waiting_count(&self) -> usize {
         self.waiting.load(Ordering::Acquire)
@@ -86,6 +92,22 @@ impl RuntimeErrorState {
     /// The predicate and notification share the error lock, including an error
     /// published before registration and spurious condition-variable wakes.
     pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> ExecutionResult<()> {
+        match self.wait_for_error(duration).as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Read only the stop fact. The original Condvar still owns registration,
+    /// notification and spurious-wake handling; no diagnostic is copied.
+    pub(crate) fn wait_until_stopped(&self, duration: std::time::Duration) -> bool {
+        self.wait_for_error(duration).is_some()
+    }
+
+    fn wait_for_error(
+        &self,
+        duration: std::time::Duration,
+    ) -> std::sync::MutexGuard<'_, Option<ExecutionFailure>> {
         let guard = self.error.lock().expect("runtime error lock");
         #[cfg(test)]
         self.waiting.fetch_add(1, Ordering::Release);
@@ -95,10 +117,7 @@ impl RuntimeErrorState {
             .expect("runtime stop wait");
         #[cfg(test)]
         self.waiting.fetch_sub(1, Ordering::Release);
-        match guard.as_ref() {
-            Some(error) => Err(error.clone()),
-            None => Ok(()),
-        }
+        guard
     }
 }
 
@@ -329,6 +348,36 @@ fn monotonic_now_ns() -> i64 {
 mod tests {
     use super::*;
     use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
+
+    #[test]
+    fn stop_presence_and_wait_keep_first_diagnostic_and_original_lossless_reader() {
+        let state = RuntimeErrorState::default();
+        assert!(!state.is_stopped());
+        assert!(!state.wait_until_stopped(Duration::ZERO));
+        let first = ExecutionFailure::from("original runtime diagnostic".repeat(1024));
+        state.set_error(first.clone());
+        state.set_error("later runtime diagnostic");
+        assert!(state.is_stopped());
+        assert!(state.wait_until_stopped(Duration::from_secs(30)));
+        assert_eq!(state.error(), Some(first.clone()));
+        assert_eq!(state.wait_interruptibly(Duration::ZERO), Err(first));
+        assert_eq!(state.waiting_count(), 0);
+    }
+
+    #[test]
+    fn stop_presence_wait_registration_is_woken_by_the_same_owner() {
+        let state = std::sync::Arc::new(RuntimeErrorState::default());
+        let reader = std::sync::Arc::clone(&state);
+        let waiter = std::thread::spawn(move || reader.wait_until_stopped(Duration::from_secs(30)));
+        let until = Instant::now() + Duration::from_secs(5);
+        while state.waiting_count() == 0 && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert_eq!(state.waiting_count(), 1);
+        state.set_error("actual runtime stop");
+        assert!(waiter.join().expect("stop reader"));
+        assert_eq!(state.waiting_count(), 0);
+    }
 
     #[test]
     fn sink_io_executor_from_default_state_runs_on_sink_runtime() {

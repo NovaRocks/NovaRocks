@@ -165,6 +165,12 @@ impl<'call, 'a> ScalarCallInput<'call, 'a> {
 /// Dispatch is once per selected batch, not once per row.
 pub trait PreparedScalarKernel: Send + Sync + fmt::Debug {
     fn contract(&self) -> &Arc<ScalarCallContract>;
+    /// Closed pure source of the complete original wrapper invocation.
+    /// None explicitly leaves this source unproved; a positive source's
+    /// arithmetic/model refusal must never be converted back to None.
+    fn invocation_resource_profile(&self) -> Option<crate::ScalarInvocationResourceProfile> {
+        None
+    }
     /// Complete lifetime retained bound of one boxed instance: inline body and
     /// all bounded owned heap, including growth on error exits. The host
     /// authorizes construction and remaining mutation headroom before any
@@ -360,6 +366,9 @@ impl ScalarEvaluationInstance {
     }
     pub fn contract(&self) -> &ScalarCallContract {
         &self.contract
+    }
+    pub fn invocation_resource_profile(&self) -> Option<crate::ScalarInvocationResourceProfile> {
+        self._prepared.invocation_resource_profile()
     }
     pub fn retained_bytes(&self) -> Result<usize, KernelFailure> {
         let bytes = self.instance.retained_bytes();

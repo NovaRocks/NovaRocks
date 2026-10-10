@@ -92,6 +92,7 @@ pub mod percentile_hash_core;
 pub mod percentile_input;
 mod pure_catalogue;
 mod scalar_kernel;
+mod scalar_resources;
 pub mod selected_copy;
 pub mod sketch_hash;
 mod specialization;
@@ -134,6 +135,9 @@ pub use novarocks_type_contract::{
 };
 pub use pure_catalogue::*;
 pub use scalar_kernel::*;
+pub use scalar_resources::{
+    ScalarInvocationRequestFacts, ScalarInvocationResourceProfile, ScalarResourceError,
+};
 pub use specialization::FunctionSpecializationFailure;
 pub use table_call::*;
 pub use table_kernel::*;

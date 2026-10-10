@@ -132,6 +132,15 @@ impl ScanOutputFilter {
 }
 
 impl ScanDriverFilter {
+    pub(super) fn bind_runtime_state(
+        &mut self,
+        state: &crate::runtime::runtime_state::RuntimeState,
+    ) {
+        if let Some(keys) = &mut self.compiled_keys {
+            keys.bind_runtime_state(state);
+        }
+    }
+
     pub(super) fn bind_mem_tracker(
         &mut self,
         tracker: std::sync::Arc<crate::runtime::mem_tracker::MemTracker>,

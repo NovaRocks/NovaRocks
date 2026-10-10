@@ -23,7 +23,7 @@ pub(super) fn evaluate<'a>(
     kind: &StaticExprKind,
     child: &Value<'a>,
     selection: Selection<'a>,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     let argument = child.argument();
     let booleans = if matches!(kind, StaticExprKind::Not(_)) {

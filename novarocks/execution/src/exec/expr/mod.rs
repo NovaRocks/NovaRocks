@@ -1440,9 +1440,9 @@ mod exact_percentile_actual_sql_rate_source_tests;
 mod legacy_field_baseline_tests;
 
 #[cfg(test)]
-mod legacy_text_time_cast_baseline_tests;
-#[cfg(test)]
 mod cast_text_time_oracle_tests;
+#[cfg(test)]
+mod legacy_text_time_cast_baseline_tests;
 
 #[cfg(test)]
 mod ndv_filter_actual_sql_source_tests;
@@ -1481,14 +1481,14 @@ mod legacy_observed_list_cast_baseline_tests;
 mod sql_dependency_resolved_binding_source_tests;
 
 #[cfg(test)]
-mod legacy_between_observed_baseline_tests;
-#[cfg(test)]
 mod between_actual_sql_compiler_tests;
+#[cfg(test)]
+mod legacy_between_observed_baseline_tests;
 
 #[cfg(test)]
-mod legacy_integral_decimal128_baseline_tests;
-#[cfg(test)]
 mod integral_decimal128_actual_sql_tests;
+#[cfg(test)]
+mod legacy_integral_decimal128_baseline_tests;
 
 #[cfg(test)]
 mod percentile_hash_original_fold_tests;
@@ -1503,9 +1503,9 @@ mod percentile_hash_native_n1_frame_tests;
 mod percentile_hash_native_n1_availability_tests;
 
 #[cfg(test)]
-mod legacy_inlist_required_baseline_tests;
-#[cfg(test)]
 mod inlist_required_actual_sql_tests;
+#[cfg(test)]
+mod legacy_inlist_required_baseline_tests;
 
 #[cfg(test)]
 mod legacy_inlist_variant_local_baseline_tests;
@@ -1523,9 +1523,9 @@ mod inlist_signed_actual_after_tests;
 mod scan_ordered_required_actual_tests;
 
 #[cfg(test)]
-mod legacy_hll_hash_original_tests;
-#[cfg(test)]
 mod hll_hash_actual_sql_source_tests;
+#[cfg(test)]
+mod legacy_hll_hash_original_tests;
 
 #[cfg(test)]
 mod bitmap_union_int_actual_sql_source_tests;
@@ -1557,9 +1557,9 @@ mod legacy_percentile_approx_raw_original_tests;
 mod percentile_approx_raw_actual_sql_source_tests;
 
 #[cfg(test)]
-mod legacy_float64_decimal128_baseline_tests;
-#[cfg(test)]
 mod cast_float64_decimal128_oracle_tests;
+#[cfg(test)]
+mod legacy_float64_decimal128_baseline_tests;
 
 #[cfg(test)]
 mod join_probe_filter_actual_sql_tests;
@@ -1568,16 +1568,16 @@ mod join_probe_filter_actual_sql_tests;
 mod bitmap_agg_actual_sql_source_tests;
 
 #[cfg(test)]
-mod legacy_struct_subfield_baseline_tests;
-#[cfg(test)]
 mod array_struct_subfield_actual_sql_source_tests;
-
 #[cfg(test)]
-mod original_float_arithmetic_baseline_tests;
+mod legacy_struct_subfield_baseline_tests;
+
 #[cfg(test)]
 mod float_arithmetic_required_oracle_tests;
 #[cfg(test)]
 mod float_arithmetic_statistics_actual_sql_tests;
+#[cfg(test)]
+mod original_float_arithmetic_baseline_tests;
 
 #[cfg(test)]
 mod float_arithmetic_conversion_author_tests;
@@ -1673,6 +1673,9 @@ mod split_part_actual_sql_source_tests;
 mod approx_top_k_actual_sql_source_tests;
 
 #[cfg(test)]
-mod parse_json_original_runtime_baseline_tests;
-#[cfg(test)]
 mod parse_json_actual_sql_source_tests;
+#[cfg(test)]
+mod parse_json_original_runtime_baseline_tests;
+
+#[cfg(test)]
+pub(crate) mod runtime_scalar_memory_actual_sql_tests;

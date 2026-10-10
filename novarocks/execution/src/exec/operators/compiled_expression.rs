@@ -23,8 +23,9 @@
 //! kernel failures stay typed. There is no legacy ExprArena or name dispatch.
 //!
 //! The kernel control observes the fragment's runtime error state. A unified
-//! absolute evaluation deadline and memory admission are not yet loaned to
-//! this host; they remain open host obligations, not implied by this control.
+//! absolute evaluation deadline remains open. A bounded installed source
+//! explicitly borrows its original runtime account at its scalar invocation;
+//! uncovered sources retain their original accounting obligations.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +51,10 @@ pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
 #[cfg(test)]
 #[path = "runtime_kernel_memory_tests.rs"]
 mod runtime_kernel_memory_tests;
+
+#[cfg(feature = "test-support")]
+#[path = "runtime_scalar_memory_test_support.rs"]
+pub(crate) mod runtime_scalar_memory_test_support;
 
 /// Kernel control backed by the fragment's runtime error state: a recorded
 /// failure or cancellation refuses the next checkpoint, and waits are
@@ -97,15 +102,17 @@ impl RuntimeKernelControl {
 }
 impl KernelEvaluationControl for RuntimeKernelControl {
     fn checkpoint(&self, _work_units: u32) -> Result<(), KernelFailure> {
-        if self.error.error().is_some() {
+        if self.error.is_stopped() {
             return Err(KernelFailure::Cancelled);
         }
         Ok(())
     }
     fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
-        self.error
-            .wait_interruptibly(duration)
-            .map_err(|_| KernelFailure::Cancelled)
+        if self.error.wait_until_stopped(duration) {
+            Err(KernelFailure::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -119,7 +126,7 @@ pub(crate) fn evaluate_all(
     instance: &mut CompiledExpressionInstance,
     site: ProgramExpressionRootSite,
     input: &RecordBatch,
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     evaluate_selection(
         instance,
@@ -144,7 +151,7 @@ pub(crate) fn evaluate_selected(
     site: ProgramExpressionRootSite,
     input: &RecordBatch,
     rows: &[usize],
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     let selection = Selection::try_sparse(input.num_rows(), rows).map_err(|_| {
         ExecutionFailure::from(KernelFailure::Internal(KernelDiagnostic::new(
@@ -165,11 +172,14 @@ fn evaluate_selection(
     input: &RecordBatch,
     selection: Selection<'_>,
     activation: novarocks_functions::ScalarInvocationActivation,
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     // Required callers supply their actual row-demand policy. Direct Frame
     // callers may activate an empty invocation (e.g. the original IF else).
-    let result = instance.evaluate_evaluation(input, selection, activation, control)?;
+    let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
+    let mut scope =
+        crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
+    let result = instance.evaluate_runtime(input, selection, activation, control, &mut scope)?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
         return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
@@ -694,14 +704,20 @@ impl ProcessorOperator for CompiledFilterProcessor {
                 Arc::clone(&self.program), node, &self.control, self.control.allocator(),
             )?);
         }
+        let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
+        let mut scope = crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(
+            &self.control,
+            &mut journal,
+        );
         let truth = self
             .instance
             .as_mut()
             .expect("instance was created")
-            .evaluate_required(
+            .evaluate_required_runtime(
                 &chunk.batch,
                 Selection::all(chunk.batch.num_rows()),
                 &self.control,
+                &mut scope,
             )?;
         let truth = truth
             .as_any()

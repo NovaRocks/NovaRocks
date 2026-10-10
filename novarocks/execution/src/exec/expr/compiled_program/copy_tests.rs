@@ -81,6 +81,7 @@ fn copy(
     let mut work = Work {
         control: &observed,
         pending: 0,
+        scalar_scope: None,
     };
     let result = observed
         .checkpoint(0)

@@ -777,11 +777,13 @@ fn operator_selected_evaluation_skips_unselected_row_errors_and_reports_batch_ro
         role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
     };
     let mut evaluator = instance(&program, 0);
-    let values = evaluate_selected(&mut evaluator, site, &input, &[0, 2], &Control).unwrap();
+    let control =
+        crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::default());
+    let values = evaluate_selected(&mut evaluator, site, &input, &[0, 2], &control).unwrap();
     let values = values.as_any().downcast_ref::<Decimal128Array>().unwrap();
     assert_eq!(values.len(), 2);
     assert_eq!((values.value(0), values.value(1)), (20, 30));
-    let error = evaluate_selected(&mut instance(&program, 0), site, &input, &[1, 2], &Control)
+    let error = evaluate_selected(&mut instance(&program, 0), site, &input, &[1, 2], &control)
         .expect_err("the selected overflow row is required");
     let message = error.to_string();
     assert!(
@@ -789,7 +791,7 @@ fn operator_selected_evaluation_skips_unselected_row_errors_and_reports_batch_ro
         "{message}"
     );
     assert!(message.contains("overflow"), "{message}");
-    let unordered = evaluate_selected(&mut instance(&program, 0), site, &input, &[2, 0], &Control)
+    let unordered = evaluate_selected(&mut instance(&program, 0), site, &input, &[2, 0], &control)
         .expect_err("rows must be strictly increasing");
     assert!(unordered.to_string().contains("not ordered"), "{unordered}");
 }

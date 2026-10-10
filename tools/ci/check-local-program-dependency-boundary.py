@@ -103,7 +103,9 @@ def verify_package(package, workspace_ids):
                     dependency["optional"] or dependency["target"] is not None):
                 violations.append(f"{name} hides a normal edge behind a feature/target: "
                                   + dependency["name"])
-        if name == "novarocks-type-contract":
+        if name in {"novarocks-type-contract", "novarocks-functions"}:
+            # These pure owners audit their exact allocation-source/compiler
+            # prerequisites in one dependency-free package-local build host.
             violations.extend(metadata_support().verify_package_targets(package, name))
         elif any("custom-build" in target["kind"] for target in package["targets"]):
             violations.append(f"{name} executes a custom build script")

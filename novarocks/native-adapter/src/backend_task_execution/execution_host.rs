@@ -2142,6 +2142,10 @@ fn failure_cause_category(
             novarocks_execution::runtime::preparation_metadata::PreparationMetadataFailure::Request(error) => metadata_request_category(error),
             novarocks_execution::runtime::preparation_metadata::PreparationMetadataFailure::Host(error) => preparation_memory_refusal_category(error),
         },
+        ExecutionFailureCause::RuntimeScalarSource(novarocks_functions::ScalarResourceError::Arithmetic)
+        | ExecutionFailureCause::RuntimeScalarMemory(_) => TaskFailureCategory::ResourceExhausted,
+        ExecutionFailureCause::RuntimeScalarSource(novarocks_functions::ScalarResourceError::SourceModel(_)
+            | novarocks_functions::ScalarResourceError::Invariant(_)) => TaskFailureCategory::Internal,
         ExecutionFailureCause::Pipeline(_) => opaque_category,
     }
 }
@@ -2407,6 +2411,82 @@ pub(super) mod tests {
         TaskExecutionHost, TaskExecutionRegistry, TaskExecutionRegistryConfig, TaskStatusOwner,
         TaskStatusReporter, TaskStatusSource, WorkerMonotonicClock,
     };
+
+    #[test]
+    fn runtime_scalar_memory_nominal_categories_preserve_original_transport() {
+        use novarocks_execution::runtime::{
+            fragment::{ExecutionFailure, ExecutionFailureCause},
+            scalar_memory::{RuntimeScalarEvaluationFailure, RuntimeScalarMemoryRefusal},
+        };
+        use novarocks_functions::{KernelFailure, ScalarResourceError};
+        for (failure, expected) in [
+            (
+                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Arithmetic),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::SourceModel(
+                    "cancelled ResourceExhausted",
+                )),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Invariant(
+                    "ResourceExhausted",
+                )),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Host(
+                    RuntimeScalarMemoryRefusal::MissingQueryMemory,
+                ),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(
+                    novarocks_memory::CapacityError::Invalid {
+                        detail: "cancelled Internal",
+                    },
+                )),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::Cancelled),
+                TaskFailureCategory::Execution,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::ResourceExhausted),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::InstanceFailed),
+                TaskFailureCategory::Internal,
+            ),
+        ] {
+            let error = ExecutionFailure::from(failure.clone());
+            assert_eq!(
+                super::failure_cause_category(error.cause(), TaskFailureCategory::Protocol),
+                expected
+            );
+            match (failure, error.cause()) {
+                (
+                    RuntimeScalarEvaluationFailure::Source(original),
+                    ExecutionFailureCause::RuntimeScalarSource(actual),
+                ) => assert_eq!(&original, actual),
+                (
+                    RuntimeScalarEvaluationFailure::Host(original),
+                    ExecutionFailureCause::RuntimeScalarMemory(actual),
+                ) => assert_eq!(&original, actual),
+                (
+                    RuntimeScalarEvaluationFailure::Kernel(original),
+                    ExecutionFailureCause::Kernel(actual),
+                ) => assert_eq!(&original, actual),
+                _ => {
+                    panic!("nominal source or host cause must survive without text classification")
+                }
+            }
+        }
+    }
 
     #[test]
     fn project_metadata_nominal_categories_match_compile_and_prepare_without_parsing_text() {

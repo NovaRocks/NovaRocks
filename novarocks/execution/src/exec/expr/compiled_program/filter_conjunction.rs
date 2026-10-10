@@ -48,6 +48,7 @@ impl CompiledFilterConjunctionInstance {
         let mut work = Work {
             control: &observed,
             pending: 0,
+            scalar_scope: None,
         };
         let result = (|| {
             work.control.checkpoint(0)?;
@@ -176,15 +177,12 @@ impl CompiledFilterConjunctionInstance {
             .map(|effects| effects.permits_boolean_reordering())
             .map_err(|_| invalid("Filter root effects differ from their original context"))
     }
-    fn evaluate_once<'a>(
+    fn evaluate_once<'a, E: scalar_invocation::FrameFailure>(
         &mut self,
         input: &RecordBatch,
         selection: Selection<'a>,
-        work: &mut Work<'_>,
-    ) -> Result<
-        (SelectedValues<'a>, Box<[ProgramExpressionRootSite]>),
-        novarocks_functions::ScalarInvocationFailure,
-    > {
+        work: &mut Work<'_, '_>,
+    ) -> Result<(SelectedValues<'a>, Box<[ProgramExpressionRootSite]>), E> {
         if input.num_rows() != selection.batch_rows() {
             return Err(invalid("Filter selection differs from its actual batch").into());
         }
@@ -206,11 +204,12 @@ impl CompiledFilterConjunctionInstance {
                 if selection.is_empty() {
                     // A zero-row invocation validates the entire original port,
                     // but the existing Frame enters no child/kernel constructor.
-                    let output = root.evaluate_evaluation(
+                    let output = root.evaluate_controlled::<E>(
                         input,
                         selection,
                         novarocks_functions::ScalarInvocationActivation::ValidateOnly,
                         work.control,
+                        work.scalar_scope.as_mut().map(|scope| &mut **scope as &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope),
                     )?;
                     work.flush()?;
                     drop(output);
@@ -230,11 +229,15 @@ impl CompiledFilterConjunctionInstance {
             }
             let actual_selection =
                 Selection::try_sparse_observed(input.num_rows(), &batch_rows, || work.step())?;
-            let output = root.evaluate_evaluation(
+            let output = root.evaluate_controlled::<E>(
                 input,
                 actual_selection,
                 novarocks_functions::ScalarInvocationActivation::Activated,
                 work.control,
+                work.scalar_scope.as_mut().map(|scope| {
+                    &mut **scope
+                        as &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope
+                }),
             )?;
             for error in output.errors() {
                 let parent = *remaining.get(error.selected_ordinal()).ok_or_else(|| {
@@ -277,11 +280,34 @@ impl CompiledFilterConjunctionInstance {
     }
     /// Public error publication occurs only after the complete legal region.
     /// It preserves the original predicate site and actual batch-row mapping.
+    #[cfg(test)]
     pub(crate) fn evaluate_required(
         &mut self,
         input: &RecordBatch,
         selection: Selection<'_>,
         control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<ArrayRef> {
+        self.evaluate_required_controlled::<novarocks_functions::ScalarInvocationFailure>(
+            input, selection, control, None,
+        )
+    }
+    pub(crate) fn evaluate_required_runtime(
+        &mut self,
+        input: &RecordBatch,
+        selection: Selection<'_>,
+        control: &dyn KernelEvaluationControl,
+        scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
+    ) -> ExecutionResult<ArrayRef> {
+        self.evaluate_required_controlled::<crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure>(input,selection,control,Some(scope))
+    }
+    fn evaluate_required_controlled<
+        E: scalar_invocation::FrameFailure + Into<crate::runtime::fragment::ExecutionFailure>,
+    >(
+        &mut self,
+        input: &RecordBatch,
+        selection: Selection<'_>,
+        control: &dyn KernelEvaluationControl,
+        scope: Option<&mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope>,
     ) -> ExecutionResult<ArrayRef> {
         if self.failed {
             return Err(KernelFailure::InstanceFailed.into());
@@ -294,24 +320,23 @@ impl CompiledFilterConjunctionInstance {
         let mut work = Work {
             control: &observed,
             pending: 0,
+            scalar_scope: scope,
         };
         let result = (|| {
             work.control.checkpoint(0)?;
-            self.evaluate_once(input, selection, &mut work)
+            self.evaluate_once::<E>(input, selection, &mut work)
         })();
-        let result = <novarocks_functions::ScalarInvocationFailure as scalar_invocation::FrameFailure>::finish(&mut work, result);
-        let result = result
-            .map_err(crate::runtime::fragment::ExecutionFailure::from)
-            .and_then(|(selected, sites)| {
-                let (selection, values, errors) = selected.into_parts();
-                if let Some(error) = errors.into_vec().into_iter().next() {
-                    let site = *sites
-                        .first()
-                        .ok_or_else(|| internal("required Filter error has no source site"))?;
-                    return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
-                }
-                Ok(values)
-            });
+        let result = E::finish(&mut work, result);
+        let result = result.map_err(Into::into).and_then(|(selected, sites)| {
+            let (selection, values, errors) = selected.into_parts();
+            if let Some(error) = errors.into_vec().into_iter().next() {
+                let site = *sites
+                    .first()
+                    .ok_or_else(|| internal("required Filter error has no source site"))?;
+                return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
+            }
+            Ok(values)
+        });
         if result.is_err() {
             self.failed = true;
         }
