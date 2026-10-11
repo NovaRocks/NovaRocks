@@ -283,19 +283,39 @@ impl PreparedScalarKernel for PreparedBitShift {
     }
 
     fn invocation_resource_profile(&self) -> Option<crate::ScalarInvocationResourceProfile> {
-        let physical_int64 = |ty: &crate::FunctionValueType| {
-            ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical
-                && ty.data_type == arrow_schema::DataType::Int64
-        };
-        let arguments = self.contract.value_argument_types();
-        if arguments.len() == 2
-            && arguments.into_iter().all(physical_int64)
-            && physical_int64(self.contract.result_type())
-        {
-            Some(crate::ScalarInvocationResourceProfile::int64_shift())
-        } else {
-            None
+        use crate::scalar_resources::NarrowShiftWidth;
+        use arrow_schema::DataType;
+        use novarocks_type_contract::ValueLogicalType;
+
+        let mut arguments = self.contract.value_argument_types();
+        if arguments.len() != 2 {
+            return None;
         }
+        let source = arguments.next()?;
+        let count = arguments.next()?;
+        let result = self.contract.result_type();
+        if count.logical_type != ValueLogicalType::Physical
+            || count.data_type != DataType::Int64
+            || source.logical_type != ValueLogicalType::Physical
+            || result.logical_type != ValueLogicalType::Physical
+            || result.data_type != source.data_type
+            || !result.nullable
+        {
+            return None;
+        }
+        Some(match source.data_type {
+            DataType::Int8 => {
+                crate::ScalarInvocationResourceProfile::narrow_shift(NarrowShiftWidth::Int8)
+            }
+            DataType::Int16 => {
+                crate::ScalarInvocationResourceProfile::narrow_shift(NarrowShiftWidth::Int16)
+            }
+            DataType::Int32 => {
+                crate::ScalarInvocationResourceProfile::narrow_shift(NarrowShiftWidth::Int32)
+            }
+            DataType::Int64 => crate::ScalarInvocationResourceProfile::int64_shift(),
+            _ => return None,
+        })
     }
 
     fn instance_retained_upper_bound(&self) -> usize {
@@ -439,12 +459,17 @@ mod tests {
     }
 
     #[test]
-    fn exact_int64_prepared_sources_alone_cover_the_original_wrapper_requests() {
+    fn exact_physical_integer_prepared_sources_cover_the_original_wrapper_requests() {
         for name in names() {
             for source_nullable in [false, true] {
                 for count_nullable in [false, true] {
                     for source in sources(source_nullable) {
-                        let covered = source.data_type == DataType::Int64;
+                        let covered = source.logical_type == ValueLogicalType::Physical;
+                        let normal_requests = if source.data_type == DataType::Int64 {
+                            7
+                        } else {
+                            12
+                        };
                         let prepared = prepared_for_test(
                             name,
                             &[
@@ -460,7 +485,7 @@ mod tests {
                         assert_eq!(instance.invocation_resource_profile(), profile);
                         if let Some(profile) = profile {
                             assert_eq!(profile.requests(0).unwrap().requests(), 6);
-                            assert_eq!(profile.requests(513).unwrap().requests(), 7);
+                            assert_eq!(profile.requests(513).unwrap().requests(), normal_requests);
                         }
                     }
                 }

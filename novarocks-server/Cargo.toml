@@ -100,6 +100,10 @@ name = "int64_shift_runtime_funding"
 required-features = ["physical-wire-v2-candidate"]
 
 [[test]]
+name = "narrow_shift_runtime_funding"
+required-features = ["physical-wire-v2-candidate"]
+
+[[test]]
 name = "window_output_schema_funding"
 required-features = ["physical-wire-v2-candidate"]
 

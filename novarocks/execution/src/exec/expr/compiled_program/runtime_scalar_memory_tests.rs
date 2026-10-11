@@ -29,7 +29,7 @@ use crate::runtime::{
     },
 };
 use arrow::{
-    array::{BooleanArray, Int64Array},
+    array::{BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array},
     datatypes::DataType,
 };
 use novarocks_functions::{
@@ -95,15 +95,19 @@ fn argument(ty: &FunctionValueType) -> novarocks_functions::FunctionArgument {
     }
 }
 fn fixture(name: &str, shape: Shape) -> Arc<LocalProgram> {
+    fixture_typed(name, shape, DataType::Int64)
+}
+fn fixture_typed(name: &str, shape: Shape, source_type: DataType) -> Arc<LocalProgram> {
     let functions = functions();
     let source = NodeId::new(u32::MAX);
     let input = NodeId::new(41);
     let output = NodeId::new(0);
-    let integer = FunctionValueType::new(DataType::Int64, true);
+    let integer = FunctionValueType::new(source_type, true);
+    let count_type = FunctionValueType::new(DataType::Int64, true);
     let boolean = FunctionValueType::new(DataType::Boolean, true);
     let columns = [
         (ValueId::new(1), integer.clone()),
-        (ValueId::new(2), integer.clone()),
+        (ValueId::new(2), count_type.clone()),
         (ValueId::new(3), boolean.clone()),
     ];
     let mut builder = FragmentBuilder::new(FragmentId::new(301));
@@ -136,7 +140,7 @@ fn fixture(name: &str, shape: Shape) -> Arc<LocalProgram> {
         .add_expression(output, integer.clone(), ExprKind::Value(columns[0].0))
         .unwrap();
     let count = builder
-        .add_expression(output, integer.clone(), ExprKind::Value(columns[1].0))
+        .add_expression(output, count_type.clone(), ExprKind::Value(columns[1].0))
         .unwrap();
     let flag = if matches!(shape, Shape::IfThen | Shape::IfElse | Shape::Filter) {
         Some(
@@ -154,7 +158,7 @@ fn fixture(name: &str, shape: Shape) -> Arc<LocalProgram> {
         author(
             &functions,
             name,
-            vec![argument(&integer), argument(&integer)],
+            vec![argument(&integer), argument(&count_type)],
             ControlShape::Eager,
         ),
         vec![value, count],
@@ -167,7 +171,7 @@ fn fixture(name: &str, shape: Shape) -> Arc<LocalProgram> {
             author(
                 &functions,
                 "bit_shift_right",
-                vec![argument(&integer), argument(&integer)],
+                vec![argument(&integer), argument(&count_type)],
                 ControlShape::Eager,
             ),
             vec![shifted, count],
@@ -193,13 +197,19 @@ fn fixture(name: &str, shape: Shape) -> Arc<LocalProgram> {
     };
     let result_value = ValueId::new(101);
     let result_type = if matches!(shape, Shape::Filter) {
-        let zero = builder
-            .add_expression(
-                output,
-                integer.clone(),
-                ExprKind::Literal(LiteralValue::Int64(0)),
-            )
-            .unwrap();
+        let zero = if integer.data_type == DataType::Int64 {
+            builder
+                .add_expression(
+                    output,
+                    integer.clone(),
+                    ExprKind::Literal(LiteralValue::Int64(0)),
+                )
+                .unwrap()
+        } else {
+            // A narrow literal is not in the frozen literal vocabulary. The
+            // new fixture compares two exact narrow values without a cast.
+            value
+        };
         let compare = builder
             .add_expression(
                 output,
@@ -303,7 +313,33 @@ fn batch(
     RecordBatch::try_new(
         program.graph().nodes()[1].output_layout().schema().clone(),
         vec![
-            Arc::new(Int64Array::from(values)),
+            match program.graph().nodes()[1]
+                .output_layout()
+                .schema()
+                .field(0)
+                .data_type()
+            {
+                DataType::Int8 => Arc::new(Int8Array::from(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|v| i8::try_from(v).unwrap()))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                DataType::Int16 => Arc::new(Int16Array::from(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|v| i16::try_from(v).unwrap()))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                DataType::Int32 => Arc::new(Int32Array::from(
+                    values
+                        .into_iter()
+                        .map(|v| v.map(|v| i32::try_from(v).unwrap()))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                DataType::Int64 => Arc::new(Int64Array::from(values)) as ArrayRef,
+                _ => panic!("exact shift fixture source"),
+            },
             Arc::new(Int64Array::from(vec![1; rows])),
             Arc::new(BooleanArray::from(flags)),
         ],
@@ -518,6 +554,156 @@ fn runtime_scalar_memory_direct_ordered_filter_uses_same_loan_and_first_host_fai
                     .cause(),
                 ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
             ));
+        }
+    }
+}
+
+#[test]
+fn runtime_scalar_memory_nine_narrow_frames_and_direct_filters_use_original_scope() {
+    for ty in [DataType::Int8, DataType::Int16, DataType::Int32] {
+        for name in [
+            "bit_shift_left",
+            "bit_shift_right",
+            "bit_shift_right_logical",
+        ] {
+            for shape in [Shape::Direct, Shape::Nested, Shape::IfThen, Shape::IfElse] {
+                let program = fixture_typed(name, shape, ty.clone());
+                let input = batch(
+                    &program,
+                    vec![Some(7), None, Some(-1)],
+                    vec![Some(true), Some(false), Some(false)],
+                );
+                let binding = bound();
+                let control = runtime_control(Some(&binding));
+                for sparse in [false, true] {
+                    let selection = if sparse {
+                        Selection::try_sparse(3, &[0, 2]).unwrap()
+                    } else {
+                        Selection::all(3)
+                    };
+                    let mut original =
+                        CompiledExpressionInstance::try_new(program.clone(), root(), &Control)
+                            .unwrap();
+                    let expected = original
+                        .evaluate_evaluation(&input, selection, Activation::Activated, &Control)
+                        .unwrap();
+                    let mut actual =
+                        CompiledExpressionInstance::try_new(program.clone(), root(), &control)
+                            .unwrap();
+                    let mut journal = RuntimeScalarMemoryJournal::default();
+                    let result = actual
+                        .evaluate_runtime(
+                            &input,
+                            selection,
+                            Activation::Activated,
+                            &control,
+                            &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                        )
+                        .unwrap();
+                    assert_eq!(result.values().data_type(), &ty);
+                    assert_eq!(result.values().to_data(), expected.values().to_data());
+                    assert!(journal.body.settlement.is_some());
+                    assert_eq!(journal.body.settlement.as_ref().unwrap().debt, 0);
+                }
+            }
+            let program = fixture_typed(name, Shape::Filter, ty.clone());
+            let input = batch(
+                &program,
+                vec![Some(7), Some(3), None],
+                vec![Some(true), Some(false), Some(true)],
+            );
+            let mut original = CompiledFilterConjunctionInstance::try_new(
+                program.clone(),
+                ProgramNodeId::new(2),
+                &Control,
+            )
+            .unwrap();
+            let expected = original
+                .evaluate_required(&input, Selection::all(3), &Control)
+                .unwrap();
+            for funded in [false, true] {
+                let binding = bound();
+                let control = runtime_control(funded.then_some(&binding));
+                let mut actual = CompiledFilterConjunctionInstance::try_new(
+                    program.clone(),
+                    ProgramNodeId::new(2),
+                    &control,
+                )
+                .unwrap();
+                let mut journal = RuntimeScalarMemoryJournal::default();
+                let result = actual.evaluate_required_runtime(
+                    &input,
+                    Selection::all(3),
+                    &control,
+                    &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
+                );
+                if funded {
+                    assert_eq!(result.unwrap().to_data(), expected.to_data());
+                    assert!(journal.body.settlement.is_some());
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().cause(),
+                        &ExecutionFailureCause::RuntimeScalarMemory(
+                            RuntimeScalarMemoryRefusal::MissingQueryMemory
+                        )
+                    );
+                    let mut journal = RuntimeScalarMemoryJournal::default();
+                    assert!(matches!(
+                        actual
+                            .evaluate_required_runtime(
+                                &input,
+                                Selection::all(3),
+                                &control,
+                                &mut RuntimeScalarMemoryScope::new(&control, &mut journal)
+                            )
+                            .unwrap_err()
+                            .cause(),
+                        ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn runtime_scalar_memory_narrow_roots_keep_missing_latch_and_strict_bypass_boundary() {
+    for ty in [DataType::Int8, DataType::Int16, DataType::Int32] {
+        for name in [
+            "bit_shift_left",
+            "bit_shift_right",
+            "bit_shift_right_logical",
+        ] {
+            let program = fixture_typed(name, Shape::Direct, ty.clone());
+            let input = batch(&program, vec![Some(7)], vec![Some(true)]);
+            let missing = runtime_control(None);
+            let mut actual =
+                CompiledExpressionInstance::try_new(program.clone(), root(), &missing).unwrap();
+            assert_eq!(
+                evaluate_all(&mut actual, root(), &input, &missing)
+                    .unwrap_err()
+                    .cause(),
+                &ExecutionFailureCause::RuntimeScalarMemory(
+                    RuntimeScalarMemoryRefusal::MissingQueryMemory
+                )
+            );
+            let binding = bound();
+            let funded = runtime_control(Some(&binding));
+            assert!(matches!(
+                evaluate_all(&mut actual, root(), &input, &funded)
+                    .unwrap_err()
+                    .cause(),
+                ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
+            ));
+            for rows in [0, 3] {
+                let input = batch(&program, vec![None; rows], vec![Some(true); rows]);
+                let mut bypass =
+                    CompiledExpressionInstance::try_new(program.clone(), root(), &missing).unwrap();
+                let values = evaluate_all(&mut bypass, root(), &input, &missing).unwrap();
+                assert_eq!(values.data_type(), &ty);
+                assert_eq!(values.len(), rows);
+                assert_eq!(values.null_count(), rows);
+            }
         }
     }
 }

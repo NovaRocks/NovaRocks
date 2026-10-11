@@ -18,11 +18,13 @@
 //! A source upgrade requires a new request proof before this model compiles.
 //! This receipt fixes source identity, not dependency feature resolution.
 
-const SOURCES: [(&[u8], &[u8]); 4] = [
+const SOURCES: [(&[u8], &[u8]); 6] = [
     (b"\nname = \"arrow-array\"\n", b"\nname = \"arrow-array\"\nversion = \"58.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ae33dad492b7df00a217563a7b0ef2874df68a0deea1b1a3acf628152f7f7a69\"\n"),
     (b"\nname = \"arrow-buffer\"\n", b"\nname = \"arrow-buffer\"\nversion = \"58.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"b9552f96391c005e6ab449fa941420935e7e062489b12b8b1b08879b2163f5b5\"\n"),
     (b"\nname = \"arrow-data\"\n", b"\nname = \"arrow-data\"\nversion = \"58.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"2b24852db04738907e06c04ea61e42fe7fda962a34513022dc0d0e754fb7976b\"\n"),
     (b"\nname = \"arrow-schema\"\n", b"\nname = \"arrow-schema\"\nversion = \"58.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"21ca356ad6425cecb6eb7b28e4f659f1ee7880fbb1a16127de7dd62901efee9e\"\n"),
+    (b"\nname = \"arrow-cast\"\n", b"\nname = \"arrow-cast\"\nversion = \"58.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"3a8a327c9649f30d8406995f27642b68df354713cca3baaaf100f076f18d5f34\"\n"),
+    (b"\nname = \"num-traits\"\n", b"\nname = \"num-traits\"\nversion = \"0.2.19\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841\"\n"),
 ];
 
 const fn matches_at(haystack: &[u8], needle: &[u8], at: usize) -> bool {
@@ -102,11 +104,15 @@ mod tests {
         for (name, expected) in SOURCES {
             let name = std::str::from_utf8(name).unwrap();
             let expected = std::str::from_utf8(expected).unwrap();
+            let version = expected
+                .lines()
+                .find(|line| line.starts_with("version = "))
+                .unwrap();
             assert!(!locked_sources_match(
                 lock.replace(name, "\nname = \"unrelated\"\n").as_bytes()
             ));
             for (old, new) in [
-                ("58.4.0", "58.5.0"),
+                (version, "version = \"0.0.0\""),
                 (
                     "registry+https://github.com/rust-lang/crates.io-index",
                     "git+https://example.invalid/fork",
