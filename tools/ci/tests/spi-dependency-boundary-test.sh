@@ -55,8 +55,10 @@ write_fixture() {
   # Arrow is deliberately part of the accepted baseline: Connector contracts
   # own the columnar vocabulary. Tokio is deliberately absent: the
   # state-store-conformance owner that used to justify it is gone.
-  for dependency in arrow async-trait bytes novarocks-frontend-application novarocks-secret \
-      novarocks-state-store-api novarocks-types serde sha2 tokio tracing url uuid; do
+  for dependency in arrow arrow-schema async-trait bytes novarocks-connector-contract \
+      novarocks-execution novarocks-frontend-application novarocks-memory \
+      novarocks-result-contract novarocks-secret novarocks-state-store-api \
+      novarocks-type-contract novarocks-types serde sha2 tokio tracing url uuid; do
     write_dependency_package "$fixture_root" "$dependency"
   done
   cat >"$fixture_root/Cargo.toml" <<'EOF'
@@ -133,6 +135,45 @@ extra_dependency_root="$(new_mutation extra-dependency)"
 append_dependency "$extra_dependency_root/Cargo.toml" 'tracing = { path = "deps/tracing" }'
 assert_accepted "$extra_dependency_root"
 
+# --- accept: neutral internal roles, without requiring the whole set ------
+direct_result_root="$(new_mutation direct-result-contract)"
+append_dependency "$direct_result_root/Cargo.toml" \
+  'novarocks-result-contract = { path = "deps/novarocks-result-contract" }'
+assert_accepted "$direct_result_root"
+
+direct_type_root="$(new_mutation direct-type-contract)"
+append_dependency "$direct_type_root/Cargo.toml" \
+  'novarocks-type-contract = { path = "deps/novarocks-type-contract" }'
+append_dependency "$direct_type_root/deps/novarocks-type-contract/Cargo.toml" \
+  'novarocks-result-contract = { path = "../novarocks-result-contract" }'
+append_dependency "$direct_type_root/deps/novarocks-type-contract/Cargo.toml" \
+  'arrow-schema = { path = "../arrow-schema" }'
+assert_accepted "$direct_type_root"
+
+connector_chain_root="$(new_mutation connector-type-result-chain)"
+append_dependency "$connector_chain_root/Cargo.toml" \
+  'novarocks-connector-contract = { path = "deps/novarocks-connector-contract" }'
+append_dependency "$connector_chain_root/deps/novarocks-connector-contract/Cargo.toml" \
+  'novarocks-type-contract = { path = "../novarocks-type-contract" }'
+append_dependency "$connector_chain_root/deps/novarocks-type-contract/Cargo.toml" \
+  'novarocks-result-contract = { path = "../novarocks-result-contract" }'
+assert_accepted "$connector_chain_root"
+
+for neutral in novarocks-type-contract novarocks-result-contract; do
+  optional_neutral_root="$(new_mutation "optional-$neutral")"
+  append_dependency "$optional_neutral_root/Cargo.toml" \
+    "$neutral = { path = \"deps/$neutral\", optional = true }"
+  assert_accepted "$optional_neutral_root"
+done
+
+# Dev/build edges do not confer a normal production dependency.
+non_normal_root="$(new_mutation non-normal-runtime)"
+append_dependency "$non_normal_root/Cargo.toml" '[dev-dependencies]'
+append_dependency "$non_normal_root/Cargo.toml" 'tokio = { path = "deps/tokio" }'
+append_dependency "$non_normal_root/Cargo.toml" '[build-dependencies]'
+append_dependency "$non_normal_root/Cargo.toml" 'tokio = { path = "deps/tokio" }'
+assert_accepted "$non_normal_root"
+
 # --- reject: a declared async runtime, optional or not --------------------
 # The removed state-store-conformance feature was Tokio's only owner, so an
 # optional Tokio is no longer a legal shape either.
@@ -173,5 +214,52 @@ append_dependency "$transitive_internal_root/deps/bytes/Cargo.toml" \
   'novarocks-types = { path = "../novarocks-types" }'
 assert_rejected "$transitive_internal_root" \
   "default normal dependency DAG contains internal crates outside the neutral allow-list"
+
+# --- reject: optional direct internal capabilities and unreviewed owners --
+for owner in novarocks-state-store-api novarocks-frontend-application \
+    novarocks-execution novarocks-memory novarocks-types; do
+  optional_owner_root="$(new_mutation "optional-$owner")"
+  append_dependency "$optional_owner_root/Cargo.toml" \
+    "$owner = { path = \"deps/$owner\", optional = true }"
+  case "$owner" in
+    novarocks-state-store-api)
+      violation="novarocks-spi declares a normal dependency on a forbidden state-store contract: $owner"
+      ;;
+    novarocks-frontend-application|novarocks-execution)
+      violation="novarocks-spi declares a normal dependency on a forbidden application/execution owner: $owner"
+      ;;
+    *)
+      violation="novarocks-spi declares normal dependencies on internal crates outside the neutral allow-list"
+      ;;
+  esac
+  assert_rejected "$optional_owner_root" "$violation"
+done
+
+# --- reject: neutral roles cannot conceal a forbidden transitive edge -----
+for neutral in novarocks-type-contract novarocks-result-contract; do
+  for owner in tokio novarocks-state-store-api novarocks-frontend-application \
+      novarocks-execution novarocks-memory novarocks-types; do
+    transitive_neutral_root="$(new_mutation "$neutral-to-$owner")"
+    append_dependency "$transitive_neutral_root/Cargo.toml" \
+      "$neutral = { path = \"deps/$neutral\" }"
+    append_dependency "$transitive_neutral_root/deps/$neutral/Cargo.toml" \
+      "$owner = { path = \"../$owner\" }"
+    case "$owner" in
+      tokio)
+        violation="novarocks-spi normal dependency closure contains a forbidden async runtime: $owner"
+        ;;
+      novarocks-state-store-api)
+        violation="novarocks-spi normal dependency closure contains a forbidden state-store contract: $owner"
+        ;;
+      novarocks-frontend-application|novarocks-execution)
+        violation="novarocks-spi normal dependency closure contains a forbidden application/execution owner: $owner"
+        ;;
+      *)
+        violation="default normal dependency DAG contains internal crates outside the neutral allow-list"
+        ;;
+    esac
+    assert_rejected "$transitive_neutral_root" "$violation"
+  done
+done
 
 echo "spi-dependency-boundary-test: PASS"
