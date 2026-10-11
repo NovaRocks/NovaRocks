@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompilePhase,
-    DecimalOverflowPolicy, FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior,
-    ObservableEffects, PureCompileControl,
+    FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
+    PureCompileControl,
 };
 
 use super::catalogue::BuiltinDynamicScalarResolver;
@@ -31,12 +31,14 @@ use crate::{
     CallEffectInput, FunctionBindingDeclaration, FunctionBindingError, FunctionBindingRequest,
     FunctionBindingResolver, FunctionBindingSelection, FunctionCatalogError, FunctionDefinition,
     FunctionEffectOwner, FunctionEffectOwnerError, FunctionFailureBehavior, FunctionId,
-    FunctionIntrinsicRowError, FunctionKind, FunctionResultType, FunctionVisibility,
-    FunctionVolatility, KernelEvaluationControl, KernelFailure, PreparedScalarKernel,
-    PureFunctionMetadataOwner, PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
-    PureScalarImplementation, ScalarCallContract, ScalarCallInput, ScalarKernelInstance,
-    SelectedValues,
+    FunctionIntrinsicRowError, FunctionKind, FunctionVisibility, FunctionVolatility,
+    KernelEvaluationControl, KernelFailure, PreparedScalarKernel, PureFunctionMetadataOwner,
+    PureImplementationDeclaration, PureImplementationId, PureKernelAbi, PureScalarImplementation,
+    ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
+
+#[cfg(test)]
+use novarocks_type_contract::DecimalOverflowPolicy;
 
 use super::truncate::TruncateOp;
 
@@ -44,13 +46,12 @@ const FUNCTION: &str = "builtin.scalar/truncate/v1";
 const OVERLOAD: &str = "builtin.scalar/truncate/dynamic-v1";
 const IMPLEMENTATION: &str = "builtin.scalar/truncate/selected-v1";
 
-/// The actual dynamic binding determines complete source/result types.
-/// A checked Float64-to-Decimal128 output can report row overflow under
-/// the frozen policy; other calls refine that own error channel away.
+/// The original safe output cast returns successful NULL on overflow.
+/// Frozen overflow policy remains part of the exact call contract.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
-        own_row_error: FunctionIntrinsicRowError::MayRaise,
+        own_row_error: FunctionIntrinsicRowError::NoRowError,
         failure_behavior: FunctionFailureBehavior::Propagate,
         null_behavior: FunctionNullBehavior::Strict,
         argument_control: ArgumentControl::Eager,
@@ -119,14 +120,7 @@ impl TruncateOwner {
         let base = effects();
         CallEffects {
             value_stability: base.value_stability,
-            own_row_error: if input.decimal_overflow_policy == DecimalOverflowPolicy::ReportError
-                && matches!(&input.selected.result_type, FunctionResultType::Scalar(result)
-                    if matches!(result.data_type, arrow_schema::DataType::Decimal128(_, _)))
-            {
-                FunctionIntrinsicRowError::MayRaise
-            } else {
-                FunctionIntrinsicRowError::NoRowError
-            },
+            own_row_error: base.own_row_error,
             failure_behavior: base.failure_behavior,
             null_behavior: base.null_behavior,
             argument_control: base.argument_control,
@@ -604,7 +598,7 @@ mod tests {
         }
     }
     #[test]
-    fn overflow_effects_refine_only_actual_decimal_output_and_frozen_policy() {
+    fn safe_output_effects_preserve_no_row_error_for_each_frozen_policy() {
         let owner = owner();
         let parameters = SemanticParameters::try_new([]).unwrap();
         let uses = uses(1);
@@ -623,22 +617,12 @@ mod tests {
                 let facts = owner
                     .validate_and_refine(input, crate::binding_test_control())
                     .unwrap();
-                let expected = if matches!(source, DataType::Decimal128(_, _))
-                    && policy == DecimalOverflowPolicy::ReportError
-                {
-                    FunctionIntrinsicRowError::MayRaise
-                } else {
-                    FunctionIntrinsicRowError::NoRowError
-                };
+                let expected = FunctionIntrinsicRowError::NoRowError;
                 assert_eq!(facts.own_row_error, expected);
                 assert_eq!(facts.null_behavior, FunctionNullBehavior::Strict);
                 assert!(facts.environment.is_empty());
                 let mut foreign = facts.clone();
-                foreign.own_row_error = if expected == FunctionIntrinsicRowError::MayRaise {
-                    FunctionIntrinsicRowError::NoRowError
-                } else {
-                    FunctionIntrinsicRowError::MayRaise
-                };
+                foreign.own_row_error = FunctionIntrinsicRowError::MayRaise;
                 assert!(matches!(
                     specialize_frozen_scalar(
                         &owner,

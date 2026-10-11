@@ -1969,3 +1969,6 @@ mod approx_top_k_full_any_error_tests;
 #[cfg(test)]
 #[path = "pure_differential_parse_json_tests.rs"]
 mod parse_json_tests;
+
+#[path = "pure_differential/truncate_shared_core_tests.rs"]
+mod truncate_shared_core_tests;

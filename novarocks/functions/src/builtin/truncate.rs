@@ -15,24 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Selected TRUNCATE computation, preserving its installed floating algorithm.
+//! Selected TRUNCATE delegates all numeric computation to the original core.
 
+use super::dround_core::{DroundComputation, compute_dround};
+use crate::math_numeric::{MathNumericError, NumericArrayView};
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionValueType, KernelEvaluationControl,
-    KernelFailure, RowDataError, ScalarCallInput, SelectedValues,
+    KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
-    kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{
-    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array,
-    builder::{Decimal128Builder, Float64Builder, Int64Builder},
-    types::{Decimal128Type, DecimalType},
-};
-use arrow_cast::cast::DecimalCast;
+use arrow_array::types::{Decimal128Type, validate_decimal_precision_and_scale};
 use arrow_schema::DataType;
-use novarocks_type_contract::{DecimalOverflowPolicy, ValueLogicalType};
-use std::sync::Arc;
+use novarocks_type_contract::ValueLogicalType;
+use std::alloc::Layout;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TruncateOp {
@@ -48,88 +43,9 @@ impl TruncateOp {
     }
 }
 
-enum NumericInput<'a> {
-    Int8(&'a Int8Array),
-    Int16(&'a Int16Array),
-    Int32(&'a Int32Array),
-    Int64(&'a Int64Array),
-    Float32(&'a Float32Array),
-    Float64(&'a Float64Array),
-    Decimal128(&'a Decimal128Array, f64),
-    Null,
-}
-impl<'a> NumericInput<'a> {
-    fn checked(array: &'a ArrayRef, source: &FunctionValueType) -> Result<Self, KernelFailure> {
-        if source.logical_type != ValueLogicalType::Physical
-            || array.data_type() != &source.data_type
-        {
-            return Err(invalid(
-                "truncate input differs from its exact numeric carrier",
-            ));
-        }
-        macro_rules! downcast {
-            ($array:ty, $variant:ident) => {
-                array
-                    .as_any()
-                    .downcast_ref::<$array>()
-                    .map(Self::$variant)
-                    .ok_or_else(|| internal("truncate numeric carrier cannot be downcast"))
-            };
-        }
-        match &source.data_type {
-            DataType::Int8 => downcast!(Int8Array, Int8),
-            DataType::Int16 => downcast!(Int16Array, Int16),
-            DataType::Int32 => downcast!(Int32Array, Int32),
-            DataType::Int64 => downcast!(Int64Array, Int64),
-            DataType::Float32 => downcast!(Float32Array, Float32),
-            DataType::Float64 => downcast!(Float64Array, Float64),
-            DataType::Decimal128(_, scale) => array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .map(|array| Self::Decimal128(array, 10_f64.powi(i32::from(*scale))))
-                .ok_or_else(|| internal("truncate decimal carrier cannot be downcast")),
-            DataType::Null => Ok(Self::Null),
-            _ => Err(invalid(
-                "truncate input is not an installed numeric carrier",
-            )),
-        }
-    }
-    fn value(&self, row: usize) -> f64 {
-        match self {
-            Self::Int8(a) => f64::from(a.value(row)),
-            Self::Int16(a) => f64::from(a.value(row)),
-            Self::Int32(a) => f64::from(a.value(row)),
-            Self::Int64(a) => a.value(row) as f64,
-            Self::Float32(a) => f64::from(a.value(row)),
-            Self::Float64(a) => a.value(row),
-            // Keep the original i128->f64 conversion before division. This is
-            // deliberately not exact integer decimal truncation.
-            Self::Decimal128(a, divisor) => (a.value(row) as f64) / divisor,
-            Self::Null => unreachable!("Null carriers never produce a non-null row"),
-        }
-    }
-    fn digits(&self, row: usize) -> Option<i64> {
-        match self {
-            Self::Int8(a) => Some(i64::from(a.value(row))),
-            Self::Int16(a) => Some(i64::from(a.value(row))),
-            Self::Int32(a) => Some(i64::from(a.value(row))),
-            Self::Int64(a) => Some(a.value(row)),
-            Self::Float32(a) => Some(f64::from(a.value(row)))
-                .filter(|v| v.is_finite())
-                .map(|v| v as i64),
-            Self::Float64(a) => Some(a.value(row))
-                .filter(|v| v.is_finite())
-                .map(|v| v as i64),
-            // The installed Decimal digits reader saturates after the same
-            // floating conversion; it is not ROUND's checked Arrow cast.
-            Self::Decimal128(..) => Some(self.value(row) as i64),
-            Self::Null => None,
-        }
-    }
-}
 struct NumericValue<'a> {
     argument: EvaluatedArgument<'a>,
-    view: NumericInput<'a>,
+    view: NumericArrayView<'a>,
     nullable: bool,
 }
 impl<'a> NumericValue<'a> {
@@ -137,18 +53,45 @@ impl<'a> NumericValue<'a> {
         argument: EvaluatedArgument<'a>,
         source: &FunctionValueType,
     ) -> Result<Self, KernelFailure> {
+        if source.logical_type != ValueLogicalType::Physical
+            || argument.array().data_type() != &source.data_type
+        {
+            return Err(invalid(
+                "truncate input differs from its exact numeric carrier",
+            ));
+        }
+        match source.data_type {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64 => {}
+            DataType::Decimal128(precision, scale) => {
+                validate_decimal_precision_and_scale::<Decimal128Type>(precision, scale)
+                    .map_err(|_| invalid("truncate selected decimal parameters are invalid"))?;
+            }
+            DataType::Null if source.nullable => {}
+            _ => {
+                return Err(invalid(
+                    "truncate input is not an installed numeric carrier",
+                ));
+            }
+        }
+        let view = NumericArrayView::new(argument.array()).map_err(|message| internal(&message))?;
         Ok(Self {
             argument,
-            view: NumericInput::checked(argument.array(), source)?,
+            view,
             nullable: source.nullable,
         })
     }
     fn row(&self, ordinal: usize, batch_row: usize) -> Result<Option<usize>, KernelFailure> {
         let row = self.argument.value_row(ordinal, batch_row);
-        if row >= self.argument.array().len() {
+        let array = self.argument.array();
+        if row >= array.len() {
             return Err(internal("truncate selected row is outside its carrier"));
         }
-        if self.argument.array().is_null(row) || matches!(self.view, NumericInput::Null) {
+        if array.is_null(row) || matches!(self.view, NumericArrayView::Null(_)) {
             if !self.nullable {
                 return Err(internal(
                     "truncate non-null input contains selected SQL NULL",
@@ -159,87 +102,15 @@ impl<'a> NumericValue<'a> {
             Ok(Some(row))
         }
     }
-}
-
-enum Output {
-    Integer(Int64Builder),
-    Float(Float64Builder),
-    Decimal {
-        builder: Decimal128Builder,
-        multiplier: f64,
-        precision: u8,
-        policy: DecimalOverflowPolicy,
-    },
-}
-impl Output {
-    fn new(
-        target: &FunctionValueType,
-        rows: usize,
-        policy: DecimalOverflowPolicy,
-    ) -> Result<Self, KernelFailure> {
-        if target.logical_type != ValueLogicalType::Physical || !target.nullable {
-            return Err(invalid(
-                "truncate requires its exact nullable Physical result",
-            ));
-        }
-        match target.data_type {
-            DataType::Int64 => Ok(Self::Integer(Int64Builder::with_capacity(rows))),
-            DataType::Float64 => Ok(Self::Float(Float64Builder::with_capacity(rows))),
-            DataType::Decimal128(38, scale) => {
-                let builder = Decimal128Builder::with_capacity(rows)
-                    .with_precision_and_scale(38, scale)
-                    .map_err(|_| {
-                        invalid("truncate selected decimal result parameters are invalid")
-                    })?;
-                Ok(Self::Decimal {
-                    builder,
-                    multiplier: 10_f64.powi(i32::from(scale)),
-                    precision: 38,
-                    policy,
-                })
-            }
-            _ => Err(invalid(
-                "truncate result is not an installed output carrier",
-            )),
-        }
+    fn value(&self, ordinal: usize, batch_row: usize) -> Result<Option<f64>, KernelFailure> {
+        Ok(self
+            .row(ordinal, batch_row)?
+            .and_then(|row| self.view.value_f64(row)))
     }
-    fn append(&mut self, value: Option<f64>, ordinal: usize, errors: &mut Vec<RowDataError>) {
-        match self {
-            // This is Arrow's checked numeric f64->i64 conversion, including
-            // its asymmetric inclusive lower/exclusive upper boundary.
-            Self::Integer(builder) => {
-                builder.append_option(value.and_then(<i64 as DecimalCast>::from_f64))
-            }
-            Self::Float(builder) => builder.append_option(value),
-            Self::Decimal {
-                builder,
-                multiplier,
-                precision,
-                policy,
-            } => {
-                let converted = value.and_then(|value| {
-                    <i128 as DecimalCast>::from_f64((*multiplier * value).round())
-                        .filter(|raw| Decimal128Type::is_valid_decimal_precision(*raw, *precision))
-                });
-                if value.is_some()
-                    && converted.is_none()
-                    && *policy == DecimalOverflowPolicy::ReportError
-                {
-                    errors.push(RowDataError::new(
-                        ordinal,
-                        "decimal overflow in truncate output",
-                    ));
-                }
-                builder.append_option(converted);
-            }
-        }
-    }
-    fn finish(self) -> ArrayRef {
-        match self {
-            Self::Integer(mut b) => Arc::new(b.finish()),
-            Self::Float(mut b) => Arc::new(b.finish()),
-            Self::Decimal { mut builder, .. } => Arc::new(builder.finish()),
-        }
+    fn digits(&self, ordinal: usize, batch_row: usize) -> Result<Option<i64>, KernelFailure> {
+        Ok(self
+            .row(ordinal, batch_row)?
+            .and_then(|row| self.view.value_i64(row)))
     }
 }
 
@@ -281,69 +152,88 @@ pub(super) fn evaluate_truncate<'a>(
             ));
         }
     };
+    let target = input.contract().result_type();
+    if target.logical_type != ValueLogicalType::Physical || !target.nullable {
+        return Err(invalid(
+            "truncate requires its exact nullable Physical result",
+        ));
+    }
+    match (value.argument.array().data_type(), &target.data_type, op) {
+        (DataType::Decimal128(..), DataType::Decimal128(38, scale), _) => {
+            validate_decimal_precision_and_scale::<Decimal128Type>(38, *scale)
+                .map_err(|_| invalid("truncate selected decimal result parameters are invalid"))?;
+        }
+        (source, DataType::Int64, TruncateOp::Unary)
+            if !matches!(source, DataType::Decimal128(..)) => {}
+        (source, DataType::Float64, TruncateOp::Binary)
+            if !matches!(source, DataType::Decimal128(..)) => {}
+        _ => {
+            return Err(invalid(
+                "truncate result is not an installed output carrier",
+            ));
+        }
+    }
     let selection = input.selection();
     output_capacity(selection.len())?;
-    let target = input.contract().result_type();
-    let mut output = Output::new(
-        target,
-        selection.len(),
-        input.contract().decimal_overflow_policy(),
-    )?;
-    let mut errors = Vec::new();
-    let mut work = EvaluationCheckpoints::new(control);
-    for (ordinal, batch_row) in selection.iter().enumerate() {
-        work.step()?;
-        let left = value
-            .row(ordinal, batch_row)?
-            .map(|row| value.view.value(row));
-        let result = match &digits {
-            None => left.map(f64::trunc),
-            Some(digits) => {
-                let right = digits
-                    .row(ordinal, batch_row)?
-                    .and_then(|row| digits.view.digits(row));
-                match (left, right) {
-                    (Some(value), Some(digits)) if digits >= 0 => {
-                        let factor = 10_f64.powi(digits as i32);
-                        Some((value * factor).trunc() / factor)
-                    }
-                    (Some(value), Some(digits)) => {
-                        // Unsigned magnitude fixes i64::MIN negation without
-                        // changing the installed exponent's i32 projection.
-                        let factor = 10_f64.powi(digits.unsigned_abs() as i32);
-                        Some((value / factor).trunc() * factor)
-                    }
-                    _ => None,
-                }
-            }
-        }
-        .filter(|value| value.is_finite());
-        output.append(result, ordinal, &mut errors);
-    }
-    let values = output.finish();
-    work.finish()?;
-    SelectedValues::try_new(
+    let computation = match op {
+        TruncateOp::Unary => DroundComputation::Truncate,
+        TruncateOp::Binary => DroundComputation::TruncateDigits,
+    };
+    let values = compute_dround(
+        computation,
         selection,
-        &target.data_type,
-        values,
-        errors.into_boxed_slice(),
+        Some(&target.data_type),
+        Some(control),
+        |ordinal, batch_row| {
+            let x = value.value(ordinal, batch_row)?;
+            let digits = digits
+                .as_ref()
+                .map(|digits| digits.digits(ordinal, batch_row))
+                .transpose()?
+                .flatten();
+            Ok((x, digits))
+        },
     )
-    .map_err(|_| internal("truncate compact output violates its selected contract"))
+    .map_err(|error| match error {
+        MathNumericError::Kernel(error) => error,
+        // Exact supported inputs and safe output casts have no lawful whole
+        // data-error route. Preserve an unexpected core diagnostic as Internal.
+        MathNumericError::Legacy(message) => internal(&message),
+    })?;
+    SelectedValues::try_new(selection, &target.data_type, values, Box::default())
+        .map_err(|_| internal("truncate compact output violates its selected contract"))
 }
-// Representation limits are not a memory grant. Formal host admission remains
-// required before the output builders and bounded row-error storage allocate.
+
+/// Rust/Arrow representation limits only; these checks grant no capacity.
 fn output_capacity(rows: usize) -> Result<(), KernelFailure> {
-    for width in [
-        16,
-        std::mem::size_of::<RowDataError>() + crate::MAX_ROW_ERROR_MESSAGE_BYTES,
+    let exhausted = || KernelFailure::ResourceExhausted;
+    Layout::array::<Option<f64>>(rows).map_err(|_| exhausted())?;
+    // The original Float64 sanitizer starts with a 1024-element Vec and
+    // doubles while appending. Validate every possible final growth capacity,
+    // not just the compact result length. Its nullable builder materializes
+    // an Arrow bitmap; the initial Float64 and safe cast also create buffers.
+    let capacity = rows
+        .max(1024)
+        .checked_next_power_of_two()
+        .ok_or_else(exhausted)?;
+    Layout::array::<f64>(capacity).map_err(|_| exhausted())?;
+    let bitmap = capacity.checked_add(7).ok_or_else(exhausted)? / 8;
+    for bytes in [
+        rows.checked_mul(8).ok_or_else(exhausted)?,
+        rows.checked_mul(16).ok_or_else(exhausted)?,
+        bitmap,
     ] {
-        let bytes = rows
-            .checked_mul(width)
-            .ok_or(KernelFailure::ResourceExhausted)?;
-        isize::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
+        arrow_layout(bytes)?;
     }
-    rows.checked_add(7)
-        .ok_or(KernelFailure::ResourceExhausted)?;
+    Ok(())
+}
+fn arrow_layout(bytes: usize) -> Result<(), KernelFailure> {
+    let rounded = bytes
+        .checked_add(63)
+        .ok_or(KernelFailure::ResourceExhausted)?
+        & !63;
+    Layout::from_size_align(rounded, arrow_buffer::alloc::ALIGNMENT)
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
     Ok(())
 }
 

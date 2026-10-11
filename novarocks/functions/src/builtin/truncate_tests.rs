@@ -17,7 +17,11 @@
 
 use super::*;
 use crate::{ConstantPolicy, ConstantPool, ScalarEvaluationInstance, Selection};
+use arrow_array::{Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int64Array};
+use arrow_cast::cast::DecimalCast;
 use novarocks_type_contract::CompilePhase;
+use novarocks_type_contract::DecimalOverflowPolicy;
+use std::sync::Arc;
 use std::{sync::Mutex, time::Duration};
 
 #[derive(Default)]
@@ -227,12 +231,11 @@ fn binary_float_truncation_preserves_sign_and_successful_nulls() {
 }
 
 #[test]
-fn signed_digits_are_lossless_before_unsigned_magnitude_and_exponent_projection() {
+fn signed_digits_preserve_original_wide_exponent_projection() {
     assert_floats(
         &dense(vec![
-            floats(vec![Some(12.99); 6]),
+            floats(vec![Some(12.99); 5]),
             signed(vec![
-                Some(i64::MIN),
                 Some(i64::MAX),
                 Some(4_294_967_296),
                 Some(4_294_967_297),
@@ -240,14 +243,7 @@ fn signed_digits_are_lossless_before_unsigned_magnitude_and_exponent_projection(
                 Some(9_007_199_254_740_993),
             ]),
         ]),
-        &[
-            Some(12.0),
-            Some(10.0),
-            Some(12.0),
-            Some(12.9),
-            Some(12.0),
-            Some(12.9),
-        ],
+        &[Some(10.0), Some(12.0), Some(12.9), Some(12.0), Some(12.9)],
     );
 }
 
@@ -255,12 +251,11 @@ fn signed_digits_are_lossless_before_unsigned_magnitude_and_exponent_projection(
 fn float_digits_truncate_saturate_and_refuse_nonfinite_values() {
     assert_floats(
         &dense(vec![
-            floats(vec![Some(123.99); 8]),
+            floats(vec![Some(123.99); 7]),
             floats(vec![
                 Some(1.9),
                 Some(-1.9),
                 Some(f64::MAX),
-                Some(-f64::MAX),
                 Some(f64::NAN),
                 Some(f64::INFINITY),
                 Some(f64::NEG_INFINITY),
@@ -271,7 +266,6 @@ fn float_digits_truncate_saturate_and_refuse_nonfinite_values() {
             Some(123.9),
             Some(120.0),
             Some(120.0),
-            Some(123.0),
             None,
             None,
             None,
@@ -342,7 +336,7 @@ fn decimal_unary_output_preserves_floating_conversion_and_extreme_scale() {
 }
 
 #[test]
-fn legal_decimal_precision_overflow_obeys_policy_and_selected_error_ordinal() {
+fn legal_decimal_precision_overflow_is_successful_null_under_both_policies() {
     const MAX38: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999;
     // Independent IEEE arithmetic: MAX38 rounds to binary64 bits
     // 0x47d2ced32a16a1b1. At scale -46, decode then re-encode rounds
@@ -383,16 +377,7 @@ fn legal_decimal_precision_overflow_obeys_policy_and_selected_error_ordinal() {
             .unwrap();
         assert_eq!(output.selection().iter().collect::<Vec<_>>(), rows);
         assert_decimals(output.values(), -46, &[Some(0), None]);
-        if policy == DecimalOverflowPolicy::ReportError {
-            assert_eq!(output.errors().len(), 1);
-            assert_eq!(output.errors()[0].selected_ordinal(), 1);
-            assert_eq!(
-                output.errors()[0].message(),
-                "decimal overflow in truncate output"
-            );
-        } else {
-            assert!(output.errors().is_empty());
-        }
+        assert!(output.errors().is_empty());
     }
 }
 
@@ -515,48 +500,99 @@ fn control_fixture(arity: usize) -> (Vec<FunctionValueType>, Vec<ArrayRef>) {
     (types, arrays)
 }
 #[test]
-fn original_control_entry_body_quantum_tail_and_publication_errors_poison_instance() {
-    for arity in [1, 2] {
-        let (types, arrays) = control_fixture(arity);
+fn original_core_control_refusals_preserve_every_prefix_and_poison_instance() {
+    let profiles = [
+        vec![floats(vec![Some(1.99)])],
+        vec![floats(vec![Some(1.99)]), signed(vec![Some(1)])],
+        vec![decimals(vec![Some(199)], 2), signed(vec![Some(1)])],
+    ];
+    for arrays in profiles {
+        let types = arrays
+            .iter()
+            .map(|a| FunctionValueType::new(a.data_type().clone(), true))
+            .collect::<Vec<_>>();
         let args = arrays
             .iter()
             .map(EvaluatedArgument::Scalar)
             .collect::<Vec<_>>();
-        let selection = Selection::all(320);
-        let mut baseline = instance(&types, DecimalOverflowPolicy::OutputNull);
-        let control = Control::default();
-        baseline.evaluate(selection, &args, &control).unwrap();
-        let calls = control.calls();
-        let body = calls
-            .iter()
-            .enumerate()
-            .filter(|(_, units)| **units == 0)
-            .nth(arity + 1)
-            .unwrap()
-            .0;
-        let quantum = calls.iter().position(|units| *units == 256).unwrap();
-        assert!(body < quantum);
-        assert_eq!(calls[quantum + 1], 64);
-        for error in [
-            KernelFailure::Cancelled,
-            KernelFailure::DeadlineExceeded,
-            KernelFailure::ResourceExhausted,
+        for policy in [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
         ] {
-            for at in [0, body, quantum, quantum + 1, calls.len() - 1] {
-                let mut call = instance(&types, DecimalOverflowPolicy::OutputNull);
-                let control = Control::refusing(at, error.clone());
-                assert_eq!(
-                    call.evaluate(selection, &args, &control).unwrap_err(),
-                    error
-                );
-                assert_eq!(control.calls().len(), at + 1);
-                let retry = Control::default();
-                assert_eq!(
-                    call.evaluate(selection, &args, &retry).unwrap_err(),
-                    KernelFailure::InstanceFailed
-                );
-                assert!(retry.calls().is_empty());
+            for rows in [320, 1025] {
+                let selection = Selection::all(rows);
+                let mut baseline = instance(&types, policy);
+                let control = Control::default();
+                baseline.evaluate(selection, &args, &control).unwrap();
+                let calls = control.calls();
+                assert!(calls.contains(&256));
+                // Both the original math and Float64 sanitizer traverse rows.
+                assert!(calls.iter().map(|n| *n as usize).sum::<usize>() >= rows * 2);
+                for error in [
+                    KernelFailure::Cancelled,
+                    KernelFailure::DeadlineExceeded,
+                    KernelFailure::ResourceExhausted,
+                ] {
+                    for at in 0..calls.len() {
+                        let mut call = instance(&types, policy);
+                        let control = Control::refusing(at, error.clone());
+                        assert_eq!(
+                            call.evaluate(selection, &args, &control).unwrap_err(),
+                            error
+                        );
+                        assert_eq!(control.calls(), calls[..=at]);
+                        let retry = Control::default();
+                        assert_eq!(
+                            call.evaluate(selection, &args, &retry).unwrap_err(),
+                            KernelFailure::InstanceFailed
+                        );
+                        assert!(retry.calls().is_empty());
+                    }
+                }
             }
+        }
+    }
+}
+
+#[test]
+fn minimum_digits_keep_original_fatal_payload_instead_of_unsigned_magnitude() {
+    use super::super::dround_core::{DroundComputation, evaluate_legacy_dround};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    fn fatal(f: impl FnOnce() -> ArrayRef) -> (String, String) {
+        let payload = catch_unwind(AssertUnwindSafe(f)).unwrap_err();
+        if let Some(s) = payload.downcast_ref::<String>() {
+            ("String".into(), s.clone())
+        } else if let Some(s) = payload.downcast_ref::<&str>() {
+            ("&str".into(), (*s).into())
+        } else {
+            panic!("unknown TRUNCATE fatal payload")
+        }
+    }
+    let digits = [
+        signed(vec![Some(i64::MIN)]),
+        floats(vec![Some(-f64::MAX)]),
+        Arc::new(Float32Array::from(vec![Some(-f32::MAX)])) as ArrayRef,
+        Arc::new(
+            Decimal128Array::from(vec![Some(-1)])
+                .with_precision_and_scale(1, -19)
+                .unwrap(),
+        ) as ArrayRef,
+    ];
+    for digits in digits {
+        for value in [12.99, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let value = floats(vec![Some(value)]);
+            let original = fatal(|| {
+                evaluate_legacy_dround(
+                    DroundComputation::TruncateDigits,
+                    &value,
+                    Some(&digits),
+                    1,
+                    Some(&DataType::Float64),
+                )
+                .unwrap()
+            });
+            let selected = fatal(|| dense(vec![value.clone(), digits.clone()]));
+            assert_eq!(original, selected);
         }
     }
 }
