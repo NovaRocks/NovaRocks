@@ -1972,3 +1972,6 @@ mod parse_json_tests;
 
 #[path = "pure_differential/truncate_shared_core_tests.rs"]
 mod truncate_shared_core_tests;
+
+#[path = "pure_differential/trim_shared_core_tests.rs"]
+mod trim_shared_core_tests;

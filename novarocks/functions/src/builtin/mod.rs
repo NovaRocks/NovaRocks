@@ -214,6 +214,7 @@ mod string_substring_owner;
 mod string_translate;
 mod string_translate_owner;
 mod string_trim;
+pub mod string_trim_core;
 mod string_trim_owner;
 mod string_url_decode;
 mod string_url_decode_owner;

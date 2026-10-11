@@ -659,3 +659,86 @@ fn string_trim_compile_success_and_ordinary_tail_preserve_all_callback_causes() 
         }
     }
 }
+
+#[test]
+fn string_trim_complete_original_success_trace_and_every_first_cause() {
+    let corpus = [
+        String::new(),
+        "x".into(),
+        "\u{2003}".repeat(320),
+        format!("{}x{}", "\u{2003}".repeat(320), "\u{3000}".repeat(320)),
+        format!("{}x{}", "\u{2003}".repeat(1025), "\u{3000}".repeat(1025)),
+    ];
+    let mut checks = 0;
+    for name in NAMES {
+        for policy in [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
+        ] {
+            for (case, text) in corpus.iter().enumerate() {
+                let array = strings(vec![Some(text.as_str()), None]);
+                let fresh = || {
+                    ScalarEvaluationInstance::instantiate(
+                        prepared_for_test_with_policy(name, &source(true), policy).unwrap(),
+                    )
+                    .unwrap()
+                };
+                let good = Control::default();
+                let mut kernel = fresh();
+                let arguments = [EvaluatedArgument::Column(&array)];
+                let result = kernel
+                    .evaluate(Selection::all(2), &arguments, &good)
+                    .unwrap();
+                let value = match name {
+                    "trim" => text.trim(),
+                    "ltrim" => text.trim_start(),
+                    "rtrim" => text.trim_end(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(output(&result), vec![Some(value.into()), None]);
+                let trace = good.trace.lock().unwrap().clone();
+                println!("C12-P1 trace name={name} policy={policy:?} case={case} units={trace:?}");
+                assert!(!trace.is_empty());
+                for at in 0..trace.len() {
+                    for cause in [
+                        KernelFailure::Cancelled,
+                        KernelFailure::DeadlineExceeded,
+                        KernelFailure::ResourceExhausted,
+                    ] {
+                        let control = Control {
+                            trace: Mutex::new(vec![]),
+                            refusal: Some((at, cause.clone())),
+                        };
+                        let mut kernel = fresh();
+                        assert_eq!(
+                            kernel
+                                .evaluate(
+                                    Selection::all(2),
+                                    &[EvaluatedArgument::Column(&array)],
+                                    &control
+                                )
+                                .unwrap_err(),
+                            cause
+                        );
+                        assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                        let after = Control::default();
+                        assert_eq!(
+                            kernel
+                                .evaluate(
+                                    Selection::all(2),
+                                    &[EvaluatedArgument::Column(&array)],
+                                    &after
+                                )
+                                .unwrap_err(),
+                            KernelFailure::InstanceFailed
+                        );
+                        assert!(after.trace.lock().unwrap().is_empty());
+                        checks += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checks > 0);
+    println!("C12-P1 complete first-cause checks={checks}");
+}

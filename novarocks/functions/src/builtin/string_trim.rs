@@ -19,6 +19,7 @@
 //! Checks cover requested-layout representability. Arrow construction and
 //! allocator internals remain opaque; this is not a formal host memory grant.
 
+use super::string_trim_core::{StringTrimOp, trimmed_observed};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
@@ -29,46 +30,6 @@ use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::{alloc::Layout, sync::Arc};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum StringTrimOp {
-    Left,
-    Right,
-    Both,
-}
-
-fn trimmed<'s>(
-    op: StringTrimOp,
-    text: &'s str,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<&'s str, KernelFailure> {
-    let mut start = 0usize;
-    let mut end = text.len();
-    // str::trim{,_start,_end} uses this same char::is_whitespace predicate.
-    // Each visited UTF-8 scalar consumes at most four bytes; source boundaries
-    // come from the original iterator, with no temporary text or side index.
-    if matches!(op, StringTrimOp::Left | StringTrimOp::Both) {
-        for ch in text.chars() {
-            let whitespace = ch.is_whitespace();
-            work.step()?;
-            if !whitespace {
-                break;
-            }
-            start += ch.len_utf8();
-        }
-    }
-    if matches!(op, StringTrimOp::Right | StringTrimOp::Both) {
-        for ch in text[start..].chars().rev() {
-            let whitespace = ch.is_whitespace();
-            work.step()?;
-            if !whitespace {
-                break;
-            }
-            end -= ch.len_utf8();
-        }
-    }
-    Ok(&text[start..end])
-}
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -142,7 +103,7 @@ pub(super) fn evaluate_string_trim<'a>(
                 }
                 continue;
             }
-            let selected = trimmed(op, values.value(row), &mut work)?;
+            let selected = trimmed_observed(op, values.value(row), || work.step())?;
             output_bytes = output_bytes
                 .checked_add(selected.len())
                 .ok_or(KernelFailure::ResourceExhausted)?;
@@ -169,7 +130,7 @@ pub(super) fn evaluate_string_trim<'a>(
                 has_null = true;
                 validity.append(false);
             } else {
-                let selected = trimmed(op, values.value(row), &mut work)?;
+                let selected = trimmed_observed(op, values.value(row), || work.step())?;
                 if selected.len() > output_bytes - bytes.len() {
                     return Err(internal(
                         "whitespace trimming exceeded its measured output extent",

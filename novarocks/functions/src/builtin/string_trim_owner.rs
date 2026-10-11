@@ -26,7 +26,7 @@ use novarocks_type_contract::{
 };
 
 use super::catalogue::BuiltinScalarResolver;
-use super::string_trim::StringTrimOp;
+use super::string_trim_core::StringTrimOp;
 use crate::kernel_control::{compile_failure, invalid};
 use crate::{
     CallEffectInput, FunctionBindingDeclaration, FunctionBindingError, FunctionBindingRequest,
