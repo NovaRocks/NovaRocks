@@ -160,6 +160,63 @@ pub fn decode_package_type_table_observed(
     decode::decode_package(package, source_retained_bytes, limits, admit, work)
 }
 
+/// Host capability for exactly the original final materialization tail.
+/// Preflight, topology and the last numerical gate have already succeeded.
+/// The synchronous continuation retains the original source borrows and may
+/// execute at most once; this trait supplies no allocation or account policy.
+pub trait PackageTypeMaterializationScope {
+    type HostError;
+
+    fn materialize<B>(
+        &mut self,
+        facts: &PackageTypeProjectionFacts,
+        body: B,
+    ) -> Result<
+        DecodedTypeTable,
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, Self::HostError>,
+    >
+    where
+        B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>;
+}
+
+/// The original decoder's adapter, with an uninhabited host failure channel.
+/// Runtime callers needing funding must supply their own explicit capability.
+pub struct DirectTypeMaterialization;
+impl PackageTypeMaterializationScope for DirectTypeMaterialization {
+    type HostError = std::convert::Infallible;
+
+    fn materialize<B>(
+        &mut self,
+        _: &PackageTypeProjectionFacts,
+        body: B,
+    ) -> Result<
+        DecodedTypeTable,
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, Self::HostError>,
+    >
+    where
+        B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>,
+    {
+        body().map_err(crate::host_projection_v2::ProjectionFailure::Codec)
+    }
+}
+
+/// The same package decoder with a borrowed host at its one materialization
+/// boundary. The original type/control failure and nominal host refusal remain
+/// separate, with no extra decoder, checkpoint or fallible completion callback.
+pub fn decode_package_type_table_with_host_observed<H: PackageTypeMaterializationScope>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+    host: &mut H,
+) -> Result<
+    DecodedTypeTable,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, H::HostError>,
+> {
+    decode::decode_package_with_host(package, source_retained_bytes, limits, admit, work, host)
+}
+
 /// A caller-authored projection envelope. No guessed or unbounded default is
 /// available. Definitions count all three namespaces; expanded nodes count
 /// each definition's unfolded carrier subtree, including field/value copies and

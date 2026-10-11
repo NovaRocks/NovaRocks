@@ -1470,10 +1470,11 @@ impl TaskExecutionRegistry {
         // publishes anything, and a refusal returns only after the host undid
         // its own local preparation: nothing is recorded as installed until it
         // succeeds, so this owner never removes a receiver it does not hold.
-        let prepared = match self
-            .task_host
-            .install_receiver(&transaction.descriptor, input)
-        {
+        let prepared = match self.task_host.install_receiver(
+            &transaction.descriptor,
+            input,
+            &crate::PreparationControlLoan::new(&transaction.cell, self.config.gate_poll_interval),
+        ) {
             Ok(prepared) => prepared,
             Err(rejection) => {
                 return transaction.abandon(
@@ -4553,7 +4554,9 @@ mod registry_lock_observation_tests {
 mod preparation_snapshot_tests {
     use super::*;
     use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
-    use novarocks_types::{AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId,
+    };
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::mpsc;
 
@@ -4591,6 +4594,7 @@ mod preparation_snapshot_tests {
             &self,
             _: &TaskDescriptor,
             _: TaskCreationInput,
+            _preparation: &crate::PreparationControlLoan<'_>,
         ) -> Result<crate::PreparedTaskInstallation, crate::HostRejection> {
             panic!("preparation observation installed receiver")
         }

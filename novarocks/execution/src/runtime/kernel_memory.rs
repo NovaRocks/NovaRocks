@@ -18,16 +18,16 @@
 //! Task-owned funding capability and one synchronous Ready continuation.
 //! Observation is not admission. The caller supplies a source-proven workset,
 //! stock, threshold and maintenance budget; this module invents none of them.
+use crate::runtime::query_memory::QueryMemoryBinding;
+use novarocks_memory::attribution::scope::AmbientStepObservation;
 use novarocks_memory::{
     CapacityError, CoverageReceipt, FundingDomain, RequestOutcome, ScopeLease, ShortageReceipt,
     StepReceipt, TeardownError,
 };
-use novarocks_memory::attribution::scope::AmbientStepObservation;
 use std::cell::Cell;
-use crate::runtime::query_memory::QueryMemoryBinding;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::exec::operators) struct KernelMemoryRequest {
+pub struct KernelMemoryRequest {
     pub workset_bytes: u64,
     pub stock_bytes: u64,
     pub threshold_bytes: u64,
@@ -37,7 +37,7 @@ pub(in crate::exec::operators) struct KernelMemoryRequest {
 /// Admission precedes the body. Pending and shortage retain their original
 /// nominal receipts, and cannot run or replay the supplied continuation.
 #[derive(Debug)]
-pub(in crate::exec::operators) enum KernelMemoryAdmission {
+pub enum KernelMemoryAdmission {
     MissingQueryMemory,
     Granted(ReadyKernelMemory),
     SettlementPending(CoverageReceipt),
@@ -45,7 +45,7 @@ pub(in crate::exec::operators) enum KernelMemoryAdmission {
     Refused(CapacityError),
 }
 
-pub(in crate::exec::operators) fn request(
+pub fn request(
     binding: Option<&QueryMemoryBinding>,
     request: KernelMemoryRequest,
 ) -> KernelMemoryAdmission {
@@ -83,7 +83,7 @@ pub(in crate::exec::operators) fn request(
 /// next-step receipt is checked only after that bounded synchronous body.
 /// Registry lengths bound one sweep, not concurrent busy/stale qualification:
 /// the original Pending and SharedShortage outcomes remain nominal.
-pub(in crate::exec::operators) fn request_complete_operation(
+pub fn request_complete_operation(
     binding: Option<&QueryMemoryBinding>,
     actual_peak: usize,
 ) -> KernelMemoryAdmission {
@@ -117,14 +117,14 @@ pub(in crate::exec::operators) fn request_complete_operation(
 /// callback is needed after a body error. The primary result stays with its
 /// original owner; these secondary observations never replace that result.
 #[derive(Debug, Default)]
-pub(in crate::exec::operators) struct KernelMemoryJournal {
+pub struct KernelMemoryJournal {
     pub observation: AmbientStepObservation,
     pub settlement: Option<StepReceipt>,
     pub stopped: Option<Result<(), TeardownError>>,
 }
 
 #[derive(Debug)]
-pub(in crate::exec::operators) struct ReadyKernelMemory {
+pub struct ReadyKernelMemory {
     domain: FundingDomain,
     stock_bytes: u64,
     threshold_bytes: u64,
@@ -149,7 +149,16 @@ impl Drop for SettleReady<'_> {
 }
 impl ReadyKernelMemory {
     #[cfg(test)]
-    pub(in crate::exec::operators) fn domain(&self) -> &FundingDomain {
+    pub(crate) fn stock_bytes(&self) -> u64 {
+        self.stock_bytes
+    }
+    #[cfg(test)]
+    pub(crate) fn threshold_bytes(&self) -> u64 {
+        self.threshold_bytes
+    }
+
+    #[cfg(test)]
+    pub fn domain(&self) -> &FundingDomain {
         &self.domain
     }
 
@@ -162,7 +171,7 @@ impl ReadyKernelMemory {
     /// observation is restored before return, and does not propagate to polls.
     /// Environment allocations below 512 bytes retain the original process-only
     /// policy. Explicit R1 allocations remain their own owner's responsibility.
-    pub(in crate::exec::operators) fn run<T>(
+    pub fn run<T>(
         &self,
         journal: &mut KernelMemoryJournal,
         body: impl FnOnce() -> T,
@@ -197,7 +206,3 @@ impl Drop for ReadyKernelMemory {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "runtime_kernel_memory_tests.rs"]
-mod tests;

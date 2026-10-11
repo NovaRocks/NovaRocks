@@ -24,7 +24,7 @@
 //! request from being mistaken for a brand new task.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
 use novarocks_execution_contract::task_execution::creation::PreparedTaskFacts;
@@ -96,8 +96,9 @@ pub(super) struct CreationFailure {
 /// round this cell belongs to, never by comparing its own body with the
 /// winner's: the frontend freezes exactly one body per identity, so a request
 /// naming an identity asks for the entity that identity already names.
-pub(super) struct CreationCell {
+pub(crate) struct CreationCell {
     decision: Mutex<CreationDecision>,
+    preparation_changed: Condvar,
     accepted_status: Mutex<Option<Arc<TaskStatusOwner>>>,
 }
 
@@ -107,7 +108,7 @@ struct CreationDecision {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub(super) enum PreparationStop {
+pub enum PreparationStop {
     Cancel(CancelReason),
     Abort(AbortCause),
 }
@@ -119,6 +120,7 @@ impl CreationCell {
                 failure: None,
                 stop: None,
             }),
+            preparation_changed: Condvar::new(),
             accepted_status: Mutex::new(None),
         }
     }
@@ -166,11 +168,32 @@ impl CreationCell {
         if decision.stop.is_none() || matches!(stop, PreparationStop::Abort(_)) {
             decision.stop = Some(stop);
         }
+        self.preparation_changed.notify_all();
         true
     }
 
-    pub(super) fn stop(&self) -> Option<PreparationStop> {
+    pub(crate) fn stop(&self) -> Option<PreparationStop> {
         self.decision.lock().expect("creation cell lock").stop
+    }
+
+    /// Check and register the wait under the SAME decision lock used by stop.
+    /// No admission/body/resource cleanup callback runs under this lock.
+    pub(crate) fn wait_preparation(
+        &self,
+        cadence: std::time::Duration,
+    ) -> Result<(), PreparationStop> {
+        let decision = self.decision.lock().expect("creation cell lock");
+        if let Some(stop) = decision.stop {
+            return Err(stop);
+        }
+        let (decision, _) = self
+            .preparation_changed
+            .wait_timeout(decision, cadence)
+            .expect("creation cell wait");
+        match decision.stop {
+            Some(stop) => Err(stop),
+            None => Ok(()),
+        }
     }
 }
 

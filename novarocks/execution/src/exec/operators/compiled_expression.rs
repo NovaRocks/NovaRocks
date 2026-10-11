@@ -45,8 +45,10 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
-#[path = "runtime_kernel_memory.rs"]
-pub(super) mod runtime_kernel_memory;
+pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
+#[cfg(test)]
+#[path = "runtime_kernel_memory_tests.rs"]
+mod runtime_kernel_memory_tests;
 
 /// Kernel control backed by the fragment's runtime error state: a recorded
 /// failure or cancellation refuses the next checkpoint, and waits are

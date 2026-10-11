@@ -363,6 +363,7 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         &self,
         _descriptor: &TaskDescriptor,
         _input: TaskCreationInput,
+        _preparation: &novarocks_worker::PreparationControlLoan<'_>,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         Err(HostRejection::new(
             TaskFailureCategory::Internal,
@@ -1874,7 +1875,9 @@ mod tests {
     #[test]
     fn a_compiled_package_backend_gates_creates_with_its_receiver_admission() {
         use novarocks_connector_contract::PureProviderProgramCatalog;
-        use novarocks_execution_contract::task_execution::identity::{TaskIdentity, TaskOperationId};
+        use novarocks_execution_contract::task_execution::identity::{
+            TaskIdentity, TaskOperationId,
+        };
         use novarocks_functions::{
             EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,
             InstalledPureKernel, PureImplementationDeclaration, PureImplementationId,

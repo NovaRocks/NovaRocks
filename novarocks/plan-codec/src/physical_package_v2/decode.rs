@@ -26,6 +26,7 @@
 
 use super::nodes::{NodeDecodeContext, NodeDispatchLimits, prepare_node_decode_in};
 use super::{PackageWireError, prepare_package_wire_in};
+use crate::host_projection_v2::ProjectionFailure;
 use crate::{
     physical_aggregate_binding_v2::{
         materialize_aggregate_bindings_in, prepare_aggregate_binding_headers_in,
@@ -76,8 +77,8 @@ use crate::{
         decode_frozen_pruning_observed, prepare_semantic_parameters_decode_observed_in,
     },
     physical_type_v2::{
-        PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
-        decode_package_type_table_observed,
+        DirectTypeMaterialization, PackageTypeMaterializationScope, PackageTypeProjectionFacts,
+        PackageTypeProjectionLimits, TypeCodecError, decode_package_type_table_with_host_observed,
     },
     physical_value_v2::{ValueCodecError, ValueProjectionLimits, decode_values_observed_in},
     physical_writer_recipe_v2::{
@@ -169,6 +170,11 @@ impl From<CompileControlError> for PackageDecodeError {
         Self::Control(cause)
     }
 }
+impl<H> From<CompileControlError> for ProjectionFailure<PackageDecodeError, H> {
+    fn from(cause: CompileControlError) -> Self {
+        Self::Codec(PackageDecodeError::Control(cause))
+    }
+}
 // Every component's own control cause stays primary; nothing else is lifted.
 macro_rules! component_error {
     ($($source:ident => $variant:ident),+ $(,)?) => {$(
@@ -178,6 +184,11 @@ macro_rules! component_error {
                     $source::Control(cause) => Self::Control(cause),
                     error => Self::$variant(error),
                 }
+            }
+        }
+        impl<H> From<$source> for ProjectionFailure<PackageDecodeError, H> {
+            fn from(error: $source) -> Self {
+                Self::Codec(PackageDecodeError::from(error))
             }
         }
     )+};
@@ -351,9 +362,32 @@ pub fn decode_fragment_package(
     limits: &PackageDecodeLimits,
     control: &dyn PureCompileControl,
 ) -> Result<p::FragmentPackage, PackageDecodeError> {
+    decode_fragment_package_with_type_host(
+        raw,
+        model,
+        limits,
+        control,
+        &mut DirectTypeMaterialization,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+/// The one whole-package receiver with a borrowed Type materialization host.
+/// Host refusal and an original Control refusal return without a fallible
+/// completion callback; all other codec outcomes keep the original footer.
+pub fn decode_fragment_package_with_type_host<H: PackageTypeMaterializationScope>(
+    raw: &[u8],
+    model: &FragmentDecodeResourceModel,
+    limits: &PackageDecodeLimits,
+    control: &dyn PureCompileControl,
+    host: &mut H,
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H::HostError>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = decode_fragment_package_in(raw, model, limits, &mut work);
-    if matches!(&result, Err(PackageDecodeError::Control(_))) {
+    let result = decode_fragment_package_in(raw, model, limits, &mut work, host);
+    if matches!(
+        &result,
+        Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(PackageDecodeError::Control(_)))
+    ) {
         return result;
     }
     work.finish()?;
@@ -362,12 +396,13 @@ pub fn decode_fragment_package(
 
 /// Same receiver on the caller's scope; the caller owns entry and completion.
 /// Admission callbacks are pass-through: each component gates its own limits.
-pub(crate) fn decode_fragment_package_in(
+fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
     raw: &[u8],
     model: &FragmentDecodeResourceModel,
     limits: &PackageDecodeLimits,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<p::FragmentPackage, PackageDecodeError> {
+    host: &mut H,
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H::HostError>> {
     let plan_limits = limits.admission.plan_limits;
 
     // L0: generated-layout byte admission, then the original Prost verdict.
@@ -417,7 +452,7 @@ pub(crate) fn decode_fragment_package_in(
     // charge their roots; their own admitted request upper bound and inline
     // header join the invoice once.
     let mut type_requests = 0;
-    let types = decode_package_type_table_observed(
+    let types = decode_package_type_table_with_host_observed(
         &wire_package,
         invoice,
         limits.types,
@@ -426,7 +461,14 @@ pub(crate) fn decode_fragment_package_in(
             Ok(())
         },
         work,
-    )?;
+        host,
+    )
+    .map_err(|error| match error {
+        ProjectionFailure::Codec(error) => {
+            ProjectionFailure::Codec(PackageDecodeError::from(error))
+        }
+        ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
+    })?;
     invoice = add(add(invoice, type_requests)?, size_of_val(&types))?;
     // Joint mode is required: writer views exist only on joint bindings.
     let provider_bindings = decode_joint_provider_bindings_in(
