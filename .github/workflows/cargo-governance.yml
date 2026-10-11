@@ -50,3 +50,21 @@ jobs:
 
       - name: Run Cargo governance gates
         run: tools/ci/local-full-ci.sh --cargo-only
+
+      - name: Publish Cargo governance summaries
+        id: publish-ci-logs
+        if: ${{ !cancelled() }}
+        run: |
+          python3 tools/ci/publish-ci-logs.py \
+            --log-root logs/ci-full \
+            --artifact-dir "$RUNNER_TEMP/cargo-governance-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --step-summary "$GITHUB_STEP_SUMMARY" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload Cargo governance logs
+        if: ${{ !cancelled() && steps.publish-ci-logs.outputs.artifact_dir != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-governance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.publish-ci-logs.outputs.artifact_dir }}
+          if-no-files-found: warn
