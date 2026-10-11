@@ -98,11 +98,14 @@ impl KernelEvaluationControl for ObservedControl<'_> {
         result
     }
 }
-struct Work<'a> {
+struct Work<'a, 'scope> {
     control: &'a ObservedControl<'a>,
     pending: u32,
+    scalar_scope: Option<
+        &'scope mut (dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope + 'scope),
+    >,
 }
-impl Work<'_> {
+impl Work<'_, '_> {
     fn step(&mut self) -> Result<(), KernelFailure> {
         self.pending += 1;
         if self.pending == novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK {
@@ -159,7 +162,7 @@ impl Value<'_> {
         self,
         selection: Selection<'a>,
         ty: &DataType,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, KernelFailure>
     where
         Self: 'a,
@@ -204,6 +207,7 @@ impl CompiledExpressionInstance {
         let mut work = Work {
             control: &observed,
             pending: 0,
+            scalar_scope: None,
         };
         let result = Self::prepare(program, root, &mut work);
         work.finish(result)
@@ -221,7 +225,7 @@ impl CompiledExpressionInstance {
     fn prepare(
         program: Arc<LocalProgram>,
         root: ProgramExpressionRootSite,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<Self, KernelFailure> {
         let checked = program.checked();
         let snapshot = checked.channels().expressions().resolved_calls().snapshot();
@@ -587,6 +591,7 @@ impl CompiledExpressionInstance {
         let mut work = Work {
             control: &observed,
             pending: 0,
+            scalar_scope: None,
         };
         let result = observed.checkpoint(0).and_then(|()| {
             self.evaluate_once::<KernelFailure>(
@@ -611,7 +616,32 @@ impl CompiledExpressionInstance {
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, novarocks_functions::ScalarInvocationFailure> {
-        use novarocks_functions::{ScalarInvocationActivation, ScalarInvocationFailure};
+        self.evaluate_controlled::<novarocks_functions::ScalarInvocationFailure>(
+            input, selection, activation, control, None,
+        )
+    }
+    /// Production runtime callers explicitly loan their original synchronous
+    /// operation scope. This uses the SAME Frame tree and demand author.
+    pub fn evaluate_runtime<'a>(
+        &mut self,
+        input: &RecordBatch,
+        selection: Selection<'a>,
+        activation: novarocks_functions::ScalarInvocationActivation,
+        control: &dyn KernelEvaluationControl,
+        scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
+    ) -> Result<SelectedValues<'a>, crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure>
+    {
+        self.evaluate_controlled(input, selection, activation, control, Some(scope))
+    }
+    fn evaluate_controlled<'a, E: scalar_invocation::FrameFailure>(
+        &mut self,
+        input: &RecordBatch,
+        selection: Selection<'a>,
+        activation: novarocks_functions::ScalarInvocationActivation,
+        control: &dyn KernelEvaluationControl,
+        scope: Option<&mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope>,
+    ) -> Result<SelectedValues<'a>, E> {
+        use novarocks_functions::ScalarInvocationActivation;
         if self.failed {
             return Err(KernelFailure::InstanceFailed.into());
         }
@@ -627,17 +657,18 @@ impl CompiledExpressionInstance {
         let mut work = Work {
             control: &observed,
             pending: 0,
+            scalar_scope: scope,
         };
         let result = (|| {
             observed.checkpoint(0)?;
-            self.evaluate_once::<ScalarInvocationFailure>(input, selection, activation, &mut work)
+            self.evaluate_once::<E>(input, selection, activation, &mut work)
         })();
         // A positively installed whole-invocation root preserves every first
         // failure, including entry validation before any leaf is created.
         let result = if self.has_invocation_data && result.is_err() {
             result
         } else {
-            <ScalarInvocationFailure as scalar_invocation::FrameFailure>::finish(&mut work, result)
+            E::finish(&mut work, result)
         };
         if result.is_err() {
             self.failed = true;
@@ -649,7 +680,7 @@ impl CompiledExpressionInstance {
         input: &RecordBatch,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, E> {
         if input.num_rows() != selection.batch_rows() {
             return Err(invalid("selection differs from actual input batch rows").into());
@@ -723,7 +754,7 @@ impl CompiledExpressionInstance {
         input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, E> {
         let checked = self.program.checked();
         let typed = checked.channels().expressions();
@@ -785,7 +816,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
     activation: novarocks_functions::ScalarInvocationActivation,
     instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, E> {
     let mut blocked = Vec::with_capacity(selection.len());
     for _ in 0..selection.len() {
@@ -915,7 +946,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
         call_selection,
         &arguments,
         activation,
-        work.control,
+        work,
     ) {
         Ok(output) => output,
         Err(cause) => {
@@ -968,7 +999,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
 fn gather(
     array: &ArrayRef,
     indices: &[Option<u64>],
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<ArrayRef, KernelFailure> {
     work.flush()?;
     if indices.is_empty() {
@@ -1023,3 +1054,6 @@ mod nary_tests;
 
 mod filter_conjunction;
 pub(crate) use filter_conjunction::CompiledFilterConjunctionInstance;
+
+#[cfg(test)]
+mod runtime_scalar_memory_tests;

@@ -47,7 +47,7 @@ fn control(fail: usize, cause: KernelFailure) -> Control {
         cause,
     }
 }
-fn frame(work: &mut Work<'_>) -> Frame {
+fn frame(work: &mut Work<'_, '_>) -> Frame {
     Frame::new(
         ProgramUseRef {
             arena: ProgramExpressionArena::Main,
@@ -68,7 +68,7 @@ fn child(ordinals: Vec<usize>, array: ArrayRef, errors: Vec<RowDataError>) -> Ch
         value: OwnedValue::Selected(array, errors.into_boxed_slice()),
     }
 }
-fn normal_with_prior_error(frame: &mut Frame, bad_last: bool, work: &mut Work<'_>) {
+fn normal_with_prior_error(frame: &mut Frame, bad_last: bool, work: &mut Work<'_, '_>) {
     frame.next = 1;
     frame
         .attach_temporal(
@@ -98,6 +98,7 @@ fn error_placeholders_never_trigger_whole_invocation_null_guard() {
     let mut work = Work {
         control: &observed,
         pending: 0,
+        scalar_scope: None,
     };
     let mut frame = frame(&mut work);
     normal_with_prior_error(&mut frame, false, &mut work);
@@ -127,6 +128,7 @@ fn demanded_deepest_data_error_projects_all_successes_preserving_prior_child_err
     let mut work = Work {
         control: &observed,
         pending: 0,
+        scalar_scope: None,
     };
     let mut frame = frame(&mut work);
     normal_with_prior_error(&mut frame, true, &mut work);
@@ -172,6 +174,7 @@ fn binary_safe_null_is_data_not_control_failure_for_exact_sparse_domain() {
     let mut work = Work {
         control: &observed,
         pending: 0,
+        scalar_scope: None,
     };
     let mut frame = frame(&mut work);
     frame.next = 3;
@@ -207,6 +210,7 @@ fn long_zone_data_error_is_full_until_owner_row_projection() {
     let mut work = Work {
         control: &observed,
         pending: 0,
+        scalar_scope: None,
     };
     let zone = "invalid_zone_".repeat(60);
     let array =
@@ -265,6 +269,7 @@ fn deepest(control: &Control) -> Result<(), KernelFailure> {
     let mut work = Work {
         control: &observed,
         pending: 0,
+        scalar_scope: None,
     };
     let frame = Frame::new(
         ProgramUseRef {

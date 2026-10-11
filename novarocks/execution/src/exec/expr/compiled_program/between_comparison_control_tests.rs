@@ -97,6 +97,7 @@ fn run<'a>(
     let mut work = Work {
         control: &observed,
         pending: 0,
+        scalar_scope: None,
     };
     let result = evaluate_comparison(
         if nullsafe {
@@ -216,6 +217,7 @@ fn between_comparison_control_row_data_and_legal_boolean_mask_remain_original() 
     let mut w = Work {
         control: &observed,
         pending: 0,
+        scalar_scope: None,
     };
     let mut state = BooleanRows::new(2, &mut w).unwrap();
     let mut errors = BTreeMap::new();

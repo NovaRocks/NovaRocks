@@ -282,6 +282,22 @@ impl PreparedScalarKernel for PreparedBitShift {
         &self.contract
     }
 
+    fn invocation_resource_profile(&self) -> Option<crate::ScalarInvocationResourceProfile> {
+        let physical_int64 = |ty: &crate::FunctionValueType| {
+            ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical
+                && ty.data_type == arrow_schema::DataType::Int64
+        };
+        let arguments = self.contract.value_argument_types();
+        if arguments.len() == 2
+            && arguments.into_iter().all(physical_int64)
+            && physical_int64(self.contract.result_type())
+        {
+            Some(crate::ScalarInvocationResourceProfile::int64_shift())
+        } else {
+            None
+        }
+    }
+
     fn instance_retained_upper_bound(&self) -> usize {
         std::mem::size_of::<BitShiftInstance>()
     }
@@ -420,6 +436,36 @@ mod tests {
             )
             .unwrap(),
         ]
+    }
+
+    #[test]
+    fn exact_int64_prepared_sources_alone_cover_the_original_wrapper_requests() {
+        for name in names() {
+            for source_nullable in [false, true] {
+                for count_nullable in [false, true] {
+                    for source in sources(source_nullable) {
+                        let covered = source.data_type == DataType::Int64;
+                        let prepared = prepared_for_test(
+                            name,
+                            &[
+                                source,
+                                FunctionValueType::new(DataType::Int64, count_nullable),
+                            ],
+                        )
+                        .unwrap();
+                        let profile = prepared.invocation_resource_profile();
+                        assert_eq!(profile.is_some(), covered);
+                        let instance =
+                            crate::ScalarEvaluationInstance::instantiate(prepared).unwrap();
+                        assert_eq!(instance.invocation_resource_profile(), profile);
+                        if let Some(profile) = profile {
+                            assert_eq!(profile.requests(0).unwrap().requests(), 6);
+                            assert_eq!(profile.requests(513).unwrap().requests(), 7);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn prepared_for_test(

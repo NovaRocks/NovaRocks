@@ -541,7 +541,9 @@ def verify_package_targets(package, owner=PACKAGE_NAME):
                         ("proc-macro", "proc-macro target")):
         targets = sorted(target["name"] for target in package.get("targets", [])
                          if kind in target.get("kind", []))
-        if kind == "custom-build" and owner == TYPE_CONTRACT:
+        if kind == "custom-build" and owner in {TYPE_CONTRACT, "novarocks-functions"}:
+            # Source-model audits may inspect the compiler and locked sources;
+            # all dependency authority remains subject to the checks below.
             audited = Path(package["manifest_path"]).parent / "build.rs"
             targets = [target["name"] for target in package.get("targets", [])
                        if kind in target.get("kind", [])

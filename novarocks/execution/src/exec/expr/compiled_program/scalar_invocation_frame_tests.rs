@@ -439,7 +439,7 @@ fn scalar_invocation_original_required_full_data_keeps_actual_domain_and_clone_d
             &mut instance,
             root(),
             &batch,
-            &Control,
+            &crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::default()),
         )
         .unwrap_err();
         let ExecutionFailureCause::ScalarInvocationData(actual) = error.cause() else {

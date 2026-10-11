@@ -81,6 +81,8 @@ pub enum ExecutionFailureCause {
     /// infer a resource, deadline, transport or invariant category from text.
     Pipeline(String),
     Kernel(KernelFailure),
+    RuntimeScalarSource(novarocks_functions::ScalarResourceError),
+    RuntimeScalarMemory(crate::runtime::scalar_memory::RuntimeScalarMemoryRefusal),
     InvocationData(novarocks_functions::InvocationData),
     ScalarInvocationData(novarocks_functions::ScalarInvocationData),
     WindowInvocationData(novarocks_functions::WindowInvocationData),
@@ -131,6 +133,8 @@ impl ExecutionFailure {
                     "metadata preparation host refused"
                 }
             },
+            ExecutionFailureCause::RuntimeScalarSource(_) => "scalar runtime source request failed",
+            ExecutionFailureCause::RuntimeScalarMemory(_) => "scalar runtime memory refused",
             ExecutionFailureCause::Kernel(error) => match error {
                 KernelFailure::Cancelled => "kernel evaluation was cancelled",
                 KernelFailure::DeadlineExceeded => "kernel evaluation deadline was exceeded",
@@ -217,6 +221,27 @@ impl From<novarocks_functions::ScalarInvocationFailure> for ExecutionFailure {
         }
     }
 }
+impl From<crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure> for ExecutionFailure {
+    fn from(error: crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure) -> Self {
+        use crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure;
+        let cause = match error {
+            RuntimeScalarEvaluationFailure::Kernel(cause) => return cause.into(),
+            RuntimeScalarEvaluationFailure::Data(cause) => {
+                ExecutionFailureCause::ScalarInvocationData(cause)
+            }
+            RuntimeScalarEvaluationFailure::Source(cause) => {
+                ExecutionFailureCause::RuntimeScalarSource(cause)
+            }
+            RuntimeScalarEvaluationFailure::Host(cause) => {
+                ExecutionFailureCause::RuntimeScalarMemory(cause)
+            }
+        };
+        Self {
+            cause,
+            context: None,
+        }
+    }
+}
 impl From<novarocks_functions::WindowEvaluationFailure> for ExecutionFailure {
     fn from(error: novarocks_functions::WindowEvaluationFailure) -> Self {
         match error {
@@ -248,6 +273,8 @@ impl fmt::Display for ExecutionFailure {
         match &self.cause {
             ExecutionFailureCause::Pipeline(message) => f.write_str(message),
             ExecutionFailureCause::Kernel(error) => error.fmt(f),
+            ExecutionFailureCause::RuntimeScalarSource(error) => error.fmt(f),
+            ExecutionFailureCause::RuntimeScalarMemory(error) => error.fmt(f),
             ExecutionFailureCause::RequiredRow(error) => error.fmt(f),
             ExecutionFailureCause::InvocationData(error) => error.fmt(f),
             ExecutionFailureCause::ScalarInvocationData(error) => error.fmt(f),
@@ -261,6 +288,8 @@ impl Error for ExecutionFailure {
         match &self.cause {
             ExecutionFailureCause::Pipeline(_) => None,
             ExecutionFailureCause::Kernel(error) => Some(error),
+            ExecutionFailureCause::RuntimeScalarSource(error) => Some(error),
+            ExecutionFailureCause::RuntimeScalarMemory(error) => Some(error),
             ExecutionFailureCause::RequiredRow(error) => Some(error),
             ExecutionFailureCause::InvocationData(error) => Some(error),
             ExecutionFailureCause::ScalarInvocationData(error) => Some(error),

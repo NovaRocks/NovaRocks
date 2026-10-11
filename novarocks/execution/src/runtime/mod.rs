@@ -19,6 +19,7 @@ pub mod profile;
 pub mod query_memory;
 pub mod query_options;
 pub mod runtime_state;
+pub mod scalar_memory;
 pub mod scan_stream_metrics;
 pub mod table_writer_metrics;
 

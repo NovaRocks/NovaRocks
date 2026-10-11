@@ -91,7 +91,7 @@ impl KernelEvaluationControl for Control {
 }
 fn run<T>(
     control: &dyn KernelEvaluationControl,
-    body: impl FnOnce(&mut Work<'_>) -> Result<T, KernelFailure>,
+    body: impl FnOnce(&mut Work<'_, '_>) -> Result<T, KernelFailure>,
 ) -> Result<T, KernelFailure> {
     let observed = ObservedControl {
         original: control,
@@ -102,6 +102,7 @@ fn run<T>(
     let mut work = Work {
         control: &observed,
         pending: 0,
+        scalar_scope: None,
     };
     let result = body(&mut work);
     work.finish(result)
