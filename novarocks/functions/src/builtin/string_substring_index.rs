@@ -18,6 +18,9 @@
 //! Selected substring_index borrows the original forward, non-overlapping match spans.
 //! Layout checks cover requested representability, not formal host memory grants.
 
+use super::string_substring_index_core::{
+    ForwardMatchAccess, ForwardMatchObserver, scan_forward_matches, substring_index_span,
+};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
@@ -50,58 +53,50 @@ fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     Ok(())
 }
 
-fn scan_matches(
-    text: &str,
-    delimiter: &str,
-    target: Option<usize>,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<(usize, Option<usize>), KernelFailure> {
-    // Retain forward match_indices, including its non-overlap direction.
-    // The old negative-index algorithm selects from these forward matches,
-    // rather than using reverse search. Std search state is borrowed/inline.
-    work.flush()?;
-    let mut matches = text.match_indices(delimiter);
-    work.flush()?;
-    let mut count = 0usize;
-    let mut cut = None;
-    loop {
-        work.flush()?;
-        let next = matches.next();
-        work.flush()?;
-        if let Some((byte, _)) = next {
-            count += 1;
-            if target == Some(count) {
-                cut = Some(byte);
-            }
-            work.step()?;
-        } else {
-            work.step()?;
-            break;
-        }
+impl ForwardMatchObserver for EvaluationCheckpoints<'_> {
+    type Error = KernelFailure;
+    fn flush(&mut self) -> Result<(), KernelFailure> {
+        EvaluationCheckpoints::flush(self)
     }
-    Ok((count, cut))
+    fn step(&mut self) -> Result<(), KernelFailure> {
+        EvaluationCheckpoints::step(self)
+    }
 }
 
-fn substring_index_span<'a>(
-    text: &'a str,
-    delimiter: &str,
-    count: i32,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<&'a str, KernelFailure> {
-    // The caller first handles NULL, delimiter-empty and count-zero success NULL.
-    if count > 0 {
-        let (_, cut) = scan_matches(text, delimiter, Some(count as usize), work)?;
-        Ok(cut.map_or(text, |byte| &text[..byte]))
-    } else {
-        let distance = (-i64::from(count)) as usize;
-        let (matches, _) = scan_matches(text, delimiter, None, work)?;
-        if distance > matches {
-            return Ok(text);
-        }
-        let target = matches - distance + 1;
-        let (_, cut) = scan_matches(text, delimiter, Some(target), work)?;
-        let cut = cut.ok_or_else(|| internal("substring_index forward match extent changed"))?;
-        Ok(&text[cut + delimiter.len()..])
+struct PureMatchAccess<'text, 'work, 'control> {
+    strings: &'text StringArray,
+    source_row: usize,
+    work: &'work mut EvaluationCheckpoints<'control>,
+    cut: Option<usize>,
+}
+impl<'text> ForwardMatchAccess<'text> for PureMatchAccess<'text, '_, '_> {
+    type Error = KernelFailure;
+    fn text(&self) -> &'text str {
+        self.strings.value(self.source_row)
+    }
+    fn first_pass(
+        &mut self,
+        text: &str,
+        delimiter: &str,
+        target: Option<usize>,
+    ) -> Result<usize, KernelFailure> {
+        let scan = scan_forward_matches(text, delimiter, target, self.work)?;
+        self.cut = scan.cut;
+        Ok(scan.count)
+    }
+    fn prefix_cut(&mut self, _: &str, _: &str, _: usize) -> Result<usize, KernelFailure> {
+        self.cut
+            .ok_or_else(|| internal("substring_index forward match extent changed"))
+    }
+    fn suffix_cut(
+        &mut self,
+        text: &str,
+        delimiter: &str,
+        ordinal: usize,
+    ) -> Result<usize, KernelFailure> {
+        scan_forward_matches(text, delimiter, Some(ordinal), self.work)?
+            .cut
+            .ok_or_else(|| internal("substring_index forward match extent changed"))
     }
 }
 
@@ -193,10 +188,13 @@ pub(super) fn evaluate_string_substring_index<'a>(
             }
             let delimiter = delimiters.value(rows[1]);
             let count = counts.value(rows[2]);
-            if delimiter.is_empty() || count == 0 {
-                return Ok(None);
-            }
-            substring_index_span(strings.value(rows[0]), delimiter, count, work).map(Some)
+            let mut access = PureMatchAccess {
+                strings,
+                source_row: rows[0],
+                work,
+                cut: None,
+            };
+            substring_index_span(&mut access, delimiter, i64::from(count))
         };
         let selection = input.selection();
         output_capacity(selection.len(), 0)?;
@@ -281,3 +279,7 @@ pub(super) fn evaluate_string_substring_index<'a>(
 #[cfg(test)]
 #[path = "string_substring_index_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "string_substring_index_shared_tests.rs"]
+mod shared_tests;

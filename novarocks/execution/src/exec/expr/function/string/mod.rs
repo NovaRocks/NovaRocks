@@ -73,3 +73,6 @@ pub use upper::eval_upper;
 
 #[cfg(test)]
 mod concat_legacy_contract_tests;
+
+#[cfg(test)]
+mod substring_index_legacy_contract_tests;

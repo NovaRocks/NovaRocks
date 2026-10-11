@@ -1978,3 +1978,6 @@ mod trim_shared_core_tests;
 
 #[cfg(test)]
 mod concat_shared_core_tests;
+
+#[cfg(test)]
+mod substring_index_shared_core_tests;

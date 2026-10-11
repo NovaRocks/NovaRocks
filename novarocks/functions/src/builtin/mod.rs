@@ -209,6 +209,7 @@ mod string_split_part;
 mod string_split_part_owner;
 mod string_substring;
 mod string_substring_index;
+pub mod string_substring_index_core;
 mod string_substring_index_owner;
 mod string_substring_owner;
 mod string_translate;

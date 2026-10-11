@@ -17,7 +17,10 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
-use std::sync::Arc;
+use novarocks_functions::builtin::string_substring_index_core::{
+    ForwardMatchAccess, forward_match_indices, substring_index_span,
+};
+use std::{convert::Infallible, sync::Arc};
 
 use super::common::downcast_int_arg_array;
 
@@ -50,34 +53,43 @@ pub fn eval_substring_index(
         let s = s_arr.value(i);
         let delim = d_arr.value(i);
         let count = c_arr.value(i);
-        if delim.is_empty() || count == 0 {
-            out.push(None);
-            continue;
-        }
-        out.push(Some(substring_index_impl(s, delim, count)));
+        let mut access = LegacyMatchAccess {
+            text: s,
+            positions: Vec::new(),
+        };
+        let span = match substring_index_span(&mut access, delim, count) {
+            Ok(span) => span,
+            Err(never) => match never {},
+        };
+        out.push(span.map(|span| span.to_string()));
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
 
-fn substring_index_impl(s: &str, delim: &str, count: i64) -> String {
-    let positions: Vec<usize> = s.match_indices(delim).map(|(idx, _)| idx).collect();
-    if positions.is_empty() {
-        return s.to_string();
+struct LegacyMatchAccess<'text> {
+    text: &'text str,
+    positions: Vec<usize>,
+}
+impl<'text> ForwardMatchAccess<'text> for LegacyMatchAccess<'text> {
+    type Error = Infallible;
+    fn text(&self) -> &'text str {
+        self.text
     }
-
-    if count > 0 {
-        let n = count as usize;
-        if n > positions.len() {
-            return s.to_string();
-        }
-        let cut = positions[n - 1];
-        s[..cut].to_string()
-    } else {
-        let n = (-count) as usize;
-        if n > positions.len() {
-            return s.to_string();
-        }
-        let pos = positions[positions.len() - n];
-        s[pos + delim.len()..].to_string()
+    fn first_pass(
+        &mut self,
+        text: &str,
+        delimiter: &str,
+        _: Option<usize>,
+    ) -> Result<usize, Infallible> {
+        self.positions = forward_match_indices(text, delimiter)
+            .map(|(idx, _)| idx)
+            .collect::<Vec<usize>>();
+        Ok(self.positions.len())
+    }
+    fn prefix_cut(&mut self, _: &str, _: &str, ordinal: usize) -> Result<usize, Infallible> {
+        Ok(self.positions[ordinal - 1])
+    }
+    fn suffix_cut(&mut self, _: &str, _: &str, ordinal: usize) -> Result<usize, Infallible> {
+        Ok(self.positions[ordinal - 1])
     }
 }
