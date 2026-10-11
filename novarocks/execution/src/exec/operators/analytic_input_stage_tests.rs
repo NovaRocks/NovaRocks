@@ -19,9 +19,9 @@ use super::analytic_input_stages::{
     AnalyticStageFailure,
 };
 use super::{ArrayRef, Chunk, ChunkSchemaRef};
+use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use arrow::array::{Array, BinaryArray, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field};
-use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use novarocks_functions::{
     EvaluationCheckpoints, KernelControlObservation, KernelDiagnostic, KernelEvaluationControl,
     KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
@@ -454,3 +454,6 @@ mod copy_operation_ports;
 
 #[path = "analytic_stage_metadata_escape_tests.rs"]
 mod metadata_escape_tests;
+
+#[path = "analytic_chunk_constructor_port_tests.rs"]
+mod chunk_constructor_ports;

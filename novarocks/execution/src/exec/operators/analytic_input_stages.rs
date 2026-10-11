@@ -18,11 +18,11 @@
 //! Scope ownership is supplied by the caller. Observing a source or a Layout
 //! grants no capacity; the legacy adapter supplies only its original lifetime.
 use super::{ArrayRef, Chunk, ChunkSchemaRef, Ordering, UInt32Builder, compare_at, take};
-use std::{collections::VecDeque, convert::Infallible, sync::Arc};
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow::compute::concat;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
-use arrow::compute::concat;
+use std::{collections::VecDeque, convert::Infallible, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AnalyticInputStage {
@@ -62,6 +62,10 @@ pub(crate) enum AnalyticCopyFailure<E> {
     OriginalText(String),
     Control(E),
 }
+
+/// Keep the original constructor String distinct from a typed Work refusal.
+/// The original stage remains the sole author of its diagnostic prefix.
+pub(crate) type AnalyticChunkConstruction<E> = Result<Chunk, Result<String, E>>;
 
 /// Admission precedes the original stage's allocation. A tracked adapter must
 /// return its real host lease, not an observation token. Success and original
@@ -113,6 +117,26 @@ pub(crate) trait AnalyticInputWork {
         len: usize,
     ) -> Result<ArrayRef, Self::Failure> {
         Ok(source.slice(offset, len))
+    }
+
+    /// ONE original batch-based Chunk construction, with its exact source schema.
+    fn construct_batch_chunk(
+        &mut self,
+        _scope: &mut Self::Scope,
+        batch: RecordBatch,
+        schema: ChunkSchemaRef,
+    ) -> AnalyticChunkConstruction<Self::Failure> {
+        Chunk::try_new_with_chunk_schema(batch, schema).map_err(Ok)
+    }
+
+    /// ONE original actual-column construction, including reconciliation/retag.
+    fn construct_columns_chunk(
+        &mut self,
+        _scope: &mut Self::Scope,
+        schema: ChunkSchemaRef,
+        columns: Vec<ArrayRef>,
+    ) -> AnalyticChunkConstruction<Self::Failure> {
+        Chunk::try_new_with_columns(schema, columns).map_err(Ok)
     }
 }
 #[derive(Debug)]
@@ -222,8 +246,11 @@ pub(crate) fn gather<W: AnalyticInputWork>(
             }
             Ok(batch) => {
                 work.boundary().map_err(|e| controlled(stage, e))?;
-                Chunk::try_new_with_chunk_schema(batch, input[0].chunk_schema_ref())
-                    .map_err(|error| format!("build analytic concat chunk: {error}"))
+                match work.construct_batch_chunk(&mut scope, batch, input[0].chunk_schema_ref()) {
+                    Ok(value) => Ok(value),
+                    Err(Ok(error)) => Err(format!("build analytic concat chunk: {error}")),
+                    Err(Err(cause)) => return Err(controlled(stage, cause)),
+                }
             }
         }
     };
@@ -388,9 +415,7 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
         columns.push(value);
     }
     work.boundary().map_err(|e| controlled(stage, e))?;
-    match Chunk::try_new_with_columns(chunk.chunk_schema_ref(), columns)
-        .map_err(|e| format!("build reordered analytic batch: {}", e))
-    {
+    match work.construct_columns_chunk(&mut scope, chunk.chunk_schema_ref(), columns) {
         Ok(value) => {
             work.boundary().map_err(|e| controlled(stage, e))?;
             Ok(AnalyticStageResult {
@@ -399,11 +424,12 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
                 scope,
             })
         }
-        Err(message) => Err(AnalyticStageFailure::OriginalData {
+        Err(Ok(error)) => Err(AnalyticStageFailure::OriginalData {
             stage,
-            message,
+            message: format!("build reordered analytic batch: {}", error),
             scope,
         }),
+        Err(Err(cause)) => Err(controlled(stage, cause)),
     }
 }
 
@@ -443,20 +469,19 @@ pub(crate) fn split<W: AnalyticInputWork>(
             work.step().map_err(|e| controlled(stage, e))?;
         }
         work.boundary().map_err(|e| controlled(stage, e))?;
-        match Chunk::try_new_with_columns(Arc::clone(&output), slices)
-            .map_err(|e| format!("build analytic output batch: {}", e))
-        {
+        match work.construct_columns_chunk(&mut scope, Arc::clone(&output), slices) {
             Ok(chunk) => {
                 work.boundary().map_err(|e| controlled(stage, e))?;
                 value.push_back(chunk);
             }
-            Err(message) => {
+            Err(Ok(error)) => {
                 return Err(AnalyticStageFailure::OriginalData {
                     stage,
-                    message,
+                    message: format!("build analytic output batch: {}", error),
                     scope,
                 });
             }
+            Err(Err(cause)) => return Err(controlled(stage, cause)),
         }
         offset += len;
     }
