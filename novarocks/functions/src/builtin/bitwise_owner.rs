@@ -282,6 +282,41 @@ impl PreparedScalarKernel for PreparedBitwise {
         &self.contract
     }
 
+    fn invocation_resource_profile(&self) -> Option<crate::ScalarInvocationResourceProfile> {
+        use crate::scalar_resources::BitwiseWidth;
+        use arrow_schema::DataType;
+        use novarocks_type_contract::ValueLogicalType;
+
+        let mut arguments = self.contract.value_argument_types();
+        if arguments.len() != self.operation.arity() {
+            return None;
+        }
+        let source = arguments.next()?;
+        let result = self.contract.result_type();
+        if source.logical_type != ValueLogicalType::Physical
+            || result.logical_type != ValueLogicalType::Physical
+            || result.data_type != source.data_type
+            || !result.nullable
+            || arguments.any(|argument| {
+                argument.logical_type != source.logical_type
+                    || argument.data_type != source.data_type
+            })
+        {
+            return None;
+        }
+        let width = match source.data_type {
+            DataType::Int8 => BitwiseWidth::Int8,
+            DataType::Int16 => BitwiseWidth::Int16,
+            DataType::Int32 => BitwiseWidth::Int32,
+            DataType::Int64 => BitwiseWidth::Int64,
+            _ => return None,
+        };
+        Some(crate::ScalarInvocationResourceProfile::bitwise(
+            self.operation,
+            width,
+        ))
+    }
+
     fn instance_retained_upper_bound(&self) -> usize {
         std::mem::size_of::<BitwiseInstance>()
     }
@@ -510,6 +545,57 @@ mod tests {
             total += owner.implementation_declarations().len();
         }
         assert_eq!(total, 20);
+    }
+
+    #[test]
+    fn bitwise_resources_cover_16_physical_profiles_and_leave_largeint_uncovered() {
+        let mut covered = 0;
+        let mut uncovered = 0;
+        for name in names() {
+            let operation = operation(name).unwrap();
+            for source in sources(false) {
+                let physical = source.logical_type == ValueLogicalType::Physical;
+                for mask in 0..1usize << operation.arity() {
+                    let arguments = (0..operation.arity())
+                        .map(|index| {
+                            let mut value = source.clone();
+                            value.nullable = mask & (1 << index) != 0;
+                            value
+                        })
+                        .collect::<Vec<_>>();
+                    for policy in [
+                        DecimalOverflowPolicy::OutputNull,
+                        DecimalOverflowPolicy::ReportError,
+                    ] {
+                        let prepared =
+                            prepared_for_test_with_policy(name, &arguments, policy).unwrap();
+                        let profile = prepared.invocation_resource_profile();
+                        assert_eq!(profile.is_some(), physical);
+                        let instance =
+                            crate::ScalarEvaluationInstance::instantiate(prepared).unwrap();
+                        assert_eq!(instance.invocation_resource_profile(), profile);
+                        if let Some(profile) = profile {
+                            assert_eq!(profile.requests(0).unwrap().requests(), 6);
+                            assert_eq!(
+                                profile.requests(513).unwrap().requests(),
+                                if source.data_type == DataType::Int64 {
+                                    7
+                                } else {
+                                    12
+                                }
+                            );
+                        }
+                    }
+                }
+                if physical {
+                    covered += 1;
+                } else {
+                    uncovered += 1;
+                }
+            }
+        }
+        assert_eq!(covered, 16);
+        assert_eq!(uncovered, 4);
     }
 
     #[test]

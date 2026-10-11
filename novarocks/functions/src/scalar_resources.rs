@@ -77,6 +77,33 @@ pub struct ScalarInvocationResourceProfile {
 enum Source {
     Int64Shift,
     NarrowShift(NarrowShiftWidth),
+    Bitwise {
+        operation: crate::bit_numeric::BitwiseOp,
+        width: BitwiseWidth,
+    },
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BitwiseWidth {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+}
+impl BitwiseWidth {
+    fn narrow(self) -> Option<NarrowShiftWidth> {
+        match self {
+            Self::Int8 => Some(NarrowShiftWidth::Int8),
+            Self::Int16 => Some(NarrowShiftWidth::Int16),
+            Self::Int32 => Some(NarrowShiftWidth::Int32),
+            Self::Int64 => None,
+        }
+    }
+    fn matches(self, array: &dyn arrow_array::Array) -> bool {
+        match self.narrow() {
+            Some(width) => width.matches(array),
+            None => array.as_any().is::<Int64Array>(),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NarrowShiftWidth {
@@ -120,6 +147,15 @@ impl ScalarInvocationResourceProfile {
         }
     }
 
+    pub(crate) const fn bitwise(
+        operation: crate::bit_numeric::BitwiseOp,
+        width: BitwiseWidth,
+    ) -> Self {
+        Self {
+            source: Source::Bitwise { operation, width },
+        }
+    }
+
     /// No arrays, diagnostics, formatting or other heap objects are created.
     /// All valid constant/column mappings, sparse selections, NULLs and count
     /// values have this same envelope. Preexisting input storage is excluded.
@@ -130,6 +166,12 @@ impl ScalarInvocationResourceProfile {
         match self.source {
             Source::Int64Shift => int64_shift_requests(selected_rows),
             Source::NarrowShift(width) => narrow_shift_requests(selected_rows, width),
+            // The original shared integer finish has the same requests.
+            // Its caller's arity and carriers are independently recognized.
+            Source::Bitwise { width, .. } => match width.narrow() {
+                Some(width) => narrow_shift_requests(selected_rows, width),
+                None => int64_shift_requests(selected_rows),
+            },
         }
     }
 
@@ -163,6 +205,19 @@ impl ScalarInvocationResourceProfile {
                 {
                     return Err(ScalarResourceError::Invariant(
                         "prepared narrow shift source has a different actual Arrow carrier",
+                    ));
+                }
+            }
+            Source::Bitwise { operation, width } => {
+                // NOT borrows one carrier; binary operations borrow two of
+                // the SAME width. Wrong arity stays with the original wrapper.
+                if arguments.len() == operation.arity()
+                    && arguments
+                        .iter()
+                        .any(|argument| !width.matches(argument.array().as_ref()))
+                {
+                    return Err(ScalarResourceError::Invariant(
+                        "prepared bitwise source has a different actual Arrow carrier",
                     ));
                 }
             }
@@ -326,6 +381,164 @@ fn int64_shift_requests(rows: usize) -> Result<ScalarInvocationRequestFacts, Sca
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_resources_bitwise_recognizes_unary_and_same_width_binary_carriers() {
+        use crate::{EvaluatedArgument, Selection, bit_numeric::BitwiseOp};
+        use arrow_array::ArrayRef;
+        use std::sync::Arc;
+        let arrays: [(BitwiseWidth, ArrayRef); 4] = [
+            (BitwiseWidth::Int8, Arc::new(Int8Array::from(vec![None]))),
+            (BitwiseWidth::Int16, Arc::new(Int16Array::from(vec![None]))),
+            (BitwiseWidth::Int32, Arc::new(Int32Array::from(vec![None]))),
+            (BitwiseWidth::Int64, Arc::new(Int64Array::from(vec![None]))),
+        ];
+        let selection = Selection::try_sparse(30, &[1, 9]).unwrap();
+        for (width, array) in &arrays {
+            for operation in [
+                BitwiseOp::And,
+                BitwiseOp::Or,
+                BitwiseOp::Xor,
+                BitwiseOp::Not,
+            ] {
+                let source = ScalarInvocationResourceProfile::bitwise(operation, *width);
+                let args = [
+                    EvaluatedArgument::Column(array),
+                    EvaluatedArgument::Scalar(array),
+                ];
+                // Deliberately malformed column shape and selected NULLs
+                // remain the original wrapper's job. Recognition reads no row.
+                assert_eq!(
+                    source.requests_for(selection, &args[..operation.arity()]),
+                    source.requests(2)
+                );
+                for (other_width, other) in &arrays {
+                    if width == other_width {
+                        continue;
+                    }
+                    let wrong = EvaluatedArgument::Column(other);
+                    assert_eq!(
+                        source.requests_for(selection, &[wrong; 2][..operation.arity()]),
+                        Err(ScalarResourceError::Invariant(
+                            "prepared bitwise source has a different actual Arrow carrier"
+                        ))
+                    );
+                    if operation.arity() == 2 {
+                        assert_eq!(
+                            source.requests_for(selection, &[args[0], wrong]),
+                            Err(ScalarResourceError::Invariant(
+                                "prepared bitwise source has a different actual Arrow carrier"
+                            ))
+                        );
+                    }
+                    // Wrong arity must leave unrelated carriers unread.
+                    let wrong_arity = if operation.arity() == 1 { 2 } else { 1 };
+                    assert_eq!(
+                        source.requests_for(selection, &[wrong; 2][..wrong_arity]),
+                        source.requests(2)
+                    );
+                }
+                assert_eq!(source.requests_for(selection, &[]), source.requests(2));
+            }
+            assert_eq!(Arc::strong_count(array), 1);
+        }
+    }
+
+    #[test]
+    fn scalar_resources_bitwise_covers_intermediate_and_final_backings_and_empty_wrapper() {
+        use crate::bit_numeric::BitwiseOp;
+        for width in [
+            BitwiseWidth::Int8,
+            BitwiseWidth::Int16,
+            BitwiseWidth::Int32,
+            BitwiseWidth::Int64,
+        ] {
+            for operation in [
+                BitwiseOp::And,
+                BitwiseOp::Or,
+                BitwiseOp::Xor,
+                BitwiseOp::Not,
+            ] {
+                let source = ScalarInvocationResourceProfile::bitwise(operation, width);
+                let array_arc = match width.narrow() {
+                    Some(width) => width.array_arc_bytes().unwrap(),
+                    None => array_arc_bytes().unwrap(),
+                };
+                let empty = source.requests(0).unwrap();
+                assert_eq!(empty.requests(), 6);
+                assert_eq!(
+                    empty.bytes(),
+                    size_of::<Buffer>()
+                        + size_of::<arrow_data::BufferSpec>()
+                        + 128
+                        + array_arc
+                        + crate::MAX_ROW_ERROR_MESSAGE_BYTES
+                );
+                for rows in [1usize, 7, 8, 31, 32, 63, 64, 65, 511, 512, 513, 4096] {
+                    let facts = source.requests(rows).unwrap();
+                    let bitmap = rows.div_ceil(8).div_ceil(64) * 64;
+                    let mut expected = rows * (size_of::<Option<i64>>() + size_of::<i64>())
+                        + bitmap
+                        + 128
+                        + array_arc_bytes().unwrap()
+                        + crate::MAX_ROW_ERROR_MESSAGE_BYTES;
+                    if let Some(narrow) = width.narrow() {
+                        // Original safe cast creates validity even when ALL
+                        // selected values are valid and mathematically in range.
+                        expected +=
+                            (rows * narrow.bytes()).div_ceil(64) * 64 + bitmap + 128 + array_arc;
+                    }
+                    assert_eq!(facts.bytes(), expected);
+                    assert_eq!(
+                        facts.requests(),
+                        if width.narrow().is_some() { 12 } else { 7 }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_resources_bitwise_checked_domain_covers_real_alignment_and_attribution_tail() {
+        use crate::bit_numeric::BitwiseOp;
+        let maximum = isize::MAX as usize / size_of::<Option<i64>>();
+        for width in [
+            BitwiseWidth::Int8,
+            BitwiseWidth::Int16,
+            BitwiseWidth::Int32,
+            BitwiseWidth::Int64,
+        ] {
+            let source = ScalarInvocationResourceProfile::bitwise(BitwiseOp::Not, width);
+            for rows in [1usize, 513, 1_000_000_000, maximum] {
+                let facts = source.requests(rows).unwrap();
+                assert!(
+                    facts
+                        .requests()
+                        .checked_mul(8)
+                        .and_then(|tail| facts.bytes().checked_add(tail))
+                        .is_some()
+                );
+                let option = Layout::array::<Option<i64>>(rows).unwrap();
+                Layout::from_size_align(option.size().checked_add(8).unwrap(), option.align())
+                    .unwrap();
+                let native = Layout::array::<i64>(rows).unwrap();
+                Layout::from_size_align(native.size().checked_add(8).unwrap(), native.align())
+                    .unwrap();
+                let bitmap = rows.div_ceil(8).div_ceil(64) * 64;
+                // Round64 is capacity, not the actual x86_64 alignment128.
+                for alignment in [64, 128] {
+                    Layout::from_size_align(bitmap.checked_add(8).unwrap(), alignment).unwrap();
+                    if let Some(narrow) = width.narrow() {
+                        let values = (rows * narrow.bytes()).div_ceil(64) * 64;
+                        Layout::from_size_align(values.checked_add(8).unwrap(), alignment).unwrap();
+                    }
+                }
+            }
+            for rows in [maximum + 1, usize::MAX] {
+                assert_eq!(source.requests(rows), Err(ScalarResourceError::Arithmetic));
+            }
+        }
+    }
 
     #[test]
     fn scalar_resources_narrow_cast_counts_distinct_rounded_values_and_always_bitmap() {

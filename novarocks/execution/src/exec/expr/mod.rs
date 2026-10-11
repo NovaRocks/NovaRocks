@@ -1679,3 +1679,6 @@ mod parse_json_original_runtime_baseline_tests;
 
 #[cfg(test)]
 pub(crate) mod runtime_scalar_memory_actual_sql_tests;
+
+#[cfg(test)]
+mod runtime_scalar_memory_actual_sql_bitwise_tests;

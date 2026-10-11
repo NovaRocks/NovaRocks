@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared lawful Native package and actual host fixture for shift GLOBAL tests.
+//! Shared lawful Native package and actual host fixture for integer GLOBAL tests.
 //! This authors inputs for the original compiler; it is not a decoder or kernel.
 use arrow::{
     array::{ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
@@ -92,11 +92,11 @@ fn constants() -> ConstantPolicy {
         max_library_validation_bytes: 1 << 20,
     }
 }
-fn functions() -> PureEngineFunctionCatalog {
+fn functions_for_names(names: &[&str]) -> PureEngineFunctionCatalog {
     let actual = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
     let mut builder = EngineFunctionCatalogBuilder::new();
     let mut installed = vec![];
-    for name in NAMES {
+    for &name in names {
         let definition = actual.definition(name, FunctionKind::Scalar).unwrap();
         builder.register(definition.clone()).unwrap();
         let binding = definition.binding_declaration().unwrap();
@@ -138,9 +138,15 @@ pub(super) fn binding() -> QueryMemoryBinding {
     .unwrap()
 }
 pub(super) fn runtime(binding: &QueryMemoryBinding) -> Arc<ExecutionRuntime> {
+    runtime_for_names(binding, &NAMES)
+}
+pub(super) fn runtime_for_names(
+    binding: &QueryMemoryBinding,
+    names: &[&str],
+) -> Arc<ExecutionRuntime> {
     let actual = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
     let mut functions = ExecutionFunctionSetBuilder::new();
-    for name in NAMES {
+    for &name in names {
         functions
             .catalog_builder_mut()
             .register(
@@ -184,11 +190,11 @@ pub(super) fn task(binding: &QueryMemoryBinding) -> TaskIdentity {
 
 // Author the complete original binding request, uses and frozen effects.
 // The interpreter selects and prepares the installed owner from these facts.
-fn source(name: &str, source_type: &DataType, functions: &PureEngineFunctionCatalog) -> Vec<u8> {
-    let types = [
-        FunctionValueType::new(source_type.clone(), true),
-        FunctionValueType::new(DataType::Int64, true),
-    ];
+fn source_for_arguments(
+    name: &str,
+    types: &[FunctionValueType],
+    functions: &PureEngineFunctionCatalog,
+) -> Vec<u8> {
     let arguments = types
         .iter()
         .map(|ty| FunctionArgument::Value {
@@ -198,7 +204,7 @@ fn source(name: &str, source_type: &DataType, functions: &PureEngineFunctionCata
         .collect::<Vec<_>>();
     let request = FunctionBindingRequest {
         arguments: &arguments,
-        logical_argument_count: 2,
+        logical_argument_count: types.len(),
         expected_result_type: None,
     };
     let bound = functions
@@ -207,7 +213,7 @@ fn source(name: &str, source_type: &DataType, functions: &PureEngineFunctionCata
         .unwrap();
     let selected = Arc::new(bound.selected.clone());
     let FunctionResultType::Scalar(result_type) = &selected.result_type else {
-        panic!("scalar shift")
+        panic!("exact scalar integer fixture")
     };
     let function = BoundFunction {
         function_id: bound.function_id.clone(),
@@ -297,7 +303,7 @@ fn source(name: &str, source_type: &DataType, functions: &PureEngineFunctionCata
                             constant: None,
                         })
                         .collect(),
-                    logical_argument_count: 2,
+                    logical_argument_count: types.len(),
                     expected_result_type: None,
                     constant_policy: constants(),
                 },
@@ -313,7 +319,9 @@ fn source(name: &str, source_type: &DataType, functions: &PureEngineFunctionCata
         domain: EvaluationDomainId::new(0),
         demand: root.demand,
     };
-    let child_ids = [ExpressionUseId::new(1), ExpressionUseId::new(2)];
+    let child_ids = (1..=types.len())
+        .map(|ordinal| ExpressionUseId::new(u32::try_from(ordinal).unwrap()))
+        .collect::<Vec<_>>();
     let mut invocations = vec![];
     for (&definition, &use_id) in children.iter().zip(&child_ids) {
         invocations.push(ExpressionInvocation {
@@ -327,7 +335,7 @@ fn source(name: &str, source_type: &DataType, functions: &PureEngineFunctionCata
         context,
         definition: expr,
         control: ControlShape::Eager,
-        arguments: Box::from(child_ids),
+        arguments: child_ids.clone().into_boxed_slice(),
     });
     let flow = ExpressionControlFlow::try_new(
         vec![ExpressionEvaluationDomain {
@@ -344,7 +352,7 @@ fn source(name: &str, source_type: &DataType, functions: &PureEngineFunctionCata
     let uses = PhysicalRootUses::try_new(&fragment, flow, vec![(*site, context.use_id)], &Control)
         .unwrap();
     let parameters = SemanticParameters::try_new([]).unwrap();
-    let argument_uses = child_ids.map(Some);
+    let argument_uses = child_ids.iter().copied().map(Some).collect::<Vec<_>>();
     let token = functions
         .prepare_fresh(
             CallEffectInput {
@@ -431,8 +439,24 @@ pub(super) fn program_typed(
     source_type: &DataType,
     binding: &QueryMemoryBinding,
 ) -> Arc<LocalProgram> {
-    let functions = functions();
-    let bytes = source(name, source_type, &functions);
+    program_for_arguments(
+        name,
+        &[
+            FunctionValueType::new(source_type.clone(), true),
+            FunctionValueType::new(DataType::Int64, true),
+        ],
+        &NAMES,
+        binding,
+    )
+}
+pub(super) fn program_for_arguments(
+    name: &str,
+    types: &[FunctionValueType],
+    names: &[&str],
+    binding: &QueryMemoryBinding,
+) -> Arc<LocalProgram> {
+    let functions = functions_for_names(names);
+    let bytes = source_for_arguments(name, types, &functions);
     let providers =
         novarocks_connector_contract::PureProviderProgramCatalog::<std::io::Error>::try_new(
             &[],
@@ -531,21 +555,37 @@ pub(super) fn batch(program: &LocalProgram, nullable: bool, rows: usize) -> Reco
         DataType::Int64 => Arc::new(Int64Array::from(source_values)),
         _ => panic!("exact shift fixture physical source"),
     };
+    batch_for_arguments(
+        program,
+        vec![
+            values,
+            Arc::new(Int64Array::from(vec![1; rows])) as ArrayRef,
+        ],
+    )
+}
+pub(super) fn batch_for_arguments(program: &LocalProgram, columns: Vec<ArrayRef>) -> RecordBatch {
+    let ProgramNodeKind::Project { input, .. } =
+        program.graph().nodes()[program.graph().root().index()].kind()
+    else {
+        panic!("original computing Project")
+    };
     RecordBatch::try_new(
         program.graph().nodes()[input.index()]
             .output_layout()
             .schema()
             .clone(),
-        vec![
-            values,
-            Arc::new(Int64Array::from(vec![1; rows])) as ArrayRef,
-        ],
+        columns,
     )
     .unwrap()
 }
 // This unsafe reader is restricted to the original standard producer in this
 // target. Capacity alone would not prove GLOBAL or exclude custom backing.
 pub(super) unsafe fn original_shift_tag(buffer: &Buffer) -> RecordRef {
+    // SAFETY: the caller supplies the same standard producer/GLOBAL premises.
+    unsafe { original_primitive_tag(buffer) }
+}
+// Same restricted tail contract, also used for the original bitwise producer.
+pub(super) unsafe fn original_primitive_tag(buffer: &Buffer) -> RecordRef {
     assert!(buffer.capacity() >= 512);
     // SAFETY: caller supplies live original primitive shift output or original
     // Vec input from this GLOBAL-only target. The standard producer requests
