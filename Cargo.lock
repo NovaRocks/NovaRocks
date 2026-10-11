@@ -3856,7 +3856,6 @@ dependencies = [
  "md-5 0.10.6",
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
- "novarocks-connector-iceberg",
  "novarocks-connector-iceberg-functions",
  "novarocks-execution-contract",
  "novarocks-functions",

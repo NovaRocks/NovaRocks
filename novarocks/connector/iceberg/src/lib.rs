@@ -120,3 +120,6 @@ mod contract_revision;
 #[cfg(test)]
 #[path = "../../../../vendor/iceberg-catalog-hms-0.9.0/src/table_projection.rs"]
 mod hms_table_projection_contract_tests;
+
+#[cfg(test)]
+mod cow_source_receipt_codec_tests;

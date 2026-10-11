@@ -61,7 +61,6 @@ url.workspace = true
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
-novarocks-connector-iceberg.workspace = true
 novarocks-functions = { workspace = true, features = ["test-support"] }
 prost.workspace = true
 novarocks-workload-control.workspace = true
