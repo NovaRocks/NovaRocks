@@ -20,14 +20,8 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Decimal128Array, Float64Array, Int64Array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
+use novarocks_functions::builtin::round_core::round_float_to_integer as round_double_to_int;
 use std::sync::Arc;
-
-/// Round a double value to the nearest integer.
-/// Returns BIGINT (Int64).
-/// Implementation matches StarRocks: round(x) = static_cast<int64_t>(x + ((x < 0) ? -0.5 : 0.5))
-fn round_double_to_int(value: f64) -> i64 {
-    (value + if value < 0.0 { -0.5 } else { 0.5 }) as i64
-}
 
 /// Round a double value to d decimal places.
 /// Returns DOUBLE.

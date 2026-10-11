@@ -20,6 +20,7 @@
 use super::{
     binding_control,
     round_cast::{CastRecipe, CastValue},
+    round_core::round_float_to_integer as round_float_integer,
     rounding_binding::CastTarget,
 };
 use crate::{
@@ -121,10 +122,6 @@ impl RoundRecipe {
     }
 }
 
-fn round_float_integer(value: f64) -> i64 {
-    // The installed unary ROUND saturates and maps NaN to zero via Rust `as`.
-    (value + if value < 0.0 { -0.5 } else { 0.5 }) as i64
-}
 fn round_float_digits(value: f64, digits: i64) -> f64 {
     let negative = digits < 0;
     let magnitude = digits.unsigned_abs();
