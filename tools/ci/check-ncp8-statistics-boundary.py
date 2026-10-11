@@ -34,6 +34,8 @@ from pathlib import Path
 DATASKETCHES = "datasketches"
 EXECUTION = "novarocks-execution"
 FUNCTIONS = "novarocks-functions"
+FUNCTION_CONTRACT = "novarocks-function-contract"
+CONSTANT_CONTRACT = "novarocks-constant-contract"
 TYPE_CONTRACT = "novarocks-type-contract"
 RESULT_CONTRACT = "novarocks-result-contract"
 ICEBERG_FUNCTIONS = "novarocks-connector-iceberg-functions"
@@ -43,7 +45,14 @@ FRONTEND_APPLICATION = "novarocks-frontend-application"
 SERVER = "novarocks-server"
 
 ROLE_PACKAGES = {FRONTEND_APPLICATION, NATIVE_ADAPTER, SERVER}
-ALLOWED_PRODUCTION_DATASKETCHES_OWNERS = {EXECUTION, ICEBERG_FUNCTIONS}
+ALLOWED_PRODUCTION_DATASKETCHES_OWNERS = {EXECUTION, FUNCTIONS, ICEBERG_FUNCTIONS}
+FUNCTIONS_INTERNAL_CLOSURE = {
+    FUNCTIONS,
+    FUNCTION_CONTRACT,
+    CONSTANT_CONTRACT,
+    TYPE_CONTRACT,
+    RESULT_CONTRACT,
+}
 FORBIDDEN_ICEBERG_FUNCTIONS_CLOSURE = {
     EXECUTION,
     NATIVE_ADAPTER,
@@ -213,6 +222,7 @@ def verify_dependency_boundary(metadata, repo_root):
     require_exact_dependency(
         iceberg_functions, DATASKETCHES, kind=None, features={"theta"}
     )
+    require_exact_dependency(functions, DATASKETCHES, kind=None, features={"hll"})
     require_exact_dependency(
         execution,
         ICEBERG_FUNCTIONS,
@@ -241,12 +251,10 @@ def verify_dependency_boundary(metadata, repo_root):
         for name in normal_closure(metadata, ICEBERG_FUNCTIONS)
         if name.startswith("novarocks-")
     }
-    # novarocks-functions carries shared type/result vocabulary through
-    # novarocks-type-contract and dependency-free novarocks-result-contract.
-    # These are contract crates, not application or provider owners; the forbidden set
-    # below still fences execution, the native adapter, the server, and the
-    # Iceberg provider.
-    expected_internal = {ICEBERG_FUNCTIONS, FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT}
+    # Shared computation uses only these neutral function, constant, type and
+    # result contracts. The provider contribution adds only its own package.
+    # The forbidden set still fences execution, role and provider capabilities.
+    expected_internal = FUNCTIONS_INTERNAL_CLOSURE | {ICEBERG_FUNCTIONS}
     if iceberg_internal != expected_internal:
         fail(
             f"{ICEBERG_FUNCTIONS} internal normal closure must be exactly "
@@ -268,16 +276,13 @@ def verify_dependency_boundary(metadata, repo_root):
         if name.startswith("novarocks-")
     }
     # Keep the same exact pure vocabulary closure for the scalar owner.
-    expected_functions_internal = {FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT}
+    expected_functions_internal = FUNCTIONS_INTERNAL_CLOSURE
     if functions_internal != expected_functions_internal:
         fail(
             f"{FUNCTIONS} internal normal closure must be exactly "
             f"{sorted(expected_functions_internal)}, got "
             + ", ".join(sorted(functions_internal))
         )
-    if DATASKETCHES in normal_closure(metadata, FUNCTIONS):
-        fail(f"{FUNCTIONS} normal closure must not contain {DATASKETCHES}")
-
     if direct_dependencies(execution, ICEBERG_PROVIDER):
         fail(f"{EXECUTION} must not directly depend on {ICEBERG_PROVIDER}")
     execution_forbidden = normal_closure(metadata, EXECUTION) & {
@@ -299,7 +304,7 @@ def verify_dependency_boundary(metadata, repo_root):
         for package in metadata["packages"]
         if package["name"] in execution_closure
         and direct_dependencies(package, DATASKETCHES)
-        and package["name"] != EXECUTION
+        and package["name"] not in {EXECUTION, FUNCTIONS}
     )
     if execution_sketch_owners:
         fail(

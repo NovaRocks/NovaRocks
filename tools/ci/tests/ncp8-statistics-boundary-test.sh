@@ -41,6 +41,8 @@ write_fixture() {
   write_package "$root" "novarocks/type-contract" "novarocks-type-contract"
   write_package "$root" "novarocks/result-contract" "novarocks-result-contract"
   write_package "$root" "novarocks/functions" "novarocks-functions"
+  write_package "$root" "novarocks/function-contract" "novarocks-function-contract"
+  write_package "$root" "novarocks/constant-contract" "novarocks-constant-contract"
   write_package "$root" "novarocks/connector/iceberg-functions" "novarocks-connector-iceberg-functions"
   write_package "$root" "novarocks/connector/iceberg" "novarocks-connector-iceberg"
   write_package "$root" "novarocks/frontend-application" "novarocks-frontend-application"
@@ -58,6 +60,8 @@ members = [
   "novarocks/type-contract",
   "novarocks/result-contract",
   "novarocks/functions",
+  "novarocks/function-contract",
+  "novarocks/constant-contract",
   "novarocks/connector/iceberg-functions",
   "novarocks/connector/iceberg",
   "novarocks/frontend-application",
@@ -74,11 +78,26 @@ EOF
 
 [dependencies]
 datasketches = { workspace = true, features = ["hll"] }
+novarocks-functions = { path = "../functions" }
 
 [dev-dependencies]
 novarocks-connector-iceberg-functions = { path = "../connector/iceberg-functions" }
 EOF
   cat >>"$root/novarocks/functions/Cargo.toml" <<'EOF'
+
+[dependencies]
+datasketches = { workspace = true, features = ["hll"] }
+novarocks-type-contract = { path = "../type-contract" }
+novarocks-function-contract = { path = "../function-contract" }
+novarocks-constant-contract = { path = "../constant-contract" }
+EOF
+  cat >>"$root/novarocks/function-contract/Cargo.toml" <<'EOF'
+
+[dependencies]
+novarocks-type-contract = { path = "../type-contract" }
+novarocks-constant-contract = { path = "../constant-contract" }
+EOF
+  cat >>"$root/novarocks/constant-contract/Cargo.toml" <<'EOF'
 
 [dependencies]
 novarocks-type-contract = { path = "../type-contract" }
@@ -129,9 +148,17 @@ EOF
 assert_rejected() {
   local root="$1"
   local expected="$2"
+  local exit_code
   if "$CHECKER" --repo-root "$root" --manifest-path "$root/Cargo.toml" \
     >"$root/stdout" 2>"$root/stderr"; then
     echo "NCP-8 statistics boundary mutation was accepted: $root" >&2
+    exit 1
+  else
+    exit_code=$?
+  fi
+  if [[ "$exit_code" != 1 ]]; then
+    echo "NCP-8 mutation produced unexpected exit $exit_code: $root" >&2
+    cat "$root/stderr" >&2
     exit 1
   fi
   if ! grep -Fq "$expected" "$root/stderr"; then
@@ -139,6 +166,8 @@ assert_rejected() {
     cat "$root/stderr" >&2
     exit 1
   fi
+  printf 'NCP-8 mutation rejected: %s (exit %s)\n' "${root##*/}" "$exit_code"
+  cat "$root/stderr"
 }
 
 replace_once() {
@@ -280,5 +309,87 @@ cat >>"$indirect_sketch/novarocks/execution/Cargo.toml" <<'EOF'
 path = "../../helper"
 EOF
 assert_rejected "$indirect_sketch" "normal closure has indirect datasketches owners"
+
+functions_missing="$fixture_root/functions-missing"
+cp -R "$valid" "$functions_missing"
+replace_once "$functions_missing/novarocks/functions/Cargo.toml" \
+  $'datasketches = { workspace = true, features = ["hll"] }\n' ''
+assert_rejected "$functions_missing" \
+  "novarocks-functions must declare exactly one direct datasketches dependency"
+
+functions_wrong_feature="$fixture_root/functions-wrong-feature"
+cp -R "$valid" "$functions_wrong_feature"
+replace_once "$functions_wrong_feature/novarocks/functions/Cargo.toml" \
+  'features = ["hll"]' 'features = ["theta"]'
+assert_rejected "$functions_wrong_feature" \
+  "novarocks-functions datasketches features must be exactly ['hll']"
+
+functions_broad_feature="$fixture_root/functions-broad-feature"
+cp -R "$valid" "$functions_broad_feature"
+replace_once "$functions_broad_feature/novarocks/functions/Cargo.toml" \
+  'features = ["hll"]' 'features = ["hll", "theta"]'
+assert_rejected "$functions_broad_feature" \
+  "novarocks-functions datasketches features must be exactly ['hll']"
+
+functions_defaults="$fixture_root/functions-defaults"
+cp -R "$valid" "$functions_defaults"
+replace_once "$functions_defaults/novarocks/functions/Cargo.toml" \
+  'workspace = true, features = ["hll"]' \
+  'workspace = true, default-features = true, features = ["hll"]'
+assert_rejected "$functions_defaults" \
+  "novarocks-functions datasketches must disable default features"
+
+functions_optional="$fixture_root/functions-optional"
+cp -R "$valid" "$functions_optional"
+replace_once "$functions_optional/novarocks/functions/Cargo.toml" \
+  'workspace = true, features = ["hll"]' \
+  'workspace = true, optional = true, features = ["hll"]'
+assert_rejected "$functions_optional" \
+  "novarocks-functions datasketches must not be optional"
+
+functions_renamed="$fixture_root/functions-renamed"
+cp -R "$valid" "$functions_renamed"
+replace_once "$functions_renamed/novarocks/functions/Cargo.toml" \
+  'datasketches = { workspace = true, features = ["hll"] }' \
+  'sketches = { package = "datasketches", path = "../../datasketches", version = "=0.1.0", default-features = false, features = ["hll"] }'
+assert_rejected "$functions_renamed" "novarocks-functions must not rename datasketches"
+
+for dependency_kind in dev build; do
+  functions_kind="$fixture_root/functions-$dependency_kind-kind"
+  cp -R "$valid" "$functions_kind"
+  replace_once "$functions_kind/novarocks/functions/Cargo.toml" \
+    $'datasketches = { workspace = true, features = ["hll"] }\n' ''
+  printf '\n[%s-dependencies]\ndatasketches = { workspace = true, features = ["hll"] }\n' \
+    "$dependency_kind" >>"$functions_kind/novarocks/functions/Cargo.toml"
+  assert_rejected "$functions_kind" \
+    "novarocks-functions datasketches dependency kind must be normal, got $dependency_kind"
+done
+
+functions_duplicate="$fixture_root/functions-duplicate-target"
+cp -R "$valid" "$functions_duplicate"
+cat >>"$functions_duplicate/novarocks/functions/Cargo.toml" <<'EOF'
+
+[target.'cfg(target_os = "none")'.dependencies]
+datasketches = { workspace = true, features = ["hll"] }
+EOF
+assert_rejected "$functions_duplicate" \
+  "novarocks-functions must declare exactly one direct datasketches dependency"
+
+# Keep the valid direct HLL declaration so that this helper reaches the
+# indirect-owner rule instead of an earlier missing-declaration rejection.
+functions_helper="$fixture_root/functions-indirect-helper"
+cp -R "$valid" "$functions_helper"
+write_package "$functions_helper" "helper" "statistics-helper"
+replace_once "$functions_helper/Cargo.toml" \
+  '  "datasketches",' '  "datasketches", "helper",'
+cat >>"$functions_helper/helper/Cargo.toml" <<'EOF'
+
+[dependencies]
+datasketches = { workspace = true, features = ["hll"] }
+EOF
+printf 'statistics-helper = { path = "../../helper" }\n' \
+  >>"$functions_helper/novarocks/functions/Cargo.toml"
+assert_rejected "$functions_helper" \
+  "novarocks-execution normal closure has indirect datasketches owners: statistics-helper"
 
 echo "ncp8-statistics-boundary-test: PASS"
