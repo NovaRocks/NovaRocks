@@ -395,6 +395,40 @@ pub(crate) fn build_compiled_pipeline_graph_with_metadata_host<H: CompiledSchema
     )
 }
 
+/// Forward every original builder input without manufacturing source authority.
+#[cfg(feature = "test-support")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The original builder inputs remain independent in the test bridge"
+)]
+pub fn build_compiled_pipeline_graph_with_metadata_host_for_test<H: CompiledSchemaMetadataScope>(
+    program: &Arc<LocalProgram>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
+    dep_manager: DependencyManager,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    function_set: Arc<SealedExecutionFunctionSet>,
+    error: Arc<RuntimeErrorState>,
+    host: &mut H,
+) -> ExecutionResult<PipelineGraph> {
+    build_compiled_pipeline_graph_with_metadata_host(
+        program,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        runtime_filter_session,
+        dep_manager,
+        pipeline_dop,
+        root_sink_dop,
+        function_set,
+        error,
+        host,
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "The compiled program and its Task capabilities are independent inputs"
@@ -742,11 +776,14 @@ fn build_node<H: CompiledSchemaMetadataScope>(
         ProgramNodeKind::Analytic { input, .. } => {
             // M1 evaluates every partition on one driver: the instance input
             // is gathered, in the order its sorted source emits it.
-            let factory = CompiledWindowProcessorFactory::try_new(
-                Arc::clone(program),
-                id,
-                Arc::clone(error),
-            )?;
+            let factory = match metadata {
+                CompiledMetadataMode::Direct => CompiledWindowProcessorFactory::try_new(
+                    Arc::clone(program), id, Arc::clone(error),
+                )?,
+                CompiledMetadataMode::Hosted(host) => CompiledWindowProcessorFactory::try_new_with_metadata_host(
+                    Arc::clone(program), id, Arc::clone(error), *host,
+                )?,
+            };
             let build = build_node(program, *input, ctx, error, metadata)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
@@ -1107,3 +1144,7 @@ mod window_fixture;
 #[cfg(test)]
 #[path = "compiled_window_tests.rs"]
 mod compiled_window_tests;
+
+#[cfg(test)]
+#[path = "compiled_window_metadata_tests.rs"]
+mod compiled_window_metadata_tests;

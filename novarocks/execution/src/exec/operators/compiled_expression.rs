@@ -44,7 +44,7 @@ use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
-use crate::runtime::preparation_metadata::{CompiledSchemaMetadataScope, ProjectSchemaSite};
+use crate::runtime::preparation_metadata::{CompiledSchemaMetadataScope, CompiledSchemaSite};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
 pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
@@ -279,7 +279,7 @@ impl CompiledProjectProcessorFactory {
         E: From<String> + From<&'static str>,
         F: FnMut(
             &Arc<LocalProgram>,
-            ProjectSchemaSite,
+            CompiledSchemaSite,
             &novarocks_local_program::StaticLayout,
         ) -> Result<ChunkSchemaRef, E>,
     {
@@ -297,7 +297,7 @@ impl CompiledProjectProcessorFactory {
             .ok_or("compiled final result root is absent")?;
         let output = materialize(
             &program,
-            ProjectSchemaSite::FinalResult,
+            CompiledSchemaSite::FinalResult,
             node.output_layout(),
         )?;
         let pairs = output
@@ -348,7 +348,7 @@ impl CompiledProjectProcessorFactory {
         E: From<String> + From<&'static str>,
         F: FnMut(
             &Arc<LocalProgram>,
-            ProjectSchemaSite,
+            CompiledSchemaSite,
             &novarocks_local_program::StaticLayout,
         ) -> Result<ChunkSchemaRef, E>,
     {
@@ -408,7 +408,7 @@ impl CompiledProjectProcessorFactory {
         };
         let output = materialize(
             &program,
-            ProjectSchemaSite::Project(node),
+            CompiledSchemaSite::Project(node),
             graph_node.output_layout(),
         )?;
         Ok(Self {
@@ -760,18 +760,21 @@ impl ProcessorOperator for CompiledFilterProcessor {
 #[cfg(feature = "test-support")]
 pub fn prepare_project_factory_for_test<H: CompiledSchemaMetadataScope>(
     program: Arc<LocalProgram>,
-    site: ProjectSchemaSite,
+    site: CompiledSchemaSite,
     error: Arc<RuntimeErrorState>,
     host: &mut H,
 ) -> ExecutionResult<CompiledProjectProcessorFactory> {
     match site {
-        ProjectSchemaSite::Project(node) => {
+        CompiledSchemaSite::Project(node) => {
             CompiledProjectProcessorFactory::try_new_with_metadata_host(program, node, error, host)
         }
-        ProjectSchemaSite::FinalResult => {
+        CompiledSchemaSite::FinalResult => {
             CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
                 program, error, host,
             )
+        }
+        CompiledSchemaSite::AnalyticOutput(_) => {
+            Err("the Project test factory cannot prepare an Analytic schema".into())
         }
     }
 }

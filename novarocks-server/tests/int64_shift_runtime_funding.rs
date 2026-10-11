@@ -27,7 +27,7 @@ use novarocks_execution::{
     exec::expr::agg::ExecutionFunctionSetBuilder,
     runtime::{
         execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig},
-        preparation_metadata::ProjectSchemaSite,
+        preparation_metadata::CompiledSchemaSite,
         query_memory::QueryMemoryBinding,
         scalar_memory::{
             RuntimeScalarEvaluationFailure, RuntimeScalarMemoryRefusal,
@@ -473,7 +473,7 @@ fn program(name: &str, binding: &QueryMemoryBinding) -> Arc<LocalProgram> {
         schema,
     } = prepare_project_metadata_for_test(
         compiled,
-        ProjectSchemaSite::Project(root),
+        CompiledSchemaSite::Project(root),
         binding,
         &loan,
         &Control,

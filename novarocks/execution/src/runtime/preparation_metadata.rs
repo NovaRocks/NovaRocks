@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Borrowed preparation port at the original Project schema birth sites.
+//! Borrowed preparation port at the original compiled schema birth sites.
 //! An implementation qualifies the complete operation before consuming its
 //! ONE original body. This trusted port is not a public provenance issuer.
 use crate::{exec::chunk::ChunkSchemaRef, runtime::fragment::ExecutionResult};
@@ -23,15 +23,16 @@ use novarocks_local_program::{LocalProgram, ProgramNodeId, StaticLayout};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProjectSchemaSite {
+pub enum CompiledSchemaSite {
     Project(ProgramNodeId),
     FinalResult,
+    AnalyticOutput(ProgramNodeId),
 }
 pub trait CompiledSchemaMetadataScope {
     fn materialize<B>(
         &mut self,
         program: &Arc<LocalProgram>,
-        site: ProjectSchemaSite,
+        site: CompiledSchemaSite,
         layout: &StaticLayout,
         body: B,
     ) -> ExecutionResult<ChunkSchemaRef>
@@ -49,7 +50,7 @@ impl CompiledSchemaMetadataScope for DirectCompiledSchemaMetadataScope {
     fn materialize<B>(
         &mut self,
         _: &Arc<LocalProgram>,
-        _: ProjectSchemaSite,
+        _: CompiledSchemaSite,
         _: &StaticLayout,
         _: B,
     ) -> ExecutionResult<ChunkSchemaRef>

@@ -26,7 +26,7 @@ use novarocks_execution::{
     runtime::{
         fragment::ExecutionResult,
         preparation_metadata::{
-            CompiledSchemaMetadataScope, PreparationMetadataFailure, ProjectSchemaSite,
+            CompiledSchemaMetadataScope, CompiledSchemaSite, PreparationMetadataFailure,
         },
         query_memory::QueryMemoryBinding,
         runtime_state::RuntimeErrorState,
@@ -50,7 +50,7 @@ impl CompiledSchemaMetadataScope for Capture<'_, '_> {
     fn materialize<B>(
         &mut self,
         program: &Arc<LocalProgram>,
-        site: ProjectSchemaSite,
+        site: CompiledSchemaSite,
         layout: &StaticLayout,
         body: B,
     ) -> ExecutionResult<ChunkSchemaRef>
@@ -64,7 +64,7 @@ impl CompiledSchemaMetadataScope for Capture<'_, '_> {
 }
 pub fn prepare_project_metadata_for_test<'a>(
     compiled: CompiledTaskProgram,
-    site: ProjectSchemaSite,
+    site: CompiledSchemaSite,
     binding: &'a QueryMemoryBinding,
     preparation: &'a PreparationControlLoan<'a>,
     control: &'a dyn PureCompileControl,

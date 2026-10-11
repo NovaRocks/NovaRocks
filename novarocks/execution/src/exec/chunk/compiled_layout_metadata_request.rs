@@ -86,6 +86,8 @@ fn original_request(
             .ok_or(MetadataRequestError::SourceModel(
                 "compiled schema request has an unpaired original root Field",
             ))?;
+        logical_type_lookup_request(field, &mut sum)?;
+        work.step()?;
         sum.allocation(layout::arc_layout(Layout::new::<Field>())?, 2)?;
         let mut debug = DebugRequestBound::default();
         validate_value_type_structure_with_scratch_observed::<MetadataRequestError>(
@@ -98,6 +100,9 @@ fn original_request(
                 // same full grammar. Map entries Struct and ignored-carrier
                 // descendants are declared conservative request overcounts.
                 match visit {
+                    ValueTypeVisit::Field(field) => {
+                        logical_type_lookup_request(field, &mut sum)?;
+                    }
                     ValueTypeVisit::TypeNode(DataType::Struct(fields)) => {
                         fresh_push::<ChunkFieldSchema>(fields.len(), work, &mut sum)?
                     }
@@ -162,6 +167,23 @@ fn original_request(
         )?;
     }
     Ok(sum.facts())
+}
+
+fn logical_type_lookup_request(
+    field: &Field,
+    sum: &mut MetadataRequestSum,
+) -> Result<(), MetadataRequestError> {
+    if let Some(value) = field
+        .metadata()
+        .get(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
+    {
+        // The original legacy lookup trims the tag, copies it to a String,
+        // and changes ASCII case in place. The borrowed raw length bounds its
+        // one request without replaying the trim or constructing that String.
+        // Full-grammar fields outside the semantic subset are overcounts.
+        array::<u8>(value.len(), sum)?;
+    }
+    Ok(())
 }
 
 fn checked_add(left: usize, right: usize) -> Result<usize, MetadataRequestError> {
@@ -362,10 +384,11 @@ mod tests {
                     * (root_table.request_bytes_upper_bound
                         + novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len()
                         + "json".len())
+                    + count * "json".len()
             );
             assert_eq!(
                 right.allocation_requests_upper_bound - left.allocation_requests_upper_bound,
-                2 * count * (root_table.allocation_requests_upper_bound + 2)
+                2 * count * (root_table.allocation_requests_upper_bound + 2) + count
             );
             let original = ChunkSchema::from_compiled_layout(&nominal).unwrap();
             assert_eq!(original.slots().len(), count);
@@ -376,6 +399,92 @@ mod tests {
                     .all(|slot| slot.field_schema().json_semantic())
             );
         }
+    }
+    #[test]
+    fn compiled_layout_metadata_request_counts_each_shared_nested_logical_lookup_occurrence() {
+        let count = 128;
+        let plain = Arc::new(Field::new("child", DataType::Utf8, true));
+        let json = Arc::new(
+            plain.as_ref().clone().with_metadata(
+                [(
+                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
+                    "json".to_owned(),
+                )]
+                .into(),
+            ),
+        );
+        let source = |field: &FieldRef| {
+            positive(&[FunctionValueType::new(
+                DataType::Struct(vec![Arc::clone(field); count].into()),
+                true,
+            )])
+        };
+        let physical = source(&plain);
+        let nominal = source(&json);
+        let left = original_compiled_schema_metadata_request(&physical, &Control::good()).unwrap();
+        let right = original_compiled_schema_metadata_request(&nominal, &Control::good()).unwrap();
+        // Shared FieldRefs avoid new child payload clones, but the original
+        // semantic constructor still reads the tag once per occurrence.
+        assert!(
+            right.allocation_requests_upper_bound - left.allocation_requests_upper_bound >= count
+        );
+        assert!(
+            right.allocation_request_bytes_upper_bound - left.allocation_request_bytes_upper_bound
+                >= count * "json".len()
+        );
+        let original = ChunkSchema::from_compiled_layout(&nominal).unwrap();
+        let semantics = original.slots()[0].field_schema();
+        assert_eq!(semantics.children().len(), count);
+        assert!(
+            semantics
+                .children()
+                .iter()
+                .all(ChunkFieldSchema::json_semantic)
+        );
+        let DataType::Struct(fields) = nominal.schema().fields()[0].data_type() else {
+            panic!("the original source remains a Struct");
+        };
+        assert!(fields.iter().all(|field| Arc::ptr_eq(field, &json)));
+    }
+    #[test]
+    fn compiled_layout_metadata_request_keeps_full_grammar_logical_lookup_overcounts() {
+        let field = Arc::new(
+            Field::new("item", DataType::Utf8, true).with_metadata(
+                [(
+                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
+                    "json".to_owned(),
+                )]
+                .into(),
+            ),
+        );
+        for ty in [
+            DataType::List(Arc::clone(&field)),
+            DataType::FixedSizeList(Arc::clone(&field), 1),
+        ] {
+            let source = positive(&[FunctionValueType::new(ty, true)]);
+            let facts =
+                original_compiled_schema_metadata_request(&source, &Control::good()).unwrap();
+            assert!(facts.allocation_requests_upper_bound > 0);
+            let original = ChunkSchema::from_compiled_layout(&source).unwrap();
+            let children = original.slots()[0].field_schema().children();
+            match source.schema().fields()[0].data_type() {
+                DataType::List(_) => {
+                    assert_eq!(children.len(), 1);
+                    assert!(children[0].json_semantic());
+                }
+                DataType::FixedSizeList(_, _) => assert!(children.is_empty()),
+                _ => panic!("the source keeps the original carrier"),
+            }
+        }
+        let mut sum = MetadataRequestSum::default();
+        logical_type_lookup_request(&Field::new("plain", DataType::Utf8, true), &mut sum).unwrap();
+        assert_eq!(sum.facts().allocation_requests_upper_bound, 0);
+        logical_type_lookup_request(&field, &mut sum).unwrap();
+        assert_eq!(sum.facts().allocation_requests_upper_bound, 1);
+        assert_eq!(
+            sum.facts().allocation_request_bytes_upper_bound,
+            "json".len()
+        );
     }
     #[test]
     fn compiled_layout_metadata_request_map_failure_keeps_original_string_and_source_graph() {

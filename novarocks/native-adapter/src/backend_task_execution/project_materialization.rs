@@ -28,7 +28,7 @@ use novarocks_execution::runtime::{
         SynchronousPreparationMemory,
     },
     preparation_metadata::{
-        CompiledSchemaMetadataScope, PreparationMetadataFailure, ProjectSchemaSite,
+        CompiledSchemaMetadataScope, CompiledSchemaSite, PreparationMetadataFailure,
     },
     query_memory::QueryMemoryBinding,
 };
@@ -189,37 +189,56 @@ impl<'a> CompiledProjectMetadataHost<'a> {
     fn source_node(
         &self,
         program: &Arc<LocalProgram>,
-        site: ProjectSchemaSite,
+        site: CompiledSchemaSite,
         layout: &StaticLayout,
     ) -> Result<ProgramNodeId, MetadataRequestError> {
+        let analytic = matches!(site, CompiledSchemaSite::AnalyticOutput(_));
         if !Arc::ptr_eq(program, self.source.program()) {
-            return Err(MetadataRequestError::SourceModel(
-                "Project schema program is not its native owner",
-            ));
+            return Err(MetadataRequestError::SourceModel(if analytic {
+                "Analytic schema program is not its native owner"
+            } else {
+                "Project schema program is not its native owner"
+            }));
         }
         let id = match site {
-            ProjectSchemaSite::Project(id) => id,
-            ProjectSchemaSite::FinalResult => program.graph().root(),
+            CompiledSchemaSite::Project(id) | CompiledSchemaSite::AnalyticOutput(id) => id,
+            CompiledSchemaSite::FinalResult => program.graph().root(),
         };
         let node =
             program
                 .graph()
                 .nodes()
                 .get(id.index())
-                .ok_or(MetadataRequestError::SourceModel(
-                    "Project schema site has no native node",
-                ))?;
-        if matches!(site, ProjectSchemaSite::Project(_))
-            && !matches!(node.kind(), ProgramNodeKind::Project { .. })
-        {
-            return Err(MetadataRequestError::SourceModel(
-                "Project schema site is not a Project",
-            ));
+                .ok_or(MetadataRequestError::SourceModel(if analytic {
+                    "Analytic schema site has no native node"
+                } else {
+                    "Project schema site has no native node"
+                }))?;
+        match site {
+            CompiledSchemaSite::Project(_)
+                if !matches!(node.kind(), ProgramNodeKind::Project { .. }) =>
+            {
+                return Err(MetadataRequestError::SourceModel(
+                    "Project schema site is not a Project",
+                ));
+            }
+            CompiledSchemaSite::AnalyticOutput(_)
+                if !matches!(node.kind(), ProgramNodeKind::Analytic { .. }) =>
+            {
+                return Err(MetadataRequestError::SourceModel(
+                    "Analytic schema site is not an Analytic",
+                ));
+            }
+            CompiledSchemaSite::Project(_)
+            | CompiledSchemaSite::AnalyticOutput(_)
+            | CompiledSchemaSite::FinalResult => {}
         }
         if !std::ptr::eq(layout, node.output_layout()) {
-            return Err(MetadataRequestError::SourceModel(
-                "Project schema layout is not its native output",
-            ));
+            return Err(MetadataRequestError::SourceModel(if analytic {
+                "Analytic schema layout is not its native output"
+            } else {
+                "Project schema layout is not its native output"
+            }));
         }
         Ok(id)
     }
@@ -228,7 +247,7 @@ impl CompiledSchemaMetadataScope for CompiledProjectMetadataHost<'_> {
     fn materialize<B>(
         &mut self,
         program: &Arc<LocalProgram>,
-        site: ProjectSchemaSite,
+        site: CompiledSchemaSite,
         layout: &StaticLayout,
         body: B,
     ) -> ExecutionResult<ChunkSchemaRef>
@@ -243,7 +262,11 @@ impl CompiledSchemaMetadataScope for CompiledProjectMetadataHost<'_> {
             .map_err(PreparationMetadataFailure::Request)?;
         if route != OriginalSchemaRoute::NormalPositive {
             tracing::debug!(
-                resource_scope = "project-schema",
+                resource_scope = match site {
+                    CompiledSchemaSite::AnalyticOutput(_) => "analytic-schema",
+                    CompiledSchemaSite::Project(_) | CompiledSchemaSite::FinalResult =>
+                        "project-schema",
+                },
                 ?route,
                 funded = false,
                 "original schema source route remains open"
@@ -259,7 +282,14 @@ impl CompiledSchemaMetadataScope for CompiledProjectMetadataHost<'_> {
         SynchronousPreparationMemory::new(Some(self.binding), &control, self.journal.loan())
             .materialize(
                 facts,
-                "Project schema request bound exceeds funding width",
+                match site {
+                    CompiledSchemaSite::AnalyticOutput(_) => {
+                        "Analytic schema request bound exceeds funding width"
+                    }
+                    CompiledSchemaSite::Project(_) | CompiledSchemaSite::FinalResult => {
+                        "Project schema request bound exceeds funding width"
+                    }
+                },
                 body,
             )
             .map_err(|error| match error {

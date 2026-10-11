@@ -24,7 +24,7 @@ use arrow::{
 };
 use novarocks_execution::runtime::{
     kernel_memory::{KernelMemoryAdmission, KernelMemoryJournal, request_complete_operation},
-    preparation_metadata::ProjectSchemaSite,
+    preparation_metadata::CompiledSchemaSite,
     query_memory::QueryMemoryBinding,
 };
 use novarocks_functions::{
@@ -342,7 +342,7 @@ fn project_original_compile_and_schema_aliases_keep_tagged_origin_to_cross_threa
             schema,
         } = prepare_project_metadata_for_test(
             compiled,
-            ProjectSchemaSite::Project(root),
+            CompiledSchemaSite::Project(root),
             &binding,
             &loan,
             &Control,
@@ -470,7 +470,7 @@ fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body()
     let mut journal = ProjectMetadataJournal::default();
     let first = compile(&bytes, &binding, &loan, &mut journal);
     let second = compile(&bytes, &binding, &loan, &mut journal);
-    let site = ProjectSchemaSite::Project(first.program().graph().root());
+    let site = CompiledSchemaSite::Project(first.program().graph().root());
     binding
         .account()
         .install_policy(0, novarocks_memory::LimitDimension::Work);
@@ -520,7 +520,7 @@ fn project_original_schema_host_preserves_real_qualified_shared_shortage_before_
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let compiled = compile(&bytes, &binding, &loan, &mut journal);
-    let site = ProjectSchemaSite::Project(compiled.program().graph().root());
+    let site = CompiledSchemaSite::Project(compiled.program().graph().root());
     let original = token(
         compiled.program().graph().nodes()[compiled.program().graph().root().index()]
             .output_layout()

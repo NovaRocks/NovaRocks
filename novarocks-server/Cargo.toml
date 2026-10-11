@@ -99,7 +99,12 @@ required-features = ["physical-wire-v2-candidate"]
 name = "int64_shift_runtime_funding"
 required-features = ["physical-wire-v2-candidate"]
 
+[[test]]
+name = "window_output_schema_funding"
+required-features = ["physical-wire-v2-candidate"]
+
 [dev-dependencies]
+novarocks-result-contract.workspace = true
 novarocks-local-program.workspace = true
 novarocks-execution = { workspace = true, features = ["test-support"] }
 arrow.workspace = true

@@ -72,3 +72,12 @@ mod project_metadata_test_support;
 pub use project_metadata_test_support::{
     PreparedProjectMetadataForTest, prepare_project_metadata_for_test,
 };
+
+#[cfg(feature = "test-support")]
+mod window_metadata_test_support;
+#[cfg(feature = "test-support")]
+pub use window_metadata_test_support::{
+    PreparedWindowMetadataForTest, PreparedWindowMetadataGraphForTest,
+    WindowSchemaOccurrenceForTest, prepare_window_metadata_for_test,
+    prepare_window_metadata_graph_for_test,
+};

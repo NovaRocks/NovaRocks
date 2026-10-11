@@ -120,13 +120,13 @@ use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::operators::compiled_expression::CompiledProjectProcessorFactory;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailureCause, ExecutionResult};
-use crate::runtime::preparation_metadata::{CompiledSchemaMetadataScope, ProjectSchemaSite};
+use crate::runtime::preparation_metadata::{CompiledSchemaMetadataScope, CompiledSchemaSite};
 use crate::runtime::runtime_state::RuntimeErrorState;
 use novarocks_local_program::{ProgramNodeId, StaticLayout};
 
 struct RecordingSchemaScope {
     program: Arc<LocalProgram>,
-    expected: ProjectSchemaSite,
+    expected: CompiledSchemaSite,
     refuse: bool,
     calls: usize,
     bodies: usize,
@@ -136,7 +136,7 @@ impl CompiledSchemaMetadataScope for RecordingSchemaScope {
     fn materialize<B>(
         &mut self,
         program: &Arc<LocalProgram>,
-        site: ProjectSchemaSite,
+        site: CompiledSchemaSite,
         layout: &StaticLayout,
         body: B,
     ) -> ExecutionResult<ChunkSchemaRef>
@@ -147,8 +147,8 @@ impl CompiledSchemaMetadataScope for RecordingSchemaScope {
         assert!(Arc::ptr_eq(program, &self.program));
         assert_eq!(site, self.expected);
         let node = match site {
-            ProjectSchemaSite::Project(node) => node,
-            ProjectSchemaSite::FinalResult => program.graph().root(),
+            CompiledSchemaSite::Project(node) | CompiledSchemaSite::AnalyticOutput(node) => node,
+            CompiledSchemaSite::FinalResult => program.graph().root(),
         };
         assert!(std::ptr::eq(
             layout,
@@ -167,7 +167,7 @@ impl CompiledSchemaMetadataScope for RecordingSchemaScope {
     }
 }
 
-fn schema_scope(program: &Arc<LocalProgram>, site: ProjectSchemaSite) -> RecordingSchemaScope {
+fn schema_scope(program: &Arc<LocalProgram>, site: CompiledSchemaSite) -> RecordingSchemaScope {
     RecordingSchemaScope {
         program: Arc::clone(program),
         expected: site,
@@ -184,7 +184,7 @@ fn compiled_project_schema_scope_preserves_both_actual_factory_sites() {
         let program = boundary_program(Some(computed));
         let node = program.graph().root();
         let error = Arc::new(RuntimeErrorState::default());
-        let mut host = schema_scope(&program, ProjectSchemaSite::Project(node));
+        let mut host = schema_scope(&program, CompiledSchemaSite::Project(node));
         let direct = CompiledProjectProcessorFactory::try_new(
             Arc::clone(&program),
             node,
@@ -202,7 +202,7 @@ fn compiled_project_schema_scope_preserves_both_actual_factory_sites() {
         assert_eq!((host.calls, host.bodies), (1, 1));
         assert!(host.output.is_some());
 
-        let mut host = schema_scope(&program, ProjectSchemaSite::FinalResult);
+        let mut host = schema_scope(&program, CompiledSchemaSite::FinalResult);
         let direct = CompiledProjectProcessorFactory::try_new_final_result_boundary(
             Arc::clone(&program),
             Arc::clone(&error),
@@ -219,7 +219,7 @@ fn compiled_project_schema_scope_preserves_both_actual_factory_sites() {
     // The terminal boundary may borrow a Values root. It does not claim a
     // Project constructor merely because its schema uses the same port.
     let program = boundary_program(None);
-    let mut host = schema_scope(&program, ProjectSchemaSite::FinalResult);
+    let mut host = schema_scope(&program, CompiledSchemaSite::FinalResult);
     CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
         program,
         Arc::new(RuntimeErrorState::default()),
@@ -233,14 +233,14 @@ fn compiled_project_schema_scope_preserves_both_actual_factory_sites() {
 fn compiled_project_schema_scope_refusal_runs_neither_original_body() {
     let program = boundary_program(Some(true));
     for site in [
-        ProjectSchemaSite::Project(program.graph().root()),
-        ProjectSchemaSite::FinalResult,
+        CompiledSchemaSite::Project(program.graph().root()),
+        CompiledSchemaSite::FinalResult,
     ] {
         let mut host = schema_scope(&program, site);
         host.refuse = true;
         let error = Arc::new(RuntimeErrorState::default());
         let result = match site {
-            ProjectSchemaSite::Project(node) => {
+            CompiledSchemaSite::Project(node) => {
                 CompiledProjectProcessorFactory::try_new_with_metadata_host(
                     Arc::clone(&program),
                     node,
@@ -248,12 +248,15 @@ fn compiled_project_schema_scope_refusal_runs_neither_original_body() {
                     &mut host,
                 )
             }
-            ProjectSchemaSite::FinalResult => {
+            CompiledSchemaSite::FinalResult => {
                 CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
                     Arc::clone(&program),
                     error,
                     &mut host,
                 )
+            }
+            CompiledSchemaSite::AnalyticOutput(_) => {
+                panic!("the Project fixture contains no Analytic schema site")
             }
         };
         let failure = result
@@ -278,7 +281,7 @@ fn compiled_project_schema_scope_keeps_original_early_factory_errors() {
             "compiled Project node is absent",
         ),
     ] {
-        let mut host = schema_scope(&program, ProjectSchemaSite::Project(node));
+        let mut host = schema_scope(&program, CompiledSchemaSite::Project(node));
         let error = Arc::new(RuntimeErrorState::default());
         let direct = CompiledProjectProcessorFactory::try_new(
             Arc::clone(&program),
@@ -303,7 +306,7 @@ fn compiled_project_schema_scope_keeps_original_early_factory_errors() {
         crate::exec::expr::compiled_program::tests::SeedMode::Input,
         false,
     );
-    let mut host = schema_scope(&program, ProjectSchemaSite::FinalResult);
+    let mut host = schema_scope(&program, CompiledSchemaSite::FinalResult);
     let error = Arc::new(RuntimeErrorState::default());
     let direct = CompiledProjectProcessorFactory::try_new_final_result_boundary(
         Arc::clone(&program),

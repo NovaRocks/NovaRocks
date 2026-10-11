@@ -379,7 +379,7 @@ fn a_compiled_scan_submission_refuses_unbound_and_unaddressed_scans() {
 
 struct RecordingProjectSchemaHost<'a> {
     program: &'a Arc<LocalProgram>,
-    sites: Vec<crate::runtime::preparation_metadata::ProjectSchemaSite>,
+    sites: Vec<crate::runtime::preparation_metadata::CompiledSchemaSite>,
     body_calls: usize,
     refusal: Option<(
         usize,
@@ -392,17 +392,17 @@ impl crate::runtime::preparation_metadata::CompiledSchemaMetadataScope
     fn materialize<B>(
         &mut self,
         program: &Arc<LocalProgram>,
-        site: crate::runtime::preparation_metadata::ProjectSchemaSite,
+        site: crate::runtime::preparation_metadata::CompiledSchemaSite,
         layout: &novarocks_local_program::StaticLayout,
         body: B,
     ) -> ExecutionResult<crate::exec::chunk::ChunkSchemaRef>
     where
         B: FnOnce() -> Result<crate::exec::chunk::ChunkSchemaRef, String>,
     {
-        use crate::runtime::preparation_metadata::ProjectSchemaSite;
+        use crate::runtime::preparation_metadata::CompiledSchemaSite;
         assert!(Arc::ptr_eq(program, self.program));
         let node = match site {
-            ProjectSchemaSite::Project(id) => {
+            CompiledSchemaSite::Project(id) => {
                 let node = &program.graph().nodes()[id.index()];
                 assert!(matches!(
                     node.kind(),
@@ -410,8 +410,16 @@ impl crate::runtime::preparation_metadata::CompiledSchemaMetadataScope
                 ));
                 node
             }
-            ProjectSchemaSite::FinalResult => {
+            CompiledSchemaSite::FinalResult => {
                 &program.graph().nodes()[program.graph().root().index()]
+            }
+            CompiledSchemaSite::AnalyticOutput(id) => {
+                let node = &program.graph().nodes()[id.index()];
+                assert!(matches!(
+                    node.kind(),
+                    novarocks_local_program::ProgramNodeKind::Analytic { .. }
+                ));
+                node
             }
         };
         assert!(std::ptr::eq(layout, node.output_layout()));
@@ -428,7 +436,7 @@ impl crate::runtime::preparation_metadata::CompiledSchemaMetadataScope
 
 #[test]
 fn project_metadata_borrow_reaches_nested_projects_before_running() {
-    use crate::runtime::preparation_metadata::ProjectSchemaSite;
+    use crate::runtime::preparation_metadata::CompiledSchemaSite;
     let program = program(SeedMode::Input, false);
     let submission = CompiledFragmentSubmission::try_new(
         Arc::clone(&program),
@@ -467,7 +475,7 @@ fn project_metadata_borrow_reaches_nested_projects_before_running() {
             )
         })
         .map(|(index, _)| {
-            ProjectSchemaSite::Project(novarocks_local_program::ProgramNodeId::new(index))
+            CompiledSchemaSite::Project(novarocks_local_program::ProgramNodeId::new(index))
         })
         .collect();
     assert_eq!(host.sites.len(), expected.len());
@@ -573,7 +581,7 @@ fn project_metadata_refusal_keeps_nominal_cause_through_the_original_prepare_cha
 
 #[test]
 fn project_metadata_borrow_reaches_the_actual_final_result_boundary() {
-    use crate::runtime::preparation_metadata::{PreparationMetadataFailure, ProjectSchemaSite};
+    use crate::runtime::preparation_metadata::{CompiledSchemaSite, PreparationMetadataFailure};
     for project in [None, Some(false), Some(true)] {
         for refuse_final in [false, true] {
             let program = crate::exec::pipeline::builder::compiled_root_result_fixture(project);
@@ -601,7 +609,7 @@ fn project_metadata_borrow_reaches_the_actual_final_result_boundary() {
             let result =
                 prepare_compiled_fragment_with_metadata_host(submission, context, &mut host);
             assert_eq!(host.sites.len(), expected);
-            assert_eq!(host.sites.last(), Some(&ProjectSchemaSite::FinalResult));
+            assert_eq!(host.sites.last(), Some(&CompiledSchemaSite::FinalResult));
             assert_eq!(host.body_calls, expected - usize::from(refuse_final));
             if refuse_final {
                 assert_eq!(

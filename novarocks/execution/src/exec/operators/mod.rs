@@ -125,3 +125,6 @@ pub use values_source::ValuesSourceFactory;
 
 #[cfg(feature = "test-support")]
 pub use compiled_expression::{CompiledProjectProcessorFactory, prepare_project_factory_for_test};
+
+#[cfg(feature = "test-support")]
+pub use compiled_window::{CompiledWindowProcessorFactory, prepare_window_factory_for_test};

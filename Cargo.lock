@@ -4405,6 +4405,7 @@ dependencies = [
  "novarocks-plan-codec",
  "novarocks-proto-models",
  "novarocks-query-application",
+ "novarocks-result-contract",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",

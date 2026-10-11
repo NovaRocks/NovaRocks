@@ -6892,6 +6892,49 @@ pub(super) mod tests {
             )
         }
 
+        pub(crate) fn window_interpreter() -> CompiledPackageInterpreter<std::io::Error> {
+            let actual =
+                novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                    .unwrap();
+            let definition = actual
+                .definition("row_number", FunctionKind::Window)
+                .unwrap();
+            let declaration = definition.binding_declaration().unwrap();
+            let installed = declaration
+                .overloads()
+                .iter()
+                .map(|overload| {
+                    let record = actual
+                        .pure_overload_declaration_observed(
+                            declaration.function_id(),
+                            declaration.kind(),
+                            &overload.identity,
+                            &Unbounded,
+                        )
+                        .unwrap();
+                    InstalledPureKernel {
+                        function: declaration.function_id().clone(),
+                        kind: declaration.kind(),
+                        implementation: record.implementation().clone(),
+                        aggregate_state_format: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut builder = EngineFunctionCatalogBuilder::new();
+            builder.register(definition.clone()).unwrap();
+            let functions = builder.seal_pure(installed).unwrap();
+            let providers =
+                PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Unbounded)
+                    .unwrap();
+            CompiledPackageInterpreter::new(
+                FragmentDecodeResourceModel::try_new(&Unbounded).unwrap(),
+                decode_limits(),
+                Arc::new(functions),
+                Arc::new(providers),
+                constants(),
+            )
+        }
+
         fn compiled_host(facts: Arc<StubContextFacts>) -> NativeTaskExecutionHost {
             host(facts).with_compiled_package_compiler(Arc::new(interpreter()))
         }
@@ -6924,10 +6967,18 @@ pub(super) mod tests {
         /// The producer fragment of a real `SELECT 1` in v2 bytes, and the
         /// consumer exchange node it streams to.
         pub(crate) fn select_one_producer() -> (Vec<u8>, u32) {
+            sql_producer("SELECT 1", false)
+        }
+
+        pub(crate) fn window_producer() -> Vec<u8> {
+            sql_producer("SELECT row_number() OVER () AS r", true).0
+        }
+
+        fn sql_producer(sql: &str, window: bool) -> (Vec<u8>, u32) {
             let control = SqlCompileControl::unbounded();
             let request = SqlFinalPlanCompileRequest::new(
                 PlanVersionId::try_new([9; 16]).expect("plan version"),
-                SqlStatementInput::sql("SELECT 1"),
+                SqlStatementInput::sql(sql),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -6998,9 +7049,18 @@ pub(super) mod tests {
             let producer = plan
                 .fragments()
                 .iter()
-                .find(|(_, fragment)| matches!(fragment.sink(), FragmentSink::Stream { .. }))
+                .find(|(_, fragment)| {
+                    if window {
+                        fragment
+                            .nodes()
+                            .values()
+                            .any(|node| matches!(node.kind, NodeKind::Window(_)))
+                    } else {
+                        matches!(fragment.sink(), FragmentSink::Stream { .. })
+                    }
+                })
                 .map(|(id, _)| *id)
-                .expect("a stream producer");
+                .expect("the requested actual SQL fragment");
             let receiver = plan
                 .fragments()
                 .values()

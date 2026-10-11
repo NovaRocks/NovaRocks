@@ -32,6 +32,8 @@ use std::sync::Arc;
 
 mod compiled;
 mod local;
+#[cfg(feature = "test-support")]
+pub use compiled::build_compiled_pipeline_graph_with_metadata_host_for_test;
 pub(crate) use compiled::{
     build_compiled_pipeline_graph, build_compiled_pipeline_graph_with_metadata_host,
 };
