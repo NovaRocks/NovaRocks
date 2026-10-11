@@ -31,9 +31,7 @@ use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::{alloc::Layout, sync::Arc};
 
-// Existing execution string::common::OLAP_STRING_MAX_LENGTH: oversize is a
-// successful SQL NULL, including when every source is declared non-null.
-const MAX_ROW_BYTES: usize = 1_048_576;
+use super::string_concat_core::{concat_length_observed, emit_concat_observed};
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -70,18 +68,17 @@ fn row_length(
     batch_row: usize,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Option<usize>, KernelFailure> {
-    let mut length = 0usize;
-    for (argument, ty) in input
-        .arguments()
-        .iter()
-        .zip(input.contract().selected().argument_types.iter())
-    {
-        let FunctionArgumentType::Value(source) = ty else {
+    let mut context = (input, ordinal, batch_row, work);
+    concat_length_observed(input.arguments().len(), &mut context, |context, index| {
+        let argument = context.0.arguments()[index];
+        let FunctionArgumentType::Value(source) =
+            &context.0.contract().selected().argument_types[index]
+        else {
             return Err(invalid("concat requires only checked value arguments"));
         };
-        let values = carrier(*argument)?;
-        let row = argument.value_row(ordinal, batch_row);
-        work.step()?;
+        let values = carrier(argument)?;
+        let row = argument.value_row(context.1, context.2);
+        context.3.step()?;
         if row >= values.len() {
             return Err(internal("concat selected row is outside its carrier"));
         }
@@ -91,17 +88,11 @@ fn row_length(
                     "concat non-null source contains selected SQL NULL",
                 ));
             }
-            return Ok(None);
+            Ok(None)
+        } else {
+            Ok(Some(values.value(row)))
         }
-        // Once a selected argument is NULL or exceeds the original row limit,
-        // later payloads are not read. Eager child evaluation belongs to the ABI.
-        let bytes = values.value(row).len();
-        if bytes > MAX_ROW_BYTES - length {
-            return Ok(None);
-        }
-        length += bytes;
-    }
-    Ok(Some(length))
+    })
 }
 
 pub(super) fn evaluate_string_concat<'a>(
@@ -174,15 +165,24 @@ pub(super) fn evaluate_string_concat<'a>(
                     if length > output_bytes - bytes.len() {
                         return Err(internal("concat exceeded its measured output extent"));
                     }
-                    for argument in input.arguments() {
-                        let values = carrier(*argument)?;
-                        let row = argument.value_row(ordinal, batch_row);
-                        for byte in values.value(row).bytes() {
-                            bytes.push(byte);
-                            work.step()?;
-                        }
-                        work.step()?;
-                    }
+                    let mut context = (&input, ordinal, batch_row, &mut bytes, &mut work);
+                    emit_concat_observed(
+                        input.arguments().len(),
+                        &mut context,
+                        |context, index| {
+                            let argument = context.0.arguments()[index];
+                            let values = carrier(argument)?;
+                            Ok(values.value(argument.value_row(context.1, context.2)))
+                        },
+                        |context, text| {
+                            for byte in text.bytes() {
+                                context.3.push(byte);
+                                context.4.step()?;
+                            }
+                            Ok(())
+                        },
+                        |context, _| context.4.step(),
+                    )?;
                     validity.append(true);
                 }
             }

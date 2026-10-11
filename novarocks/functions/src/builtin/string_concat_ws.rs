@@ -31,9 +31,7 @@ use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::{alloc::Layout, sync::Arc};
 
-// Existing execution string::common::OLAP_STRING_MAX_LENGTH. An oversized
-// row produces a successful SQL NULL, rather than a row/resource failure.
-const MAX_ROW_BYTES: usize = 1_048_576;
+use super::string_concat_core::{concat_ws_length_observed, emit_concat_ws_observed};
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -105,38 +103,17 @@ fn row_length(
     batch_row: usize,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Option<usize>, KernelFailure> {
-    let separator = selected_text(input, 0, ordinal, batch_row, work)?;
-    let mut length = 0usize;
-    let mut has_value = false;
-    let mut oversize = false;
-    for index in 1..input.arguments().len() {
-        let value = selected_text(input, index, ordinal, batch_row, work)?;
-        if let (Some(separator), Some(value)) = (separator, value)
-            && !oversize
-        {
-            if has_value {
-                if separator.len() > MAX_ROW_BYTES - length {
-                    oversize = true;
-                } else {
-                    length += separator.len();
-                }
-                work.step()?;
-            }
-            if !oversize {
-                if value.len() > MAX_ROW_BYTES - length {
-                    oversize = true;
-                } else {
-                    length += value.len();
-                }
-                has_value = true;
-                work.step()?;
-            }
-        }
-        // This includes the visited branch when later payload is unnecessary;
-        // it does not claim a scan of skipped bytes.
-        work.step()?;
-    }
-    Ok((separator.is_some() && !oversize).then_some(length))
+    let mut context = (input, ordinal, batch_row, work);
+    concat_ws_length_observed(
+        input.arguments().len(),
+        &mut context,
+        |context, index| selected_text(context.0, index, context.1, context.2, context.3),
+        |context, index| {
+            selected_text(context.0, index, context.1, context.2, context.3)?;
+            Ok(())
+        },
+        |context, _| context.3.step(),
+    )
 }
 
 fn copy_span(
@@ -226,21 +203,23 @@ pub(super) fn evaluate_string_concat_ws<'a>(
                     if length > available {
                         return Err(internal("concat_ws exceeded its measured output extent"));
                     }
-                    let separator = selected_text(&input, 0, ordinal, row, &mut work)?
-                        .ok_or_else(|| internal("concat_ws changed its measured separator NULL"))?;
                     let start = bytes.len();
-                    let mut has_value = false;
-                    for index in 1..input.arguments().len() {
-                        if let Some(value) = selected_text(&input, index, ordinal, row, &mut work)?
-                        {
-                            if has_value {
-                                copy_span(separator, &mut bytes, &mut work)?;
-                            }
-                            copy_span(value, &mut bytes, &mut work)?;
-                            has_value = true;
-                        }
-                        work.step()?;
-                    }
+                    let mut context = (&input, ordinal, row, &mut bytes, &mut work);
+                    emit_concat_ws_observed(
+                        input.arguments().len(),
+                        &mut context,
+                        |context| {
+                            selected_text(context.0, 0, context.1, context.2, context.4)?
+                                .ok_or_else(|| {
+                                    internal("concat_ws changed its measured separator NULL")
+                                })
+                        },
+                        |context, index| {
+                            selected_text(context.0, index, context.1, context.2, context.4)
+                        },
+                        |context, text| copy_span(text, context.3, context.4),
+                        |context, _| context.4.step(),
+                    )?;
                     if bytes.len() - start != length {
                         return Err(internal("concat_ws changed its measured row extent"));
                     }

@@ -19,7 +19,10 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
 use std::sync::Arc;
 
-use super::common::OLAP_STRING_MAX_LENGTH;
+use novarocks_functions::builtin::string_concat_core::{
+    concat_ws_length_observed, emit_concat_ws_observed,
+};
+use std::convert::Infallible;
 
 pub fn eval_concat_ws(
     arena: &ExprArena,
@@ -47,50 +50,54 @@ pub fn eval_concat_ws(
     let len = chunk.len();
     let mut out = Vec::with_capacity(len);
     for row in 0..len {
-        if sep.is_null(row) {
+        let mut context = (sep, &arrays, row);
+        let length = match concat_ws_length_observed(
+            arrays.len() + 1,
+            &mut context,
+            |context, index| {
+                let array = if index == 0 {
+                    context.0
+                } else {
+                    &context.1[index - 1]
+                };
+                Ok::<_, Infallible>(if array.is_null(context.2) {
+                    None
+                } else {
+                    Some(array.value(context.2))
+                })
+            },
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+        ) {
+            Ok(length) => length,
+            Err(never) => match never {},
+        };
+        let Some(total_len) = length else {
             out.push(None);
             continue;
-        }
-        let sep_val = sep.value(row);
-        let sep_len = sep_val.len();
-        let mut total_len = 0usize;
-        let mut has_output = false;
-        let mut oversize = false;
-        for arr in &arrays {
-            if arr.is_null(row) {
-                continue;
-            }
-            let value = arr.value(row);
-            if has_output {
-                total_len = total_len.saturating_add(sep_len);
-                if total_len > OLAP_STRING_MAX_LENGTH {
-                    oversize = true;
-                    break;
-                }
-            }
-            total_len = total_len.saturating_add(value.len());
-            if total_len > OLAP_STRING_MAX_LENGTH {
-                oversize = true;
-                break;
-            }
-            has_output = true;
-        }
-        if oversize {
-            out.push(None);
-            continue;
-        }
+        };
         let mut buf = String::with_capacity(total_len);
-        let mut first_part = true;
-        for arr in &arrays {
-            if arr.is_null(row) {
-                continue;
-            }
-            if first_part {
-                first_part = false;
-            } else {
-                buf.push_str(sep_val);
-            }
-            buf.push_str(arr.value(row));
+        let mut context = (sep, &arrays, row, &mut buf);
+        match emit_concat_ws_observed(
+            arrays.len() + 1,
+            &mut context,
+            |context| Ok::<_, Infallible>(context.0.value(context.2)),
+            |context, index| {
+                let array = &context.1[index - 1];
+                Ok(if array.is_null(context.2) {
+                    None
+                } else {
+                    Some(array.value(context.2))
+                })
+            },
+            |context, text| {
+                context.3.push_str(text);
+                Ok(())
+            },
+            |_, _| Ok(()),
+        ) {
+            Ok(()) => {}
+            Err(never) => match never {},
         }
         out.push(Some(buf));
     }

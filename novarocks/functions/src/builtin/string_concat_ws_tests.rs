@@ -973,3 +973,95 @@ fn string_concat_ws_output_layout_is_checked_before_any_output_request() {
         Err(KernelFailure::ResourceExhausted)
     );
 }
+
+#[test]
+fn string_concat_ws_complete_success_traces_and_bounded_all_seven_causes() {
+    let wide = "x".repeat(1025);
+    let oversized = "x".repeat(1_048_577);
+    let mut checks = 0;
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        for case in 0..5 {
+            let mut arrays = match case {
+                0 => vec![
+                    strings(vec![Some("é\0"), None, Some(""), Some("x")]),
+                    strings(vec![Some("尾"), Some(""), None, Some("b")]),
+                ],
+                1 => vec![strings(vec![Some("a")]); 320],
+                2 => vec![strings(vec![Some(&wide)]), strings(vec![Some("z")])],
+                3 => vec![
+                    strings(vec![Some("x"), None]),
+                    strings(vec![Some("y"), Some("z")]),
+                ],
+                4 => vec![
+                    strings(vec![Some(&oversized)]),
+                    strings(vec![Some("never-copied")]),
+                ],
+                _ => unreachable!(),
+            };
+            let separator = if case == 3 {
+                strings(vec![None, Some("-")])
+            } else {
+                strings(vec![Some("-"); arrays[0].len()])
+            };
+            arrays.insert(0, separator);
+            let types = vec![source(true); arrays.len()];
+            let prepared = prepared_for_test_with_policy("concat_ws", &types, policy).unwrap();
+            let make = || ScalarEvaluationInstance::instantiate(prepared.clone()).unwrap();
+            let arguments = arrays
+                .iter()
+                .map(EvaluatedArgument::Column)
+                .collect::<Vec<_>>();
+            let selection = Selection::all(arrays[0].len());
+            let good = Control::default();
+            let result = make().evaluate(selection, &arguments, &good).unwrap();
+            let actual = output(&result);
+            let trace = good.trace.lock().unwrap().clone();
+            println!(
+                "C12-P2 trace name=concat_ws policy={policy:?} case={case} output={actual:?} units={trace:?}"
+            );
+            assert!(!trace.is_empty());
+            for at in 0..trace.len() {
+                // The byte-cap oracle retains the complete success trace, but
+                // samples originating/refusal positions to avoid quadratic work.
+                if case == 4 && at != 0 && at + 1 != trace.len() {
+                    continue;
+                }
+                for cause in [
+                    KernelFailure::Cancelled,
+                    KernelFailure::DeadlineExceeded,
+                    KernelFailure::ResourceExhausted,
+                    invalid("original refusal"),
+                    internal("original refusal"),
+                    KernelFailure::Operational(crate::KernelDiagnostic::new("original refusal")),
+                    KernelFailure::InstanceFailed,
+                ] {
+                    let control = Control {
+                        trace: Mutex::new(vec![]),
+                        refusal: Some((at, cause.clone())),
+                    };
+                    let mut kernel = make();
+                    assert_eq!(
+                        kernel
+                            .evaluate(selection, &arguments, &control)
+                            .unwrap_err(),
+                        cause
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                    let after = Control::default();
+                    assert_eq!(
+                        kernel.evaluate(selection, &arguments, &after).unwrap_err(),
+                        KernelFailure::InstanceFailed
+                    );
+                    assert!(after.trace.lock().unwrap().is_empty());
+                    checks += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "C12-P2 string_concat_ws first-cause checks={checks}; cap-mask entry/tail only; other fixtures complete"
+    );
+}

@@ -19,7 +19,10 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
 use std::sync::Arc;
 
-use super::common::OLAP_STRING_MAX_LENGTH;
+use novarocks_functions::builtin::string_concat_core::{
+    concat_length_observed, emit_concat_observed,
+};
+use std::convert::Infallible;
 
 pub fn eval_concat(
     arena: &ExprArena,
@@ -42,28 +45,37 @@ pub fn eval_concat(
     let len = chunk.len();
     let mut out = Vec::with_capacity(len);
     for row in 0..len {
-        let mut total_len = 0usize;
-        let mut is_null_or_oversize = false;
-        for arr in &arrays {
-            if arr.is_null(row) {
-                is_null_or_oversize = true;
-                break;
-            }
-            let value = arr.value(row);
-            total_len = total_len.saturating_add(value.len());
-            if total_len > OLAP_STRING_MAX_LENGTH {
-                is_null_or_oversize = true;
-                break;
-            }
-        }
-        if is_null_or_oversize {
-            out.push(None);
-        } else {
+        let mut context = (&arrays, row);
+        let length = match concat_length_observed(arrays.len(), &mut context, |context, index| {
+            let array = &context.0[index];
+            Ok::<_, Infallible>(if array.is_null(context.1) {
+                None
+            } else {
+                Some(array.value(context.1))
+            })
+        }) {
+            Ok(length) => length,
+            Err(never) => match never {},
+        };
+        if let Some(total_len) = length {
             let mut buf = String::with_capacity(total_len);
-            for arr in &arrays {
-                buf.push_str(arr.value(row));
+            let mut context = (&arrays, row, &mut buf);
+            match emit_concat_observed(
+                arrays.len(),
+                &mut context,
+                |context, index| Ok::<_, Infallible>(context.0[index].value(context.1)),
+                |context, text| {
+                    context.2.push_str(text);
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            ) {
+                Ok(()) => {}
+                Err(never) => match never {},
             }
             out.push(Some(buf));
+        } else {
+            out.push(None);
         }
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)

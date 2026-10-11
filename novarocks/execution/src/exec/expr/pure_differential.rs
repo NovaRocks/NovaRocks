@@ -1975,3 +1975,6 @@ mod truncate_shared_core_tests;
 
 #[path = "pure_differential/trim_shared_core_tests.rs"]
 mod trim_shared_core_tests;
+
+#[cfg(test)]
+mod concat_shared_core_tests;

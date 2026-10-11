@@ -353,3 +353,5 @@ mod array_scalar_diagnostic_source;
 
 mod aggregate_top_k;
 mod aggregate_top_k_owner;
+
+pub mod string_concat_core;
