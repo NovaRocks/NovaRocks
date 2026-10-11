@@ -27,6 +27,10 @@ use crate::{
     expressions::{
         ExpressionLoweringError, lower_expressions_with_unions, prepare_calls_with_aggregates,
     },
+    project_metadata::{
+        DirectProjectMetadata, ProjectMetadataMode, ProjectMetadataOutput, ProjectMetadataScope,
+        project_output_requests,
+    },
     repeat::{RepeatLoweringError, lower_repeat},
     scan::{admit_scan, lower_scan},
     sort::lower_sort,
@@ -69,6 +73,10 @@ pub struct LocalCompileOptions {
 
 #[derive(Debug)]
 pub enum FragmentCompileError {
+    ProjectMetadataRequest(novarocks_type_contract::MetadataRequestError),
+    ProjectMetadataHost {
+        error: Box<dyn Error + Send + Sync>,
+    },
     Control(CompileControlError),
     Unsupported {
         node: Option<NodeId>,
@@ -83,6 +91,8 @@ pub enum FragmentCompileError {
 impl fmt::Display for FragmentCompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProjectMetadataRequest(error) => write!(f, "Project metadata request: {error}"),
+            Self::ProjectMetadataHost { error } => write!(f, "Project metadata host: {error}"),
             Self::Control(error) => error.fmt(f),
             Self::Unsupported { node, feature } => {
                 write!(f, "unsupported local lowering at {node:?}: {feature}")
@@ -95,6 +105,8 @@ impl fmt::Display for FragmentCompileError {
 impl Error for FragmentCompileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::ProjectMetadataRequest(error) => Some(error),
+            Self::ProjectMetadataHost { error } => Some(error.as_ref()),
             Self::Control(error) => Some(error),
             Self::Owner { error, .. } => Some(error.as_ref()),
             _ => None,
@@ -201,20 +213,59 @@ pub fn compile_fragment(
     options: LocalCompileOptions,
     control: &dyn PureCompileControl,
 ) -> Result<LocalProgram, FragmentCompileError> {
+    compile_fragment_impl::<DirectProjectMetadata>(
+        input,
+        functions,
+        options,
+        control,
+        ProjectMetadataMode::Direct,
+    )
+}
+
+/// Explicit host entry around the original physical Project metadata births.
+/// Direct callers keep the original entry and compute no unused request facts.
+pub fn compile_fragment_with_project_metadata_host<H: ProjectMetadataScope>(
+    input: ProviderValidatedFragment,
+    functions: &PureEngineFunctionCatalog,
+    options: LocalCompileOptions,
+    control: &dyn PureCompileControl,
+    host: &mut H,
+) -> Result<LocalProgram, FragmentCompileError> {
+    compile_fragment_impl(
+        input,
+        functions,
+        options,
+        control,
+        ProjectMetadataMode::Funded(host),
+    )
+}
+fn compile_fragment_impl<H: ProjectMetadataScope>(
+    input: ProviderValidatedFragment,
+    functions: &PureEngineFunctionCatalog,
+    options: LocalCompileOptions,
+    control: &dyn PureCompileControl,
+    mut metadata: ProjectMetadataMode<'_, H>,
+) -> Result<LocalProgram, FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower(input, functions, options, &mut work);
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
+    let result = lower(input, functions, options, &mut work, &mut metadata);
+    if matches!(
+        &result,
+        Err(FragmentCompileError::Control(_)
+            | FragmentCompileError::ProjectMetadataRequest(_)
+            | FragmentCompileError::ProjectMetadataHost { .. })
+    ) {
         return result;
     }
     work.finish()?;
     result
 }
 
-fn lower(
+fn lower<H: ProjectMetadataScope>(
     input: ProviderValidatedFragment,
     functions: &PureEngineFunctionCatalog,
     options: LocalCompileOptions,
     work: &mut CompileCheckpoints<'_>,
+    metadata: &mut ProjectMetadataMode<'_, H>,
 ) -> Result<LocalProgram, FragmentCompileError> {
     // Each validated provider recipe moves into its one lowered owner.
     let (package, mut reads, mut writes) = input.into_parts();
@@ -1329,84 +1380,126 @@ fn lower(
                         }
                     }
                 }
-                for (ordinal, (expr, value)) in projected.iter().enumerate() {
-                    work.step()?;
-                    let definition =
-                        physical
-                            .expressions()
-                            .get(*expr)
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing projection definition",
-                            ))?;
-                    let value_type = &physical
-                        .values()
-                        .get(value)
-                        .ok_or(FragmentCompileError::Invalid("missing projection value"))?
-                        .ty;
-                    work.flush()?;
-                    if !definition
-                        .ty
-                        .exactly_equals_observed::<FragmentCompileError>(value_type, || {
-                            work.step().map_err(Into::into)
-                        })?
-                    {
-                        return Err(FragmentCompileError::Invalid(
-                            "projection output type differs from definition",
-                        ));
-                    }
-                    // Full result labels are authoritative only when the entire
-                    // ordered output matches, including repeated occurrences.
-                    let name = if is_result_output {
-                        let field = result
-                            .and_then(|result| result.fields.get(ordinal))
-                            .ok_or(FragmentCompileError::Invalid("missing result field"))?;
-                        field.alias.as_deref().unwrap_or(&field.name).to_string()
-                    } else {
-                        format!("local_{}_{}", id.index(), ordinal)
-                    };
-                    if let Some(original_fields) = original_fields.as_mut() {
-                        original_fields.push(novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(value_type, name).map_err(|error| {
+                let requests = if matches!(metadata, ProjectMetadataMode::Funded(_)) {
+                    package
+                        .original_metadata_namespace()
+                        .map(|namespace| {
+                            project_output_requests(
+                                node.id,
+                                projected.len(),
+                                projected.iter().enumerate().map(|(ordinal, (_, value))| {
+                                    let value_type = &physical
+                                        .values()
+                                        .get(value)
+                                        .ok_or(FragmentCompileError::Invalid(
+                                            "missing projection value",
+                                        ))?
+                                        .ty;
+                                    let name = if is_result_output {
+                                        let field = result
+                                            .and_then(|result| result.fields.get(ordinal))
+                                            .ok_or(FragmentCompileError::Invalid(
+                                                "missing result field",
+                                            ))?;
+                                        Some(field.alias.as_deref().unwrap_or(&field.name))
+                                    } else {
+                                        None
+                                    };
+                                    Ok((value_type, name))
+                                }),
+                                namespace,
+                                work,
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
+                let build = || {
+                    for (ordinal, (expr, value)) in projected.iter().enumerate() {
+                        work.step()?;
+                        let definition = physical.expressions().get(*expr).ok_or(
+                            FragmentCompileError::Invalid("missing projection definition"),
+                        )?;
+                        let value_type = &physical
+                            .values()
+                            .get(value)
+                            .ok_or(FragmentCompileError::Invalid("missing projection value"))?
+                            .ty;
+                        work.flush()?;
+                        if !definition
+                            .ty
+                            .exactly_equals_observed::<FragmentCompileError>(value_type, || {
+                                work.step().map_err(Into::into)
+                            })?
+                        {
+                            return Err(FragmentCompileError::Invalid(
+                                "projection output type differs from definition",
+                            ));
+                        }
+                        // Full result labels are authoritative only when the entire
+                        // ordered output matches, including repeated occurrences.
+                        let name = if is_result_output {
+                            let field = result
+                                .and_then(|result| result.fields.get(ordinal))
+                                .ok_or(FragmentCompileError::Invalid("missing result field"))?;
+                            field.alias.as_deref().unwrap_or(&field.name).to_string()
+                        } else {
+                            format!("local_{}_{}", id.index(), ordinal)
+                        };
+                        if let Some(original_fields) = original_fields.as_mut() {
+                            original_fields.push(novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(value_type, name).map_err(|error| {
                                 FragmentCompileError::Owner {
                                     phase: "projection field",
                                     error: Box::new(error),
                                 }
                             })?);
-                    } else {
-                        fields.push(value_type.try_to_field(name).map_err(|error| {
-                            FragmentCompileError::Owner {
-                                phase: "projection field",
-                                error: Box::new(error),
-                            }
-                        })?);
+                        } else {
+                            fields.push(value_type.try_to_field(name).map_err(|error| {
+                                FragmentCompileError::Owner {
+                                    phase: "projection field",
+                                    error: Box::new(error),
+                                }
+                            })?);
+                        }
+                        work.flush()?;
+                        slots.push(*planned.slots.get(ordinal).ok_or(
+                            FragmentCompileError::Invalid("missing planned output occurrence"),
+                        )?);
+                        exprs.push(*expressions.ids.get(expr).ok_or(
+                            FragmentCompileError::Invalid("missing projection expression"),
+                        )?);
                     }
                     work.flush()?;
-                    slots.push(*planned.slots.get(ordinal).ok_or(
-                        FragmentCompileError::Invalid("missing planned output occurrence"),
-                    )?);
-                    exprs.push(
-                        *expressions
-                            .ids
-                            .get(expr)
-                            .ok_or(FragmentCompileError::Invalid(
-                                "missing projection expression",
-                            ))?,
-                    );
-                }
-                work.flush()?;
-                let layout = match (original_fields, package.original_metadata_namespace()) {
-                    (Some(fields), Some(namespace)) => {
-                        let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
-                        StaticLayout::try_new_materialized_for_compile(
-                            source,
+                    let layout = match (original_fields, package.original_metadata_namespace()) {
+                        (Some(fields), Some(namespace)) => {
+                            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
+                            StaticLayout::try_new_materialized_for_compile(
+                                source,
+                                Arc::from(slots),
+                                work.control(),
+                            )?
+                        }
+                        _ => StaticLayout::try_new_for_compile(
+                            Arc::new(Schema::new(fields)),
                             Arc::from(slots),
                             work.control(),
-                        )?
-                    }
-                    _ => StaticLayout::try_new_for_compile(
-                        Arc::new(Schema::new(fields)),
-                        Arc::from(slots),
-                        work.control(),
-                    )?,
+                        )?,
+                    };
+                    let expr_slot_ids = layout.slots().to_vec();
+                    Ok(ProjectMetadataOutput {
+                        layout,
+                        exprs,
+                        expr_slot_ids,
+                    })
+                };
+                let ProjectMetadataOutput {
+                    layout,
+                    exprs,
+                    expr_slot_ids,
+                } = match requests {
+                    Some(requests) => metadata.materialize(&requests, build)?,
+                    None => build()?,
                 };
                 (
                     ProgramNodeKind::Project {
@@ -1416,7 +1509,7 @@ fn lower(
                         // terminal RootResult boundary validates the actual output.
                         validate_final_result_input: false,
                         exprs,
-                        expr_slot_ids: layout.slots().to_vec(),
+                        expr_slot_ids,
                         expr_slot_schemas: None,
                         output_indices: None,
                     },

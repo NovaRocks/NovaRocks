@@ -18,8 +18,15 @@
 //! Funding for the original BE type materialization tail, before its first
 //! Arrow allocation. No writer exists across a Pending wait or requalification.
 
+use super::preparation_memory_control::{WorkerPreparationMemoryControl, worker_stop};
+#[cfg(test)]
+use novarocks_execution::runtime::kernel_memory::KernelMemoryAdmission;
 use novarocks_execution::runtime::{
-    kernel_memory::{KernelMemoryAdmission, KernelMemoryJournal, request_complete_operation},
+    kernel_memory::KernelMemoryJournal,
+    preparation_memory::{
+        PreparationMemoryJournalLoan, PreparationMemoryRefusal, SynchronousPreparationFailure,
+        SynchronousPreparationMemory,
+    },
     query_memory::QueryMemoryBinding,
 };
 use novarocks_memory::{CapacityError, CoverageReceipt, ShortageReceipt};
@@ -30,6 +37,7 @@ use novarocks_plan_codec::{
         TypeCodecError,
     },
 };
+use novarocks_type_contract::CompleteMetadataRequestFacts;
 use novarocks_worker::{PreparationControlLoan, PreparationStop};
 
 #[derive(Debug)]
@@ -83,98 +91,40 @@ impl<'a> TypeMaterializationHost<'a> {
             journal,
         }
     }
-    fn stopped(&self) -> Result<(), TypeMaterializationRefusal> {
-        self.preparation
-            .checkpoint()
-            .map_err(TypeMaterializationRefusal::Stopped)
-    }
-    fn capacity(&mut self, cause: CapacityError) -> TypeMaterializationRefusal {
-        self.journal.capacity = Some(cause.clone());
-        TypeMaterializationRefusal::Capacity(cause)
+    fn journal_loan(&mut self) -> PreparationMemoryJournalLoan<'_> {
+        PreparationMemoryJournalLoan {
+            workset_bytes: &mut self.journal.workset_bytes,
+            pending: &mut self.journal.pending,
+            shortage: &mut self.journal.shortage,
+            capacity: &mut self.journal.capacity,
+            body: &mut self.journal.body,
+        }
     }
 
-    // The production caller supplies the original complete-operation request.
-    // Tests may exercise a real bounded qualification without manufacturing an
-    // admission result or changing that production policy.
+    #[cfg(test)]
     fn materialize_with_request<B, R>(
         &mut self,
         facts: &PackageTypeProjectionFacts,
         body: B,
-        mut request: R,
+        request: R,
     ) -> Result<DecodedTypeTable, ProjectionFailure<TypeCodecError, TypeMaterializationRefusal>>
     where
         B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>,
         R: FnMut(&QueryMemoryBinding, usize) -> KernelMemoryAdmission,
     {
         self.journal.facts = Some(*facts);
-        // The original cumulative request bound is conservative for this tail.
-        // Include the real tag in every request bound, including small ones;
-        // never add the old source invoice or retroactively fund early scratch.
-        let peak = facts
-            .allocation_requests_upper_bound
-            .checked_mul(novarocks_memory::attribution::ATTRIBUTION_TOKEN_BYTES)
-            .and_then(|tokens| {
-                facts
-                    .allocation_request_bytes_upper_bound
-                    .checked_add(tokens)
-            })
-            .ok_or_else(|| {
-                ProjectionFailure::Host(self.capacity(CapacityError::Invalid {
-                    detail: "type materialization request bound exceeds funding width",
-                }))
-            })?;
-        self.journal.workset_bytes = Some(peak);
-        loop {
-            self.stopped().map_err(ProjectionFailure::Host)?;
-            match request(self.binding, peak) {
-                KernelMemoryAdmission::Granted(ready) => {
-                    // A stop can win while admission runs. Drop an unused Ready
-                    // to return its real rights; the body still has not run.
-                    self.stopped().map_err(ProjectionFailure::Host)?;
-                    let result = ready
-                        .run(&mut self.journal.body, body)
-                        .map_err(|cause| ProjectionFailure::Host(self.capacity(cause)))?;
-                    match result {
-                        Err(original) => return Err(ProjectionFailure::Codec(original)),
-                        Ok(table) => {
-                            if let Some(cause) = self
-                                .journal
-                                .body
-                                .settlement
-                                .as_ref()
-                                .and_then(|receipt| receipt.next_step.as_ref().err())
-                                .cloned()
-                            {
-                                return Err(ProjectionFailure::Host(self.capacity(cause)));
-                            }
-                            return Ok(table);
-                        }
-                    }
-                }
-                KernelMemoryAdmission::SettlementPending(receipt) => {
-                    self.journal.pending = Some(receipt);
-                    // No ScopeLease exists on this path. The SAME winner waits
-                    // and retries only its unexecuted tail admission.
-                    self.preparation.wait().map_err(|stop| {
-                        ProjectionFailure::Host(TypeMaterializationRefusal::Stopped(stop))
-                    })?;
-                }
-                KernelMemoryAdmission::SharedShortage(receipt) => {
-                    self.journal.shortage = Some(receipt.clone());
-                    return Err(ProjectionFailure::Host(
-                        TypeMaterializationRefusal::SharedShortage(receipt),
-                    ));
-                }
-                KernelMemoryAdmission::Refused(cause) => {
-                    return Err(ProjectionFailure::Host(self.capacity(cause)));
-                }
-                KernelMemoryAdmission::MissingQueryMemory => {
-                    return Err(ProjectionFailure::Host(
-                        TypeMaterializationRefusal::MissingQueryMemory,
-                    ));
-                }
-            }
-        }
+        let control = WorkerPreparationMemoryControl {
+            preparation: self.preparation,
+        };
+        let binding = self.binding;
+        SynchronousPreparationMemory::new(Some(binding), &control, self.journal_loan())
+            .materialize_with_request_for_test(
+                request_facts(facts),
+                "type materialization request bound exceeds funding width",
+                body,
+                request,
+            )
+            .map_err(original_failure)
     }
 }
 impl PackageTypeMaterializationScope for TypeMaterializationHost<'_> {
@@ -187,9 +137,46 @@ impl PackageTypeMaterializationScope for TypeMaterializationHost<'_> {
     where
         B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>,
     {
-        self.materialize_with_request(facts, body, |binding, peak| {
-            request_complete_operation(Some(binding), peak)
-        })
+        self.journal.facts = Some(*facts);
+        let control = WorkerPreparationMemoryControl {
+            preparation: self.preparation,
+        };
+        let binding = self.binding;
+        SynchronousPreparationMemory::new(Some(binding), &control, self.journal_loan())
+            .materialize(
+                request_facts(facts),
+                "type materialization request bound exceeds funding width",
+                body,
+            )
+            .map_err(original_failure)
+    }
+}
+
+fn request_facts(facts: &PackageTypeProjectionFacts) -> CompleteMetadataRequestFacts {
+    CompleteMetadataRequestFacts {
+        allocation_requests_upper_bound: facts.allocation_requests_upper_bound,
+        allocation_request_bytes_upper_bound: facts.allocation_request_bytes_upper_bound,
+    }
+}
+fn original_failure(
+    failure: SynchronousPreparationFailure<TypeCodecError>,
+) -> ProjectionFailure<TypeCodecError, TypeMaterializationRefusal> {
+    match failure {
+        SynchronousPreparationFailure::Body(error) => ProjectionFailure::Codec(error),
+        SynchronousPreparationFailure::Host(error) => ProjectionFailure::Host(match error {
+            PreparationMemoryRefusal::Stopped(stop) => {
+                TypeMaterializationRefusal::Stopped(worker_stop(stop))
+            }
+            PreparationMemoryRefusal::MissingQueryMemory => {
+                TypeMaterializationRefusal::MissingQueryMemory
+            }
+            PreparationMemoryRefusal::SharedShortage(receipt) => {
+                TypeMaterializationRefusal::SharedShortage(receipt)
+            }
+            PreparationMemoryRefusal::Capacity(error) => {
+                TypeMaterializationRefusal::Capacity(error)
+            }
+        }),
     }
 }
 

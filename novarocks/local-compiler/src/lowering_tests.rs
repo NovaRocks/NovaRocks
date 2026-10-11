@@ -120,6 +120,8 @@ fn package(functions: &PureEngineFunctionCatalog, projections: usize) -> Arc<Fra
 #[derive(Clone, Copy)]
 enum PackageCase {
     Ordinary,
+    EmptyProject,
+    NestedProject,
     PowerOfTwoDomain,
     DuplicateProducedValue,
     ForgedEffects,
@@ -132,7 +134,7 @@ fn package_with_case(
     projections: usize,
     case: PackageCase,
 ) -> Arc<FragmentPackage> {
-    assert!(projections > 0);
+    assert!(projections > 0 || matches!(case, PackageCase::EmptyProject));
     let request = FunctionBindingRequest {
         arguments: &[],
         logical_argument_count: 0,
@@ -243,8 +245,39 @@ fn package_with_case(
             output.clone().into_boxed_slice(),
         )
         .unwrap();
+    let limit_input = if matches!(case, PackageCase::NestedProject) {
+        let final_project = NodeId::new(42);
+        let expr = builder
+            .add_expression(
+                final_project,
+                result_type.clone(),
+                ExprKind::Value(output[0]),
+            )
+            .unwrap();
+        let value = builder
+            .add_value(
+                result_type.clone(),
+                ValueOrigin::Expr {
+                    node: final_project,
+                    expr,
+                },
+            )
+            .unwrap();
+        builder
+            .add_project(
+                final_project,
+                project_node,
+                Box::from([(expr, value)]),
+                Box::from([value]),
+            )
+            .unwrap();
+        output = vec![value];
+        final_project
+    } else {
+        project_node
+    };
     builder
-        .add_limit(limit_node, project_node, Some(1), 0)
+        .add_limit(limit_node, limit_input, Some(1), 0)
         .unwrap();
     let fragment = builder
         .finish_definition(
@@ -842,3 +875,6 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
         },
     }
 }
+
+#[path = "project_metadata_tests.rs"]
+mod project_metadata_tests;

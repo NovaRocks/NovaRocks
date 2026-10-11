@@ -16,7 +16,9 @@
 // under the License.
 
 use super::*;
-use novarocks_execution::runtime::kernel_memory::{KernelMemoryRequest, request};
+use novarocks_execution::runtime::kernel_memory::{
+    KernelMemoryRequest, request, request_complete_operation,
+};
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, FundingDomain, MemoryAuthority};
 use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
 use novarocks_proto_models::{physical_package_v2 as package, physical_type_v2 as wire, plan};

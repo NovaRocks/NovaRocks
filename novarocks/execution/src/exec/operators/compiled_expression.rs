@@ -43,6 +43,7 @@ use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
+use crate::runtime::preparation_metadata::{CompiledSchemaMetadataScope, ProjectSchemaSite};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
 pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
@@ -240,6 +241,38 @@ impl CompiledProjectProcessorFactory {
         program: Arc<LocalProgram>,
         error: Arc<RuntimeErrorState>,
     ) -> Result<Self, String> {
+        Self::try_new_final_result_boundary_in(program, error, |_, _, layout| {
+            ChunkSchema::from_compiled_layout(layout)
+        })
+    }
+
+    pub(crate) fn try_new_final_result_boundary_with_metadata_host<
+        H: CompiledSchemaMetadataScope,
+    >(
+        program: Arc<LocalProgram>,
+        error: Arc<RuntimeErrorState>,
+        host: &mut H,
+    ) -> ExecutionResult<Self> {
+        Self::try_new_final_result_boundary_in(program, error, |program, site, layout| {
+            host.materialize(program, site, layout, || {
+                ChunkSchema::from_compiled_layout(layout)
+            })
+        })
+    }
+
+    fn try_new_final_result_boundary_in<E, F>(
+        program: Arc<LocalProgram>,
+        error: Arc<RuntimeErrorState>,
+        mut materialize: F,
+    ) -> Result<Self, E>
+    where
+        E: From<String> + From<&'static str>,
+        F: FnMut(
+            &Arc<LocalProgram>,
+            ProjectSchemaSite,
+            &novarocks_local_program::StaticLayout,
+        ) -> Result<ChunkSchemaRef, E>,
+    {
         if !matches!(
             program.graph().sink(),
             Some(novarocks_local_program::StaticSinkProgram::RootResult(_))
@@ -252,7 +285,11 @@ impl CompiledProjectProcessorFactory {
             .nodes()
             .get(root.index())
             .ok_or("compiled final result root is absent")?;
-        let output = ChunkSchema::from_compiled_layout(node.output_layout())?;
+        let output = materialize(
+            &program,
+            ProjectSchemaSite::FinalResult,
+            node.output_layout(),
+        )?;
         let pairs = output
             .slot_ids()
             .iter()
@@ -273,6 +310,38 @@ impl CompiledProjectProcessorFactory {
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
     ) -> Result<Self, String> {
+        Self::try_new_in(program, node, error, |_, _, layout| {
+            ChunkSchema::from_compiled_layout(layout)
+        })
+    }
+
+    pub(crate) fn try_new_with_metadata_host<H: CompiledSchemaMetadataScope>(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+        host: &mut H,
+    ) -> ExecutionResult<Self> {
+        Self::try_new_in(program, node, error, |program, site, layout| {
+            host.materialize(program, site, layout, || {
+                ChunkSchema::from_compiled_layout(layout)
+            })
+        })
+    }
+
+    fn try_new_in<E, F>(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+        mut materialize: F,
+    ) -> Result<Self, E>
+    where
+        E: From<String> + From<&'static str>,
+        F: FnMut(
+            &Arc<LocalProgram>,
+            ProjectSchemaSite,
+            &novarocks_local_program::StaticLayout,
+        ) -> Result<ChunkSchemaRef, E>,
+    {
         let graph_node = program
             .graph()
             .nodes()
@@ -286,7 +355,7 @@ impl CompiledProjectProcessorFactory {
             ..
         } = graph_node.kind()
         else {
-            return Err("compiled node is not a Project".to_string());
+            return Err("compiled node is not a Project".to_string().into());
         };
         let mut sites = Vec::with_capacity(exprs.len());
         for ordinal in 0..exprs.len() {
@@ -327,7 +396,11 @@ impl CompiledProjectProcessorFactory {
         } else {
             None
         };
-        let output = ChunkSchema::from_compiled_layout(graph_node.output_layout())?;
+        let output = materialize(
+            &program,
+            ProjectSchemaSite::Project(node),
+            graph_node.output_layout(),
+        )?;
         Ok(Self {
             name: format!("COMPILED_PROJECT (node={})", node.index()),
             program,
@@ -665,5 +738,24 @@ impl ProcessorOperator for CompiledFilterProcessor {
             self.finished = true;
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub fn prepare_project_factory_for_test<H: CompiledSchemaMetadataScope>(
+    program: Arc<LocalProgram>,
+    site: ProjectSchemaSite,
+    error: Arc<RuntimeErrorState>,
+    host: &mut H,
+) -> ExecutionResult<CompiledProjectProcessorFactory> {
+    match site {
+        ProjectSchemaSite::Project(node) => {
+            CompiledProjectProcessorFactory::try_new_with_metadata_host(program, node, error, host)
+        }
+        ProjectSchemaSite::FinalResult => {
+            CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
+                program, error, host,
+            )
+        }
     }
 }

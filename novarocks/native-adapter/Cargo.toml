@@ -9,7 +9,7 @@ build = "build.rs"
 workspace = true
 
 [features]
-test-support = ["dep:novarocks-secret"]
+test-support = ["dep:novarocks-secret", "novarocks-execution/test-support"]
 
 [dependencies]
 novarocks-result-contract.workspace = true
@@ -58,6 +58,7 @@ protoc-bin-vendored.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+novarocks-execution = { workspace = true, features = ["test-support"] }
 novarocks-plan-codec = { workspace = true, features = ["test-support"] }
 h2.workspace = true
 novarocks-sql.workspace = true

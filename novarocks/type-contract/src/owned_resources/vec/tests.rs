@@ -19,6 +19,71 @@ use super::*;
 use crate::{CompilePhase, PureCompileControl, owned_resources::copy::copy_string};
 use std::sync::Mutex;
 
+#[test]
+fn partitioned_collision_vecs_cover_cumulative_requests_for_all_small_partitions() {
+    fn check_partition(parts: &[usize]) {
+        let total = parts.iter().sum();
+        let facts = original_partitioned_fresh_push_request_bound::<(&str, &str)>(total).unwrap();
+        let mut requests = 0;
+        let mut bytes = 0;
+        for count in parts {
+            let mut bucket = Vec::new();
+            for _ in 0..*count {
+                let previous = bucket.capacity();
+                bucket.push(("key", "value"));
+                if bucket.capacity() != previous {
+                    requests += 1;
+                    bytes += bucket.capacity() * 32;
+                }
+            }
+        }
+        assert!(requests <= facts.allocation_requests_upper_bound);
+        assert!(bytes <= facts.request_bytes_upper_bound);
+        assert_eq!(facts.request_bytes_upper_bound, 128 * total);
+        assert_eq!(facts.request_alignment, 8);
+    }
+    fn partitions(remaining: usize, parts: &mut Vec<usize>) {
+        if remaining == 0 {
+            check_partition(parts);
+        }
+        for count in 1..=remaining {
+            parts.push(count);
+            partitions(remaining - count, parts);
+            parts.pop();
+        }
+    }
+    assert_eq!(std::mem::size_of::<(&str, &str)>(), 32);
+    for total in 0..=12 {
+        partitions(total, &mut Vec::new());
+    }
+    // Large collision/singleton extremes exercise later doubling extents.
+    check_partition(&[4096]);
+    check_partition(&[1; 4096]);
+    check_partition(&[1, 3, 5, 9, 17, 33, 65, 129, 257, 513]);
+}
+
+#[test]
+fn partitioned_push_bound_keeps_original_minimum_zst_and_overflow_rules() {
+    assert_eq!(
+        original_partitioned_fresh_push_request_bound::<u8>(1).unwrap(),
+        PartitionedFreshPushFacts {
+            allocation_requests_upper_bound: 1,
+            request_bytes_upper_bound: 8,
+            request_alignment: 1,
+        }
+    );
+    let large = original_partitioned_fresh_push_request_bound::<[u8; 1025]>(1).unwrap();
+    assert_eq!(large.request_bytes_upper_bound, 4 * 1025);
+    assert_eq!(large.allocation_requests_upper_bound, 1);
+    let zero = original_partitioned_fresh_push_request_bound::<()>(usize::MAX).unwrap();
+    assert_eq!(zero.allocation_requests_upper_bound, 0);
+    assert_eq!(zero.request_bytes_upper_bound, 0);
+    assert_eq!(
+        original_partitioned_fresh_push_request_bound::<(&str, &str)>(usize::MAX),
+        Err(resource())
+    );
+}
+
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
     CompileControlError::DeadlineExceeded,

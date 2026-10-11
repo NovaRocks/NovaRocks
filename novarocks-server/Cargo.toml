@@ -91,8 +91,13 @@ physical-wire-v2-candidate = ["dep:novarocks-arrow-ipc-frame", "dep:novarocks-pl
 name = "be_type_metadata_funding"
 required-features = ["physical-wire-v2-candidate"]
 
+[[test]]
+name = "project_metadata_funding"
+required-features = ["physical-wire-v2-candidate"]
+
 [dev-dependencies]
 arrow.workspace = true
+prost.workspace = true
 novarocks-native-adapter = { workspace = true, features = ["test-support"] }
 novarocks-plan-codec = { workspace = true, features = ["test-support"] }
 novarocks-proto-models.workspace = true

@@ -41,6 +41,8 @@
 mod compiled_package;
 mod context_host;
 mod execution_host;
+mod preparation_memory_control;
+mod project_materialization;
 mod type_materialization;
 
 #[cfg(test)]
@@ -59,3 +61,14 @@ pub use type_materialization::{
 
 #[cfg(any(test, feature = "test-support"))]
 pub use type_materialization::materialize_package_types_for_test;
+
+pub use project_materialization::{
+    ProjectMetadataHost, ProjectMetadataJournal, ProjectMetadataPhase,
+};
+
+#[cfg(feature = "test-support")]
+mod project_metadata_test_support;
+#[cfg(feature = "test-support")]
+pub use project_metadata_test_support::{
+    PreparedProjectMetadataForTest, prepare_project_metadata_for_test,
+};

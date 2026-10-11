@@ -28,6 +28,9 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::preparation_metadata::{
+    CompiledMetadataMode, CompiledSchemaMetadataScope, DirectCompiledSchemaMetadataScope,
+};
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -40,7 +43,7 @@ use crate::runtime::runtime_state::RuntimeState;
 use tracing::{info, warn};
 
 use super::builder::{
-    PipelineGraph, build_compiled_pipeline_graph,
+    PipelineGraph, build_compiled_pipeline_graph, build_compiled_pipeline_graph_with_metadata_host,
     build_native_pipeline_graph_for_exec_plan_with_runtime_settings,
     build_native_pipeline_graph_for_local_program_with_runtime_settings,
 };
@@ -606,6 +609,76 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
     runtime_state: Arc<RuntimeState>,
     event_sink: Arc<dyn FragmentEventSink>,
 ) -> ExecutionResult<PreparedPipelineExecution> {
+    prepare_compiled_program_pipeline_execution_in(
+        program,
+        time_slice,
+        sink,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        event_sink,
+        &mut CompiledMetadataMode::<DirectCompiledSchemaMetadataScope>::Direct,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compiled program and its Task capabilities are independent inputs"
+)]
+pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_metadata_host<
+    H: CompiledSchemaMetadataScope,
+>(
+    program: Arc<novarocks_local_program::LocalProgram>,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    event_sink: Arc<dyn FragmentEventSink>,
+    host: &mut H,
+) -> ExecutionResult<PreparedPipelineExecution> {
+    prepare_compiled_program_pipeline_execution_in(
+        program,
+        time_slice,
+        sink,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        event_sink,
+        &mut CompiledMetadataMode::Hosted(host),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compiled program and its Task capabilities are independent inputs"
+)]
+pub(crate) fn prepare_compiled_program_pipeline_execution_in<H: CompiledSchemaMetadataScope>(
+    program: Arc<novarocks_local_program::LocalProgram>,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    event_sink: Arc<dyn FragmentEventSink>,
+    metadata: &mut CompiledMetadataMode<'_, H>,
+) -> ExecutionResult<PreparedPipelineExecution> {
     for node_id in exchange_bindings.node_ids() {
         let binding = exchange_bindings
             .get(node_id)
@@ -643,18 +716,33 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
         .execution_runtime()
         .ok_or_else(|| "compiled program execution requires an execution runtime".to_string())?;
     let terminal_scan_ops = scan_bindings.terminal_ops();
-    let graph = build_compiled_pipeline_graph(
-        &program,
-        exchange_bindings,
-        scan_bindings,
-        writer_bindings,
-        runtime_state.runtime_filter_session().cloned(),
-        DependencyManager::new(),
-        pipeline_dop,
-        root_sink_dop,
-        execution_runtime.function_set().clone(),
-        runtime_state.error_state(),
-    )?;
+    let graph = match metadata {
+        CompiledMetadataMode::Direct => build_compiled_pipeline_graph(
+            &program,
+            exchange_bindings,
+            scan_bindings,
+            writer_bindings,
+            runtime_state.runtime_filter_session().cloned(),
+            DependencyManager::new(),
+            pipeline_dop,
+            root_sink_dop,
+            execution_runtime.function_set().clone(),
+            runtime_state.error_state(),
+        )?,
+        CompiledMetadataMode::Hosted(host) => build_compiled_pipeline_graph_with_metadata_host(
+            &program,
+            exchange_bindings,
+            scan_bindings,
+            writer_bindings,
+            runtime_state.runtime_filter_session().cloned(),
+            DependencyManager::new(),
+            pipeline_dop,
+            root_sink_dop,
+            execution_runtime.function_set().clone(),
+            runtime_state.error_state(),
+            *host,
+        )?,
+    };
     prepare_pipeline_execution_from_graph(
         graph,
         time_slice,

@@ -97,8 +97,7 @@ use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInbou
 use tracing::debug;
 
 use super::compiled_package::{
-    CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, CompiledTaskProgram,
-    TaskPreparationControl,
+    CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, TaskPreparationControl,
 };
 use crate::compiled_runtime_filter::program_runtime_filter_bindings;
 use crate::compiled_scan_binding::{CompiledScanTask, bind_compiled_scans};
@@ -619,6 +618,9 @@ impl NativeTaskExecutionHost {
             preparation,
             &mut metadata_journal,
         );
+        let mut project_journal = super::ProjectMetadataJournal::default();
+        let mut project_host =
+            super::ProjectMetadataHost::new(memory.binding(), preparation, &mut project_journal);
         let compiled = compiler.compile(
             carrier.package(),
             CompiledTaskOptions {
@@ -629,13 +631,14 @@ impl NativeTaskExecutionHost {
             },
             &control,
             &mut type_host,
+            &mut project_host,
         );
         // Fixed local facts only: no metadata text or query-id metric labels.
         tracing::debug!(resource_scope = "be-type-materialization", receipt = ?metadata_journal, "type materialization resource receipt");
-        let CompiledTaskProgram {
-            program,
-            runtime_filters,
-        } = compiled.map_err(|error| compiled_package_rejection(identity, error))?;
+        tracing::debug!(resource_scope = "project-compile-metadata", receipt = ?project_journal, "Project compilation resource receipt");
+        let compiled = compiled.map_err(|error| compiled_package_rejection(identity, error))?;
+        let program = compiled.program();
+        let runtime_filters = &compiled.runtime_filters;
         // The bindings this program's runtime-filter sites bind. They decide
         // whether the task needs the query context's filter session, exactly
         // as a plan-tree program's bindings do, and the session must host
@@ -735,8 +738,11 @@ impl NativeTaskExecutionHost {
             .map(|session| Arc::clone(session.channel()));
         let root_display_id = i32::try_from(program.graph().root().index())
             .map_err(|_| internal(format!("task {identity} compiled root index exceeds i32")))?;
+        // This is the original Arc birth. Submission and the private loan
+        // borrow this same immutable backing, with no recreated program.
+        let compiled = compiled.into_preparation();
         let submission = CompiledFragmentSubmission::try_new_with_writers(
-            Arc::new(program),
+            Arc::clone(compiled.program()),
             scans,
             writers,
             instance,
@@ -787,6 +793,12 @@ impl NativeTaskExecutionHost {
                     "task {identity} could not install connector resource accounting: {error}"
                 ))
             })?;
+        // A binding clone borrows the same authority/account as the original
+        // context transport; it creates no new query registration or domain.
+        let project_binding = admission
+            .query_memory()
+            .cloned()
+            .expect("validated preparation memory reaches admission");
         let mut context = admission
             .into_prepare_context(
                 profiler,
@@ -802,8 +814,25 @@ impl NativeTaskExecutionHost {
         if let Some(session) = root_session {
             context = context.with_root_result_session(session);
         }
-        let dormant = prepare_compiled_fragment(submission, context)
-            .map_err(|error| preparation_failure_to_host(identity, &error))?;
+        let prepared = match compiled.native_metadata_loan() {
+            Some(source) => {
+                let mut host = super::project_materialization::CompiledProjectMetadataHost::new(
+                    source,
+                    &project_binding,
+                    preparation,
+                    &control,
+                    &mut project_journal,
+                );
+                novarocks_execution::runtime::fragment::prepare_compiled_fragment_with_metadata_host(
+                    submission, context, &mut host,
+                )
+            }
+            // Independently assembled products use their original route before
+            // any bounded-native author or preparation metadata admission.
+            None => prepare_compiled_fragment(submission, context),
+        };
+        tracing::debug!(resource_scope = "project-prepare-metadata", receipt = ?project_journal, "Project preparation resource receipt");
+        let dormant = prepared.map_err(|error| preparation_failure_to_host(identity, &error))?;
 
         crate::task_execution_observation::emit_prepared_task_dop(
             identity,
@@ -2109,7 +2138,45 @@ fn failure_cause_category(
         | ExecutionFailureCause::InvocationData(_)
         | ExecutionFailureCause::ScalarInvocationData(_)
         | ExecutionFailureCause::WindowInvocationData(_) => TaskFailureCategory::Execution,
+        ExecutionFailureCause::PreparationMetadata(cause) => match cause {
+            novarocks_execution::runtime::preparation_metadata::PreparationMetadataFailure::Request(error) => metadata_request_category(error),
+            novarocks_execution::runtime::preparation_metadata::PreparationMetadataFailure::Host(error) => preparation_memory_refusal_category(error),
+        },
         ExecutionFailureCause::Pipeline(_) => opaque_category,
+    }
+}
+
+fn preparation_memory_refusal_category(
+    error: &novarocks_execution::runtime::preparation_memory::PreparationMemoryRefusal,
+) -> TaskFailureCategory {
+    use novarocks_execution::runtime::preparation_memory::PreparationMemoryRefusal;
+    match error {
+        PreparationMemoryRefusal::Stopped(_) => TaskFailureCategory::Execution,
+        PreparationMemoryRefusal::MissingQueryMemory
+        | PreparationMemoryRefusal::SharedShortage(_)
+        | PreparationMemoryRefusal::Capacity(_) => TaskFailureCategory::ResourceExhausted,
+    }
+}
+fn metadata_request_category(
+    error: &novarocks_type_contract::MetadataRequestError,
+) -> TaskFailureCategory {
+    use novarocks_type_contract::owned_resources::{
+        hashmap::HashMapResourceError, metadata_materialization::MetadataMaterializationError,
+    };
+    use novarocks_type_contract::{CompileControlError, MetadataRequestError};
+    match error {
+        MetadataRequestError::Control(
+            CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
+        ) => TaskFailureCategory::Execution,
+        MetadataRequestError::Control(CompileControlError::ResourceExhausted)
+        | MetadataRequestError::Arithmetic
+        | MetadataRequestError::Metadata(
+            MetadataMaterializationError::Arithmetic
+            | MetadataMaterializationError::Model(HashMapResourceError::Arithmetic(_)),
+        ) => TaskFailureCategory::ResourceExhausted,
+        MetadataRequestError::SourceModel(_)
+        | MetadataRequestError::ValueType(_)
+        | MetadataRequestError::Metadata(_) => TaskFailureCategory::Internal,
     }
 }
 
@@ -2216,6 +2283,8 @@ fn compiled_package_rejection(
             CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
         ) => TaskFailureCategory::Execution,
         CompiledPackageError::Refused(_) => TaskFailureCategory::Protocol,
+        CompiledPackageError::ProjectMetadata(error) => preparation_memory_refusal_category(error),
+        CompiledPackageError::ProjectMetadataRequest(error) => metadata_request_category(error),
         CompiledPackageError::TypeMaterialization(super::TypeMaterializationRefusal::Stopped(
             _,
         )) => TaskFailureCategory::Execution,
@@ -2253,7 +2322,7 @@ fn resource_exhausted(detail: impl AsRef<str>) -> HostRejection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         CompositeFragmentEventSink, FragmentStandDown, NativeRunnableTask, NativeTaskExecutionHost,
         PreparationStopGuard, QueryContextOptions, RootProducerPool, StandDown,
@@ -2338,6 +2407,150 @@ mod tests {
         TaskExecutionHost, TaskExecutionRegistry, TaskExecutionRegistryConfig, TaskStatusOwner,
         TaskStatusReporter, TaskStatusSource, WorkerMonotonicClock,
     };
+
+    #[test]
+    fn project_metadata_nominal_categories_match_compile_and_prepare_without_parsing_text() {
+        use super::{
+            CompiledPackageError, ExecutionFailureCause, compiled_package_rejection,
+            failure_cause_category,
+        };
+        use novarocks_execution::runtime::{
+            preparation_memory::{PreparationMemoryRefusal, PreparationMemoryStop},
+            preparation_metadata::PreparationMetadataFailure,
+        };
+        use novarocks_type_contract::{
+            CompileControlError, MetadataRequestError, ValueTypeError,
+            owned_resources::{
+                hashmap::HashMapResourceError,
+                metadata_materialization::MetadataMaterializationError,
+            },
+        };
+        let task = identity(371, 1, 1);
+        let requests = [
+            (
+                MetadataRequestError::Control(CompileControlError::Cancelled),
+                TaskFailureCategory::Execution,
+            ),
+            (
+                MetadataRequestError::Control(CompileControlError::DeadlineExceeded),
+                TaskFailureCategory::Execution,
+            ),
+            (
+                MetadataRequestError::Control(CompileControlError::ResourceExhausted),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                MetadataRequestError::Arithmetic,
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                MetadataRequestError::SourceModel("ResourceExhausted: cancelled"),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::ValueType(ValueTypeError::UnknownLogicalMetadata),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::Metadata(MetadataMaterializationError::Arithmetic),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                MetadataRequestError::Metadata(MetadataMaterializationError::Model(
+                    HashMapResourceError::Arithmetic("original arithmetic"),
+                )),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                MetadataRequestError::Metadata(MetadataMaterializationError::Model(
+                    HashMapResourceError::SourceModel("cancelled"),
+                )),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::Metadata(MetadataMaterializationError::ValueType(
+                    ValueTypeError::TooDeep,
+                )),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::Metadata(
+                    MetadataMaterializationError::InsertCountExceededOriginalReservation,
+                ),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::Metadata(
+                    MetadataMaterializationError::MissingOriginalFieldOrigin,
+                ),
+                TaskFailureCategory::Internal,
+            ),
+        ];
+        for (request, expected) in requests {
+            let cause = ExecutionFailureCause::PreparationMetadata(
+                PreparationMetadataFailure::Request(request),
+            );
+            assert_eq!(
+                failure_cause_category(&cause, TaskFailureCategory::Protocol),
+                expected
+            );
+            assert_eq!(
+                compiled_package_rejection(
+                    task,
+                    CompiledPackageError::ProjectMetadataRequest(request)
+                )
+                .category(),
+                expected
+            );
+        }
+        for stop in [
+            PreparationMemoryStop::Cancel(CancelReason::UpstreamNoLongerNeeded),
+            PreparationMemoryStop::Abort(AbortCause::QueryFailed),
+            PreparationMemoryStop::Abort(AbortCause::LeaseExpired),
+            PreparationMemoryStop::Abort(AbortCause::PeerTaskFailed),
+        ] {
+            let refusal = PreparationMemoryRefusal::Stopped(stop);
+            let cause = ExecutionFailureCause::PreparationMetadata(
+                PreparationMetadataFailure::Host(refusal.clone()),
+            );
+            assert_eq!(
+                failure_cause_category(&cause, TaskFailureCategory::Internal),
+                TaskFailureCategory::Execution
+            );
+            assert_eq!(
+                compiled_package_rejection(task, CompiledPackageError::ProjectMetadata(refusal))
+                    .category(),
+                TaskFailureCategory::Execution
+            );
+        }
+        for refusal in [
+            PreparationMemoryRefusal::MissingQueryMemory,
+            PreparationMemoryRefusal::Capacity(novarocks_memory::CapacityError::Invalid {
+                detail: "cancelled Internal: original capacity",
+            }),
+        ] {
+            let cause = ExecutionFailureCause::PreparationMetadata(
+                PreparationMetadataFailure::Host(refusal.clone()),
+            );
+            assert_eq!(
+                failure_cause_category(&cause, TaskFailureCategory::Internal),
+                TaskFailureCategory::ResourceExhausted
+            );
+            assert_eq!(
+                compiled_package_rejection(task, CompiledPackageError::ProjectMetadata(refusal))
+                    .category(),
+                TaskFailureCategory::ResourceExhausted
+            );
+        }
+        let original = ExecutionFailureCause::Pipeline("ResourceExhausted: cancelled".into());
+        for category in [
+            TaskFailureCategory::Internal,
+            TaskFailureCategory::Protocol,
+            TaskFailureCategory::ResourceExhausted,
+        ] {
+            assert_eq!(failure_cause_category(&original, category), category);
+        }
+    }
 
     // ------------------------------------------------------------- fixtures
 
@@ -6490,7 +6703,7 @@ mod tests {
     /// Hosts composed with the compiled-package interpreter: the static
     /// carrier is a physical package, received, provider-validated and
     /// compiled during preparation.
-    mod compiled_package_host {
+    pub(crate) mod compiled_package_host {
         use super::*;
         use std::collections::BTreeMap;
 
@@ -6586,7 +6799,7 @@ mod tests {
                 .expect("sealed rand subset")
         }
 
-        fn interpreter() -> CompiledPackageInterpreter<std::io::Error> {
+        pub(crate) fn interpreter() -> CompiledPackageInterpreter<std::io::Error> {
             let providers =
                 PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Unbounded)
                     .expect("empty provider catalog");
@@ -6618,8 +6831,11 @@ mod tests {
                 options: CompiledTaskOptions,
                 control: &dyn PureCompileControl,
                 type_host: &mut crate::backend_task_execution::TypeMaterializationHost<'_>,
+                project_host: &mut crate::backend_task_execution::ProjectMetadataHost<'_>,
             ) -> Result<CompiledTaskProgram, CompiledPackageError> {
-                let mut compiled = self.inner.compile(package, options, control, type_host)?;
+                let mut compiled =
+                    self.inner
+                        .compile(package, options, control, type_host, project_host)?;
                 compiled.runtime_filters = self.runtime_filters.clone();
                 Ok(compiled)
             }
@@ -6627,7 +6843,7 @@ mod tests {
 
         /// The producer fragment of a real `SELECT 1` in v2 bytes, and the
         /// consumer exchange node it streams to.
-        fn select_one_producer() -> (Vec<u8>, u32) {
+        pub(crate) fn select_one_producer() -> (Vec<u8>, u32) {
             let control = SqlCompileControl::unbounded();
             let request = SqlFinalPlanCompileRequest::new(
                 PlanVersionId::try_new([9; 16]).expect("plan version"),

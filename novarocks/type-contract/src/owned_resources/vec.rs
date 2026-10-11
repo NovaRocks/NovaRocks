@@ -136,6 +136,56 @@ pub fn original_fresh_push_allocation_requests_observed<T, E: From<ControlResour
     Ok(requests)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PartitionedFreshPushFacts {
+    pub allocation_requests_upper_bound: usize,
+    pub request_bytes_upper_bound: usize,
+    pub request_alignment: usize,
+}
+
+/// Cumulative backing requests when `count` original pushes are partitioned
+/// among fresh Vecs of the SAME element type, with no other reserve/shrink.
+/// Bucket membership and collision distribution need not be predicted.
+/// Each allocating growth belongs to a distinct push, so total requests are
+/// at most count. For one nonempty bucket of n elements and minimum capacity
+/// m, the geometric sum of capacities is at most max(m, 4)*n: below m there
+/// is one m request; above m the last capacity is less than 2*n and summing
+/// doublings is less than twice the last. Sum over the partition of count.
+///
+/// This is an aggregate upper bound, not a claim that each original request
+/// has the same Layout. Element payloads/HashMap storage are separate authors.
+/// It neither allocates buckets nor inspects an existing Vec's capacity.
+pub fn original_partitioned_fresh_push_request_bound<T>(
+    count: usize,
+) -> Result<PartitionedFreshPushFacts, ControlResourceError> {
+    if !LOCKED_TOOLCHAIN {
+        return Err(ControlResourceError::SourceModel(
+            "Partitioned Vec growth source model drift",
+        ));
+    }
+    let element = Layout::new::<T>();
+    if element.size() == 0 || count == 0 {
+        return Ok(PartitionedFreshPushFacts {
+            allocation_requests_upper_bound: 0,
+            request_bytes_upper_bound: 0,
+            request_alignment: element.align(),
+        });
+    }
+    // Obtain the original minimum from the SAME checked push geometry, not
+    // an independently copied RawVec minimum-capacity decision.
+    let minimum = push_geometry::<T>(0, 0)?.requested_capacity;
+    let request_bytes_upper_bound = minimum
+        .max(4)
+        .checked_mul(count)
+        .and_then(|elements| elements.checked_mul(element.size()))
+        .ok_or_else(resource)?;
+    Ok(PartitionedFreshPushFacts {
+        allocation_requests_upper_bound: count,
+        request_bytes_upper_bound,
+        request_alignment: element.align(),
+    })
+}
+
 /// Capture the next original push request from this actual default-Global Vec.
 /// A full new layout is a cumulative request contribution; old/new coexistence
 /// and cleanup are separate caller facts. Spare capacity requests no backing.

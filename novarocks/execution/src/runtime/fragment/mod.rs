@@ -21,7 +21,7 @@ pub use fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 pub use handle::{
     CompiledFragmentSubmission, CompiledWriterBindings, DormantFragmentHandle,
     FragmentPrepareContext, RunningFragmentHandle, compiled_sink_kind, prepare_compiled_fragment,
-    prepare_fragment,
+    prepare_compiled_fragment_with_metadata_host, prepare_fragment,
 };
 pub use instance::*;
 pub use submission::FragmentSubmission;

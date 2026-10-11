@@ -77,6 +77,115 @@ fn fresh_generic_pairs_use_actual_size_alignment_and_small_type_thresholds() {
 }
 
 #[test]
+fn insertion_only_requests_include_every_original_growth_extent() {
+    let width = group_layout().unwrap().size();
+    for (calls, buckets) in [
+        (0, &[][..]),
+        (1, &[4][..]),
+        (3, &[4][..]),
+        (4, &[4, 8][..]),
+        (7, &[4, 8][..]),
+        (8, &[4, 8, 16][..]),
+        (14, &[4, 8, 16][..]),
+        (15, &[4, 8, 16, 32][..]),
+        (29, &[4, 8, 16, 32, 64][..]),
+    ] {
+        let mut actual = Vec::new();
+        let facts = original_fresh_insertion_allocation_requests_observed::<
+            String,
+            String,
+            HashMapResourceError,
+        >(calls, &mut |layout| {
+            actual.push(layout);
+            Ok(())
+        })
+        .unwrap();
+        // Independent locked String/String pair size and explicit growth
+        // sequence, including the unpadded four-bucket request.
+        let expected: Vec<_> = buckets
+            .iter()
+            .map(|buckets| {
+                let align = width.max(8);
+                let pairs = (48 * buckets + align - 1) & !(align - 1);
+                Layout::from_size_align(pairs + buckets + width, align).unwrap()
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(facts.insertion_calls, calls);
+        assert_eq!(
+            facts.final_bucket_upper_bound,
+            buckets.last().copied().unwrap_or(0)
+        );
+        assert_eq!(facts.allocation_requests_upper_bound, expected.len());
+        assert_eq!(
+            facts.request_bytes_upper_bound,
+            expected.iter().map(Layout::size).sum::<usize>()
+        );
+    }
+}
+
+#[test]
+fn insertion_call_bound_keeps_original_small_pair_profile_and_duplicate_growth() {
+    let width = group_layout().unwrap().size();
+    let tiny =
+        original_fresh_insertion_allocation_requests_observed::<(), (), HashMapResourceError>(
+            15,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(tiny.final_bucket_upper_bound, 32);
+    assert_eq!(
+        tiny.allocation_requests_upper_bound,
+        if width == 16 { 2 } else { 3 }
+    );
+
+    let mut actual = HashMap::<u64, u64>::new();
+    for key in 0..3 {
+        actual.insert(key, key);
+    }
+    let before_duplicate = actual.capacity();
+    actual.insert(0, 99);
+    // The pinned insert reserves before lookup, even for this duplicate. A
+    // distinct-key-only bound would miss this real growth occurrence.
+    assert_eq!(before_duplicate, 3);
+    assert_eq!(actual.capacity(), 7);
+    let bound = original_fresh_insertion_allocation_requests_observed::<
+        u64,
+        u64,
+        HashMapResourceError,
+    >(4, &mut |_| Ok(()))
+    .unwrap();
+    assert_eq!(bound.final_bucket_upper_bound, 8);
+    assert_eq!(bound.allocation_requests_upper_bound, 2);
+}
+
+#[test]
+fn insertion_request_loan_refusal_and_overflow_do_not_visit_later_extents() {
+    let mut calls = 0;
+    let refusal = original_fresh_insertion_allocation_requests_observed::<
+        String,
+        String,
+        HashMapResourceError,
+    >(29, &mut |_| {
+        calls += 1;
+        Err(Arithmetic("original allocation loan refused"))
+    });
+    assert_eq!(refusal, Err(Arithmetic("original allocation loan refused")));
+    assert_eq!(calls, 1);
+    calls = 0;
+    let overflow = original_fresh_insertion_allocation_requests_observed::<
+        String,
+        String,
+        HashMapResourceError,
+    >(usize::MAX, &mut |_| {
+        calls += 1;
+        Ok(())
+    });
+    assert!(matches!(overflow, Err(Arithmetic(_))));
+    assert_eq!(calls, 0);
+}
+
+#[test]
 fn zero_table_has_no_request_and_target_uses_actual_public_group_carrier() {
     let f = fresh_table_layout::<String, String>(0).unwrap();
     assert_eq!(
